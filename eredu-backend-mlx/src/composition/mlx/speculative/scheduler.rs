@@ -12,21 +12,21 @@ use eredu_core::{
     SpeculativeOptimisticBranch, SpeculativeProposal,
 };
 #[cfg(test)]
+use eredu_core::{GenerationRequestTable, SpeculativeSchedulerStats};
+#[cfg(test)]
 use eredu_core::{
     SpeculativeCallbackPublisher, SpeculativeDriverError, SpeculativeOutputError,
     SpeculativeOutputRuntime, SpeculativeSampling, SpeculativeSemanticConstraint,
     SpeculativeSemanticState,
 };
 use eredu_core::{SpeculativeExecutor, SpeculativeStats, SpeculativeTelemetry};
-#[cfg(test)]
-use eredu_core::{GenerationRequestTable, SpeculativeSchedulerStats};
 use safemlx::{error::Exception, Array};
 #[cfg(test)]
 use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stream};
 
-use crate::composition::mlx::{
-    speculative::{MlxSpeculativeCompletion, SpeculativeExecutionStreams},
-};
+use crate::composition::mlx::speculative::{MlxSpeculativeCompletion, SpeculativeExecutionStreams};
+#[cfg(test)]
+use crate::composition::mlx::MlxModelInput;
 #[cfg(test)]
 use crate::{
     backend::runtime::generation::MlxSamplingBackend,
@@ -36,11 +36,9 @@ use crate::{
 };
 #[cfg(test)]
 use eredu_core::generation::{
-    FinishReason, GenerationCancellationToken, GenerationSequence, SemanticEvent,
-    GenerationRequestConfig, SpeculativeSchedulerOptions,
+    FinishReason, GenerationCancellationToken, GenerationRequestConfig, GenerationSequence,
+    SemanticEvent, SpeculativeSchedulerOptions,
 };
-#[cfg(test)]
-use crate::composition::mlx::MlxModelInput;
 #[cfg(test)]
 use eredu_core::{generation::SpeculativeRequestId, InputModality};
 #[cfg(test)]

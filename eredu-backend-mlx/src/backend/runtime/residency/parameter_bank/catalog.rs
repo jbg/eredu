@@ -173,7 +173,11 @@ pub fn entries_from_selected_members(
             if let Some(bindings) = parameter.quantization_companions() {
                 for companion in parameter.task().output_companions() {
                     let name = match companion.role() {
-                        eredu_nn::LinearCompanionRole::GlobalScale => return Err(Error::Quantization("load-time NVFP4 encoding is unavailable".into())),
+                        eredu_nn::LinearCompanionRole::GlobalScale => {
+                            return Err(Error::Quantization(
+                                "load-time NVFP4 encoding is unavailable".into(),
+                            ))
+                        }
                         eredu_nn::LinearCompanionRole::Scale => bindings.scale(),
                         eredu_nn::LinearCompanionRole::AffineBias => {
                             bindings.affine_bias().ok_or_else(|| {

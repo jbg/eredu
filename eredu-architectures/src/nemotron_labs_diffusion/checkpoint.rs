@@ -1,8 +1,8 @@
 use crate::decoder::Config;
-use eredu_checkpoint::StoredDtype;
 use eredu_checkpoint::schema::{
     CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
 };
+use eredu_checkpoint::StoredDtype;
 
 use super::FamilyConfig;
 

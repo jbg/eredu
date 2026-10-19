@@ -353,7 +353,10 @@ impl PhysicalLinear {
                         output_dimensions,
                         input_dimensions / quantization.group_size(),
                     ],
-                    if matches!(quantization, WeightQuantization::MxFp4 | WeightQuantization::NvFp4) {
+                    if matches!(
+                        quantization,
+                        WeightQuantization::MxFp4 | WeightQuantization::NvFp4
+                    ) {
                         Dtype::Uint8
                     } else {
                         Dtype::Float32
@@ -377,7 +380,9 @@ impl PhysicalLinear {
             },
             global_scale: if format == LinearFormat::NvFp4 {
                 PhysicalParam::<Option<Array>>::unloaded_some(&[], Dtype::Float32, stream)?
-            } else { PhysicalParam::new(None) },
+            } else {
+                PhysicalParam::new(None)
+            },
             bias: if bias {
                 PhysicalParam::<Option<Array>>::unloaded_some(
                     &[output_dimensions],
@@ -451,9 +456,17 @@ impl PhysicalLinear {
             )?
             .linear(input, true, stream)?
         } else if let Some(global) = self.global_scale.as_ref() {
-            super::nvfp4::linear(input, self.weight.as_ref(),
-                self.scales.as_ref().as_ref().ok_or_else(|| Exception::custom("NVFP4 block scales are absent"))?,
-                global, eredu_nn::LinearRowLayout::Contiguous, stream)?
+            super::nvfp4::linear(
+                input,
+                self.weight.as_ref(),
+                self.scales
+                    .as_ref()
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("NVFP4 block scales are absent"))?,
+                global,
+                eredu_nn::LinearRowLayout::Contiguous,
+                stream,
+            )?
         } else if let Some(scales) = self.scales.as_ref() {
             let sparse = if self.prefers_transposed_storage() {
                 self.biases

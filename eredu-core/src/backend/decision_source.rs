@@ -38,8 +38,8 @@ impl<B: TextGenerationBackend> NativeDecisionContext<B> for NativeDecisionScope<
     }
 }
 
-fn unsupported<B: TextGenerationBackend, C: TokenFilterController>()
--> ControlledTextGenerationError<B::Error, C::Error> {
+fn unsupported<B: TextGenerationBackend, C: TokenFilterController>(
+) -> ControlledTextGenerationError<B::Error, C::Error> {
     TextOperationPolicyError::OutcomeMismatch.into()
 }
 

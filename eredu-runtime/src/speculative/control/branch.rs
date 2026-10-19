@@ -32,7 +32,9 @@ pub(super) struct Branch<E: SpeculativeExecutor, S: SpeculativeSampling, C> {
     _reservation: SnapshotReservation,
 }
 impl<E: SpeculativeExecutor, S: SpeculativeSampling, C> Drop for Branch<E, S, C> {
-    fn drop(&mut self) { self.control.close(); }
+    fn drop(&mut self) {
+        self.control.close();
+    }
 }
 
 impl<'a, E, S, C, P> Session<'a, E, S, C, P>
@@ -84,7 +86,9 @@ where
                 copy_bytes: overhead,
             }),
         )?;
-        let control = self.request().expect("checked canonical request")
+        let control = self
+            .request()
+            .expect("checked canonical request")
             .fork_decoding_owner(&self.snapshots[&handle.id].state)?;
         // Immutable state can be shared until activation. The payload's original
         // reservation remains live even if the source snapshot is released.
@@ -120,7 +124,10 @@ where
         // Reserve both copies before replacing anything. Every switch prices
         // the actual outgoing state, including growth since its last activation.
         let outgoing = self.save_state(SnapshotResourceKind::BranchCopy)?;
-        let outgoing_control = self.request().expect("checked canonical request").decoding_owner();
+        let outgoing_control = self
+            .request()
+            .expect("checked canonical request")
+            .decoding_owner();
         let _restore = self
             .budget
             .as_ref()
@@ -143,7 +150,9 @@ where
         slot.control = outgoing_control;
         slot.run_id = self.run_id;
         self.run_id = incoming_run;
-        if self.timing.time_to_first_token().is_none() { self.timing = incoming.timing; }
+        if self.timing.time_to_first_token().is_none() {
+            self.timing = incoming.timing;
+        }
         self.first_token_work = self.first_token_work.max(incoming.first_token_work);
         self.epoch = epoch;
         self.failed = false;

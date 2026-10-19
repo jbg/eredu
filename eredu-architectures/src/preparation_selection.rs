@@ -471,14 +471,24 @@ fn select_preparation_once<P>(
 where
     P: PreparationMechanismProvider,
 {
-    let adapted_inspection = request.draft_adapter().map(|source| {
-        inspection.architecture_plan().clone().with_draft_adapter(source)
-            .map(|plan| inspection.clone().map_architecture_plan(|_| plan))
-            .map_err(PreparationSelectionError::DraftAdapter)
-    }).transpose()?;
+    let adapted_inspection = request
+        .draft_adapter()
+        .map(|source| {
+            inspection
+                .architecture_plan()
+                .clone()
+                .with_draft_adapter(source)
+                .map(|plan| inspection.clone().map_architecture_plan(|_| plan))
+                .map_err(PreparationSelectionError::DraftAdapter)
+        })
+        .transpose()?;
     let inspection = adapted_inspection.as_ref().unwrap_or(inspection);
-    let media_inspection = if request.media_companions().is_empty() { None } else {
-        let architecture = inspection.architecture_plan().clone()
+    let media_inspection = if request.media_companions().is_empty() {
+        None
+    } else {
+        let architecture = inspection
+            .architecture_plan()
+            .clone()
             .with_media_companions(request.media_companions())
             .map_err(|e| PreparationSelectionError::MediaCompanion(std::sync::Arc::new(e)))?;
         Some(inspection.clone().map_architecture_plan(|_| architecture))
@@ -631,7 +641,8 @@ where
         admission,
         prediction_extension,
         prediction_realization,
-    ).with_retained_architecture(inspection.architecture_plan().clone()))
+    )
+    .with_retained_architecture(inspection.architecture_plan().clone()))
 }
 
 fn admit_inspected_preparation(

@@ -16,11 +16,11 @@ pub mod composite;
 pub mod expert;
 /// Neutral block-FP8 metadata normalization.
 pub mod fp8;
-/// Neutral NVFP4 storage geometry and bounded selected-row decoding.
-pub mod nvfp4;
-pub mod gguf_store;
 /// Shard-layout-independent identity of exact GGUF metadata and encoded payloads.
 pub mod gguf_fingerprint;
+pub mod gguf_store;
+/// Neutral NVFP4 storage geometry and bounded selected-row decoding.
+pub mod nvfp4;
 /// Bounded persisted encoded prepared-checkpoint storage.
 pub mod prepared_cache;
 pub mod recipe;

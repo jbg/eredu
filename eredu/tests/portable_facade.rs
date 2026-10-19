@@ -1,4 +1,4 @@
-use eredu::api::{LoadedModel, LoadedTextModelConfig, TextInspectionOptions, load_tokenizer};
+use eredu::api::{load_tokenizer, LoadedModel, LoadedTextModelConfig, TextInspectionOptions};
 use eredu_architectures::ModelKind;
 use eredu_core::{
     BackendDescriptor, BackendProvider, BackendSession, BoundedCompletion,
@@ -9,7 +9,6 @@ use eredu_core::{
 };
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
-
 
 #[path = "portable_facade/sampling.rs"]
 mod sampling;

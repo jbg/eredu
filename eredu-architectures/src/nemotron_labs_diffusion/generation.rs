@@ -81,11 +81,19 @@ impl FamilyConfig {
             defaults,
             diffusion,
             self.model_identity() == "nemotron_labs_diffusion",
-            self.draft_adapter().map(|adapter| eredu_runtime::speculative::shared_backbone::SharedDraftAdapterGeometry {
-                rank: std::num::NonZeroU32::new(adapter.rank() as u32).expect("validated positive adapter rank"),
-                input: std::num::NonZeroU32::new((self.num_attention_heads()*self.head_dim()) as u32).expect("validated attention channels"),
-                output: std::num::NonZeroU32::new(self.hidden_size() as u32).expect("validated residual width"),
-                layers: std::num::NonZeroU32::new(self.num_hidden_layers() as u32).expect("validated layer count"),
+            self.draft_adapter().map(|adapter| {
+                eredu_runtime::speculative::shared_backbone::SharedDraftAdapterGeometry {
+                    rank: std::num::NonZeroU32::new(adapter.rank() as u32)
+                        .expect("validated positive adapter rank"),
+                    input: std::num::NonZeroU32::new(
+                        (self.num_attention_heads() * self.head_dim()) as u32,
+                    )
+                    .expect("validated attention channels"),
+                    output: std::num::NonZeroU32::new(self.hidden_size() as u32)
+                        .expect("validated residual width"),
+                    layers: std::num::NonZeroU32::new(self.num_hidden_layers() as u32)
+                        .expect("validated layer count"),
+                }
             }),
             true,
         )

@@ -24,12 +24,13 @@ use eredu_nn::{
     RotarySubspace, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
-    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LocalModelLayout,
-    MemberSharding, OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelPlanError,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterRole, PartitionedLayeredArchitecture,
-    ProjectionSharding, StateLayout, TensorPlacement, module_parameter_group,
-    partitioned_module_parameter_group, partitioned_projection_group, segmented_projection_group,
+    module_parameter_group, partitioned_module_parameter_group, partitioned_projection_group,
+    segmented_projection_group, ArchitectureParameterDescription, ExecutionGraph,
+    ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
+    LayeredPartitionInput, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelLayeredArchitecture, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterRole, PartitionedLayeredArchitecture, ProjectionSharding, StateLayout,
+    TensorPlacement,
 };
 
 /// Narrows a causal decoder's position-independent readout before projection.
@@ -173,9 +174,15 @@ impl<T: Tensor> ComponentInstrumentation<'_, T> {
     {
         match self.observer.as_deref_mut() {
             Some(observer) => eredu_runtime::select_routes_with_observer(
-                selector, input, context, &format!("{}.{}", self.unit_path, boundary), observer,
+                selector,
+                input,
+                context,
+                &format!("{}.{}", self.unit_path, boundary),
+                observer,
             ),
-            None => eredu_runtime::select_routes_with_provider::<B, P>(selector, input, context, provider, bank),
+            None => eredu_runtime::select_routes_with_provider::<B, P>(
+                selector, input, context, provider, bank,
+            ),
         }
     }
 
@@ -188,13 +195,21 @@ impl<T: Tensor> ComponentInstrumentation<'_, T> {
         output: T,
         expert_count: i32,
     ) -> Result<T, Error> {
-        let Some(observer) = self.observer.as_deref_mut() else { return Ok(output); };
+        let Some(observer) = self.observer.as_deref_mut() else {
+            return Ok(output);
+        };
         let path = format!("{}.{}", self.unit_path, boundary);
         observer.observe_routing(eredu_runtime::RoutingObservation {
-            path: &path, selected_experts: routes.group_indices(), selected_scores: routes.selected_scores(),
-            coefficients: routes.coefficients(), routed_output: &output,
-            local_routed_output: None, reduced_routed_output: None, shared_output: None,
-            combined_output: None, expert_count,
+            path: &path,
+            selected_experts: routes.group_indices(),
+            selected_scores: routes.selected_scores(),
+            coefficients: routes.coefficients(),
+            routed_output: &output,
+            local_routed_output: None,
+            reduced_routed_output: None,
+            shared_output: None,
+            combined_output: None,
+            expert_count,
         })?;
         eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &output)
     }
@@ -4667,8 +4682,12 @@ pub struct LayeredModel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
 
 impl<B: NeuralBackend, C: Config + Clone, P> Clone for LayeredModel<B, C, P> {
     fn clone(&self) -> Self {
-        Self { args: self.args.clone(), static_modules: self.static_modules.clone(),
-            parallel_geometry: self.parallel_geometry.clone(), block_factory: std::marker::PhantomData }
+        Self {
+            args: self.args.clone(),
+            static_modules: self.static_modules.clone(),
+            parallel_geometry: self.parallel_geometry.clone(),
+            block_factory: std::marker::PhantomData,
+        }
     }
 }
 

@@ -304,17 +304,15 @@ mod tests {
         assert_eq!(shape.resolve(&projected).unwrap(), Some(vec![1, 4, 6]));
         assert!(shape.validate_actual(&raw, &[1, 13, 8]).is_err());
         assert!(shape.validate_actual(&projected, &[1, 16, 6]).is_err());
-        assert!(
-            CaptureInvocationShape {
-                media: Some(CaptureMediaShape {
-                    patches: 4,
-                    projected: 5
-                }),
-                ..shape
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(CaptureInvocationShape {
+            media: Some(CaptureMediaShape {
+                patches: 4,
+                projected: 5
+            }),
+            ..shape
+        }
+        .validate()
+        .is_err());
         let without_media = CaptureInvocationShape {
             media: None,
             ..shape
@@ -346,29 +344,25 @@ mod tests {
         let partly_known = point(&[SymbolicDimension::Unknown, SymbolicDimension::Sequence]);
         assert_eq!(shape.resolve(&partly_known).unwrap(), None);
         assert!(shape.validate_actual(&partly_known, &[8, 1]).is_err());
-        assert!(
-            shape
-                .validate_slices(
-                    &partly_known,
-                    &[CaptureSlice {
-                        axis: "axis1".into(),
-                        start: 0,
-                        end: 4,
-                        stride: 1
-                    }]
-                )
-                .is_err()
-        );
-        assert!(
-            CaptureInvocationShape {
-                media: None,
-                batch: u64::MAX,
-                sequence: 2,
-                context: None
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(shape
+            .validate_slices(
+                &partly_known,
+                &[CaptureSlice {
+                    axis: "axis1".into(),
+                    start: 0,
+                    end: 4,
+                    stride: 1
+                }]
+            )
+            .is_err());
+        assert!(CaptureInvocationShape {
+            media: None,
+            batch: u64::MAX,
+            sequence: 2,
+            context: None
+        }
+        .validate()
+        .is_err());
         let schedule = CaptureSchedule {
             first_prediction: 3,
             every: 2,

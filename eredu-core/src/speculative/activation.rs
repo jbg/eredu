@@ -31,7 +31,14 @@ impl SpeculativeCaptureScope {
     pub fn applies(self, phase: SpeculativeActivationPhase) -> bool {
         use SpeculativeActivationPhase as P;
         match (self, phase) {
-            (Self::Target, P::TargetPrefill | P::Verification | P::TargetReplay | P::Refinement { .. } | P::MaskedDraft { .. }) => true,
+            (
+                Self::Target,
+                P::TargetPrefill
+                | P::Verification
+                | P::TargetReplay
+                | P::Refinement { .. }
+                | P::MaskedDraft { .. },
+            ) => true,
             (Self::Prediction { depth }, P::Proposal { depth: actual }) => depth == actual,
             (Self::Prediction { .. }, P::PredictionPrefill | P::PredictionReplay) => true,
             (Self::PredictionContext, P::PredictionPrefill | P::PredictionReplay) => true,

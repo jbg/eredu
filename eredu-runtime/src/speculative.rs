@@ -1,10 +1,10 @@
 //! Backend-neutral speculative request lifecycle and fair scheduling.
 
 use eredu_core::{
-    BoundedCompletion, CompletedSpeculativeSchedule, GenerationError, GenerationTiming,
-    PreparedSpeculativeLane, SpeculativeConstraint, SpeculativeDriverError, SpeculativeExecutor,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
-    SpeculativePublisher, GenerationRequestTable, SpeculativeSampling,
+    BoundedCompletion, CompletedSpeculativeSchedule, GenerationError, GenerationRequestTable,
+    GenerationTiming, PreparedSpeculativeLane, SpeculativeConstraint, SpeculativeDriverError,
+    SpeculativeExecutor, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
+    SpeculativeGenerationVisitor, SpeculativePublisher, SpeculativeSampling,
 };
 
 mod control;
@@ -76,7 +76,10 @@ where
     }
 
     /// Constrains all lanes and prospective mode commands to the retained plan.
-    pub fn with_speculation_limits(mut self, limits: Option<eredu_core::decoding::SpeculationLimits>) -> Self {
+    pub fn with_speculation_limits(
+        mut self,
+        limits: Option<eredu_core::decoding::SpeculationLimits>,
+    ) -> Self {
         self.requests = self.requests.with_speculation_limits(limits);
         self
     }
@@ -171,11 +174,21 @@ impl RunSpeculativeGeneration {
     }
 
     /// Uses the facade call's origin so all active request preparation contributes to TTFT.
-    pub fn new_at(options: eredu_core::generation::SpeculativeSchedulerOptions, started: std::time::Instant) -> Self {
-        Self { options, limits: None, started }
+    pub fn new_at(
+        options: eredu_core::generation::SpeculativeSchedulerOptions,
+        started: std::time::Instant,
+    ) -> Self {
+        Self {
+            options,
+            limits: None,
+            started,
+        }
     }
     /// Retains the source's selected resource ceilings for mode admission.
-    pub fn with_speculation_limits(mut self, limits: Option<eredu_core::decoding::SpeculationLimits>) -> Self {
+    pub fn with_speculation_limits(
+        mut self,
+        limits: Option<eredu_core::decoding::SpeculationLimits>,
+    ) -> Self {
         self.limits = limits;
         self
     }
@@ -205,7 +218,8 @@ impl SpeculativeGenerationVisitor for RunSpeculativeGeneration {
             optimistic_execution_available,
             component_timings_collected,
             context,
-        )?.with_speculation_limits(self.limits);
+        )?
+        .with_speculation_limits(self.limits);
         let mut preparation_elapsed = Vec::with_capacity(lanes.len());
         for lane in lanes {
             preparation_elapsed.push(self.started.elapsed());

@@ -227,9 +227,13 @@ fn original_estimates_are_used_at_admission_and_reserved_before_routing() {
         {
             session.begin_step(phase, prediction).unwrap();
             let control = session.routing_control("router", rows).unwrap().unwrap();
-            let actual = eredu_nn::TopKGroupSelectionSpec::new(4, 2, eredu_nn::GroupScoring::Softmax, true)
-                .unwrap().with_order(eredu_nn::GroupSelectionOrder::Partition);
-            control.validate(actual, false, rows).expect("portable admission preserves the realized coefficient reduction order");
+            let actual =
+                eredu_nn::TopKGroupSelectionSpec::new(4, 2, eredu_nn::GroupScoring::Softmax, true)
+                    .unwrap()
+                    .with_order(eredu_nn::GroupSelectionOrder::Partition);
+            control
+                .validate(actual, false, rows)
+                .expect("portable admission preserves the realized coefficient reduction order");
             assert!(control.capture_original);
             let ids = Value {
                 shape: vec![rows, 2],

@@ -538,8 +538,6 @@ pub(crate) fn f32_grouped_rms(
     }
 }
 
-
-
 pub(crate) fn f32_sum_last(input: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {

@@ -302,15 +302,26 @@ pub trait SpeculativeSampler<B: SamplingBackend> {
     /// Position-wise output restrictions for refinement, without causal sampling
     /// transformations. Unknown policies must explicitly supply this contract.
     fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, B::Error> {
-        Err(B::error("sampler has no refinement commitment filter".into()))
+        Err(B::error(
+            "sampler has no refinement commitment filter".into(),
+        ))
     }
 
     /// Observes/intervenes on raw position scores, then applies only output
     /// restrictions. Causal penalties, truncation and temperature are excluded.
     fn refinement_scores_with_capture(
-        &mut self, logits: &B::Logits, history: &[u32], context: &B::Context,
-        capture: impl FnOnce(&B::Logits, Option<eredu_core::capture::CaptureTokenDomain<'_>>) -> Result<B::Logits, B::Error>,
-    ) -> Result<B::Logits, B::Error> where Self: Sized {
+        &mut self,
+        logits: &B::Logits,
+        history: &[u32],
+        context: &B::Context,
+        capture: impl FnOnce(
+            &B::Logits,
+            Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        ) -> Result<B::Logits, B::Error>,
+    ) -> Result<B::Logits, B::Error>
+    where
+        Self: Sized,
+    {
         let effective = capture(logits, None)?;
         B::apply_token_filter(&effective, &self.refinement_filter(history)?, context)
     }
@@ -445,14 +456,25 @@ where
     C: SpeculativeTokenFilterController,
 {
     fn refinement_filter(&mut self, history: &[u32]) -> Result<TokenFilter, B::Error> {
-        self.controller.filter_at(history).map_err(|error| B::error(error.to_string()))
+        self.controller
+            .filter_at(history)
+            .map_err(|error| B::error(error.to_string()))
     }
 
     fn refinement_scores_with_capture(
-        &mut self, logits: &B::Logits, history: &[u32], context: &B::Context,
-        capture: impl FnOnce(&B::Logits, Option<eredu_core::capture::CaptureTokenDomain<'_>>) -> Result<B::Logits, B::Error>,
+        &mut self,
+        logits: &B::Logits,
+        history: &[u32],
+        context: &B::Context,
+        capture: impl FnOnce(
+            &B::Logits,
+            Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        ) -> Result<B::Logits, B::Error>,
     ) -> Result<B::Logits, B::Error> {
-        let decision = self.controller.decision_at(history).map_err(|error| B::error(error.to_string()))?;
+        let decision = self
+            .controller
+            .decision_at(history)
+            .map_err(|error| B::error(error.to_string()))?;
         let effective = capture(logits, decision.capture_domain())?;
         B::apply_token_filter(&effective, decision.filter(), context)
     }
@@ -630,8 +652,12 @@ where
 pub struct DefaultSampler;
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for DefaultSampler {
-    fn control_snapshot_bytes(&self) -> Option<u64> { Some(0) }
-    fn continuation_storage_bytes(&self, _additional_tokens: u64) -> Option<u64> { Some(0) }
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        Some(0)
+    }
+    fn continuation_storage_bytes(&self, _additional_tokens: u64) -> Option<u64> {
+        Some(0)
+    }
     fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, B::Error> {
         Ok(TokenFilter::All)
     }

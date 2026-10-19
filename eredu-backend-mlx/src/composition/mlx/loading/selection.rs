@@ -117,7 +117,6 @@ impl<'a> MlxPreparationMechanisms<'a> {
             communication: None,
         }
     }
-
 }
 
 impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechanisms<'_> {

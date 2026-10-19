@@ -343,9 +343,11 @@ where
             ))
         })?;
         if expected != address {
-            return Err(eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
-                "execution unit address differs from the prepared owner".into(),
-            )));
+            return Err(eredu_runtime::LayerwiseAcquireError::Policy(
+                Error::ArchitectureModel(
+                    "execution unit address differs from the prepared owner".into(),
+                ),
+            ));
         }
         let mut policy = self.inner.lock().map_err(|_| {
             eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
@@ -359,13 +361,11 @@ where
             MlxSelectedLayerwisePolicyInner::Bounded {
                 policy,
                 local_addresses: _,
-            } => {
-                policy.acquire(ordinal, local, build, context).map(|lease| {
-                    #[cfg(test)]
-                    crate::tests::support::path_instrumentation::bounded_unit_acquisition();
-                    MlxSelectedUnitLease::Bounded(lease)
-                })
-            }
+            } => policy.acquire(ordinal, local, build, context).map(|lease| {
+                #[cfg(test)]
+                crate::tests::support::path_instrumentation::bounded_unit_acquisition();
+                MlxSelectedUnitLease::Bounded(lease)
+            }),
         }
     }
 

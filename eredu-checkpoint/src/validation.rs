@@ -425,12 +425,23 @@ pub fn validate_gguf_tensor_catalog(
     let mut catalog = BTreeMap::new();
     let mut issues = Vec::new();
     for (key, shape, encoding) in tensors {
-        if catalog.insert(key.clone(), PhysicalMetadata { shape, encoding }).is_some() {
-            issues.push(metadata_failure(&key, "duplicate physical GGUF tensor".into()));
+        if catalog
+            .insert(key.clone(), PhysicalMetadata { shape, encoding })
+            .is_some()
+        {
+            issues.push(metadata_failure(
+                &key,
+                "duplicate physical GGUF tensor".into(),
+            ));
         }
     }
-    issues.extend(validate_catalog(&catalog, &plan.identity, &plan.common_tensors,
-        &plan.layout_groups, &plan.catalog_policy));
+    issues.extend(validate_catalog(
+        &catalog,
+        &plan.identity,
+        &plan.common_tensors,
+        &plan.layout_groups,
+        &plan.catalog_policy,
+    ));
     CheckpointValidation::from_issues(issues)
 }
 
@@ -959,21 +970,41 @@ mod tests {
     #[test]
     fn recipe_input_remains_admitted_for_conversion_and_requires_exact_geometry() {
         let mut scale = SafetensorsTensorConstraint::required(
-            "scale", vec![], StoredDtypeConstraint::Exact(StoredDtype::F32),
+            "scale",
+            vec![],
+            StoredDtypeConstraint::Exact(StoredDtype::F32),
         );
         scale.role = TensorRole::RecipeInput;
-        let plan = safe_plan(vec![
-            SafetensorsTensorConstraint::required("weight", vec![2], StoredDtypeConstraint::Floating),
-            scale,
-        ], Vec::new(), CatalogPolicy::strict());
+        let plan = safe_plan(
+            vec![
+                SafetensorsTensorConstraint::required(
+                    "weight",
+                    vec![2],
+                    StoredDtypeConstraint::Floating,
+                ),
+                scale,
+            ],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        );
         let catalog = BTreeMap::from([
             safe("weight", &[2], StoredDtype::F32),
             safe("scale", &[], StoredDtype::F32),
         ]);
-        let resolve = |catalog| resolve_catalog(catalog, &plan.identity, &plan.common_tensors,
-            &plan.layout_groups, &plan.catalog_policy, Vec::new());
-        assert_eq!(resolve(&catalog).unwrap().source_keys(),
-            &BTreeSet::from(["weight".into(), "scale".into()]));
+        let resolve = |catalog| {
+            resolve_catalog(
+                catalog,
+                &plan.identity,
+                &plan.common_tensors,
+                &plan.layout_groups,
+                &plan.catalog_policy,
+                Vec::new(),
+            )
+        };
+        assert_eq!(
+            resolve(&catalog).unwrap().source_keys(),
+            &BTreeSet::from(["weight".into(), "scale".into()])
+        );
         let mut malformed = catalog.clone();
         malformed.get_mut("scale").unwrap().shape = vec![1];
         assert!(resolve(&malformed).is_err());

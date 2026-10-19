@@ -5,10 +5,10 @@ mod construction;
 use construction::NormalizedExternalAssistant;
 mod static_placement;
 mod target_operation;
+pub use capture_placement::PreparedTargetCapturePlacement;
 pub use static_placement::PreparedTargetStaticPlacement;
 pub(crate) use static_placement::TargetStaticDescription;
 pub use target_operation::PreparedExternalTargetOperation;
-pub use capture_placement::PreparedTargetCapturePlacement;
 mod execution_plan;
 mod parameters;
 pub use execution_plan::{
@@ -420,7 +420,10 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
     /// Retained resource equations, absent when the assistant projection is unimplemented.
     fn memory_topology(
         _config: &Self::ModuleConfig,
-    ) -> Result<Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>, eredu_nn::Error> {
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>,
+        eredu_nn::Error,
+    > {
         Ok(None)
     }
 
@@ -626,8 +629,11 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
         _stage: eredu_core::run_preparation::TextPreparationStage,
         status: eredu_core::run_preparation::TextPreparationStatus,
         _context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
-        use eredu_core::run_preparation::{TextPreparationOutcome as O, TextPreparationStatus as S};
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        use eredu_core::run_preparation::{
+            TextPreparationOutcome as O, TextPreparationStatus as S,
+        };
         Ok(match status {
             S::Ready => O::Ready,
             S::Cancelled => O::Cancelled,
@@ -1099,7 +1105,10 @@ impl sealed::Sealed for MuseAssistantArchitecture {}
 impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
     fn memory_topology(
         config: &Self::ModuleConfig,
-    ) -> Result<Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>, eredu_nn::Error> {
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>,
+        eredu_nn::Error,
+    > {
         config.execution_definition().memory_topology().map(Some)
     }
     type Config = MuseAssistantConfig;
@@ -1311,26 +1320,43 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
     /// conversion retention, loading, operator workspace, state and source caches.
     pub fn parameter_residency_requirement(
         &self,
-    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_runtime::BoundedResidencySizingError> {
-        let bytes = self.parameter_units.iter()
-            .map(|unit| unit.parameter_bytes()).collect::<Vec<_>>();
+    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_runtime::BoundedResidencySizingError>
+    {
+        let bytes = self
+            .parameter_units
+            .iter()
+            .map(|unit| unit.parameter_bytes())
+            .collect::<Vec<_>>();
         let (static_bytes, window_bytes, depth) = match &self.execution_layout {
             Some(layout) => (
                 0,
-                eredu_runtime::execution_unit_parameter_window_bytes(layout, &bytes, self.residency)?,
+                eredu_runtime::execution_unit_parameter_window_bytes(
+                    layout,
+                    &bytes,
+                    self.residency,
+                )?,
                 self.residency.device_depth(layout.len()),
             ),
             None => {
-                let total = bytes.iter().try_fold(0u64, |total, bytes| total.checked_add(*bytes))
-                    .ok_or(eredu_runtime::BoundedResidencySizingError::ArithmeticOverflow("resident assistant parameter bytes"))?;
+                let total = bytes
+                    .iter()
+                    .try_fold(0u64, |total, bytes| total.checked_add(*bytes))
+                    .ok_or(
+                        eredu_runtime::BoundedResidencySizingError::ArithmeticOverflow(
+                            "resident assistant parameter bytes",
+                        ),
+                    )?;
                 (total, 0, 0)
             }
         };
         Ok(eredu_core::BoundedResidencyRequirement {
             static_bytes,
             window_bytes,
-            required_bytes: static_bytes.checked_add(window_bytes)
-                .ok_or(eredu_runtime::BoundedResidencySizingError::ArithmeticOverflow("assistant parameter requirement"))?,
+            required_bytes: static_bytes.checked_add(window_bytes).ok_or(
+                eredu_runtime::BoundedResidencySizingError::ArithmeticOverflow(
+                    "assistant parameter requirement",
+                ),
+            )?,
             depth,
         })
     }
@@ -1470,7 +1496,8 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
             tasks,
             _architecture: _,
         } = self;
-        let execution_layout = A::execution_unit_layout(&module_config).map_err(invalid_assistant)?;
+        let execution_layout =
+            A::execution_unit_layout(&module_config).map_err(invalid_assistant)?;
         let retained_checkpoint = checkpoint.clone();
         let artifact_identity = match &checkpoint {
             ExternalAssistantCheckpoint::SafeTensors { shards, .. } => {
@@ -1597,7 +1624,10 @@ pub trait MaterializedExternalAssistantRefVisitor<V: ExternalAssistantPreparatio
 
 impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistant<V> {
     /// Observes the retained typed assistant without changing execution state.
-    pub fn visit_ref<W: MaterializedExternalAssistantRefVisitor<V>>(&self, visitor: W) -> W::Output {
+    pub fn visit_ref<W: MaterializedExternalAssistantRefVisitor<V>>(
+        &self,
+        visitor: W,
+    ) -> W::Output {
         match &self.dispatched {
             DispatchedMaterializedExternalAssistant::Gemma4(assistant) => {
                 visitor.visit::<Gemma4AssistantArchitecture>(assistant)
@@ -1834,7 +1864,9 @@ impl PreparedCompatibleExternalAssistant {
         rank: ParallelRankTopology,
     ) -> Result<Self, ArtifactError> {
         if self.placement.is_some() {
-            return Err(invalid_assistant("assistant source placement is already selected"));
+            return Err(invalid_assistant(
+                "assistant source placement is already selected",
+            ));
         }
         self.preparation = match self.preparation {
             DispatchedPreparedExternalAssistant::Muse(source) => {
@@ -1853,10 +1885,15 @@ impl PreparedCompatibleExternalAssistant {
     /// Exact selected immutable device-parameter payload, excluding other resources.
     pub fn parameter_residency_requirement(
         &self,
-    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_runtime::BoundedResidencySizingError> {
+    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_runtime::BoundedResidencySizingError>
+    {
         match &self.preparation {
-            DispatchedPreparedExternalAssistant::Gemma4(source) => source.parameter_residency_requirement(),
-            DispatchedPreparedExternalAssistant::Muse(source) => source.parameter_residency_requirement(),
+            DispatchedPreparedExternalAssistant::Gemma4(source) => {
+                source.parameter_residency_requirement()
+            }
+            DispatchedPreparedExternalAssistant::Muse(source) => {
+                source.parameter_residency_requirement()
+            }
         }
     }
 
@@ -1867,10 +1904,14 @@ impl PreparedCompatibleExternalAssistant {
     ) -> Self {
         self.preparation = match self.preparation {
             DispatchedPreparedExternalAssistant::Gemma4(source) => {
-                DispatchedPreparedExternalAssistant::Gemma4(source.with_parameter_conversion_retention(policy))
+                DispatchedPreparedExternalAssistant::Gemma4(
+                    source.with_parameter_conversion_retention(policy),
+                )
             }
             DispatchedPreparedExternalAssistant::Muse(source) => {
-                DispatchedPreparedExternalAssistant::Muse(source.with_parameter_conversion_retention(policy))
+                DispatchedPreparedExternalAssistant::Muse(
+                    source.with_parameter_conversion_retention(policy),
+                )
             }
         };
         self
@@ -1985,7 +2026,6 @@ impl ExternalAssistantPreparation {
 }
 
 impl SelectedExternalAssistantPreparation {
-
     /// Proves exact target compatibility without opening assistant weight payloads.
     pub fn prove_target_compatibility(
         self,
@@ -2006,14 +2046,16 @@ impl SelectedExternalAssistantPreparation {
         }?;
         let preparation = match self.dispatched {
             DispatchedSelectedExternalAssistant::Gemma4(selected) => {
-                DispatchedNormalizedExternalAssistant::Gemma4(
-                    NormalizedExternalAssistant::new(selected, Some(target))?,
-                )
+                DispatchedNormalizedExternalAssistant::Gemma4(NormalizedExternalAssistant::new(
+                    selected,
+                    Some(target),
+                )?)
             }
             DispatchedSelectedExternalAssistant::Muse(selected) => {
-                DispatchedNormalizedExternalAssistant::Muse(
-                    NormalizedExternalAssistant::new(selected, Some(target))?,
-                )
+                DispatchedNormalizedExternalAssistant::Muse(NormalizedExternalAssistant::new(
+                    selected,
+                    Some(target),
+                )?)
             }
         };
         Ok(CompatibleExternalAssistantPreparation {
@@ -2466,7 +2508,10 @@ fn external_speculative_contract(
     // Public speculative lanes are batch-one. Capture cannot exceed either the
     // architecture context or the selected decoder invocation.
     let batch = 1;
-    let sequence = compatible.target.maximum_capture_sequence_length()?.get()
+    let sequence = compatible
+        .target
+        .maximum_capture_sequence_length()?
+        .get()
         .min(request.maximum_capture_sequence_length.get());
     let target_identity = compatible.target.speculative_identity()?;
     let topology = external_topology_identity(request.topology)?;

@@ -167,12 +167,16 @@ pub trait GenerationForecastBackend: ModelCapabilityBackend {
     fn refinement_memory_plan(
         _runtime: &ModelRuntime<Self>,
         _policy: Option<eredu_core::refinement::RefinementPolicy>,
-    ) -> Result<Option<RefinementMemoryPlan>, GenerationForecastError> { Ok(None) }
+    ) -> Result<Option<RefinementMemoryPlan>, GenerationForecastError> {
+        Ok(None)
+    }
     /// Retained shared-backbone proposal geometry for the ordinary mode driver.
     /// None means invocation overlap remains unbounded in the forecast.
     fn shared_backbone_memory_profile(
         _runtime: &ModelRuntime<Self>,
-    ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> { Ok(None) }
+    ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> {
+        Ok(None)
+    }
 
     /// Complete ordinary capture sizing, including source creation where needed.
     /// None retains the admitted ceilings. No submission or reservation is allowed.

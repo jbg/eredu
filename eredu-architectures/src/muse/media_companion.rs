@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use super::{ConfigError, DecoderConfig, RoutedFeedForwardEquation, checkpoint};
+use super::{checkpoint, ConfigError, DecoderConfig, RoutedFeedForwardEquation};
 use crate::{
     artifact_preparation::{ArtifactSourceRole, PhysicalArtifactPreparation},
     processor_plan::{MuseProcessorPlan, ProcessorPlanError},
@@ -13,11 +13,11 @@ use crate::{
 use eredu_checkpoint::{
     artifact::{ArtifactFile, ArtifactFingerprintSource},
     recipe::{DerivedWeightRecipe, RecipeCatalog},
-    safetensors::{SafetensorsMetadataCatalog, SafetensorsShardError, checkpoint_member_path},
+    safetensors::{checkpoint_member_path, SafetensorsMetadataCatalog, SafetensorsShardError},
     schema::SafetensorsCheckpointPlan,
-    store::{SharedCheckpointSource, StoreError, TensorMetadata, open_prepared_safetensors_source},
+    store::{open_prepared_safetensors_source, SharedCheckpointSource, StoreError, TensorMetadata},
     validation::{
-        CatalogTensorMetadata, ResolvedCheckpointPlan, SafetensorsCatalog, resolve_safetensors_plan,
+        resolve_safetensors_plan, CatalogTensorMetadata, ResolvedCheckpointPlan, SafetensorsCatalog,
     },
 };
 use eredu_core::ArtifactCompanionRole;

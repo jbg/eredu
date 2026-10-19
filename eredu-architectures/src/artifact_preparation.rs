@@ -40,21 +40,46 @@ pub enum PhysicalArtifactPreparation {
 }
 impl PhysicalArtifactPreparation {
     fn contains_same_sources(&self, other: &Self, keys: &BTreeSet<String>) -> bool {
-        let (Self::Safetensors { catalog, shards, resolution },
-             Self::Safetensors { catalog: selected, shards: selected_shards, .. }) = (self, other) else {
+        let (
+            Self::Safetensors {
+                catalog,
+                shards,
+                resolution,
+            },
+            Self::Safetensors {
+                catalog: selected,
+                shards: selected_shards,
+                ..
+            },
+        ) = (self, other)
+        else {
             return false;
         };
-        fn location<'a>(shards: &'a eredu_checkpoint::safetensors::SafetensorsShards, key: &str) -> Option<&'a std::path::Path> {
-            shards.tensor_locations().and_then(|locations| locations.get(key)).map(|path| path.as_path())
-                .or_else(|| (shards.payload_paths().len() == 1).then(|| shards.payload_paths()[0].as_path()))
+        fn location<'a>(
+            shards: &'a eredu_checkpoint::safetensors::SafetensorsShards,
+            key: &str,
+        ) -> Option<&'a std::path::Path> {
+            shards
+                .tensor_locations()
+                .and_then(|locations| locations.get(key))
+                .map(|path| path.as_path())
+                .or_else(|| {
+                    (shards.payload_paths().len() == 1).then(|| shards.payload_paths()[0].as_path())
+                })
         }
         keys.iter().all(|key| {
             resolution.source_keys().contains(key)
-                && catalog.get(key).zip(selected.get(key)).is_some_and(|(left, right)| {
-                    left.logical_shape == right.logical_shape && left.physical_shape == right.physical_shape
-                        && left.stored_dtype == right.stored_dtype && left.encoded_byte_len == right.encoded_byte_len
-                })
-                && location(shards, key).is_some_and(|path| Some(path) == location(selected_shards, key))
+                && catalog
+                    .get(key)
+                    .zip(selected.get(key))
+                    .is_some_and(|(left, right)| {
+                        left.logical_shape == right.logical_shape
+                            && left.physical_shape == right.physical_shape
+                            && left.stored_dtype == right.stored_dtype
+                            && left.encoded_byte_len == right.encoded_byte_len
+                    })
+                && location(shards, key)
+                    .is_some_and(|path| Some(path) == location(selected_shards, key))
         })
     }
 

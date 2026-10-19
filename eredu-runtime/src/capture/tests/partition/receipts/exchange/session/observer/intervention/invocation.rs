@@ -64,7 +64,7 @@ fn verify_invocation_scopes(scoped: bool) {
                             session.restore(&saved).unwrap();
                         }
                         let invocation = CaptureInvocationShape {
-            media: None,
+                            media: None,
                             batch: 1,
                             sequence: rows,
                             context: None,

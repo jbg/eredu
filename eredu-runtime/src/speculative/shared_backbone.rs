@@ -1,9 +1,8 @@
 //! Masked drafting and causal verification over one retained executable.
 
 use super::{
-    CausalVerification,
     autoregressive::{AutoregressiveMechanisms, AutoregressivePass},
-    causal_verification,
+    causal_verification, CausalVerification,
 };
 use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
@@ -219,9 +218,9 @@ pub trait SharedBackboneMechanisms: AutoregressiveMechanisms {
         Option<
             Box<
                 dyn crate::inspection::SpeculativeActivationObserver<
-                        Self::ActivationTensor,
-                        Self::Error,
-                    >,
+                    Self::ActivationTensor,
+                    Self::Error,
+                >,
             >,
         >,
         eredu_core::speculative::SpeculativeControlError,
@@ -478,7 +477,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
         request: eredu_core::SpeculativeRequestId,
         context: Self::Context<'context>,
-    ) -> Result<(), eredu_core::speculative::SpeculativeControlError>  where Self: 'context {
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'context,
+    {
         if self.execution_started || self.observation_configured {
             return Err(eredu_core::speculative::SpeculativeControlError::Invalid(
                 "shared activation authority must be installed once before execution",
@@ -532,7 +534,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         &mut self,
         local: Vec<eredu_core::SpeculativeScheduleState>,
         context: Self::Context<'context>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>  where Self: 'context {
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
+    where
+        Self: 'context,
+    {
         M::coordinate_speculative_step(local, context)
     }
     fn agree_text_preparation<'context>(
@@ -541,14 +546,19 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: Self::Context<'context>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-     where Self: 'context {
+    where
+        Self: 'context,
+    {
         M::agree_text_preparation(stage, status, context)
     }
     fn coordinate_decoding_control<'context>(
         &mut self,
         local: eredu_core::decoding::DecodingCoordination,
         context: Self::Context<'context>,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>  where Self: 'context {
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>
+    where
+        Self: 'context,
+    {
         M::coordinate_decoding_control(local, context)
     }
     fn configure_decoding_mode(
@@ -583,7 +593,9 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         temperature: f32,
         context: Self::Context<'a>,
     ) -> Result<Option<eredu_core::speculative::RefinementProgress<Self::Logits>>, Self::Error>
-     where Self: 'a {
+    where
+        Self: 'a,
+    {
         self.execution_started = true;
         M::refine(
             self.model,
@@ -615,7 +627,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     type CacheCheckpoint = M::Checkpoint;
     type Verification = CausalVerification<M::Output>;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a> where Self: 'a;
+    type Context<'a>
+        = M::Context<'a>
+    where
+        Self: 'a;
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
@@ -629,7 +644,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         self.execution_started = true;
         let (output, count) = M::prefill_observed(
             self.model,
@@ -665,7 +683,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         last_token: u32,
         capacity: usize,
         context: Self::Context<'context>,
-    ) -> Result<Self::DraftState, Self::Error>  where Self: 'context {
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'context,
+    {
         if capacity > self.capacity.get() {
             return Err(M::invalid("invalid shared-backbone proposal capacity"));
         }
@@ -708,7 +729,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         proposal: &mut Self::DraftState,
         last_token: u32,
         _: Self::Context<'context>,
-    ) -> Result<eredu_core::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<eredu_core::SpeculativeProposalStep<Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         if proposal.preceding_token != last_token {
             return Err(M::invalid(
                 "masked proposal prefix differs from the selected canvas",
@@ -734,7 +758,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         cache: &mut Self::Cache,
         saved: &Self::CacheCheckpoint,
         context: Self::Context<'context>,
-    ) -> Result<(), Self::Error>  where Self: 'context {
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'context,
+    {
         *cache = M::restore(saved, context)?;
         Ok(())
     }
@@ -744,7 +771,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         tokens: &[u32],
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'context {
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
+    where
+        Self: 'context,
+    {
         if tokens.is_empty() {
             return Err(M::invalid("invalid shared-backbone verification width"));
         }
@@ -771,7 +801,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         output: &Self::Verification,
         index: usize,
         context: Self::Context<'context>,
-    ) -> Result<Self::Logits, Self::Error>  where Self: 'context {
+    ) -> Result<Self::Logits, Self::Error>
+    where
+        Self: 'context,
+    {
         causal_verification::logits::<M>(output, index, context)
     }
 
@@ -783,7 +816,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         saved: &Self::CacheCheckpoint,
         verified: usize,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
+    where
+        Self: 'context,
+    {
         if verified == 0 || verified > output.inputs.len() {
             return Err(M::invalid(
                 "invalid shared-backbone verification commitment",
@@ -927,7 +963,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     ) -> Result<
         Option<(Self::CacheCheckpoint, Self::TargetState)>,
         eredu_core::speculative::SpeculativeControlError,
-    >  where Self: 'context {
+    >
+    where
+        Self: 'context,
+    {
         let mut seed = seed.clone();
         seed.activations = self
             .observer
@@ -946,7 +985,10 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         saved: &Self::CacheCheckpoint,
         seed: &Self::TargetState,
         context: Self::Context<'context>,
-    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>  where Self: 'context {
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'context,
+    {
         let prepared = match (self.observer.as_mut(), seed.activations.as_ref()) {
             (Some(observer), Some(saved)) => Some(observer.prepare_activation_restore(saved)?),
             (None, None) => None,

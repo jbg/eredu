@@ -3,9 +3,9 @@
 use std::{num::NonZeroUsize, path::Path};
 
 use eredu_core::{
+    generation::{resolve_generation_config, FinishReason, SemanticEvent},
     SpeculativeCapability, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
     SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
-    generation::{FinishReason, SemanticEvent, resolve_generation_config},
 };
 use eredu_text::{
     gguf::GgufTokenizer,
@@ -160,11 +160,16 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         (eredu_core::TextGenerationConfig, NonZeroUsize),
         eredu_core::generation::GenerationError,
     > {
-        let mode = settings.decoding_mode.unwrap_or_else(|| B::default_decoding_mode(&self.runtime));
+        let mode = settings
+            .decoding_mode
+            .unwrap_or_else(|| B::default_decoding_mode(&self.runtime));
         if matches!(mode, eredu_core::decoding::DecodingMode::Diffusion { .. })
             && ((!B::decoding_capabilities(&self.runtime).autoregressive
                 && settings.overrides.has_sampling_overrides())
-                || !matches!(settings.strategy, eredu_core::TextSamplingStrategy::Standard))
+                || !matches!(
+                    settings.strategy,
+                    eredu_core::TextSamplingStrategy::Standard
+                ))
         {
             return Err(eredu_core::generation::GenerationError::RequiresCausalConditionalScores);
         }
@@ -388,9 +393,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         F: FnMut(SemanticEvent),
     {
         let mode = request.request.output_mode;
-        let driver =
-            eredu_runtime::RunSpeculativeGeneration::new_at(source_request_scheduler(&request), request.started)
-                .with_speculation_limits(request.limits.map(Into::into));
+        let driver = eredu_runtime::RunSpeculativeGeneration::new_at(
+            source_request_scheduler(&request),
+            request.started,
+        )
+        .with_speculation_limits(request.limits.map(Into::into));
         self.generate_prepared_speculative_with(request, mode, driver)
     }
 

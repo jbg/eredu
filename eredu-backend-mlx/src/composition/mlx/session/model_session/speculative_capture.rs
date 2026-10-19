@@ -87,9 +87,12 @@ impl SpeculativePartitionBinding {
     }
 
     pub(in crate::composition::mlx) fn coordinate_decoding_control(
-        &self, local: eredu_core::decoding::DecodingCoordination,
+        &self,
+        local: eredu_core::decoding::DecodingCoordination,
     ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
-        self.transport.coordinate_decoding_control(local).map_err(eredu_core::BackendFailure::from_error)
+        self.transport
+            .coordinate_decoding_control(local)
+            .map_err(eredu_core::BackendFailure::from_error)
     }
     pub(in crate::composition::mlx) fn coordinate_speculative_step(
         &self,

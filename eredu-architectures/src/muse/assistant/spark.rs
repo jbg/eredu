@@ -24,8 +24,6 @@ pub enum SparkAssistantIdentity {
     DFlash2,
 }
 
-
-
 impl SparkAssistantIdentity {
     /// Published model architecture marker, independent of the target registry.
     pub const fn architecture(self) -> &'static str {

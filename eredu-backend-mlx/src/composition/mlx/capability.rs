@@ -385,7 +385,9 @@ impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
     ) -> Result<Vec<u32>, eredu_core::BackendFailure> {
         input
             .with_borrowed(|input| {
-                runtime.session().prepared_input_token_ids(input, runtime.backend().stream())
+                runtime
+                    .session()
+                    .prepared_input_token_ids(input, runtime.backend().stream())
             })
             .map_err(eredu_core::BackendFailure::from_error)
     }

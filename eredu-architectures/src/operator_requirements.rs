@@ -85,8 +85,11 @@ pub const MUSE_AUDIO: C = C::ZEROS_LIKE
 /// Exact media-dependent requirements of a selected Muse configuration.
 pub fn muse(config: &crate::muse::DecoderConfig) -> C {
     let mut requirements = MUSE;
-    if matches!(config.attention_equation, crate::muse::AttentionEquation::NormalizedHeads | crate::muse::AttentionEquation::NormalizedHeadsScoreScaled)
-        || config.block_normalization == crate::muse::BlockNormalization::InputScaledFeedForward
+    if matches!(
+        config.attention_equation,
+        crate::muse::AttentionEquation::NormalizedHeads
+            | crate::muse::AttentionEquation::NormalizedHeadsScoreScaled
+    ) || config.block_normalization == crate::muse::BlockNormalization::InputScaledFeedForward
         || config.vocabulary_arithmetic() == crate::muse::VocabularyArithmetic::StageRounded
         || config.vision_config.as_ref().is_some_and(|vision| {
             matches!(

@@ -1,8 +1,8 @@
 //! Generic ordinary-decoder operations for the portable independent-draft transaction.
 use super::*;
 use crate::composition::mlx::{
-    MlxModelInput,
     replicated_text::{ErasedReplicatedTextExecutable, MlxPredictionTargetState},
+    MlxModelInput,
 };
 use eredu_runtime::speculative::autoregressive::{AutoregressiveMechanisms, AutoregressivePass};
 use std::rc::Rc;
@@ -18,7 +18,6 @@ pub(crate) struct MlxAutoregressiveOutput {
     stream: Stream,
 }
 impl MlxAutoregressiveState {
-
     pub(crate) fn publish(
         &mut self,
         model: &mut dyn ErasedReplicatedTextExecutable,
@@ -598,7 +597,16 @@ impl eredu_runtime::speculative::shared_backbone::SharedBackboneMechanisms
                 .reshape(&[1, geometry.canvas_length.get() as i32], stream)?;
             let feedback = refinement
                 .self_conditioning()
-                .map(|value| value.as_array().reshape(&[1, geometry.canvas_length.get() as i32, geometry.vocabulary_size.get() as i32], stream))
+                .map(|value| {
+                    value.as_array().reshape(
+                        &[
+                            1,
+                            geometry.canvas_length.get() as i32,
+                            geometry.vocabulary_size.get() as i32,
+                        ],
+                        stream,
+                    )
+                })
                 .transpose()?;
             let scores = observed_forward(
                 observer
@@ -635,7 +643,9 @@ impl eredu_runtime::speculative::shared_backbone::SharedBackboneMechanisms
         refinement.visit_retained_values(|value| {
             use eredu_runtime::generation::refinement::RefinementValue;
             let array = match value {
-                RefinementValue::Tokens(value) | RefinementValue::Scores(value) | RefinementValue::Mask(value) => value.as_array(),
+                RefinementValue::Tokens(value)
+                | RefinementValue::Scores(value)
+                | RefinementValue::Mask(value) => value.as_array(),
                 RefinementValue::Random(value) => value.as_array(),
             };
             retained.push(array.clone());

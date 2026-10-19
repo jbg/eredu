@@ -1281,7 +1281,8 @@ fn expand_linear_format_member(
                 name,
                 packed,
                 remap_linear_segments(source.sharding(), column_axis, 32 / bits, name)?,
-            ).with_linear_row_layout(declaration.row_layout())];
+            )
+            .with_linear_row_layout(declaration.row_layout())];
             let companion_sharding =
                 remap_linear_segments(source.sharding(), column_axis, group, name)?;
             members.push(
@@ -1301,12 +1302,21 @@ fn expand_linear_format_member(
             if let Some(global) = declaration.global_scale() {
                 let mut global_shape = shape[..row_axis].to_vec();
                 let parts = declaration.row_layout().partitions();
-                declaration.row_layout().rows_per_partition(shape[row_axis])
+                declaration
+                    .row_layout()
+                    .rows_per_partition(shape[row_axis])
                     .map_err(|error| invalid(error.to_string()))?;
-                if parts > 1 { global_shape.push(parts); }
-                members.push(ParameterMemberSpec::new(
-                    global.id.as_str(), global_shape, MemberSharding::Replicated,
-                ).with_linear_companion(eredu_nn::LinearCompanionRole::GlobalScale, name));
+                if parts > 1 {
+                    global_shape.push(parts);
+                }
+                members.push(
+                    ParameterMemberSpec::new(
+                        global.id.as_str(),
+                        global_shape,
+                        MemberSharding::Replicated,
+                    )
+                    .with_linear_companion(eredu_nn::LinearCompanionRole::GlobalScale, name),
+                );
             }
             Ok(members)
         }
@@ -1643,18 +1653,51 @@ mod tests {
         let declaration = LinearFormatSpec::nvfp4(
             eredu_nn::ParameterSpec::trainable("blocks").unwrap(),
             eredu_nn::ParameterSpec::trainable("globals").unwrap(),
-        ).unwrap().with_row_layout(eredu_nn::LinearRowLayout::equal_partitions(2).unwrap()).unwrap();
+        )
+        .unwrap()
+        .with_row_layout(eredu_nn::LinearRowLayout::equal_partitions(2).unwrap())
+        .unwrap();
         for (sharding, expected_weight, expected_blocks) in [
-            (MemberSharding::PartitionedSegments { axis: 1, segments: vec![0..64, 64..128] },
-                MemberSharding::PartitionedSegments { axis: 1, segments: vec![0..64, 64..128] },
-                MemberSharding::PartitionedSegments { axis: 1, segments: vec![0..64, 64..128] }),
-            (MemberSharding::PartitionedChunks { axis: 2, chunk_size: 16 },
-                MemberSharding::PartitionedChunks { axis: 2, chunk_size: 2 },
-                MemberSharding::PartitionedChunks { axis: 2, chunk_size: 1 }),
+            (
+                MemberSharding::PartitionedSegments {
+                    axis: 1,
+                    segments: vec![0..64, 64..128],
+                },
+                MemberSharding::PartitionedSegments {
+                    axis: 1,
+                    segments: vec![0..64, 64..128],
+                },
+                MemberSharding::PartitionedSegments {
+                    axis: 1,
+                    segments: vec![0..64, 64..128],
+                },
+            ),
+            (
+                MemberSharding::PartitionedChunks {
+                    axis: 2,
+                    chunk_size: 16,
+                },
+                MemberSharding::PartitionedChunks {
+                    axis: 2,
+                    chunk_size: 2,
+                },
+                MemberSharding::PartitionedChunks {
+                    axis: 2,
+                    chunk_size: 1,
+                },
+            ),
         ] {
-            let group = ParameterGroupSpec::partitioned("experts", ParameterRole::ExpertIntermediate, 2,
-                [ParameterMemberSpec::new("matrix", [3, 128, 32], sharding)]).unwrap();
-            let groups = expand_linear_format_parameter_groups(vec![group], |_| Ok(Some(declaration.clone()))).unwrap();
+            let group = ParameterGroupSpec::partitioned(
+                "experts",
+                ParameterRole::ExpertIntermediate,
+                2,
+                [ParameterMemberSpec::new("matrix", [3, 128, 32], sharding)],
+            )
+            .unwrap();
+            let groups = expand_linear_format_parameter_groups(vec![group], |_| {
+                Ok(Some(declaration.clone()))
+            })
+            .unwrap();
             let members = groups[0].members();
             assert_eq!(members[0].global_shape(), [3, 128, 4]);
             assert_eq!(members[0].sharding(), &expected_weight);

@@ -1,18 +1,18 @@
 //! Whole-session MLX speculative generation capability.
 
 use eredu_architectures::speculative_execution::{
-    EmbeddedPredictionOutput,
-    ReplicatedPredictionInput, ReplicatedPredictionNative, SpeculativeTensorMechanisms,
+    EmbeddedPredictionOutput, ReplicatedPredictionInput, ReplicatedPredictionNative,
+    SpeculativeTensorMechanisms,
 };
+use eredu_core::speculative::{DynGenerationExecutor, GenerationExecutorTypes};
 use eredu_core::{
-    generation::{GenerationCancellationToken, SemanticEvent, GenerationRequestConfig},
+    generation::{GenerationCancellationToken, GenerationRequestConfig, SemanticEvent},
     GenerationSequence, ModelRuntime, PreparedSpeculativeLane, SpeculativeCallbackPublisher,
     SpeculativeCapability, SpeculativeDraft, SpeculativeExecutor, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativeSampling,
     SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTokenFilterController,
 };
-use eredu_core::speculative::{DynGenerationExecutor, GenerationExecutorTypes};
 use eredu_runtime::{ConstrainedSampler, SpeculativeSampler};
 use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
@@ -40,7 +40,8 @@ pub(crate) struct MlxGenerationExecutorTypes;
 pub(crate) struct MlxSharedGenerationExecutorTypes;
 impl GenerationExecutorTypes for MlxSharedGenerationExecutorTypes {
     type Input = eredu_runtime::speculative::shared_backbone::SharedBackboneInput<
-        MlxModelInput, eredu_runtime::speculative::shared_backbone::SharedBackboneDraftOptions,
+        MlxModelInput,
+        eredu_runtime::speculative::shared_backbone::SharedBackboneDraftOptions,
         crate::backend::random::RandomState,
     >;
     type Logits = Array;
@@ -49,16 +50,33 @@ impl GenerationExecutorTypes for MlxSharedGenerationExecutorTypes {
     type Telemetry = super::speculative::scheduler::SpeculativeComponentTimings;
     type Error = Exception;
     fn erased_type_mismatch(value: &'static str) -> Exception {
-        Exception::custom(format!("shared generation carried a mismatched erased {value}"))
+        Exception::custom(format!(
+            "shared generation carried a mismatched erased {value}"
+        ))
     }
 }
 impl eredu_core::speculative::GenerationExecutorCacheFactory<MlxSharedGenerationExecutorTypes>
-    for eredu_runtime::speculative::shared_backbone::SharedBackboneExecutor<'_, super::speculative::autoregressive::MlxAutoregressiveMechanisms>
+    for eredu_runtime::speculative::shared_backbone::SharedBackboneExecutor<
+        '_,
+        super::speculative::autoregressive::MlxAutoregressiveMechanisms,
+    >
 {
-    fn new_cache<'a>(&mut self, context: Self::Context<'a>) -> Result<Self::Cache, Exception>  where Self: 'a {
-        eredu_runtime::speculative::shared_backbone::SharedBackboneExecutor::new_cache(self, context)
+    fn new_cache<'a>(&mut self, context: Self::Context<'a>) -> Result<Self::Cache, Exception>
+    where
+        Self: 'a,
+    {
+        eredu_runtime::speculative::shared_backbone::SharedBackboneExecutor::new_cache(
+            self, context,
+        )
     }
-    fn bind_context<'a>(context: <MlxSharedGenerationExecutorTypes as GenerationExecutorTypes>::Context<'a>) -> Self::Context<'a>  where Self: 'a { context }
+    fn bind_context<'a>(
+        context: <MlxSharedGenerationExecutorTypes as GenerationExecutorTypes>::Context<'a>,
+    ) -> Self::Context<'a>
+    where
+        Self: 'a,
+    {
+        context
+    }
 }
 
 pub(crate) trait MlxEmbeddedExecutorContinuation {
@@ -251,7 +269,9 @@ where
 }
 
 impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
-    fn control_logits_estimate(logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+    fn control_logits_estimate(
+        logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         super::speculative::state_snapshot::estimate_array(logits)
     }
     type Tensor = MlxTensor;
@@ -280,7 +300,8 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     }
 
     fn coordinate_decoding_control<'a>(
-        local: eredu_core::decoding::DecodingCoordination, context: Self::Context<'a>,
+        local: eredu_core::decoding::DecodingCoordination,
+        context: Self::Context<'a>,
     ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
         context.coordinate_decoding_control(local)
     }
@@ -555,12 +576,20 @@ struct MlxSpeculativeLaneRuntime<'a, C, I = MlxModelInput> {
 }
 
 impl<'a, C, I> MlxSpeculativeLaneRuntime<'a, C, I> {
-    fn map_input<J>(self, prepare: impl FnOnce(I, u64) -> Result<J, Exception>) -> Result<MlxSpeculativeLaneRuntime<'a, C, J>, Exception> {
+    fn map_input<J>(
+        self,
+        prepare: impl FnOnce(I, u64) -> Result<J, Exception>,
+    ) -> Result<MlxSpeculativeLaneRuntime<'a, C, J>, Exception> {
         Ok(MlxSpeculativeLaneRuntime {
-            input: prepare(self.input, self.refinement_seed)?, config: self.config,
-            prng_key: self.prng_key, refinement_seed: self.refinement_seed, sampler: self.sampler,
-            semantic: self.semantic, cancellation: self.cancellation,
-            on_event: self.on_event, control_handle: self.control_handle,
+            input: prepare(self.input, self.refinement_seed)?,
+            config: self.config,
+            prng_key: self.prng_key,
+            refinement_seed: self.refinement_seed,
+            sampler: self.sampler,
+            semantic: self.semantic,
+            cancellation: self.cancellation,
+            on_event: self.on_event,
+            control_handle: self.control_handle,
         })
     }
 }
@@ -737,7 +766,8 @@ where
                     prng_key,
                     config.temperature,
                     streams,
-                )?.with_verification_policy(backend.verification_policy());
+                )?
+                .with_verification_policy(backend.verification_policy());
             let sequence =
                 GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied());
             prepared.push(PreparedSpeculativeLane::new(
@@ -750,7 +780,8 @@ where
                     SpeculativeSemanticConstraint::semantic(semantic),
                     SpeculativeCallbackPublisher::semantic(on_event),
                     cancellation,
-                ).with_control_handle(control_handle),
+                )
+                .with_control_handle(control_handle),
                 randomness,
             ));
         }
@@ -842,9 +873,10 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         V: SpeculativeGenerationVisitor,
     {
         let drafting = request.take_drafting();
-        if !matches!(drafting, SpeculativeDraft::Target) && <MlxBackend<'_> as eredu_core::TextGenerationBackend>::generation_score_kind(
-            self.runtime,
-        ) != eredu_core::refinement::PredictionScoreKind::CausalConditional
+        if !matches!(drafting, SpeculativeDraft::Target)
+            && <MlxBackend<'_> as eredu_core::TextGenerationBackend>::generation_score_kind(
+                self.runtime,
+            ) != eredu_core::refinement::PredictionScoreKind::CausalConditional
         {
             return Err(
                 eredu_core::generation::GenerationError::RequiresCausalConditionalScores.into(),
@@ -853,7 +885,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let lanes = request.take_lanes();
         match drafting {
             SpeculativeDraft::Target => self.generate_batch_with_target(lanes, visitor),
-            SpeculativeDraft::SharedBackbone => self.generate_speculative_batch_with_shared_backbone(lanes, visitor),
+            SpeculativeDraft::SharedBackbone => {
+                self.generate_speculative_batch_with_shared_backbone(lanes, visitor)
+            }
             SpeculativeDraft::External(drafter) => {
                 self.generate_speculative_batch_with_external_draft(drafter, lanes, visitor)
             }
@@ -871,16 +905,22 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         lanes: Vec<SpeculativeGenerationLane<'_, MlxBackend<'world>, C>>,
         visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Error>
-    where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor,
+    where
+        C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor,
     {
-        if <MlxBackend<'_> as eredu_core::TextGenerationBackend>::decoding_capabilities(self.runtime).speculation {
+        if <MlxBackend<'_> as eredu_core::TextGenerationBackend>::decoding_capabilities(
+            self.runtime,
+        )
+        .speculation
+        {
             return self.generate_speculative_batch_with_shared_backbone(lanes, visitor);
         }
+        use super::speculative::autoregressive::MlxAutoregressiveMechanisms;
         use eredu_runtime::speculative::autoregressive::{
             AutoregressiveInput, CausalExecutor, SharedTargetRefinement,
             SharedTargetRefinementState,
         };
-        use super::speculative::autoregressive::MlxAutoregressiveMechanisms;
         self.runtime.session().ensure_no_submission_in_flight()?;
         let stream = self.runtime.backend().stream().clone();
         let partition_binding = self.runtime.session().speculative_partition_binding();
@@ -888,23 +928,41 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         self.runtime.session_mut().with_model_operation(|model| {
             let streams = SpeculativeExecutionStreams::single(&stream)
                 .with_capture_binding(partition_binding.as_ref());
-            let substream = model.erased().capability_estimate().ordinary_refinement()
+            let substream = model
+                .erased()
+                .capability_estimate()
+                .ordinary_refinement()
                 .and_then(|policy| policy.randomness_substream());
-            let mut executor = CausalExecutor::<MlxAutoregressiveMechanisms, SharedTargetRefinement>::new(
-                model.erased_mut(), SharedTargetRefinement,
-            );
-            let prepared = prepared.into_iter().map(|lane| lane.map_input(|input, seed| {
-                let root = safemlx::random::key(seed)?;
-                let key = match substream {
-                    Some(index) => crate::backend::random::split_key_at(&root, index, streams.target())?,
-                    None => root,
-                };
-                super::speculative::state_snapshot::settle(vec![&key])?;
-                Ok(AutoregressiveInput::new(input, SharedTargetRefinementState::new(
-                    crate::backend::random::RandomState::from_key(key),
-                )))
-            })).collect::<Result<Vec<_>, Exception>>()?;
-            let caches = (0..prepared.len()).map(|_| executor.new_cache(streams))
+            let mut executor =
+                CausalExecutor::<MlxAutoregressiveMechanisms, SharedTargetRefinement>::new(
+                    model.erased_mut(),
+                    SharedTargetRefinement,
+                );
+            let prepared = prepared
+                .into_iter()
+                .map(|lane| {
+                    lane.map_input(|input, seed| {
+                        let root = safemlx::random::key(seed)?;
+                        let key = match substream {
+                            Some(index) => crate::backend::random::split_key_at(
+                                &root,
+                                index,
+                                streams.target(),
+                            )?,
+                            None => root,
+                        };
+                        super::speculative::state_snapshot::settle(vec![&key])?;
+                        Ok(AutoregressiveInput::new(
+                            input,
+                            SharedTargetRefinementState::new(
+                                crate::backend::random::RandomState::from_key(key),
+                            ),
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, Exception>>()?;
+            let caches = (0..prepared.len())
+                .map(|_| executor.new_cache(streams))
                 .collect::<Result<Vec<_>, _>>()?;
             run_speculative_batch(&mut executor, prepared, caches, Ok, streams, visitor)
                 .map_err(|error| Error::Exception(Exception::from_source(error)))
@@ -916,14 +974,27 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         lanes: Vec<SpeculativeGenerationLane<'_, MlxBackend<'world>, C>>,
         visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Error>
-    where C: SpeculativeTokenFilterController, V: SpeculativeGenerationVisitor,
+    where
+        C: SpeculativeTokenFilterController,
+        V: SpeculativeGenerationVisitor,
     {
-        use eredu_core::decoding::{DecodingMode, SpeculationOptions};
-        use eredu_runtime::speculative::shared_backbone::{SharedBackboneExecutor, SharedBackboneInput};
         use super::speculative::autoregressive::MlxAutoregressiveMechanisms;
+        use eredu_core::decoding::{DecodingMode, SpeculationOptions};
+        use eredu_runtime::speculative::shared_backbone::{
+            SharedBackboneExecutor, SharedBackboneInput,
+        };
         self.runtime.session().ensure_no_submission_in_flight()?;
-        let policy = self.runtime.session().capability_estimate().map_err(|error| Error::Exception(Exception::from_source(error)))?.shared_backbone_draft()
-            .ok_or_else(|| Error::Speculative("selected execution has no shared-backbone draft declaration".into()))?;
+        let policy = self
+            .runtime
+            .session()
+            .capability_estimate()
+            .map_err(|error| Error::Exception(Exception::from_source(error)))?
+            .shared_backbone_draft()
+            .ok_or_else(|| {
+                Error::Speculative(
+                    "selected execution has no shared-backbone draft declaration".into(),
+                )
+            })?;
         let stream = self.runtime.backend().stream().clone();
         let mut prepared = Vec::with_capacity(lanes.len());
         for mut lane in lanes {
@@ -931,25 +1002,48 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             let generation = lane.take_generation();
             let config = lane.take_config();
             validate_lane_proposal_capacity(&config, policy.proposal_capacity().get())?;
-            if generation.decoding_mode().is_some_and(|mode| mode != config.decoding_mode) {
+            if generation
+                .decoding_mode()
+                .is_some_and(|mode| mode != config.decoding_mode)
+            {
                 return Err(eredu_core::generation::GenerationError::DecodingMode(
-                    eredu_core::decoding::DecodingModeError::Unsupported("lane sampling and execution modes disagree")).into());
+                    eredu_core::decoding::DecodingModeError::Unsupported(
+                        "lane sampling and execution modes disagree",
+                    ),
+                )
+                .into());
             }
             let options = match config.decoding_mode {
                 DecodingMode::SelfSpeculation(options) => options,
-                DecodingMode::Autoregressive | DecodingMode::Diffusion { .. } => SpeculationOptions::default().with_proposal_capacity(policy.proposal_capacity()),
+                DecodingMode::Autoregressive | DecodingMode::Diffusion { .. } => {
+                    SpeculationOptions::default().with_proposal_capacity(policy.proposal_capacity())
+                }
             };
-            let options = policy.prepare(options, config.temperature).map_err(|error| Error::Exception(Exception::from_source(error)))?;
+            let options = policy
+                .prepare(options, config.temperature)
+                .map_err(|error| Error::Exception(Exception::from_source(error)))?;
             let refinement_seed = generation.seed();
             let root = safemlx::random::key(refinement_seed)?;
             let proposal_key = crate::backend::random::split_key_at(&root, 1, &stream)?;
             let refinement_key = crate::backend::random::split_key_at(&root, 2, &stream)?;
-            super::speculative::state_snapshot::settle(vec![&proposal_key, &refinement_key]).map_err(Error::Exception)?;
-            let (prng_key, sampler) = Self::prepare_mlx_speculative_sampling(generation, lane.take_constraint())?;
+            super::speculative::state_snapshot::settle(vec![&proposal_key, &refinement_key])
+                .map_err(Error::Exception)?;
+            let (prng_key, sampler) =
+                Self::prepare_mlx_speculative_sampling(generation, lane.take_constraint())?;
             prepared.push(MlxSpeculativeLaneRuntime {
-                input: SharedBackboneInput::new(input, options, crate::backend::random::RandomState::from_key(proposal_key), crate::backend::random::RandomState::from_key(refinement_key)),
-                config, prng_key, refinement_seed, sampler,
-                semantic: lane.take_semantic(), cancellation: lane.take_cancellation(), on_event: lane.take_on_event(),
+                input: SharedBackboneInput::new(
+                    input,
+                    options,
+                    crate::backend::random::RandomState::from_key(proposal_key),
+                    crate::backend::random::RandomState::from_key(refinement_key),
+                ),
+                config,
+                prng_key,
+                refinement_seed,
+                sampler,
+                semantic: lane.take_semantic(),
+                cancellation: lane.take_cancellation(),
+                on_event: lane.take_on_event(),
                 control_handle: lane.take_control_handle(),
             });
         }
@@ -957,9 +1051,15 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         self.runtime.session_mut().with_model_operation(|model| {
             let streams = SpeculativeExecutionStreams::single(&stream)
                 .with_capture_binding(partition_binding.as_ref());
-            let mut typed = SharedBackboneExecutor::<MlxAutoregressiveMechanisms>::new(model.erased_mut(), policy.proposal_capacity());
-            let mut executor = DynGenerationExecutor::<MlxSharedGenerationExecutorTypes>::new(&mut typed);
-            let caches = (0..prepared.len()).map(|_| executor.new_cache(streams)).collect::<Result<Vec<_>, _>>()?;
+            let mut typed = SharedBackboneExecutor::<MlxAutoregressiveMechanisms>::new(
+                model.erased_mut(),
+                policy.proposal_capacity(),
+            );
+            let mut executor =
+                DynGenerationExecutor::<MlxSharedGenerationExecutorTypes>::new(&mut typed);
+            let caches = (0..prepared.len())
+                .map(|_| executor.new_cache(streams))
+                .collect::<Result<Vec<_>, _>>()?;
             run_speculative_batch(&mut executor, prepared, caches, Ok, streams, visitor)
                 .map_err(|error| Error::Exception(Exception::from_source(error)))
         })

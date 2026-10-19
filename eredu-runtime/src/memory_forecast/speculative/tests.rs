@@ -706,11 +706,17 @@ fn conditioned_continuation_keeps_installed_backing_and_unknown_future_capacity(
     // Seven possible new positions: native target and context bounds each grow
     // by 700 bytes, plus 144 bytes for the three-position compact logical bank.
     assert_eq!(phases[1].persistent_state.upper_bytes, Some(201_544));
-    assert!(phases.iter().all(|p| !matches!(p.phase, MemoryPhase::Loading | MemoryPhase::Prefill)));
+    assert!(phases
+        .iter()
+        .all(|p| !matches!(p.phase, MemoryPhase::Loading | MemoryPhase::Prefill)));
 
-    installed.draft.as_mut().unwrap().peak_state = MemoryBytes::unknown("future native backing capacity");
+    installed.draft.as_mut().unwrap().peak_state =
+        MemoryBytes::unknown("future native backing capacity");
     let unknown = estimate_speculative_continuation_memory(&target, &plan, &installed).unwrap();
-    assert_eq!(unknown.domains[0].phases[0].persistent_state.upper_bytes, Some(200_000));
+    assert_eq!(
+        unknown.domains[0].phases[0].persistent_state.upper_bytes,
+        Some(200_000)
+    );
     assert!(unknown.domains[0].generation_peak.upper_bytes.is_none());
 }
 

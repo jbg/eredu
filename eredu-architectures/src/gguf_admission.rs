@@ -167,8 +167,9 @@ fn resolve_family(
     }
     match architecture {
         GgufArchitecture::NemotronLabsDiffusion => {
-            let admitted = crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
-                .map_err(|error| error.to_string())?;
+            let admitted =
+                crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
+                    .map_err(|error| error.to_string())?;
             let plan = admitted.checkpoint().clone();
             Ok((GgufModelConfig::NemotronLabsDiffusion(admitted), plan, None))
         }

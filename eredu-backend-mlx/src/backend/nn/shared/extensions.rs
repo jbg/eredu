@@ -298,7 +298,10 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
             ));
         }
         if let Some(global) = gate_up.format().global_scale() {
-            topology.push(("gate_up_proj_global_scale", bind_linear_companion(gate_up.weight(), global.clone())));
+            topology.push((
+                "gate_up_proj_global_scale",
+                bind_linear_companion(gate_up.weight(), global.clone()),
+            ));
         }
         if let Some(bias) = gate_up.format().affine_bias() {
             topology.push((
@@ -313,7 +316,10 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
             ));
         }
         if let Some(global) = down.format().global_scale() {
-            topology.push(("down_proj_global_scale", bind_linear_companion(down.weight(), global.clone())));
+            topology.push((
+                "down_proj_global_scale",
+                bind_linear_companion(down.weight(), global.clone()),
+            ));
         }
         if let Some(bias) = down.format().affine_bias() {
             topology.push((

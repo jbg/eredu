@@ -1,7 +1,7 @@
 //! Portable model-artifact inspection results.
 
 use crate::{
-    artifact::ArtifactError, ArtifactFormat, ArtifactInspection, ArtifactCompanionRole,
+    artifact::ArtifactError, ArtifactCompanionRole, ArtifactFormat, ArtifactInspection,
     InputModalities, ModelResourceProfile, Observed, PreparationAdmission,
     PreparationAdmissionError, SessionCapabilities,
 };

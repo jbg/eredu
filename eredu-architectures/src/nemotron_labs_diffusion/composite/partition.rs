@@ -547,10 +547,18 @@ where
         }
     }
     fn state_ordinal(&self, group: usize, index: usize, ordinal: usize) -> usize {
-        if group == 2 { index } else { ordinal }
+        if group == 2 {
+            index
+        } else {
+            ordinal
+        }
     }
     fn retained_state_ordinals(&self, group: usize, index: usize, _: usize) -> Range<usize> {
-        if group == 2 { index..index + 1 } else { 0..0 }
+        if group == 2 {
+            index..index + 1
+        } else {
+            0..0
+        }
     }
     fn forward_unit(
         &mut self,
@@ -585,17 +593,19 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Error> {
         match (group, unit) {
-            (0, Unit::Vision(layer)) if self.geometry.vision.contains(&index) => layer.forward_observed(
-                hidden,
-                forward
-                    .image_state
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("vision continuation has no positions"))?,
-                None,
-                context,
-                observer,
-            ),
-            (1, Unit::Projector(projector)) if index == 0 && self.geometry.projection => projector.finish_observed(
+            (0, Unit::Vision(layer)) if self.geometry.vision.contains(&index) => layer
+                .forward_observed(
+                    hidden,
+                    forward
+                        .image_state
+                        .as_ref()
+                        .ok_or_else(|| Error::backend("vision continuation has no positions"))?,
+                    None,
+                    context,
+                    observer,
+                ),
+            (1, Unit::Projector(projector)) if index == 0 && self.geometry.projection => projector
+                .finish_observed(
                     hidden,
                     forward
                         .image_state
@@ -765,7 +775,8 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Error> {
         match (group, unit) {
-            (0, Unit::Vision(layer)) if self.geometry.vision.contains(&index) => layer.forward_observed(
+            (0, Unit::Vision(layer)) if self.geometry.vision.contains(&index) => layer
+                .forward_observed(
                     hidden,
                     forward
                         .image_state
@@ -773,9 +784,10 @@ where
                         .ok_or_else(|| Error::backend("vision continuation has no positions"))?,
                     Some(parallel),
                     context,
-                observer,
+                    observer,
                 ),
-            (1, Unit::Projector(projector)) if index == 0 && self.geometry.projection => projector.finish_observed(
+            (1, Unit::Projector(projector)) if index == 0 && self.geometry.projection => projector
+                .finish_observed(
                     hidden,
                     forward
                         .image_state
@@ -1010,14 +1022,17 @@ where
             return Ok(None);
         }
         let patches = native_patch_positions(input)?;
-        Ok((patches > 0).then_some((
-            patches,
-            self.config
-                .vision
-                .as_ref()
-                .expect("validated tower")
-                .hidden_size,
-        ).into()))
+        Ok((patches > 0).then_some(
+            (
+                patches,
+                self.config
+                    .vision
+                    .as_ref()
+                    .expect("validated tower")
+                    .hidden_size,
+            )
+                .into(),
+        ))
     }
     fn prepared_group_collective_waves(
         &self,

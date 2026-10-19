@@ -218,7 +218,8 @@ impl AddressableBankParameter {
                     eredu_nn::LinearCompanionRole::GlobalScale => {
                         return Err(AddressableBankMemberError::InvalidParameter {
                             parameter: task.name().to_owned(),
-                            detail: "load-time quantization does not produce NVFP4 global scales".into(),
+                            detail: "load-time quantization does not produce NVFP4 global scales"
+                                .into(),
                         });
                     }
                     eredu_nn::LinearCompanionRole::Scale => companions.scale(),

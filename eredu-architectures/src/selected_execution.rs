@@ -565,8 +565,12 @@ impl SelectedExecution {
     pub fn partitioned_invocation_limits(&self) -> Option<(i32, i32)> {
         let boundary = match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => selected.requirements().boundary(),
-            SelectedExecutionKind::PartitionedRouted(selected) => selected.requirements().boundary(),
-            SelectedExecutionKind::PartitionedComposite(selected) => selected.requirements().boundary(),
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                selected.requirements().boundary()
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                selected.requirements().boundary()
+            }
             _ => return None,
         };
         let shape = boundary.primary().shape();
@@ -1215,13 +1219,18 @@ pub struct SelectedPreparation {
 }
 
 impl SelectedPreparation {
-    pub(crate) fn with_retained_architecture(mut self, architecture: crate::processor_plan::ArtifactArchitecturePlan) -> Self {
+    pub(crate) fn with_retained_architecture(
+        mut self,
+        architecture: crate::processor_plan::ArtifactArchitecturePlan,
+    ) -> Self {
         // Source preparation needs the complete admitted artifact, including
         // its predictor. Retain declarations without the cache that owns this selection.
         self.retained_architecture = Some(architecture.without_validation());
         self
     }
-    pub(crate) fn retained_architecture(&self) -> Option<&crate::processor_plan::ArtifactArchitecturePlan> {
+    pub(crate) fn retained_architecture(
+        &self,
+    ) -> Option<&crate::processor_plan::ArtifactArchitecturePlan> {
         self.retained_architecture.as_ref()
     }
 

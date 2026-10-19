@@ -166,14 +166,26 @@ impl SpeculativeSnapshotHandle {
 /// Returning from the controlling closure cancels and safely settles unfinished work.
 pub trait ControlledSpeculativeSession {
     /// Active execution and queued mode commands over retained parameters.
-    fn decoding_state(&self) -> Option<eredu_core::decoding::DecodingState> { None }
+    fn decoding_state(&self) -> Option<eredu_core::decoding::DecodingState> {
+        None
+    }
     /// Queues one transition for the next settled canonical boundary.
-    fn request_decoding_mode(&mut self, _mode: eredu_core::decoding::DecodingMode) -> Result<(), SpeculativeControlError> {
-        Err(SpeculativeControlError::Unsupported("session has no decoding mode control"))
+    fn request_decoding_mode(
+        &mut self,
+        _mode: eredu_core::decoding::DecodingMode,
+    ) -> Result<(), SpeculativeControlError> {
+        Err(SpeculativeControlError::Unsupported(
+            "session has no decoding mode control",
+        ))
     }
     /// Binds cross-thread commands to the same logical request.
-    fn bind_control_handle(&self, _handle: &eredu_core::execution_control::GenerationControlHandle) -> Result<(), SpeculativeControlError> {
-        Err(SpeculativeControlError::Unsupported("session has no decoding command mailbox"))
+    fn bind_control_handle(
+        &self,
+        _handle: &eredu_core::execution_control::GenerationControlHandle,
+    ) -> Result<(), SpeculativeControlError> {
+        Err(SpeculativeControlError::Unsupported(
+            "session has no decoding command mailbox",
+        ))
     }
     /// Releases optional conversions only at a canonical boundary. Pending work
     /// is rejected without polling, settling, advancing or consuming budgets.
@@ -450,7 +462,10 @@ where
                 r.stats().clone(),
             )
         });
-        let age_before = self.request().map(|request| request.submission_age()).unwrap_or_default();
+        let age_before = self
+            .request()
+            .map(|request| request.submission_age())
+            .unwrap_or_default();
         let started = std::time::Instant::now();
         let was_prefill = self.lane.is_some();
         if let Some(lane) = self.lane.take() {
@@ -466,8 +481,13 @@ where
         }
         let elapsed = started.elapsed();
         if self.timing.time_to_first_token().is_none() {
-            if let Some(first) = self.request().and_then(|request| request.stats().submission_to_first_token()) {
-                self.timing = GenerationTiming::new(Some(self.preparation + self.first_token_work + first.saturating_sub(age_before)));
+            if let Some(first) = self
+                .request()
+                .and_then(|request| request.stats().submission_to_first_token())
+            {
+                self.timing = GenerationTiming::new(Some(
+                    self.preparation + self.first_token_work + first.saturating_sub(age_before),
+                ));
             } else {
                 self.first_token_work += elapsed;
             }
@@ -571,15 +591,29 @@ where
     fn decoding_state(&self) -> Option<eredu_core::decoding::DecodingState> {
         self.request().map(|request| request.decoding_state())
     }
-    fn request_decoding_mode(&mut self, mode: eredu_core::decoding::DecodingMode) -> Result<(), SpeculativeControlError> {
+    fn request_decoding_mode(
+        &mut self,
+        mode: eredu_core::decoding::DecodingMode,
+    ) -> Result<(), SpeculativeControlError> {
         self.healthy()?;
-        self.request().ok_or(SpeculativeControlError::Unsupported("prefill has not committed"))?
-            .request_decoding_mode(mode).map_err(Into::into)
+        self.request()
+            .ok_or(SpeculativeControlError::Unsupported(
+                "prefill has not committed",
+            ))?
+            .request_decoding_mode(mode)
+            .map_err(Into::into)
     }
-    fn bind_control_handle(&self, handle: &eredu_core::execution_control::GenerationControlHandle) -> Result<(), SpeculativeControlError> {
+    fn bind_control_handle(
+        &self,
+        handle: &eredu_core::execution_control::GenerationControlHandle,
+    ) -> Result<(), SpeculativeControlError> {
         self.healthy()?;
-        self.request().ok_or(SpeculativeControlError::Unsupported("prefill has not committed"))?
-            .bind_control_handle(handle).map_err(Into::into)
+        self.request()
+            .ok_or(SpeculativeControlError::Unsupported(
+                "prefill has not committed",
+            ))?
+            .bind_control_handle(handle)
+            .map_err(Into::into)
     }
     fn trim_parameter_conversions(
         &mut self,
@@ -937,7 +971,9 @@ where
         if result.is_ok() {
             self.failed = false;
             self.epoch = epoch;
-            if self.timing.time_to_first_token().is_none() { self.timing = saved.timing; }
+            if self.timing.time_to_first_token().is_none() {
+                self.timing = saved.timing;
+            }
             self.first_token_work = self.first_token_work.max(saved.first_token_work);
         }
         result
@@ -998,7 +1034,10 @@ impl<F> DriveControlledSpeculation<'_, F> {
         self
     }
     /// Retains the source policy across control commands, snapshots and forks.
-    pub fn with_speculation_limits(mut self, limits: Option<eredu_core::decoding::SpeculationLimits>) -> Self {
+    pub fn with_speculation_limits(
+        mut self,
+        limits: Option<eredu_core::decoding::SpeculationLimits>,
+    ) -> Self {
         self.run = self.run.with_speculation_limits(limits);
         self
     }

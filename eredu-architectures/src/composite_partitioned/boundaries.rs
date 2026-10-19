@@ -263,25 +263,52 @@ pub(crate) fn from_config(
         }
         CompositeConfig::Muse(args) => {
             if let Some(audio) = &args.audio_config {
-                let mut factor = audio.samples_per_token().map_err(|error| error.to_string())?;
+                let mut factor = audio
+                    .samples_per_token()
+                    .map_err(|error| error.to_string())?;
                 let mut width = 1;
                 let mut geometry = Vec::new();
-                let schema = |width, continuation| BoundaryWireSchema::new(
-                    if continuation {"muse.audio_continuation"} else {"muse.audio_to_decoder"},
-                    BoundaryTensorSpec::new("hidden", [Dim::Batch, Dim::Sequence, Dim::Fixed(width)], Dtype::Activation), [],
-                ).map_err(|error| error.to_string());
+                let schema = |width, continuation| {
+                    BoundaryWireSchema::new(
+                        if continuation {
+                            "muse.audio_continuation"
+                        } else {
+                            "muse.audio_to_decoder"
+                        },
+                        BoundaryTensorSpec::new(
+                            "hidden",
+                            [Dim::Batch, Dim::Sequence, Dim::Fixed(width)],
+                            Dtype::Activation,
+                        ),
+                        [],
+                    )
+                    .map_err(|error| error.to_string())
+                };
                 for kind in audio.execution_units().map_err(|error| error.to_string())? {
                     match kind {
-                        crate::muse::AudioUnitKind::Patch {stage} => {
-                            factor /= audio.patch_sizes[stage]; width = audio.hidden_sizes[stage];
-                        },
+                        crate::muse::AudioUnitKind::Patch { stage } => {
+                            factor /= audio.patch_sizes[stage];
+                            width = audio.hidden_sizes[stage];
+                        }
                         crate::muse::AudioUnitKind::Projection => width = audio.out_hidden_size,
-                        crate::muse::AudioUnitKind::Convolution {..} => {},
+                        crate::muse::AudioUnitKind::Convolution { .. } => {}
                     }
                     geometry.push((schema(width, true)?, DecoderMultiple(factor)));
                 }
-                plan = plan.with_boundary(2, 2, CompositePartitionBoundary::after_unit_geometry(geometry)?)?
-                    .with_boundary(2, 1, CompositePartitionBoundary::fixed(schema(args.hidden_size, false)?, Decoder))?;
+                plan = plan
+                    .with_boundary(
+                        2,
+                        2,
+                        CompositePartitionBoundary::after_unit_geometry(geometry)?,
+                    )?
+                    .with_boundary(
+                        2,
+                        1,
+                        CompositePartitionBoundary::fixed(
+                            schema(args.hidden_size, false)?,
+                            Decoder,
+                        ),
+                    )?;
             }
             if let Some(vision) = &args.vision_config {
                 let factor = vision

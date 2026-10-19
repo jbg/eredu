@@ -1,7 +1,7 @@
 use super::*;
 use crate::api::forecast::{
-    add_retention, continuation_forecast, ContinuationForecast,
-    ContinuationForecastBackend, GenerationForecastError, GenerationForecastOptions,
+    add_retention, continuation_forecast, ContinuationForecast, ContinuationForecastBackend,
+    GenerationForecastError, GenerationForecastOptions,
 };
 use eredu_runtime::execution_control::{SnapshotTokenController, TextSnapshotBackend};
 

@@ -416,11 +416,9 @@ fn failed_settlement_and_invalid_geometry_do_not_advance_state_or_randomness() {
     let initial = state.clone();
     assert!(state.advance(&vec![vec![0.0, 1.0]], &context).is_err());
     context.fail_settlement.set(true);
-    assert!(
-        state
-            .advance(&vec![vec![0.0, 1.0], vec![2.0, 0.0]], &context)
-            .is_err()
-    );
+    assert!(state
+        .advance(&vec![vec![0.0, 1.0], vec![2.0, 0.0]], &context)
+        .is_err());
     assert_eq!(state.completed_steps(), 0);
     assert!(state.draft().is_none());
     assert_eq!(state.canvas(), initial.canvas());
@@ -724,18 +722,16 @@ fn pinned_positions_preserve_seed_and_one_hot_feedback_across_iterations_and_for
         seed_tokens: vec![Some(1), None, Some(2)],
         pinned_positions: vec![1],
     };
-    assert!(
-        RefinementState::<Numeric>::new(
-            policy,
-            NonZeroU32::new(3).unwrap(),
-            TokenDomain::new(3),
-            (),
-            0,
-            Some(&invalid),
-            &context
-        )
-        .is_err()
-    );
+    assert!(RefinementState::<Numeric>::new(
+        policy,
+        NonZeroU32::new(3).unwrap(),
+        TokenDomain::new(3),
+        (),
+        0,
+        Some(&invalid),
+        &context
+    )
+    .is_err());
 }
 
 #[test]

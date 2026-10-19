@@ -6,8 +6,6 @@ pub mod attention;
 pub(crate) mod codebooks;
 /// Architecture-neutral block-scaled FP8 projections.
 pub mod fp8;
-/// Bounded execution of retained NVFP4 values and exact scale companions.
-pub(crate) mod nvfp4;
 mod gated_arithmetic;
 /// Gated-delta recurrent scans shared by linear-attention architectures.
 pub mod gated_delta;
@@ -26,6 +24,8 @@ pub(crate) mod module;
 pub(crate) mod native_quantization;
 pub(crate) mod nested;
 pub(crate) mod normalization;
+/// Bounded execution of retained NVFP4 values and exact scale companions.
+pub(crate) mod nvfp4;
 pub(crate) mod parameter_conversion;
 pub(crate) mod primitives;
 /// Opt-in capture and isolated replay for native projection diagnostics.

@@ -1,5 +1,5 @@
 //! Exact prepared image admission and semantic decoder positions.
-use super::{FamilyConfig, processing::image_token_ids};
+use super::{processing::image_token_ids, FamilyConfig};
 use crate::{
     decoder::Config,
     media_plan::{

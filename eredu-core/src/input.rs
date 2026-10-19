@@ -144,7 +144,9 @@ impl InputExtent {
             Self::PatchGrid { .. } => {
                 matches!(modality, InputModality::Image | InputModality::Video)
             }
-            Self::AudioValidFrames(_) | Self::AudioValidSamples(_) => matches!(modality, InputModality::Audio),
+            Self::AudioValidFrames(_) | Self::AudioValidSamples(_) => {
+                matches!(modality, InputModality::Audio)
+            }
         }
     }
 
@@ -187,7 +189,9 @@ impl InputExtent {
                 width: cursor.usize("patch grid width")?,
             }),
             1 => Ok(Self::AudioValidFrames(cursor.usize("valid audio frames")?)),
-            2 => Ok(Self::AudioValidSamples(cursor.usize("valid audio samples")?)),
+            2 => Ok(Self::AudioValidSamples(
+                cursor.usize("valid audio samples")?,
+            )),
             value => Err(PreparedInputError::InvalidWireValue {
                 field: "input extent",
                 value,
@@ -766,7 +770,10 @@ mod tests {
                 width: 2,
             }]
         );
-        assert_eq!(identity.parts()[3].extents().collect::<Vec<_>>(), [InputExtent::AudioValidSamples(1921)]);
+        assert_eq!(
+            identity.parts()[3].extents().collect::<Vec<_>>(),
+            [InputExtent::AudioValidSamples(1921)]
+        );
     }
 
     #[test]

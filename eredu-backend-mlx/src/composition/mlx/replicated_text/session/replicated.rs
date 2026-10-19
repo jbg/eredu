@@ -453,10 +453,20 @@ where
             .map(MlxPredictionTargetState::new)
             .map_err(|e| Error::Other(Box::new(e)))
     }
-    fn exchange_autoregressive_cache(&mut self, cache: &mut MlxPredictionTargetState, stream: &Stream) -> Result<(), Error> {
-        if !cache.is::<S>() { return Err(Error::ArchitectureModel("canonical causal state type differs".into())); }
+    fn exchange_autoregressive_cache(
+        &mut self,
+        cache: &mut MlxPredictionTargetState,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if !cache.is::<S>() {
+            return Err(Error::ArchitectureModel(
+                "canonical causal state type differs".into(),
+            ));
+        }
         let mut state = cache.take_state::<S>()?;
-        let result = self.session.exchange_prediction_target_state(&mut state, stream)
+        let result = self
+            .session
+            .exchange_prediction_target_state(&mut state, stream)
             .map_err(|error| Error::Other(Box::new(error)));
         cache.restore_state(state);
         result
@@ -470,9 +480,15 @@ where
     ) -> Result<(Array, usize), Error> {
         let tokens = input::text_token_ids(input, stream)?;
         let count = tokens.shape()[1] as usize;
-        let output = self.attention_forward_with_observer(&tokens, None,
-            eredu_core::decoding::AttentionInvocation::CAUSAL, Some(cache), true,
-            stream, observer)?;
+        let output = self.attention_forward_with_observer(
+            &tokens,
+            None,
+            eredu_core::decoding::AttentionInvocation::CAUSAL,
+            Some(cache),
+            true,
+            stream,
+            observer,
+        )?;
         Ok((output, count))
     }
     fn attention_forward_with_observer(
@@ -487,34 +503,63 @@ where
     ) -> Result<Array, Error> {
         let tokens = MlxTensor::from_array(tokens.clone());
         let feedback = feedback.cloned().map(MlxTensor::from_array);
-        let input = A::invocation_input(&tokens, feedback.as_ref(), None, invocation)
-            .ok_or_else(|| Error::ArchitectureModel("selected architecture rejects attention invocation".into()))?;
-        let pass = if prefill { eredu_runtime::ExpertPass::Prefill } else { eredu_runtime::ExpertPass::Decode };
+        let input =
+            A::invocation_input(&tokens, feedback.as_ref(), None, invocation).ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "selected architecture rejects attention invocation".into(),
+                )
+            })?;
+        let pass = if prefill {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
         if let Some(cache) = cache {
-            if !cache.is::<S>() { return Err(Error::Speculative("lane state type differs".into())); }
+            if !cache.is::<S>() {
+                return Err(Error::Speculative("lane state type differs".into()));
+            }
             let mut lane = cache.take_state::<S>()?;
-            if let Err(error) = self.session.exchange_prediction_target_state(&mut lane, stream) {
+            if let Err(error) = self
+                .session
+                .exchange_prediction_target_state(&mut lane, stream)
+            {
                 cache.restore_state(lane);
                 return Err(Error::Other(Box::new(error)));
             }
-            let result = self.session.sequence_output_with_observer(input, pass, stream, &mut observer);
-            let restored = match self.session.exchange_prediction_target_state(&mut lane, stream) {
+            let result =
+                self.session
+                    .sequence_output_with_observer(input, pass, stream, &mut observer);
+            let restored = match self
+                .session
+                .exchange_prediction_target_state(&mut lane, stream)
+            {
                 Ok(()) => Ok(()),
                 Err(error) => super::finish_prediction_state_operation(
                     Err(Error::Other(Box::new(error))),
-                    self.session.recover_prediction_target_state_after_failure(&mut lane)
+                    self.session
+                        .recover_prediction_target_state_after_failure(&mut lane)
                         .map_err(|recovery| Error::Other(Box::new(recovery))),
                 ),
             };
             cache.restore_state(lane);
-            let output = super::finish_prediction_state_operation(result.map_err(|e| Error::Other(Box::new(e))), restored)?;
+            let output = super::finish_prediction_state_operation(
+                result.map_err(|e| Error::Other(Box::new(e))),
+                restored,
+            )?;
             Ok(self.published(output.into_array()))
         } else {
             let before = self.session.successful_state_restoration_generation();
-            self.session.sequence_output_with_observer(input, pass, stream, &mut observer)
+            self.session
+                .sequence_output_with_observer(input, pass, stream, &mut observer)
                 .map(MlxTensor::into_array)
-                .map_err(|error| Error::after_replicated_model_call(error, before, self.session.successful_state_restoration_generation()))
+                .map_err(|error| {
+                    Error::after_replicated_model_call(
+                        error,
+                        before,
+                        self.session.successful_state_restoration_generation(),
+                    )
+                })
         }
     }
 
@@ -683,7 +728,10 @@ where
     fn speculative_activation_execution(
         &self,
     ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
-        self.prediction.activation_execution().or_else(|| self.capability_estimate.shared_backbone_activation_execution())
+        self.prediction.activation_execution().or_else(|| {
+            self.capability_estimate
+                .shared_backbone_activation_execution()
+        })
     }
 
     fn install_embedded_prediction_observers(

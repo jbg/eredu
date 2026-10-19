@@ -3,8 +3,8 @@
 mod observation;
 mod parameters;
 pub(crate) use parameters::describe as parameter_description;
-mod waveform;
 mod prefill;
+mod waveform;
 use prefill::DecoderPrefill;
 
 use eredu_nn::{
@@ -464,7 +464,8 @@ where
                     chunk.range.len() as u64
                 })
         };
-        i32::try_from(positions).map_err(|_| "Muse prepared boundary sequence exceeds i32".to_owned())
+        i32::try_from(positions)
+            .map_err(|_| "Muse prepared boundary sequence exceeds i32".to_owned())
     }
 
     fn prepared_group_continuation_geometry(
@@ -2217,7 +2218,12 @@ where
         let mut values = Vec::new();
         values.extend(forward.mask.iter());
         values.extend(forward.waveform.iter());
-        values.extend(forward.prefill.as_ref().and_then(|prefill| prefill.assembled.as_ref()));
+        values.extend(
+            forward
+                .prefill
+                .as_ref()
+                .and_then(|prefill| prefill.assembled.as_ref()),
+        );
         for part in &forward.parts {
             match part {
                 PreparedPart::Text { tokens, embeddings } => {

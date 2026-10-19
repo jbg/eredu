@@ -27,7 +27,13 @@ pub struct ContinuationForecast {
 impl ContinuationForecast {
     pub(crate) fn reestimate(&mut self) -> Result<(), GenerationForecastError> {
         self.estimate = match &self.decoding {
-            Some(decoding) => eredu_runtime::memory_forecast::estimate_decoding_continuation_memory(&self.request, &self.continuation, decoding)?,
+            Some(decoding) => {
+                eredu_runtime::memory_forecast::estimate_decoding_continuation_memory(
+                    &self.request,
+                    &self.continuation,
+                    decoding,
+                )?
+            }
             None => estimate_continuation_memory(&self.request, &self.continuation)?,
         };
         Ok(())
@@ -47,7 +53,16 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> super::super::TextGen
         options: &GenerationForecastOptions,
     ) -> Result<ContinuationForecast, GenerationForecastError> {
         let (runtime, state, pending) = self.inner.observation_parts();
-        continuation_forecast::<B>(runtime, state, pending, self.inner.decoding_state(), self.inner.committed_sequence(), additional_tokens, options, None)
+        continuation_forecast::<B>(
+            runtime,
+            state,
+            pending,
+            self.inner.decoding_state(),
+            self.inner.committed_sequence(),
+            additional_tokens,
+            options,
+            None,
+        )
     }
 }
 
@@ -69,36 +84,76 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
             "requires an advanced continuation with retained physical input authority".into(),
         ));
     }
-    let mut decoding = eredu_runtime::memory_forecast::DecodingContinuationMemoryPlan { state: decoding_state, settlement_input_tokens: if decoding_state.pending.is_some() {
-        B::decoding_settlement_input_tokens(runtime, B::sampling_state(state), pending.as_ref().map(|p| match p {
-            PendingTextInput::Prefill(prompt) => PendingTextInput::Prefill(*prompt),
-            PendingTextInput::Decode(token) => PendingTextInput::Decode(*token),
-            PendingTextInput::Continue => PendingTextInput::Continue,
-        })).ok_or_else(|| GenerationForecastError::UnsupportedContinuation("mode settlement has no bounded committed suffix".into()))?
-    } else { 0 }, refinement: Vec::new(), speculative: Vec::new() };
+    let mut decoding = eredu_runtime::memory_forecast::DecodingContinuationMemoryPlan {
+        state: decoding_state,
+        settlement_input_tokens: if decoding_state.pending.is_some() {
+            B::decoding_settlement_input_tokens(
+                runtime,
+                B::sampling_state(state),
+                pending.as_ref().map(|p| match p {
+                    PendingTextInput::Prefill(prompt) => PendingTextInput::Prefill(*prompt),
+                    PendingTextInput::Decode(token) => PendingTextInput::Decode(*token),
+                    PendingTextInput::Continue => PendingTextInput::Continue,
+                }),
+            )
+            .ok_or_else(|| {
+                GenerationForecastError::UnsupportedContinuation(
+                    "mode settlement has no bounded committed suffix".into(),
+                )
+            })?
+        } else {
+            0
+        },
+        refinement: Vec::new(),
+        speculative: Vec::new(),
+    };
     for mode in std::iter::once(decoding_state.active).chain(decoding_state.pending) {
         match mode {
-            eredu_core::decoding::DecodingMode::Autoregressive => {},
+            eredu_core::decoding::DecodingMode::Autoregressive => {}
             eredu_core::decoding::DecodingMode::Diffusion { policy } => {
-                let plan = B::refinement_memory_plan(runtime, policy)?.ok_or_else(|| GenerationForecastError::UnsupportedContinuation("selected refinement invocation has no complete storage projection".into()))?;
+                let plan = B::refinement_memory_plan(runtime, policy)?.ok_or_else(|| {
+                    GenerationForecastError::UnsupportedContinuation(
+                        "selected refinement invocation has no complete storage projection".into(),
+                    )
+                })?;
                 decoding.refinement.push(plan);
-            },
+            }
             eredu_core::decoding::DecodingMode::SelfSpeculation(options) => {
-                let profile = B::shared_backbone_memory_profile(runtime)?.ok_or_else(|| GenerationForecastError::UnsupportedContinuation("selected shared-target transaction has no complete storage projection".into()))?;
-                if profile.conditioned.is_some() || profile.draft.is_some() || profile.embedded.is_some() || profile.shared_backbone.is_none() || options.request().max_draft_tokens.get() as u64 > profile.proposal_capacity {
-                    return Err(failure("shared-target continuation requires exact retained proposal geometry"));
+                let profile = B::shared_backbone_memory_profile(runtime)?.ok_or_else(|| {
+                    GenerationForecastError::UnsupportedContinuation(
+                        "selected shared-target transaction has no complete storage projection"
+                            .into(),
+                    )
+                })?;
+                if profile.conditioned.is_some()
+                    || profile.draft.is_some()
+                    || profile.embedded.is_some()
+                    || profile.shared_backbone.is_none()
+                    || options.request().max_draft_tokens.get() as u64 > profile.proposal_capacity
+                {
+                    return Err(failure(
+                        "shared-target continuation requires exact retained proposal geometry",
+                    ));
                 }
                 let mut shared = profile.shared_backbone;
-                if !options.request().draft_adapter { shared.as_mut().unwrap().adapter = None; }
-                decoding.speculative.push(eredu_runtime::memory_forecast::SpeculativeMemoryPlan {
-                    conditioned: None,
-                    shared_backbone: shared, embedded: None, draft: None,
-                    auxiliary_bytes_per_position: profile.auxiliary_bytes_per_position,
-                    sampling_bytes_per_vocabulary_entry: profile.sampling_bytes_per_vocabulary_entry,
-                    max_draft_tokens: options.request().max_draft_tokens.get() as u64,
-                    scheduler: options.request().scheduler, shared_allocator: profile.shared_allocator,
-                });
-            },
+                if !options.request().draft_adapter {
+                    shared.as_mut().unwrap().adapter = None;
+                }
+                decoding
+                    .speculative
+                    .push(eredu_runtime::memory_forecast::SpeculativeMemoryPlan {
+                        conditioned: None,
+                        shared_backbone: shared,
+                        embedded: None,
+                        draft: None,
+                        auxiliary_bytes_per_position: profile.auxiliary_bytes_per_position,
+                        sampling_bytes_per_vocabulary_entry: profile
+                            .sampling_bytes_per_vocabulary_entry,
+                        max_draft_tokens: options.request().max_draft_tokens.get() as u64,
+                        scheduler: options.request().scheduler,
+                        shared_allocator: profile.shared_allocator,
+                    });
+            }
         }
     }
     let inputs = B::continuation_input_tokens(
@@ -167,8 +222,9 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     // Without finer attribution, cover the allowance in each separate pool.
     add_retention(&mut forecast.request, bound,
         "current sampler/pending input plus future sampling storage; conservative per-pool allowance", false)?;
-    let sequence_storage = sequence.snapshot_storage_bytes()
-        .and_then(|bytes| bytes.checked_sub(std::mem::size_of::<eredu_core::GenerationSequence>() as u64));
+    let sequence_storage = sequence.snapshot_storage_bytes().and_then(|bytes| {
+        bytes.checked_sub(std::mem::size_of::<eredu_core::GenerationSequence>() as u64)
+    });
     add_retention(&mut forecast.request, sequence_storage,
         "common request driver retained canonical IDs; future commitment storage is in the phase horizon", true)?;
     let mut capture_plan = None;

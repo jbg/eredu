@@ -70,7 +70,10 @@ impl<M: SharedBackboneMechanisms> SharedBackboneTransaction<M> {
         randomness: M::ProposalRandomness,
         wait: BoundedCompletionWait,
         context: M::Context<'context>,
-    ) -> Result<Self, SharedBackboneTransactionError<M::Error>>  where M: 'context {
+    ) -> Result<Self, SharedBackboneTransactionError<M::Error>>
+    where
+        M: 'context,
+    {
         use SharedBackboneTransactionError::Backend;
         if !M::Completion::supports_cancellation(wait.cancellation()) {
             return Err(
@@ -168,7 +171,10 @@ impl<M: SharedBackboneMechanisms> SharedBackboneTransaction<M> {
         &self,
         executor: &SharedBackboneExecutor<'context, M>,
         context: M::Context<'context>,
-    ) -> Result<M::Logits, SharedBackboneTransactionError<M::Error>>  where M: 'context {
+    ) -> Result<M::Logits, SharedBackboneTransactionError<M::Error>>
+    where
+        M: 'context,
+    {
         let index = self.cursor.position()?;
         executor
             .verification_logits(&self.verification, index, context)
@@ -200,7 +206,8 @@ impl<M: SharedBackboneMechanisms> SharedBackboneTransaction<M> {
     ) -> Result<(bool, M::State), SharedBackboneTransactionError<M::Error>>
     where
         M::Output: Clone,
-        M: 'context {
+        M: 'context,
+    {
         use SharedBackboneTransactionError::Backend;
         let boundary = self.cursor.boundary(token)?;
         let mut cache = M::restore(&self.verified, context).map_err(Backend)?;

@@ -12,7 +12,8 @@ pub struct SpeculativeExecutionStreams<'a> {
 
 impl std::fmt::Debug for SpeculativeExecutionStreams<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SpeculativeExecutionStreams")
+        formatter
+            .debug_struct("SpeculativeExecutionStreams")
             .field("topology", &self.topology)
             .field("target_observer", &self.target_observer.is_some())
             .finish_non_exhaustive()
@@ -77,14 +78,19 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         }
     }
 
-    pub(in crate::composition::mlx) fn with_target_observer(mut self, observer: &'a dyn TargetObserver) -> Self {
+    pub(in crate::composition::mlx) fn with_target_observer(
+        mut self,
+        observer: &'a dyn TargetObserver,
+    ) -> Self {
         self.target_observer = Some(observer);
         self
     }
 
     pub(in crate::composition::mlx) fn observe_target(
         self,
-        mut execute: impl FnMut(&mut dyn eredu_runtime::ActivationObserver<Array, Error>) -> Result<Array, Error>,
+        mut execute: impl FnMut(
+            &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+        ) -> Result<Array, Error>,
     ) -> Result<Array, Error> {
         match self.target_observer {
             Some(observer) => observer.with_observer(&mut execute),
@@ -127,7 +133,8 @@ impl<'a> SpeculativeExecutionStreams<'a> {
     }
 
     pub(in crate::composition::mlx) fn coordinate_decoding_control(
-        self, local: eredu_core::decoding::DecodingCoordination,
+        self,
+        local: eredu_core::decoding::DecodingCoordination,
     ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
         match self.capture {
             Some(binding) => binding.coordinate_decoding_control(local),
@@ -231,12 +238,24 @@ impl<'a> SpeculativeExecutionStreams<'a> {
 /// Request-local observation is borrowed only across the exact native invocation.
 /// Erasing its implementation preserves covariance of queue assignments.
 pub(in crate::composition::mlx) trait TargetObserver {
-    fn with_observer(&self, execute: &mut dyn FnMut(&mut dyn eredu_runtime::ActivationObserver<Array, Error>) -> Result<Array, Error>) -> Result<Array, Error>;
+    fn with_observer(
+        &self,
+        execute: &mut dyn FnMut(
+            &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+        ) -> Result<Array, Error>,
+    ) -> Result<Array, Error>;
 }
 
-pub(in crate::composition::mlx) struct BorrowedTargetObserver<'a>(pub std::cell::RefCell<&'a mut dyn eredu_runtime::ActivationObserver<Array, Error>>);
+pub(in crate::composition::mlx) struct BorrowedTargetObserver<'a>(
+    pub std::cell::RefCell<&'a mut dyn eredu_runtime::ActivationObserver<Array, Error>>,
+);
 impl TargetObserver for BorrowedTargetObserver<'_> {
-    fn with_observer(&self, execute: &mut dyn FnMut(&mut dyn eredu_runtime::ActivationObserver<Array, Error>) -> Result<Array, Error>) -> Result<Array, Error> {
+    fn with_observer(
+        &self,
+        execute: &mut dyn FnMut(
+            &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+        ) -> Result<Array, Error>,
+    ) -> Result<Array, Error> {
         execute(&mut **self.0.borrow_mut())
     }
 }

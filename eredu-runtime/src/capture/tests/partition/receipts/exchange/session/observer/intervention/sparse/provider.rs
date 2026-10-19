@@ -165,7 +165,7 @@ fn speculative_partition_provider_retains_sparse_edits_and_native_failures() {
                         assert_eq!(
                             record.captures.invocation,
                             Some(CaptureInvocationShape {
-            media: None,
+                                media: None,
                                 batch: 1,
                                 sequence: 3,
                                 context: None

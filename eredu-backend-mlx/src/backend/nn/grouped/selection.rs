@@ -760,7 +760,8 @@ fn float32_router_projection(
         let input = input.contiguous(false, stream)?.into_evaluated()?;
         let weight = weight.contiguous(false, stream)?.into_evaluated()?;
         let values = safemlx::ops::aligned_f32_row_projection(
-            input.as_slice::<f32>(), weight.as_slice::<f32>(),
+            input.as_slice::<f32>(),
+            weight.as_slice::<f32>(),
         )?;
         return Ok(Array::from_slice(&values, &[1, rows]));
     }

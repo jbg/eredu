@@ -186,7 +186,9 @@ impl PreparedTextSessionFacts {
     }
 
     /// Exact shard identity, absent for a partition with no mutable cache.
-    pub const fn prompt_cache_identity(&self) -> Option<&eredu_core::cache::PromptCacheModelIdentity> {
+    pub const fn prompt_cache_identity(
+        &self,
+    ) -> Option<&eredu_core::cache::PromptCacheModelIdentity> {
         self.prompt_cache_identity.as_ref()
     }
 

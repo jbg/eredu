@@ -6,8 +6,8 @@ pub mod checkpoint;
 pub mod config;
 pub mod equations;
 pub mod graph;
-pub mod model;
 pub mod media_companion;
+pub mod model;
 pub mod parallel;
 /// Architecture-owned external DFlash speculative lifecycle.
 pub mod speculative;
@@ -36,8 +36,8 @@ pub use config::{
     VisionInputPolicy, VisionPositionLayout, VocabularyArithmetic, WeightConvention,
 };
 pub use equations::{
-    BranchNorm, LearnedResidualCombination, LearnedRmsNorm, ResidualCombination, RmsGain, RmsNormEquation,
-    StoredResidualCombination,
+    BranchNorm, LearnedResidualCombination, LearnedRmsNorm, ResidualCombination, RmsGain,
+    RmsNormEquation, StoredResidualCombination,
 };
 pub use graph::{component_graph, state_layout};
 pub use model::{

@@ -39,7 +39,9 @@ impl QuantizationMode {
     /// Validates the group size and bit width required by this encoding.
     pub fn validate(self, group_size: i32, bits: i32) -> Result<()> {
         if self == Self::NvFp4 && (group_size != 16 || bits != 4) {
-            return Err(crate::error::Exception::custom("NVFP4 requires group_size=16 and bits=4"));
+            return Err(crate::error::Exception::custom(
+                "NVFP4 requires group_size=16 and bits=4",
+            ));
         }
         if self == Self::MxFp4 && (group_size != 32 || bits != 4) {
             return Err(crate::error::Exception::custom(format!(

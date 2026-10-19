@@ -1,7 +1,7 @@
 //! Shared-executor transactions inside the ordinary physical generation driver.
 use super::*;
 use crate::composition::mlx::speculative::{
-    SpeculativeExecutionStreams, autoregressive::MlxAutoregressiveMechanisms,
+    autoregressive::MlxAutoregressiveMechanisms, SpeculativeExecutionStreams,
 };
 use eredu_core::{PendingTextInput, TextOperationOutput, TextProgress};
 use eredu_runtime::speculative::{
@@ -41,8 +41,13 @@ impl MlxBackend<'_> {
         .map_err(|error| Error::Exception(Exception::from_source(error)))?;
         runtime.session_mut().with_model_operation(|model| {
             let context = SpeculativeExecutionStreams::single(&stream);
-            let mut executor =
-                CausalExecutor::<MlxAutoregressiveMechanisms, eredu_runtime::speculative::autoregressive::NoTargetRefinement>::new(model.erased_mut(), eredu_runtime::speculative::autoregressive::NoTargetRefinement);
+            let mut executor = CausalExecutor::<
+                MlxAutoregressiveMechanisms,
+                eredu_runtime::speculative::autoregressive::NoTargetRefinement,
+            >::new(
+                model.erased_mut(),
+                eredu_runtime::speculative::autoregressive::NoTargetRefinement,
+            );
             let mut cache = executor.new_cache(context)?;
             let settled = eredu_core::speculative::settle_committed_suffix(
                 &mut executor,

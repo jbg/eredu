@@ -358,7 +358,10 @@ pub struct AudioArchitecture<B: NeuralBackend> {
 impl<B: NeuralBackend> AudioArchitecture<B> {
     /// Validates geometry without constructing any backend parameter or tensor.
     pub fn new(config: AudioConfig) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>("Muse audio", crate::operator_requirements::MUSE_AUDIO)?;
+        crate::operator_requirements::require::<B>(
+            "Muse audio",
+            crate::operator_requirements::MUSE_AUDIO,
+        )?;
         let units = config.execution_units()?;
         Ok(Self {
             config,

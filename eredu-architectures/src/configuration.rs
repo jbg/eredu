@@ -13,7 +13,7 @@ use eredu_checkpoint::{
 use eredu_core::{
     artifact::ArtifactError,
     checkpoint::{TensorCatalog, TensorDtype},
-    ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement, ArtifactCompanionRole,
+    ArtifactCompanionRole, ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement,
     LoadingProtocol, ModelConfiguration, ModelConfigurationResolver, ResolvedModelConfiguration,
     ValidatedGguf,
 };
@@ -63,12 +63,24 @@ impl ModelConfigurationResolver for ModelConfigurations {
         architecture: &str,
         checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
-        if matches!(architecture, "dream" | "mistral3" | "nemotron_labs_diffusion") {
-            let admitted = crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
-                .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
-            if admitted.config().vision.is_none() { return Ok(Vec::new()); }
-            return GgufCompanionRequirement::new(ArtifactCompanionRole::MediaProjector, false,
-                "mmproj", 1, GgufCompanionEncoding::DenseRequired).map(|requirement| vec![requirement]);
+        if matches!(
+            architecture,
+            "dream" | "mistral3" | "nemotron_labs_diffusion"
+        ) {
+            let admitted =
+                crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
+                    .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
+            if admitted.config().vision.is_none() {
+                return Ok(Vec::new());
+            }
+            return GgufCompanionRequirement::new(
+                ArtifactCompanionRole::MediaProjector,
+                false,
+                "mmproj",
+                1,
+                GgufCompanionEncoding::DenseRequired,
+            )
+            .map(|requirement| vec![requirement]);
         }
         gguf_companion_requirements(GgufArchitecture::resolve(architecture)?)
     }
@@ -84,7 +96,9 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
                 crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
             ],
-            ModelKind::MuseGlimmer | ModelKind::MuseSpark => &[crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME],
+            ModelKind::MuseGlimmer | ModelKind::MuseSpark => {
+                &[crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME]
+            }
             _ => &[],
         }
     }
@@ -100,7 +114,14 @@ impl ModelConfigurationResolver for ModelConfigurations {
     ) -> Result<Self::ArtifactPlan, ArtifactError> {
         let plan = match format {
             ArtifactFormat::SafeTensors => {
-                let resolved_plan = resolved_plan.admit_safetensors_catalog(tensors, configuration.json().ok_or_else(|| ArtifactError::InvalidArtifact("SafeTensors inspection omitted its source configuration".into()))?)?;
+                let resolved_plan = resolved_plan.admit_safetensors_catalog(
+                    tensors,
+                    configuration.json().ok_or_else(|| {
+                        ArtifactError::InvalidArtifact(
+                            "SafeTensors inspection omitted its source configuration".into(),
+                        )
+                    })?,
+                )?;
                 let kind = resolved_plan.model_kind();
                 let model = serde_json::to_vec(configuration.json().ok_or_else(|| {
                     ArtifactError::InvalidArtifact(
@@ -386,7 +407,9 @@ impl ModelKind {
             "muse_spark" | "muse_spark_text" => Ok(Self::MuseSpark),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
-            "nemotron_labs_diffusion" | "nemotron_labs_diffusion_vlm" => Ok(Self::NemotronLabsDiffusion),
+            "nemotron_labs_diffusion" | "nemotron_labs_diffusion_vlm" => {
+                Ok(Self::NemotronLabsDiffusion)
+            }
             "moshi" | "personaplex" => Ok(Self::Moshi),
             "nemotron_voicechat" => Ok(Self::VoiceChat),
             "qwen2" => Ok(Self::Qwen2),
@@ -577,16 +600,23 @@ fn resolve_gguf_configuration(
     checkpoint: &GgufCheckpoint,
 ) -> Result<(ModelConfiguration, GgufArchitecturePlan), ArtifactError> {
     let (architecture, plan) = if matches!(name, "dream" | "mistral3" | "nemotron_labs_diffusion") {
-        let admitted = crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
-            .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
+        let admitted =
+            crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
+                .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
         let architecture = GgufArchitecture::NemotronLabsDiffusion;
-        let plan = GgufArchitecturePlan::new(architecture,
+        let plan = GgufArchitecturePlan::new(
+            architecture,
             GgufModelConfig::NemotronLabsDiffusion(admitted.clone()),
-            admitted.checkpoint().clone(), admitted.mapping().to_vec());
+            admitted.checkpoint().clone(),
+            admitted.mapping().to_vec(),
+        );
         (architecture, plan)
     } else {
         let architecture = GgufArchitecture::resolve(name)?;
-        (architecture, resolve_gguf_architecture(architecture, checkpoint)?)
+        (
+            architecture,
+            resolve_gguf_architecture(architecture, checkpoint)?,
+        )
     };
     Ok((
         ModelConfiguration::new(
@@ -929,10 +959,19 @@ impl GgufArchitecturePlan {
         }
     }
 
-    pub(crate) fn with_draft_adapter(mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<Self, String> {
+    pub(crate) fn with_draft_adapter(
+        mut self,
+        adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig,
+    ) -> Result<Self, String> {
         match &mut self.model {
-            GgufModelConfig::NemotronLabsDiffusion(plan) => *plan = plan.clone().with_draft_adapter(adapter),
-            _ => return Err("draft-only low-rank parameters require a shared-backbone family".into()),
+            GgufModelConfig::NemotronLabsDiffusion(plan) => {
+                *plan = plan.clone().with_draft_adapter(adapter)
+            }
+            _ => {
+                return Err(
+                    "draft-only low-rank parameters require a shared-backbone family".into(),
+                )
+            }
         }
         Ok(self)
     }
@@ -1005,10 +1044,19 @@ impl SafetensorsArchitecturePlan {
         }
     }
 
-    pub(crate) fn with_draft_adapter(mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<Self, String> {
+    pub(crate) fn with_draft_adapter(
+        mut self,
+        adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig,
+    ) -> Result<Self, String> {
         match &mut self.model {
-            SafetensorsModelConfig::NemotronLabsDiffusion(plan) => *plan = plan.clone().with_draft_adapter(adapter),
-            _ => return Err("draft-only low-rank parameters require a shared-backbone family".into()),
+            SafetensorsModelConfig::NemotronLabsDiffusion(plan) => {
+                *plan = plan.clone().with_draft_adapter(adapter)
+            }
+            _ => {
+                return Err(
+                    "draft-only low-rank parameters require a shared-backbone family".into(),
+                )
+            }
         }
         Ok(self)
     }
@@ -1215,10 +1263,18 @@ impl SafetensorsArchitecturePlan {
         )))
     }
 
-    pub(crate) fn resolve_muse_catalog(&mut self, tensors: &TensorCatalog, source: &Value) -> Result<(), ArtifactError> {
+    pub(crate) fn resolve_muse_catalog(
+        &mut self,
+        tensors: &TensorCatalog,
+        source: &Value,
+    ) -> Result<(), ArtifactError> {
         if let SafetensorsModelConfig::Muse(config) = &self.model {
-            let config = crate::muse::resolve_safetensors_config(config, source, &PortableSafetensorsCatalog(tensors))
-                .map_err(ArtifactError::InvalidArchitecturePlan)?;
+            let config = crate::muse::resolve_safetensors_config(
+                config,
+                source,
+                &PortableSafetensorsCatalog(tensors),
+            )
+            .map_err(ArtifactError::InvalidArchitecturePlan)?;
             self.checkpoint = crate::muse::safetensors_plan(&config)
                 .map_err(ArtifactError::InvalidArchitecturePlan)?;
             self.model = SafetensorsModelConfig::Muse(config);
@@ -1536,9 +1592,11 @@ fn resolve_safetensors_architecture(
     kind: ModelKind,
 ) -> Result<SafetensorsArchitecturePlan, ArtifactError> {
     let model = match kind {
-        ModelKind::NemotronLabsDiffusion => crate::nemotron_labs_diffusion::FamilyConfig::from_hf_value(json)
-            .map(SafetensorsModelConfig::NemotronLabsDiffusion)
-            .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::NemotronLabsDiffusion => {
+            crate::nemotron_labs_diffusion::FamilyConfig::from_hf_value(json)
+                .map(SafetensorsModelConfig::NemotronLabsDiffusion)
+                .map_err(|error| invalid_configuration(kind, error))
+        }
         ModelKind::DeepSeekV3 => crate::deepseek::parse_v3_config(json)
             .map(SafetensorsModelConfig::DeepSeekV3)
             .map_err(|error| invalid_configuration(kind, error)),
@@ -1625,8 +1683,10 @@ fn resolve_safetensors_architecture(
         }
     }?;
     let checkpoint = match &model {
-        SafetensorsModelConfig::NemotronLabsDiffusion(args) => crate::nemotron_labs_diffusion::safetensors_plan(args)
-            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::NemotronLabsDiffusion(args) => {
+            crate::nemotron_labs_diffusion::safetensors_plan(args)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
         SafetensorsModelConfig::Qwen4Exp(config, encoding) => {
             crate::qwen4_exp::checkpoint::schema::safetensors_config_plan(config, encoding)
                 .map_err(|error| invalid_configuration(kind, error))?

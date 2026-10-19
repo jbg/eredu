@@ -26,7 +26,7 @@ pub(crate) use collectives::{
     all_gather_for, all_gather_unchecked, all_sum_for, payload_free_all_sum_for,
 };
 pub use handle::Group;
-pub(crate) use point_to_point::{recv_like, broadcast_boundary_frame};
+pub(crate) use point_to_point::{broadcast_boundary_frame, recv_like};
 pub use point_to_point::{recv, send};
 
 #[cfg(test)]

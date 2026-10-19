@@ -605,8 +605,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         config: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if matches!(config.perception_normalization, super::PerceptionNormalization::Float32 { .. }) {
-            B::require_operator_capabilities("ordered perception RMS normalization", eredu_nn::NeuralOperatorCapabilities::CASCADED_RMS.union(eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT))?;
+        if matches!(
+            config.perception_normalization,
+            super::PerceptionNormalization::Float32 { .. }
+        ) {
+            B::require_operator_capabilities(
+                "ordered perception RMS normalization",
+                eredu_nn::NeuralOperatorCapabilities::CASCADED_RMS
+                    .union(eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT),
+            )?;
         }
         let linear = |name: &str, input, output| {
             B::linear(

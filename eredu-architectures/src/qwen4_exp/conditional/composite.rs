@@ -123,10 +123,13 @@ where
                     .and_then(|count| total.checked_add(count))
                     .ok_or("vision patch extent overflow")
             })?;
-        Ok(Some((
-            i32::try_from(patches).map_err(|_| "vision patch extent exceeds i32")?,
-            self.vision.hidden_size,
-        ).into()))
+        Ok(Some(
+            (
+                i32::try_from(patches).map_err(|_| "vision patch extent exceeds i32")?,
+                self.vision.hidden_size,
+            )
+                .into(),
+        ))
     }
     fn prepared_group_continuation_batched(&self, group: usize) -> bool {
         group != VISION_INDEX
@@ -169,7 +172,8 @@ where
             <Self as CompositeArchitecture<B, S>>::prepared_group_continuation_geometry(
                 self, group, input,
             )?
-            .ok_or("missing vision continuation")?.after_unit_end(1)?;
+            .ok_or("missing vision continuation")?
+            .after_unit_end(1)?;
         let projected = <Self as CompositeArchitecture<B, S>>::prepared_group_boundary_sequence(
             self, group, input,
         )?;

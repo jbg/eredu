@@ -3,14 +3,13 @@ use super::*;
 use eredu_core::{CapabilityError, InputTokenCount};
 use eredu_runtime::memory_forecast::LoadedMemoryProfile;
 pub use eredu_runtime::memory_forecast::{
-    ConditionedAssistantMemoryPlan, ConditionedBlockConvolution,
+    CaptureMemoryPlan, ConditionedAssistantMemoryPlan, ConditionedBlockConvolution,
     ConditionedPredictionBody, ConditionedPredictionScoring, ConditionedPredictionTopology,
-    ParameterResidencyMemoryBounds,
-    CaptureMemoryPlan, ConversionRetentionGroupMemoryPlan, ConversionRetentionMemoryPlan,
+    ConversionRetentionGroupMemoryPlan, ConversionRetentionMemoryPlan,
     DecodingContinuationMemoryPlan, EmbeddedPredictionMemoryPlan, ForecastCalibration,
     ForecastExecutionContract, GenerationForecastBackend, GenerationForecastError,
-    RefinementMemoryPlan, SpeculativeForecastBackend, SpeculativeMemoryPlan,
-    PrefillInputRetention,
+    ParameterResidencyMemoryBounds, PrefillInputRetention, RefinementMemoryPlan,
+    SpeculativeForecastBackend, SpeculativeMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
 mod continuation;
@@ -110,7 +109,9 @@ impl GenerationForecast {
     }
 }
 
-fn speculative_forecast_settings(mut settings: PreparedChatGenerationSettings) -> (PreparedChatGenerationSettings, DecodingMode) {
+fn speculative_forecast_settings(
+    mut settings: PreparedChatGenerationSettings,
+) -> (PreparedChatGenerationSettings, DecodingMode) {
     let mode = settings.decoding_mode.unwrap_or_default();
     settings.decoding_mode = None;
     (settings, mode)
@@ -194,7 +195,9 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         mode: DecodingMode,
         options: &GenerationForecastOptions,
     ) -> Result<(), GenerationForecastError> {
-        if matches!(mode, DecodingMode::SelfSpeculation(_)) && speculative.request().max_draft_tokens.get() as u64 > profile.proposal_capacity {
+        if matches!(mode, DecodingMode::SelfSpeculation(_))
+            && speculative.request().max_draft_tokens.get() as u64 > profile.proposal_capacity
+        {
             return Err(failure(
                 "forecast proposal width exceeds the selected drafter capacity",
             ));
@@ -256,16 +259,23 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             Some(assistant) => {
                 if ordinary_draft.is_some() {
                     return Err(eredu_core::CapabilityError::InvalidConfiguration {
-                        field: "speculative memory", detail: "conditioned and autoregressive draft owners are mutually exclusive".into(),
-                    }.into());
+                        field: "speculative memory",
+                        detail:
+                            "conditioned and autoregressive draft owners are mutually exclusive"
+                                .into(),
+                    }
+                    .into());
                 }
                 let (request, plan) = assistant.into_request(
                     forecast.request.input,
-                    forecast.request.max_output_tokens.unwrap_or(forecast.request.forecast_output_tokens),
+                    forecast
+                        .request
+                        .max_output_tokens
+                        .unwrap_or(forecast.request.forecast_output_tokens),
                     options,
                 )?;
                 (Some(request), Some(plan))
-            },
+            }
             None => (ordinary_draft.map(|f| f.request), None),
         };
         let mut embedded = profile
@@ -302,7 +312,10 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         if let DecodingMode::Diffusion { policy } = mode {
             match B::refinement_memory_plan(&self.runtime, policy)? {
                 Some(plan) => forecast.refinement = Some(plan),
-                None => mark_specialized(forecast, "complete refinement invocation and finalization storage is not projected")?,
+                None => mark_specialized(
+                    forecast,
+                    "complete refinement invocation and finalization storage is not projected",
+                )?,
             }
         }
         forecast.reestimate()
@@ -420,17 +433,45 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         let profile = B::loaded_memory_profile(&self.runtime)?;
         let contract = B::forecast_execution_contract(&self.runtime, prompt, instrumented);
         let target_profile = profile.clone();
-        let mut forecast = loaded_forecast(profile, input, output.get() as u64, settings.prefill, contract, options)?;
+        let mut forecast = loaded_forecast(
+            profile,
+            input,
+            output.get() as u64,
+            settings.prefill,
+            contract,
+            options,
+        )?;
         if let Some(DecodingMode::SelfSpeculation(speculative)) = settings.decoding_mode {
             match B::shared_backbone_memory_profile(&self.runtime)? {
-                Some(profile) => self.project_speculation_profile(&mut forecast, profile, target_profile, speculative, DecodingMode::SelfSpeculation(speculative), options)?,
+                Some(profile) => self.project_speculation_profile(
+                    &mut forecast,
+                    profile,
+                    target_profile,
+                    speculative,
+                    DecodingMode::SelfSpeculation(speculative),
+                    options,
+                )?,
                 None => mark_speculative_forecast(&mut forecast)?,
             }
-        } else if matches!(settings.decoding_mode.unwrap_or_else(|| B::default_decoding_mode(&self.runtime)), DecodingMode::Diffusion { .. }) {
-            let policy = match settings.decoding_mode { Some(DecodingMode::Diffusion { policy }) => policy, _ => None };
+        } else if matches!(
+            settings
+                .decoding_mode
+                .unwrap_or_else(|| B::default_decoding_mode(&self.runtime)),
+            DecodingMode::Diffusion { .. }
+        ) {
+            let policy = match settings.decoding_mode {
+                Some(DecodingMode::Diffusion { policy }) => policy,
+                _ => None,
+            };
             match B::refinement_memory_plan(&self.runtime, policy)? {
-                Some(plan) => { forecast.refinement = Some(plan); forecast.reestimate()?; }
-                None => mark_specialized(&mut forecast, "complete refinement invocation and finalization storage is not projected")?,
+                Some(plan) => {
+                    forecast.refinement = Some(plan);
+                    forecast.reestimate()?;
+                }
+                None => mark_specialized(
+                    &mut forecast,
+                    "complete refinement invocation and finalization storage is not projected",
+                )?,
             }
         }
         Ok(forecast)

@@ -330,10 +330,9 @@ pub fn routed_muse_partition_foundation(
     >,
     String,
 > {
-    let geometry = crate::muse::parallel::routed_partition_local_geometry(
-        args, layout, groups, ownership,
-    )
-    .map_err(|error| error.to_string())?;
+    let geometry =
+        crate::muse::parallel::routed_partition_local_geometry(args, layout, groups, ownership)
+            .map_err(|error| error.to_string())?;
     let units =
         0..usize::try_from(args.num_hidden_layers).map_err(|_| "Muse layer count exceeds usize")?;
     routed_composite_foundation(
@@ -494,7 +493,13 @@ impl PreparedCompositeExecutorPlan {
         let route_schemas = selected
             .boundary_routes()
             .iter()
-            .map(|route| (route.route().route, route.schema().clone(), route.source_unit_end()))
+            .map(|route| {
+                (
+                    route.route().route,
+                    route.schema().clone(),
+                    route.source_unit_end(),
+                )
+            })
             .collect::<Vec<_>>();
         validate_executor_routes(selected.boundary_routes(), &route_schemas)?;
         let topology = selected.topology();
@@ -779,10 +784,15 @@ fn validate_executor_routes(
         usize,
     )],
 ) -> Result<(), String> {
-    let expected = expected
+    let expected = expected.iter().map(|route| {
+        (
+            route.route().route,
+            (route.schema().clone(), route.source_unit_end()),
+        )
+    });
+    let actual = actual
         .iter()
-        .map(|route| (route.route().route, (route.schema().clone(), route.source_unit_end())));
-    let actual = actual.iter().map(|(id,schema,end)| (*id,(schema.clone(),*end)));
+        .map(|(id, schema, end)| (*id, (schema.clone(), *end)));
     validate_exact_executor_contract(expected, actual)
 }
 
@@ -1547,54 +1557,114 @@ fn inkling_gated_execution_plan(
 #[inline(never)]
 fn visit_nemotron_composite_partition<B, S, V>(
     source: &crate::nemotron_labs_diffusion::FamilyConfig,
-    selected: SelectedPartitionedAdmission<SelectedCompositeTextRealization, CompositeTextRequirements>,
+    selected: SelectedPartitionedAdmission<
+        SelectedCompositeTextRealization,
+        CompositeTextRequirements,
+    >,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, CompositePartitionPreparationError<V::Error>>
-where B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor> + RuntimeStateComponents<B> + AuxiliaryConvolutionState<B::Tensor>,
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
+        + RuntimeStateComponents<B>
+        + AuxiliaryConvolutionState<B::Tensor>,
     V: AuthoritativeCompositePartitionVisitor<B, S>,
 {
     use crate::decoder::Config;
     use crate::nemotron_labs_diffusion::{composite::partition, partitioned::TextBoundarySchema};
     let error = |message: String| CompositePartitionPreparationError::Architecture(message);
-    let args = source.with_checkpoint_formats(selected_formats(selected.base().execution()))
+    let args = source
+        .with_checkpoint_formats(selected_formats(selected.base().execution()))
         .map_err(|e| error(e.to_string()))?;
-    let parameters = crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&args)
-        .map_err(|e| error(e.to_string()))?;
-    let layout = derive_partitioned_local_layout(&parameters, selected.requirements().topology()).map_err(error)?;
-    let range = |name: &str| selected.requirements().groups().iter()
-        .find(|group| group.group().as_str() == name).map(|group| group.units());
-    let geometry = partition::geometry(&args, layout.clone(), range("vision").unwrap_or(0..0),
-        range("vision_projection").is_some(), range(crate::decoder::TEXT_DECODER_EXECUTION_GROUP))
-        .map_err(|e| error(e.to_string()))?;
-    let partition = ArchitecturePartition::from_description(&parameters,
-        selected.requirements().groups().iter().map(|group| (group.group().as_str(), group.units())),
-        selected.requirements().ownership().clone(), geometry.complete_state(),
+    let parameters =
+        crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&args)
+            .map_err(|e| error(e.to_string()))?;
+    let layout = derive_partitioned_local_layout(&parameters, selected.requirements().topology())
+        .map_err(error)?;
+    let range = |name: &str| {
+        selected
+            .requirements()
+            .groups()
+            .iter()
+            .find(|group| group.group().as_str() == name)
+            .map(|group| group.units())
+    };
+    let geometry = partition::geometry(
+        &args,
+        layout.clone(),
+        range("vision").unwrap_or(0..0),
+        range("vision_projection").is_some(),
+        range(crate::decoder::TEXT_DECODER_EXECUTION_GROUP),
+    )
+    .map_err(|e| error(e.to_string()))?;
+    let partition = ArchitecturePartition::from_description(
+        &parameters,
+        selected
+            .requirements()
+            .groups()
+            .iter()
+            .map(|group| (group.group().as_str(), group.units())),
+        selected.requirements().ownership().clone(),
+        geometry.complete_state(),
         &eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(2, 0..args.num_hidden_layers() as usize)]),
-        geometry.clone(), TextBoundarySchema::new(args.hidden_size())).map_err(|e| error(e.to_string()))?;
+            eredu_runtime::ArchitectureStatePartitionRule::group_units(
+                2,
+                0..args.num_hidden_layers() as usize,
+            ),
+        ]),
+        geometry.clone(),
+        TextBoundarySchema::new(args.hidden_size()),
+    )
+    .map_err(|e| error(e.to_string()))?;
     if selected.requirements().state() != partition.state() {
-        return Err(error("constructed shared-backbone partition state differs from cold admission".into()));
+        return Err(error(
+            "constructed shared-backbone partition state differs from cold admission".into(),
+        ));
     }
     let architecture = partition::Model::<B>::new(args.clone(), &parameters, &partition, context)
         .map_err(|e| error(e.to_string()))?;
-    let source_architecture = if crate::replicated_text::selected_uses_transform(selected.base().execution()) {
-        let source_args = source.with_checkpoint_formats(crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution())).map_err(|e| error(e.to_string()))?;
-        let model = partition::Model::<B>::new(source_args, &parameters, &partition, context)
-            .map_err(|e| error(e.to_string()))?;
-        Some((Box::new(model), layout.clone()))
-    } else { None };
+    let source_architecture =
+        if crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+            let source_args = source
+                .with_checkpoint_formats(crate::replicated_text::requirement_formats(
+                    selected.requirements().execution().execution(),
+                ))
+                .map_err(|e| error(e.to_string()))?;
+            let model = partition::Model::<B>::new(source_args, &parameters, &partition, context)
+                .map_err(|e| error(e.to_string()))?;
+            Some((Box::new(model), layout.clone()))
+        } else {
+            None
+        };
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
-        selected.materialization_tasks(), &parameters, &partition).map_err(|e| error(e.to_string()))?;
-    let capability = crate::capability::nemotron_labs_diffusion(&args, true).map_err(|e| error(e.to_string()))?;
-    let publication = crate::partitioned_execution::PublicationValueDescriptor::new(args.vocabulary_size())
+        selected.materialization_tasks(),
+        &parameters,
+        &partition,
+    )
+    .map_err(|e| error(e.to_string()))?;
+    let capability = crate::capability::nemotron_labs_diffusion(&args, true)
         .map_err(|e| error(e.to_string()))?;
-    finish_composite_partition::<B, S, _, _, _, _>(architecture, source_architecture, selected, partition,
-        CompositePartitionDetails { layout, tasks, capability_estimate: capability,
-            effective_model_type: "nemotron_labs_diffusion_vlm".into(), publication, routed: None, rows: None }, visitor)
+    let publication =
+        crate::partitioned_execution::PublicationValueDescriptor::new(args.vocabulary_size())
+            .map_err(|e| error(e.to_string()))?;
+    finish_composite_partition::<B, S, _, _, _, _>(
+        architecture,
+        source_architecture,
+        selected,
+        partition,
+        CompositePartitionDetails {
+            layout,
+            tasks,
+            capability_estimate: capability,
+            effective_model_type: "nemotron_labs_diffusion_vlm".into(),
+            publication,
+            routed: None,
+            rows: None,
+        },
+        visitor,
+    )
 }
 
 /// Constructs and visits one selected prediction-free composite partition.
@@ -1618,13 +1688,20 @@ where
         + AuxiliaryConvolutionState<B::Tensor>,
     V: AuthoritativeCompositePartitionVisitor<B, S>,
 {
-    let config = composite_config(selected.requirements().execution().inspection().architecture_plan())
-        .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+    let config = composite_config(
+        selected
+            .requirements()
+            .execution()
+            .inspection()
+            .architecture_plan(),
+    )
+    .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
     if let Some(CompositeConfig::NemotronLabsDiffusion(config)) = config {
         let config = config.clone();
         if !matches!(selected.base(), SelectedCompositeTextRealization::Direct(_)) {
             return Err(CompositePartitionPreparationError::Architecture(
-                "shared-backbone composite requires its admitted dense text strategy".into()));
+                "shared-backbone composite requires its admitted dense text strategy".into(),
+            ));
         }
         return visit_nemotron_composite_partition::<B, S, V>(&config, selected, context, visitor);
     }
@@ -1738,7 +1815,9 @@ where
     }
 
     match config {
-        CompositeConfig::NemotronLabsDiffusion(_) => unreachable!("shared-backbone construction is selected before other family frames"),
+        CompositeConfig::NemotronLabsDiffusion(_) => {
+            unreachable!("shared-backbone construction is selected before other family frames")
+        }
 
         CompositeConfig::Diffusion(source) => {
             let args = source.with_checkpoint_formats(target_formats);
@@ -2099,10 +2178,9 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::muse::model::parameter_description(&args)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+            let parameters = crate::muse::model::parameter_description(&args).map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2140,8 +2218,13 @@ where
             let mut architecture =
                 crate::muse::LayeredModel::<B>::new_parallel(args.clone(), local, context)
                     .and_then(|architecture| {
-                        architecture.with_partition_state(selected.requirements().state().cloned()
-                    .ok_or_else(|| eredu_nn::Error::backend("Muse selected partition has no state ownership"))?)
+                        architecture.with_partition_state(
+                            selected.requirements().state().cloned().ok_or_else(|| {
+                                eredu_nn::Error::backend(
+                                    "Muse selected partition has no state ownership",
+                                )
+                            })?,
+                        )
                     })
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
@@ -2190,14 +2273,9 @@ where
             let capability = crate::capability::muse(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
-            let source_architecture = muse_transform_source::<B, S>(
-                source,
-                &selected,
-                &parameters,
-                &geometry,
-                context,
-            )
-            .map_err(CompositePartitionPreparationError::Architecture)?;
+            let source_architecture =
+                muse_transform_source::<B, S>(source, &selected, &parameters, &geometry, context)
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
             let effective = args.identity.text_model_type().to_owned();
             prepare!(
                 architecture,
@@ -2220,11 +2298,11 @@ where
                             realization,
                         )
                         .map(|_| ()),
-                        None => crate::muse::PartitionLocalFoundation::from_partition(
-                            &args, partition,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
+                        None => {
+                            crate::muse::PartitionLocalFoundation::from_partition(&args, partition)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        }
                     }
                 },
                 routed_execution,
@@ -2928,8 +3006,7 @@ where
         target_parameters,
         rank,
     )?;
-    let local =
-        crate::muse::local_geometry(source, &layout).map_err(|error| error.to_string())?;
+    let local = crate::muse::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {
         selected
             .requirements()
@@ -2939,12 +3016,7 @@ where
     };
     let ownership = selected.requirements().ownership();
     let geometry = if source.is_moe() {
-        crate::muse::parallel::routed_partition_local_geometry(
-            source,
-            &layout,
-            ranges(),
-            ownership,
-        )
+        crate::muse::parallel::routed_partition_local_geometry(source, &layout, ranges(), ownership)
     } else {
         crate::muse::partition_local_geometry(source, &layout, ranges(), ownership)
     }
@@ -2962,8 +3034,11 @@ where
     let mut architecture =
         crate::muse::LayeredModel::<B>::new_parallel(source.clone(), local, context)
             .and_then(|architecture| {
-                architecture.with_partition_state(selected.requirements().state().cloned()
-                    .ok_or_else(|| eredu_nn::Error::backend("Muse selected partition has no state ownership"))?)
+                architecture.with_partition_state(
+                    selected.requirements().state().cloned().ok_or_else(|| {
+                        eredu_nn::Error::backend("Muse selected partition has no state ownership")
+                    })?,
+                )
             })
             .map_err(|error| error.to_string())?;
     if source.is_moe() {

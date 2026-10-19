@@ -17,8 +17,8 @@ mod input_projection;
 mod output_gate;
 mod output_projection;
 mod prediction;
-mod routed;
 mod residual;
+mod routed;
 mod streams;
 mod transforms;
 pub(crate) use routed::{derive_bank_unit_coordinates, derive_coordinates_for_experts};
@@ -455,25 +455,46 @@ impl ComponentPartitionLayout {
                 )?;
             }
             if let eredu_core::component::ComponentActivation::Attention {
-                query_heads, head_width, attended_head_normalization: Some(head), ..
-            } = &component.activation_equation {
-                let point = descriptor.observations.get(&head.input)
-                    .ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(head.input.clone()))?;
-                let axes = point.axes.as_deref().ok_or_else(|| ComponentPartitionError::InvalidPlacement(component.id.clone()))?;
+                query_heads,
+                head_width,
+                attended_head_normalization: Some(head),
+                ..
+            } = &component.activation_equation
+            {
+                let point = descriptor.observations.get(&head.input).ok_or_else(|| {
+                    eredu_core::capture::CaptureError::MissingPath(head.input.clone())
+                })?;
+                let axes = point.axes.as_deref().ok_or_else(|| {
+                    ComponentPartitionError::InvalidPlacement(component.id.clone())
+                })?;
                 if point.position != eredu_core::ObservationPosition::ReadOnly
                     || !matches!(axes, [batch, heads, sequence, channels]
                         if batch.dimension == eredu_core::SymbolicDimension::Batch
                             && heads.dimension == eredu_core::SymbolicDimension::Known(*query_heads)
                             && sequence.dimension == eredu_core::SymbolicDimension::Sequence
-                            && channels.dimension == eredu_core::SymbolicDimension::Known(*head_width)) {
-                    return Err(ComponentPartitionError::InvalidPlacement(component.id.clone()));
+                            && channels.dimension == eredu_core::SymbolicDimension::Known(*head_width))
+                {
+                    return Err(ComponentPartitionError::InvalidPlacement(
+                        component.id.clone(),
+                    ));
                 }
-                let head_coordinates = coordinates.as_ref().map(|coordinates|
-                    transforms::complete_groups(coordinates, *query_heads, *head_width)).transpose()?;
-                insert_observation(&mut observations, &head.input, PartitionedObservation {
-                    axis: axes[1].name.clone(), coordinates: head_coordinates, exports: local,
-                    site: ObservationHookSite::Unit, combination: PartitionCaptureCombination::Disjoint,
-                })?;
+                let head_coordinates = coordinates
+                    .as_ref()
+                    .map(|coordinates| {
+                        transforms::complete_groups(coordinates, *query_heads, *head_width)
+                    })
+                    .transpose()?;
+                insert_observation(
+                    &mut observations,
+                    &head.input,
+                    PartitionedObservation {
+                        axis: axes[1].name.clone(),
+                        coordinates: head_coordinates,
+                        exports: local,
+                        site: ObservationHookSite::Unit,
+                        combination: PartitionCaptureCombination::Disjoint,
+                    },
+                )?;
             }
             for path in component.write_output.iter().chain(component.output.iter()) {
                 replicated_observation(
@@ -551,30 +572,83 @@ impl ComponentPartitionLayout {
         // Complete block boundaries and residual additions execute in their
         // containing unit after TP reduction. Their hidden values are replicated
         // on that unit's ranks, independently of contribution parameter shards.
-        for node in descriptor.nodes.iter().filter(|node| node.kind == eredu_core::ArchitectureNodeKind::ResidualAdd
-            || (node.kind == eredu_core::ArchitectureNodeKind::DecoderBlock
-                && descriptor.layer_groups.iter().flat_map(|group| &group.passes)
-                    .flat_map(|pass| &pass.executions).any(|execution| execution.node_id == node.id))) {
+        for node in descriptor.nodes.iter().filter(|node| {
+            node.kind == eredu_core::ArchitectureNodeKind::ResidualAdd
+                || (node.kind == eredu_core::ArchitectureNodeKind::DecoderBlock
+                    && descriptor
+                        .layer_groups
+                        .iter()
+                        .flat_map(|group| &group.passes)
+                        .flat_map(|pass| &pass.executions)
+                        .any(|execution| execution.node_id == node.id))
+        }) {
             if crate::speculative_execution::speculative_capture_scope(descriptor, &node.id)?
-                != eredu_core::speculative::SpeculativeCaptureScope::Target { continue; }
-            let points = descriptor.observations.points.iter().filter(|point| point.node_id == node.id
-                && node.observation_paths.contains(&point.path)
-                && point.axes.as_ref().is_some_and(|axes| axes.iter().any(|axis| axis.name == "hidden")))
+                != eredu_core::speculative::SpeculativeCaptureScope::Target
+            {
+                continue;
+            }
+            let points = descriptor
+                .observations
+                .points
+                .iter()
+                .filter(|point| {
+                    point.node_id == node.id
+                        && node.observation_paths.contains(&point.path)
+                        && point
+                            .axes
+                            .as_ref()
+                            .is_some_and(|axes| axes.iter().any(|axis| axis.name == "hidden"))
+                })
                 .collect::<Vec<_>>();
-            if points.is_empty() { continue; }
+            if points.is_empty() {
+                continue;
+            }
             let owner = if node.kind == eredu_core::ArchitectureNodeKind::DecoderBlock {
                 capture_bundle::block_invocation_owner(descriptor, parameters, &node.id)?
-            } else { residual_invocation_owner(descriptor, parameters, &node.id)? };
-            let local = owner.is_owned_by(ownership, |group, unit| owned_groups.iter()
-                .any(|owned| owned.group() == group && owned.units().contains(&unit)));
+            } else {
+                residual_invocation_owner(descriptor, parameters, &node.id)?
+            };
+            let local = owner.is_owned_by(ownership, |group, unit| {
+                owned_groups
+                    .iter()
+                    .any(|owned| owned.group() == group && owned.units().contains(&unit))
+            });
             for point in points {
-                replicated_observation(&mut observations, descriptor, &point.path, "hidden", local, ObservationHookSite::Unit)?;
+                replicated_observation(
+                    &mut observations,
+                    descriptor,
+                    &point.path,
+                    "hidden",
+                    local,
+                    ObservationHookSite::Unit,
+                )?;
             }
         }
-        for point in descriptor.observations.points.iter().filter(|point| point.axes.as_ref().is_some_and(|axes| axes.iter().any(|axis| matches!(axis.dimension, eredu_core::SymbolicDimension::MediaPositions | eredu_core::SymbolicDimension::ProjectedMediaPositions)))) {
+        for point in descriptor.observations.points.iter().filter(|point| {
+            point.axes.as_ref().is_some_and(|axes| {
+                axes.iter().any(|axis| {
+                    matches!(
+                        axis.dimension,
+                        eredu_core::SymbolicDimension::MediaPositions
+                            | eredu_core::SymbolicDimension::ProjectedMediaPositions
+                    )
+                })
+            })
+        }) {
             let owner = residual_invocation_owner(descriptor, parameters, &point.node_id)?;
-            let local = owner.is_owned_by(ownership, |group, unit| owned_groups.iter().any(|owned| owned.group() == group && owned.units().contains(&unit)));
-            replicated_observation(&mut observations, descriptor, &point.path, "hidden", local, ObservationHookSite::Unit)?;
+            let local = owner.is_owned_by(ownership, |group, unit| {
+                owned_groups
+                    .iter()
+                    .any(|owned| owned.group() == group && owned.units().contains(&unit))
+            });
+            replicated_observation(
+                &mut observations,
+                descriptor,
+                &point.path,
+                "hidden",
+                local,
+                ObservationHookSite::Unit,
+            )?;
         }
         register_routed_boundaries(
             &mut observations,
@@ -784,7 +858,13 @@ impl ComponentPartitionLayout {
             )?;
         }
         if let Some(readout) = &descriptor.component_readout {
-            residual::register(&mut observations, descriptor, &readout.residual_cycles, layout, &owns_parameter_invocation)?;
+            residual::register(
+                &mut observations,
+                descriptor,
+                &readout.residual_cycles,
+                layout,
+                &owns_parameter_invocation,
+            )?;
         }
         transforms::register(
             &mut observations,
@@ -1040,15 +1120,35 @@ fn register_routed_boundaries(
     owns_node: impl Fn(&str) -> Result<bool, ComponentPartitionError>,
 ) -> Result<(), ComponentPartitionError> {
     for component in components {
-        let mut boundaries = component.input.iter().map(|path| (path, Some(component.input_width)))
-            .chain(component.write_output.iter().map(|path| (path, Some(component.output_width))))
-            .chain(component.output.iter().map(|path| (path, None))).collect::<Vec<_>>();
+        let mut boundaries = component
+            .input
+            .iter()
+            .map(|path| (path, Some(component.input_width)))
+            .chain(
+                component
+                    .write_output
+                    .iter()
+                    .map(|path| (path, Some(component.output_width))),
+            )
+            .chain(component.output.iter().map(|path| (path, None)))
+            .collect::<Vec<_>>();
         if let Some(id) = &component.expert_output_transform {
-            let transform = descriptor.component_transforms.iter().find(|transform| &transform.id == id)
+            let transform = descriptor
+                .component_transforms
+                .iter()
+                .find(|transform| &transform.id == id)
                 .ok_or_else(|| ComponentPartitionError::InvalidPlacement(component.id.clone()))?;
-            let path = transform.input.strip_suffix(".effective").unwrap_or(&transform.input);
-            let point = descriptor.observations.get(path).ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(path.into()))?;
-            let routes = component.routes_per_token.ok_or_else(|| ComponentPartitionError::InvalidPlacement(component.id.clone()))?;
+            let path = transform
+                .input
+                .strip_suffix(".effective")
+                .unwrap_or(&transform.input);
+            let point = descriptor
+                .observations
+                .get(path)
+                .ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(path.into()))?;
+            let routes = component
+                .routes_per_token
+                .ok_or_else(|| ComponentPartitionError::InvalidPlacement(component.id.clone()))?;
             if !point.axes.as_ref().is_some_and(|axes| matches!(axes.as_slice(), [token, route, channel]
                 if token.dimension == eredu_core::SymbolicDimension::TokenRows
                     && route.dimension == eredu_core::SymbolicDimension::Known(routes)
@@ -1060,29 +1160,47 @@ fn register_routed_boundaries(
             boundaries.push((&transform.input, Some(component.output_width)));
         }
         for (path, width) in boundaries {
-            let point = descriptor.observations.get(path)
+            let point = descriptor
+                .observations
+                .get(path)
                 .ok_or_else(|| eredu_core::capture::CaptureError::MissingPath(path.clone()))?;
             let axis = point.axes.as_ref().and_then(|axes| axes.last()).filter(|axis|
                 matches!(axis.dimension, eredu_core::SymbolicDimension::Known(actual) if actual > 0 && width.is_none_or(|width| width == actual)))
                 .ok_or_else(|| ComponentPartitionError::InvalidPlacement(component.id.clone()))?;
             let original = if point.position == eredu_core::ObservationPosition::AfterIntervention {
-                path.strip_suffix(".effective").ok_or_else(|| ComponentPartitionError::InvalidPlacement(component.id.clone()))?
-            } else { path.as_str() };
-            replicated_observation(observations, descriptor, original, &axis.name,
-                owns_node(&point.node_id)?, ObservationHookSite::Unit)?;
+                path.strip_suffix(".effective").ok_or_else(|| {
+                    ComponentPartitionError::InvalidPlacement(component.id.clone())
+                })?
+            } else {
+                path.as_str()
+            };
+            replicated_observation(
+                observations,
+                descriptor,
+                original,
+                &axis.name,
+                owns_node(&point.node_id)?,
+                ObservationHookSite::Unit,
+            )?;
         }
     }
     Ok(())
 }
 
 fn residual_invocation_owner<'a>(
-    descriptor: &ArchitectureDescriptor, parameters: &'a ArchitectureParameterDescription, node_id: &str,
+    descriptor: &ArchitectureDescriptor,
+    parameters: &'a ArchitectureParameterDescription,
+    node_id: &str,
 ) -> Result<&'a eredu_runtime::ParameterGroupOwner, ComponentPartitionError> {
     use eredu_core::capture::CaptureError;
     let mut current = Some(node_id);
     for _ in 0..=descriptor.nodes.len() {
-        let Some(id) = current else { break; };
-        let node = descriptor.node(id).ok_or_else(|| CaptureError::Invalid("residual ancestry contains an unknown node".into()))?;
+        let Some(id) = current else {
+            break;
+        };
+        let node = descriptor.node(id).ok_or_else(|| {
+            CaptureError::Invalid("residual ancestry contains an unknown node".into())
+        })?;
         if !node.parameter_groups.is_empty() {
             return node_invocation_owner(descriptor, parameters, id);
         }
@@ -1116,9 +1234,10 @@ fn node_invocation_owner<'a>(
             .ok_or_else(invalid)?;
         // A declared logical group owns its invocation even when another
         // invocation (for example lexical injection) nests in its namespace.
-        let named_group = parameters.groups().iter().any(|owned| {
-            owned.logical_name() == group.canonical_prefix
-        });
+        let named_group = parameters
+            .groups()
+            .iter()
+            .any(|owned| owned.logical_name() == group.canonical_prefix);
         let mut matched = false;
         for owned in parameters.groups().iter().filter(|owned| {
             if named_group {
@@ -1126,7 +1245,9 @@ fn node_invocation_owner<'a>(
             } else {
                 owned.members().iter().any(|member| {
                     member.target() == group.canonical_prefix
-                        || member.target().strip_prefix(&group.canonical_prefix)
+                        || member
+                            .target()
+                            .strip_prefix(&group.canonical_prefix)
                             .is_some_and(|suffix| suffix.starts_with('.'))
                 })
             }

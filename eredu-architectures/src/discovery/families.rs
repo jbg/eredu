@@ -10,7 +10,9 @@ pub(super) fn gguf_composite(
 ) {
     use crate::gguf_companion::GgufMediaProjectorConfig as C;
     match config {
-        C::NemotronLabsDiffusion { config, .. } => super::nemotron_labs_diffusion::describe(g, config),
+        C::NemotronLabsDiffusion { config, .. } => {
+            super::nemotron_labs_diffusion::describe(g, config)
+        }
         C::Qwen4Exp(_) | C::Qwen4ExpPending { .. } => {
             if let GgufModelConfig::Qwen4Exp(target) = primary {
                 qwen4_exp(g, target.text_plan().config());
@@ -676,7 +678,9 @@ fn merge_capture(g: &mut Builder, assembly: &str) {
 
 pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig) {
     match c {
-        SafetensorsModelConfig::NemotronLabsDiffusion(c) => super::nemotron_labs_diffusion::describe(g, c),
+        SafetensorsModelConfig::NemotronLabsDiffusion(c) => {
+            super::nemotron_labs_diffusion::describe(g, c)
+        }
         SafetensorsModelConfig::Qwen4Exp(c, _) => qwen4_exp(g, c),
         SafetensorsModelConfig::K2Horizon(c) => k2_horizon(g, c),
         SafetensorsModelConfig::Nanbeige(c) => nanbeige(g, c),
@@ -705,7 +709,9 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
 
 pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
     match c {
-        GgufModelConfig::NemotronLabsDiffusion(plan) => super::nemotron_labs_diffusion::describe(g, plan.text_config()),
+        GgufModelConfig::NemotronLabsDiffusion(plan) => {
+            super::nemotron_labs_diffusion::describe(g, plan.text_config())
+        }
         GgufModelConfig::Qwen4Exp(plan) => qwen4_exp(g, plan.text_plan().config()),
         GgufModelConfig::K2Horizon(c) => k2_horizon(g, c),
         GgufModelConfig::Lfm2(c) => lfm2(g, c),
@@ -1600,16 +1606,28 @@ fn muse(g: &mut Builder, c: &crate::muse::DecoderConfig) {
                     0,
                     c.norm_topk_prob,
                     match c.routed_feed_forward {
-                        crate::muse::RoutedFeedForwardEquation::DirectSoftmax => RoutingScoreTransform::Softmax,
-                        crate::muse::RoutedFeedForwardEquation::CompressedSigmoid { .. } => RoutingScoreTransform::Sigmoid,
+                        crate::muse::RoutedFeedForwardEquation::DirectSoftmax => {
+                            RoutingScoreTransform::Softmax
+                        }
+                        crate::muse::RoutedFeedForwardEquation::CompressedSigmoid { .. } => {
+                            RoutingScoreTransform::Sigmoid
+                        }
                     },
                 )
             }),
         );
         if c.is_moe() {
             match crate::muse::text::routing_selection_spec(c) {
-                Ok(spec) => g.routing_control(&format!("decoder.{i}.feed_forward"), &format!("model.layers.{i}.routing"), spec, 0, false),
-                Err(error) => g.partial(format!("Muse routing control declaration failed: {error}")),
+                Ok(spec) => g.routing_control(
+                    &format!("decoder.{i}.feed_forward"),
+                    &format!("model.layers.{i}.routing"),
+                    spec,
+                    0,
+                    false,
+                ),
+                Err(error) => {
+                    g.partial(format!("Muse routing control declaration failed: {error}"))
+                }
             }
         }
         super::components::muse::unit(g, c, i);

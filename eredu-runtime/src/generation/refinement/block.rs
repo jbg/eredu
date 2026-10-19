@@ -100,10 +100,13 @@ where
     }
 
     /// Independent numerical stream at the last settled block boundary.
-    pub fn random(&self) -> &B::RandomState { &self.random }
+    pub fn random(&self) -> &B::RandomState {
+        &self.random
+    }
     /// Carries spent draws through a policy handoff after the block settles.
     pub fn into_random(self) -> B::RandomState {
-        self.refinement.map_or(self.random, RefinementState::into_random)
+        self.refinement
+            .map_or(self.random, RefinementState::into_random)
     }
 
     /// Exact authoritative context growth needed to emit a finite future prefix.

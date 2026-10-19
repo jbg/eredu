@@ -19,8 +19,8 @@ use crate::processor_plan::{
     QwenProcessorPlan, RgbTransformPlan,
 };
 
-mod qwen_request;
 mod nemotron_request;
+mod qwen_request;
 use eredu_runtime::processor_resources::{
     ProcessorRequestBudget, ProcessorRequestResources, ProcessorResourceError,
 };
@@ -516,7 +516,10 @@ impl PreparedProcessor {
     /// Selects architecture-owned processor semantics without backend inspection.
     pub fn from_artifact(plan: &ArtifactArchitecturePlan) -> Option<Self> {
         if let Some(plan) = plan.nemotron_labs_diffusion().cloned() {
-            return Some(Self { authority: None, kind: ProcessorKind::NemotronLabsDiffusion(plan) });
+            return Some(Self {
+                authority: None,
+                kind: ProcessorKind::NemotronLabsDiffusion(plan),
+            });
         }
 
         if let Some(plan) = plan.qwen().cloned() {
@@ -610,7 +613,12 @@ impl PreparedProcessor {
             }
             None => budget,
         };
-        if budget.is_some() && !matches!(self.kind, ProcessorKind::Qwen(_) | ProcessorKind::NemotronLabsDiffusion(_)) {
+        if budget.is_some()
+            && !matches!(
+                self.kind,
+                ProcessorKind::Qwen(_) | ProcessorKind::NemotronLabsDiffusion(_)
+            )
+        {
             return Err(ProcessorExecutionError::Resources(
                 ProcessorResourceError::Unavailable,
             ));
@@ -1385,31 +1393,38 @@ where
                 push_muse_video(&mut parts, video, &video_plan, mechanisms, encode_text)?;
             }
             TokenizedMultimodalSegment::Media(Media::Audio(audio)) => {
-                let waveform = plan.waveform().ok_or_else(|| ProcessorExecutionError::Plan(
-                    "selected Muse processor asset has no waveform policy".into(),
-                ))?;
+                let waveform = plan.waveform().ok_or_else(|| {
+                    ProcessorExecutionError::Plan(
+                        "selected Muse processor asset has no waveform policy".into(),
+                    )
+                })?;
                 let padded = eredu_media::audio::pad_waveform_to_cadence(
                     AudioWaveform::new(audio.samples(), audio.sample_rate())
                         .map_err(|error| ProcessorExecutionError::Plan(error.to_string()))?,
                     waveform.sample_rate,
                     waveform.samples_per_token,
-                ).map_err(|error| ProcessorExecutionError::Plan(error.to_string()))?;
+                )
+                .map_err(|error| ProcessorExecutionError::Plan(error.to_string()))?;
                 push_tokens(
                     &mut parts,
                     &encode_text(waveform.start_text).map_err(ProcessorExecutionError::Text)?,
                     mechanisms,
                 )?;
-                let payload = mechanisms.tensor_f32(&padded.samples, &[1, padded.samples.len()])
+                let payload = mechanisms
+                    .tensor_f32(&padded.samples, &[1, padded.samples.len()])
                     .map_err(mechanism_error)?;
                 // The exact valid-sample extent carries the reference attention
                 // mask's length. Independent clips are padded separately, so no
                 // sample-sized native mask or cross-clip batch padding is needed.
-                parts.push(PreparedInputPart::new_with_extents(
-                    InputModality::Audio,
-                    PreparedInputPayload::Tensor(payload),
-                    [],
-                    [InputExtent::AudioValidSamples(padded.valid_samples)],
-                ).map_err(ProcessorExecutionError::Prepared)?);
+                parts.push(
+                    PreparedInputPart::new_with_extents(
+                        InputModality::Audio,
+                        PreparedInputPayload::Tensor(payload),
+                        [],
+                        [InputExtent::AudioValidSamples(padded.valid_samples)],
+                    )
+                    .map_err(ProcessorExecutionError::Prepared)?,
+                );
                 push_tokens(
                     &mut parts,
                     &encode_text(waveform.end_text).map_err(ProcessorExecutionError::Text)?,

@@ -176,14 +176,27 @@ pub struct MediaShapePlan {
 
 /// Resolves independently packed tower axes before observation transaction admission.
 /// Projected caller inputs contribute no tower invocation.
-pub fn capture_media_shape(plans: &[PreparedInputPartPlan]) -> Result<Option<eredu_core::capture::CaptureMediaShape>, CapabilityError> {
+pub fn capture_media_shape(
+    plans: &[PreparedInputPartPlan],
+) -> Result<Option<eredu_core::capture::CaptureMediaShape>, CapabilityError> {
     let mut result: Option<eredu_core::capture::CaptureMediaShape> = None;
     for plan in plans {
         if let PreparedInputPartPlan::Media { shape } = plan {
             if let Some(media) = shape.capture_media {
-                let current = result.get_or_insert(eredu_core::capture::CaptureMediaShape { patches: 0, projected: 0 });
-                current.patches = current.patches.checked_add(media.patches).ok_or(CapabilityError::ArithmeticOverflow { operation: "capture media patches" })?;
-                current.projected = current.projected.checked_add(media.projected).ok_or(CapabilityError::ArithmeticOverflow { operation: "capture projected media" })?;
+                let current = result.get_or_insert(eredu_core::capture::CaptureMediaShape {
+                    patches: 0,
+                    projected: 0,
+                });
+                current.patches = current.patches.checked_add(media.patches).ok_or(
+                    CapabilityError::ArithmeticOverflow {
+                        operation: "capture media patches",
+                    },
+                )?;
+                current.projected = current.projected.checked_add(media.projected).ok_or(
+                    CapabilityError::ArithmeticOverflow {
+                        operation: "capture projected media",
+                    },
+                )?;
             }
         }
     }
@@ -416,7 +429,9 @@ impl From<MuseInputPartPlan> for PreparedInputPartPlan {
     fn from(plan: MuseInputPartPlan) -> Self {
         match plan {
             MuseInputPartPlan::TextTokens { positions } => Self::Text { positions },
-            MuseInputPartPlan::Vision { shape, .. } | MuseInputPartPlan::Audio {shape, ..} => Self::Media { shape },
+            MuseInputPartPlan::Vision { shape, .. } | MuseInputPartPlan::Audio { shape, .. } => {
+                Self::Media { shape }
+            }
         }
     }
 }
@@ -542,7 +557,7 @@ impl CompositePartPlan for MuseInputPartPlan {
     fn decoder_positions(&self) -> u64 {
         match self {
             Self::TextTokens { positions } => *positions,
-            Self::Vision { shape, .. } | Self::Audio {shape, ..} => shape.decoder_positions,
+            Self::Vision { shape, .. } | Self::Audio { shape, .. } => shape.decoder_positions,
         }
     }
 }
@@ -992,7 +1007,7 @@ fn qwen_vision(
         "Qwen vision graph workspace",
     )?;
     Ok(MediaShapePlan {
-                capture_media: None,
+        capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: graph_scalars,
     })
@@ -1546,7 +1561,7 @@ fn gemma_vision(
         "Gemma vision graph workspace",
     )?;
     Ok(MediaShapePlan {
-                capture_media: None,
+        capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: graph_scalars,
     })
@@ -1692,7 +1707,7 @@ fn gemma_audio(
         "Gemma audio graph workspace",
     )?;
     Ok(MediaShapePlan {
-                capture_media: None,
+        capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: graph_scalars,
     })
@@ -1958,13 +1973,14 @@ fn muse_vision(
     args: &crate::muse::DecoderConfig,
     input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
-    let vision = args.vision_config.as_ref().ok_or_else(|| {
-        CapabilityError::MissingCompanion {
+    let vision = args
+        .vision_config
+        .as_ref()
+        .ok_or_else(|| CapabilityError::MissingCompanion {
             architecture: args.identity.text_model_type().into(),
             modality: input.modality(),
             component: "vision encoder and projector",
-        }
-    })?;
+        })?;
     if input.modality() == InputModality::Audio
         || (input.modality() == InputModality::Video
             && vision.input_policy == crate::muse::VisionInputPolicy::Images)
@@ -2049,7 +2065,7 @@ fn muse_vision(
         "Muse vision activation scalars",
     )?;
     Ok(MediaShapePlan {
-                capture_media: None,
+        capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: checked_mul(graph, 8, "Muse vision graph multiplier")?,
     })
@@ -2068,16 +2084,14 @@ pub fn muse_input_part<Tensor>(
     let payload = descriptor.payload_kind();
     let shape = u64_shape(descriptor.payload())?;
     match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => {
-            Ok(MuseInputPartPlan::TextTokens {
-                positions: batch_one_sequence(
-                    &shape,
-                    2,
-                    "Muse-Glimmer text token IDs",
-                    args.identity.text_model_type(),
-                )?,
-            })
-        }
+        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(MuseInputPartPlan::TextTokens {
+            positions: batch_one_sequence(
+                &shape,
+                2,
+                "Muse-Glimmer text token IDs",
+                args.identity.text_model_type(),
+            )?,
+        }),
         (modality @ (InputModality::Image | InputModality::Video), InputPayloadKind::Tensor) => {
             let shape = muse_vision(args, &inspected)?;
             let placeholder_token_id = if modality == InputModality::Image {
@@ -2116,15 +2130,43 @@ pub fn muse_input_part<Tensor>(
         }
         (InputModality::Audio, InputPayloadKind::Tensor) if args.audio_config.is_some() => {
             let audio = args.audio_config.as_ref().expect("admitted audio geometry");
-            let samples = batch_one_sequence(&shape, 2, "Muse mono waveform", args.identity.text_model_type())?;
-            let cadence = nonzero_positive(audio.samples_per_token().map_err(|error| unsupported(args.identity.text_model_type(), error.to_string()))?, "Muse waveform cadence")?;
-            let valid = descriptor.extents().find_map(|extent| match extent {
-                InputExtent::AudioValidSamples(samples) => u64::try_from(samples).ok(), _ => None,
-            }).ok_or_else(|| unsupported(args.identity.text_model_type(), "Muse waveform requires valid-sample extent"))?;
-            if samples == 0 || samples % cadence != 0 || valid == 0 || valid > samples
+            let samples = batch_one_sequence(
+                &shape,
+                2,
+                "Muse mono waveform",
+                args.identity.text_model_type(),
+            )?;
+            let cadence = nonzero_positive(
+                audio.samples_per_token().map_err(|error| {
+                    unsupported(args.identity.text_model_type(), error.to_string())
+                })?,
+                "Muse waveform cadence",
+            )?;
+            let valid = descriptor
+                .extents()
+                .find_map(|extent| match extent {
+                    InputExtent::AudioValidSamples(samples) => u64::try_from(samples).ok(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    unsupported(
+                        args.identity.text_model_type(),
+                        "Muse waveform requires valid-sample extent",
+                    )
+                })?;
+            if samples == 0
+                || samples % cadence != 0
+                || valid == 0
+                || valid > samples
                 || valid.div_ceil(cadence) != samples / cadence
-                || descriptor.extents().count() != 1 || !descriptor.metadata().is_empty()
-                || !matches!(descriptor.payload().dtype(), eredu_core::checkpoint::TensorDtype::F32 | eredu_core::checkpoint::TensorDtype::F16 | eredu_core::checkpoint::TensorDtype::Bf16)
+                || descriptor.extents().count() != 1
+                || !descriptor.metadata().is_empty()
+                || !matches!(
+                    descriptor.payload().dtype(),
+                    eredu_core::checkpoint::TensorDtype::F32
+                        | eredu_core::checkpoint::TensorDtype::F16
+                        | eredu_core::checkpoint::TensorDtype::Bf16
+                )
             {
                 return Err(unsupported(args.identity.text_model_type(), "Muse waveform must be floating mono PCM padded only to its final token cadence"));
             }
@@ -2133,13 +2175,31 @@ pub fn muse_input_part<Tensor>(
             let mut workspace = samples;
             for (&patch, &width) in audio.patch_sizes.iter().zip(&audio.hidden_sizes) {
                 frames /= nonzero_positive(patch, "Muse audio patch")?;
-                workspace = workspace.max(checked_mul(checked_mul(frames, positive(width, "Muse audio width")?, "Muse audio frame scalars")?, 8, "Muse audio workspace")?);
+                workspace = workspace.max(checked_mul(
+                    checked_mul(
+                        frames,
+                        positive(width, "Muse audio width")?,
+                        "Muse audio frame scalars",
+                    )?,
+                    8,
+                    "Muse audio workspace",
+                )?);
             }
-            Ok(MuseInputPartPlan::Audio {ingress:MuseAudioIngressPlan {
-                valid_samples:valid, padded_samples:samples,
-                placeholder_token_id:args.audio_token_id.expect("validated audio token identity"),
-                placeholder_count:positions,
-            }, shape:MediaShapePlan {decoder_positions:positions, execution_workspace_scalars:workspace, capture_media:None}})
+            Ok(MuseInputPartPlan::Audio {
+                ingress: MuseAudioIngressPlan {
+                    valid_samples: valid,
+                    padded_samples: samples,
+                    placeholder_token_id: args
+                        .audio_token_id
+                        .expect("validated audio token identity"),
+                    placeholder_count: positions,
+                },
+                shape: MediaShapePlan {
+                    decoder_positions: positions,
+                    execution_workspace_scalars: workspace,
+                    capture_media: None,
+                },
+            })
         }
         (modality, payload) => Err(unsupported(
             args.identity.text_model_type(),

@@ -1,12 +1,12 @@
 //! Shared-backbone Nemotron-Labs-Diffusion equations and artifact contracts.
 
 pub mod adapter;
-pub mod generation;
-pub mod composite;
-pub mod input;
-pub mod gguf;
 mod checkpoint;
+pub mod composite;
 mod config;
+pub mod generation;
+pub mod gguf;
+pub mod input;
 pub mod model;
 pub mod parallel;
 pub mod partitioned;

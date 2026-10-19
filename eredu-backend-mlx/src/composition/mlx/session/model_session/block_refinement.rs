@@ -14,10 +14,13 @@ use eredu_runtime::{
 fn causal_next_logits(scores: Array, stream: &Stream) -> Result<Array, Error> {
     let shape = scores.shape();
     match shape {
-        [1, sequence, vocabulary] if *sequence > 0 && *vocabulary > 0 =>
-            Ok(scores.try_index_device((.., -1, ..), stream)?),
+        [1, sequence, vocabulary] if *sequence > 0 && *vocabulary > 0 => {
+            Ok(scores.try_index_device((.., -1, ..), stream)?)
+        }
         [1, vocabulary] if *vocabulary > 0 => Ok(scores),
-        _ => Err(Error::ArchitectureModel("causal context has invalid next-token score geometry".into())),
+        _ => Err(Error::ArchitectureModel(
+            "causal context has invalid next-token score geometry".into(),
+        )),
     }
 }
 
@@ -87,12 +90,19 @@ impl MlxModelSession {
     }
 
     pub(super) fn submit_settled_logits(
-        &mut self, backend: &MlxBackend<'_>, scores: Array,
+        &mut self,
+        backend: &MlxBackend<'_>,
+        scores: Array,
     ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
         let operation = self.begin_submission(backend)?;
         let validation = TokenValidationScope::begin()?;
         let (output, owner, recovery) = operation.finish(Ok(scores))?;
-        Ok(model_array_submission(output, validation.finish(), owner, recovery))
+        Ok(model_array_submission(
+            output,
+            validation.finish(),
+            owner,
+            recovery,
+        ))
     }
 
     fn submit_finalization_boundary(
@@ -119,38 +129,72 @@ impl MlxBackend<'_> {
         previous: eredu_core::decoding::DecodingMode,
         requested: eredu_core::decoding::DecodingMode,
     ) -> Result<bool, Error> {
-        if state.sampling.speculative.is_some() { return Ok(false); }
-        if matches!(previous, eredu_core::decoding::DecodingMode::SelfSpeculation(_)) {
+        if state.sampling.speculative.is_some() {
+            return Ok(false);
+        }
+        if matches!(
+            previous,
+            eredu_core::decoding::DecodingMode::SelfSpeculation(_)
+        ) {
             if let Some(PendingTextInput::Decode(token)) = input.as_ref() {
                 let stream = runtime.backend().stream().clone();
                 let token = token.value.clone().try_item::<u32>(&stream)?;
-                state.sampling.next_logits = Some(Self::append_shared_committed_suffix(runtime, state, &[token])?);
+                state.sampling.next_logits = Some(Self::append_shared_committed_suffix(
+                    runtime,
+                    state,
+                    &[token],
+                )?);
                 state.sampling.committed_token_cached = true;
                 *input = Some(PendingTextInput::Continue);
             }
         }
-        if matches!(previous, eredu_core::decoding::DecodingMode::Diffusion { .. }) {
+        if matches!(
+            previous,
+            eredu_core::decoding::DecodingMode::Diffusion { .. }
+        ) {
             if let Some(block) = &state.sampling.refinement {
-                if block.phase() != GenerationPhase::Context { return Ok(false); }
-                let arrays = block.authoritative_tokens().iter().map(|token| token.as_array()).collect::<Vec<_>>();
+                if block.phase() != GenerationPhase::Context {
+                    return Ok(false);
+                }
+                let arrays = block
+                    .authoritative_tokens()
+                    .iter()
+                    .map(|token| token.as_array())
+                    .collect::<Vec<_>>();
                 if !arrays.is_empty() {
                     let stream = runtime.backend().stream().clone();
                     let tokens = safemlx::ops::concatenate(&arrays, &stream)?
-                        .as_dtype(Dtype::Uint32, &stream)?.into_evaluated()?.try_to_vec::<u32>()
+                        .as_dtype(Dtype::Uint32, &stream)?
+                        .into_evaluated()?
+                        .try_to_vec::<u32>()
                         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    state.sampling.next_logits = Some(Self::append_shared_committed_suffix(runtime, state, &tokens)?);
+                    state.sampling.next_logits = Some(Self::append_shared_committed_suffix(
+                        runtime, state, &tokens,
+                    )?);
                     *input = Some(PendingTextInput::Continue);
                 }
             }
-            state.sampling.refinement_random = state.sampling.refinement.take().map(BlockRefinementState::into_random)
+            state.sampling.refinement_random = state
+                .sampling
+                .refinement
+                .take()
+                .map(BlockRefinementState::into_random)
                 .or_else(|| state.sampling.refinement_random.take());
         }
         state.sampling.mode = requested;
         if let eredu_core::decoding::DecodingMode::Diffusion { policy } = requested {
             state.sampling.refinement_policy = match policy {
                 Some(policy) => policy,
-                None => runtime.session().payload.model.erased().capability_estimate().shared_backbone_draft()
-                    .ok_or_else(|| Error::ArchitectureModel("no retained masked generation policy".into()))?
+                None => runtime
+                    .session()
+                    .payload
+                    .model
+                    .erased()
+                    .capability_estimate()
+                    .shared_backbone_draft()
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel("no retained masked generation policy".into())
+                    })?
                     .diffusion_policy(state.sampling.temperature)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             };
@@ -179,11 +223,22 @@ impl MlxBackend<'_> {
         runtime
             .session()
             .validate_parameter_epoch(&mut state.sampling.parameter_epoch)?;
-        let shared_policy = runtime.session().payload.model.erased().capability_estimate().shared_backbone_draft();
+        let shared_policy = runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .capability_estimate()
+            .shared_backbone_draft();
         if state.sampling.refinement.is_none()
-            && matches!(state.sampling.mode, eredu_core::decoding::DecodingMode::Diffusion { policy: None }) {
+            && matches!(
+                state.sampling.mode,
+                eredu_core::decoding::DecodingMode::Diffusion { policy: None }
+            )
+        {
             if let Some(policy) = shared_policy {
-                state.sampling.refinement_policy = policy.diffusion_policy(state.sampling.temperature)
+                state.sampling.refinement_policy = policy
+                    .diffusion_policy(state.sampling.temperature)
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             }
         }
@@ -197,88 +252,92 @@ impl MlxBackend<'_> {
         let domain = TokenDomain::new(geometry.vocabulary_size.get() as usize);
         let submission = match phase {
             GenerationPhase::Context => {
-                let cached = if state.sampling.refinement.is_none() && matches!(input, PendingTextInput::Continue) {
+                let cached = if state.sampling.refinement.is_none()
+                    && matches!(input, PendingTextInput::Continue)
+                {
                     state.sampling.next_logits.take()
-                } else { None };
+                } else {
+                    None
+                };
                 if let Some(scores) = cached {
                     let (backend, session) = runtime.parts_mut();
                     session.submit_settled_logits(backend, scores)?
                 } else {
-                let prompt = match (&state.sampling.refinement, input) {
-                    (None, PendingTextInput::Prefill(prompt)) => prompt,
-                    (None, PendingTextInput::Decode(token)) => {
-                        let tokens = token.value.reshape(&[1, 1], &stream)?;
-                        let parts = [input::token_ids_part(&tokens)?];
-                        MlxModelInput::from(input::ModelInput::new(&parts))
-                    },
-                    (Some(block), _) => {
-                        let arrays = block
-                            .authoritative_tokens()
-                            .iter()
-                            .map(|token| token.as_array())
-                            .collect::<Vec<_>>();
-                        if arrays.len() != geometry.canvas_length.get() as usize {
-                            return Err(Error::ArchitectureModel(
-                                "next context requires a complete authoritative block".into(),
-                            ));
+                    let prompt = match (&state.sampling.refinement, input) {
+                        (None, PendingTextInput::Prefill(prompt)) => prompt,
+                        (None, PendingTextInput::Decode(token)) => {
+                            let tokens = token.value.reshape(&[1, 1], &stream)?;
+                            let parts = [input::token_ids_part(&tokens)?];
+                            MlxModelInput::from(input::ModelInput::new(&parts))
                         }
-                        let tokens = safemlx::ops::concatenate(&arrays, &stream)?
-                            .reshape(&[1, arrays.len() as i32], &stream)?;
-                        let parts = [input::input_part(
-                            InputModality::Text,
-                            input::InputPayload::TokenIds(tokens),
-                            [],
-                            [],
-                        )?];
-                        MlxModelInput::from(input::ModelInput::new(&parts))
+                        (Some(block), _) => {
+                            let arrays = block
+                                .authoritative_tokens()
+                                .iter()
+                                .map(|token| token.as_array())
+                                .collect::<Vec<_>>();
+                            if arrays.len() != geometry.canvas_length.get() as usize {
+                                return Err(Error::ArchitectureModel(
+                                    "next context requires a complete authoritative block".into(),
+                                ));
+                            }
+                            let tokens = safemlx::ops::concatenate(&arrays, &stream)?
+                                .reshape(&[1, arrays.len() as i32], &stream)?;
+                            let parts = [input::input_part(
+                                InputModality::Text,
+                                input::InputPayload::TokenIds(tokens),
+                                [],
+                                [],
+                            )?];
+                            MlxModelInput::from(input::ModelInput::new(&parts))
+                        }
+                        _ => {
+                            return Err(Error::ArchitectureModel(
+                                "initial refinement context requires a prepared prompt".into(),
+                            ))
+                        }
+                    };
+                    let (backend, session) = runtime.parts_mut();
+                    let invocation = prompt.with_borrowed(|input| {
+                        let plans = session
+                            .payload
+                            .model
+                            .erased()
+                            .prepared_input_plans(input)
+                            .map_err(|error| CaptureError::Invalid(error.to_string()))?;
+                        let sequence = plans
+                            .iter()
+                            .try_fold(0u64, |total, part| {
+                                total.checked_add(part.decoder_positions())
+                            })
+                            .ok_or(CaptureError::Overflow)?;
+                        session
+                            .refinement_capture_shape(sequence)
+                            .map(|shape| (CapturePhase::Prefill, shape))
+                    });
+                    match &mut state.capture {
+                        Some(capture) => partition_capture::with_invocation_observer(
+                            session,
+                            capture,
+                            &stream,
+                            state.sampling.next_prediction,
+                            invocation,
+                            |session, observer| {
+                                session.submit_prefill_result_with_observer(
+                                    backend,
+                                    Ok(prompt),
+                                    None,
+                                    &mut eredu_runtime::BorrowedActivationObserver(observer),
+                                )
+                            },
+                        )?,
+                        None => session.submit_prefill_result_with_observer(
+                            backend,
+                            Ok(prompt),
+                            None,
+                            &mut eredu_runtime::NoopObserver,
+                        )?,
                     }
-                    _ => {
-                        return Err(Error::ArchitectureModel(
-                            "initial refinement context requires a prepared prompt".into(),
-                        ))
-                    }
-                };
-                let (backend, session) = runtime.parts_mut();
-                let invocation = prompt.with_borrowed(|input| {
-                    let plans = session
-                        .payload
-                        .model
-                        .erased()
-                        .prepared_input_plans(input)
-                        .map_err(|error| CaptureError::Invalid(error.to_string()))?;
-                    let sequence = plans
-                        .iter()
-                        .try_fold(0u64, |total, part| {
-                            total.checked_add(part.decoder_positions())
-                        })
-                        .ok_or(CaptureError::Overflow)?;
-                    session
-                        .refinement_capture_shape(sequence)
-                        .map(|shape| (CapturePhase::Prefill, shape))
-                });
-                match &mut state.capture {
-                    Some(capture) => partition_capture::with_invocation_observer(
-                        session,
-                        capture,
-                        &stream,
-                        state.sampling.next_prediction,
-                        invocation,
-                        |session, observer| {
-                            session.submit_prefill_result_with_observer(
-                                backend,
-                                Ok(prompt),
-                                None,
-                                &mut eredu_runtime::BorrowedActivationObserver(observer),
-                            )
-                        },
-                    )?,
-                    None => session.submit_prefill_result_with_observer(
-                        backend,
-                        Ok(prompt),
-                        None,
-                        &mut eredu_runtime::NoopObserver,
-                    )?,
-                }
                 }
             }
             GenerationPhase::Refinement => {
@@ -346,12 +405,21 @@ impl MlxBackend<'_> {
                     geometry.canvas_length,
                     domain,
                     submission.output.dtype(),
-                    state.sampling.refinement_random.take().map_or_else(|| {
-                        if shared_policy.is_some() {
-                            crate::backend::random::split_key_at(&safemlx::random::key(state.sampling.refinement_seed)?, 1, &stream)
+                    state.sampling.refinement_random.take().map_or_else(
+                        || {
+                            if shared_policy.is_some() {
+                                crate::backend::random::split_key_at(
+                                    &safemlx::random::key(state.sampling.refinement_seed)?,
+                                    1,
+                                    &stream,
+                                )
                                 .map(RandomState::from_key)
-                        } else { RandomState::with_seed(state.sampling.refinement_seed) }
-                    }, Ok)?,
+                            } else {
+                                RandomState::with_seed(state.sampling.refinement_seed)
+                            }
+                        },
+                        Ok,
+                    )?,
                     state.sampling.canvas.clone(),
                 ));
             }
@@ -365,22 +433,58 @@ impl MlxBackend<'_> {
                     }
                     let block_index = block.block();
                     let mut random = block.random().clone();
-                    let seeds = if shared_policy.is_some_and(|policy| policy.seed_first()) && state.sampling.canvas.is_none() {
+                    let seeds = if shared_policy.is_some_and(|policy| policy.seed_first())
+                        && state.sampling.canvas.is_none()
+                    {
                         use eredu_runtime::generation::refinement::RefinementBackend;
-                        let eredu_core::refinement::RefinementPolicy::MaskedUnmasking { config, mask_token_id } = state.sampling.refinement_policy else {
-                            return Err(Error::ArchitectureModel("seeded masked context requires a masked policy".into()));
+                        let eredu_core::refinement::RefinementPolicy::MaskedUnmasking {
+                            config,
+                            mask_token_id,
+                        } = state.sampling.refinement_policy
+                        else {
+                            return Err(Error::ArchitectureModel(
+                                "seeded masked context requires a masked policy".into(),
+                            ));
                         };
-                        let scores = MlxTensor::from_array(causal_next_logits(submission.output.clone(), &stream)?);
-                        let mask = MlxTensor::from_array(Array::from_slice(&[mask_token_id as i32], &[1]));
-                        let sampled = MlxSamplingBackend::masked_refinement_step(&mask, None, &scores, mask_token_id, config, 1, &mut random, &stream)?
-                            .ok_or_else(|| Error::ArchitectureModel("masked seed sampling is unavailable".into()))?;
-                        let seed = sampled.canvas.as_array().as_dtype(Dtype::Uint32, &stream)?.into_evaluated()?.try_to_vec::<u32>()
+                        let scores = MlxTensor::from_array(causal_next_logits(
+                            submission.output.clone(),
+                            &stream,
+                        )?);
+                        let mask =
+                            MlxTensor::from_array(Array::from_slice(&[mask_token_id as i32], &[1]));
+                        let sampled = MlxSamplingBackend::masked_refinement_step(
+                            &mask,
+                            None,
+                            &scores,
+                            mask_token_id,
+                            config,
+                            1,
+                            &mut random,
+                            &stream,
+                        )?
+                        .ok_or_else(|| {
+                            Error::ArchitectureModel("masked seed sampling is unavailable".into())
+                        })?;
+                        let seed = sampled
+                            .canvas
+                            .as_array()
+                            .as_dtype(Dtype::Uint32, &stream)?
+                            .into_evaluated()?
+                            .try_to_vec::<u32>()
                             .map_err(|error| Error::ArchitectureModel(error.to_string()))?[0];
                         let mut seeds = vec![None; geometry.canvas_length.get() as usize];
                         seeds[0] = Some(seed);
-                        Some(eredu_core::refinement::RefinementCanvas { seed_tokens: seeds,
-                            pinned_positions: if seed == mask_token_id { vec![] } else { vec![0] } })
-                    } else { None };
+                        Some(eredu_core::refinement::RefinementCanvas {
+                            seed_tokens: seeds,
+                            pinned_positions: if seed == mask_token_id {
+                                vec![]
+                            } else {
+                                vec![0]
+                            },
+                        })
+                    } else {
+                        None
+                    };
                     block.replace_random(random);
                     block
                         .context_encoded(&stream, seeds.as_ref())
@@ -468,9 +572,19 @@ impl MlxBackend<'_> {
                         )
                         .map_err(eredu_nn::Error::backend_source)?;
                     if shared_policy.is_some() {
-                        let token_id = <MlxSamplingBackend as eredu_runtime::SamplingBackend>::token_id(&finalized.token, &stream)?;
-                        <MlxTextSampler as eredu_runtime::SpeculativeSampler<MlxSamplingBackend>>::commit_token(
-                            &mut state.sampling.sampler, &finalized.scores, token_id, &stream)?;
+                        let token_id =
+                            <MlxSamplingBackend as eredu_runtime::SamplingBackend>::token_id(
+                                &finalized.token,
+                                &stream,
+                            )?;
+                        <MlxTextSampler as eredu_runtime::SpeculativeSampler<
+                            MlxSamplingBackend,
+                        >>::commit_token(
+                            &mut state.sampling.sampler,
+                            &finalized.scores,
+                            token_id,
+                            &stream,
+                        )?;
                     }
                     state.sampling.next_prediction = state
                         .sampling

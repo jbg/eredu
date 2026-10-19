@@ -1426,7 +1426,9 @@ where
         if invocation == eredu_core::decoding::AttentionInvocation::CAUSAL && feedback.is_none() {
             return Some(TextInput::Context { tokens, mask });
         }
-        if invocation != eredu_core::decoding::AttentionInvocation::DIFFUSION { return None; }
+        if invocation != eredu_core::decoding::AttentionInvocation::DIFFUSION {
+            return None;
+        }
         Some(TextInput::Refinement {
             tokens,
             feedback,

@@ -101,10 +101,15 @@ where
     > {
         self.ensure_commit_resolved()?;
         let state = match self.selected_state.state() {
-            Some(selected) => self.mechanisms.realize_state(selected, context)
+            Some(selected) => self
+                .mechanisms
+                .realize_state(selected, context)
                 .map_err(ReplicatedTextSessionError::Mechanism)?,
-            None => self.mechanisms.realize_stateless_state().ok_or_else(||
-                ReplicatedTextSessionError::Contract("mechanism cannot realize a stateless parameter reset".into()))?,
+            None => self.mechanisms.realize_stateless_state().ok_or_else(|| {
+                ReplicatedTextSessionError::Contract(
+                    "mechanism cannot realize a stateless parameter reset".into(),
+                )
+            })?,
         };
         self.validate_control_geometry(&state)?;
         Ok(ReplicatedTextControlState {

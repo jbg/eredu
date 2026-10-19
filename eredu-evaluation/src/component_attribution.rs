@@ -168,8 +168,6 @@ impl MeasuredReadout {
 mod tests {
     use super::*;
 
-
-
     #[test]
     fn signed_components_embedding_and_bias_reconstruct_declared_scores_and_margins() {
         let embedding = [1.1, -0.7, 0.2, 0.5];

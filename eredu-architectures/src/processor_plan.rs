@@ -560,17 +560,23 @@ pub struct ArtifactArchitecturePlan {
     media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
     processor: Option<NormalizedProcessorPlan>,
     prediction_extension: Option<crate::configuration::PredictionExtensionPlan>,
-    draft_adapter: Option<std::sync::Arc<crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter>>,
+    draft_adapter:
+        Option<std::sync::Arc<crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter>>,
     media_companions: Vec<std::sync::Arc<crate::muse::media_companion::Bf16MediaCompanion>>,
 }
 
 impl ArtifactArchitecturePlan {
-    pub(crate) fn draft_adapter(&self) -> Option<&crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter> {
+    pub(crate) fn draft_adapter(
+        &self,
+    ) -> Option<&crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter> {
         self.draft_adapter.as_deref()
     }
 
-    pub(crate) fn with_draft_adapter(mut self, source: &eredu_core::DraftAdapterSource) -> Result<Self, String> {
-        use crate::configuration::{SafetensorsModelConfig, GgufModelConfig};
+    pub(crate) fn with_draft_adapter(
+        mut self,
+        source: &eredu_core::DraftAdapterSource,
+    ) -> Result<Self, String> {
+        use crate::configuration::{GgufModelConfig, SafetensorsModelConfig};
         let config = match &self.family {
             ArtifactFamilyPlan::Safetensors(plan) => match plan.model() {
                 SafetensorsModelConfig::NemotronLabsDiffusion(config) => config,
@@ -581,10 +587,15 @@ impl ArtifactArchitecturePlan {
                 _ => return Err("draft adapter requires shared-backbone low-rank support".into()),
             },
         };
-        let adapter = crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter::admit(config, source)?;
+        let adapter =
+            crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter::admit(config, source)?;
         self.family = match self.family {
-            ArtifactFamilyPlan::Safetensors(plan) => ArtifactFamilyPlan::Safetensors(plan.with_draft_adapter(adapter.config.clone())?),
-            ArtifactFamilyPlan::Gguf(plan) => ArtifactFamilyPlan::Gguf(plan.with_draft_adapter(adapter.config.clone())?),
+            ArtifactFamilyPlan::Safetensors(plan) => {
+                ArtifactFamilyPlan::Safetensors(plan.with_draft_adapter(adapter.config.clone())?)
+            }
+            ArtifactFamilyPlan::Gguf(plan) => {
+                ArtifactFamilyPlan::Gguf(plan.with_draft_adapter(adapter.config.clone())?)
+            }
         };
         if let Some(projector) = &mut self.media_projector {
             projector.attach_draft_adapter(adapter.config.clone())?;
@@ -714,7 +725,7 @@ impl ArtifactArchitecturePlan {
             ArtifactFamilyPlan::Safetensors(plan) => {
                 plan.resolve_muse_catalog(tensors, source)?;
                 plan.admit_catalog(tensors)?;
-            },
+            }
             ArtifactFamilyPlan::Gguf(_) => {
                 return Err(
                     eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(
@@ -741,14 +752,25 @@ impl ArtifactArchitecturePlan {
         let kind = architecture.model_kind();
         let processor = match kind {
             ModelKind::NemotronLabsDiffusion => {
-                let crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(config) = architecture.model() else {
-                    return Err(invalid("masked model processor requires its admitted configuration"));
+                let crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(config) =
+                    architecture.model()
+                else {
+                    return Err(invalid(
+                        "masked model processor requires its admitted configuration",
+                    ));
                 };
-                config.vision.as_ref().map(|vision| {
-                    crate::nemotron_labs_diffusion::processing::ImageProcessor::new(config, 1400.min(vision.image_size as u32))
+                config
+                    .vision
+                    .as_ref()
+                    .map(|vision| {
+                        crate::nemotron_labs_diffusion::processing::ImageProcessor::new(
+                            config,
+                            1400.min(vision.image_size as u32),
+                        )
                         .map(NormalizedProcessorPlan::NemotronLabsDiffusion)
                         .map_err(|error| invalid(error.to_string()))
-                }).transpose()?
+                    })
+                    .transpose()?
             }
 
             ModelKind::DiffusionGemma | ModelKind::Gemma4 => {
@@ -797,13 +819,24 @@ impl ArtifactArchitecturePlan {
                 .collect::<HashMap<_, _>>()
         };
         let processor = match architecture {
-            GgufArchitecture::NemotronLabsDiffusion => self.media_projector.as_ref().map(|projector| {
-                let crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } = projector.model() else {
-                    return Err(invalid("masked image processor requires its admitted companion"));
-                };
-                crate::nemotron_labs_diffusion::processing::ImageProcessor::new(config, 1400)
-                    .map(NormalizedProcessorPlan::NemotronLabsDiffusion).map_err(|error| invalid(error.to_string()))
-            }).transpose()?,
+            GgufArchitecture::NemotronLabsDiffusion => self
+                .media_projector
+                .as_ref()
+                .map(|projector| {
+                    let crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion {
+                        config,
+                        ..
+                    } = projector.model()
+                    else {
+                        return Err(invalid(
+                            "masked image processor requires its admitted companion",
+                        ));
+                    };
+                    crate::nemotron_labs_diffusion::processing::ImageProcessor::new(config, 1400)
+                        .map(NormalizedProcessorPlan::NemotronLabsDiffusion)
+                        .map_err(|error| invalid(error.to_string()))
+                })
+                .transpose()?,
 
             GgufArchitecture::Gemma4 => projector
                 .map(|projector| {
@@ -862,9 +895,7 @@ impl ArtifactArchitecturePlan {
                     ),
                 ),
                 SafetensorsModelConfig::Muse(config) => Some(
-                    crate::external_assistant::ExternalAssistantTargetProfile::Muse(
-                        config.clone(),
-                    ),
+                    crate::external_assistant::ExternalAssistantTargetProfile::Muse(config.clone()),
                 ),
                 _ => None,
             },
@@ -875,9 +906,7 @@ impl ArtifactArchitecturePlan {
                     ),
                 ),
                 GgufModelConfig::Muse(config) => Some(
-                    crate::external_assistant::ExternalAssistantTargetProfile::Muse(
-                        config.clone(),
-                    ),
+                    crate::external_assistant::ExternalAssistantTargetProfile::Muse(config.clone()),
                 ),
                 _ => None,
             },
@@ -993,9 +1022,12 @@ impl ArtifactArchitecturePlan {
     }
 
     /// Returns the admitted Pixtral pixel, patch and marker policy.
-    pub const fn nemotron_labs_diffusion(&self) -> Option<&crate::nemotron_labs_diffusion::processing::ImageProcessor> {
+    pub const fn nemotron_labs_diffusion(
+        &self,
+    ) -> Option<&crate::nemotron_labs_diffusion::processing::ImageProcessor> {
         match &self.processor {
-            Some(NormalizedProcessorPlan::NemotronLabsDiffusion(plan)) => Some(plan), _ => None,
+            Some(NormalizedProcessorPlan::NemotronLabsDiffusion(plan)) => Some(plan),
+            _ => None,
         }
     }
 
@@ -2336,14 +2368,24 @@ impl MuseProcessorPlan {
                     || source.temporal_patch_size != vision.temporal_patch_size as usize
                     || source.merge_size != vision.merge_size as usize
                 {
-                    return Err(invalid("Muse processor patch geometry differs from its selected vision tower"));
+                    return Err(invalid(
+                        "Muse processor patch geometry differs from its selected vision tower",
+                    ));
                 }
             }
         }
         if let Some(audio) = &config.audio_config {
-            let waveform = self.waveform.ok_or_else(|| invalid("selected audio companion omits its waveform processor"))?;
-            if waveform.samples_per_token != audio.samples_per_token().map_err(|e| invalid(e.to_string()))? as usize {
-                return Err(invalid("Muse waveform processor cadence differs from its selected audio tower"));
+            let waveform = self
+                .waveform
+                .ok_or_else(|| invalid("selected audio companion omits its waveform processor"))?;
+            if waveform.samples_per_token
+                != audio
+                    .samples_per_token()
+                    .map_err(|e| invalid(e.to_string()))? as usize
+            {
+                return Err(invalid(
+                    "Muse waveform processor cadence differs from its selected audio tower",
+                ));
             }
         }
         Ok(())
@@ -2441,7 +2483,9 @@ impl MuseProcessorPlan {
 
     /// Returns the exact waveform policy when the selected asset includes it.
     /// Weight-source coverage is checked separately during artifact preparation.
-    pub const fn waveform(&self) -> Option<MuseWaveformPlan> { self.waveform }
+    pub const fn waveform(&self) -> Option<MuseWaveformPlan> {
+        self.waveform
+    }
 
     /// Derives image framing, transform, and patch policy.
     pub fn image(&self, height: usize, width: usize) -> Result<MuseImagePlan, ProcessorPlanError> {
@@ -2503,7 +2547,10 @@ impl MuseProcessorPlan {
                     .unwrap_or(0);
                 MuseVideoGroupPlan {
                     source_indices: chunk.to_vec(),
-                    timestamp_text: self.video.frame_timestamp_format.render(source_index as f64 / source_fps),
+                    timestamp_text: self
+                        .video
+                        .frame_timestamp_format
+                        .render(source_index as f64 / source_fps),
                     boundary_text: if group + 1 == group_count {
                         "<|vid_end|>"
                     } else {

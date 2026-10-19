@@ -27,7 +27,9 @@ use super::{BlockNormalization, DecoderConfig, ResidualEquation, RoutedFeedForwa
 
 /// Exact source views for independently consumed media towers. Keys retain their
 /// admitted source spelling; namespace normalization only determines ownership.
-pub(crate) fn media_source_roles(keys: &BTreeSet<String>) -> BTreeMap<crate::artifact_preparation::ArtifactSourceRole, BTreeSet<String>> {
+pub(crate) fn media_source_roles(
+    keys: &BTreeSet<String>,
+) -> BTreeMap<crate::artifact_preparation::ArtifactSourceRole, BTreeSet<String>> {
     let mut roles = BTreeMap::<_, BTreeSet<_>>::new();
     for key in keys {
         if let Some(role) = media_source_role(key) {
@@ -37,12 +39,18 @@ pub(crate) fn media_source_roles(keys: &BTreeSet<String>) -> BTreeMap<crate::art
     roles
 }
 
-pub(crate) fn media_source_role(key: &str) -> Option<crate::artifact_preparation::ArtifactSourceRole> {
+pub(crate) fn media_source_role(
+    key: &str,
+) -> Option<crate::artifact_preparation::ArtifactSourceRole> {
     use crate::artifact_preparation::ArtifactSourceRole;
     let canonical = canonical_safetensors_target(key);
-    if canonical.starts_with("model.audio_tower.") { Some(ArtifactSourceRole::Audio) }
-    else if canonical.starts_with("model.vision_") { Some(ArtifactSourceRole::Vision) }
-    else { None }
+    if canonical.starts_with("model.audio_tower.") {
+        Some(ArtifactSourceRole::Audio)
+    } else if canonical.starts_with("model.vision_") {
+        Some(ArtifactSourceRole::Vision)
+    } else {
+        None
+    }
 }
 
 /// Resolves actual SafeTensors component coverage and per-weight MLX encodings.
@@ -232,11 +240,17 @@ pub fn load_time_quantization(
         }
     }
     if let Some(audio) = &mut target.audio_config {
-        let group = usize::try_from(quantization.group_size()).map_err(|_| "negative quantization group size")?;
-        audio.linear_formats = audio_tensor_layouts(audio)?.into_iter()
-            .filter(|tensor| tensor.operation == TensorOperation::Matrix
-                && tensor.shape[1].is_multiple_of(group) && tensor.shape[1].is_multiple_of(32))
-            .map(|tensor| (tensor.canonical, quantization.into())).collect();
+        let group = usize::try_from(quantization.group_size())
+            .map_err(|_| "negative quantization group size")?;
+        audio.linear_formats = audio_tensor_layouts(audio)?
+            .into_iter()
+            .filter(|tensor| {
+                tensor.operation == TensorOperation::Matrix
+                    && tensor.shape[1].is_multiple_of(group)
+                    && tensor.shape[1].is_multiple_of(32)
+            })
+            .map(|tensor| (tensor.canonical, quantization.into()))
+            .collect();
     }
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
@@ -679,22 +693,37 @@ pub(crate) fn bf16_media_plan(
 ) -> Result<SafetensorsCheckpointPlan, String> {
     use crate::artifact_preparation::ArtifactSourceRole;
     args.validate().map_err(|e| e.to_string())?;
-    if roles.is_empty() || roles.iter().any(|role| !matches!(role, ArtifactSourceRole::Vision | ArtifactSourceRole::Audio)) {
+    if roles.is_empty()
+        || roles
+            .iter()
+            .any(|role| !matches!(role, ArtifactSourceRole::Vision | ArtifactSourceRole::Audio))
+    {
         return Err("BF16 media admission requires vision or audio source roles".into());
     }
     let mut tensors = Vec::new();
     if roles.contains(&ArtifactSourceRole::Vision) {
-        add_safetensors_vision(args, dimension(args.hidden_size, "decoder width")?, &mut tensors)?;
+        add_safetensors_vision(
+            args,
+            dimension(args.hidden_size, "decoder width")?,
+            &mut tensors,
+        )?;
     }
     if roles.contains(&ArtifactSourceRole::Audio) {
-        if args.audio_config.is_none() { return Err("media source omits its audio configuration".into()); }
+        if args.audio_config.is_none() {
+            return Err("media source omits its audio configuration".into());
+        }
         add_safetensors_audio(args, &mut tensors)?;
     }
     for tensor in &mut tensors {
         tensor.dtype = StoredDtypeConstraint::Exact(eredu_checkpoint::StoredDtype::BF16);
     }
-    SafetensorsCheckpointPlan::new("Muse BF16 media companions", tensors, Vec::new(), CatalogPolicy::strict())
-        .map_err(|e| e.to_string())
+    SafetensorsCheckpointPlan::new(
+        "Muse BF16 media companions",
+        tensors,
+        Vec::new(),
+        CatalogPolicy::strict(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub(crate) fn bf16_media_recipes<C: RecipeCatalog + ?Sized>(
@@ -702,7 +731,10 @@ pub(crate) fn bf16_media_recipes<C: RecipeCatalog + ?Sized>(
     roles: &BTreeSet<crate::artifact_preparation::ArtifactSourceRole>,
     catalog: &C,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    Ok(direct_safetensors_recipes(&bf16_media_plan(args, roles)?, catalog))
+    Ok(direct_safetensors_recipes(
+        &bf16_media_plan(args, roles)?,
+        catalog,
+    ))
 }
 
 fn is_expert_recipe_intermediate(target: &str) -> bool {
@@ -743,8 +775,13 @@ pub fn unit_safetensors_recipes<C: RecipeCatalog + ?Sized>(
             .as_ref()
             .map_or(0, |vision| vision.layer_count()),
         1 => dimension(args.num_hidden_layers, "text layer count")?,
-        2 => args.audio_config.as_ref().map(|audio| audio.execution_units().map(|units| units.len()))
-            .transpose().map_err(|error| error.to_string())?.unwrap_or(0),
+        2 => args
+            .audio_config
+            .as_ref()
+            .map(|audio| audio.execution_units().map(|units| units.len()))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0),
         _ => {
             return Err(format!(
                 "Muse-Glimmer recipe group {group} is outside two groups"
@@ -772,13 +809,18 @@ fn select_safetensors_recipe_group<C: RecipeCatalog + ?Sized>(
     let mut selected_recipes = BTreeMap::new();
     for (target, recipe) in safetensors_recipes(args, catalog)? {
         let owner = if target.starts_with("model.audio_tower.") {
-            let audio = args.audio_config.as_ref().ok_or("audio recipe has no declared tower")?;
-            let index = audio.execution_units().map_err(|error| error.to_string())?.iter()
-                .position(|kind| kind.owns_parameter(&target)).ok_or_else(|| format!("unowned Muse audio recipe {target}"))?;
+            let audio = args
+                .audio_config
+                .as_ref()
+                .ok_or("audio recipe has no declared tower")?;
+            let index = audio
+                .execution_units()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .position(|kind| kind.owns_parameter(&target))
+                .ok_or_else(|| format!("unowned Muse audio recipe {target}"))?;
             Some((2, index))
-        } else if let Some(index) =
-            indexed_recipe_target(&target, "model.vision_tower.layers.")?
-        {
+        } else if let Some(index) = indexed_recipe_target(&target, "model.vision_tower.layers.")? {
             if index >= vision_layers {
                 return Err(format!(
                     "Muse-Glimmer recipe {target:?} names vision unit {index}, but only {vision_layers} exist"
@@ -1153,50 +1195,158 @@ pub(crate) struct AudioTensorLayout {
     pub(crate) operation: TensorOperation,
 }
 
-pub(crate) fn audio_tensor_layouts(audio: &super::AudioConfig) -> Result<Vec<AudioTensorLayout>, String> {
+pub(crate) fn audio_tensor_layouts(
+    audio: &super::AudioConfig,
+) -> Result<Vec<AudioTensorLayout>, String> {
     audio.validate().map_err(|error| error.to_string())?;
     let mut tensors = Vec::new();
     let mut add = |canonical: String, gguf: String, shape, operation| {
-        tensors.push(AudioTensorLayout { canonical, gguf, shape, operation });
+        tensors.push(AudioTensorLayout {
+            canonical,
+            gguf,
+            shape,
+            operation,
+        });
     };
     let mut flat_block = 0usize;
     for stage in 0..audio.hidden_sizes.len() {
         let width = dimension(audio.hidden_sizes[stage], "audio stage width")?;
-        let input = if stage == 0 { 1 } else { dimension(audio.hidden_sizes[stage-1], "audio input channels")? };
+        let input = if stage == 0 {
+            1
+        } else {
+            dimension(audio.hidden_sizes[stage - 1], "audio input channels")?
+        };
         let patch = dimension(audio.patch_sizes[stage], "audio patch size")?;
-        let intermediate = dimension(audio.intermediate_size(stage).map_err(|error| error.to_string())?, "audio MLP width")?;
+        let intermediate = dimension(
+            audio
+                .intermediate_size(stage)
+                .map_err(|error| error.to_string())?,
+            "audio MLP width",
+        )?;
         let root = format!("model.audio_tower.layers.{stage}");
-        add(format!("{root}.patch_embedder.proj.weight"), format!("a.patch.{stage}.weight"),
-            vec![width, checked_mul(input, patch, "audio patch input width")?], TensorOperation::Matrix);
-        add(format!("{root}.patch_embedder.proj.bias"), format!("a.patch.{stage}.bias"), vec![width], TensorOperation::Vector);
-        add(format!("{root}.patch_embedder.norm.weight"), format!("a.patch.{stage}.norm.weight"), vec![width], TensorOperation::Vector);
+        add(
+            format!("{root}.patch_embedder.proj.weight"),
+            format!("a.patch.{stage}.weight"),
+            vec![width, checked_mul(input, patch, "audio patch input width")?],
+            TensorOperation::Matrix,
+        );
+        add(
+            format!("{root}.patch_embedder.proj.bias"),
+            format!("a.patch.{stage}.bias"),
+            vec![width],
+            TensorOperation::Vector,
+        );
+        add(
+            format!("{root}.patch_embedder.norm.weight"),
+            format!("a.patch.{stage}.norm.weight"),
+            vec![width],
+            TensorOperation::Vector,
+        );
         for block in 0..audio.depths[stage] {
             let root = format!("{root}.conv_blocks.{block}");
             for (canonical, source, shape, operation) in [
-                ("conv.weight", format!("a.conv1d.{flat_block}.weight"), vec![width, 1, dimension(audio.conv_kernel_size, "audio kernel width")?], TensorOperation::Dense),
-                ("conv.bias", format!("a.conv1d.{flat_block}.bias"), vec![width], TensorOperation::Vector),
-                ("norm.weight", format!("a.conv1d.{flat_block}.norm.weight"), vec![width], TensorOperation::Vector),
-                ("mlp.fc1.weight", format!("a.blk.{flat_block}.ffn_up.weight"), vec![intermediate,width], TensorOperation::Matrix),
-                ("mlp.fc1.bias", format!("a.blk.{flat_block}.ffn_up.bias"), vec![intermediate], TensorOperation::Vector),
-                ("mlp.fc2.weight", format!("a.blk.{flat_block}.ffn_down.weight"), vec![width,intermediate], TensorOperation::Matrix),
-                ("mlp.fc2.bias", format!("a.blk.{flat_block}.ffn_down.bias"), vec![width], TensorOperation::Vector),
-            ] { add(format!("{root}.{canonical}"), source, shape, operation); }
-            flat_block = flat_block.checked_add(1).ok_or("audio flat block index overflowed")?;
+                (
+                    "conv.weight",
+                    format!("a.conv1d.{flat_block}.weight"),
+                    vec![
+                        width,
+                        1,
+                        dimension(audio.conv_kernel_size, "audio kernel width")?,
+                    ],
+                    TensorOperation::Dense,
+                ),
+                (
+                    "conv.bias",
+                    format!("a.conv1d.{flat_block}.bias"),
+                    vec![width],
+                    TensorOperation::Vector,
+                ),
+                (
+                    "norm.weight",
+                    format!("a.conv1d.{flat_block}.norm.weight"),
+                    vec![width],
+                    TensorOperation::Vector,
+                ),
+                (
+                    "mlp.fc1.weight",
+                    format!("a.blk.{flat_block}.ffn_up.weight"),
+                    vec![intermediate, width],
+                    TensorOperation::Matrix,
+                ),
+                (
+                    "mlp.fc1.bias",
+                    format!("a.blk.{flat_block}.ffn_up.bias"),
+                    vec![intermediate],
+                    TensorOperation::Vector,
+                ),
+                (
+                    "mlp.fc2.weight",
+                    format!("a.blk.{flat_block}.ffn_down.weight"),
+                    vec![width, intermediate],
+                    TensorOperation::Matrix,
+                ),
+                (
+                    "mlp.fc2.bias",
+                    format!("a.blk.{flat_block}.ffn_down.bias"),
+                    vec![width],
+                    TensorOperation::Vector,
+                ),
+            ] {
+                add(format!("{root}.{canonical}"), source, shape, operation);
+            }
+            flat_block = flat_block
+                .checked_add(1)
+                .ok_or("audio flat block index overflowed")?;
         }
     }
-    let width = dimension(*audio.hidden_sizes.last().ok_or("audio stages are empty")?, "audio final width")?;
+    let width = dimension(
+        *audio.hidden_sizes.last().ok_or("audio stages are empty")?,
+        "audio final width",
+    )?;
     let language = dimension(audio.out_hidden_size, "audio language width")?;
     for (canonical, source, shape, operation) in [
-        ("norm.weight", "a.pre_ln.weight", vec![width], TensorOperation::Vector),
-        ("proj.weight", "mm.a.fc.weight", vec![language,width], TensorOperation::Matrix),
-        ("proj.bias", "mm.a.fc.bias", vec![language], TensorOperation::Vector),
-        ("post_proj_norm.weight", "a.post_ln.weight", vec![language], TensorOperation::Vector),
-    ] { add(format!("model.audio_tower.{canonical}"), source.into(), shape, operation); }
+        (
+            "norm.weight",
+            "a.pre_ln.weight",
+            vec![width],
+            TensorOperation::Vector,
+        ),
+        (
+            "proj.weight",
+            "mm.a.fc.weight",
+            vec![language, width],
+            TensorOperation::Matrix,
+        ),
+        (
+            "proj.bias",
+            "mm.a.fc.bias",
+            vec![language],
+            TensorOperation::Vector,
+        ),
+        (
+            "post_proj_norm.weight",
+            "a.post_ln.weight",
+            vec![language],
+            TensorOperation::Vector,
+        ),
+    ] {
+        add(
+            format!("model.audio_tower.{canonical}"),
+            source.into(),
+            shape,
+            operation,
+        );
+    }
     Ok(tensors)
 }
 
-fn add_safetensors_audio(args: &DecoderConfig, output: &mut Vec<SafetensorsTensorConstraint>) -> Result<(), String> {
-    let Some(audio) = &args.audio_config else { return Ok(()); };
+fn add_safetensors_audio(
+    args: &DecoderConfig,
+    output: &mut Vec<SafetensorsTensorConstraint>,
+) -> Result<(), String> {
+    let Some(audio) = &args.audio_config else {
+        return Ok(());
+    };
     for tensor in audio_tensor_layouts(audio)? {
         if tensor.operation == TensorOperation::Matrix {
             add_audio_matrix(audio, output, &tensor.canonical, tensor.shape)?;
@@ -1959,8 +2109,10 @@ pub fn translate_text_gguf_name(name: &str) -> String {
 /// Translates one official projector GGUF name to its neutral identity.
 pub fn translate_projector_gguf_name(name: &str, audio: Option<&super::AudioConfig>) -> String {
     if name.starts_with("a.") || name.starts_with("mm.a.") {
-        if let Some(target) = audio.and_then(|audio| audio_tensor_layouts(audio).ok())
-            .and_then(|tensors| tensors.into_iter().find(|tensor| tensor.gguf == name)) {
+        if let Some(target) = audio
+            .and_then(|audio| audio_tensor_layouts(audio).ok())
+            .and_then(|tensors| tensors.into_iter().find(|tensor| tensor.gguf == name))
+        {
             return target.canonical;
         }
         return name.into();

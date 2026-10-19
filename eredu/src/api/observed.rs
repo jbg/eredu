@@ -67,7 +67,10 @@ pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
 
 impl<B: TextGenerationBackend> PreparedObservedGeneration<B> {
     /// Supplies mode commands to the same physical driver used by controlled runs.
-    pub fn with_control_handle(mut self, control: eredu_core::execution_control::GenerationControlHandle) -> Self {
+    pub fn with_control_handle(
+        mut self,
+        control: eredu_core::execution_control::GenerationControlHandle,
+    ) -> Self {
         self.control_handle = Some(control);
         self
     }

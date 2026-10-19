@@ -1,5 +1,5 @@
 //! Header-only admission of independently selected Muse BF16 media sources.
-use eredu_architectures::muse::{DecoderConfig, media_companion::Bf16MediaCompanion};
+use eredu_architectures::muse::{media_companion::Bf16MediaCompanion, DecoderConfig};
 use eredu_core::ArtifactCompanionRole;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

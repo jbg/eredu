@@ -866,15 +866,22 @@ pub enum LinearArithmetic {
 impl LinearArithmetic {
     /// Requested input conversion, if this policy is an ordinary native projection.
     pub const fn compute_element(self) -> Option<TensorElementType> {
-        match self { Self::Compute(element) => Some(element), _ => None }
+        match self {
+            Self::Compute(element) => Some(element),
+            _ => None,
+        }
     }
 }
 
 impl LinearFormatSpec {
     /// Selects one complete affine arithmetic policy without changing storage.
     pub fn with_arithmetic(mut self, arithmetic: LinearArithmetic) -> Result<Self, Error> {
-        if arithmetic.compute_element().is_some_and(|e| !matches!(e,
-            TensorElementType::F32 | TensorElementType::F16 | TensorElementType::Bf16)) {
+        if arithmetic.compute_element().is_some_and(|e| {
+            !matches!(
+                e,
+                TensorElementType::F32 | TensorElementType::F16 | TensorElementType::Bf16
+            )
+        }) {
             return Err(Error::backend("linear compute precision must be floating"));
         }
         self.arithmetic = arithmetic;
@@ -882,7 +889,9 @@ impl LinearFormatSpec {
     }
 
     /// Retained affine arithmetic, independently of physical weight encoding.
-    pub const fn arithmetic(&self) -> LinearArithmetic { self.arithmetic }
+    pub const fn arithmetic(&self) -> LinearArithmetic {
+        self.arithmetic
+    }
     /// Offers an optimization hint for inputs with substantial exact-zero sparsity.
     /// This does not authorize pruning, approximation, or changing the equation.
     pub fn with_exact_zero_inputs(mut self) -> Self {
@@ -1410,7 +1419,10 @@ impl NormalizationConstructionSpec {
     /// Selects the FP32 reduction traversal over the complete feature axis.
     pub fn with_reduction(mut self, reduction: NormalizationReduction) -> Result<Self, Error> {
         self.reduction = reduction;
-        if matches!(reduction, NormalizationReduction::ChannelMajor | NormalizationReduction::Cascaded) {
+        if matches!(
+            reduction,
+            NormalizationReduction::ChannelMajor | NormalizationReduction::Cascaded
+        ) {
             self.groups = Some(1);
         }
         self.validate()?;
@@ -1431,7 +1443,10 @@ impl NormalizationConstructionSpec {
             NormalizationScale::Learned(_) | NormalizationScale::Unit => None,
         };
         if self.dimensions <= 0
-            || (matches!(self.reduction, NormalizationReduction::ChannelMajor | NormalizationReduction::Cascaded) && self.groups != Some(1))
+            || (matches!(
+                self.reduction,
+                NormalizationReduction::ChannelMajor | NormalizationReduction::Cascaded
+            ) && self.groups != Some(1))
             || self
                 .groups
                 .is_some_and(|groups| groups <= 0 || self.dimensions % groups != 0)
@@ -4255,8 +4270,14 @@ impl NeuralOperatorCapabilities {
     /// Returns stable names for every required capability absent from this set.
     pub fn missing_capability_names(self, required: Self) -> Vec<&'static str> {
         const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
-            (NeuralOperatorCapabilities::CASCADED_LAYER_NORM, "cascaded_layer_norm"),
-            (NeuralOperatorCapabilities::CHANNEL_MAJOR_RMS, "channel_major_rms"),
+            (
+                NeuralOperatorCapabilities::CASCADED_LAYER_NORM,
+                "cascaded_layer_norm",
+            ),
+            (
+                NeuralOperatorCapabilities::CHANNEL_MAJOR_RMS,
+                "channel_major_rms",
+            ),
             (NeuralOperatorCapabilities::CASCADED_RMS, "cascaded_rms"),
             (
                 NeuralOperatorCapabilities::WEIGHTED_EMBEDDING,
@@ -4331,7 +4352,10 @@ impl NeuralOperatorCapabilities {
             (NeuralOperatorCapabilities::UNLOADED_I32, "unloaded_i32"),
             (NeuralOperatorCapabilities::UNLOADED_I64, "unloaded_i64"),
             (NeuralOperatorCapabilities::RANKED_TOPK, "ranked_topk"),
-            (NeuralOperatorCapabilities::SCATTER_LAST_AXIS, "scatter_last_axis"),
+            (
+                NeuralOperatorCapabilities::SCATTER_LAST_AXIS,
+                "scatter_last_axis",
+            ),
             (NeuralOperatorCapabilities::FROM_I32_SLICE, "from_i32_slice"),
             (NeuralOperatorCapabilities::TO_F32_VEC, "to_f32_vec"),
             (NeuralOperatorCapabilities::TO_I32_VEC, "to_i32_vec"),
@@ -5379,7 +5403,9 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// integer representation through ordinary parameter binding.
     fn unloaded_i64(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         let _ = (shape, context);
-        Err(Error::backend("I64 parameter allocation is not implemented by this backend"))
+        Err(Error::backend(
+            "I64 parameter allocation is not implemented by this backend",
+        ))
     }
     /// Creates a floating-point tensor from host initialization data.
     fn from_f32_slice(
@@ -5531,16 +5557,25 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// returns selected values and I32 indices with the same leading dimensions.
     fn ranked_topk(&self, count: i32, context: &Self::Context) -> Result<(Self, Self), Error> {
         let _ = (count, context);
-        Err(Error::backend("ranked final-axis selection is not implemented by this backend"))
+        Err(Error::backend(
+            "ranked final-axis selection is not implemented by this backend",
+        ))
     }
     /// Writes values at unique, nonnegative final-axis indices. Leading shapes
     /// must match; indices and values have the same shape. I32/I64 indices are
     /// validated before narrowing or native access. Duplicate or out-of-range
     /// indices fail, possibly at completion, without unchecked native indexing.
     /// Values are converted to the destination's physical representation.
-    fn scatter_last_axis(&self, indices: &Self, values: &Self, context: &Self::Context) -> Result<Self, Error> {
+    fn scatter_last_axis(
+        &self,
+        indices: &Self,
+        values: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
         let _ = (indices, values, context);
-        Err(Error::backend("strict final-axis scatter is not implemented by this backend"))
+        Err(Error::backend(
+            "strict final-axis scatter is not implemented by this backend",
+        ))
     }
     /// Whether both optional row ranking and validated index compaction are
     /// available in this execution context. This query does not evaluate tensors.
@@ -6169,22 +6204,46 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
         };
         let mut output = match arithmetic {
             ConvolutionArithmetic::Native => B::Tensor::conv1d(
-                &work, &execution_weight, 1, 0, self.dilation, self.channels, context)?,
+                &work,
+                &execution_weight,
+                1,
+                0,
+                self.dilation,
+                self.channels,
+                context,
+            )?,
             ConvolutionArithmetic::FourLaneFloat32Affine => {
-                let prototype = work.index(&[Index::Full, Index::Range(0, shape[1]), Index::Full], context)?;
+                let prototype = work.index(
+                    &[Index::Full, Index::Range(0, shape[1]), Index::Full],
+                    context,
+                )?;
                 let zero = B::Tensor::zeros_like(&prototype, context)?;
                 let mut sums = vec![zero; 4];
                 let kernel = execution_weight.shape()[1];
                 for tap in 0..kernel {
                     let first = tap * self.dilation;
-                    let values = work.index(&[Index::Full, Index::Range(first, first + shape[1]), Index::Full], context)?;
-                    let gain = execution_weight.index(&[Index::Full, Index::At(tap), Index::At(0)], context)?
+                    let values = work.index(
+                        &[
+                            Index::Full,
+                            Index::Range(first, first + shape[1]),
+                            Index::Full,
+                        ],
+                        context,
+                    )?;
+                    let gain = execution_weight
+                        .index(&[Index::Full, Index::At(tap), Index::At(0)], context)?
                         .reshape(&[1, 1, self.channels], context)?;
-                    let lane = if tap < (kernel / 4) * 4 { (tap % 4) as usize } else { 0 };
+                    let lane = if tap < (kernel / 4) * 4 {
+                        (tap % 4) as usize
+                    } else {
+                        0
+                    };
                     sums[lane] = sums[lane].add(&values.multiply(&gain, context)?, context)?;
                 }
                 let mut sum = sums[0].clone();
-                for partial in &sums[1..] { sum = sum.add(partial, context)?; }
+                for partial in &sums[1..] {
+                    sum = sum.add(partial, context)?;
+                }
                 sum
             }
         };

@@ -72,9 +72,12 @@ fn phase_overlap_and_uneven_chunks_are_explicit() {
     assert_eq!(phases[1].persistent_state.lower_bytes, 768);
     let p = &phases[0];
     // The request retains a sequence header and up to four committed token IDs.
-    let sequence_bytes = std::mem::size_of::<eredu_core::GenerationSequence>()
-        + std::mem::size_of::<[u32; 4]>();
-    assert_eq!(p.retained_input.upper_bytes, Some(128 + sequence_bytes as u64));
+    let sequence_bytes =
+        std::mem::size_of::<eredu_core::GenerationSequence>() + std::mem::size_of::<[u32; 4]>();
+    assert_eq!(
+        p.retained_input.upper_bytes,
+        Some(128 + sequence_bytes as u64)
+    );
     assert_eq!(
         p.total.lower_bytes,
         p.parameters.lower_bytes

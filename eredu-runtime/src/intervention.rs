@@ -664,10 +664,16 @@ impl CaptureSession {
             .and_then(|spec| {
                 spec.with_weight_policy(policy.normalization_epsilon, policy.coefficient_scale)
             })
-            .map(|spec| spec.with_order(match policy.selection_order {
-                eredu_core::intervention::RoutingSelectionOrder::Ranked => eredu_nn::GroupSelectionOrder::Ranked,
-                eredu_core::intervention::RoutingSelectionOrder::Partition => eredu_nn::GroupSelectionOrder::Partition,
-            }))
+            .map(|spec| {
+                spec.with_order(match policy.selection_order {
+                    eredu_core::intervention::RoutingSelectionOrder::Ranked => {
+                        eredu_nn::GroupSelectionOrder::Ranked
+                    }
+                    eredu_core::intervention::RoutingSelectionOrder::Partition => {
+                        eredu_nn::GroupSelectionOrder::Partition
+                    }
+                })
+            })
             .map_err(|error| CaptureError::Invalid(error.to_string()))?;
             let capture_original = operation.evidence != InterventionEvidence::None;
             if capture_original {

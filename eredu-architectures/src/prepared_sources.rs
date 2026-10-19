@@ -14,7 +14,8 @@ use eredu_checkpoint::{
 };
 use eredu_core::{
     artifact::{
-        ArtifactError, ArtifactFile, ArtifactIdentity, DeferredArtifactIdentity, ArtifactCompanionRole,
+        ArtifactCompanionRole, ArtifactError, ArtifactFile, ArtifactIdentity,
+        DeferredArtifactIdentity,
     },
     ArtifactFormat, ModelArtifact, ModelPreparationPlan,
 };
@@ -66,7 +67,10 @@ impl PreparedSourceResolutions {
     }
 
     /// Companion contract that is an explicit member of the target graph.
-    pub fn target_companion(&self, role: &ArtifactCompanionRole) -> Option<&ResolvedCheckpointPlan> {
+    pub fn target_companion(
+        &self,
+        role: &ArtifactCompanionRole,
+    ) -> Option<&ResolvedCheckpointPlan> {
         self.target_companions.get(role)
     }
 
@@ -434,7 +438,9 @@ impl PreparedModelDiscovery {
         let Some(target) = self.component_partition_layouts(max_ranks)? else {
             return Ok(None);
         };
-        if execution.is_shared_backbone() { return Ok(Some(target)); }
+        if execution.is_shared_backbone() {
+            return Ok(Some(target));
+        }
         let prediction = self.prediction.as_ref().ok_or_else(|| {
             eredu_core::capture::CaptureError::Unsupported(
                 "prepared sources have no selected prediction catalog".into(),
@@ -619,9 +625,17 @@ impl PreparedModelDiscovery {
             (&self.descriptor, &self.intervention_points)
         } else {
             let prediction = self.prediction.as_ref().ok_or_else(|| {
-                CaptureError::Unsupported("prepared sources have no selected prediction catalog".into())
+                CaptureError::Unsupported(
+                    "prepared sources have no selected prediction catalog".into(),
+                )
             })?;
-            (prediction.descriptor.as_ref().map_err(|reason| CaptureError::Invalid(reason.clone()))?, &prediction.intervention_points)
+            (
+                prediction
+                    .descriptor
+                    .as_ref()
+                    .map_err(|reason| CaptureError::Invalid(reason.clone()))?,
+                &prediction.intervention_points,
+            )
         };
         let mut captures = self.capture()?;
         captures.catalog = descriptor.observations.clone();
@@ -762,7 +776,9 @@ impl PreparedModelSources {
                 .execution()
                 .parallel_topology()
                 .map(|_| self.selected().execution().clone()),
-            target_static: crate::external_assistant::TargetStaticDescription::from_plan(self.architecture()),
+            target_static: crate::external_assistant::TargetStaticDescription::from_plan(
+                self.architecture(),
+            ),
             partition_parameters: None,
             partition_parameter_index: None,
             partition_hooks: None,
@@ -770,7 +786,9 @@ impl PreparedModelSources {
             observation_context,
             intervention_points: self.architecture().intervention_points(),
             prediction: self.selected().prediction_realization().map(|_| {
-                let complete = self.selected().retained_architecture()
+                let complete = self
+                    .selected()
+                    .retained_architecture()
                     .unwrap_or_else(|| self.inspection.architecture_plan());
                 PreparedPredictionDiscovery {
                     resources: self
@@ -889,7 +907,10 @@ impl PreparedModelSources {
 
     /// Exact tower/projector view for the selected modality, sharing its already
     /// opened physical artifacts with every other role.
-    pub fn media_source(&self, modality: eredu_core::InputModality) -> Option<&SharedCheckpointSource> {
+    pub fn media_source(
+        &self,
+        modality: eredu_core::InputModality,
+    ) -> Option<&SharedCheckpointSource> {
         self.graph.media_source(modality)
     }
 
@@ -971,10 +992,15 @@ impl PreparedModelSourceGraph {
 
     /// Independently projected vision or audio parameters. A missing view does
     /// not prevent text execution and cannot authorize opening another artifact.
-    pub fn media_source(&self, modality: eredu_core::InputModality) -> Option<&SharedCheckpointSource> {
+    pub fn media_source(
+        &self,
+        modality: eredu_core::InputModality,
+    ) -> Option<&SharedCheckpointSource> {
         use crate::artifact_preparation::ArtifactSourceRole;
         let role = match modality {
-            eredu_core::InputModality::Image | eredu_core::InputModality::Video => ArtifactSourceRole::Vision,
+            eredu_core::InputModality::Image | eredu_core::InputModality::Video => {
+                ArtifactSourceRole::Vision
+            }
             eredu_core::InputModality::Audio => ArtifactSourceRole::Audio,
             _ => return None,
         };
@@ -1050,7 +1076,10 @@ pub fn prepare_model_sources(
         .architecture_identity()
         .to_owned();
     let inspection = plan.inspection().clone();
-    let complete_architecture = selected.retained_architecture().unwrap_or(inspection.architecture_plan()).clone();
+    let complete_architecture = selected
+        .retained_architecture()
+        .unwrap_or(inspection.architecture_plan())
+        .clone();
     let projection = complete_architecture.prediction_target_projection()?;
     let (architecture, admitted_extension) = projection.map_or_else(
         || (complete_architecture.clone(), None),
@@ -1220,13 +1249,19 @@ fn prepare_retained_qwen4_sources(
     };
     let vision = bound.roles.remove(&ArtifactSourceRole::Vision);
     let mut media = BTreeMap::new();
-    if let Some(source) = &vision { media.insert(ArtifactSourceRole::Vision, source.clone()); }
-    if let Some(source) = bound.roles.remove(&ArtifactSourceRole::Audio) { media.insert(ArtifactSourceRole::Audio, source); }
+    if let Some(source) = &vision {
+        media.insert(ArtifactSourceRole::Vision, source.clone());
+    }
+    if let Some(source) = bound.roles.remove(&ArtifactSourceRole::Audio) {
+        media.insert(ArtifactSourceRole::Audio, source);
+    }
     let mut companions = bound
         .physical
         .iter()
         .filter_map(|(id, source)| match id {
-            PhysicalArtifactId::Companion(role) if *role == ArtifactCompanionRole::MediaProjector => {
+            PhysicalArtifactId::Companion(role)
+                if *role == ArtifactCompanionRole::MediaProjector =>
+            {
                 Some((role.clone(), source.clone()))
             }
             _ => None,
@@ -1236,7 +1271,9 @@ fn prepare_retained_qwen4_sources(
         .artifacts()
         .iter()
         .filter_map(|(id, artifact)| match id {
-            PhysicalArtifactId::Companion(role) if *role == ArtifactCompanionRole::MediaProjector => {
+            PhysicalArtifactId::Companion(role)
+                if *role == ArtifactCompanionRole::MediaProjector =>
+            {
                 Some((role.clone(), artifact.resolution().clone()))
             }
             _ => None,
@@ -1253,7 +1290,8 @@ fn prepare_retained_qwen4_sources(
         .roles
         .remove(&ArtifactSourceRole::Prediction)
         .map(|source| {
-            let role = PhysicalArtifactId::Companion(ArtifactCompanionRole::Named("prediction".into()));
+            let role =
+                PhysicalArtifactId::Companion(ArtifactCompanionRole::Named("prediction".into()));
             (source, declarations.artifacts()[&role].resolution().clone())
         });
     use crate::prepared_execution::RetainedArchitectureConstruction;
@@ -1398,36 +1436,77 @@ fn source_graph_identity(
     let mut files = Vec::new();
     match inspection.format() {
         ArtifactFormat::SafeTensors => {
-            let shards = inspection.safetensors_shards().ok_or_else(|| ArtifactError::InvalidArtifact("SafeTensors inspection omitted admitted shards".into()))?;
-            files.extend(shards.logical_payload_paths().iter().map(|(role, path)| ArtifactFile::new(role, path)));
+            let shards = inspection.safetensors_shards().ok_or_else(|| {
+                ArtifactError::InvalidArtifact(
+                    "SafeTensors inspection omitted admitted shards".into(),
+                )
+            })?;
+            files.extend(
+                shards
+                    .logical_payload_paths()
+                    .iter()
+                    .map(|(role, path)| ArtifactFile::new(role, path)),
+            );
         }
         ArtifactFormat::Gguf => {
-            let validated = inspection.validated_gguf().ok_or_else(|| ArtifactError::InvalidArtifact("GGUF inspection omitted its admission proof".into()))?;
-            files.extend(validated.checkpoint().shards().iter().map(|shard| ArtifactFile::new(format!("primary/split/{:05}", shard.split_no()), shard.path())));
+            let validated = inspection.validated_gguf().ok_or_else(|| {
+                ArtifactError::InvalidArtifact("GGUF inspection omitted its admission proof".into())
+            })?;
+            files.extend(validated.checkpoint().shards().iter().map(|shard| {
+                ArtifactFile::new(
+                    format!("primary/split/{:05}", shard.split_no()),
+                    shard.path(),
+                )
+            }));
             for (role, companion) in validated.companions() {
                 let role = match role {
                     ArtifactCompanionRole::MediaProjector => "media-projector".to_owned(),
                     ArtifactCompanionRole::Named(name) => format!("named/{name}"),
-                    _ => return Err(ArtifactError::InvalidArtifact("unsupported GGUF companion role in source identity".into())),
+                    _ => {
+                        return Err(ArtifactError::InvalidArtifact(
+                            "unsupported GGUF companion role in source identity".into(),
+                        ))
+                    }
                 };
-                files.extend(companion.checkpoint().shards().iter().map(|shard| ArtifactFile::new(format!("companion/{role}/split/{:05}", shard.split_no()), shard.path())));
+                files.extend(companion.checkpoint().shards().iter().map(|shard| {
+                    ArtifactFile::new(
+                        format!("companion/{role}/split/{:05}", shard.split_no()),
+                        shard.path(),
+                    )
+                }));
             }
         }
-        _ => return Err(ArtifactError::InvalidArtifact("unsupported artifact format in prepared source identity".into())),
+        _ => {
+            return Err(ArtifactError::InvalidArtifact(
+                "unsupported artifact format in prepared source identity".into(),
+            ))
+        }
     }
-    if let Some(prediction) = prediction { files.extend(prediction.files()); }
+    if let Some(prediction) = prediction {
+        files.extend(prediction.files());
+    }
     if let Some(adapter) = inspection.architecture_plan().draft_adapter() {
-        adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?;
+        adapter
+            .verify_configuration()
+            .map_err(ArtifactError::InvalidArtifact)?;
         files.extend(adapter.files());
     }
     for source in inspection.architecture_plan().media_companions() {
-        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+        source
+            .verify_unchanged()
+            .map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
         files.extend(source.files().iter().cloned());
     }
     let identity = DeferredArtifactIdentity::filesystem(execution_identity, files)?;
-    if let Some(adapter) = inspection.architecture_plan().draft_adapter() { adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?; }
+    if let Some(adapter) = inspection.architecture_plan().draft_adapter() {
+        adapter
+            .verify_configuration()
+            .map_err(ArtifactError::InvalidArtifact)?;
+    }
     for source in inspection.architecture_plan().media_companions() {
-        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+        source
+            .verify_unchanged()
+            .map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
     }
     Ok(identity)
 }
@@ -1456,12 +1535,20 @@ fn prepare_ordinary_sources(
         ));
     }
     for source in architecture.media_companions() {
-        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+        source
+            .verify_unchanged()
+            .map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
     }
     let mut bound = declarations.bind(cache)?;
-    if let Some(adapter) = architecture.draft_adapter() { adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?; }
+    if let Some(adapter) = architecture.draft_adapter() {
+        adapter
+            .verify_configuration()
+            .map_err(ArtifactError::InvalidArtifact)?;
+    }
     for source in architecture.media_companions() {
-        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+        source
+            .verify_unchanged()
+            .map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
     }
     let primary = bound
         .physical
@@ -1482,9 +1569,13 @@ fn prepare_ordinary_sources(
     let extension = bound.roles.remove(&ArtifactSourceRole::Prediction);
     let complete: SharedCheckpointSource = match &extension {
         None => target.clone(),
-        Some(extension) => Arc::new(CompositeCheckpointSource::new([target.clone(), extension.clone()])?),
+        Some(extension) => Arc::new(CompositeCheckpointSource::new([
+            target.clone(),
+            extension.clone(),
+        ])?),
     };
-    let media = [ArtifactSourceRole::Vision, ArtifactSourceRole::Audio].into_iter()
+    let media = [ArtifactSourceRole::Vision, ArtifactSourceRole::Audio]
+        .into_iter()
         .filter_map(|role| bound.roles.remove(&role).map(|source| (role, source)))
         .collect();
     let primary_resolution = declarations.artifacts()[&PhysicalArtifactId::Primary]

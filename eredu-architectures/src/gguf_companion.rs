@@ -62,9 +62,14 @@ impl GgufMediaProjectorPlan {
         }
     }
 
-    pub(crate) fn attach_draft_adapter(&mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<(), String> {
+    pub(crate) fn attach_draft_adapter(
+        &mut self,
+        adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig,
+    ) -> Result<(), String> {
         match &mut self.model {
-            GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => *config = config.clone().with_draft_adapter(adapter),
+            GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => {
+                *config = config.clone().with_draft_adapter(adapter)
+            }
             _ => return Err("draft adapter cannot attach to this media companion".into()),
         }
         Ok(())
@@ -189,13 +194,19 @@ pub(crate) fn resolve_media_projector(
     projector: &Checkpoint,
 ) -> Result<GgufMediaProjectorPlan, String> {
     if let GgufModelConfig::NemotronLabsDiffusion(text) = primary_plan.model() {
-        let vision = crate::nemotron_labs_diffusion::vision_gguf::VisionGgufPlan::from_checkpoint(projector, text.config())
-            .map_err(|error| error.to_string())?;
+        let vision = crate::nemotron_labs_diffusion::vision_gguf::VisionGgufPlan::from_checkpoint(
+            projector,
+            text.config(),
+        )
+        .map_err(|error| error.to_string())?;
         return Ok(GgufMediaProjectorPlan {
             checkpoint: vision.checkpoint().clone(),
             primary_tensor_mapping: text.mapping().to_vec(),
             tensor_mapping: vision.mapping().to_vec(),
-            model: GgufMediaProjectorConfig::NemotronLabsDiffusion { config: text.config().clone(), vision },
+            model: GgufMediaProjectorConfig::NemotronLabsDiffusion {
+                config: text.config().clone(),
+                vision,
+            },
         });
     }
     let model_metadata = metadata(primary);
@@ -245,15 +256,24 @@ pub(crate) fn resolve_media_projector(
             (GgufMediaProjectorConfig::Inkling(args), checkpoint)
         }
         GgufModelConfig::Muse(args) => {
-            let audio = if projector_metadata.get("clip.has_audio_encoder")
-                .and_then(MetadataValue::as_bool) == Some(true) {
-                Some(crate::muse::AudioConfig::from_gguf_metadata(&projector_metadata, args.hidden_size)
-                    .map_err(|error| error.to_string())?)
-            } else { None };
-            let formats = weight_formats(
-                projector,
-                |name| crate::muse::translate_projector_gguf_name(name, audio.as_ref()),
-            )?;
+            let audio = if projector_metadata
+                .get("clip.has_audio_encoder")
+                .and_then(MetadataValue::as_bool)
+                == Some(true)
+            {
+                Some(
+                    crate::muse::AudioConfig::from_gguf_metadata(
+                        &projector_metadata,
+                        args.hidden_size,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
+            let formats = weight_formats(projector, |name| {
+                crate::muse::translate_projector_gguf_name(name, audio.as_ref())
+            })?;
             let args = args
                 .clone()
                 .with_gguf_projector_metadata(&projector_metadata, formats)
@@ -323,7 +343,9 @@ fn canonical_projector_mapping(
     model: &GgufMediaProjectorConfig,
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
-        GgufMediaProjectorConfig::NemotronLabsDiffusion { vision, .. } => return Ok(vision.mapping().to_vec()),
+        GgufMediaProjectorConfig::NemotronLabsDiffusion { vision, .. } => {
+            return Ok(vision.mapping().to_vec())
+        }
         GgufMediaProjectorConfig::Qwen4ExpPending { vision, .. } => {
             return Ok(vision.gguf_source().mapping().to_vec());
         }
@@ -339,9 +361,9 @@ fn canonical_projector_mapping(
         GgufMediaProjectorConfig::Inkling(_) => {
             projector.translated_outputs(crate::inkling::translate_mmproj_weight_name)
         }
-        GgufMediaProjectorConfig::Muse(args) => {
-            projector.translated_outputs(|name| crate::muse::translate_projector_gguf_name(name, args.audio_config.as_ref()))
-        }
+        GgufMediaProjectorConfig::Muse(args) => projector.translated_outputs(|name| {
+            crate::muse::translate_projector_gguf_name(name, args.audio_config.as_ref())
+        }),
         GgufMediaProjectorConfig::Qwen3Vl(model) => {
             let deepstack = model.vision.deepstack_layers();
             projector.translated_outputs(|name| {

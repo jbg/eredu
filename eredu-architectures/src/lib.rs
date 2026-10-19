@@ -39,9 +39,9 @@ pub use external_assistant::{
     ExternalAssistantTensorPlacement, ExternalAssistantTransfer, ExternalSpeculativeContract,
     ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
     MaterializedExternalAssistantExecution, MaterializedExternalAssistantRefVisitor,
-    MaterializedExternalAssistantVisitor,
-    PreparedCompatibleExternalAssistant, PreparedExternalAssistantExecution,
-    PreparedExternalAssistantSource, SelectedExternalAssistantPreparation,
+    MaterializedExternalAssistantVisitor, PreparedCompatibleExternalAssistant,
+    PreparedExternalAssistantExecution, PreparedExternalAssistantSource,
+    SelectedExternalAssistantPreparation,
 };
 pub use external_draft::{
     prepare_execution_plan_draft, prepare_external_draft, ExternalDraftPreparation,

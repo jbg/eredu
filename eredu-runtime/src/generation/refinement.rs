@@ -214,7 +214,9 @@ pub enum RefinementError<E> {
     #[error("masked-token refinement mechanism is unavailable")]
     MaskedUnavailable,
     /// The bounded schedule leaves unresolved mask positions.
-    #[error("masked-token refinement exhausted its schedule with {remaining} unresolved positions")]
+    #[error(
+        "masked-token refinement exhausted its schedule with {remaining} unresolved positions"
+    )]
     MaskedExhausted {
         /// Number of unresolved positions; no final candidates are published.
         remaining: u32,

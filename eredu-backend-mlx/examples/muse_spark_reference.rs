@@ -12,9 +12,7 @@ use eredu_backend_mlx::{
         nn::shared::MlxNeuralBackend,
         runtime::{
             cache::state::MlxHybridState,
-            checkpoint::binding::{
-                build_neutral_module_bindings_with_recipes,
-            },
+            checkpoint::binding::build_neutral_module_bindings_with_recipes,
             execution::generic::prepare_layerwise_policy_with_bindings,
         },
         ExecutionContext,
@@ -143,8 +141,6 @@ fn layer_trace(
     )
 }
 
-
-
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     if !args.atol.is_finite() || args.atol < 0.0 || !args.rtol.is_finite() || args.rtol < 0.0 {
@@ -196,7 +192,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         resolution,
         SOURCE_READER_BOUND,
     )?;
-
 
     let mut config = full;
     let source = if args.multimodal {

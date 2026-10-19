@@ -3,10 +3,10 @@
 pub mod partition;
 
 use super::{
-    FamilyConfig,
-    input::{InputPartPlan, admit_input},
+    input::{admit_input, InputPartPlan},
     model::{ForwardContext as TextForward, TextLayer, TextModel},
     vision::{ImageEmbedding, ImageInput, ImageLayer, ImageProjector, ImageState},
+    FamilyConfig,
 };
 use crate::{
     composite_execution::{
@@ -369,7 +369,11 @@ where
         }
     }
     fn state_ordinal(&self, group: usize, index: usize, ordinal: usize) -> usize {
-        if group == 2 { index } else { ordinal }
+        if group == 2 {
+            index
+        } else {
+            ordinal
+        }
     }
     fn retained_state_ordinals(
         &self,
@@ -377,7 +381,11 @@ where
         index: usize,
         _: usize,
     ) -> std::ops::Range<usize> {
-        if group == 2 { index..index + 1 } else { 0..0 }
+        if group == 2 {
+            index..index + 1
+        } else {
+            0..0
+        }
     }
     fn forward_unit(
         &mut self,
@@ -965,7 +973,8 @@ where
             return Ok(None);
         }
         let patches = native_patch_positions(input)?;
-        Ok((patches > 0).then_some((patches, self.config.vision.as_ref().unwrap().hidden_size).into()))
+        Ok((patches > 0)
+            .then_some((patches, self.config.vision.as_ref().unwrap().hidden_size).into()))
     }
 }
 impl<B, S> ParallelCompositeArchitecture<B, S> for Model<B>

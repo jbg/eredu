@@ -2258,33 +2258,58 @@ where
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    if let Some(config) = plan.safetensors_architecture().and_then(|plan| match plan.model() {
-        SafetensorsModelConfig::NemotronLabsDiffusion(config) => Some(config),
-        _ => None,
-    }).or_else(|| plan.gguf_plan().and_then(|plan| match plan.model() {
-        GgufModelConfig::NemotronLabsDiffusion(plan) => Some(plan.text_config()), _ => None,
-    })) {
+    if let Some(config) = plan
+        .safetensors_architecture()
+        .and_then(|plan| match plan.model() {
+            SafetensorsModelConfig::NemotronLabsDiffusion(config) => Some(config),
+            _ => None,
+        })
+        .or_else(|| {
+            plan.gguf_plan().and_then(|plan| match plan.model() {
+                GgufModelConfig::NemotronLabsDiffusion(plan) => Some(plan.text_config()),
+                _ => None,
+            })
+        })
+    {
         let requirements = selected.requirements().clone();
-        validate_plan_identity(&requirements, &EligibleConfig::NemotronLabsDiffusion(config))
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        validate_plan_identity(
+            &requirements,
+            &EligibleConfig::NemotronLabsDiffusion(config),
+        )
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
         validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         visitor.construction_started();
         let source = selected_uses_transform(&selected)
-            .then(|| crate::nemotron_labs_diffusion::model::TextModel::<B>::new(config.clone(), context))
-            .transpose().map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let target = config.with_checkpoint_formats(selected_formats(&selected))
+            .then(|| {
+                crate::nemotron_labs_diffusion::model::TextModel::<B>::new(config.clone(), context)
+            })
+            .transpose()
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target = config
+            .with_checkpoint_formats(selected_formats(&selected))
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let identity = target.architecture_fingerprint();
         let capability = crate::capability::nemotron_labs_diffusion(&target, false)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let effective_model_type = target.model_identity().to_owned();
-        let architecture = crate::nemotron_labs_diffusion::model::TextModel::<B>::new(target, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let prepared = prepare_architecture_handoff::<B, S, _>(architecture, source, requirements,
-            selected, capability, effective_model_type, identity, context)
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-        return visitor.visit(prepared, store).map_err(ReplicatedTextDispatchError::Backend);
+        let architecture =
+            crate::nemotron_labs_diffusion::model::TextModel::<B>::new(target, context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let prepared = prepare_architecture_handoff::<B, S, _>(
+            architecture,
+            source,
+            requirements,
+            selected,
+            capability,
+            effective_model_type,
+            identity,
+            context,
+        )
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+        return visitor
+            .visit(prepared, store)
+            .map_err(ReplicatedTextDispatchError::Backend);
     }
     let config = match (plan.safetensors_architecture(), plan.gguf_plan()) {
         (Some(plan), None) => match plan.model() {
@@ -2667,7 +2692,13 @@ impl EligibleConfig<'_> {
                 .map_err(|error| error.to_string())
         };
         match self {
-            Self::NemotronLabsDiffusion(args) => crate::nemotron_labs_diffusion::partitioned::TextBoundarySchema::new(args.hidden_size()).wire_schema().map_err(|error| error.to_string()),
+            Self::NemotronLabsDiffusion(args) => {
+                crate::nemotron_labs_diffusion::partitioned::TextBoundarySchema::new(
+                    args.hidden_size(),
+                )
+                .wire_schema()
+                .map_err(|error| error.to_string())
+            }
             Self::Nanbeige(args) => standard(args.dense_config().hidden_size),
             Self::Gemma2(args) => standard(args.dense_config().hidden_size),
             Self::Llama(args) => standard(args.hidden_size),
@@ -2758,7 +2789,9 @@ impl EligibleConfig<'_> {
             Ok(())
         };
         match self {
-            Self::NemotronLabsDiffusion(_) => extend(crate::nemotron_labs_diffusion::source_recipes(source)?)?,
+            Self::NemotronLabsDiffusion(_) => {
+                extend(crate::nemotron_labs_diffusion::source_recipes(source)?)?
+            }
             Self::Gemma2(_) | Self::Llama(_) => {}
             Self::Nanbeige(args) => extend(crate::decoder::repeated::recipes(
                 source,
@@ -2882,9 +2915,17 @@ impl EligibleConfig<'_> {
             }
             Self::Muse(args) => {
                 if args.weight_convention == crate::muse::WeightConvention::Gguf {
-                    let vision_source = source.source_provenance("model.vision_tower.patch_embedder.patch_embedding.weight").ok();
-                    if !vision_source.as_ref().is_some_and(|source| matches!(source.source_encoding, SourceTensorEncoding::Safetensors(_))) {
-                        extend(crate::muse::checkpoint::projector_gguf_recipes(args, source)?)?;
+                    let vision_source = source
+                        .source_provenance(
+                            "model.vision_tower.patch_embedder.patch_embedding.weight",
+                        )
+                        .ok();
+                    if !vision_source.as_ref().is_some_and(|source| {
+                        matches!(source.source_encoding, SourceTensorEncoding::Safetensors(_))
+                    }) {
+                        extend(crate::muse::checkpoint::projector_gguf_recipes(
+                            args, source,
+                        )?)?;
                     }
                     if args.is_moe() {
                         let text_layers = usize::try_from(args.num_hidden_layers)
@@ -2899,9 +2940,7 @@ impl EligibleConfig<'_> {
                     }
                     return Ok(recipes);
                 }
-                extend(crate::muse::static_safetensors_recipes(
-                    args, source,
-                )?)?;
+                extend(crate::muse::static_safetensors_recipes(args, source)?)?;
                 let mut counts = vec![
                     args.vision_config
                         .as_ref()
@@ -2909,7 +2948,14 @@ impl EligibleConfig<'_> {
                     usize::try_from(args.num_hidden_layers)
                         .map_err(|_| "invalid Muse-Glimmer text layer count".to_owned())?,
                 ];
-                if let Some(audio) = &args.audio_config {counts.push(audio.execution_units().map_err(|error| error.to_string())?.len());}
+                if let Some(audio) = &args.audio_config {
+                    counts.push(
+                        audio
+                            .execution_units()
+                            .map_err(|error| error.to_string())?
+                            .len(),
+                    );
+                }
                 for (group, count) in counts.into_iter().enumerate() {
                     for index in 0..count {
                         extend(crate::muse::unit_safetensors_recipes(
@@ -2989,7 +3035,9 @@ impl EligibleConfig<'_> {
     }
 
     fn canonical_parameter_name(&self, name: &str, aliases: &[String]) -> String {
-        if matches!(self, Self::NemotronLabsDiffusion(_)) { return crate::nemotron_labs_diffusion::canonical_parameter_name(name); }
+        if matches!(self, Self::NemotronLabsDiffusion(_)) {
+            return crate::nemotron_labs_diffusion::canonical_parameter_name(name);
+        }
         if matches!(self, Self::DiffusionGemma(_)) {
             return crate::diffusion_gemma::canonical_safetensors_target(name);
         }
@@ -3140,7 +3188,8 @@ impl EligibleConfig<'_> {
 
     fn operators(&self) -> NeuralOperatorCapabilities {
         match self {
-            Self::NemotronLabsDiffusion(args) => crate::decoder::operator_requirements(*args).union(NeuralOperatorCapabilities::CAST_FLOAT),
+            Self::NemotronLabsDiffusion(args) => crate::decoder::operator_requirements(*args)
+                .union(NeuralOperatorCapabilities::CAST_FLOAT),
             Self::K2Horizon(args) => crate::decoder::operator_requirements(*args),
             Self::Gemma2(args) => crate::decoder::operator_requirements(*args),
             Self::Llama(_)
@@ -3291,7 +3340,9 @@ impl EligibleConfig<'_> {
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
         match self {
-            Self::NemotronLabsDiffusion(args) => crate::decoder::state_layout(*args).map_err(|error| error.to_string()),
+            Self::NemotronLabsDiffusion(args) => {
+                crate::decoder::state_layout(*args).map_err(|error| error.to_string())
+            }
             Self::Nanbeige(args) => {
                 crate::nanbeige::state_layout(args).map_err(|error| error.to_string())
             }
@@ -3338,9 +3389,7 @@ impl EligibleConfig<'_> {
                 crate::inkling::composite_state_layout(&target, prediction.as_ref())
                     .map_err(|error| error.to_string())
             }
-            Self::Muse(args) => {
-                crate::muse::state_layout(args).map_err(|error| error.to_string())
-            }
+            Self::Muse(args) => crate::muse::state_layout(args).map_err(|error| error.to_string()),
             Self::QwenVl(args) => {
                 crate::qwen::vl::state_layout(args).map_err(|error| error.to_string())
             }
@@ -3372,7 +3421,9 @@ impl EligibleConfig<'_> {
 
     fn native_format(&self, name: &str) -> LinearFormat {
         match self {
-            Self::NemotronLabsDiffusion(args) => return crate::decoder::Config::linear_format(*args, name),
+            Self::NemotronLabsDiffusion(args) => {
+                return crate::decoder::Config::linear_format(*args, name)
+            }
             Self::Nanbeige(args) => args.weight_quantization_for(name),
             Self::Gemma2(args) => args.weight_quantization_for(name),
             Self::Llama(args) => args.weight_quantization_for(name),
@@ -3438,7 +3489,10 @@ impl EligibleConfig<'_> {
                         .map_or(LinearFormat::Dense, |vision| vision.linear_format_for(name));
                 }
                 if name.starts_with("model.audio_tower.") {
-                    return args.audio_config.as_ref().map_or(LinearFormat::Dense, |audio| audio.linear_format_for(name));
+                    return args
+                        .audio_config
+                        .as_ref()
+                        .map_or(LinearFormat::Dense, |audio| audio.linear_format_for(name));
                 }
                 return args.linear_format_for(name);
             }
@@ -3797,7 +3851,10 @@ impl EligibleConfig<'_> {
                                         })
                                     })?;
                             shapes.insert(
-                                crate::muse::translate_projector_gguf_name(&patch.key, args.audio_config.as_ref()),
+                                crate::muse::translate_projector_gguf_name(
+                                    &patch.key,
+                                    args.audio_config.as_ref(),
+                                ),
                                 vec![patch.shape[0], width],
                             );
                         }
@@ -3935,7 +3992,9 @@ impl EligibleConfig<'_> {
         linear_shapes: &BTreeMap<String, Vec<usize>>,
     ) -> ReplicatedTextParameterRole {
         match self {
-            Self::NemotronLabsDiffusion(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
+            Self::NemotronLabsDiffusion(args) => {
+                decoder_parameter_role(*args, name, companion, linear_shapes)
+            }
             Self::Nanbeige(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Gemma2(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Llama(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
@@ -4536,9 +4595,10 @@ fn replicated_text_requirements_for_structure(
     let floating_source = crate::preparation::prepared_floating_state_dtype_source(inspection)
         .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
     let state_partition_plan = match &config {
-        EligibleConfig::Muse(args) => {
-            Some(crate::muse::model::state_partition_plan(args, &state_layout))
-        }
+        EligibleConfig::Muse(args) => Some(crate::muse::model::state_partition_plan(
+            args,
+            &state_layout,
+        )),
         _ => None,
     };
     let mut requirements = ReplicatedTextRequirements::new(
@@ -4626,13 +4686,12 @@ fn prediction_extension_materialization_parameters(
     )?;
     let extra_recipes = prediction_extension_recipes(extension, recipe_source.as_ref())?;
     let extra_targets = extra_recipes.keys().cloned().collect::<BTreeSet<_>>();
-    let (mut parameters, mut recipes, mut outputs) =
-        finalize_materialization_parameters(
-            &config,
-            parameters,
-            recipe_source.as_ref(),
-            extra_recipes,
-        )?;
+    let (mut parameters, mut recipes, mut outputs) = finalize_materialization_parameters(
+        &config,
+        parameters,
+        recipe_source.as_ref(),
+        extra_recipes,
+    )?;
     let missing_recipe_parameters = extra_targets
         .iter()
         .filter(|target| {
@@ -5236,8 +5295,12 @@ fn safetensors_eligible_config(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
-        SafetensorsModelConfig::NemotronLabsDiffusion(args) if args.vision.is_some() => Err(ReplicatedTextIneligibility::CompositeInput),
-        SafetensorsModelConfig::NemotronLabsDiffusion(args) => Ok(EligibleConfig::NemotronLabsDiffusion(args)),
+        SafetensorsModelConfig::NemotronLabsDiffusion(args) if args.vision.is_some() => {
+            Err(ReplicatedTextIneligibility::CompositeInput)
+        }
+        SafetensorsModelConfig::NemotronLabsDiffusion(args) => {
+            Ok(EligibleConfig::NemotronLabsDiffusion(args))
+        }
         SafetensorsModelConfig::DiffusionGemma(_) => {
             Err(ReplicatedTextIneligibility::BlockRefinement)
         }
@@ -5309,7 +5372,9 @@ fn gguf_eligible_config(
     architecture: &crate::configuration::GgufArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
-        GgufModelConfig::NemotronLabsDiffusion(plan) => Ok(EligibleConfig::NemotronLabsDiffusion(plan.text_config())),
+        GgufModelConfig::NemotronLabsDiffusion(plan) => {
+            Ok(EligibleConfig::NemotronLabsDiffusion(plan.text_config()))
+        }
         GgufModelConfig::DiffusionGemma(_) => Err(ReplicatedTextIneligibility::BlockRefinement),
         GgufModelConfig::VoiceChat(_) => Err(ReplicatedTextIneligibility::Realtime),
         GgufModelConfig::Qwen4Exp(_) => Err(ReplicatedTextIneligibility::Routed),
@@ -5354,9 +5419,9 @@ fn gguf_eligible_config(
             Err(ReplicatedTextIneligibility::Routed)
         }
         GgufModelConfig::NemotronH(args) => Ok(EligibleConfig::NemotronH(args)),
-        GgufModelConfig::Gemma4(_)
-        | GgufModelConfig::Inkling(_)
-        | GgufModelConfig::Muse(_) => Err(ReplicatedTextIneligibility::CompositeInput),
+        GgufModelConfig::Gemma4(_) | GgufModelConfig::Inkling(_) | GgufModelConfig::Muse(_) => {
+            Err(ReplicatedTextIneligibility::CompositeInput)
+        }
         GgufModelConfig::DeepSeekV3(args) if args.num_nextn_predict_layers > 0 => {
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
         }
@@ -5680,10 +5745,20 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
             })
     };
     if matches!(config, EligibleConfig::NemotronLabsDiffusion(_)) {
-        if let Some(owner) = execution_unit("draft_adapter.layers.", crate::decoder::TEXT_DECODER_EXECUTION_GROUP) { return owner; }
-        if let Some(owner) = execution_unit("model.vision_tower.transformer.layers.", "vision") { return owner; }
+        if let Some(owner) = execution_unit(
+            "draft_adapter.layers.",
+            crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
+        ) {
+            return owner;
+        }
+        if let Some(owner) = execution_unit("model.vision_tower.transformer.layers.", "vision") {
+            return owner;
+        }
         if name.starts_with("model.multi_modal_projector.") {
-            return ReplicatedTextParameterOwner::ExecutionUnit { group: "vision_projection".into(), unit: 0 };
+            return ReplicatedTextParameterOwner::ExecutionUnit {
+                group: "vision_projection".into(),
+                unit: 0,
+            };
         }
         if name.starts_with("model.vision_tower.") {
             return ReplicatedTextParameterOwner::StaticRole("vision_embedding".into());
@@ -5785,18 +5860,11 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
         }
     }
     if let EligibleConfig::Muse(args) = config {
-        if let Some(consumers) =
-            crate::muse::parallel::vision_static_consumer_units(args, name)
-        {
+        if let Some(consumers) = crate::muse::parallel::vision_static_consumer_units(args, name) {
             return ReplicatedTextParameterOwner::StaticUnitConsumers {
                 role: "vision".into(),
                 consumers: consumers
-                    .map(|unit| {
-                        (
-                            crate::muse::model::VISION_EXECUTION_GROUP.into(),
-                            unit,
-                        )
-                    })
+                    .map(|unit| (crate::muse::model::VISION_EXECUTION_GROUP.into(), unit))
                     .collect(),
             };
         }
@@ -5888,12 +5956,9 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
         } else {
             "norm"
         }
-    } else if matches!(config, EligibleConfig::Muse(_)) && name.starts_with("model.vision_")
-    {
+    } else if matches!(config, EligibleConfig::Muse(_)) && name.starts_with("model.vision_") {
         "vision"
-    } else if matches!(config, EligibleConfig::Muse(_))
-        && name == "model.embed_tokens.weight"
-    {
+    } else if matches!(config, EligibleConfig::Muse(_)) && name == "model.embed_tokens.weight" {
         "embedding"
     } else if matches!(config, EligibleConfig::DeepSeekV4(_)) && name.starts_with("hc_head_") {
         "hyper_head"
@@ -6823,7 +6888,12 @@ impl CompositeConfig<'_> {
 
     fn input_modalities(&self) -> InputModalities {
         match self {
-            Self::NemotronLabsDiffusion(_) => InputModalities { text: true, image: true, audio: false, video: false },
+            Self::NemotronLabsDiffusion(_) => InputModalities {
+                text: true,
+                image: true,
+                audio: false,
+                video: false,
+            },
             Self::Diffusion(args) => args.input_modalities(),
             Self::Gemma4(args) => args.input_modalities(),
             Self::Inkling(args) => args.input_modalities(),
@@ -6856,7 +6926,9 @@ impl CompositeConfig<'_> {
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
         match self {
-            Self::NemotronLabsDiffusion(args) => crate::decoder::state_layout(*args).map_err(|error| error.to_string()),
+            Self::NemotronLabsDiffusion(args) => {
+                crate::decoder::state_layout(*args).map_err(|error| error.to_string())
+            }
             Self::Diffusion(args) => {
                 crate::diffusion_gemma::state_layout(args).map_err(|error| error.to_string())
             }
@@ -6871,9 +6943,7 @@ impl CompositeConfig<'_> {
                 crate::inkling::composite_state_layout(&target, prediction.as_ref())
                     .map_err(|error| error.to_string())
             }
-            Self::Muse(args) => {
-                crate::muse::state_layout(args).map_err(|error| error.to_string())
-            }
+            Self::Muse(args) => crate::muse::state_layout(args).map_err(|error| error.to_string()),
             Self::QwenVl(args) => {
                 crate::qwen::vl::state_layout(args).map_err(|error| error.to_string())
             }
@@ -6908,7 +6978,21 @@ impl CompositeConfig<'_> {
             request_optional: true,
         };
         let (graph, counts, transports) = match self {
-            Self::NemotronLabsDiffusion(args) => { let (graph, _) = crate::nemotron_labs_diffusion::parallel::composite_graph(args).map_err(|error| error.to_string())?; (graph, vec![args.vision.as_ref().unwrap().num_hidden_layers as usize, 1, args.num_hidden_layers() as usize], (0..3).map(crate::nemotron_labs_diffusion::parallel::group_transport).collect()) },
+            Self::NemotronLabsDiffusion(args) => {
+                let (graph, _) = crate::nemotron_labs_diffusion::parallel::composite_graph(args)
+                    .map_err(|error| error.to_string())?;
+                (
+                    graph,
+                    vec![
+                        args.vision.as_ref().unwrap().num_hidden_layers as usize,
+                        1,
+                        args.num_hidden_layers() as usize,
+                    ],
+                    (0..3)
+                        .map(crate::nemotron_labs_diffusion::parallel::group_transport)
+                        .collect(),
+                )
+            }
             Self::Diffusion(args) => {
                 let (graph, _) = crate::diffusion_gemma::composite::graph(args)
                     .map_err(|error| error.to_string())?;
@@ -7033,11 +7117,25 @@ impl CompositeConfig<'_> {
                 )
             }
             Self::Muse(args) => {
-                let graph = crate::muse::graph::execution_graph(args).map_err(|error| error.to_string())?;
-                let mut counts = vec![args.vision_config.as_ref().map_or(0, |vision| vision.layer_count()), args.num_hidden_layers as usize];
-                let mut transports = vec![crate::muse::model::vision_group_transport(args), crate::transport::decoder()];
+                let graph =
+                    crate::muse::graph::execution_graph(args).map_err(|error| error.to_string())?;
+                let mut counts = vec![
+                    args.vision_config
+                        .as_ref()
+                        .map_or(0, |vision| vision.layer_count()),
+                    args.num_hidden_layers as usize,
+                ];
+                let mut transports = vec![
+                    crate::muse::model::vision_group_transport(args),
+                    crate::transport::decoder(),
+                ];
                 if let Some(audio) = &args.audio_config {
-                    counts.push(audio.execution_units().map_err(|error| error.to_string())?.len());
+                    counts.push(
+                        audio
+                            .execution_units()
+                            .map_err(|error| error.to_string())?
+                            .len(),
+                    );
                     transports.push(crate::muse::model::audio_group_transport());
                 }
                 (graph, counts, transports)
@@ -7105,7 +7203,9 @@ pub(crate) fn composite_config(
             GgufMediaProjectorConfig::Gemma4(args) => CompositeConfig::Gemma4(args),
             GgufMediaProjectorConfig::Inkling(args) => CompositeConfig::Inkling(args),
             GgufMediaProjectorConfig::Muse(args) => CompositeConfig::Muse(args),
-            GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => CompositeConfig::NemotronLabsDiffusion(config),
+            GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => {
+                CompositeConfig::NemotronLabsDiffusion(config)
+            }
             GgufMediaProjectorConfig::Qwen3Vl(args) => CompositeConfig::QwenVl(args),
             GgufMediaProjectorConfig::Qwen35(args) => CompositeConfig::QwenHybrid(args),
             GgufMediaProjectorConfig::Qwen4Exp(_) => {
@@ -7127,15 +7227,17 @@ pub(crate) fn composite_config(
         plan.safetensors_architecture().map(|plan| plan.model()),
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
-        (Some(SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) if args.vision.is_some() => Some(CompositeConfig::NemotronLabsDiffusion(args)),
+        (Some(SafetensorsModelConfig::NemotronLabsDiffusion(args)), None)
+            if args.vision.is_some() =>
+        {
+            Some(CompositeConfig::NemotronLabsDiffusion(args))
+        }
         (Some(SafetensorsModelConfig::DiffusionGemma(args)), None) if args.vision.is_some() => {
             Some(CompositeConfig::Diffusion(args))
         }
         (Some(SafetensorsModelConfig::Gemma4(args)), None) => Some(CompositeConfig::Gemma4(args)),
         (Some(SafetensorsModelConfig::Inkling(args)), None) => Some(CompositeConfig::Inkling(args)),
-        (Some(SafetensorsModelConfig::Muse(args)), None) => {
-            Some(CompositeConfig::Muse(args))
-        }
+        (Some(SafetensorsModelConfig::Muse(args)), None) => Some(CompositeConfig::Muse(args)),
         (Some(SafetensorsModelConfig::QwenVl(args)), None) => Some(CompositeConfig::QwenVl(args)),
         (Some(SafetensorsModelConfig::QwenHybrid(args)), None) if args.vision.is_some() => {
             Some(CompositeConfig::QwenHybrid(args))
@@ -7398,8 +7500,7 @@ fn muse_replicated_expert_realization_plan(
     for layer in 0..usize::try_from(args.num_hidden_layers).map_err(|error| error.to_string())? {
         specs.insert(
             (owner_group.clone(), layer),
-            crate::muse::text::expert_bank_spec(args, layer)
-                .map_err(|error| error.to_string())?,
+            crate::muse::text::expert_bank_spec(args, layer).map_err(|error| error.to_string())?,
         );
     }
     crate::ExpertRealizationPlan::balanced(global_experts, replicated_expert_topology()?, specs)
@@ -7560,18 +7661,16 @@ fn composite_routed_requirements(
             )
         }
         CompositeConfig::Muse(args) => {
-            let owner_group = eredu_runtime::ExecutionGroupId::new(
-                crate::muse::model::TEXT_EXECUTION_GROUP,
-            )
-            .map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-            })?;
+            let owner_group =
+                eredu_runtime::ExecutionGroupId::new(crate::muse::model::TEXT_EXECUTION_GROUP)
+                    .map_err(|error| {
+                        ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                    })?;
             let plan = muse_replicated_expert_realization_plan(args).map_err(|error| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
             })?;
-            let catalog =
-                crate::muse::expert_residency_catalog(recipe_source.as_ref(), args)
-                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+            let catalog = crate::muse::expert_residency_catalog(recipe_source.as_ref(), args)
+                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
             (
                 owner_group,
                 plan,
@@ -8057,18 +8156,36 @@ where
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
         let capability = crate::capability::nemotron_labs_diffusion(args, true)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let source = self.has_transform.then(|| {
-            args.with_checkpoint_formats(self.source_formats.clone())
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))
-                .and_then(|config| crate::nemotron_labs_diffusion::composite::Model::<B>::new(config, self.context)
-                    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string())))
-        }).transpose()?;
-        let target = args.with_checkpoint_formats(self.target_formats.clone())
+        let source = self
+            .has_transform
+            .then(|| {
+                args.with_checkpoint_formats(self.source_formats.clone())
+                    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))
+                    .and_then(|config| {
+                        crate::nemotron_labs_diffusion::composite::Model::<B>::new(
+                            config,
+                            self.context,
+                        )
+                        .map_err(|error| {
+                            ReplicatedTextDispatchError::Architecture(error.to_string())
+                        })
+                    })
+            })
+            .transpose()?;
+        let target = args
+            .with_checkpoint_formats(self.target_formats.clone())
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let identity = target.architecture_fingerprint();
-        let architecture = crate::nemotron_labs_diffusion::composite::Model::<B>::new(target, self.context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        self.visit(architecture, source, capability, "nemotron_labs_diffusion_vlm".into(), identity)
+        let architecture =
+            crate::nemotron_labs_diffusion::composite::Model::<B>::new(target, self.context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(
+            architecture,
+            source,
+            capability,
+            "nemotron_labs_diffusion_vlm".into(),
+            identity,
+        )
     }
 
     #[inline(never)]
@@ -8162,17 +8279,14 @@ where
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let source = self
             .has_transform
-            .then(|| {
-                crate::muse::with_checkpoint_formats(args, self.source_formats.clone())
-            })
+            .then(|| crate::muse::with_checkpoint_formats(args, self.source_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
             .map(|args| crate::muse::LayeredModel::<B>::new(args, self.context))
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let target =
-            crate::muse::with_checkpoint_formats(args, self.target_formats.clone())
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
+        let target = crate::muse::with_checkpoint_formats(args, self.target_formats.clone())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.identity.text_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
         let architecture = crate::muse::LayeredModel::<B>::new(target, self.context)

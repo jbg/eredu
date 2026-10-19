@@ -149,7 +149,13 @@ impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
             .parser
             .continuation_event_storage_bytes(input, max_predictions)
             .and_then(|bytes| {
-                bytes.checked_add(self.parser.stream.sink.tool_names.event_growth_bytes(input)?)
+                bytes.checked_add(
+                    self.parser
+                        .stream
+                        .sink
+                        .tool_names
+                        .event_growth_bytes(input)?,
+                )
             })
     }
 
@@ -183,6 +189,12 @@ impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
             )?
             .checked_add(64)?
             .checked_add(max_predictions.checked_mul(4)?)?
-            .checked_add(self.parser.stream.sink.tool_names.event_growth_bytes(input)?)
+            .checked_add(
+                self.parser
+                    .stream
+                    .sink
+                    .tool_names
+                    .event_growth_bytes(input)?,
+            )
     }
 }

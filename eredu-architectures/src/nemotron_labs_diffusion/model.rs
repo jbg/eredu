@@ -574,7 +574,16 @@ where
         mask: Option<&'a B::Tensor>,
         invocation: AttentionInvocation,
     ) -> Option<Self::Input<'a>> {
-        if ![AttentionInvocation::CAUSAL, AttentionInvocation::DIFFUSION, AttentionInvocation::DRAFT].contains(&invocation) || feedback.is_some() { return None; }
+        if ![
+            AttentionInvocation::CAUSAL,
+            AttentionInvocation::DIFFUSION,
+            AttentionInvocation::DRAFT,
+        ]
+        .contains(&invocation)
+            || feedback.is_some()
+        {
+            return None;
+        }
         Some(TextInput {
             tokens,
             mask,

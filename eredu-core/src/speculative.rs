@@ -9,9 +9,9 @@ use crate::{
         TextGenerationConfig,
     },
     generation::{
-        FinishReason, GenerationCancellationToken, GenerationError, GenerationSequence,
-        SemanticEvent, SpeculativeCancellationDisposition, GenerationRequestConfig, SpeculativeRequestId,
-        SpeculativeRequestLifecycle, SpeculativeRequestStatus,
+        FinishReason, GenerationCancellationToken, GenerationError, GenerationRequestConfig,
+        GenerationSequence, SemanticEvent, SpeculativeCancellationDisposition,
+        SpeculativeRequestId, SpeculativeRequestLifecycle, SpeculativeRequestStatus,
         SpeculativeSchedulerOptions, TokenTerminalSignals,
     },
 };
@@ -23,9 +23,9 @@ use std::{
 
 pub mod erasure;
 pub use erasure::{
-    DynGenerationCache, DynGenerationCheckpoint, DynGenerationDraftState,
-    DynGenerationExecutor, DynGenerationTargetState, DynGenerationVerification,
-    GenerationExecutorCacheFactory, GenerationExecutorTypes,
+    DynGenerationCache, DynGenerationCheckpoint, DynGenerationDraftState, DynGenerationExecutor,
+    DynGenerationTargetState, DynGenerationVerification, GenerationExecutorCacheFactory,
+    GenerationExecutorTypes,
 };
 
 mod control;
@@ -156,12 +156,17 @@ where
         }
     }
     /// Retains optional mode commands for this independently progressing lane.
-    pub fn with_control_handle(mut self, handle: Option<crate::execution_control::GenerationControlHandle>) -> Self {
+    pub fn with_control_handle(
+        mut self,
+        handle: Option<crate::execution_control::GenerationControlHandle>,
+    ) -> Self {
         self.control_handle = handle;
         self
     }
     /// Transfers command ownership into prepared generation without rebinding it.
-    pub fn take_control_handle(&mut self) -> Option<crate::execution_control::GenerationControlHandle> {
+    pub fn take_control_handle(
+        &mut self,
+    ) -> Option<crate::execution_control::GenerationControlHandle> {
         self.control_handle.take()
     }
     /// Takes the backend-owned prompt exactly once.
@@ -530,9 +535,13 @@ impl SpeculativeStats {
         self.target_tokens
     }
     /// Complete canvas positions evaluated by ordinary refinement.
-    pub const fn refinement_tokens(&self) -> usize { self.refinement_tokens }
+    pub const fn refinement_tokens(&self) -> usize {
+        self.refinement_tokens
+    }
     /// Ordinary numerical refinement invocations.
-    pub const fn refinement_steps(&self) -> usize { self.refinement_steps }
+    pub const fn refinement_steps(&self) -> usize {
+        self.refinement_steps
+    }
     /// Assistant tokens proposed.
     pub const fn draft_tokens(&self) -> usize {
         self.draft_tokens
@@ -854,41 +863,87 @@ pub enum RefinementProgress<L> {
 pub trait SpeculativeExecutor {
     /// Completed native decisions use this source protocol instead of exposing
     /// logits or fabricating verification probability evidence.
-    fn uses_completed_decisions(&self) -> bool { false }
+    fn uses_completed_decisions(&self) -> bool {
+        false
+    }
 
     /// Installs a prepared completed-decision source without executing a prompt.
-    fn prepare_decision_source<'a>(&mut self, _input: Self::Input, _cache: &mut Self::Cache,
-        _context: Self::Context<'a>) -> Result<Option<Self::TargetState>, Self::Error>
-    where Self: 'a { Ok(None) }
+    fn prepare_decision_source<'a>(
+        &mut self,
+        _input: Self::Input,
+        _cache: &mut Self::Cache,
+        _context: Self::Context<'a>,
+    ) -> Result<Option<Self::TargetState>, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(None)
+    }
 
     /// Advances one context, numerical, or sampled operation. A decision retains
     /// exact native output until commitment; progress never advances constraints.
-    fn advance_decision_source<'a>(&mut self, _cache: &mut Self::Cache,
-        _state: &mut Self::TargetState, _remaining: usize, _context: Self::Context<'a>)
-        -> Result<Option<CompletedDecisionProgress>, Self::Error>
-    where Self: 'a { Ok(None) }
+    fn advance_decision_source<'a>(
+        &mut self,
+        _cache: &mut Self::Cache,
+        _state: &mut Self::TargetState,
+        _remaining: usize,
+        _context: Self::Context<'a>,
+    ) -> Result<Option<CompletedDecisionProgress>, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(None)
+    }
 
     /// Completes one nonfinal context chunk without requesting a sampling decision.
-    fn advance_decision_context<'a>(&mut self, _cache: &mut Self::Cache,
-        _context: Self::Context<'a>) -> Result<Option<crate::backend::TextProgress>, Self::Error>
-    where Self: 'a { Ok(None) }
+    fn advance_decision_context<'a>(
+        &mut self,
+        _cache: &mut Self::Cache,
+        _context: Self::Context<'a>,
+    ) -> Result<Option<crate::backend::TextProgress>, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(None)
+    }
 
     /// Exact commitment allowance for a completed source, including unlimited runs.
-    fn completed_decision_allowance(&self, _cache: &Self::Cache) -> Option<Option<usize>> { None }
+    fn completed_decision_allowance(&self, _cache: &Self::Cache) -> Option<Option<usize>> {
+        None
+    }
 
     /// Settles native sampling before a decision becomes authoritative.
-    fn commit_decision_source<'a>(&mut self, _cache: &mut Self::Cache, _token: u32,
-        _committed_position: u64, _context: Self::Context<'a>) -> Result<(), Self::Error>
-    where Self: 'a { Ok(()) }
+    fn commit_decision_source<'a>(
+        &mut self,
+        _cache: &mut Self::Cache,
+        _token: u32,
+        _committed_position: u64,
+        _context: Self::Context<'a>,
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(())
+    }
 
     /// Settles a completed-decision block and its committed suffix. None selects
     /// the ordinary score-source handoff; false retains the queued command.
-    fn settle_decision_source<'a>(&mut self, _cache: &mut Self::Cache,
-        _previous: crate::decoding::DecodingMode, _requested: crate::decoding::DecodingMode,
-        _context: Self::Context<'a>) -> Result<Option<bool>, Self::Error>
-    where Self: 'a { Ok(None) }
+    fn settle_decision_source<'a>(
+        &mut self,
+        _cache: &mut Self::Cache,
+        _previous: crate::decoding::DecodingMode,
+        _requested: crate::decoding::DecodingMode,
+        _context: Self::Context<'a>,
+    ) -> Result<Option<bool>, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(None)
+    }
     /// Exact verification contract; masked confidence selection supplies no causal q.
-    fn verification_policy(&self) -> SpeculativeVerificationPolicy { SpeculativeVerificationPolicy::LikelihoodRatio }
+    fn verification_policy(&self) -> SpeculativeVerificationPolicy {
+        SpeculativeVerificationPolicy::LikelihoodRatio
+    }
     /// Backend-owned model input accepted by prefill submission.
     type Input;
     /// Complete backend-owned target cache.
@@ -904,7 +959,9 @@ pub trait SpeculativeExecutor {
     /// Opaque logits consumed by the backend's sampling adapter.
     type Logits: Clone;
     /// Backend execution assignment for one operation.
-    type Context<'a>: Copy where Self: 'a;
+    type Context<'a>: Copy
+    where
+        Self: 'a;
     /// Exact completion for submitted verification work.
     type Completion: BoundedCompletion<Error = Self::Error>;
     /// Optional backend-specific component telemetry.
@@ -914,14 +971,18 @@ pub trait SpeculativeExecutor {
 
     /// Mode mechanisms retained by this executor, independent of artifacts.
     fn decoding_capabilities(&self) -> crate::decoding::DecodingCapabilities {
-        let native = Self::Completion::supports_cancellation(CompletionCancellationMode::NativeCancel);
-        let quarantine = Self::Completion::supports_cancellation(CompletionCancellationMode::QuarantineUntilComplete);
+        let native =
+            Self::Completion::supports_cancellation(CompletionCancellationMode::NativeCancel);
+        let quarantine = Self::Completion::supports_cancellation(
+            CompletionCancellationMode::QuarantineUntilComplete,
+        );
         crate::decoding::DecodingCapabilities {
             autoregressive: true,
             speculation: self.max_proposals() != 0,
             mode_changes: true,
             ..Default::default()
-        }.with_completion_support(native, quarantine)
+        }
+        .with_completion_support(native, quarantine)
     }
 
     /// Refines a complete admitted canvas over the settled causal prefix.
@@ -938,7 +999,8 @@ pub trait SpeculativeExecutor {
         _temperature: f32,
         _context: Self::Context<'a>,
     ) -> Result<Option<RefinementProgress<Self::Logits>>, Self::Error>
-    where Self: 'a
+    where
+        Self: 'a,
     {
         Ok(None)
     }
@@ -949,13 +1011,17 @@ pub trait SpeculativeExecutor {
         local: crate::decoding::DecodingCoordination,
         _context: Self::Context<'a>,
     ) -> Result<crate::decoding::DecodingCoordination, crate::BackendFailure>
-    where Self: 'a
+    where
+        Self: 'a,
     {
         Ok(local)
     }
 
     /// Complete storage retained by an immutable next-token row at a handoff.
-    fn logits_snapshot_estimate(&self, _logits: &Self::Logits) -> Option<crate::execution_control::SnapshotEstimate> {
+    fn logits_snapshot_estimate(
+        &self,
+        _logits: &Self::Logits,
+    ) -> Option<crate::execution_control::SnapshotEstimate> {
         None
     }
 
@@ -978,7 +1044,8 @@ pub trait SpeculativeExecutor {
         status: crate::run_preparation::TextPreparationStatus,
         _context: Self::Context<'a>,
     ) -> Result<crate::run_preparation::TextPreparationOutcome, crate::BackendFailure>
-    where Self: 'a
+    where
+        Self: 'a,
     {
         use crate::run_preparation::{TextPreparationOutcome as O, TextPreparationStatus as S};
         Ok(match status {
@@ -998,7 +1065,8 @@ pub trait SpeculativeExecutor {
         local: Vec<SpeculativeScheduleState>,
         _context: Self::Context<'a>,
     ) -> Result<Vec<SpeculativeScheduleState>, crate::BackendFailure>
-    where Self: 'a
+    where
+        Self: 'a,
     {
         Ok(local)
     }
@@ -1044,7 +1112,8 @@ pub trait SpeculativeExecutor {
         _request: SpeculativeRequestId,
         _context: Self::Context<'a>,
     ) -> Result<(), SpeculativeControlError>
-    where Self: 'a
+    where
+        Self: 'a,
     {
         if plan.is_empty() {
             Ok(())
@@ -1104,7 +1173,8 @@ pub trait SpeculativeExecutor {
         _state: &Self::TargetState,
         _context: Self::Context<'a>,
     ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, SpeculativeControlError>
-    where Self: 'a
+    where
+        Self: 'a,
     {
         Ok(None)
     }
@@ -1118,7 +1188,8 @@ pub trait SpeculativeExecutor {
         _state: &Self::TargetState,
         _context: Self::Context<'a>,
     ) -> Result<Option<Self::TargetState>, SpeculativeControlError>
-    where Self: 'a
+    where
+        Self: 'a,
     {
         Ok(None)
     }
@@ -1161,8 +1232,8 @@ pub trait SpeculativeExecutor {
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
-    where Self: 'context
-    ;
+    where
+        Self: 'context;
 
     /// Starts one private source state sized to the available output budget.
     /// Zero capacity preserves source alignment for a causal target step without
@@ -1174,8 +1245,8 @@ pub trait SpeculativeExecutor {
         proposal_capacity: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::DraftState, Self::Error>
-    where Self: 'a
-    ;
+    where
+        Self: 'a;
 
     /// Advances private assistant state and returns explicit proposal evidence.
     /// Causal assistants return logits; masked assistants return already selected
@@ -1186,8 +1257,8 @@ pub trait SpeculativeExecutor {
         last_token: u32,
         context: Self::Context<'a>,
     ) -> Result<SpeculativeProposalStep<Self::Logits>, Self::Error>
-    where Self: 'a
-    ;
+    where
+        Self: 'a;
 
     /// Captures the exact cache boundary before target verification.
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error>;
@@ -1199,8 +1270,8 @@ pub trait SpeculativeExecutor {
         checkpoint: &Self::CacheCheckpoint,
         context: Self::Context<'a>,
     ) -> Result<(), Self::Error>
-    where Self: 'a
-    ;
+    where
+        Self: 'a;
 
     /// Submits verification of the last committed token and proposal block.
     ///
@@ -1212,8 +1283,8 @@ pub trait SpeculativeExecutor {
         cache: &mut Self::Cache,
         context: Self::Context<'a>,
     ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
-    where Self: 'a
-    ;
+    where
+        Self: 'a;
 
     /// Selects one prediction row from retained verification output.
     fn verification_logits<'a>(
@@ -1222,8 +1293,8 @@ pub trait SpeculativeExecutor {
         index: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error>
-    where Self: 'a
-    ;
+    where
+        Self: 'a;
 
     /// Commits exactly the requested verified inputs and restores matching seed state.
     fn commit_verification<'a>(
@@ -1235,8 +1306,8 @@ pub trait SpeculativeExecutor {
         verified_inputs: usize,
         context: Self::Context<'a>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
-    where Self: 'a
-    ;
+    where
+        Self: 'a;
 }
 
 /// One source-owned physical operation, without invented logits or probabilities.
@@ -1307,7 +1378,9 @@ impl<R, D> SpeculativeRandomness<R, D> {
     /// Selected masked canvases own a separate proposal stream and do not use
     /// the conditional drafter's position-addressable sampling keys.
     pub fn with_verification_policy(mut self, policy: SpeculativeVerificationPolicy) -> Self {
-        if policy == SpeculativeVerificationPolicy::TargetMatching { self.draft = None; }
+        if policy == SpeculativeVerificationPolicy::TargetMatching {
+            self.draft = None;
+        }
         self
     }
 }
@@ -1322,14 +1395,26 @@ pub enum GenerationCache<'a, T> {
     Owned(T),
 }
 impl<'a, T> From<&'a mut T> for GenerationCache<'a, T> {
-    fn from(cache: &'a mut T) -> Self { Self::Borrowed(Box::new(cache)) }
+    fn from(cache: &'a mut T) -> Self {
+        Self::Borrowed(Box::new(cache))
+    }
 }
 impl<T> std::ops::Deref for GenerationCache<'_, T> {
     type Target = T;
-    fn deref(&self) -> &T { match self { Self::Borrowed(cache) => cache.as_ref(), Self::Owned(cache) => cache } }
+    fn deref(&self) -> &T {
+        match self {
+            Self::Borrowed(cache) => cache.as_ref(),
+            Self::Owned(cache) => cache,
+        }
+    }
 }
 impl<T> std::ops::DerefMut for GenerationCache<'_, T> {
-    fn deref_mut(&mut self) -> &mut T { match self { Self::Borrowed(cache) => cache.as_mut(), Self::Owned(cache) => cache } }
+    fn deref_mut(&mut self) -> &mut T {
+        match self {
+            Self::Borrowed(cache) => cache.as_mut(),
+            Self::Owned(cache) => cache,
+        }
+    }
 }
 
 /// One backend-prepared lane lent to neutral speculative orchestration.
@@ -1640,7 +1725,8 @@ pub trait SpeculativeSampling: Clone {
         _history: &[u32],
         _context: Self::Context<'a>,
     ) -> Result<Option<(u32, Self::Distribution)>, Self::Error>
-    where Self: 'a,
+    where
+        Self: 'a,
     {
         Ok(None)
     }
@@ -2287,7 +2373,10 @@ where
     }
 
     /// Shares commands with uninterrupted advancement before prefill starts.
-    pub fn with_control_handle(mut self, handle: Option<crate::execution_control::GenerationControlHandle>) -> Self {
+    pub fn with_control_handle(
+        mut self,
+        handle: Option<crate::execution_control::GenerationControlHandle>,
+    ) -> Self {
         self.control_handle = handle;
         self
     }
@@ -2623,8 +2712,8 @@ where
     let mut constraint = constraint.fork().map_err(SpeculativeDriverError::Output)?;
     let mut target_randomness = target_randomness.cloned();
     let mut history = sequence.tokens().to_vec();
-    let mut round =
-        crate::generation::VerificationCursor::new(proposal_count).map_err(SpeculativeDriverError::Generation)?;
+    let mut round = crate::generation::VerificationCursor::new(proposal_count)
+        .map_err(SpeculativeDriverError::Generation)?;
     let mut finish_reason = None;
 
     for (index, proposal) in proposals.iter().enumerate() {
@@ -2659,9 +2748,15 @@ where
                     &mut constraint,
                     proposal.token,
                 )?;
-                round.stage(crate::generation::VerificationDecision::Accept(proposal.token), finish_reason.is_some())
+                round
+                    .stage(
+                        crate::generation::VerificationDecision::Accept(proposal.token),
+                        finish_reason.is_some(),
+                    )
                     .map_err(SpeculativeDriverError::Generation)?;
-                round.commit(proposal.token).map_err(SpeculativeDriverError::Generation)?;
+                round
+                    .commit(proposal.token)
+                    .map_err(SpeculativeDriverError::Generation)?;
                 if finish_reason.is_some() {
                     break;
                 }
@@ -2679,9 +2774,15 @@ where
                     &mut constraint,
                     replacement,
                 )?;
-                round.stage(crate::generation::VerificationDecision::Replacement(replacement), finish_reason.is_some())
+                round
+                    .stage(
+                        crate::generation::VerificationDecision::Replacement(replacement),
+                        finish_reason.is_some(),
+                    )
                     .map_err(SpeculativeDriverError::Generation)?;
-                round.commit(replacement).map_err(SpeculativeDriverError::Generation)?;
+                round
+                    .commit(replacement)
+                    .map_err(SpeculativeDriverError::Generation)?;
                 break;
             }
         }
@@ -2707,9 +2808,15 @@ where
         sampler.update_sampler_state(&target, chosen, SamplingPlacement::Target, context)?;
         finish_reason =
             commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, chosen)?;
-        round.stage(crate::generation::VerificationDecision::Bonus(chosen), finish_reason.is_some())
+        round
+            .stage(
+                crate::generation::VerificationDecision::Bonus(chosen),
+                finish_reason.is_some(),
+            )
             .map_err(SpeculativeDriverError::Generation)?;
-        round.commit(chosen).map_err(SpeculativeDriverError::Generation)?;
+        round
+            .commit(chosen)
+            .map_err(SpeculativeDriverError::Generation)?;
         bonus_token = Some(chosen);
     }
     let plan = round
@@ -2791,39 +2898,78 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
     wait: BoundedCompletionWait,
     mut observe: impl FnMut(SpeculativeLifecycleStage) -> Result<(), SpeculativeOutputError>,
     context: E::Context<'a>,
-) -> Result<SettledCommittedSuffix<E::TargetState, E::Logits, E::Telemetry>, SpeculativeDriverError<E::Error>> {
-    let first = coordination::ready_result(executor,
-        tokens.first().copied().ok_or(SpeculativeDriverError::Generation(GenerationError::EmptyCommittedSuffix)), context)?;
-    let admitted = if E::Completion::supports_cancellation(wait.cancellation()) { Ok(()) }
-        else { Err(SpeculativeDriverError::UnsupportedCompletionCancellation { cancellation: wait.cancellation() }) };
+) -> Result<
+    SettledCommittedSuffix<E::TargetState, E::Logits, E::Telemetry>,
+    SpeculativeDriverError<E::Error>,
+> {
+    let first = coordination::ready_result(
+        executor,
+        tokens
+            .first()
+            .copied()
+            .ok_or(SpeculativeDriverError::Generation(
+                GenerationError::EmptyCommittedSuffix,
+            )),
+        context,
+    )?;
+    let admitted = if E::Completion::supports_cancellation(wait.cancellation()) {
+        Ok(())
+    } else {
+        Err(SpeculativeDriverError::UnsupportedCompletionCancellation {
+            cancellation: wait.cancellation(),
+        })
+    };
     coordination::ready_result(executor, admitted, context)?;
-    let checkpoint = executor.checkpoint(cache).map_err(SpeculativeDriverError::Backend);
+    let checkpoint = executor
+        .checkpoint(cache)
+        .map_err(SpeculativeDriverError::Backend);
     let checkpoint = coordination::ready_result(executor, checkpoint, context)?;
     let mut retained_output = None;
     let mut completion = None;
     let result = (|| {
-        let observed = observe(SpeculativeLifecycleStage::Execution).map_err(SpeculativeDriverError::Output);
+        let observed =
+            observe(SpeculativeLifecycleStage::Execution).map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
-        let draft = executor.begin_proposal(state, first, 0, context)
+        let draft = executor
+            .begin_proposal(state, first, 0, context)
             .map_err(SpeculativeDriverError::Backend);
         let draft = coordination::ready_result(executor, draft, context)?;
-        let submitted = executor.submit_verification(tokens, cache, context)
+        let submitted = executor
+            .submit_verification(tokens, cache, context)
             .map_err(SpeculativeDriverError::Backend);
         let submission = coordination::ready_result(executor, submitted, context)?;
         completion = Some(submission.completion);
         retained_output = Some(submission.output);
-        coordination::settle_completion::<E>(&mut completion, Ok(wait), observe(SpeculativeLifecycleStage::Completion))?;
+        coordination::settle_completion::<E>(
+            &mut completion,
+            Ok(wait),
+            observe(SpeculativeLifecycleStage::Completion),
+        )?;
         let computed = (|| {
-            observe(SpeculativeLifecycleStage::Observation).map_err(SpeculativeDriverError::Output)?;
-            let output = retained_output.as_mut().expect("suffix verification is retained");
+            observe(SpeculativeLifecycleStage::Observation)
+                .map_err(SpeculativeDriverError::Output)?;
+            let output = retained_output
+                .as_mut()
+                .expect("suffix verification is retained");
             let telemetry = executor.take_verification_telemetry(output)?;
             let logits = executor.verification_logits(output, tokens.len() - 1, context)?;
             Ok((telemetry, logits))
         })();
         let (telemetry, logits) = coordination::ready_result(executor, computed, context)?;
-        let observed = observe(SpeculativeLifecycleStage::CachePersistence).map_err(SpeculativeDriverError::Output);
+        let observed = observe(SpeculativeLifecycleStage::CachePersistence)
+            .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
-        let committed = executor.commit_verification(retained_output.take().expect("suffix verification is retained"), draft, cache, &checkpoint, tokens.len(), context)
+        let committed = executor
+            .commit_verification(
+                retained_output
+                    .take()
+                    .expect("suffix verification is retained"),
+                draft,
+                cache,
+                &checkpoint,
+                tokens.len(),
+                context,
+            )
             .map_err(SpeculativeDriverError::Backend);
         let committed = coordination::ready_result(executor, committed, context)?;
         Ok(SettledCommittedSuffix {
@@ -2983,7 +3129,9 @@ where
         let committed_tokens = resolved.committed_tokens;
         let pending_committed_tokens = if committed_tokens.len() + 1 > resolved.verified_inputs {
             committed_tokens.last().copied().into_iter().collect()
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let commit = executor
             .commit_verification(
                 verification.take().expect("pending verification"),
@@ -3004,7 +3152,9 @@ where
         stats.emitted_tokens += committed_tokens.len();
         let target_randomness = resolved.target_randomness;
         if terminal.is_some() {
-            if let Some(control) = &runtime.decoding { control.finish(); }
+            if let Some(control) = &runtime.decoding {
+                control.finish();
+            }
         }
         let cancelled = coordination::publish_candidate(
             executor,
@@ -3314,9 +3464,13 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
-    pub(crate) fn completed_source_cache(&self) -> &E::Cache { &self.cache }
+    pub(crate) fn completed_source_cache(&self) -> &E::Cache {
+        &self.cache
+    }
 
-    pub(crate) fn completed_source_parts(&mut self) -> (&mut E::Cache, &mut SpeculativeOutputRuntime<S, C, P>) {
+    pub(crate) fn completed_source_parts(
+        &mut self,
+    ) -> (&mut E::Cache, &mut SpeculativeOutputRuntime<S, C, P>) {
         (&mut self.cache, &mut self.runtime)
     }
 
@@ -3328,7 +3482,9 @@ where
         &self.decoding
     }
 
-    pub(crate) fn replace_completed_cancellation(&mut self, token: GenerationCancellationToken) { self.runtime.cancellation = token; }
+    pub(crate) fn replace_completed_cancellation(&mut self, token: GenerationCancellationToken) {
+        self.runtime.cancellation = token;
+    }
 
     pub(crate) fn restore_completed_sequence(&mut self, sequence: GenerationSequence) {
         self.config.max_tokens = sequence.max_tokens();
@@ -3338,7 +3494,9 @@ where
             SpeculativeRequestLifecycle::completed()
         } else {
             let mut lifecycle = SpeculativeRequestLifecycle::new();
-            lifecycle.transition(SpeculativeRequestStatus::ReadyToDraft).expect("prepared source becomes ready");
+            lifecycle
+                .transition(SpeculativeRequestStatus::ReadyToDraft)
+                .expect("prepared source becomes ready");
             lifecycle
         };
     }
@@ -3364,7 +3522,9 @@ where
     }
 
     /// Monotone request age for separating active work from controlled pauses.
-    pub fn submission_age(&self) -> Duration { self.started.elapsed() }
+    pub fn submission_age(&self) -> Duration {
+        self.started.elapsed()
+    }
 
     /// Portable request statistics.
     pub const fn stats(&self) -> &SpeculativeStats {
@@ -3382,7 +3542,9 @@ where
     }
 
     /// Whether a partially committed canvas still owns tentative positions.
-    pub fn has_tentative_refinement(&self) -> bool { self.refinement.is_some() }
+    pub fn has_tentative_refinement(&self) -> bool {
+        self.refinement.is_some()
+    }
 
     /// Active mode, queued command and most recent settled acknowledgement.
     pub fn decoding_state(&self) -> crate::decoding::DecodingState {
@@ -3390,7 +3552,10 @@ where
     }
 
     /// Queues one validated transition over the already retained source.
-    pub fn request_decoding_mode(&self, mode: crate::decoding::DecodingMode) -> Result<(), crate::decoding::DecodingModeError> {
+    pub fn request_decoding_mode(
+        &self,
+        mode: crate::decoding::DecodingMode,
+    ) -> Result<(), crate::decoding::DecodingModeError> {
         if self.runtime.cancellation().is_cancelled() || self.lifecycle.is_terminal() {
             return Err(crate::decoding::DecodingModeError::Terminal);
         }
@@ -3398,7 +3563,10 @@ where
     }
 
     /// Shares the same mailbox with cross-thread uninterrupted control.
-    pub fn bind_control_handle(&self, handle: &crate::execution_control::GenerationControlHandle) -> Result<(), crate::decoding::DecodingModeError> {
+    pub fn bind_control_handle(
+        &self,
+        handle: &crate::execution_control::GenerationControlHandle,
+    ) -> Result<(), crate::decoding::DecodingModeError> {
         handle.bind_decoding(self.decoding.clone(), Some(self.runtime.cancellation()))
     }
 
@@ -3424,7 +3592,9 @@ where
         self.lifecycle
             .transition(next)
             .map_err(SpeculativeDriverError::Generation)?;
-        if self.lifecycle.is_terminal() { self.decoding.finish(); }
+        if self.lifecycle.is_terminal() {
+            self.decoding.finish();
+        }
         Ok(())
     }
 
@@ -3518,20 +3688,43 @@ where
         ceiling: SpeculativeSchedulerOptions,
         context: E::Context<'context>,
     ) -> Result<bool, SpeculativeDriverError<E::Error>>
-    where E: 'context,
-        S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'context> = E::Context<'context>> + 'context,
+    where
+        E: 'context,
+        S: SpeculativeSampling<
+                Logits = E::Logits,
+                Error = E::Error,
+                Context<'context> = E::Context<'context>,
+            > + 'context,
     {
-        let Some(requested) = self.decoding.state().pending else { return Ok(false) };
-        if self.lifecycle.status() != SpeculativeRequestStatus::ReadyToDraft || self.pending.is_some() || self.refinement.is_some() {
+        let Some(requested) = self.decoding.state().pending else {
+            return Ok(false);
+        };
+        if self.lifecycle.status() != SpeculativeRequestStatus::ReadyToDraft
+            || self.pending.is_some()
+            || self.refinement.is_some()
+        {
             return Ok(false);
         }
         if executor.uses_completed_decisions() {
-            if executor.settle_decision_source(&mut self.cache, self.config.decoding_mode, requested, context)
-                .map_err(SpeculativeDriverError::Backend)? != Some(true) {
+            if executor
+                .settle_decision_source(
+                    &mut self.cache,
+                    self.config.decoding_mode,
+                    requested,
+                    context,
+                )
+                .map_err(SpeculativeDriverError::Backend)?
+                != Some(true)
+            {
                 return Ok(false);
             }
-            if self.decoding.acknowledge(requested, self.sequence().tokens().len() as u64,
-                || self.runtime.cancellation().is_cancelled()).is_none() {
+            if self
+                .decoding
+                .acknowledge(requested, self.sequence().tokens().len() as u64, || {
+                    self.runtime.cancellation().is_cancelled()
+                })
+                .is_none()
+            {
                 self.request_cancellation()?;
                 return Ok(false);
             }
@@ -3542,13 +3735,21 @@ where
             let origin = self.activation_origin(executor, false);
             let settled = with_activation_origin(executor, origin, |executor| {
                 settle_committed_suffix(
-                    executor, &mut self.cache, self.target_state.as_ref().expect("ready target seed"), &self.pending_committed_tokens,
-                    self.config.scheduler_options(ceiling).completion_wait().map_err(SpeculativeDriverError::Generation)?,
-                    |stage| self.runtime.observe_lifecycle(stage), context,
+                    executor,
+                    &mut self.cache,
+                    self.target_state.as_ref().expect("ready target seed"),
+                    &self.pending_committed_tokens,
+                    self.config
+                        .scheduler_options(ceiling)
+                        .completion_wait()
+                        .map_err(SpeculativeDriverError::Generation)?,
+                    |stage| self.runtime.observe_lifecycle(stage),
+                    context,
                 )
             })?;
             settled.telemetry.record(&mut self.stats);
-            self.stats.target_tokens += self.pending_committed_tokens.len() + settled.replayed_tokens;
+            self.stats.target_tokens +=
+                self.pending_committed_tokens.len() + settled.replayed_tokens;
             self.target_state = Some(settled.state);
             self.pending_committed_tokens.clear();
             self.next_logits = Some(settled.logits);
@@ -3556,12 +3757,21 @@ where
         if let Some(block) = self.block.take() {
             discard_continuation(&mut self.stats, SpeculativeContinuation::Promoted(block));
         }
-        let configured = executor.configure_decoding_mode(
-            self.target_state.as_mut().expect("ready target seed"), requested, self.config.temperature,
-        ).map_err(SpeculativeDriverError::Generation);
+        let configured = executor
+            .configure_decoding_mode(
+                self.target_state.as_mut().expect("ready target seed"),
+                requested,
+                self.config.temperature,
+            )
+            .map_err(SpeculativeDriverError::Generation);
         coordination::ready_result(executor, configured, context)?;
-        if self.decoding.acknowledge(requested, self.sequence().tokens().len() as u64,
-            || self.runtime.cancellation().is_cancelled()).is_none() {
+        if self
+            .decoding
+            .acknowledge(requested, self.sequence().tokens().len() as u64, || {
+                self.runtime.cancellation().is_cancelled()
+            })
+            .is_none()
+        {
             self.request_cancellation()?;
             return Ok(false);
         }
@@ -3574,51 +3784,108 @@ where
         executor: &mut E,
         context: E::Context<'context>,
     ) -> Result<(), SpeculativeDriverError<E::Error>>
-    where E: 'context,
-        S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'context> = E::Context<'context>> + 'context,
+    where
+        E: 'context,
+        S: SpeculativeSampling<
+                Logits = E::Logits,
+                Error = E::Error,
+                Context<'context> = E::Context<'context>,
+            > + 'context,
     {
         let computed = (|| {
-            self.runtime.observe_lifecycle(SpeculativeLifecycleStage::Execution).map_err(SpeculativeDriverError::Output)?;
+            self.runtime
+                .observe_lifecycle(SpeculativeLifecycleStage::Execution)
+                .map_err(SpeculativeDriverError::Output)?;
             let mut sampler = self.runtime.sampler().clone();
-            let mut constraint = self.runtime.constraint().fork().map_err(SpeculativeDriverError::Output)?;
+            let mut constraint = self
+                .runtime
+                .constraint()
+                .fork()
+                .map_err(SpeculativeDriverError::Output)?;
             let mut sequence = self.sequence().clone();
             let mut randomness = self.target_randomness.clone();
             let distribution = sampler.process_logits(
-                self.next_logits.as_ref().expect("retained causal row"), self.config.temperature,
-                sequence.tokens(), SamplingPlacement::Target, context,
+                self.next_logits.as_ref().expect("retained causal row"),
+                self.config.temperature,
+                sequence.tokens(),
+                SamplingPlacement::Target,
+                context,
             )?;
-            let token = sampler.sample(&distribution, self.config.temperature, randomness.as_mut(), SamplingPlacement::Target, context)?;
-            sampler.update_sampler_state(&distribution, token, SamplingPlacement::Target, context)?;
-            let terminal = commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, token)?;
+            let token = sampler.sample(
+                &distribution,
+                self.config.temperature,
+                randomness.as_mut(),
+                SamplingPlacement::Target,
+                context,
+            )?;
+            sampler.update_sampler_state(
+                &distribution,
+                token,
+                SamplingPlacement::Target,
+                context,
+            )?;
+            let terminal =
+                commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, token)?;
             Ok((sampler, constraint, sequence, randomness, token, terminal))
         })();
         let (sampler, mut constraint, mut sequence, randomness, token, terminal) =
             coordination::ready_result(executor, computed, context)?;
-        self.stats.submission_to_first_token.get_or_insert_with(|| self.started.elapsed());
-        if terminal.is_some() { self.decoding.finish(); }
-        let cancelled = coordination::publish_candidate(executor, &mut self.runtime, &mut constraint, &mut sequence, &[token], context)?;
-        self.runtime.install_committed_state(sampler, constraint, sequence);
+        self.stats
+            .submission_to_first_token
+            .get_or_insert_with(|| self.started.elapsed());
+        if terminal.is_some() {
+            self.decoding.finish();
+        }
+        let cancelled = coordination::publish_candidate(
+            executor,
+            &mut self.runtime,
+            &mut constraint,
+            &mut sequence,
+            &[token],
+            context,
+        )?;
+        self.runtime
+            .install_committed_state(sampler, constraint, sequence);
         self.target_randomness = randomness;
         self.pending_committed_tokens.push(token);
         self.next_logits = None;
         self.stats.emitted_tokens += 1;
-        if cancelled { self.transition(SpeculativeRequestStatus::Cancelled)?; }
-        else if terminal.is_some() { self.transition(SpeculativeRequestStatus::Completed)?; }
-        if self.lifecycle.is_terminal() { self.stats.elapsed = self.started.elapsed(); }
+        if cancelled {
+            self.transition(SpeculativeRequestStatus::Cancelled)?;
+        } else if terminal.is_some() {
+            self.transition(SpeculativeRequestStatus::Completed)?;
+        }
+        if self.lifecycle.is_terminal() {
+            self.stats.elapsed = self.started.elapsed();
+        }
         Ok(())
     }
 
     fn coordinate_refinement_cancellation<'a>(
-        &mut self, executor: &mut E, context: E::Context<'a>,
+        &mut self,
+        executor: &mut E,
+        context: E::Context<'a>,
     ) -> Result<bool, SpeculativeDriverError<E::Error>> {
-        let cancelled = self.decoding.coordinate(
-            self.runtime.cancellation().is_cancelled(), self.sequence().tokens().len() as u64,
-            Some(self.config.max_tokens.saturating_sub(self.sequence().tokens().len())),
-            |local| executor.coordinate_decoding_control(local, context),
-        ).map_err(|error| match error {
-            crate::decoding::DecodingControlError::Agreement(error) => SpeculativeDriverError::Preparation(error),
-            crate::decoding::DecodingControlError::Mode(error) => SpeculativeDriverError::Generation(GenerationError::DecodingMode(error)),
-        })?;
+        let cancelled = self
+            .decoding
+            .coordinate(
+                self.runtime.cancellation().is_cancelled(),
+                self.sequence().tokens().len() as u64,
+                Some(
+                    self.config
+                        .max_tokens
+                        .saturating_sub(self.sequence().tokens().len()),
+                ),
+                |local| executor.coordinate_decoding_control(local, context),
+            )
+            .map_err(|error| match error {
+                crate::decoding::DecodingControlError::Agreement(error) => {
+                    SpeculativeDriverError::Preparation(error)
+                }
+                crate::decoding::DecodingControlError::Mode(error) => {
+                    SpeculativeDriverError::Generation(GenerationError::DecodingMode(error))
+                }
+            })?;
         if cancelled {
             self.runtime.cancellation().cancel();
             self.request_cancellation()?;
@@ -3627,49 +3894,100 @@ where
     }
 
     fn refine_committed<'context>(
-        &mut self, executor: &mut E, policy: Option<crate::refinement::RefinementPolicy>,
-        ceiling: SpeculativeSchedulerOptions, context: E::Context<'context>,
+        &mut self,
+        executor: &mut E,
+        policy: Option<crate::refinement::RefinementPolicy>,
+        ceiling: SpeculativeSchedulerOptions,
+        context: E::Context<'context>,
     ) -> Result<(), SpeculativeDriverError<E::Error>>
-    where E: 'context,
-        S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'context> = E::Context<'context>> + 'context,
+    where
+        E: 'context,
+        S: SpeculativeSampling<
+                Logits = E::Logits,
+                Error = E::Error,
+                Context<'context> = E::Context<'context>,
+            > + 'context,
     {
         if self.refinement.is_none() && !self.pending_committed_tokens.is_empty() {
             let origin = self.activation_origin(executor, false);
-            let settled = with_activation_origin(executor, origin, |executor| settle_committed_suffix(
-                executor, &mut self.cache, self.target_state.as_ref().expect("ready target seed"),
-                &self.pending_committed_tokens,
-                self.config.scheduler_options(ceiling).completion_wait().map_err(SpeculativeDriverError::Generation)?,
-                |stage| self.runtime.observe_lifecycle(stage), context,
-            ))?;
+            let settled = with_activation_origin(executor, origin, |executor| {
+                settle_committed_suffix(
+                    executor,
+                    &mut self.cache,
+                    self.target_state.as_ref().expect("ready target seed"),
+                    &self.pending_committed_tokens,
+                    self.config
+                        .scheduler_options(ceiling)
+                        .completion_wait()
+                        .map_err(SpeculativeDriverError::Generation)?,
+                    |stage| self.runtime.observe_lifecycle(stage),
+                    context,
+                )
+            })?;
             settled.telemetry.record(&mut self.stats);
-            self.stats.target_tokens += self.pending_committed_tokens.len() + settled.replayed_tokens;
+            self.stats.target_tokens +=
+                self.pending_committed_tokens.len() + settled.replayed_tokens;
             self.target_state = Some(settled.state);
             self.pending_committed_tokens.clear();
             self.next_logits = Some(settled.logits);
         }
-        let unavailable = || SpeculativeDriverError::Generation(GenerationError::DecodingMode(
-            crate::decoding::DecodingModeError::Unsupported("refinement commitment policy")));
-        if self.refinement.as_ref().is_none_or(|canvas| canvas.positions.is_none()) {
-            let observed = self.runtime.observe_lifecycle(SpeculativeLifecycleStage::Execution)
+        let unavailable = || {
+            SpeculativeDriverError::Generation(GenerationError::DecodingMode(
+                crate::decoding::DecodingModeError::Unsupported("refinement commitment policy"),
+            ))
+        };
+        if self
+            .refinement
+            .as_ref()
+            .is_none_or(|canvas| canvas.positions.is_none())
+        {
+            let observed = self
+                .runtime
+                .observe_lifecycle(SpeculativeLifecycleStage::Execution)
                 .map_err(SpeculativeDriverError::Output);
             coordination::ready_result(executor, observed, context)?;
-            let pinned = self.refinement.as_ref().map_or(&[][..], |canvas| canvas.committed.as_slice());
+            let pinned = self
+                .refinement
+                .as_ref()
+                .map_or(&[][..], |canvas| canvas.committed.as_slice());
             let origin = self.activation_origin(executor, false);
-            let refined = with_activation_origin(executor, origin, |executor| executor.refine_block(
-                self.target_state.as_mut().expect("ready target seed"),
-                self.next_logits.as_ref().expect("settled causal row"), pinned,
-                policy, self.config.temperature, context,
-            )).map_err(SpeculativeDriverError::Backend);
-            let refined = coordination::ready_result(executor, refined, context)?.ok_or_else(unavailable)?;
+            let refined = with_activation_origin(executor, origin, |executor| {
+                executor.refine_block(
+                    self.target_state.as_mut().expect("ready target seed"),
+                    self.next_logits.as_ref().expect("settled causal row"),
+                    pinned,
+                    policy,
+                    self.config.temperature,
+                    context,
+                )
+            })
+            .map_err(SpeculativeDriverError::Backend);
+            let refined =
+                coordination::ready_result(executor, refined, context)?.ok_or_else(unavailable)?;
             let refined = match refined {
-                RefinementProgress::Pending { width, evaluated_positions, iterations } => {
-                    if width <= pinned.len() || self.refinement.as_ref().is_some_and(|canvas| canvas.width != width) {
-                        return Err(SpeculativeDriverError::Coordination("refinement changed its admitted canvas geometry"));
+                RefinementProgress::Pending {
+                    width,
+                    evaluated_positions,
+                    iterations,
+                } => {
+                    if width <= pinned.len()
+                        || self
+                            .refinement
+                            .as_ref()
+                            .is_some_and(|canvas| canvas.width != width)
+                    {
+                        return Err(SpeculativeDriverError::Coordination(
+                            "refinement changed its admitted canvas geometry",
+                        ));
                     }
                     self.stats.refinement_tokens += evaluated_positions;
                     self.stats.refinement_steps += iterations as usize;
                     if self.refinement.is_none() {
-                        self.refinement = Some(RefinementContinuation { positions: None, committed: Vec::new(), width });
+                        self.refinement = Some(RefinementContinuation {
+                            positions: None,
+                            committed: Vec::new(),
+                            width,
+                        });
                     }
                     self.coordinate_refinement_cancellation(executor, context)?;
                     return Ok(());
@@ -3679,37 +3997,86 @@ where
             self.stats.refinement_tokens += refined.evaluated_positions;
             self.stats.refinement_steps += refined.iterations as usize;
             let rows = refined.positions;
-            if rows.len() <= pinned.len() || rows.iter().zip(pinned).any(|((token, _), pinned)| token != pinned)
-                || self.refinement.as_ref().is_some_and(|canvas| canvas.width != rows.len()) {
-                return Err(SpeculativeDriverError::Coordination("refinement changed its committed prefix or admitted geometry"));
+            if rows.len() <= pinned.len()
+                || rows
+                    .iter()
+                    .zip(pinned)
+                    .any(|((token, _), pinned)| token != pinned)
+                || self
+                    .refinement
+                    .as_ref()
+                    .is_some_and(|canvas| canvas.width != rows.len())
+            {
+                return Err(SpeculativeDriverError::Coordination(
+                    "refinement changed its committed prefix or admitted geometry",
+                ));
             }
-            if self.coordinate_refinement_cancellation(executor, context)? { return Ok(()); }
+            if self.coordinate_refinement_cancellation(executor, context)? {
+                return Ok(());
+            }
             match &mut self.refinement {
                 Some(canvas) => canvas.positions = Some(rows),
-                slot @ None => *slot = Some(RefinementContinuation { width: rows.len(), positions: Some(rows), committed: Vec::new() }),
+                slot @ None => {
+                    *slot = Some(RefinementContinuation {
+                        width: rows.len(),
+                        positions: Some(rows),
+                        committed: Vec::new(),
+                    })
+                }
             }
             return Ok(());
         }
         let canvas = self.refinement.as_ref().expect("settled tentative canvas");
-        let (selected, scores) = &canvas.positions.as_ref().expect("settled position rows")[canvas.committed.len()];
+        let (selected, scores) =
+            &canvas.positions.as_ref().expect("settled position rows")[canvas.committed.len()];
         let selected = *selected;
         let mut sampler = self.runtime.sampler().clone();
-        let mut constraint = self.runtime.constraint().fork().map_err(SpeculativeDriverError::Output)?;
+        let mut constraint = self
+            .runtime
+            .constraint()
+            .fork()
+            .map_err(SpeculativeDriverError::Output)?;
         let mut sequence = self.sequence().clone();
         let finalized = (|| {
-            let (token, distribution) = sampler.finalize_refinement_position(scores, selected,
-                executor.decoding_capabilities().mask_token_id, sequence.tokens(), context)?
+            let (token, distribution) = sampler
+                .finalize_refinement_position(
+                    scores,
+                    selected,
+                    executor.decoding_capabilities().mask_token_id,
+                    sequence.tokens(),
+                    context,
+                )?
                 .ok_or_else(unavailable)?;
-            sampler.update_sampler_state(&distribution, token, SamplingPlacement::Target, context)?;
-            let terminal = commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, token)?;
+            sampler.update_sampler_state(
+                &distribution,
+                token,
+                SamplingPlacement::Target,
+                context,
+            )?;
+            let terminal =
+                commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, token)?;
             Ok((token, terminal))
         })();
         let (token, terminal) = coordination::ready_result(executor, finalized, context)?;
-        if self.coordinate_refinement_cancellation(executor, context)? { return Ok(()); }
-        if terminal.is_some() { self.decoding.finish(); }
-        self.stats.submission_to_first_token.get_or_insert_with(|| self.started.elapsed());
-        let cancelled = coordination::publish_candidate(executor, &mut self.runtime, &mut constraint, &mut sequence, &[token], context)?;
-        self.runtime.install_committed_state(sampler, constraint, sequence);
+        if self.coordinate_refinement_cancellation(executor, context)? {
+            return Ok(());
+        }
+        if terminal.is_some() {
+            self.decoding.finish();
+        }
+        self.stats
+            .submission_to_first_token
+            .get_or_insert_with(|| self.started.elapsed());
+        let cancelled = coordination::publish_candidate(
+            executor,
+            &mut self.runtime,
+            &mut constraint,
+            &mut sequence,
+            &[token],
+            context,
+        )?;
+        self.runtime
+            .install_committed_state(sampler, constraint, sequence);
         self.stats.emitted_tokens += 1;
         self.pending_committed_tokens.push(token);
         let canvas = self.refinement.as_mut().expect("settled tentative canvas");
@@ -3722,9 +4089,14 @@ where
             // can leave tentative state. The next action refines that suffix.
             canvas.positions = None;
         }
-        if cancelled { self.transition(SpeculativeRequestStatus::Cancelled)?; }
-        else if terminal.is_some() { self.transition(SpeculativeRequestStatus::Completed)?; }
-        if self.lifecycle.is_terminal() { self.stats.elapsed = self.started.elapsed(); }
+        if cancelled {
+            self.transition(SpeculativeRequestStatus::Cancelled)?;
+        } else if terminal.is_some() {
+            self.transition(SpeculativeRequestStatus::Completed)?;
+        }
+        if self.lifecycle.is_terminal() {
+            self.stats.elapsed = self.started.elapsed();
+        }
         Ok(())
     }
 
@@ -3743,37 +4115,70 @@ where
             > + 'context,
     {
         if executor.uses_completed_decisions() {
-            self.runtime.observe_lifecycle(SpeculativeLifecycleStage::Execution)
+            self.runtime
+                .observe_lifecycle(SpeculativeLifecycleStage::Execution)
                 .map_err(SpeculativeDriverError::Output)?;
-            let decision = executor.advance_decision_source(&mut self.cache,
-                self.target_state.as_mut().expect("prepared decision source"),
-                self.runtime.sequence().remaining(), context)
+            let decision = executor
+                .advance_decision_source(
+                    &mut self.cache,
+                    self.target_state
+                        .as_mut()
+                        .expect("prepared decision source"),
+                    self.runtime.sequence().remaining(),
+                    context,
+                )
                 .map_err(SpeculativeDriverError::Backend)?
-                .ok_or(SpeculativeDriverError::Coordination("completed decision source advancement"))?;
+                .ok_or(SpeculativeDriverError::Coordination(
+                    "completed decision source advancement",
+                ))?;
             if self.runtime.cancellation().is_cancelled() {
                 self.request_cancellation()?;
                 return Ok(false);
             }
             match decision {
-                CompletedDecisionProgress::Token { token_id, score_kind } => {
+                CompletedDecisionProgress::Token {
+                    token_id,
+                    score_kind,
+                } => {
                     let committed_position = self.sequence().tokens().len() as u64 + 1;
-                    executor.commit_decision_source(&mut self.cache, token_id,
-                        committed_position, context)
+                    executor
+                        .commit_decision_source(
+                            &mut self.cache,
+                            token_id,
+                            committed_position,
+                            context,
+                        )
                         .map_err(SpeculativeDriverError::Backend)?;
-                    let terminal = commit_terminal_token(&mut self.runtime.sequence,
-                        &mut self.runtime.sampler, &mut self.runtime.constraint, token_id)?;
-                    let cancelled = self.runtime.publish_committed(&[token_id])
+                    let terminal = commit_terminal_token(
+                        &mut self.runtime.sequence,
+                        &mut self.runtime.sampler,
+                        &mut self.runtime.constraint,
+                        token_id,
+                    )?;
+                    let cancelled = self
+                        .runtime
+                        .publish_committed(&[token_id])
                         .map_err(SpeculativeDriverError::Output)?;
-                    self.stats.submission_to_first_token.get_or_insert_with(|| self.started.elapsed());
+                    self.stats
+                        .submission_to_first_token
+                        .get_or_insert_with(|| self.started.elapsed());
                     self.stats.emitted_tokens += 1;
-                    self.completed_decision = Some(CompletedDecisionProgress::Token { token_id, score_kind });
-                    if cancelled { self.transition(SpeculativeRequestStatus::Cancelled)?; }
-                    else if terminal.is_some() { self.transition(SpeculativeRequestStatus::Completed)?; }
+                    self.completed_decision = Some(CompletedDecisionProgress::Token {
+                        token_id,
+                        score_kind,
+                    });
+                    if cancelled {
+                        self.transition(SpeculativeRequestStatus::Cancelled)?;
+                    } else if terminal.is_some() {
+                        self.transition(SpeculativeRequestStatus::Completed)?;
+                    }
                 }
                 CompletedDecisionProgress::Progress(progress) => {
                     self.completed_decision = Some(CompletedDecisionProgress::Progress(progress));
                 }
-                CompletedDecisionProgress::Finished => self.transition(SpeculativeRequestStatus::Completed)?,
+                CompletedDecisionProgress::Finished => {
+                    self.transition(SpeculativeRequestStatus::Completed)?
+                }
             }
             if self.lifecycle.is_terminal() {
                 self.decoding.finish();
@@ -3789,9 +4194,13 @@ where
             self.commit_retained_next_scores(executor, context)?;
             return Ok(false);
         }
-        let configured = executor.configure_decoding_mode(
-            self.target_state.as_mut().expect("ready target seed"), self.config.decoding_mode, self.config.temperature,
-        ).map_err(SpeculativeDriverError::Generation);
+        let configured = executor
+            .configure_decoding_mode(
+                self.target_state.as_mut().expect("ready target seed"),
+                self.config.decoding_mode,
+                self.config.temperature,
+            )
+            .map_err(SpeculativeDriverError::Generation);
         coordination::ready_result(executor, configured, context)?;
         let observed = self
             .runtime
@@ -3817,7 +4226,10 @@ where
         let mut block = if let Some(block) = self.block.take() {
             block
         } else {
-            let last = *self.pending_committed_tokens.last().expect("ready request retains its uncached committed token");
+            let last = *self
+                .pending_committed_tokens
+                .last()
+                .expect("ready request retains its uncached committed token");
             let target_state = self
                 .target_state
                 .as_ref()
@@ -3855,7 +4267,10 @@ where
             history.extend(block.proposals.iter().map(|proposal| proposal.token));
             let previous = block.proposals.last().map_or_else(
                 || {
-                    *self.pending_committed_tokens.last().expect("ready request retains its uncached committed token")
+                    *self
+                        .pending_committed_tokens
+                        .last()
+                        .expect("ready request retains its uncached committed token")
                 },
                 |proposal| proposal.token,
             );
@@ -3903,7 +4318,10 @@ where
             .block
             .take()
             .expect("verification-ready request has a draft block");
-        let last = *self.pending_committed_tokens.last().expect("verification retains its uncached committed token");
+        let last = *self
+            .pending_committed_tokens
+            .last()
+            .expect("verification retains its uncached committed token");
         let origin = self.activation_origin(executor, false);
         let pending = with_activation_origin(executor, origin, |executor| {
             submit_verification_transaction(executor, &mut self.cache, last, block, context)
@@ -4188,12 +4606,16 @@ where
 }
 
 impl<E, S, C, P> Drop for GenerationRequestTable<'_, E, S, C, P>
-where E: SpeculativeExecutor,
+where
+    E: SpeculativeExecutor,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
-    C: SpeculativeConstraint, P: SpeculativePublisher<C>,
+    C: SpeculativeConstraint,
+    P: SpeculativePublisher<C>,
 {
     fn drop(&mut self) {
-        for request in &self.requests { request.decoding.finish(); }
+        for request in &self.requests {
+            request.decoding.finish();
+        }
     }
 }
 
@@ -4221,31 +4643,60 @@ where
     }
 
     /// Retains the selected source policy before registering any lanes.
-    pub fn with_speculation_limits(mut self, limits: Option<crate::decoding::SpeculationLimits>) -> Self {
-        assert!(self.requests.is_empty(), "speculation limits are set before submitting requests");
+    pub fn with_speculation_limits(
+        mut self,
+        limits: Option<crate::decoding::SpeculationLimits>,
+    ) -> Self {
+        assert!(
+            self.requests.is_empty(),
+            "speculation limits are set before submitting requests"
+        );
         self.speculation_limits = limits;
         self
     }
 
-    pub(crate) fn fork_completed_source(&self, id: SpeculativeRequestId, cache: E::Cache, state: E::TargetState,
-        runtime: SpeculativeOutputRuntime<S, C, P>, decoding: crate::decoding::DecodingControl) -> Self {
+    pub(crate) fn fork_completed_source(
+        &self,
+        id: SpeculativeRequestId,
+        cache: E::Cache,
+        state: E::TargetState,
+        runtime: SpeculativeOutputRuntime<S, C, P>,
+        decoding: crate::decoding::DecodingControl,
+    ) -> Self {
         let parent = self.request(id).expect("retained source");
         let mut config = parent.config.clone();
         config.max_tokens = runtime.sequence.max_tokens();
         config.decoding_mode = decoding.state().active;
         let mut lifecycle = SpeculativeRequestLifecycle::new();
-        lifecycle.transition(SpeculativeRequestStatus::ReadyToDraft).expect("prepared source becomes ready");
-        if runtime.sequence.is_finished() || decoding.state().terminal { lifecycle = SpeculativeRequestLifecycle::completed(); }
+        lifecycle
+            .transition(SpeculativeRequestStatus::ReadyToDraft)
+            .expect("prepared source becomes ready");
+        if runtime.sequence.is_finished() || decoding.state().terminal {
+            lifecycle = SpeculativeRequestLifecycle::completed();
+        }
         Self {
             schedule: SpeculativeSchedule::new(self.options()).expect("retained scheduler options"),
             speculation_limits: self.speculation_limits,
             stats: self.stats.clone(),
             requests: vec![SpeculativeRequest {
-                control_identity: Arc::new(()), id: SpeculativeRequestId::new(0), cache: GenerationCache::Owned(cache),
-                config, runtime, target_randomness: None, draft_randomness: None,
-                stats: parent.stats.clone(), started: parent.started, target_state: Some(state),
-                pending_committed_tokens: Vec::new(), next_logits: None, refinement: None,
-                decoding, block: None, pending: None, lifecycle, completed_decision: None,
+                control_identity: Arc::new(()),
+                id: SpeculativeRequestId::new(0),
+                cache: GenerationCache::Owned(cache),
+                config,
+                runtime,
+                target_randomness: None,
+                draft_randomness: None,
+                stats: parent.stats.clone(),
+                started: parent.started,
+                target_state: Some(state),
+                pending_committed_tokens: Vec::new(),
+                next_logits: None,
+                refinement: None,
+                decoding,
+                block: None,
+                pending: None,
+                lifecycle,
+                completed_decision: None,
             }],
         }
     }
@@ -4309,7 +4760,9 @@ where
                     GenerationError::NoBackendDraftCapacity,
                 ));
             }
-            let completion = config.scheduler_options(self.schedule.options()).completion_wait()
+            let completion = config
+                .scheduler_options(self.schedule.options())
+                .completion_wait()
                 .map_err(SpeculativeDriverError::Generation)?;
             if !E::Completion::supports_cancellation(completion.cancellation()) {
                 return Err(SpeculativeDriverError::UnsupportedCompletionCancellation {
@@ -4319,18 +4772,45 @@ where
             let mut capabilities = executor.decoding_capabilities();
             capabilities.speculation_limits = self.speculation_limits;
             if let Some(limits) = self.speculation_limits {
-                capabilities.max_draft_tokens = Some(capabilities.max_draft_tokens.map_or(
-                    limits.max_draft_tokens, |native| native.min(limits.max_draft_tokens)));
+                capabilities.max_draft_tokens = Some(
+                    capabilities
+                        .max_draft_tokens
+                        .map_or(limits.max_draft_tokens, |native| {
+                            native.min(limits.max_draft_tokens)
+                        }),
+                );
             }
-            decoding = Some(crate::decoding::DecodingRegistration::new(crate::decoding::DecodingControl::new(
-                capabilities, config.decoding_mode,
-                runtime.sampler().control_requires_positive_temperature() == Some(true),
-            ).map_err(|error| SpeculativeDriverError::Generation(GenerationError::DecodingMode(error)))?));
+            decoding = Some(crate::decoding::DecodingRegistration::new(
+                crate::decoding::DecodingControl::new(
+                    capabilities,
+                    config.decoding_mode,
+                    runtime.sampler().control_requires_positive_temperature() == Some(true),
+                )
+                .map_err(|error| {
+                    SpeculativeDriverError::Generation(GenerationError::DecodingMode(error))
+                })?,
+            ));
             if let Some(handle) = &runtime.control_handle {
-                handle.bind_decoding(decoding.as_ref().expect("registered owner").control().clone(), Some(runtime.cancellation()))
-                    .map_err(|error| SpeculativeDriverError::Generation(GenerationError::DecodingMode(error)))?;
+                handle
+                    .bind_decoding(
+                        decoding
+                            .as_ref()
+                            .expect("registered owner")
+                            .control()
+                            .clone(),
+                        Some(runtime.cancellation()),
+                    )
+                    .map_err(|error| {
+                        SpeculativeDriverError::Generation(GenerationError::DecodingMode(error))
+                    })?;
             }
-            runtime.decoding = Some(decoding.as_ref().expect("registered owner").control().clone());
+            runtime.decoding = Some(
+                decoding
+                    .as_ref()
+                    .expect("registered owner")
+                    .control()
+                    .clone(),
+            );
             Ok((!runtime.cancellation().is_cancelled()).then_some(()))
         })();
         if crate::run_preparation::finish_preparation_cancellable(
@@ -4377,17 +4857,37 @@ where
                 SpeculativeDriverError::Preparation,
             )?;
             if executor.uses_completed_decisions() {
-                let state = executor.prepare_decision_source(input, cache, context)
+                let state = executor
+                    .prepare_decision_source(input, cache, context)
                     .map_err(SpeculativeDriverError::Backend)?
-                    .ok_or(SpeculativeDriverError::Coordination("completed decision source preparation"))?;
+                    .ok_or(SpeculativeDriverError::Coordination(
+                        "completed decision source preparation",
+                    ))?;
                 self.requests.push(SpeculativeRequest {
                     completed_decision: None,
-                    control_identity: Arc::new(()), id, cache: cache_slot, config,
-                    runtime, target_randomness, draft_randomness, stats, started,
-                    target_state: Some(state), pending_committed_tokens: Vec::new(),
-                    next_logits: None, refinement: None, decoding: decoding.install(),
-                    block: None, pending: None,
-                    lifecycle: { let mut lifecycle = SpeculativeRequestLifecycle::new(); lifecycle.transition(SpeculativeRequestStatus::ReadyToDraft).map_err(SpeculativeDriverError::Generation)?; lifecycle },
+                    control_identity: Arc::new(()),
+                    id,
+                    cache: cache_slot,
+                    config,
+                    runtime,
+                    target_randomness,
+                    draft_randomness,
+                    stats,
+                    started,
+                    target_state: Some(state),
+                    pending_committed_tokens: Vec::new(),
+                    next_logits: None,
+                    refinement: None,
+                    decoding: decoding.install(),
+                    block: None,
+                    pending: None,
+                    lifecycle: {
+                        let mut lifecycle = SpeculativeRequestLifecycle::new();
+                        lifecycle
+                            .transition(SpeculativeRequestStatus::ReadyToDraft)
+                            .map_err(SpeculativeDriverError::Generation)?;
+                        lifecycle
+                    },
                 });
                 return Ok(id);
             }
@@ -4400,11 +4900,17 @@ where
                 |status| executor.agree_text_preparation(stage, status, context),
                 SpeculativeDriverError::Preparation,
             )?;
-            if matches!(config.decoding_mode, crate::decoding::DecodingMode::Diffusion { .. }) {
-                let origin = executor.requires_activation_origin()
+            if matches!(
+                config.decoding_mode,
+                crate::decoding::DecodingMode::Diffusion { .. }
+            ) {
+                let origin = executor
+                    .requires_activation_origin()
                     .then(|| SpeculativeActivationOrigin::new(id, &[], false));
-                let prefilling = with_activation_origin(executor, origin, |executor| executor.prefill(input, cache, context))
-                    .map_err(SpeculativeDriverError::Backend);
+                let prefilling = with_activation_origin(executor, origin, |executor| {
+                    executor.prefill(input, cache, context)
+                })
+                .map_err(SpeculativeDriverError::Backend);
                 let prefill = match coordination::ready_result(executor, prefilling, context) {
                     Ok(prefill) => prefill,
                     Err(error) => {
@@ -4414,15 +4920,28 @@ where
                 };
                 stats.target_tokens = prefill.evaluated_tokens;
                 let mut lifecycle = SpeculativeRequestLifecycle::new();
-                lifecycle.transition(SpeculativeRequestStatus::ReadyToDraft)
+                lifecycle
+                    .transition(SpeculativeRequestStatus::ReadyToDraft)
                     .map_err(SpeculativeDriverError::Generation)?;
                 self.requests.push(SpeculativeRequest {
-                completed_decision: None,
-                    control_identity: Arc::new(()), id, cache: cache_slot, config, runtime,
-                    target_randomness, draft_randomness, stats, started,
-                    target_state: Some(prefill.state), pending_committed_tokens: Vec::new(),
-                    next_logits: Some(prefill.logits), refinement: None, decoding: decoding.install(),
-                    block: None, pending: None, lifecycle,
+                    completed_decision: None,
+                    control_identity: Arc::new(()),
+                    id,
+                    cache: cache_slot,
+                    config,
+                    runtime,
+                    target_randomness,
+                    draft_randomness,
+                    stats,
+                    started,
+                    target_state: Some(prefill.state),
+                    pending_committed_tokens: Vec::new(),
+                    next_logits: Some(prefill.logits),
+                    refinement: None,
+                    decoding: decoding.install(),
+                    block: None,
+                    pending: None,
+                    lifecycle,
                 });
                 return Ok(id);
             }
@@ -4490,7 +5009,9 @@ where
                     |status| executor.agree_text_preparation(stage, status, context),
                     SpeculativeDriverError::Preparation,
                 )?;
-                if reason.is_some() { decoding.control().finish(); }
+                if reason.is_some() {
+                    decoding.control().finish();
+                }
                 let cancelled = coordination::publish_candidate(
                     executor,
                     &mut runtime,
@@ -4541,14 +5062,22 @@ where
                 lifecycle
             };
             self.stats.turns += 1;
-            if lifecycle.is_terminal() { decoding.control().finish(); }
+            if lifecycle.is_terminal() {
+                decoding.control().finish();
+            }
             self.requests.push(SpeculativeRequest {
                 completed_decision: None,
                 control_identity: Arc::new(()),
                 id,
                 cache: cache_slot,
                 config,
-                pending_committed_tokens: runtime.sequence().tokens().last().copied().into_iter().collect(),
+                pending_committed_tokens: runtime
+                    .sequence()
+                    .tokens()
+                    .last()
+                    .copied()
+                    .into_iter()
+                    .collect(),
                 next_logits: None,
                 refinement: None,
                 decoding: decoding.install(),
@@ -4564,9 +5093,11 @@ where
             });
             return Ok(id);
         };
-        if lifecycle.is_terminal() { decoding.control().finish(); }
+        if lifecycle.is_terminal() {
+            decoding.control().finish();
+        }
         self.requests.push(SpeculativeRequest {
-                completed_decision: None,
+            completed_decision: None,
             control_identity: Arc::new(()),
             id,
             cache: cache_slot,
@@ -4616,22 +5147,53 @@ where
         Ok(())
     }
 
-    pub(crate) fn advance_completed_context<'context>(&mut self, executor: &mut E,
-        id: SpeculativeRequestId, context: E::Context<'context>) -> Result<bool, SpeculativeDriverError<E::Error>>
-    where E: 'context {
+    pub(crate) fn advance_completed_context<'context>(
+        &mut self,
+        executor: &mut E,
+        id: SpeculativeRequestId,
+        context: E::Context<'context>,
+    ) -> Result<bool, SpeculativeDriverError<E::Error>>
+    where
+        E: 'context,
+    {
         let request = self.request_mut(id).expect("retained completed source");
-        if request.lifecycle.is_terminal() { return Ok(false); }
-        let cancelled = request.decoding.coordinate(request.runtime.cancellation().is_cancelled(),
-            request.sequence().tokens().len() as u64, executor.completed_decision_allowance(&request.cache).flatten(),
-            |local| executor.coordinate_decoding_control(local, context))
+        if request.lifecycle.is_terminal() {
+            return Ok(false);
+        }
+        let cancelled = request
+            .decoding
+            .coordinate(
+                request.runtime.cancellation().is_cancelled(),
+                request.sequence().tokens().len() as u64,
+                executor
+                    .completed_decision_allowance(&request.cache)
+                    .flatten(),
+                |local| executor.coordinate_decoding_control(local, context),
+            )
             .map_err(|error| match error {
-                crate::decoding::DecodingControlError::Agreement(error) => SpeculativeDriverError::Preparation(error),
-                crate::decoding::DecodingControlError::Mode(error) => SpeculativeDriverError::Generation(GenerationError::DecodingMode(error)),
+                crate::decoding::DecodingControlError::Agreement(error) => {
+                    SpeculativeDriverError::Preparation(error)
+                }
+                crate::decoding::DecodingControlError::Mode(error) => {
+                    SpeculativeDriverError::Generation(GenerationError::DecodingMode(error))
+                }
             })?;
-        if cancelled { request.runtime.cancellation().cancel(); request.request_cancellation()?; return Ok(false); }
-        request.runtime.observe_lifecycle(SpeculativeLifecycleStage::Execution).map_err(SpeculativeDriverError::Output)?;
-        let progress = executor.advance_decision_context(&mut request.cache, context).map_err(SpeculativeDriverError::Backend)?;
-        if progress.is_some() { request.stats.scheduler_turns += 1; self.stats.turns += 1; }
+        if cancelled {
+            request.runtime.cancellation().cancel();
+            request.request_cancellation()?;
+            return Ok(false);
+        }
+        request
+            .runtime
+            .observe_lifecycle(SpeculativeLifecycleStage::Execution)
+            .map_err(SpeculativeDriverError::Output)?;
+        let progress = executor
+            .advance_decision_context(&mut request.cache, context)
+            .map_err(SpeculativeDriverError::Backend)?;
+        if progress.is_some() {
+            request.stats.scheduler_turns += 1;
+            self.stats.turns += 1;
+        }
         Ok(progress.is_some())
     }
 
@@ -4652,16 +5214,35 @@ where
     {
         let stage = crate::run_preparation::TextPreparationStage::Delivery;
         for request in &mut self.requests {
-            if request.lifecycle.is_terminal() { continue; }
-            let cancelled = request.decoding.coordinate(
-                request.runtime.cancellation().is_cancelled() || request.lifecycle.cancellation_pending(),
-                request.sequence().tokens().len() as u64,
-                executor.completed_decision_allowance(&request.cache).unwrap_or_else(|| Some(request.config.max_tokens.saturating_sub(request.sequence().tokens().len()))),
-                |local| executor.coordinate_decoding_control(local, context),
-            ).map_err(|error| match error {
-                crate::decoding::DecodingControlError::Agreement(error) => SpeculativeDriverError::Preparation(error),
-                crate::decoding::DecodingControlError::Mode(error) => SpeculativeDriverError::Generation(GenerationError::DecodingMode(error)),
-            })?;
+            if request.lifecycle.is_terminal() {
+                continue;
+            }
+            let cancelled = request
+                .decoding
+                .coordinate(
+                    request.runtime.cancellation().is_cancelled()
+                        || request.lifecycle.cancellation_pending(),
+                    request.sequence().tokens().len() as u64,
+                    executor
+                        .completed_decision_allowance(&request.cache)
+                        .unwrap_or_else(|| {
+                            Some(
+                                request
+                                    .config
+                                    .max_tokens
+                                    .saturating_sub(request.sequence().tokens().len()),
+                            )
+                        }),
+                    |local| executor.coordinate_decoding_control(local, context),
+                )
+                .map_err(|error| match error {
+                    crate::decoding::DecodingControlError::Agreement(error) => {
+                        SpeculativeDriverError::Preparation(error)
+                    }
+                    crate::decoding::DecodingControlError::Mode(error) => {
+                        SpeculativeDriverError::Generation(GenerationError::DecodingMode(error))
+                    }
+                })?;
             if cancelled {
                 request.runtime.cancellation().cancel();
                 request.request_cancellation()?;
@@ -4674,7 +5255,10 @@ where
                     return Ok(true);
                 }
                 Ok(false) => {}
-                Err(error) => { request.decoding.finish(); return Err(error); }
+                Err(error) => {
+                    request.decoding.finish();
+                    return Err(error);
+                }
             }
         }
         let local = self
@@ -4684,7 +5268,9 @@ where
                 let candidate = request.candidate(
                     executor,
                     optimistic_execution_available,
-                    request.config.scheduler_options(self.schedule.options())
+                    request
+                        .config
+                        .scheduler_options(self.schedule.options())
                         .completion_wait()
                         .expect("speculative schedule retains validated completion options"),
                 )?;
@@ -4787,7 +5373,11 @@ where
                     index,
                     cross_request,
                 } => {
-                    let drafted = self.requests[index].draft_committed(executor, self.schedule.options(), context)?;
+                    let drafted = self.requests[index].draft_committed(
+                        executor,
+                        self.schedule.options(),
+                        context,
+                    )?;
                     if cross_request && drafted {
                         self.requests[index].stats.cross_request_draft_opportunities += 1;
                         self.stats.cross_request_draft_opportunities += 1;
@@ -4809,21 +5399,23 @@ where
                 }
                 SpeculativeAction::PollVerification(_) => {}
                 SpeculativeAction::ResolveVerification(index) => {
-                    let options = self.requests[index].config.scheduler_options(self.schedule.options());
-                    self.requests[index].resolve_verification(
-                        executor,
-                        options,
-                        context,
-                    )?;
+                    let options = self.requests[index]
+                        .config
+                        .scheduler_options(self.schedule.options());
+                    self.requests[index].resolve_verification(executor, options, context)?;
                 }
             }
             Ok(true)
         })();
         let result = crate::run_preparation::finish_preparation(
-            stage, completed, |status| executor.agree_text_preparation(stage, status, context),
+            stage,
+            completed,
+            |status| executor.agree_text_preparation(stage, status, context),
             SpeculativeDriverError::Preparation,
         );
-        if result.is_err() { self.requests[index].decoding.finish(); }
+        if result.is_err() {
+            self.requests[index].decoding.finish();
+        }
         result
     }
 
@@ -5041,8 +5633,8 @@ mod tests {
         fmt,
         rc::Rc,
         sync::{
-            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
         },
     };
 
@@ -5129,9 +5721,7 @@ mod tests {
         assert!(ready.is_ready_for(SpeculativeDraftSource::Embedded));
         assert!(!unsupported.admits_source(SpeculativeDraftSource::Embedded));
         assert!(!unsupported.is_ready_for(SpeculativeDraftSource::Embedded));
-        assert!(
-            !SpeculativeCapability::Unavailable.admits_source(SpeculativeDraftSource::Embedded)
-        );
+        assert!(!SpeculativeCapability::Unavailable.admits_source(SpeculativeDraftSource::Embedded));
     }
 
     #[derive(Debug, Clone, Default)]
@@ -5211,16 +5801,14 @@ mod tests {
             let mut publisher = SpeculativeCallbackPublisher::semantic(move |event| {
                 published.borrow_mut().push(event)
             });
-            assert!(
-                !publisher
-                    .publish_committed(
-                        &mut constraint,
-                        &[7],
-                        &GenerationCancellationToken::new(),
-                        true,
-                    )
-                    .unwrap()
-            );
+            assert!(!publisher
+                .publish_committed(
+                    &mut constraint,
+                    &[7],
+                    &GenerationCancellationToken::new(),
+                    true,
+                )
+                .unwrap());
         }
         assert_eq!(
             *published.borrow(),
@@ -5287,11 +5875,24 @@ mod tests {
         type Completion = Done;
         type Telemetry = ();
         type Error = Infallible;
-        fn erased_type_mismatch(value: &'static str) -> Infallible { panic!("mismatched fixture value: {value}") }
+        fn erased_type_mismatch(value: &'static str) -> Infallible {
+            panic!("mismatched fixture value: {value}")
+        }
     }
     impl GenerationExecutorCacheFactory<MockGenerationTypes> for MockExecutor {
-        fn new_cache<'a>(&mut self, _: ()) -> Result<Vec<u32>, Infallible>  where Self: 'a { Ok(Vec::new()) }
-        fn bind_context<'a>(_: <MockGenerationTypes as GenerationExecutorTypes>::Context<'a>) -> Self::Context<'a>  where Self: 'a {}
+        fn new_cache<'a>(&mut self, _: ()) -> Result<Vec<u32>, Infallible>
+        where
+            Self: 'a,
+        {
+            Ok(Vec::new())
+        }
+        fn bind_context<'a>(
+            _: <MockGenerationTypes as GenerationExecutorTypes>::Context<'a>,
+        ) -> Self::Context<'a>
+        where
+            Self: 'a,
+        {
+        }
     }
 
     struct MockVerification {
@@ -5302,21 +5903,44 @@ mod tests {
     impl SpeculativeExecutor for MockExecutor {
         fn decoding_capabilities(&self) -> crate::decoding::DecodingCapabilities {
             crate::decoding::DecodingCapabilities {
-                autoregressive: true, speculation: self.max_proposals() != 0, mode_changes: true,
-                diffusion: self.refinement.is_some(), masked_unmasking: self.refinement.is_some(),
-                mask_token_id: self.refinement.as_ref().map(|_| 0), ..Default::default()
+                autoregressive: true,
+                speculation: self.max_proposals() != 0,
+                mode_changes: true,
+                diffusion: self.refinement.is_some(),
+                masked_unmasking: self.refinement.is_some(),
+                mask_token_id: self.refinement.as_ref().map(|_| 0),
+                ..Default::default()
             }
         }
         fn refine_block<'a>(
-            &mut self, _: &mut usize, _: &Vec<f32>, committed: &[u32],
-            _: Option<crate::refinement::RefinementPolicy>, _: f32, _: (),
-        ) -> Result<Option<RefinementProgress<Vec<f32>>>, Infallible>  where Self: 'a {
+            &mut self,
+            _: &mut usize,
+            _: &Vec<f32>,
+            committed: &[u32],
+            _: Option<crate::refinement::RefinementPolicy>,
+            _: f32,
+            _: (),
+        ) -> Result<Option<RefinementProgress<Vec<f32>>>, Infallible>
+        where
+            Self: 'a,
+        {
             self.refined_prefixes.push(committed.to_vec());
-            Ok(self.refinement.as_ref().map(|tokens| RefinementProgress::Complete(RefinementBlock {
-                positions: tokens.iter().enumerate().map(|(position, token)| {
-                    (committed.get(position).copied().unwrap_or(*token), vec![10.0, 1.0, 2.0])
-                }).collect(), evaluated_positions: tokens.len() * 2, iterations: 2,
-            })))
+            Ok(self.refinement.as_ref().map(|tokens| {
+                RefinementProgress::Complete(RefinementBlock {
+                    positions: tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(position, token)| {
+                            (
+                                committed.get(position).copied().unwrap_or(*token),
+                                vec![10.0, 1.0, 2.0],
+                            )
+                        })
+                        .collect(),
+                    evaluated_positions: tokens.len() * 2,
+                    iterations: 2,
+                })
+            }))
         }
         type Input = Vec<u32>;
         type Cache = Vec<u32>;
@@ -5329,7 +5953,10 @@ mod tests {
         fn max_proposals(&self) -> usize {
             self.draft_capacity.unwrap_or(usize::MAX)
         }
-        type Context<'a> = () where Self: 'a;
+        type Context<'a>
+            = ()
+        where
+            Self: 'a;
         type Completion = Done;
         type Telemetry = ();
         type Error = Infallible;
@@ -5351,7 +5978,10 @@ mod tests {
             input: Self::Input,
             cache: &mut Self::Cache,
             _: Self::Context<'context>,
-        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
+        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+        where
+            Self: 'context,
+        {
             self.activations.push(("prefill", self.origin));
             cache.extend_from_slice(&input);
             Ok(SpeculativePrefill {
@@ -5367,7 +5997,10 @@ mod tests {
             last_token: u32,
             _: usize,
             _: Self::Context<'a>,
-        ) -> Result<Self::DraftState, Self::Error>  where Self: 'a {
+        ) -> Result<Self::DraftState, Self::Error>
+        where
+            Self: 'a,
+        {
             self.activations.push(("begin", self.origin));
             Ok(vec![last_token])
         }
@@ -5377,7 +6010,10 @@ mod tests {
             state: &mut Self::DraftState,
             last_token: u32,
             _: Self::Context<'a>,
-        ) -> Result<SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'a {
+        ) -> Result<SpeculativeProposalStep<Self::Logits>, Self::Error>
+        where
+            Self: 'a,
+        {
             self.activations.push(("proposal", self.origin));
             state.push(last_token + 1);
             Ok(if self.masked_draft {
@@ -5396,7 +6032,10 @@ mod tests {
             cache: &mut Self::Cache,
             checkpoint: &Self::CacheCheckpoint,
             _: Self::Context<'a>,
-        ) -> Result<(), Self::Error>  where Self: 'a {
+        ) -> Result<(), Self::Error>
+        where
+            Self: 'a,
+        {
             cache.truncate(*checkpoint);
             Ok(())
         }
@@ -5406,7 +6045,10 @@ mod tests {
             input_tokens: &[u32],
             cache: &mut Self::Cache,
             _: Self::Context<'a>,
-        ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'a {
+        ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
+        where
+            Self: 'a,
+        {
             self.activations.push(("verify", self.origin));
             cache.extend_from_slice(input_tokens);
             let logits = if self.full_acceptance {
@@ -5430,7 +6072,10 @@ mod tests {
             output: &Self::Verification,
             index: usize,
             _: Self::Context<'a>,
-        ) -> Result<Self::Logits, Self::Error>  where Self: 'a {
+        ) -> Result<Self::Logits, Self::Error>
+        where
+            Self: 'a,
+        {
             Ok(output.logits[index].clone())
         }
 
@@ -5442,7 +6087,10 @@ mod tests {
             checkpoint: &Self::CacheCheckpoint,
             verified_inputs: usize,
             _: Self::Context<'a>,
-        ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'a {
+        ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
+        where
+            Self: 'a,
+        {
             assert!(!output.tokens.is_empty());
             if let Some(trace) = &self.trace {
                 trace.borrow_mut().push("commit");
@@ -5487,11 +6135,25 @@ mod tests {
 
     impl SpeculativeSampling for MockSampling {
         fn finalize_refinement_position<'a>(
-            &mut self, scores: &Vec<f32>, selected: u32, mask: Option<u32>, _: &[u32], _: (),
-        ) -> Result<Option<(u32, Vec<f32>)>, Infallible> where Self: 'a {
+            &mut self,
+            scores: &Vec<f32>,
+            selected: u32,
+            mask: Option<u32>,
+            _: &[u32],
+            _: (),
+        ) -> Result<Option<(u32, Vec<f32>)>, Infallible>
+        where
+            Self: 'a,
+        {
             let mut scores = scores.clone();
-            if let Some(mask) = mask { scores[mask as usize] = f32::NEG_INFINITY; }
-            let token = if mask.is_some() && scores[selected as usize].is_finite() { selected } else { argmax(&scores) };
+            if let Some(mask) = mask {
+                scores[mask as usize] = f32::NEG_INFINITY;
+            }
+            let token = if mask.is_some() && scores[selected as usize].is_finite() {
+                selected
+            } else {
+                argmax(&scores)
+            };
             Ok(Some((token, scores)))
         }
         type Logits = Vec<f32>;
@@ -5807,17 +6469,26 @@ mod tests {
         let mut table = GenerationRequestTable::new(
             SpeculativeSchedulerOptions::default(),
             SpeculativeExecutionTopology::Single,
-        ).unwrap();
-        let id = table.submit(
-            &mut executor,
-            &mut cache,
-            vec![4],
-            GenerationRequestConfig { max_tokens: 4, ..Default::default() },
-            empty_mock_runtime(4, GenerationCancellationToken::new()),
-            SpeculativeRandomness { target: None, draft: None },
-            false,
-            (),
-        ).unwrap();
+        )
+        .unwrap();
+        let id = table
+            .submit(
+                &mut executor,
+                &mut cache,
+                vec![4],
+                GenerationRequestConfig {
+                    max_tokens: 4,
+                    ..Default::default()
+                },
+                empty_mock_runtime(4, GenerationCancellationToken::new()),
+                SpeculativeRandomness {
+                    target: None,
+                    draft: None,
+                },
+                false,
+                (),
+            )
+            .unwrap();
         table.run(&mut executor, true, ()).unwrap();
         let request = table.request(id).unwrap();
         assert_eq!(request.sequence().tokens(), [1, 1, 1, 1]);
@@ -5827,25 +6498,53 @@ mod tests {
         assert_eq!(request.stats().optimistic_draft_tokens, 0);
         assert_eq!(request.status(), SpeculativeRequestStatus::Completed);
         table.finish().unwrap();
-        assert_eq!(cache, [4, 1, 1, 1], "each prior committed token enters the causal cache once");
-        assert_eq!(executor.activations.iter().filter(|(phase, _)| *phase == "verify").count(), 3);
-        assert!(!executor.activations.iter().any(|(phase, _)| *phase == "proposal"));
+        assert_eq!(
+            cache,
+            [4, 1, 1, 1],
+            "each prior committed token enters the causal cache once"
+        );
+        assert_eq!(
+            executor
+                .activations
+                .iter()
+                .filter(|(phase, _)| *phase == "verify")
+                .count(),
+            3
+        );
+        assert!(!executor
+            .activations
+            .iter()
+            .any(|(phase, _)| *phase == "proposal"));
     }
 
     #[test]
     fn suffix_settlement_retains_next_scores_without_sampling_or_publication() {
         let trace = TransactionTrace::default();
-        let mut executor = MockExecutor { trace: Some(trace.clone()), ..Default::default() };
+        let mut executor = MockExecutor {
+            trace: Some(trace.clone()),
+            ..Default::default()
+        };
         let mut cache = vec![4, 5];
         let settled = settle_committed_suffix(
-            &mut executor, &mut cache, &2, &[1],
-            SpeculativeSchedulerOptions::default().completion_wait().unwrap(), |_| Ok(()), (),
-        ).unwrap();
+            &mut executor,
+            &mut cache,
+            &2,
+            &[1],
+            SpeculativeSchedulerOptions::default()
+                .completion_wait()
+                .unwrap(),
+            |_| Ok(()),
+            (),
+        )
+        .unwrap();
         assert_eq!(cache, [4, 5, 1]);
         assert_eq!(settled.logits, [0.0, 1.0]);
         assert_eq!(settled.replayed_tokens, 0);
         assert_eq!(*trace.borrow(), ["wait", "commit"]);
-        assert!(!executor.activations.iter().any(|(phase, _)| *phase == "proposal"));
+        assert!(!executor
+            .activations
+            .iter()
+            .any(|(phase, _)| *phase == "proposal"));
     }
 
     #[test]
@@ -5853,17 +6552,38 @@ mod tests {
         let handle = crate::execution_control::GenerationControlHandle::default();
         let runtime = empty_mock_runtime(3, GenerationCancellationToken::new())
             .with_control_handle(Some(handle.clone()))
-            .with_lifecycle_observer(Arc::new(LifecycleTrace::failing(SpeculativeLifecycleStage::Execution)));
+            .with_lifecycle_observer(Arc::new(LifecycleTrace::failing(
+                SpeculativeLifecycleStage::Execution,
+            )));
         let mut executor = MockExecutor::default();
         let mut cache = Vec::new();
-        let mut table = GenerationRequestTable::new(SpeculativeSchedulerOptions::default(), SpeculativeExecutionTopology::Single).unwrap();
-        assert!(matches!(table.submit(
-            &mut executor, &mut cache, vec![4], GenerationRequestConfig::default(), runtime,
-            SpeculativeRandomness { target: None, draft: None }, false, (),
-        ), Err(SpeculativeDriverError::Output(_))));
+        let mut table = GenerationRequestTable::new(
+            SpeculativeSchedulerOptions::default(),
+            SpeculativeExecutionTopology::Single,
+        )
+        .unwrap();
+        assert!(matches!(
+            table.submit(
+                &mut executor,
+                &mut cache,
+                vec![4],
+                GenerationRequestConfig::default(),
+                runtime,
+                SpeculativeRandomness {
+                    target: None,
+                    draft: None
+                },
+                false,
+                (),
+            ),
+            Err(SpeculativeDriverError::Output(_))
+        ));
         assert!(executor.activations.is_empty());
         assert!(handle.decoding_state().unwrap().terminal);
-        assert_eq!(handle.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive), Err(crate::decoding::DecodingModeError::Terminal));
+        assert_eq!(
+            handle.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive),
+            Err(crate::decoding::DecodingModeError::Terminal)
+        );
     }
 
     #[test]
@@ -5874,18 +6594,39 @@ mod tests {
             let mut executor = MockExecutor::default();
             let mut cache = Vec::new();
             let runtime = SpeculativeOutputRuntime::new(
-                MockSampling::default(), GenerationSequence::new(budget, []),
+                MockSampling::default(),
+                GenerationSequence::new(budget, []),
                 SpeculativeSemanticConstraint::plain(),
                 SpeculativeCallbackPublisher::tokens(|tokens| {
                     observed.push((tokens.to_vec(), handle.decoding_state().unwrap().terminal));
                     Ok(())
-                }), GenerationCancellationToken::new(),
-            ).with_control_handle(Some(handle.clone()));
-            let mut table = GenerationRequestTable::new(SpeculativeSchedulerOptions::default(), SpeculativeExecutionTopology::Single).unwrap();
-            table.submit(&mut executor, &mut cache, vec![4],
-                GenerationRequestConfig { max_tokens: budget, ..Default::default() }, runtime,
-                SpeculativeRandomness { target: None, draft: None }, false, (),
-            ).unwrap();
+                }),
+                GenerationCancellationToken::new(),
+            )
+            .with_control_handle(Some(handle.clone()));
+            let mut table = GenerationRequestTable::new(
+                SpeculativeSchedulerOptions::default(),
+                SpeculativeExecutionTopology::Single,
+            )
+            .unwrap();
+            table
+                .submit(
+                    &mut executor,
+                    &mut cache,
+                    vec![4],
+                    GenerationRequestConfig {
+                        max_tokens: budget,
+                        ..Default::default()
+                    },
+                    runtime,
+                    SpeculativeRandomness {
+                        target: None,
+                        draft: None,
+                    },
+                    false,
+                    (),
+                )
+                .unwrap();
             table.run(&mut executor, true, ()).unwrap();
             table.finish().unwrap();
             assert_eq!(observed.len(), budget);
@@ -5897,49 +6638,106 @@ mod tests {
     #[test]
     fn request_table_mode_handoffs_settle_suffix_and_preserve_the_retained_target_row() {
         use crate::decoding::{DecodingMode, DecodingModeError, SpeculationOptions};
-        let speculation = DecodingMode::SelfSpeculation(SpeculationOptions::default()
-            .with_proposal_capacity(std::num::NonZeroUsize::new(2).unwrap()));
-        let mut executor = MockExecutor { full_acceptance: true, ..Default::default() };
+        let speculation = DecodingMode::SelfSpeculation(
+            SpeculationOptions::default()
+                .with_proposal_capacity(std::num::NonZeroUsize::new(2).unwrap()),
+        );
+        let mut executor = MockExecutor {
+            full_acceptance: true,
+            ..Default::default()
+        };
         let mut cache = Vec::new();
         let mut table = GenerationRequestTable::new(
-            SpeculativeSchedulerOptions::default(), SpeculativeExecutionTopology::Single,
-        ).unwrap();
-        let id = table.submit(
-            &mut executor, &mut cache, vec![4],
-            GenerationRequestConfig { max_tokens: 9, decoding_mode: speculation, ..Default::default() },
-            empty_mock_runtime(9, GenerationCancellationToken::new()),
-            SpeculativeRandomness { target: None, draft: None }, false, (),
-        ).unwrap();
+            SpeculativeSchedulerOptions::default(),
+            SpeculativeExecutionTopology::Single,
+        )
+        .unwrap();
+        let id = table
+            .submit(
+                &mut executor,
+                &mut cache,
+                vec![4],
+                GenerationRequestConfig {
+                    max_tokens: 9,
+                    decoding_mode: speculation,
+                    ..Default::default()
+                },
+                empty_mock_runtime(9, GenerationCancellationToken::new()),
+                SpeculativeRandomness {
+                    target: None,
+                    draft: None,
+                },
+                false,
+                (),
+            )
+            .unwrap();
         table.step(&mut executor, true, ()).unwrap();
         table.step(&mut executor, true, ()).unwrap();
         let request = table.request(id).unwrap();
         assert!(request.has_pending_verification());
-        assert!(matches!(request.request_decoding_mode(DecodingMode::Diffusion { policy: None }), Err(DecodingModeError::Unsupported(_))));
-        request.request_decoding_mode(DecodingMode::Autoregressive).unwrap();
-        assert_eq!(request.request_decoding_mode(speculation), Err(DecodingModeError::ModeChangePending));
+        assert!(matches!(
+            request.request_decoding_mode(DecodingMode::Diffusion { policy: None }),
+            Err(DecodingModeError::Unsupported(_))
+        ));
+        request
+            .request_decoding_mode(DecodingMode::Autoregressive)
+            .unwrap();
+        assert_eq!(
+            request.request_decoding_mode(speculation),
+            Err(DecodingModeError::ModeChangePending)
+        );
         table.step(&mut executor, true, ()).unwrap();
-        assert_eq!(table.request(id).unwrap().decoding_state().active, speculation);
+        assert_eq!(
+            table.request(id).unwrap().decoding_state().active,
+            speculation
+        );
         assert_eq!(table.request(id).unwrap().sequence().tokens().len(), 4);
         table.step(&mut executor, true, ()).unwrap();
         let request = table.request(id).unwrap();
-        assert_eq!(request.decoding_state().acknowledgement.unwrap().committed_position, 4);
-        assert_eq!(request.decoding_state().active, DecodingMode::Autoregressive);
+        assert_eq!(
+            request
+                .decoding_state()
+                .acknowledgement
+                .unwrap()
+                .committed_position,
+            4
+        );
+        assert_eq!(
+            request.decoding_state().active,
+            DecodingMode::Autoregressive
+        );
         assert!(request.pending_committed_tokens().is_empty());
         assert_eq!(*request.cache, [4, 1, 1, 1, 1]);
         let evaluations = request.stats().target_tokens;
         table.step(&mut executor, true, ()).unwrap();
         let request = table.request(id).unwrap();
         assert_eq!(request.sequence().tokens().len(), 5);
-        assert_eq!(request.stats().target_tokens, evaluations, "retained target scores require no duplicate append");
+        assert_eq!(
+            request.stats().target_tokens,
+            evaluations,
+            "retained target scores require no duplicate append"
+        );
         assert_eq!(*request.cache, [4, 1, 1, 1, 1]);
         request.request_decoding_mode(speculation).unwrap();
         table.step(&mut executor, true, ()).unwrap();
-        assert_eq!(table.request(id).unwrap().decoding_state().acknowledgement.unwrap().committed_position, 5);
+        assert_eq!(
+            table
+                .request(id)
+                .unwrap()
+                .decoding_state()
+                .acknowledgement
+                .unwrap()
+                .committed_position,
+            5
+        );
         table.run(&mut executor, true, ()).unwrap();
         let request = table.request(id).unwrap();
         assert_eq!(request.sequence().tokens(), [1; 9]);
         assert_eq!(*request.cache, [4, 1, 1, 1, 1, 1, 1, 1, 1]);
-        assert_eq!(request.request_decoding_mode(DecodingMode::Autoregressive), Err(DecodingModeError::Terminal));
+        assert_eq!(
+            request.request_decoding_mode(DecodingMode::Autoregressive),
+            Err(DecodingModeError::Terminal)
+        );
     }
 
     #[test]
@@ -5949,24 +6747,39 @@ mod tests {
                 scheduler: SpeculativeSchedulerOptions::default().with_lookahead(false),
                 ..Default::default()
             },
-        ).unwrap();
-        let mut executor = MockExecutor { full_acceptance: true, ..Default::default() };
+        )
+        .unwrap();
+        let mut executor = MockExecutor {
+            full_acceptance: true,
+            ..Default::default()
+        };
         let mut cache = Vec::new();
         let mut table = GenerationRequestTable::new(
-            SpeculativeSchedulerOptions::default(), SpeculativeExecutionTopology::Single,
-        ).unwrap();
-        let id = table.submit(
-            &mut executor, &mut cache, vec![4],
-            GenerationRequestConfig {
-                max_tokens: 7,
-                decoding_mode: crate::decoding::DecodingMode::SelfSpeculation(
-                    options.with_proposal_capacity(std::num::NonZeroUsize::new(2).unwrap()),
-                ),
-                ..Default::default()
-            },
-            empty_mock_runtime(7, GenerationCancellationToken::new()),
-            SpeculativeRandomness { target: None, draft: None }, false, (),
-        ).unwrap();
+            SpeculativeSchedulerOptions::default(),
+            SpeculativeExecutionTopology::Single,
+        )
+        .unwrap();
+        let id = table
+            .submit(
+                &mut executor,
+                &mut cache,
+                vec![4],
+                GenerationRequestConfig {
+                    max_tokens: 7,
+                    decoding_mode: crate::decoding::DecodingMode::SelfSpeculation(
+                        options.with_proposal_capacity(std::num::NonZeroUsize::new(2).unwrap()),
+                    ),
+                    ..Default::default()
+                },
+                empty_mock_runtime(7, GenerationCancellationToken::new()),
+                SpeculativeRandomness {
+                    target: None,
+                    draft: None,
+                },
+                false,
+                (),
+            )
+            .unwrap();
         table.run(&mut executor, true, ()).unwrap();
         let request = table.request(id).unwrap();
         assert_eq!(request.sequence().tokens(), [1, 1, 1, 1, 1, 1, 1]);
@@ -5977,14 +6790,33 @@ mod tests {
 
     #[test]
     fn diffusion_table_preserves_selections_refines_replacements_and_settles_the_suffix() {
-        let mut executor = MockExecutor { refinement: Some(vec![1, 0, 1]), ..Default::default() };
-        let mut table = GenerationRequestTable::new(Default::default(), SpeculativeExecutionTopology::Single).unwrap();
-        let id = table.submit(&mut executor, GenerationCache::Owned(Vec::new()), vec![4], GenerationRequestConfig {
-            max_tokens: 8, decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None },
+        let mut executor = MockExecutor {
+            refinement: Some(vec![1, 0, 1]),
             ..Default::default()
-        }, empty_mock_runtime(8, GenerationCancellationToken::new()), SpeculativeRandomness::new(Some(19), Some(23)), false, ()).unwrap();
+        };
+        let mut table =
+            GenerationRequestTable::new(Default::default(), SpeculativeExecutionTopology::Single)
+                .unwrap();
+        let id = table
+            .submit(
+                &mut executor,
+                GenerationCache::Owned(Vec::new()),
+                vec![4],
+                GenerationRequestConfig {
+                    max_tokens: 8,
+                    decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None },
+                    ..Default::default()
+                },
+                empty_mock_runtime(8, GenerationCancellationToken::new()),
+                SpeculativeRandomness::new(Some(19), Some(23)),
+                false,
+                (),
+            )
+            .unwrap();
         assert!(table.request(id).unwrap().sequence().tokens().is_empty());
-        while table.request(id).unwrap().sequence().tokens().len() < 3 { table.step(&mut executor, false, ()).unwrap(); }
+        while table.request(id).unwrap().sequence().tokens().len() < 3 {
+            table.step(&mut executor, false, ()).unwrap();
+        }
         let request = table.request(id).unwrap();
         // Selected one survives a higher-scoring two. The unresolved mask is
         // replaced by two; its dependent suffix is numerically refined again.
@@ -5994,50 +6826,134 @@ mod tests {
         assert_eq!(request.target_randomness, Some(19));
         assert_eq!(request.stats().refinement_tokens(), 12);
         assert_eq!(request.stats().refinement_steps(), 4);
-        request.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive).unwrap();
+        request
+            .request_decoding_mode(crate::decoding::DecodingMode::Autoregressive)
+            .unwrap();
         table.step(&mut executor, false, ()).unwrap();
         let request = table.request(id).unwrap();
         assert_eq!(&**request.cache, &[4, 1, 2, 1]);
         assert!(request.pending_committed_tokens().is_empty());
-        assert_eq!(request.decoding_state().acknowledgement.unwrap().committed_position, 3);
+        assert_eq!(
+            request
+                .decoding_state()
+                .acknowledgement
+                .unwrap()
+                .committed_position,
+            3
+        );
     }
 
     #[test]
     fn erased_generation_drives_diffusion_and_causal_handoff_with_owned_state() {
-        let mut source = MockExecutor { refinement: Some(vec![1, 0, 1]), ..Default::default() };
+        let mut source = MockExecutor {
+            refinement: Some(vec![1, 0, 1]),
+            ..Default::default()
+        };
         {
             let mut executor = DynGenerationExecutor::<MockGenerationTypes>::new(&mut source);
             let cache = executor.new_cache(()).unwrap();
-            let mut table = GenerationRequestTable::new(Default::default(), SpeculativeExecutionTopology::Single).unwrap();
-            let id = table.submit(&mut executor, GenerationCache::Owned(cache), vec![4], GenerationRequestConfig {
-                max_tokens: 8, decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None }, ..Default::default()
-            }, empty_mock_runtime(8, GenerationCancellationToken::new()), SpeculativeRandomness::new(Some(19), Some(23)), false, ()).unwrap();
-            while table.request(id).unwrap().sequence().tokens().len() < 3 { table.step(&mut executor, false, ()).unwrap(); }
+            let mut table = GenerationRequestTable::new(
+                Default::default(),
+                SpeculativeExecutionTopology::Single,
+            )
+            .unwrap();
+            let id = table
+                .submit(
+                    &mut executor,
+                    GenerationCache::Owned(cache),
+                    vec![4],
+                    GenerationRequestConfig {
+                        max_tokens: 8,
+                        decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None },
+                        ..Default::default()
+                    },
+                    empty_mock_runtime(8, GenerationCancellationToken::new()),
+                    SpeculativeRandomness::new(Some(19), Some(23)),
+                    false,
+                    (),
+                )
+                .unwrap();
+            while table.request(id).unwrap().sequence().tokens().len() < 3 {
+                table.step(&mut executor, false, ()).unwrap();
+            }
             assert_eq!(table.request(id).unwrap().sequence().tokens(), [1, 2, 1]);
-            table.request(id).unwrap().request_decoding_mode(crate::decoding::DecodingMode::Autoregressive).unwrap();
+            table
+                .request(id)
+                .unwrap()
+                .request_decoding_mode(crate::decoding::DecodingMode::Autoregressive)
+                .unwrap();
             table.step(&mut executor, false, ()).unwrap();
-            assert_eq!(table.request(id).unwrap().decoding_state().acknowledgement.unwrap().committed_position, 3);
-            assert!(table.request(id).unwrap().pending_committed_tokens().is_empty());
+            assert_eq!(
+                table
+                    .request(id)
+                    .unwrap()
+                    .decoding_state()
+                    .acknowledgement
+                    .unwrap()
+                    .committed_position,
+                3
+            );
+            assert!(table
+                .request(id)
+                .unwrap()
+                .pending_committed_tokens()
+                .is_empty());
             table.step(&mut executor, false, ()).unwrap();
             assert_eq!(table.request(id).unwrap().sequence().tokens(), [1, 2, 1, 1]);
-            assert!(table.request(id).unwrap().stats().submission_to_first_token().is_some());
+            assert!(table
+                .request(id)
+                .unwrap()
+                .stats()
+                .submission_to_first_token()
+                .is_some());
         }
         assert_eq!(source.refined_prefixes, [vec![], vec![1, 2]]);
     }
 
     #[test]
     fn diffusion_table_keeps_full_geometry_for_budget_and_eos_inside_blocks() {
-        for (limit, eos, expected) in [(1, vec![], vec![2]), (2, vec![], vec![2, 1]), (8, vec![1], vec![2, 1])] {
-            let mut executor = MockExecutor { refinement: Some(vec![2, 1, 2]), ..Default::default() };
-            let mut cache = Vec::new();
-            let mut table = GenerationRequestTable::new(Default::default(), SpeculativeExecutionTopology::Single).unwrap();
-            let output = SpeculativeOutputRuntime::new(MockSampling::default(), GenerationSequence::new(limit, eos.clone()),
-                SpeculativeSemanticConstraint::plain(), SpeculativeCallbackPublisher::tokens(|_| Ok(())), Default::default());
-            let id = table.submit(&mut executor, &mut cache, vec![4], GenerationRequestConfig {
-                max_tokens: limit, eos_token_ids: eos, decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None },
+        for (limit, eos, expected) in [
+            (1, vec![], vec![2]),
+            (2, vec![], vec![2, 1]),
+            (8, vec![1], vec![2, 1]),
+        ] {
+            let mut executor = MockExecutor {
+                refinement: Some(vec![2, 1, 2]),
                 ..Default::default()
-            }, output, SpeculativeRandomness::new(Some(19), Some(23)), false, ()).unwrap();
-            while !table.is_finished() { table.step(&mut executor, false, ()).unwrap(); }
+            };
+            let mut cache = Vec::new();
+            let mut table = GenerationRequestTable::new(
+                Default::default(),
+                SpeculativeExecutionTopology::Single,
+            )
+            .unwrap();
+            let output = SpeculativeOutputRuntime::new(
+                MockSampling::default(),
+                GenerationSequence::new(limit, eos.clone()),
+                SpeculativeSemanticConstraint::plain(),
+                SpeculativeCallbackPublisher::tokens(|_| Ok(())),
+                Default::default(),
+            );
+            let id = table
+                .submit(
+                    &mut executor,
+                    &mut cache,
+                    vec![4],
+                    GenerationRequestConfig {
+                        max_tokens: limit,
+                        eos_token_ids: eos,
+                        decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None },
+                        ..Default::default()
+                    },
+                    output,
+                    SpeculativeRandomness::new(Some(19), Some(23)),
+                    false,
+                    (),
+                )
+                .unwrap();
+            while !table.is_finished() {
+                table.step(&mut executor, false, ()).unwrap();
+            }
             let request = table.request(id).unwrap();
             assert_eq!(request.sequence().tokens(), expected);
             assert_eq!(request.pending_committed_tokens(), expected);
@@ -6045,7 +6961,10 @@ mod tests {
             assert_eq!(request.stats().refinement_tokens(), 6);
             assert_eq!(request.target_randomness, Some(19));
             assert_eq!(request.status(), SpeculativeRequestStatus::Completed);
-            assert_eq!(request.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive), Err(crate::decoding::DecodingModeError::Terminal));
+            assert_eq!(
+                request.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive),
+                Err(crate::decoding::DecodingModeError::Terminal)
+            );
         }
     }
 
@@ -6056,8 +6975,13 @@ mod tests {
             executions: AtomicUsize,
         }
         impl SpeculativeLifecycleObserver for CancelAtRefinement {
-            fn observe(&self, stage: SpeculativeLifecycleStage) -> Result<(), SpeculativeOutputError> {
-                if stage == SpeculativeLifecycleStage::Execution && self.executions.fetch_add(1, Ordering::Relaxed) != 0 {
+            fn observe(
+                &self,
+                stage: SpeculativeLifecycleStage,
+            ) -> Result<(), SpeculativeOutputError> {
+                if stage == SpeculativeLifecycleStage::Execution
+                    && self.executions.fetch_add(1, Ordering::Relaxed) != 0
+                {
                     self.cancellation.cancel();
                 }
                 Ok(())
@@ -6066,26 +6990,65 @@ mod tests {
         for cancellation_case in [true, false] {
             let cancellation = GenerationCancellationToken::new();
             let observer: Arc<dyn SpeculativeLifecycleObserver> = if cancellation_case {
-                Arc::new(CancelAtRefinement { cancellation: cancellation.clone(), executions: AtomicUsize::new(0) })
-            } else { Arc::new(LifecycleTrace::failing(SpeculativeLifecycleStage::Publication)) };
-            let mut executor = MockExecutor { refinement: Some(vec![2, 1, 2]), ..Default::default() };
+                Arc::new(CancelAtRefinement {
+                    cancellation: cancellation.clone(),
+                    executions: AtomicUsize::new(0),
+                })
+            } else {
+                Arc::new(LifecycleTrace::failing(
+                    SpeculativeLifecycleStage::Publication,
+                ))
+            };
+            let mut executor = MockExecutor {
+                refinement: Some(vec![2, 1, 2]),
+                ..Default::default()
+            };
             let mut cache = Vec::new();
-            let mut table = GenerationRequestTable::new(Default::default(), SpeculativeExecutionTopology::Single).unwrap();
+            let mut table = GenerationRequestTable::new(
+                Default::default(),
+                SpeculativeExecutionTopology::Single,
+            )
+            .unwrap();
             let output = empty_mock_runtime(1, cancellation).with_lifecycle_observer(observer);
-            let id = table.submit(&mut executor, &mut cache, vec![4], GenerationRequestConfig {
-                max_tokens: 1, decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None }, ..Default::default()
-            }, output, SpeculativeRandomness::new(Some(19), Some(23)), false, ()).unwrap();
+            let id = table
+                .submit(
+                    &mut executor,
+                    &mut cache,
+                    vec![4],
+                    GenerationRequestConfig {
+                        max_tokens: 1,
+                        decoding_mode: crate::decoding::DecodingMode::Diffusion { policy: None },
+                        ..Default::default()
+                    },
+                    output,
+                    SpeculativeRandomness::new(Some(19), Some(23)),
+                    false,
+                    (),
+                )
+                .unwrap();
             let numerical = table.step(&mut executor, false, ());
-            assert!(numerical.is_ok(), "numerical completion precedes publication");
-            let result = if cancellation_case { numerical } else { table.step(&mut executor, false, ()) };
+            assert!(
+                numerical.is_ok(),
+                "numerical completion precedes publication"
+            );
+            let result = if cancellation_case {
+                numerical
+            } else {
+                table.step(&mut executor, false, ())
+            };
             assert_eq!(result.is_ok(), cancellation_case);
             let request = table.request(id).unwrap();
             assert!(request.sequence().tokens().is_empty());
             assert!(request.pending_committed_tokens().is_empty());
             assert_eq!(&**request.cache, &[4]);
             assert_eq!(request.target_randomness, Some(19));
-            assert_eq!(request.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive), Err(crate::decoding::DecodingModeError::Terminal));
-            if cancellation_case { assert_eq!(request.status(), SpeculativeRequestStatus::Cancelled); }
+            assert_eq!(
+                request.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive),
+                Err(crate::decoding::DecodingModeError::Terminal)
+            );
+            if cancellation_case {
+                assert_eq!(request.status(), SpeculativeRequestStatus::Cancelled);
+            }
         }
     }
 
@@ -6398,23 +7361,62 @@ mod tests {
 
     #[test]
     fn accepted_eos_is_cached_and_leaves_no_committed_suffix() {
-        let mut executor = MockExecutor { full_acceptance: true, masked_draft: true, ..Default::default() };
+        let mut executor = MockExecutor {
+            full_acceptance: true,
+            masked_draft: true,
+            ..Default::default()
+        };
         let mut cache = vec![4, 5];
         let mut draft = executor.begin_proposal(&2, 5, 2, ()).unwrap();
-        let proposals = propose_block(&mut executor, &MockSampling::default(), &mut draft, 5, 2,
-            &[5], 0.0, &[1], None, ()).unwrap();
-        let pending = submit_verification_transaction(&mut executor, &mut cache, 5,
-            SpeculativeDraftBlock::new(draft, proposals), ()).unwrap();
+        let proposals = propose_block(
+            &mut executor,
+            &MockSampling::default(),
+            &mut draft,
+            5,
+            2,
+            &[5],
+            0.0,
+            &[1],
+            None,
+            (),
+        )
+        .unwrap();
+        let pending = submit_verification_transaction(
+            &mut executor,
+            &mut cache,
+            5,
+            SpeculativeDraftBlock::new(draft, proposals),
+            (),
+        )
+        .unwrap();
         let mut sequence = GenerationSequence::new(8, [1]);
         sequence.commit(5, TokenTerminalSignals::default()).unwrap();
-        let mut runtime = SpeculativeOutputRuntime::new(MockSampling::default(), sequence,
-            MockConstraint::default(), MockPublisher::default(), GenerationCancellationToken::new());
-        let published = resolve_commit_and_publish(&mut executor, &mut cache, pending, &mut runtime,
-            None, 0.0, SpeculativeStats::default(), SpeculativeSchedulerOptions::default(), ()).unwrap();
+        let mut runtime = SpeculativeOutputRuntime::new(
+            MockSampling::default(),
+            sequence,
+            MockConstraint::default(),
+            MockPublisher::default(),
+            GenerationCancellationToken::new(),
+        );
+        let published = resolve_commit_and_publish(
+            &mut executor,
+            &mut cache,
+            pending,
+            &mut runtime,
+            None,
+            0.0,
+            SpeculativeStats::default(),
+            SpeculativeSchedulerOptions::default(),
+            (),
+        )
+        .unwrap();
         assert_eq!(runtime.sequence().tokens(), [5, 1]);
         assert_eq!(cache, [4, 5, 5, 1]);
         assert!(published.pending_committed_tokens.is_empty());
-        assert!(matches!(published.status, SpeculativePublicationStatus::Completed));
+        assert!(matches!(
+            published.status,
+            SpeculativePublicationStatus::Completed
+        ));
     }
 
     #[test]
@@ -6932,20 +7934,43 @@ mod tests {
             let mut cache = vec![4, 5];
             let state = executor.begin_proposal(&0, 5, 0, ()).unwrap();
             let pending = submit_verification_transaction(
-                &mut executor, &mut cache, 5,
-                SpeculativeDraftBlock { state, proposals: Vec::new() }, (),
-            ).unwrap();
-            let mut runtime = mock_output_runtime(GenerationCancellationToken::new(), Some(trace.clone()));
+                &mut executor,
+                &mut cache,
+                5,
+                SpeculativeDraftBlock {
+                    state,
+                    proposals: Vec::new(),
+                },
+                (),
+            )
+            .unwrap();
+            let mut runtime =
+                mock_output_runtime(GenerationCancellationToken::new(), Some(trace.clone()));
             let published = resolve_commit_and_publish(
-                &mut executor, &mut cache, pending, &mut runtime, Some(&0), 0.7,
-                SpeculativeStats::default(), SpeculativeSchedulerOptions::default(), (),
-            ).unwrap();
-            assert_eq!(cache, [4, 5, 5], "only the pending input enters canonical K/V");
+                &mut executor,
+                &mut cache,
+                pending,
+                &mut runtime,
+                Some(&0),
+                0.7,
+                SpeculativeStats::default(),
+                SpeculativeSchedulerOptions::default(),
+                (),
+            )
+            .unwrap();
+            assert_eq!(
+                cache,
+                [4, 5, 5],
+                "only the pending input enters canonical K/V"
+            );
             assert_eq!(runtime.sequence().tokens(), [5, 1]);
             assert_eq!(runtime.sampler().committed, [1]);
             assert_eq!(published.stats.accepted_tokens, 0);
             assert_eq!(published.stats.emitted_tokens, 1);
-            assert!(!executor.activations.iter().any(|(phase, _)| *phase == "proposal"));
+            assert!(!executor
+                .activations
+                .iter()
+                .any(|(phase, _)| *phase == "proposal"));
             assert_eq!(*trace.borrow(), ["wait", "commit", "publish"]);
         }
     }
@@ -7165,7 +8190,10 @@ mod tests {
         type CacheCheckpoint = TransactionCheckpoint;
         type Verification = TransactionVerification;
         type Logits = Vec<f32>;
-        type Context<'a> = () where Self: 'a;
+        type Context<'a>
+            = ()
+        where
+            Self: 'a;
         type Completion = DelayedCompletion;
         type Telemetry = ();
         type Error = TransactionFailure;
@@ -7175,7 +8203,10 @@ mod tests {
             input: Self::Input,
             cache: &mut Self::Cache,
             _: Self::Context<'a>,
-        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'a {
+        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+        where
+            Self: 'a,
+        {
             cache.target.extend(input);
             Ok(SpeculativePrefill::new(
                 vec![0.0, 1.0],
@@ -7190,7 +8221,10 @@ mod tests {
             last_token: u32,
             _: usize,
             _: Self::Context<'a>,
-        ) -> Result<Self::DraftState, Self::Error>  where Self: 'a {
+        ) -> Result<Self::DraftState, Self::Error>
+        where
+            Self: 'a,
+        {
             Ok(TransactionDraftState {
                 values: vec![last_token],
                 _probe: None,
@@ -7202,7 +8236,10 @@ mod tests {
             state: &mut Self::DraftState,
             last_token: u32,
             _: Self::Context<'a>,
-        ) -> Result<SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'a {
+        ) -> Result<SpeculativeProposalStep<Self::Logits>, Self::Error>
+        where
+            Self: 'a,
+        {
             state.values.push(last_token);
             Ok(SpeculativeProposalStep::CausalLogits(vec![0.0, 1.0]))
         }
@@ -7219,7 +8256,10 @@ mod tests {
             cache: &mut Self::Cache,
             checkpoint: &Self::CacheCheckpoint,
             _: Self::Context<'a>,
-        ) -> Result<(), Self::Error>  where Self: 'a {
+        ) -> Result<(), Self::Error>
+        where
+            Self: 'a,
+        {
             cache.trace.borrow_mut().push("restore");
             if cache.fail_restore {
                 return Err(TransactionFailure::Restore);
@@ -7234,7 +8274,10 @@ mod tests {
             input_tokens: &[u32],
             cache: &mut Self::Cache,
             _: Self::Context<'a>,
-        ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'a {
+        ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
+        where
+            Self: 'a,
+        {
             self.ready.set(false);
             self.completion_polls.set(0);
             cache.target.extend_from_slice(input_tokens);
@@ -7271,7 +8314,10 @@ mod tests {
             output: &Self::Verification,
             index: usize,
             _: Self::Context<'a>,
-        ) -> Result<Self::Logits, Self::Error>  where Self: 'a {
+        ) -> Result<Self::Logits, Self::Error>
+        where
+            Self: 'a,
+        {
             assert!(
                 output.ready.get(),
                 "verification read before completion wait"
@@ -7287,7 +8333,10 @@ mod tests {
             checkpoint: &Self::CacheCheckpoint,
             verified_inputs: usize,
             _: Self::Context<'a>,
-        ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'a {
+        ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
+        where
+            Self: 'a,
+        {
             assert!(output.ready.get(), "commit before completion wait");
             self.trace.borrow_mut().push("commit");
             self.committed_draft.borrow_mut().clone_from(&state.values);
