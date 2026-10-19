@@ -2330,6 +2330,7 @@ fn assert_automatic_planning_conformance() {
     let assistant = TestDirectory::new();
     write_loadable_assistant_artifact(assistant.path());
     external = external.with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: assistant.path().display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 4,
@@ -2343,6 +2344,7 @@ fn assert_automatic_planning_conformance() {
     )
     .unwrap();
     let changed_external = external.clone().with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: assistant.path().display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 5,
@@ -2492,6 +2494,7 @@ fn assert_automatic_planning_conformance() {
     write_loadable_assistant_artifact(incompatible_assistant.path());
     replace_with_incompatible_tokenizer(incompatible_assistant.path());
     external = external.with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: incompatible_assistant.path().display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 4,

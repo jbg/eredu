@@ -26,6 +26,69 @@ impl MechanismInvocation {
             Ok(())
         };
         match *self {
+            Self::Float32GroupProjection {
+                rows,
+                input,
+                groups,
+            } => {
+                add("input", &[rows, input], TensorElementType::F32, Input)?;
+                add("logits", &[rows, groups], TensorElementType::F32, Output)?;
+            }
+            Self::GroupIndexSelection {
+                rows,
+                groups,
+                selected,
+                element,
+                ..
+            } => {
+                if selected == 0
+                    || selected > groups
+                    || !matches!(
+                        element,
+                        TensorElementType::F32 | TensorElementType::F16 | TensorElementType::Bf16
+                    )
+                {
+                    return Err(Error::backend(
+                        "group index selection requires floating score rows and a valid selected extent",
+                    ));
+                }
+                add("scores", &[rows, groups], element, Input)?;
+                add("indices", &[rows, selected], TensorElementType::I32, Output)?;
+            }
+            Self::RmsNormalization {
+                batch,
+                time,
+                width,
+                element,
+                weight,
+                weight_element,
+                ..
+            } => {
+                if !weight && weight_element.is_some() {
+                    return Err(Error::backend(
+                        "absent RMS scale has a scalar representation",
+                    ));
+                }
+                if [Some(element), weight_element]
+                    .into_iter()
+                    .flatten()
+                    .any(|element| {
+                        !matches!(
+                            element,
+                            TensorElementType::F16
+                                | TensorElementType::Bf16
+                                | TensorElementType::F32
+                                | TensorElementType::F64
+                        )
+                    })
+                {
+                    return Err(Error::backend(
+                        "RMS normalization requires floating representations",
+                    ));
+                }
+                add("input", &[batch, time, width], element, Input)?;
+                add("output", &[batch, time, width], element, Output)?;
+            }
             Self::LayerNormalization {
                 rows,
                 width,
@@ -34,6 +97,7 @@ impl MechanismInvocation {
                 weight_element,
                 bias,
                 bias_element,
+                ..
             } => {
                 if (!weight && weight_element.is_some()) || (!bias && bias_element.is_some()) {
                     return Err(Error::backend(
@@ -87,8 +151,19 @@ impl MechanismInvocation {
                 element,
                 bias,
                 bias_element,
+                arithmetic,
                 ..
             } => {
+                if arithmetic.compute_element().is_some_and(|e| {
+                    !matches!(
+                        e,
+                        TensorElementType::F32 | TensorElementType::F16 | TensorElementType::Bf16
+                    )
+                }) {
+                    return Err(Error::backend(
+                        "projection compute precision must be floating",
+                    ));
+                }
                 if !bias && bias_element.is_some() {
                     return Err(Error::backend(
                         "absent projection bias has a scalar representation",
@@ -207,6 +282,7 @@ impl MechanismInvocation {
                 kernel,
                 dilation,
                 element,
+                ..
             } => {
                 if kernel == 0 || dilation == 0 {
                     return Err(Error::backend(

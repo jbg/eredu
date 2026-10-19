@@ -329,3 +329,228 @@ fn exact_affine_tasks_preserve_source_precision_through_unloaded_f32_slots() {
         }
     }
 }
+
+#[test]
+fn exact_affine_tp_input_slices_convert_before_binding_without_double_placement() {
+    use crate::backend::runtime::checkpoint::{
+        binding::{build_mlx_exact_replicated_text_bindings, materialize_module_bindings},
+        quantization::quantize_tensor,
+    };
+    use eredu_checkpoint::{SourceTensorEncoding, StoredDtype};
+    use eredu_runtime::{
+        ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout,
+        MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec,
+        ParameterMemberSpec, ParameterRole, ReplicatedTextOutputCompanion,
+        ReplicatedTextParameterOwner, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
+        WeightLoweringDescriptor,
+    };
+    use safemlx::ops::indexing::TryIndexOp;
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let quantization = AffineQuantization::default();
+    let format = LinearFormat::Affine(quantization);
+    let native_format = LinearFormatSpec::affine(
+        format,
+        parameter("projection.scale"),
+        parameter("projection.zero"),
+    )
+    .unwrap();
+    let group = ParameterGroupSpec::partitioned(
+        "projection.intermediate",
+        ParameterRole::FeedForwardIntermediate,
+        192,
+        [ParameterMemberSpec::new(
+            "projection.kernel",
+            vec![8, 192],
+            MemberSharding::Partitioned { axis: 1 },
+        )],
+    )
+    .unwrap();
+    let groups = eredu_runtime::expand_linear_format_parameter_groups(vec![group], |_| {
+        Ok(Some(native_format.clone()))
+    })
+    .unwrap();
+    let graph = ExecutionGraph::chain(["decoder"]).unwrap();
+    let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+    let owned = groups
+        .iter()
+        .cloned()
+        .map(|group| {
+            OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(ExecutionGroupId::new("decoder").unwrap(), 0),
+                group,
+            )
+        })
+        .collect::<Vec<_>>();
+    let parameters = ArchitectureParameterDescription::new(&graph, &units, groups, owned).unwrap();
+    let values = (0..8 * 192)
+        .map(|i| ((i * 37 % 257) as f32 - 128.) / 71.)
+        .collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    let directory = tempfile::tempdir().unwrap();
+    safetensors::tensor::serialize_to_file(
+        [(
+            "projection.kernel",
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![8, 192], &bytes)
+                .unwrap(),
+        )],
+        None,
+        &directory.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let full =
+        quantize_tensor(&Array::from_slice(&values, &[8, 192]), quantization, stream).unwrap();
+    for rank in 0..2 {
+        let layout = eredu_runtime::derive_partitioned_local_layout(
+            &parameters,
+            eredu_core::ParallelRankTopology::new(
+                eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+                rank,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let columns = [128, 64][rank];
+        let first = [0, 128][rank];
+        let end = first + columns;
+        let store: SharedCheckpointSource = Arc::new(
+            SafetensorsWeightStore::open_with_max_cached_shards(directory.path(), 1).unwrap(),
+        );
+        let provenance = store.source_provenance("projection.kernel").unwrap();
+        let owner = ReplicatedTextParameterOwner::ExecutionUnit {
+            group: "decoder".into(),
+            unit: 0,
+        };
+        let task = ReplicatedTextMaterializationTask::from_exact_source(
+            "projection.kernel",
+            ReplicatedTextPhysicalSource::new(
+                provenance.catalog_key,
+                provenance.physical_tensor,
+                provenance.backing_shard.unwrap(),
+                provenance.output,
+                provenance.source_encoding,
+                bytes.len() as u64,
+            )
+            .unwrap(),
+            Vec::new(),
+            vec![8, 192],
+            vec![8, 192],
+            ReplicatedTextParameterRole::LinearWeight,
+            owner.clone(),
+            format,
+            WeightLoweringKind::Transform,
+            WeightLoweringDescriptor::new(
+                SourceTensorEncoding::Safetensors(StoredDtype::F32),
+                format,
+                vec![8, 192],
+                vec![8, 192],
+                Some(1),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .with_output_companions(vec![
+            ReplicatedTextOutputCompanion::new(
+                "projection.scale",
+                LinearCompanionRole::Scale,
+                vec![8, 3],
+                owner.parameter_group_owner().unwrap(),
+            )
+            .unwrap(),
+            ReplicatedTextOutputCompanion::new(
+                "projection.zero",
+                LinearCompanionRole::AffineBias,
+                vec![8, 3],
+                owner.parameter_group_owner().unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let source = MlxNeuralBackend::linear(
+            LinearSpec {
+                input: columns,
+                output: 8,
+                weight: parameter("projection.kernel"),
+                bias: None,
+                format: LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap(),
+            },
+            stream,
+        )
+        .unwrap();
+        let target = MlxNeuralBackend::linear(
+            LinearSpec {
+                input: columns,
+                output: 8,
+                weight: parameter("projection.kernel"),
+                bias: None,
+                format: native_format.clone(),
+            },
+            stream,
+        )
+        .unwrap();
+        let empty: Vec<eredu_nn::Parameter<crate::MlxTensor>> = Vec::new();
+        let (converted, report) = quantize_exact_replicated_text_tasks(
+            Arc::clone(&store),
+            &empty,
+            &empty,
+            &[source],
+            &[target.clone()],
+            Some(&layout),
+            quantization.into(),
+            &[&task],
+            stream,
+        )
+        .unwrap();
+        // The shared persistent cache may avoid conversion entirely. A fresh
+        // conversion reads exactly the admitted local columns, never the full matrix.
+        assert!(
+            report.source_bytes_read == 0 || report.source_bytes_read == 8 * columns as u64 * 4
+        );
+        assert_eq!(
+            report.output_bytes,
+            8 * columns as u64 / 2 + 8 * (columns as u64 / 64) * 8
+        );
+        let bindings = build_mlx_exact_replicated_text_bindings(
+            &target,
+            converted.as_ref(),
+            &[&task],
+            &BTreeSet::new(),
+            Some(&layout),
+        )
+        .unwrap();
+        let arrays =
+            materialize_module_bindings(converted.as_ref(), &bindings, stream, stream).unwrap();
+        let expected = full
+            .weight
+            .try_index_device((.., first / 8..end / 8), stream)
+            .unwrap()
+            .contiguous(false, stream)
+            .unwrap();
+        assert_eq!(arrays["projection.kernel"].shape(), &[8, columns / 8]);
+        assert_eq!(
+            arrays["projection.kernel"]
+                .evaluated()
+                .unwrap()
+                .as_slice::<u32>(),
+            expected.evaluated().unwrap().as_slice::<u32>()
+        );
+        for (name, full) in [
+            ("projection.scale", &full.scales),
+            ("projection.zero", full.biases.as_ref().unwrap()),
+        ] {
+            let expected = full
+                .try_index_device((.., first / 64..end / 64), stream)
+                .unwrap()
+                .contiguous(false, stream)
+                .unwrap();
+            assert_eq!(
+                arrays[name].evaluated().unwrap().as_slice::<f32>(),
+                expected.evaluated().unwrap().as_slice::<f32>()
+            );
+        }
+        println!("exact affine TP rank {rank}: source columns {first}..{end}, bounded source bytes {}, packed output bytes {}",report.source_bytes_read,report.output_bytes);
+    }
+}

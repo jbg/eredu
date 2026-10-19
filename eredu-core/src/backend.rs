@@ -973,6 +973,10 @@ impl<B: ModelLoadingBackend> SelectedModelPreparation<B> {
         &self.plan
     }
 
+    pub(crate) const fn selected(&self) -> &B::SelectedPreparation {
+        &self.selected
+    }
+
     /// Consumes the binding into the exact admitted plan and backend selection.
     pub fn into_parts(
         self,
@@ -2139,6 +2143,9 @@ where
     B: std::error::Error + 'static,
     T: std::error::Error + 'static,
 {
+    /// The selected architecture rejected the request before native preprocessing.
+    #[error(transparent)]
+    Capability(#[from] crate::CapabilityError),
     /// The selected backend rejected or failed media preprocessing.
     #[error("backend multimodal preparation failed: {0}")]
     Backend(#[source] B),

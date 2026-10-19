@@ -23,11 +23,18 @@ use crate::{
 };
 use eredu_runtime::selected_text_bounded_requirement;
 
+#[derive(Debug, Clone, Copy)]
+struct ParallelExecution {
+    request: eredu_runtime::ParallelLoadRequest,
+    backend: safemlx::distributed::Backend,
+}
+
 /// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MlxBackendFactory {
     sample_mlx_memory: bool,
     sample_process_memory: bool,
+    parallel: Option<ParallelExecution>,
 }
 
 impl MlxBackendFactory {
@@ -52,6 +59,20 @@ impl MlxBackendFactory {
         self
     }
 
+    /// Selects the exact process rank, wire, invocation bounds and world initializer.
+    ///
+    /// The native backend choice is retained with cold target selection. Its world
+    /// is initialized strictly during realization using the launcher's environment.
+    /// No communicator, device or stream is created by this configuration.
+    pub const fn with_parallel_execution(
+        mut self,
+        request: eredu_runtime::ParallelLoadRequest,
+        backend: safemlx::distributed::Backend,
+    ) -> Self {
+        self.parallel = Some(ParallelExecution { request, backend });
+        self
+    }
+
     /// Translates a portable execution plan into its backend load request.
     ///
     /// This performs no native device or stream realization and is suitable
@@ -60,16 +81,37 @@ impl MlxBackendFactory {
         &self,
         plan: &ExecutionPlan,
     ) -> Result<MlxLoadRequest, AutomaticPlanningError> {
-        eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+        let normalized = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
             plan,
             eredu_runtime::ResidencyDiagnostics::new(
                 self.sample_mlx_memory,
                 self.sample_process_memory,
             ),
-            None,
+            self.parallel.map(|parallel| parallel.request),
         )
-        .map(MlxLoadRequest::from_normalized)
-        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+        let request = MlxLoadRequest::from_normalized(normalized);
+        if let Some(parallel) = self.parallel {
+            if !safemlx::distributed::is_available(parallel.backend) {
+                return Err(AutomaticPlanningError::Invalid(format!(
+                    "MLX communication backend {} is not compiled",
+                    parallel.backend.as_str(),
+                )));
+            }
+            let (family, index) = parse_mlx_device(plan.device())?;
+            request
+                .bind_parallel_device(crate::backend::DeviceAssignment::new(
+                    if family.is_some() {
+                        DeviceType::Gpu
+                    } else {
+                        DeviceType::Cpu
+                    },
+                    index as usize,
+                ))
+                .map_err(|error| planning_backend_error("bind_parallel_device", error))
+        } else {
+            Ok(request)
+        }
     }
 }
 
@@ -261,6 +303,12 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         })?;
         let (_, neutral) = selected.into_parts();
         let selected = super::loading::MlxSelectedPreparation::new(neutral, None);
+        let selected = match self.parallel {
+            Some(parallel) => selected
+                .with_world_backend(parallel.backend)
+                .map_err(|error| planning_backend_error("select_world_backend", error))?,
+            None => selected,
+        };
         let policy = selected.neutral().admission().request().policy();
         let capabilities = selected.session_capabilities();
         Ok(ExecutionPlanTargetSelection::new(
@@ -278,6 +326,32 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::target_native_resource_realization_attempt();
         let realized = mlx_device(selected.execution_plan().device())?;
+        let world = match selected.selected_preparation().world_backend() {
+            Some(backend) => {
+                let rank = selected
+                    .selected_preparation()
+                    .rank_context()
+                    .ok_or_else(|| {
+                        AutomaticPlanningError::Invalid(
+                            "selected native world has no rank authority".into(),
+                        )
+                    })?;
+                let world = safemlx::distributed::init(true, backend).map_err(|error| {
+                    planning_backend_error("initialize_distributed_world", error)
+                })?;
+                if (world.size(), world.rank()) != (rank.world_size(), rank.global_rank()) {
+                    return Err(AutomaticPlanningError::Invalid(format!(
+                        "native world size/rank {}/{} differs from retained selection {}/{}",
+                        world.size(),
+                        world.rank(),
+                        rank.world_size(),
+                        rank.global_rank(),
+                    )));
+                }
+                Some(world)
+            }
+            None => None,
+        };
         crate::initialize_allocator_cache_policy(false)
             .map_err(|error| planning_backend_error("initialize_allocator_cache", error))?;
         let stream = Stream::try_new_with_device(&realized.device)
@@ -285,7 +359,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
             .map_err(|error| planning_backend_error("create_weights_stream", error))?;
         Ok(ExecutionPlanTarget::new(
-            MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity),
+            MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity, world),
             selected,
         ))
     }
@@ -305,6 +379,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         eredu_architectures::prepare_execution_plan_draft(
             plan,
             target.inspection(),
+            target.selected_preparation().neutral(),
             artifact,
             &super::loading::MlxPreparationMechanisms::new(
                 &super::replicated_text::GROUPED_OPERATION_CAPABILITIES,
@@ -365,6 +440,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 };
                 let drafter = MlxDrafter::materialize(
                     artifact.preparation,
+                    target.session(),
                     &draft_stream,
                     target.backend().weights_stream(),
                 )

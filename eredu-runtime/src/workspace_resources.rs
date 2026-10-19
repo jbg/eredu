@@ -70,6 +70,7 @@ fn projection(p: &ProjectionTopology, rows: u64, scalar: TensorElementType) -> M
         input: p.input,
         output: p.output,
         format: p.format,
+        arithmetic: p.arithmetic,
         element: scalar,
         weight_element: None,
         bias: p.bias,
@@ -584,6 +585,8 @@ pub fn describe_text_workspace(
                 ..
             } => {
                 let invocation = MechanismInvocation::Convolution {
+                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
+                    bias: false,
                     batch: request.batch_size,
                     tokens: query,
                     channels: *channels,

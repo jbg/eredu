@@ -1881,18 +1881,21 @@ where
         Ok(<A as crate::LayeredArchitecture<B, S>>::prediction_target_capture(forward).cloned())
     }
 
-    /// Runs one typed prediction-only operation against this rank's target partition.
-    fn apply_prediction_target_operation<O>(
+    /// Runs one typed prediction operation with the retained bounded session transport.
+    fn apply_prediction_target_operation<O, X>(
         &mut self,
         _state: &mut S,
         _operation: O,
+        _transport: &mut X,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<O::Output>, A::Error>
     where
         O: crate::PredictionTargetOperation<A, B, S>,
+        X: crate::PredictionTargetTransport<B>,
     {
         Ok(None)
     }
+
 }
 
 /// Additive policy for an optional point-to-point boundary path.
@@ -3437,6 +3440,52 @@ where
         }
     }
 
+    fn publish_capture_tensor(
+        runtime: &mut Self::Runtime,
+        capture: B::Tensor,
+        slot: &crate::ForwardCaptureSlot,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        B::Tensor,
+        ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>,
+    > {
+        let mut transport = PredictionOperationTransport {
+            phase: DistributedExecutionPhase::PredictionTargetCapturePublication,
+            communication: &runtime.communication,
+            executor: runtime.communication_executor.borrow(),
+            publisher: &mut runtime.output_publisher,
+            agreement: &mut runtime.commit_agreement,
+            publication: runtime.plan.publication,
+            agreement_group: runtime.plan.commit_barrier,
+        };
+        let publication = (|| {
+            let plan = crate::PredictionTensorAssemblyPlan::new(
+                slot.role(),
+                vec![crate::PredictionTensorSource::new(
+                    slot.owner(),
+                    slot.shape().to_vec(),
+                )?],
+                crate::PredictionTensorAssembly::Sum,
+            )?;
+            plan.complete_dependencies::<B, _>(&[&capture], &mut transport)?;
+            if slot.permitted_elements().len() == 1 {
+                return crate::PredictionTargetTransport::<B>::publish(
+                    &mut transport,
+                    capture,
+                    slot.owner(),
+                );
+            }
+            let local =
+                (runtime.communication.manifest().rank() == slot.owner()).then_some(capture);
+            plan.assemble::<B, _>(Ok(local), &mut transport, context)
+        })();
+        publication.map_err(|error| {
+            ReplicatedTextSessionError::Partition(PartitionExecutionError::OutputPreparationFailed(
+                eredu_core::BackendFailure::from_error(error),
+            ))
+        })
+    }
+
     fn apply_prediction_target_operation<O>(
         runtime: &mut Self::Runtime,
         state: &mut S,
@@ -3449,9 +3498,20 @@ where
     where
         O: crate::PredictionTargetOperation<A, B, S>,
     {
+        let mut transport = PredictionOperationTransport {
+            phase: DistributedExecutionPhase::PredictionExtensionExecution,
+            communication: &runtime.communication,
+            executor: runtime.communication_executor.borrow(),
+            publisher: &mut runtime.output_publisher,
+            agreement: &mut runtime.commit_agreement,
+            publication: runtime.plan.publication,
+            agreement_group: runtime.plan.commit_barrier,
+        };
         runtime
             .executor
-            .apply_prediction_target_operation(state, operation, context)
+            .apply_prediction_target_operation(
+                state, operation, &mut transport, context,
+            )
             .map_err(ReplicatedTextSessionError::Architecture)
     }
 
@@ -3863,7 +3923,7 @@ impl<E> From<LayeredPipelineScheduleError> for PartitionScheduleSetupError<E> {
     reason = "field names and error messages document mechanical validation diagnostics"
 )]
 pub enum PartitionExecutionError {
-    /// Native output preparation failed before entering distributed publication.
+    /// Neural output preparation or publication failed through the retained authority.
     #[error("distributed output preparation failed: {0}")]
     OutputPreparationFailed(#[source] eredu_core::BackendFailure),
     /// A partition communication object omitted the selected bounded-wait contract.
@@ -4272,5 +4332,86 @@ mod plan_tests {
                 ..
             })
         ));
+    }
+}
+
+
+/// Borrows the already-selected communication resources for one static operation.
+/// It creates no group, completion policy or independent submission authority.
+struct PredictionOperationTransport<'a, B, G, R, I, U, V>
+where
+    B: CommunicationBackend,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: CommunicationTensorMetadata<B>,
+{
+    phase: DistributedExecutionPhase,
+    communication: &'a PartitionCommunication<B, G, R, I>,
+    executor: &'a B::Executor,
+    publisher: &'a mut U,
+    agreement: &'a mut V,
+    publication: Option<PartitionOutputPublication>,
+    agreement_group: Option<CollectiveGroupId>,
+}
+
+impl<B, G, R, I, U, V> crate::PredictionTargetTransport<B>
+    for PredictionOperationTransport<'_, B, G, R, I, U, V>
+where
+    B: CommunicationBackend,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: CommunicationTensorMetadata<B>,
+    U: PartitionOutputPublisher<B, G, R, I>,
+    V: PartitionCommitAgreement<B, G, R, I>,
+{
+    fn rank(&self) -> usize {
+        self.communication.manifest().rank()
+    }
+
+    fn agree(&mut self, ready: bool, descriptor: [u64; 8]) -> Result<bool, eredu_nn::Error> {
+        if !V::PHASE_FAILURE_AGREEMENT || !V::DESCRIPTOR_AGREEMENT {
+            return Err(eredu_nn::Error::backend(
+                "prediction transport requires bounded descriptor and failure agreement",
+            ));
+        }
+        let group = self.agreement_group.ok_or_else(|| {
+            eredu_nn::Error::backend("prediction transport has no retained session agreement group")
+        })?;
+        self.agreement
+            .agree_descriptor(
+                self.communication,
+                group,
+                self.phase,
+                ready,
+                descriptor,
+                self.executor,
+            )
+            .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn publish(&mut self, value: B::Tensor, owner: usize) -> Result<B::Tensor, eredu_nn::Error> {
+        let publication = self.publication.ok_or_else(|| {
+            eredu_nn::Error::backend(
+                "prediction transport has no retained session publication group",
+            )
+        })?;
+        self.publisher
+            .publish(
+                self.communication,
+                value,
+                PartitionOutputPublication {
+                    group: publication.group,
+                    owner_rank: owner,
+                },
+                self.phase,
+                self.executor,
+            )
+            .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn complete(&mut self, value: &B::Tensor) -> Result<(), eredu_nn::Error> {
+        self.communication
+            .complete_execution_dependencies([value], self.executor)
+            .map_err(eredu_nn::Error::backend_source)
     }
 }

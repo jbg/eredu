@@ -278,7 +278,7 @@ fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityE
     Ok(spec)
 }
 
-fn muse_glimmer_spec(args: &crate::muse_glimmer::DecoderConfig) -> Result<Spec, CapabilityError> {
+fn muse_spec(args: &crate::muse::DecoderConfig) -> Result<Spec, CapabilityError> {
     let context = plain_context(args.max_position_embeddings)?;
     let full_layers = args.attention_schedule.full_layer_count() as u64;
     let sliding = args
@@ -300,12 +300,13 @@ fn muse_glimmer_spec(args: &crate::muse_glimmer::DecoderConfig) -> Result<Spec, 
         state_strategy,
         InputModalities {
             text: true,
-            image: true,
-            audio: false,
-            video: args.weight_convention == crate::muse_glimmer::WeightConvention::HuggingFace,
+            image: args.vision_config.is_some(),
+            audio: args.audio_config.is_some(),
+            video: args.vision_config.as_ref().is_some_and(|vision|
+                vision.input_policy == crate::muse::VisionInputPolicy::ImagesAndVideo),
         },
         state_memory_layout(
-            crate::muse_glimmer::state_layout(args),
+            crate::muse::state_layout(args),
             args.hidden_size,
             1,
             EstimationCompleteness::Complete,
@@ -804,6 +805,7 @@ fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, C
 pub struct CapabilityEstimate {
     capabilities: ModelCapabilities,
     state_layout: StateMemoryLayout,
+    missing_media_companions: Vec<(eredu_core::InputModality, &'static str)>,
     draft_source: Option<SpeculativeDraftSource>,
     shared_backbone: Option<eredu_runtime::speculative::shared_backbone::SharedBackboneExecutionPolicy>,
     ordinary_refinement: Option<eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy>,
@@ -859,6 +861,59 @@ impl CapabilityEstimate {
         &self.capabilities
     }
 
+    /// Admits decoded media against selected component coverage before processor lookup.
+    /// Token-only segments require no media components or processor assets.
+    pub fn admit_raw_media_request(
+        &self,
+        request: &eredu_core::TokenizedMultimodalRequest,
+        processor_available: bool,
+    ) -> Result<(), CapabilityError> {
+        use eredu_core::{InputModality, Media, TokenizedMultimodalSegment};
+        for segment in request.segments() {
+            let modality = match segment {
+                TokenizedMultimodalSegment::TokenIds(_) => continue,
+                TokenizedMultimodalSegment::Media(Media::Image(_)) => InputModality::Image,
+                TokenizedMultimodalSegment::Media(Media::Video(_)) => InputModality::Video,
+                TokenizedMultimodalSegment::Media(Media::Audio(_)) => InputModality::Audio,
+            };
+            if let Some((_, component)) = self
+                .missing_media_companions
+                .iter()
+                .find(|(missing, _)| *missing == modality)
+            {
+                return Err(CapabilityError::MissingCompanion {
+                    architecture: self.capabilities.effective_model_type.clone(),
+                    modality,
+                    component,
+                });
+            }
+            let supported = match modality {
+                InputModality::Text => self.capabilities.modalities.text,
+                InputModality::Image => self.capabilities.modalities.image,
+                InputModality::Video => self.capabilities.modalities.video,
+                InputModality::Audio => self.capabilities.modalities.audio,
+                _ => false,
+            };
+            if !supported {
+                return Err(CapabilityError::UnsupportedInput {
+                    architecture: self.capabilities.effective_model_type.clone(),
+                    reason: format!(
+                        "selected architecture does not accept {} input",
+                        modality.as_str()
+                    ),
+                });
+            }
+            if !processor_available {
+                return Err(CapabilityError::MissingCompanion {
+                    architecture: self.capabilities.effective_model_type.clone(),
+                    modality,
+                    component: "processor assets",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Returns memory metadata around the exact executable layer schedule.
     pub const fn state_layout(&self) -> &StateMemoryLayout {
         &self.state_layout
@@ -897,6 +952,7 @@ fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
             estimation,
         },
         state_layout,
+        missing_media_companions: Vec::new(),
         draft_source: None,
         shared_backbone: None,
         ordinary_refinement: None,
@@ -1006,14 +1062,36 @@ pub fn qwen_vl(args: &crate::qwen::vl::ModelArgs) -> Result<CapabilityEstimate, 
     Ok(finish(args.effective_model_type().into(), spec))
 }
 
-/// Derives Muse-Glimmer capabilities from normalized architecture policy.
-pub fn muse_glimmer(
-    args: &crate::muse_glimmer::DecoderConfig,
-) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(with_speculative_draft_source(
-        finish(args.model_type.clone(), muse_glimmer_spec(args)?),
+/// Derives Muse capabilities from selected component coverage and normalized policy.
+pub fn muse(args: &crate::muse::DecoderConfig) -> Result<CapabilityEstimate, CapabilityError> {
+    let mut estimate = with_speculative_draft_source(
+        finish(args.identity.text_model_type().into(), muse_spec(args)?),
         Some(SpeculativeDraftSource::Separate),
-    ))
+    );
+    estimate.missing_media_companions = muse_missing_media_companions(args);
+    Ok(estimate)
+}
+
+/// Source omissions that can be satisfied by independently admitted Muse companions.
+pub(crate) fn muse_missing_media_companions(
+    args: &crate::muse::DecoderConfig,
+) -> Vec<(eredu_core::InputModality, &'static str)> {
+    let mut missing = Vec::new();
+    if args.vision_config.is_none() {
+        for modality in [
+            eredu_core::InputModality::Image,
+            eredu_core::InputModality::Video,
+        ] {
+            missing.push((modality, "vision encoder and projector"));
+        }
+    }
+    if args.identity == crate::muse::MuseIdentity::Spark && args.audio_config.is_none() {
+        missing.push((
+            eredu_core::InputModality::Audio,
+            "waveform encoder and perception projection",
+        ));
+    }
+    missing
 }
 
 /// Derives DeepSeek-V3 capabilities from normalized architecture policy.

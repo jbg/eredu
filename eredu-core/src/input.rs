@@ -132,6 +132,9 @@ pub enum InputExtent {
     },
     /// Number of valid (unpadded) input audio frames.
     AudioValidFrames(usize),
+    /// Number of valid mono PCM samples before right padding. This is distinct
+    /// from feature frames and from the decoder's audio-token cadence.
+    AudioValidSamples(usize),
 }
 
 impl InputExtent {
@@ -141,7 +144,7 @@ impl InputExtent {
             Self::PatchGrid { .. } => {
                 matches!(modality, InputModality::Image | InputModality::Video)
             }
-            Self::AudioValidFrames(_) => matches!(modality, InputModality::Audio),
+            Self::AudioValidFrames(_) | Self::AudioValidSamples(_) => matches!(modality, InputModality::Audio),
         }
     }
 
@@ -149,6 +152,7 @@ impl InputExtent {
         match self {
             Self::PatchGrid { .. } => 0,
             Self::AudioValidFrames(_) => 1,
+            Self::AudioValidSamples(_) => 2,
         }
     }
 
@@ -164,7 +168,7 @@ impl InputExtent {
                 height,
                 width,
             } => &[*time, *height, *width],
-            Self::AudioValidFrames(frames) => &[*frames],
+            Self::AudioValidFrames(frames) | Self::AudioValidSamples(frames) => &[*frames],
         };
         for value in values {
             output.push(
@@ -183,6 +187,7 @@ impl InputExtent {
                 width: cursor.usize("patch grid width")?,
             }),
             1 => Ok(Self::AudioValidFrames(cursor.usize("valid audio frames")?)),
+            2 => Ok(Self::AudioValidSamples(cursor.usize("valid audio samples")?)),
             value => Err(PreparedInputError::InvalidWireValue {
                 field: "input extent",
                 value,
@@ -737,6 +742,14 @@ mod tests {
                 )],
             )
             .unwrap(),
+            InputPartDescriptor::new_with_extents(
+                InputModality::Audio,
+                InputPayloadKind::Tensor,
+                tensor(TensorDtype::F32, &[1, 3840]),
+                [],
+                [InputExtent::AudioValidSamples(1921)],
+            )
+            .unwrap(),
         ])
         .unwrap();
 
@@ -753,6 +766,7 @@ mod tests {
                 width: 2,
             }]
         );
+        assert_eq!(identity.parts()[3].extents().collect::<Vec<_>>(), [InputExtent::AudioValidSamples(1921)]);
     }
 
     #[test]

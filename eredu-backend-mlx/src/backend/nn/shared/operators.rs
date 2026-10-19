@@ -6,35 +6,43 @@ mod grouped_units;
 /// MLX dense-or-quantized affine projection.
 #[derive(Debug, Clone)]
 pub struct MlxLinear {
-    pub(super) compute_element: Option<eredu_nn::TensorElementType>,
+    pub(super) arithmetic: eredu_nn::LinearArithmetic,
     pub(super) module: common::linear::PhysicalLinear,
     pub(super) topology: BTreeMap<String, ParameterSpec>,
     pub(super) vocabulary_range: Option<VocabularyParallelRange>,
 }
 
 impl LinearOperator<MlxTensor> for MlxLinear {
+    fn parameter_element_type(&self) -> Option<eredu_nn::TensorElementType> {
+        floating_element(self.module.weight.dtype()).or_else(|| {
+            // Block-scale bytes are not an activation dtype. Ordinary affine
+            // parameters carry floating scales; native block formats use F32
+            // for a standalone host-input projection.
+            if self.module.gguf.is_none()
+                && self.module.mode == safemlx::ops::QuantizationMode::Affine
+            {
+                self.module
+                    .scales
+                    .value
+                    .as_ref()
+                    .and_then(|value| floating_element(value.dtype()))
+            } else {
+                Some(eredu_nn::TensorElementType::F32)
+            }
+        })
+    }
     fn set_compute_element(
         &mut self,
         element: Option<eredu_nn::TensorElementType>,
     ) -> Result<(), ComputeError> {
-        eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?
-            .with_compute_element(element)?;
-        self.compute_element = element;
+        self.arithmetic =
+            eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?
+                .with_compute_element(element)?
+                .arithmetic();
         Ok(())
     }
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
-        let original = input
-            .element_type()
-            .ok_or_else(|| ComputeError::backend("unknown linear input precision"))?;
-        let value = self
-            .compute_element
-            .map_or_else(|| Ok(input.clone()), |e| input.cast_float(e, context))?;
-        let output = compute_tensor(self.module.forward(value.as_array(), context))?;
-        if self.compute_element.is_some() {
-            output.cast_float(original, context)
-        } else {
-            Ok(output)
-        }
+        self.forward_observed_input(input, None, context, None)
     }
     fn forward_with_input_observer(
         &mut self,
@@ -81,6 +89,62 @@ impl common::linear::NativeProjectionInputObserver for NativeInputObserver<'_> {
     }
 }
 impl MlxLinear {
+    fn forward_row_affine(
+        &mut self,
+        input: &MlxTensor,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        let original = input
+            .element_type()
+            .ok_or_else(|| ComputeError::backend("unknown affine precision"))?;
+        let wide = input.cast_float(eredu_nn::TensorElementType::F32, context)?;
+        if let Some(observer) = observer {
+            observer.observe(&wide)?;
+        }
+        if let Some(output) = compute(super::super::matrix::bf16_affine_projection(
+            input.as_array(),
+            self.module.weight.as_ref(),
+            self.module.bias.as_ref().as_ref(),
+            context,
+        ))? {
+            return Ok(MlxTensor::from_array(output));
+        }
+        compute_tensor(self.module.forward(wide.as_array(), context))?.cast_float(original, context)
+    }
+
+    fn forward_channel_major(
+        &mut self,
+        input: &MlxTensor,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        let shape = input.shape();
+        if shape.len() != 3 || shape.iter().any(|&n| n <= 0) {
+            return Err(ComputeError::backend(
+                "channel-major affine requires [batch, time, channel]",
+            ));
+        }
+        if shape[1] == 1 || shape[2] == 1 {
+            return self.forward_row_affine(input, context, observer);
+        }
+        if let Some(observer) = observer {
+            observer.observe(input)?;
+        }
+        let value = compute(super::super::matrix::bf16_column_projection(
+            input.as_array(),
+            self.module.weight.as_ref(),
+            context,
+        ))?;
+        match value {
+            Some(value) => compute_tensor(match self.module.bias.as_ref() {
+                Some(bias) => value.add(bias, context),
+                None => Ok(value),
+            }),
+            None => compute_tensor(self.module.forward(input.as_array(), context)),
+        }
+    }
+
     pub(super) fn forward_observed_input(
         &mut self,
         input: &MlxTensor,
@@ -88,11 +152,25 @@ impl MlxLinear {
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
+        if self.arithmetic == eredu_nn::LinearArithmetic::ChannelMajorAffine {
+            if parallel.is_some() {
+                return Err(ComputeError::backend(
+                    "channel-major affine arithmetic requires a replicated projection",
+                ));
+            }
+            return self.forward_channel_major(input, context, observer);
+        }
+        if self.arithmetic == eredu_nn::LinearArithmetic::RowMajorAffine && parallel.is_none() {
+            return self.forward_row_affine(input, context, observer);
+        }
+        let compute_element = match self.arithmetic {
+            eredu_nn::LinearArithmetic::RowMajorAffine => Some(eredu_nn::TensorElementType::F32),
+            arithmetic => arithmetic.compute_element(),
+        };
         let original = input
             .element_type()
             .ok_or_else(|| ComputeError::backend("unknown projection input precision"))?;
-        let cast = self
-            .compute_element
+        let cast = compute_element
             .filter(|_| parallel.is_none())
             .map(|e| input.cast_float(e, context))
             .transpose()?;
@@ -110,7 +188,7 @@ impl MlxLinear {
                 group,
                 context,
                 observer,
-                self.compute_element.map(|e| match e {
+                compute_element.map(|e| match e {
                     eredu_nn::TensorElementType::F16 => safemlx::Dtype::Float16,
                     eredu_nn::TensorElementType::Bf16 => safemlx::Dtype::Bfloat16,
                     _ => safemlx::Dtype::Float32,
@@ -124,7 +202,7 @@ impl MlxLinear {
             Some(error) => Err(error),
             None => {
                 let output = compute_tensor(result)?;
-                if self.compute_element.is_some() {
+                if compute_element.is_some() {
                     output.cast_float(original, context)
                 } else {
                     Ok(output)
@@ -162,6 +240,19 @@ pub struct MlxEmbedding {
 }
 
 impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
+    fn output_element_type(&self) -> Option<eredu_nn::TensorElementType> {
+        match &self.module {
+            common::linear::PhysicalEmbedding::Dense(value) => {
+                floating_element(value.weight.dtype())
+            }
+            common::linear::PhysicalEmbedding::Quantized(value) => {
+                // Ordinary restored dense tables retain their own dtype;
+                // packed row lookup explicitly publishes F32 activations.
+                floating_element(value.inner.weight.dtype())
+                    .or(Some(eredu_nn::TensorElementType::F32))
+            }
+        }
+    }
     fn weighted_sum(
         &mut self,
         coefficients: &MlxTensor,
@@ -212,6 +303,26 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
             sentinel,
             context,
         ))?;
+        if let Some(range) = &self.vocabulary_range {
+            let start =
+                Array::from_int(i32::try_from(range.local.start).map_err(ComputeError::backend)?);
+            let end =
+                Array::from_int(i32::try_from(range.local.end).map_err(ComputeError::backend)?);
+            let owned = compute(input.ge(&start, context))?
+                .logical_and(&compute(input.lt(&end, context))?, context)
+                .map_err(ComputeError::backend)?;
+            let local = compute(input.subtract(&start, context))?;
+            let safe = compute(safemlx::ops::r#where(
+                &owned,
+                &local,
+                Array::from_int(0),
+                context,
+            ))?;
+            let value = compute(self.module.forward(&safe, context))?;
+            let mask = compute(owned.expand_dims(-1, context))?;
+            let zero = compute(safemlx::ops::zeros_like(&value, context))?;
+            return compute_tensor(safemlx::ops::r#where(&mask, &value, &zero, context));
+        }
         let nonnegative = compute(input.ge(Array::from_int(0), context))?;
         let below_vocabulary = compute(input.lt(Array::from_int(self.vocabulary), context))?;
         let ordinary_mask = compute(nonnegative.logical_and(&below_vocabulary, context))?;
@@ -246,6 +357,17 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
     }
 }
 
+fn floating_element(dtype: safemlx::Dtype) -> Option<eredu_nn::TensorElementType> {
+    use eredu_nn::TensorElementType;
+    match dtype {
+        safemlx::Dtype::Float16 => Some(TensorElementType::F16),
+        safemlx::Dtype::Bfloat16 => Some(TensorElementType::Bf16),
+        safemlx::Dtype::Float32 => Some(TensorElementType::F32),
+        safemlx::Dtype::Float64 => Some(TensorElementType::F64),
+        _ => None,
+    }
+}
+
 impl Parameterized<MlxTensor> for MlxEmbedding {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
@@ -268,6 +390,7 @@ impl Parameterized<MlxTensor> for MlxEmbedding {
 /// scale construction.
 #[derive(Debug, Clone)]
 pub struct MlxRmsNorm {
+    pub(super) reduction: eredu_nn::NormalizationReduction,
     pub(super) groups: Option<i32>,
     pub(super) module: Option<nn::RmsNorm>,
     pub(super) topology: BTreeMap<String, ParameterSpec>,
@@ -303,6 +426,26 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
                 self.dimensions,
                 input.shape()
             )));
+        }
+        if self.reduction == eredu_nn::NormalizationReduction::Cascaded {
+            return compute_tensor(super::super::normalization::cascaded_rms(
+                input,
+                self.module.as_ref().map(|module| module.weight.as_ref()),
+                self.offset,
+                self.epsilon,
+                context,
+            ));
+        }
+        if self.reduction == eredu_nn::NormalizationReduction::ChannelMajor {
+            if let Some(value) = compute(super::super::normalization::channel_major_rms(
+                input,
+                self.module.as_ref().map(|module| module.weight.as_ref()),
+                self.offset,
+                self.epsilon,
+                context,
+            ))? {
+                return Ok(MlxTensor::from_array(value));
+            }
         }
         if self.groups.is_some() || self.offset.is_some() {
             let groups = self.groups.unwrap_or(1);
@@ -379,6 +522,7 @@ pub(super) fn mlx_weightless_rms_norm(
 /// MLX RoPE variant selected from model metadata.
 #[derive(Debug, Clone)]
 pub struct MlxRotary {
+    pub(super) arithmetic: eredu_nn::RotaryArithmetic,
     pub(super) dimensions: i32,
     pub(super) traditional: bool,
     pub(super) native: RopeVariant,
@@ -406,12 +550,13 @@ impl RotaryOperator<MlxTensor> for MlxRotary {
                 }
             }
             RotaryPosition::Embeddings { cosine, sine } => {
-                compute_tensor(common::attention::apply_rotary_embeddings(
+                compute_tensor(common::attention::apply_rotary_embeddings_with_arithmetic(
                     input.as_array(),
                     cosine.as_array(),
                     sine.as_array(),
                     self.dimensions,
                     self.traditional,
+                    self.arithmetic,
                     context,
                 ))
             }
@@ -715,6 +860,30 @@ impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
         &self.spec
     }
 
+    fn forward_uncombined(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        self.forward_uncombined_units(input, selections, context, observer)
+    }
+
+    fn combine_outputs(
+        &self,
+        outputs: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        compute_tensor(self.module.combine_outputs(
+            outputs.as_array(),
+            selections.group_indices().as_array(),
+            selections.coefficients().as_array(),
+            context,
+        ))
+    }
+
     fn forward_grouped(
         &mut self,
         input: &MlxTensor,
@@ -749,6 +918,19 @@ impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
 }
 
 impl TensorParallelGroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
+    fn forward_uncombined_tensor_parallel(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        partitions: usize,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
+        self.forward_uncombined_units_tensor_parallel(
+            input, selections, partitions, context, observer,
+        )
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &MlxTensor,

@@ -3,7 +3,9 @@
 //! This is evaluation policy, not an inference primitive. Inputs must come from
 //! effective parameters and the same forward's residual; checkpoint metadata or
 //! another trial's normalization denominator is not sufficient. The decomposed
-//! score is the affine readout before any nonlinear output transform.
+//! score is the affine readout before any nonlinear output transform. Calculations
+//! use analytical F64 arithmetic; declared native/FP32 activation and parameter
+//! rounding remains execution evidence, rather than a bitwise host simulation.
 
 use eredu_core::component::ComponentNormalizationKind;
 
@@ -98,11 +100,17 @@ impl MeasuredReadout {
             } else {
                 0.0
             };
+            let input_scaled = norm.kind == ComponentNormalizationKind::InputScaledRmsFloat32;
             let denominator = if norm.kind == ComponentNormalizationKind::Identity {
                 1.0
             } else {
-                (signed_sum(residual[start..end].iter().map(|x| {
-                    (x - center).powi(2)
+                (signed_sum((start..end).map(|i| {
+                    let value = if input_scaled {
+                        residual[i] * norm.gain[i]
+                    } else {
+                        residual[i] - center
+                    };
+                    value.powi(2)
                         / if norm.kind == ComponentNormalizationKind::L2 {
                             1.0
                         } else {
@@ -159,6 +167,8 @@ impl MeasuredReadout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
 
     #[test]
     fn signed_components_embedding_and_bias_reconstruct_declared_scores_and_margins() {

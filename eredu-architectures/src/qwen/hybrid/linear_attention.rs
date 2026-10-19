@@ -57,6 +57,7 @@ pub fn recurrent_spec(config: &HybridConfig, layer: usize) -> Result<GatedDeltaM
         input_beta: linear("in_proj_b", config.hidden_size, value_heads, dense_ba)?,
         input_decay: linear("in_proj_a", config.hidden_size, value_heads, dense_ba)?,
         convolution: CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             channels: qkv_width,
             kernel_size: config.linear_conv_kernel_dim,
             dilation: 1,

@@ -27,6 +27,8 @@ mod grouped_units;
 mod linear_rows;
 pub use grouped_units::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
 pub use linear_rows::LinearRowLayout;
+/// Separate low-rank projection deltas over an immutable base projection.
+pub mod low_rank;
 /// Logical and implementation memory descriptions for reusable mechanisms.
 pub mod mechanism_memory;
 /// Reusable patch projection and multi-axis position operations.
@@ -35,8 +37,6 @@ pub mod multimodal;
 pub mod operation_geometry;
 /// Portable recurrent inference with explicitly retained hidden and cell state.
 pub mod recurrent;
-/// Separate low-rank projection deltas over an immutable base projection.
-pub mod low_rank;
 mod retained_tensors;
 pub use retained_tensors::RetainedTensorRoots;
 /// Complete residual stream geometry and portable gated mixing.
@@ -401,6 +401,7 @@ mod recurrent_encoder_contract_tests {
     #[test]
     fn normalization_construction_rejects_invalid_geometry_and_scalars() {
         assert!(NormalizationConstructionSpec {
+            reduction: crate::NormalizationReduction::Native,
             groups: None,
             dimensions: 8,
             epsilon: 1e-6,
@@ -409,6 +410,7 @@ mod recurrent_encoder_contract_tests {
         .validate()
         .is_ok());
         assert!(NormalizationConstructionSpec {
+            reduction: crate::NormalizationReduction::Native,
             groups: None,
             dimensions: 0,
             epsilon: 1e-6,
@@ -417,6 +419,7 @@ mod recurrent_encoder_contract_tests {
         .validate()
         .is_err());
         assert!(NormalizationConstructionSpec {
+            reduction: crate::NormalizationReduction::Native,
             groups: None,
             dimensions: 8,
             epsilon: f32::NAN,
@@ -646,6 +649,8 @@ pub enum LinearCompanionRole {
     Scale,
     /// Per-group affine zero-point/bias tensor.
     AffineBias,
+    /// F32 multiplier shared by a matrix or an independent output-row partition.
+    GlobalScale,
 }
 
 /// Parameter metadata observed during traversal.
@@ -832,12 +837,52 @@ pub struct LinearFormatSpec {
     format: LinearFormat,
     scale: Option<ParameterSpec>,
     affine_bias: Option<ParameterSpec>,
+    global_scale: Option<ParameterSpec>,
     row_layout: LinearRowLayout,
-    compute_element: Option<TensorElementType>,
+    arithmetic: LinearArithmetic,
     exact_zero_inputs: bool,
 }
 
+/// Floating affine arithmetic retained independently of physical weight encoding.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum LinearArithmetic {
+    /// Ordinary backend projection and bias arithmetic.
+    #[default]
+    Native,
+    /// Convert projection inputs to this precision; native reduction and bias
+    /// arithmetic apply before restoring the caller's floating precision.
+    Compute(TensorElementType),
+    /// Complete FP32 affine arithmetic with the stored-row BF16 reduction tree
+    /// and bias before one output cast. Other encodings use FP32 projection.
+    RowMajorAffine,
+    /// A channel-major `[batch, time, channel]` projection. For nonsingleton
+    /// time/channel axes, dense BF16 dots use four independent FP32
+    /// sums, merged left to right, then round before bias. Singleton axes use
+    /// a complete FP32 affine result before returning activation precision.
+    /// Other physical encodings retain their native projection reduction.
+    ChannelMajorAffine,
+}
+
+impl LinearArithmetic {
+    /// Requested input conversion, if this policy is an ordinary native projection.
+    pub const fn compute_element(self) -> Option<TensorElementType> {
+        match self { Self::Compute(element) => Some(element), _ => None }
+    }
+}
+
 impl LinearFormatSpec {
+    /// Selects one complete affine arithmetic policy without changing storage.
+    pub fn with_arithmetic(mut self, arithmetic: LinearArithmetic) -> Result<Self, Error> {
+        if arithmetic.compute_element().is_some_and(|e| !matches!(e,
+            TensorElementType::F32 | TensorElementType::F16 | TensorElementType::Bf16)) {
+            return Err(Error::backend("linear compute precision must be floating"));
+        }
+        self.arithmetic = arithmetic;
+        Ok(self)
+    }
+
+    /// Retained affine arithmetic, independently of physical weight encoding.
+    pub const fn arithmetic(&self) -> LinearArithmetic { self.arithmetic }
     /// Offers an optimization hint for inputs with substantial exact-zero sparsity.
     /// This does not authorize pruning, approximation, or changing the equation.
     pub fn with_exact_zero_inputs(mut self) -> Self {
@@ -855,25 +900,13 @@ impl LinearFormatSpec {
     /// accumulator precision and bias arithmetic retain their mechanism's policy.
     /// Other mechanisms using this encoding do not gain a precision override.
     /// Implementations reject unsupported requests.
-    pub fn with_compute_element(
-        mut self,
-        element: Option<TensorElementType>,
-    ) -> Result<Self, Error> {
-        if element.is_some_and(|e| {
-            !matches!(
-                e,
-                TensorElementType::F32 | TensorElementType::F16 | TensorElementType::Bf16
-            )
-        }) {
-            return Err(Error::backend("linear compute precision must be floating"));
-        }
-        self.compute_element = element;
-        Ok(self)
+    pub fn with_compute_element(self, element: Option<TensorElementType>) -> Result<Self, Error> {
+        self.with_arithmetic(element.map_or(LinearArithmetic::Native, LinearArithmetic::Compute))
     }
 
-    /// Explicit projection precision, or ordinary input arithmetic when absent.
+    /// Explicit native projection input conversion, if selected.
     pub const fn compute_element(&self) -> Option<TensorElementType> {
-        self.compute_element
+        self.arithmetic.compute_element()
     }
     /// Declares a dense or checkpoint-native encoding with no companions.
     pub fn unscaled(format: LinearFormat) -> Result<Self, Error> {
@@ -881,8 +914,9 @@ impl LinearFormatSpec {
             format,
             scale: None,
             affine_bias: None,
+            global_scale: None,
             row_layout: LinearRowLayout::Contiguous,
-            compute_element: None,
+            arithmetic: LinearArithmetic::Native,
             exact_zero_inputs: false,
         };
         spec.validate()?;
@@ -898,8 +932,9 @@ impl LinearFormatSpec {
             format,
             scale: Some(scale),
             affine_bias: None,
+            global_scale: None,
             row_layout: LinearRowLayout::Contiguous,
-            compute_element: None,
+            arithmetic: LinearArithmetic::Native,
             exact_zero_inputs: false,
         };
         spec.validate()?;
@@ -922,8 +957,30 @@ impl LinearFormatSpec {
             format,
             scale: Some(scale),
             affine_bias: Some(affine_bias),
+            global_scale: None,
             row_layout: LinearRowLayout::Contiguous,
-            compute_element: None,
+            arithmetic: LinearArithmetic::Native,
+            exact_zero_inputs: false,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Declares NVFP4 block scales and independent F32 global multipliers.
+    pub fn nvfp4(scale: ParameterSpec, global_scale: ParameterSpec) -> Result<Self, Error> {
+        let mut scale = scale;
+        scale.linear_companion = Some(LinearCompanionRole::Scale);
+        scale.linear_companion_of = None;
+        let mut global_scale = global_scale;
+        global_scale.linear_companion = Some(LinearCompanionRole::GlobalScale);
+        global_scale.linear_companion_of = None;
+        let spec = Self {
+            format: LinearFormat::NvFp4,
+            scale: Some(scale),
+            affine_bias: None,
+            global_scale: Some(global_scale),
+            row_layout: LinearRowLayout::Contiguous,
+            arithmetic: LinearArithmetic::Native,
             exact_zero_inputs: false,
         };
         spec.validate()?;
@@ -957,19 +1014,29 @@ impl LinearFormatSpec {
         self.affine_bias.as_ref()
     }
 
+    /// Exact per-matrix or per-row-partition global scale companion.
+    pub const fn global_scale(&self) -> Option<&ParameterSpec> {
+        self.global_scale.as_ref()
+    }
+
     /// Validates that companion cardinality matches the physical encoding.
     pub fn validate(&self) -> Result<(), Error> {
         self.format.validate().map_err(Error::backend)?;
         if self.row_layout != LinearRowLayout::Contiguous
-            && !matches!(self.format, LinearFormat::E4M3BlockFp8(_))
+            && !matches!(
+                self.format,
+                LinearFormat::E4M3BlockFp8(_) | LinearFormat::NvFp4
+            )
         {
             return Err(Error::backend(
-                "independent row blocks require a block-FP8 encoding",
+                "independent row blocks require a block-scaled floating encoding",
             ));
         }
         let expected = match self.format {
             LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => (false, false),
-            LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => (true, false),
+            LinearFormat::MxFp4 | LinearFormat::NvFp4 | LinearFormat::E4M3BlockFp8(_) => {
+                (true, false)
+            }
             LinearFormat::Affine(_) => (true, true),
         };
         if (self.scale.is_some(), self.affine_bias.is_some()) != expected {
@@ -979,6 +1046,23 @@ impl LinearFormatSpec {
                 expected,
                 (self.scale.is_some(), self.affine_bias.is_some())
             )));
+        }
+        if self.global_scale.is_some() != (self.format == LinearFormat::NvFp4) {
+            return Err(Error::backend(
+                "only NVFP4 requires a global scale companion",
+            ));
+        }
+        if let Some(global) = &self.global_scale {
+            if global.linear_companion != Some(LinearCompanionRole::GlobalScale)
+                || self
+                    .scale
+                    .as_ref()
+                    .is_some_and(|scale| scale.id == global.id)
+            {
+                return Err(Error::backend(
+                    "NVFP4 global and block scales require distinct identities and roles",
+                ));
+            }
         }
         if self
             .scale
@@ -1014,6 +1098,7 @@ impl LinearFormatSpec {
             .as_ref()
             .into_iter()
             .chain(self.affine_bias.as_ref())
+            .chain(self.global_scale.as_ref())
             .any(|companion| companion.id == weight.id)
         {
             return Err(Error::backend(format!(
@@ -1269,6 +1354,8 @@ pub enum NormalizationScale {
 /// Complete construction policy for an RMS normalization operator.
 #[derive(Debug, Clone)]
 pub struct NormalizationConstructionSpec {
+    /// Logical input traversal retained by the FP32 reduction.
+    pub reduction: NormalizationReduction,
     /// Independent reduction groups, with one scale per feature. When present,
     /// reduction and scale multiplication both use float32 before casting back.
     pub groups: Option<i32>,
@@ -1280,15 +1367,54 @@ pub struct NormalizationConstructionSpec {
     pub scale: NormalizationScale,
 }
 
+/// FP32 RMS reduction traversal, independent of parameter storage.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum NormalizationReduction {
+    /// Ordinary contiguous/grouped backend reduction.
+    #[default]
+    Native,
+    /// Four-lane, four-chain FP32 cascaded reduction on each final-axis row.
+    Cascaded,
+    /// Channel-major `[batch, time, channel]` traversal. Complete sixteen-row
+    /// blocks use one cascaded sum per row; remaining rows use four interleaved
+    /// cascaded sums. Singleton axes retain contiguous reduction.
+    ChannelMajor,
+}
+
+/// Reduction and affine-rounding policy for final-axis layer normalization.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum LayerNormalizationArithmetic {
+    /// Native backend normalization, including ordinary dtype promotion.
+    #[default]
+    Native,
+    /// FP32 cascaded four-lane Welford moments. Reduced-precision inputs use
+    /// `(x * inverse - mean * inverse) * gain + bias` before one output cast;
+    /// F32 inputs subtract the mean before multiplying by the inverse. Final
+    /// scalar moment merges use fused multiply-add; vector chains round their
+    /// products and sums separately.
+    CascadedMoments,
+}
+
 impl NormalizationConstructionSpec {
     /// Creates an RMS normalization with an ordinary learned scale.
     pub fn learned(dimensions: i32, epsilon: f32, weight: ParameterSpec) -> Self {
         Self {
+            reduction: NormalizationReduction::Native,
             groups: None,
             dimensions,
             epsilon,
             scale: NormalizationScale::Learned(weight),
         }
+    }
+
+    /// Selects the FP32 reduction traversal over the complete feature axis.
+    pub fn with_reduction(mut self, reduction: NormalizationReduction) -> Result<Self, Error> {
+        self.reduction = reduction;
+        if matches!(reduction, NormalizationReduction::ChannelMajor | NormalizationReduction::Cascaded) {
+            self.groups = Some(1);
+        }
+        self.validate()?;
+        Ok(self)
     }
 
     /// Selects independent float32 reductions over equal contiguous groups.
@@ -1305,6 +1431,7 @@ impl NormalizationConstructionSpec {
             NormalizationScale::Learned(_) | NormalizationScale::Unit => None,
         };
         if self.dimensions <= 0
+            || (matches!(self.reduction, NormalizationReduction::ChannelMajor | NormalizationReduction::Cascaded) && self.groups != Some(1))
             || self
                 .groups
                 .is_some_and(|groups| groups <= 0 || self.dimensions % groups != 0)
@@ -1424,6 +1551,9 @@ pub enum RotaryArithmetic {
     /// Compute trigonometric values and amplitude in FP32, cast to the input
     /// dtype, and round each product before adding the rotated components.
     InputProducts,
+    /// Compute trigonometric values and amplitude in FP32, round the table to
+    /// the input dtype, then apply FP32 products and sums before one output cast.
+    InputTableFloat32Products,
 }
 
 /// Complete backend-neutral rotary-position construction specification.
@@ -1506,6 +1636,13 @@ pub use TensorValueObserver as ProjectionInputObserver;
 
 /// Backend-native affine projection used by shared architectures.
 pub trait LinearOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Preferred floating input precision of the bound parameters, when known.
+    /// This is a metadata query; it must not evaluate or materialize weights.
+    /// Dense weights report their scalar type, affine weights their scale type.
+    /// Formats without an unambiguous floating input precision return `None`.
+    fn parameter_element_type(&self) -> Option<TensorElementType> {
+        None
+    }
     /// Selects explicit floating projection arithmetic. Unsupported backends reject it.
     fn set_compute_element(&mut self, element: Option<TensorElementType>) -> Result<(), Error> {
         if element.is_some() {
@@ -1536,6 +1673,11 @@ pub trait LinearOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
 
 /// Backend-native token embedding used by shared architectures.
 pub trait EmbeddingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Floating scalar type produced by lookup, without submitting a lookup.
+    /// This describes the actual bound representation, including packed tables.
+    fn output_element_type(&self) -> Option<TensorElementType> {
+        None
+    }
     /// Forms an embedding from weights over vocabulary rows. The final input
     /// axis equals the vocabulary; coefficients round to the materialized
     /// embedding arithmetic before multiplication. This neither samples tokens
@@ -1550,7 +1692,10 @@ pub trait EmbeddingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     }
     /// Looks up token embeddings.
     fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
-    /// Looks up token embeddings under an explicit validation/sentinel policy.
+    /// Looks up global token IDs under an explicit validation/sentinel policy.
+    /// A vocabulary-sharded table returns its owned contribution and typed zero
+    /// for valid IDs outside its row range. This performs no collective; callers
+    /// combine contributions before applying complete-embedding transformations.
     fn lookup(
         &mut self,
         input: &T,
@@ -1807,9 +1952,21 @@ pub enum GroupScoring {
     SqrtSoftplus,
 }
 
+/// Ordering of selected groups before coefficient normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSelectionOrder {
+    /// Rank the selected set by descending selection score.
+    Ranked,
+    /// Retain value-only median-partition order without a subsequent score sort.
+    /// Coefficient reductions consume this order; mixture accumulation has its
+    /// own independent reduction policy.
+    Partition,
+}
+
 /// Backend-neutral top-k group-selection semantics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopKGroupSelectionSpec {
+    order: GroupSelectionOrder,
     group_count: i32,
     top_k: i32,
     scoring: GroupScoring,
@@ -1843,6 +2000,7 @@ pub struct TopKGroupSelectorSpec {
     /// Architecture-selected scoring and selection semantics.
     selection: TopKGroupSelectionSpec,
     arithmetic: RoutingArithmetic,
+    logit_scale: f32,
 }
 
 /// Arithmetic dtype for one routing stage.
@@ -1935,6 +2093,7 @@ impl TopKGroupSelectorSpec {
             _ => RoutingPrecision::Preserve,
         };
         let spec = Self {
+            logit_scale: 1.0,
             arithmetic: RoutingArithmetic::uniform(precision),
             input_dimensions,
             weight,
@@ -1957,6 +2116,23 @@ impl TopKGroupSelectorSpec {
     /// Returns the complete arithmetic policy retained for controlled routing too.
     pub const fn arithmetic(&self) -> RoutingArithmetic {
         self.arithmetic
+    }
+
+    /// Scales projected logits, including ordinary bias, before scoring and
+    /// selection-only correction. The scale uses projection arithmetic.
+    pub fn with_logit_scale(mut self, scale: f32) -> Result<Self, Error> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(Error::backend(
+                "selector logit scale must be finite and positive",
+            ));
+        }
+        self.logit_scale = scale;
+        Ok(self)
+    }
+
+    /// Returns the multiplier applied before the scoring nonlinearity.
+    pub const fn logit_scale(&self) -> f32 {
+        self.logit_scale
     }
 
     /// Adds an ordinary projection bias.
@@ -2065,6 +2241,7 @@ impl TopKGroupSelectionSpec {
             )));
         }
         Ok(Self {
+            order: GroupSelectionOrder::Ranked,
             group_count,
             top_k,
             scoring,
@@ -2074,6 +2251,17 @@ impl TopKGroupSelectionSpec {
             selection_partitions: 1,
             selected_groups: 1,
         })
+    }
+
+    /// Selects the order consumed by gathered-score normalization.
+    pub const fn with_order(mut self, order: GroupSelectionOrder) -> Self {
+        self.order = order;
+        self
+    }
+
+    /// Returns the selected-score ordering policy.
+    pub const fn order(self) -> GroupSelectionOrder {
+        self.order
     }
 
     /// Selects grouped selection semantics.
@@ -2631,6 +2819,7 @@ impl GroupedProjectionSpec {
         parameters.extend(self.bias.as_ref());
         parameters.extend(self.format.scale());
         parameters.extend(self.format.affine_bias());
+        parameters.extend(self.format.global_scale());
         parameters
     }
 }
@@ -2808,7 +2997,8 @@ impl GroupedGatedProductSpec {
 pub struct TensorParallelGroupedOutput<T> {
     /// Rank-local projection contribution to all-sum.
     reducible: T,
-    /// Replicated selection-weighted down bias added once after all-sum.
+    /// Replicated down bias added once after all-sum, in the calling
+    /// operation's combined or uncombined output geometry.
     post_reduce: Option<T>,
 }
 
@@ -2843,6 +3033,34 @@ pub trait GroupedGatedProductOperator<T: Tensor>: Clone + Debug + Parameterized<
     /// same geometry, encoding, bias, and activation policy.
     fn spec(&self) -> &GroupedGatedProductSpec;
 
+    /// Executes complete selected experts without weighting or accumulation.
+    /// The result has shape `[tokens, selected_slots, output_dimensions]` in
+    /// the exact slot order of `selections`. This boundary permits architecture
+    /// equations such as nonlinear normalization of each expert output.
+    fn forward_uncombined(
+        &mut self,
+        _input: &T,
+        _selections: &GroupSelection<T>,
+        _context: &T::Context,
+        _observer: Option<&mut dyn GroupedUnitObserver<T>>,
+    ) -> Result<T, Error> {
+        Err(Error::backend_source(UncombinedGroupedOutputUnavailable))
+    }
+
+    /// Applies selection coefficients to per-slot outputs after any
+    /// architecture-owned transformations, preserving this bank's declared
+    /// reduction order and coefficient-rounding policy.
+    fn combine_outputs(
+        &self,
+        _outputs: &T,
+        _selections: &GroupSelection<T>,
+        _context: &T::Context,
+    ) -> Result<T, Error> {
+        Err(Error::backend(
+            "separate grouped accumulation is unavailable",
+        ))
+    }
+
     /// Executes selected groups and combines their outputs by selection weight.
     fn forward_grouped(
         &mut self,
@@ -2867,10 +3085,30 @@ pub trait GroupedGatedProductOperator<T: Tensor>: Clone + Debug + Parameterized<
     }
 }
 
+/// A selected neural mechanism cannot retain individual expert outputs.
+#[derive(Debug, thiserror::Error)]
+#[error("uncombined grouped expert outputs are unavailable")]
+pub struct UncombinedGroupedOutputUnavailable;
+
 /// Additive mechanism for tensor-parallel grouped gated-product partials.
 pub trait TensorParallelGroupedGatedProductOperator<T: Tensor>:
     GroupedGatedProductOperator<T>
 {
+    /// Returns unweighted per-slot rank-local outputs and replicated down bias.
+    /// Both tensors have shape `[tokens, selected_slots, output_dimensions]`.
+    /// All-sum the partials and add bias once before any nonlinear expert
+    /// transformation, routing multiplication or accumulation.
+    fn forward_uncombined_tensor_parallel(
+        &mut self,
+        _input: &T,
+        _selections: &GroupSelection<T>,
+        _partitions: usize,
+        _context: &T::Context,
+        _observer: Option<&mut dyn GroupedUnitObserver<T>>,
+    ) -> Result<TensorParallelGroupedOutput<T>, Error> {
+        Err(Error::backend_source(UncombinedGroupedOutputUnavailable))
+    }
+
     /// Executes a rank-local partial and separates replicated down bias for one
     /// literal post-reduction addition.
     fn forward_grouped_tensor_parallel(
@@ -3123,6 +3361,19 @@ pub trait GroupedNeuralBackend: NeuralBackend {
 /// Grouped backend whose selected realization provides every required
 /// tensor-parallel grouped partial operation.
 pub trait TensorParallelGroupedNeuralBackend: GroupedNeuralBackend {
+    /// Executes per-slot unweighted rank-local outputs. Reconstruction precedes
+    /// any architecture-owned nonlinear transformation and accumulation.
+    fn gated_product_groups_uncombined_tensor_parallel(
+        _groups: &mut Self::GatedProductGroups,
+        _input: &Self::Tensor,
+        _selections: &GroupSelection<Self::Tensor>,
+        _partitions: usize,
+        _context: &<Self::Tensor as Tensor>::Context,
+        _observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        Err(Error::backend_source(UncombinedGroupedOutputUnavailable))
+    }
+
     /// Executes one rank-local gated-product grouped partial.
     fn gated_product_groups_tensor_parallel(
         groups: &mut Self::GatedProductGroups,
@@ -3177,6 +3428,17 @@ where
     B::GatedProductGroups: TensorParallelGroupedGatedProductOperator<B::Tensor>,
     B::Relu2Groups: TensorParallelGroupedRelu2Operator<B::Tensor>,
 {
+    fn gated_product_groups_uncombined_tensor_parallel(
+        groups: &mut Self::GatedProductGroups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        groups.forward_uncombined_tensor_parallel(input, selections, partitions, context, observer)
+    }
+
     fn gated_product_groups_tensor_parallel(
         groups: &mut Self::GatedProductGroups,
         input: &Self::Tensor,
@@ -3470,6 +3732,10 @@ pub enum AttentionArithmetic {
     /// A fused kernel may retain score/probability intermediates in FP32.
     #[default]
     Fused,
+    /// Compute QK products in FP32, apply scale to those products, then compute
+    /// probabilities and value products in FP32. Round only the complete
+    /// attention result to the promoted query/key/value dtype.
+    Float32,
     /// Round QK products and scaled/masked scores to the query dtype. Compute
     /// softmax in FP32, then round probabilities before the value product.
     InputScores,
@@ -3961,8 +4227,20 @@ impl NeuralOperatorCapabilities {
     pub const RFFT: Self = Self(1 << 46);
     /// Weighted vocabulary-row embedding, including packed tables.
     pub const WEIGHTED_EMBEDDING: Self = Self(1 << 47);
+    /// Reference-ordered cascaded layer normalization and affine rounding.
+    pub const CASCADED_LAYER_NORM: Self = Self(1 << 48);
+    /// Channel-major FP32 RMS reduction independent of realized tensor strides.
+    pub const CHANNEL_MAJOR_RMS: Self = Self(1 << 49);
+    /// Final-axis FP32 cascaded RMS normalization.
+    pub const CASCADED_RMS: Self = Self(1 << 50);
+    /// Signed 64-bit checkpoint buffer placeholders without narrowing.
+    pub const UNLOADED_I64: Self = Self(1 << 51);
+    /// Ranked, deterministic last-axis selection from floating score rows.
+    pub const RANKED_TOPK: Self = Self(1 << 52);
+    /// Strict unique-index final-axis scatter without integer narrowing.
+    pub const SCATTER_LAST_AXIS: Self = Self(1 << 53);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 48) - 1);
+    pub const ALL: Self = Self((1 << 54) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -3977,6 +4255,9 @@ impl NeuralOperatorCapabilities {
     /// Returns stable names for every required capability absent from this set.
     pub fn missing_capability_names(self, required: Self) -> Vec<&'static str> {
         const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
+            (NeuralOperatorCapabilities::CASCADED_LAYER_NORM, "cascaded_layer_norm"),
+            (NeuralOperatorCapabilities::CHANNEL_MAJOR_RMS, "channel_major_rms"),
+            (NeuralOperatorCapabilities::CASCADED_RMS, "cascaded_rms"),
             (
                 NeuralOperatorCapabilities::WEIGHTED_EMBEDDING,
                 "weighted_embedding",
@@ -4048,6 +4329,9 @@ impl NeuralOperatorCapabilities {
             (NeuralOperatorCapabilities::GROUPED_LINEAR, "grouped_linear"),
             (NeuralOperatorCapabilities::SUM_PARALLEL, "sum_parallel"),
             (NeuralOperatorCapabilities::UNLOADED_I32, "unloaded_i32"),
+            (NeuralOperatorCapabilities::UNLOADED_I64, "unloaded_i64"),
+            (NeuralOperatorCapabilities::RANKED_TOPK, "ranked_topk"),
+            (NeuralOperatorCapabilities::SCATTER_LAST_AXIS, "scatter_last_axis"),
             (NeuralOperatorCapabilities::FROM_I32_SLICE, "from_i32_slice"),
             (NeuralOperatorCapabilities::TO_F32_VEC, "to_f32_vec"),
             (NeuralOperatorCapabilities::TO_I32_VEC, "to_i32_vec"),
@@ -5091,6 +5375,12 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "I32 parameter allocation is not implemented by this backend",
         ))
     }
+    /// Allocates an unloaded signed 64-bit checkpoint buffer, preserving its
+    /// integer representation through ordinary parameter binding.
+    fn unloaded_i64(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        let _ = (shape, context);
+        Err(Error::backend("I64 parameter allocation is not implemented by this backend"))
+    }
     /// Creates a floating-point tensor from host initialization data.
     fn from_f32_slice(
         values: &[f32],
@@ -5236,6 +5526,22 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Indices outside the supported axis domain must fail; deferred validation must prevent the
     /// native gather from reading outside its source while work is pending.
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error>;
+    /// Selects `count` entries along the final axis, ordered by descending score
+    /// and then ascending original index. Inputs must be finite floating values;
+    /// returns selected values and I32 indices with the same leading dimensions.
+    fn ranked_topk(&self, count: i32, context: &Self::Context) -> Result<(Self, Self), Error> {
+        let _ = (count, context);
+        Err(Error::backend("ranked final-axis selection is not implemented by this backend"))
+    }
+    /// Writes values at unique, nonnegative final-axis indices. Leading shapes
+    /// must match; indices and values have the same shape. I32/I64 indices are
+    /// validated before narrowing or native access. Duplicate or out-of-range
+    /// indices fail, possibly at completion, without unchecked native indexing.
+    /// Values are converted to the destination's physical representation.
+    fn scatter_last_axis(&self, indices: &Self, values: &Self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = (indices, values, context);
+        Err(Error::backend("strict final-axis scatter is not implemented by this backend"))
+    }
     /// Whether both optional row ranking and validated index compaction are
     /// available in this execution context. This query does not evaluate tensors.
     fn supports_row_selection(context: &Self::Context) -> bool {
@@ -5465,6 +5771,7 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         weight: Option<&Self>,
         bias: Option<&Self>,
         epsilon: f32,
+        arithmetic: LayerNormalizationArithmetic,
         context: &Self::Context,
     ) -> Result<Self, Error>;
     /// Gaussian error linear unit.
@@ -5562,6 +5869,14 @@ impl<T: Tensor> Parameter<T> {
     ) -> Result<Self, Error> {
         Ok(Self::new(spec, T::unloaded_i32(shape, context)?))
     }
+    /// Creates an unloaded signed 64-bit buffer without a lossy floating cast.
+    pub fn unloaded_i64(
+        spec: ParameterSpec,
+        shape: &[i32],
+        context: &T::Context,
+    ) -> Result<Self, Error> {
+        Ok(Self::new(spec, T::unloaded_i64(shape, context)?))
+    }
 }
 
 impl<T: 'static> Parameterized<T> for Parameter<T> {
@@ -5651,6 +5966,17 @@ pub enum ConvolutionActivation {
     Silu,
 }
 
+/// Accumulation and bias precision before a convolution's output is rounded.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ConvolutionArithmetic {
+    /// Backend convolution output followed by bias in that output precision.
+    Native,
+    /// Four independent FP32 tap sums, leftovers added to the first sum,
+    /// merged left to right before bias and one cast to input precision.
+    /// The optional activation follows that cast; histories retain input precision.
+    FourLaneFloat32Affine,
+}
+
 /// Activation applied after learned grouped RMS normalization.
 ///
 /// Normalization, scaling and gating use float32 arithmetic before converting
@@ -5676,6 +6002,8 @@ pub enum OutputGatedNormArithmetic {
 /// Geometry and parameter identity for a causal depthwise convolution.
 #[derive(Debug, Clone)]
 pub struct CausalDepthwiseConvolutionSpec {
+    /// Convolution and additive-bias rounding boundary.
+    pub arithmetic: ConvolutionArithmetic,
     /// Spacing between consecutive kernel taps in token positions.
     pub dilation: i32,
     /// Number of independent channels.
@@ -5740,6 +6068,8 @@ pub struct CausalDepthwiseConvolutionOutput<T> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct CausalDepthwiseConvolution<B: NeuralBackend> {
+    #[parameter(skip)]
+    arithmetic: ConvolutionArithmetic,
     /// Checkpoint-layout kernel shaped `[channels, 1, kernel]`.
     pub weight: Parameter<B::Tensor>,
     /// Optional per-channel bias.
@@ -5763,6 +6093,7 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
         spec.validate()?;
         let history_len = spec.history_len()?;
         Ok(Self {
+            arithmetic: spec.arithmetic,
             weight: Parameter::unloaded(
                 spec.weight,
                 &[spec.channels, 1, spec.kernel_size],
@@ -5791,6 +6122,7 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
         history: Option<&B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<CausalDepthwiseConvolutionOutput<B::Tensor>, Error> {
+        let arithmetic = self.arithmetic;
         let shape = input.shape();
         if shape.len() != 3 || shape[0] <= 0 || shape[1] <= 0 || shape[2] != self.channels {
             return Err(Error::backend(format!(
@@ -5827,15 +6159,35 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
             )?
         };
         let execution_weight = self.weight.as_ref().swap_axes(1, 2, context)?;
-        let mut output = B::Tensor::conv1d(
-            &padded,
-            &execution_weight,
-            1,
-            0,
-            self.dilation,
-            self.channels,
-            context,
-        )?;
+        let element = input.element_type();
+        let (work, execution_weight) = match arithmetic {
+            ConvolutionArithmetic::Native => (padded.clone(), execution_weight),
+            ConvolutionArithmetic::FourLaneFloat32Affine => (
+                padded.cast_float(TensorElementType::F32, context)?,
+                execution_weight.cast_float(TensorElementType::F32, context)?,
+            ),
+        };
+        let mut output = match arithmetic {
+            ConvolutionArithmetic::Native => B::Tensor::conv1d(
+                &work, &execution_weight, 1, 0, self.dilation, self.channels, context)?,
+            ConvolutionArithmetic::FourLaneFloat32Affine => {
+                let prototype = work.index(&[Index::Full, Index::Range(0, shape[1]), Index::Full], context)?;
+                let zero = B::Tensor::zeros_like(&prototype, context)?;
+                let mut sums = vec![zero; 4];
+                let kernel = execution_weight.shape()[1];
+                for tap in 0..kernel {
+                    let first = tap * self.dilation;
+                    let values = work.index(&[Index::Full, Index::Range(first, first + shape[1]), Index::Full], context)?;
+                    let gain = execution_weight.index(&[Index::Full, Index::At(tap), Index::At(0)], context)?
+                        .reshape(&[1, 1, self.channels], context)?;
+                    let lane = if tap < (kernel / 4) * 4 { (tap % 4) as usize } else { 0 };
+                    sums[lane] = sums[lane].add(&values.multiply(&gain, context)?, context)?;
+                }
+                let mut sum = sums[0].clone();
+                for partial in &sums[1..] { sum = sum.add(partial, context)?; }
+                sum
+            }
+        };
         if output.shape() != shape {
             return Err(Error::backend(format!(
                 "causal depthwise convolution backend returned shape {:?}, expected {shape:?}",
@@ -5843,11 +6195,26 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
             )));
         }
         if let Some(bias) = &self.bias {
+            let bias = match arithmetic {
+                ConvolutionArithmetic::Native => bias.as_ref().clone(),
+                ConvolutionArithmetic::FourLaneFloat32Affine => {
+                    bias.as_ref().cast_float(TensorElementType::F32, context)?
+                }
+            };
             let bias = bias
-                .as_ref()
                 .reshape(&[1, 1, self.channels], context)?
                 .broadcast_to(shape, context)?;
             output = output.add(&bias, context)?;
+        }
+        if arithmetic == ConvolutionArithmetic::FourLaneFloat32Affine {
+            output = output.cast_float(
+                element.ok_or_else(|| {
+                    Error::backend(
+                        "explicit convolution arithmetic requires a known floating input type",
+                    )
+                })?,
+                context,
+            )?;
         }
         if self.activation == ConvolutionActivation::Silu {
             output = B::silu(output, context)?;
@@ -6246,6 +6613,7 @@ impl<T: Tensor> LayerNorm<T> {
             self.weight.as_ref().map(Parameter::as_ref),
             self.bias.as_ref().map(Parameter::as_ref),
             self.epsilon,
+            LayerNormalizationArithmetic::Native,
             context,
         )
     }

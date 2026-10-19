@@ -160,6 +160,7 @@ fn norm<B: NeuralBackend>(
 ) -> Result<B::Normalization, eredu_nn::Error> {
     B::normalization(
         NormalizationConstructionSpec {
+            reduction: eredu_nn::NormalizationReduction::Native,
             dimensions: dimensions.hidden,
             epsilon: dimensions.epsilon,
             groups: Some(1),

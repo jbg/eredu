@@ -85,12 +85,13 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
             },
             eredu_core::decoding::DecodingMode::SelfSpeculation(options) => {
                 let profile = B::shared_backbone_memory_profile(runtime)?.ok_or_else(|| GenerationForecastError::UnsupportedContinuation("selected shared-target transaction has no complete storage projection".into()))?;
-                if profile.draft.is_some() || profile.embedded.is_some() || profile.shared_backbone.is_none() || options.request().max_draft_tokens.get() as u64 > profile.proposal_capacity {
+                if profile.conditioned.is_some() || profile.draft.is_some() || profile.embedded.is_some() || profile.shared_backbone.is_none() || options.request().max_draft_tokens.get() as u64 > profile.proposal_capacity {
                     return Err(failure("shared-target continuation requires exact retained proposal geometry"));
                 }
                 let mut shared = profile.shared_backbone;
                 if !options.request().draft_adapter { shared.as_mut().unwrap().adapter = None; }
                 decoding.speculative.push(eredu_runtime::memory_forecast::SpeculativeMemoryPlan {
+                    conditioned: None,
                     shared_backbone: shared, embedded: None, draft: None,
                     auxiliary_bytes_per_position: profile.auxiliary_bytes_per_position,
                     sampling_bytes_per_vocabulary_entry: profile.sampling_bytes_per_vocabulary_entry,
@@ -133,6 +134,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
         0,
         eredu_core::PrefillChunkPolicy::Unchunked,
         ForecastExecutionContract {
+            input_retention: eredu_runtime::memory_forecast::PrefillInputRetention::TokenIds,
             full_pass_reason: None,
             logits: if profile.plan.query_tokens > 1 {
                 LogitsWorkspace::EveryPosition

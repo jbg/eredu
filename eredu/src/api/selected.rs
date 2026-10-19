@@ -247,6 +247,16 @@ impl LocalLoadOptions {
         self.normalized.draft_adapter()
     }
 
+    /// Selects independently admitted image/video and waveform sources.
+    pub fn with_media_companions(mut self, sources: eredu_core::MediaCompanionSources) -> Self {
+        self.normalized = self.normalized.with_media_companions(sources);
+        self
+    }
+    /// Explicit independent media sources selected at load time.
+    pub fn media_companions(&self) -> &eredu_core::MediaCompanionSources {
+        self.normalized.media_companions()
+    }
+
     /// Explicit embedded prediction artifact, if supplied.
     pub fn prediction_source(&self) -> Option<&std::path::Path> {
         self.normalized.prediction_source()

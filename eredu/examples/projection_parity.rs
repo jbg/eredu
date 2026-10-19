@@ -201,6 +201,7 @@ fn main() -> anyhow::Result<()> {
     }
     let expected_tokens: Vec<_> = baseline.as_ref().unwrap().iter().map(|d| d.0).collect();
     let spec_plan = plan.with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: path.display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 2,

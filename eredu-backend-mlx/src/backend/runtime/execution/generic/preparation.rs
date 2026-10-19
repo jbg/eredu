@@ -186,17 +186,9 @@ where
     }
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let device_window_bytes = (0..layout.group_count())
-        .map(|group| {
-            let range = layout
-                .group_range(group)
-                .expect("validated layout covers every execution group");
-            largest_window_bytes(&unit_bytes[range], depth)
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let device_window_bytes =
+        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &unit_bytes, options)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
     let host_required = match dense {
         Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
             .checked_mul(dense.host_lookahead() as u64)
@@ -395,6 +387,44 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
+    prepare_parameter_unit_policy::<A::Unit, _, _, _>(
+        store,
+        architecture.static_modules_mut(),
+        populator,
+        options,
+        stream,
+        weights_stream,
+        ignored,
+        layout,
+        static_bindings,
+        unit_bindings,
+        supplementary,
+    )
+}
+
+/// Prepares the existing completion-safe resident/host/disk parameter mechanism
+/// from retained exact units, independently of the caller's invocation driver.
+/// Architecture-owned traversal supplies unit construction and semantic addresses.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_parameter_unit_policy<U, SM, P, I>(
+    store: SharedCheckpointSource,
+    static_modules: &mut SM,
+    populator: P,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    ignored: I,
+    layout: ExecutionUnitLayout,
+    static_bindings: Vec<WeightBinding>,
+    unit_bindings: Vec<Vec<WeightBinding>>,
+    supplementary: Vec<SupplementaryResidencyUnit>,
+) -> Result<(MlxLayerwisePolicy<U, P>, LayerwiseModelMetadata), Error>
+where
+    U: Parameterized<MlxTensor> + 'static,
+    SM: Parameterized<MlxTensor>,
+    P: MlxUnitPopulator<U>,
+    I: Fn(&str) -> bool,
+{
     crate::backend::runtime::checkpoint::bounded_quantization::realize_prepared_source(
         &store, stream,
     )?;
@@ -522,17 +552,9 @@ where
     }
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let device_window_bytes = (0..layout.group_count())
-        .map(|group| {
-            let range = layout
-                .group_range(group)
-                .expect("validated layout covers every execution group");
-            largest_window_bytes(&unit_bytes[range], depth)
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let device_window_bytes =
+        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &unit_bytes, options)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
     let host_required = match dense {
         Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
             .checked_mul(dense.host_lookahead() as u64)
@@ -582,11 +604,7 @@ where
     let mut static_leases = Vec::new();
     if let Some(id) = static_id {
         let lease = residency.acquire(&id, MemoryTier::Device)?;
-        populate_selected_parameterized(
-            architecture.static_modules_mut(),
-            &lease,
-            &static_parameters,
-        )?;
+        populate_selected_parameterized(static_modules, &lease, &static_parameters)?;
         static_leases.push(lease);
     }
     let metadata = LayerwiseModelMetadata::new(

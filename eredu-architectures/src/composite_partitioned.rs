@@ -317,7 +317,7 @@ pub fn routed_gemma4_partition_foundation(
 
 /// Binds selected sparse Muse-Glimmer ownership to exact optional-root geometry.
 pub fn routed_muse_partition_foundation(
-    args: &crate::muse_glimmer::DecoderConfig,
+    args: &crate::muse::DecoderConfig,
     layout: &LocalModelLayout,
     groups: impl IntoIterator<Item = (impl AsRef<str>, std::ops::Range<usize>)>,
     ownership: &eredu_runtime::PartitionOwnership,
@@ -325,12 +325,12 @@ pub fn routed_muse_partition_foundation(
     realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
 ) -> Result<
     RoutedCompositePartitionFoundation<
-        crate::muse_glimmer::PartitionLocalGeometry,
+        crate::muse::PartitionLocalGeometry,
         eredu_nn::GroupedGatedProductSpec,
     >,
     String,
 > {
-    let geometry = crate::muse_glimmer::parallel::routed_partition_local_geometry(
+    let geometry = crate::muse::parallel::routed_partition_local_geometry(
         args, layout, groups, ownership,
     )
     .map_err(|error| error.to_string())?;
@@ -338,7 +338,7 @@ pub fn routed_muse_partition_foundation(
         0..usize::try_from(args.num_hidden_layers).map_err(|_| "Muse layer count exceeds usize")?;
     routed_composite_foundation(
         geometry.clone(),
-        crate::muse_glimmer::TEXT_EXECUTION_GROUP,
+        crate::muse::TEXT_EXECUTION_GROUP,
         geometry.text_units(),
         args.num_hidden_layers as usize,
         units,
@@ -494,7 +494,7 @@ impl PreparedCompositeExecutorPlan {
         let route_schemas = selected
             .boundary_routes()
             .iter()
-            .map(|route| (route.route().route, route.schema().clone()))
+            .map(|route| (route.route().route, route.schema().clone(), route.source_unit_end()))
             .collect::<Vec<_>>();
         validate_executor_routes(selected.boundary_routes(), &route_schemas)?;
         let topology = selected.topology();
@@ -776,12 +776,13 @@ fn validate_executor_routes(
     actual: &[(
         eredu_runtime::CommunicationRouteId,
         eredu_runtime::ResolvedBoundaryWireSchema,
+        usize,
     )],
 ) -> Result<(), String> {
     let expected = expected
         .iter()
-        .map(|route| (route.route().route, route.schema().clone()));
-    let actual = actual.iter().cloned();
+        .map(|route| (route.route().route, (route.schema().clone(), route.source_unit_end())));
+    let actual = actual.iter().map(|(id,schema,end)| (*id,(schema.clone(),*end)));
     validate_exact_executor_contract(expected, actual)
 }
 
@@ -2090,7 +2091,7 @@ where
             )
         }
         CompositeConfig::Muse(source) => {
-            let args = crate::muse_glimmer::with_checkpoint_formats(source, target_formats)
+            let args = crate::muse::with_checkpoint_formats(source, target_formats)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
             if routed != args.is_moe() {
                 return Err(CompositePartitionPreparationError::Architecture(
@@ -2098,18 +2099,14 @@ where
                         .into(),
                 ));
             }
-            let description = crate::muse_glimmer::LayeredModel::<B>::new(args.clone(), context)
+            let parameters = crate::muse::model::parameter_description(&args)
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
-            let local = crate::muse_glimmer::local_geometry(&args, &layout).map_err(|error| {
+            let local = crate::muse::local_geometry(&args, &layout).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let group_ranges = selected
@@ -2121,7 +2118,7 @@ where
             let ownership = selected.requirements().ownership().clone();
             let rank = selected.requirements().topology();
             let geometry = if routed {
-                crate::muse_glimmer::parallel::routed_partition_local_geometry(
+                crate::muse::parallel::routed_partition_local_geometry(
                     &args,
                     &layout,
                     group_ranges
@@ -2130,7 +2127,7 @@ where
                     &ownership,
                 )
             } else {
-                crate::muse_glimmer::partition_local_geometry(
+                crate::muse::partition_local_geometry(
                     &args,
                     &layout,
                     group_ranges
@@ -2141,15 +2138,16 @@ where
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let mut architecture =
-                crate::muse_glimmer::LayeredModel::<B>::new_parallel(args.clone(), local, context)
+                crate::muse::LayeredModel::<B>::new_parallel(args.clone(), local, context)
                     .and_then(|architecture| {
-                        architecture.with_partition_state_offset(geometry.text_units().start)
+                        architecture.with_partition_state(selected.requirements().state().cloned()
+                    .ok_or_else(|| eredu_nn::Error::backend("Muse selected partition has no state ownership"))?)
                     })
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
             let realization = if routed {
-                let realization = crate::muse_glimmer::expert_realization_plan(&architecture, rank)
+                let realization = crate::muse::expert_realization_plan(&architecture, rank)
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?
@@ -2189,10 +2187,10 @@ where
                 })
                 .transpose()
                 .map_err(CompositePartitionPreparationError::Architecture)?;
-            let capability = crate::capability::muse_glimmer(&args).map_err(|error| {
+            let capability = crate::capability::muse(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
-            let source_architecture = muse_glimmer_transform_source::<B, S>(
+            let source_architecture = muse_transform_source::<B, S>(
                 source,
                 &selected,
                 &parameters,
@@ -2200,7 +2198,7 @@ where
                 context,
             )
             .map_err(CompositePartitionPreparationError::Architecture)?;
-            let effective = args.model_type.clone();
+            let effective = args.identity.text_model_type().to_owned();
             prepare!(
                 architecture,
                 parameters,
@@ -2222,7 +2220,7 @@ where
                             realization,
                         )
                         .map(|_| ()),
-                        None => crate::muse_glimmer::PartitionLocalFoundation::from_partition(
+                        None => crate::muse::PartitionLocalFoundation::from_partition(
                             &args, partition,
                         )
                         .map(|_| ())
@@ -2887,16 +2885,16 @@ where
     Ok(Some((Box::new(architecture), layout)))
 }
 
-fn muse_glimmer_transform_source<B, S>(
-    source: &crate::muse_glimmer::DecoderConfig,
+fn muse_transform_source<B, S>(
+    source: &crate::muse::DecoderConfig,
     selected: &SelectedPartitionedAdmission<
         SelectedCompositeTextRealization,
         CompositeTextRequirements,
     >,
     target_parameters: &eredu_runtime::ArchitectureParameterDescription,
-    target_geometry: &crate::muse_glimmer::PartitionLocalGeometry,
+    target_geometry: &crate::muse::PartitionLocalGeometry,
     context: &<B::Tensor as Tensor>::Context,
-) -> Result<Option<(Box<crate::muse_glimmer::LayeredModel<B>>, LocalModelLayout)>, String>
+) -> Result<Option<(Box<crate::muse::LayeredModel<B>>, LocalModelLayout)>, String>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
@@ -2907,14 +2905,14 @@ where
     if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
         return Ok(None);
     }
-    let source_args = crate::muse_glimmer::with_checkpoint_formats(
+    let source_args = crate::muse::with_checkpoint_formats(
         source,
         crate::replicated_text::requirement_formats(
             selected.requirements().execution().execution(),
         ),
     )?;
     let source = &source_args;
-    let description = crate::muse_glimmer::LayeredModel::<B>::new(source.clone(), context)
+    let description = crate::muse::LayeredModel::<B>::new(source.clone(), context)
         .map_err(|error| error.to_string())?;
     let parameters = description
         .parameter_description(context)
@@ -2931,7 +2929,7 @@ where
         rank,
     )?;
     let local =
-        crate::muse_glimmer::local_geometry(source, &layout).map_err(|error| error.to_string())?;
+        crate::muse::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {
         selected
             .requirements()
@@ -2941,18 +2939,19 @@ where
     };
     let ownership = selected.requirements().ownership();
     let geometry = if source.is_moe() {
-        crate::muse_glimmer::parallel::routed_partition_local_geometry(
+        crate::muse::parallel::routed_partition_local_geometry(
             source,
             &layout,
             ranges(),
             ownership,
         )
     } else {
-        crate::muse_glimmer::partition_local_geometry(source, &layout, ranges(), ownership)
+        crate::muse::partition_local_geometry(source, &layout, ranges(), ownership)
     }
     .map_err(|error| error.to_string())?;
     if geometry.text_units() != target_geometry.text_units()
         || geometry.vision_units() != target_geometry.vision_units()
+        || geometry.audio_units() != target_geometry.audio_units()
         || geometry.complete_state_layout() != target_geometry.complete_state_layout()
         || geometry.static_roles() != target_geometry.static_roles()
         || geometry.embedding_range() != target_geometry.embedding_range()
@@ -2961,13 +2960,14 @@ where
         return Err("Muse-Glimmer transform source changed partition state or ownership".into());
     }
     let mut architecture =
-        crate::muse_glimmer::LayeredModel::<B>::new_parallel(source.clone(), local, context)
+        crate::muse::LayeredModel::<B>::new_parallel(source.clone(), local, context)
             .and_then(|architecture| {
-                architecture.with_partition_state_offset(geometry.text_units().start)
+                architecture.with_partition_state(selected.requirements().state().cloned()
+                    .ok_or_else(|| eredu_nn::Error::backend("Muse selected partition has no state ownership"))?)
             })
             .map_err(|error| error.to_string())?;
     if source.is_moe() {
-        let realization = crate::muse_glimmer::expert_realization_plan(&architecture, rank)
+        let realization = crate::muse::expert_realization_plan(&architecture, rank)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Muse-Glimmer transform source has no expert realization".to_owned())?;
         routed_muse_partition_foundation(source, &layout, ranges(), ownership, rank, &realization)?;
@@ -2990,7 +2990,7 @@ where
         return Err("Muse-Glimmer transform source changed selected state".into());
     }
     if !source.is_moe() {
-        crate::muse_glimmer::PartitionLocalFoundation::from_partition(source, &partition)
+        crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
     }
     Ok(Some((Box::new(architecture), layout)))

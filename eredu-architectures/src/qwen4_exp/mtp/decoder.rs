@@ -86,6 +86,7 @@ impl PredictionSpec {
         let geometry = ResidualStreamGeometry::new(config.residual.streams, config.hidden_size)?;
         let norm = |name: &str, dimensions| -> Result<_, Error> {
             Ok(NormalizationConstructionSpec {
+                reduction: eredu_nn::NormalizationReduction::Native,
                 dimensions,
                 groups: None,
                 epsilon: config.norm_epsilon,

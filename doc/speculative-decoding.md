@@ -48,9 +48,9 @@ embedded prediction heads.
 ## Assistants
 
 An external assistant is loaded separately and validated against the target's
-tokenizer, vocabulary, and model-specific interface. Gemma 4 assistant and
-Muse-Glimmer DFlash artifacts are supported through this path. Prepared Gemma 4
-and Muse-Glimmer targets report a `Declared` separate-checkpoint capability so
+tokenizer, vocabulary, and model-specific interface. Gemma 4 assistant,
+Muse-Glimmer DFlash, and the published Spark DSpark/DFlash2 artifacts use this path.
+Prepared Gemma 4 and Muse targets report a `Declared` separate-checkpoint capability so
 automatic execution-plan realization can prove compatibility and construct the
 matching assistant. `Ready` is reserved for a speculative realization that is
 executable without further pairing.
@@ -60,9 +60,22 @@ executor retained by the session. The ordinary target projection deliberately
 has prediction depth zero, so its target-only configuration is not used as a
 proxy for installed execution capability.
 
-External assistants currently pair only with replicated target topology. An
-external plan requesting a partitioned target is rejected before assistant
-weights or draft queues are materialized.
+Muse assistants pair with retained tensor, pipeline and expert target placements
+when the target's selected invocation contracts admit capture, verification and
+static operations. Source placement and exact communication bounds are checked
+before assistant payload acquisition. Pure TP DSpark can shard its body while
+replicating its scoring heads; DFlash2 and other selected placements use complete
+per-participant replicas with explicit memory accounting. Target families without
+these coordinated invocation contracts retain replicated-only external pairing.
+
+Spark assistants borrow the admitted target tokenizer. DFlash2's published `qwen3`
+configuration identifies an assistant and is not an ordinary Qwen target. The
+trained DSpark/DFlash2 blocks have seven/eight positions respectively; proposal
+requests can select fewer tokens while the shared driver preserves the complete
+trained invocation and mask identity. Both assistants use ordinary and controlled
+sessions, including multimodal context, bounded parameter policies, snapshots,
+restore, fork and transactional rejection. See [Spark validation scope](model-support.md#muse-spark-evidence-and-support-status)
+for released target/assistant results and native coverage limits.
 
 Embedded MTP is available for registered checkpoints with executable prediction
 weights, including supported DeepSeek, Inkling, Nemotron-H, Qwen3-Next, and

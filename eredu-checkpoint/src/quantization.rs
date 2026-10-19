@@ -127,6 +127,9 @@ impl BoundedQuantizationPlan {
         quantization
             .validate()
             .map_err(|e| quantization_error(e.to_string()))?;
+        if quantization == WeightQuantization::NvFp4 {
+            return Err(quantization_error("NVFP4 load-time encoding is unavailable; retained NVFP4 sources use direct materialization"));
+        }
         if quantization.gguf_iquant().is_some() {
             return Err(quantization_error(
                 "checkpoint-native GGUF IQ encodings cannot be produced by load-time quantization",
@@ -411,6 +414,19 @@ impl PreparedQuantizedSource {
 }
 
 impl CheckpointSource for PreparedQuantizedSource {
+    fn has_direct_encoded_leases(&self) -> bool {
+        self.source.has_direct_encoded_leases()
+            && self.ready.get().is_some_and(|ready| ready.has_direct_encoded_leases())
+    }
+
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        // Publication retains both the original and the prepared source.
+        // Before publication the native materializer chooses the output owner.
+        self.source.retained_payload_bytes_upper_bound()?.checked_add(
+            self.ready.get()?.retained_payload_bytes_upper_bound()?,
+        )
+    }
+
     fn preparation_working_set_bytes(&self) -> u64 {
         self.plan.max_working_set_bytes
     }

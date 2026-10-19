@@ -53,7 +53,7 @@ pub enum CheckpointMetadata {
 #[derive(Debug, Clone)]
 pub struct GgufCompanionMetadata {
     /// Architecture-declared semantic role.
-    pub role: GgufCompanionRole,
+    pub role: ArtifactCompanionRole,
     /// Complete companion shard set, starting with shard zero.
     pub headers: Vec<CheckpointHeader>,
 }

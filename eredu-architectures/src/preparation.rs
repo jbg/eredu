@@ -197,6 +197,11 @@ pub const fn gguf_composite_artifact_plan(
             }),
             Optional,
         ),
+        GgufArchitecture::MuseSpark => (
+            InputModalities::TEXT,
+            Some(InputModalities { text: true, image: true, audio: true, video: true }),
+            Optional,
+        ),
         GgufArchitecture::MuseGlimmer => (
             InputModalities::TEXT,
             Some(InputModalities {
@@ -383,7 +388,7 @@ pub fn prepared_safetensors_floating_state_dtype_source(
             } else { "model.embed_tokens.weight".into() }
         },
         SafetensorsModelConfig::DiffusionGemma(_) => "model.decoder.embed_tokens.weight".into(),
-        SafetensorsModelConfig::Gemma4(_) | SafetensorsModelConfig::MuseGlimmer(_) => {
+        SafetensorsModelConfig::Gemma4(_) | SafetensorsModelConfig::Muse(_) => {
             "model.language_model.embed_tokens.weight".into()
         }
         SafetensorsModelConfig::GptOss(args) => {
@@ -442,7 +447,7 @@ pub fn prepared_gguf_floating_state_dtype_source(
         | GgufModelConfig::Gemma2(_)
         | GgufModelConfig::Llama(_)
         | GgufModelConfig::Nanbeige(_)
-        | GgufModelConfig::MuseGlimmer(_)
+        | GgufModelConfig::Muse(_)
         | GgufModelConfig::NemotronH(_)
         | GgufModelConfig::Qwen(_)
         | GgufModelConfig::QwenHybrid(_)
@@ -560,7 +565,7 @@ pub fn prepared_safetensors_capabilities(
                 InputModalities::TEXT,
                 0,
             ),
-            SafetensorsModelConfig::MuseGlimmer(args) => {
+            SafetensorsModelConfig::Muse(args) => {
                 let routed = args.is_moe();
                 (
                     routed_parallel(routed),
@@ -570,7 +575,7 @@ pub fn prepared_safetensors_capabilities(
                         image: true,
                         audio: false,
                         video: args.weight_convention
-                            == crate::muse_glimmer::WeightConvention::HuggingFace,
+                            == crate::muse::WeightConvention::HuggingFace,
                     },
                     0,
                 )
@@ -684,7 +689,7 @@ pub fn prepared_gguf_capabilities(
         GgufModelConfig::NemotronLabsDiffusion(_) => false,
         GgufModelConfig::DiffusionGemma(family) => family.text.num_experts.is_some(),
         GgufModelConfig::Gemma4(family) => family.text.num_experts.is_some(),
-        GgufModelConfig::MuseGlimmer(args) => args.is_moe(),
+        GgufModelConfig::Muse(args) => args.is_moe(),
         GgufModelConfig::DeepSeekV3(args) => args.has_sparse_moe_layers(),
         GgufModelConfig::DeepSeekV4(_) | GgufModelConfig::GptOss(_) => true,
         GgufModelConfig::Inkling(args) => args.text_config.has_sparse_moe_layers(),

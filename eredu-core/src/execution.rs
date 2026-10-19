@@ -1,5 +1,8 @@
 //! Portable execution-plan and telemetry schemas.
 
+mod media_sources;
+pub use media_sources::MediaCompanionSources;
+
 use crate::{
     backend::{DeviceCapabilities, SessionCapabilities},
     residency::CacheEvictionPolicy,
@@ -104,11 +107,12 @@ impl DevicePlan {
 }
 
 /// Static weight placement selected by an execution plan.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResidencyPlan {
     /// Retain all selected weights on the execution device.
+    #[default]
     FullyResident,
     /// Retain repeated groups on the host and promote a bounded device window.
     LayerwiseHost {
@@ -208,6 +212,9 @@ pub enum DraftingPlan {
     },
     /// Use an explicitly supplied external assistant.
     External {
+        /// Independent assistant parameter placement and budgets.
+        #[serde(default)]
+        residency: ResidencyPlan,
         /// Assistant artifact path or identifier.
         model: String,
         /// Backend/device placement used for assistant execution.
@@ -313,12 +320,19 @@ pub struct DraftAdapterSource {
 impl DraftAdapterSource {
     /// Selects an adapter directory and the independently expected base repository.
     pub fn new(path: impl Into<std::path::PathBuf>, expected_base: impl Into<String>) -> Self {
-        Self { path: path.into(), expected_base: expected_base.into() }
+        Self {
+            path: path.into(),
+            expected_base: expected_base.into(),
+        }
     }
     /// Directory containing adapter configuration and SafeTensors parameters.
-    pub fn path(&self) -> &std::path::Path { &self.path }
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     /// Expected base identity checked against the adapter declaration.
-    pub fn expected_base(&self) -> &str { &self.expected_base }
+    pub fn expected_base(&self) -> &str {
+        &self.expected_base
+    }
 }
 
 /// A concrete, backend-neutral set of model/session execution choices.
@@ -351,6 +365,9 @@ pub struct ExecutionPlan {
     /// Optional separately admitted shared-backbone draft parameters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) draft_adapter: Option<DraftAdapterSource>,
+    /// Explicit independent input-tower sources.
+    #[serde(default, skip_serializing_if = "MediaCompanionSources::is_empty")]
+    pub(crate) media_companions: MediaCompanionSources,
     /// Capabilities which the selected device must provide.
     pub(crate) required_device_capabilities: DeviceCapabilities,
     /// Capabilities which the exact prepared session must provide.
@@ -379,6 +396,7 @@ impl ExecutionPlan {
             drafting: DraftingPlan::Disabled,
             prediction_source: None,
             draft_adapter: None,
+            media_companions: MediaCompanionSources::default(),
             required_device_capabilities: DeviceCapabilities::new(true, false, false),
             required_session_capabilities: SessionCapabilities::default(),
             prompt_cache_persistence: false,
@@ -481,7 +499,19 @@ impl ExecutionPlan {
         self
     }
     /// Separately stored shared-backbone draft parameters.
-    pub fn draft_adapter(&self) -> Option<&DraftAdapterSource> { self.draft_adapter.as_ref() }
+    pub fn draft_adapter(&self) -> Option<&DraftAdapterSource> {
+        self.draft_adapter.as_ref()
+    }
+
+    /// Selects independently admitted vision and audio source directories.
+    pub fn with_media_companions(mut self, sources: MediaCompanionSources) -> Self {
+        self.media_companions = sources;
+        self
+    }
+    /// Explicit media sources retained by this execution plan.
+    pub fn media_companions(&self) -> &MediaCompanionSources {
+        &self.media_companions
+    }
 
     /// Required device capabilities.
     pub const fn required_device_capabilities(&self) -> &DeviceCapabilities {
@@ -697,7 +727,12 @@ mod tests {
 
     #[test]
     fn plan_round_trips_with_extensible_backend_identity() {
-        let plan = ExecutionPlan::fully_resident(DevicePlan::new("iree", "vulkan:2").unwrap());
+        let plan = ExecutionPlan::fully_resident(DevicePlan::new("iree", "vulkan:2").unwrap())
+            .with_media_companions(
+                MediaCompanionSources::default()
+                    .with_vision("sources/vision")
+                    .with_audio("sources/audio"),
+            );
         let encoded = serde_json::to_vec(&plan).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&encoded).unwrap()["schema_version"],
@@ -754,6 +789,7 @@ mod tests {
         );
 
         plan.drafting = DraftingPlan::External {
+            residency: crate::ResidencyPlan::FullyResident,
             model: "  ".into(),
             placement: DraftPlacementPlan::Target,
             max_draft_tokens: 1,

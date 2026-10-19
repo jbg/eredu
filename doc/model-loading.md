@@ -159,6 +159,35 @@ be split to stay within the configured prefill-bank target and scratch bound.
 Decode remains one routed bank. Exact routing never substitutes a different
 expert when the requested one is unavailable.
 
+## Independent media sources
+
+An artifact's admitted tower and processor coverage determines its usable input
+modalities. A text-only Spark conversion remains usable for text; an image, audio
+or video request without the corresponding components produces a typed
+`MissingCompanion` error during preparation. Cold inspection describes the
+missing optional source without rejecting text loading.
+
+Select independent vision and audio sources in the ordinary load options:
+
+```rust,no_run
+use eredu::api::{LocalLoadOptions, MediaCompanionSources};
+
+let companions = MediaCompanionSources::default()
+    .with_vision("/path/to/spark-bf16-vision")
+    .with_audio("/path/to/spark-bf16-audio");
+let options = LocalLoadOptions::default().with_media_companions(companions);
+```
+
+The same source selection is available through `ExecutionPlan::with_media_companions`.
+Vision and audio can share one directory or select different directories. Muse
+validates the selected BF16 tower schemas, decoder geometry, token identities,
+processor policy and provenance before acquiring payloads. Indexed source
+directories require the complete members containing the selected media tensors;
+their unrelated decoder members need not be present. Prepared construction keeps
+these exact sources and restricted component views through materialization.
+The text CLI exposes the same selection through `--vision-companion DIRECTORY`
+and `--audio-companion DIRECTORY`, including planning and exact-plan replay.
+
 ## Load-time quantization
 
 Eredu can convert eligible dense F32/F16/BF16 weights to an affine or MXFP4

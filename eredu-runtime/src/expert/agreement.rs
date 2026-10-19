@@ -74,6 +74,30 @@ where
     fn routing_failed(&mut self, bank: RoutedBankId, message: &str) {
         self.provider.routing_failed(bank, message);
     }
+    fn forward_compact_grouped_uncombined(
+        &mut self,
+        bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let local = self
+            .provider
+            .forward_compact_grouped_uncombined(bank, request, context);
+        finish(local, &mut self.agree)
+    }
+
+    fn forward_grouped_uncombined(
+        &mut self,
+        bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let local = self
+            .provider
+            .forward_grouped_uncombined(bank, request, context);
+        finish(local, &mut self.agree)
+    }
+
     fn forward_grouped(
         &mut self,
         bank: &mut B::GatedProductGroups,
@@ -119,6 +143,32 @@ where
     P: TensorParallelParameterProvider<B>,
     F: FnMut(bool) -> Result<bool, Error>,
 {
+    fn forward_compact_grouped_uncombined_tensor_parallel(
+        &mut self,
+        bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Error> {
+        let local = self
+            .provider
+            .forward_compact_grouped_uncombined_tensor_parallel(bank, request, partitions, context);
+        finish(local, &mut self.agree)
+    }
+
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Error> {
+        let local = self
+            .provider
+            .forward_grouped_uncombined_tensor_parallel(bank, request, partitions, context);
+        finish(local, &mut self.agree)
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         bank: &mut B::GatedProductGroups,

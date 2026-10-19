@@ -4250,8 +4250,52 @@ impl<U> std::ops::DerefMut for ResidentUnitLease<U> {
 }
 
 /// Minimal one-at-a-time unit window useful for conformance and resident storage.
+/// Parameter traversal and cloning require all exclusive loans to have returned.
+#[derive(Debug)]
 pub struct ResidentUnitWindow<U> {
     units: Vec<Option<U>>,
+}
+
+impl<U: Clone> Clone for ResidentUnitWindow<U> {
+    fn clone(&self) -> Self {
+        assert!(
+            self.units.iter().all(Option::is_some),
+            "resident window cloning requires returned loans"
+        );
+        Self {
+            units: self.units.clone(),
+        }
+    }
+}
+
+impl<T: 'static, U: Parameterized<T>> Parameterized<T> for ResidentUnitWindow<U> {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: eredu_nn::ParameterVisitor<'a, T>,
+    {
+        for unit in &self.units {
+            unit.as_ref()
+                .expect("resident parameter traversal requires returned loans")
+                .visit_parameters(visitor);
+        }
+    }
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: eredu_nn::ParameterVisitorMut<'a, T>,
+    {
+        for unit in &mut self.units {
+            unit.as_mut()
+                .expect("resident parameter traversal requires returned loans")
+                .visit_parameters_mut(visitor);
+        }
+    }
+    fn set_trainable(&mut self, trainable: bool) {
+        for unit in &mut self.units {
+            unit.as_mut()
+                .expect("resident parameter traversal requires returned loans")
+                .set_trainable(trainable);
+        }
+    }
 }
 
 impl<U> ResidentUnitWindow<U> {
@@ -4260,6 +4304,15 @@ impl<U> ResidentUnitWindow<U> {
         Self {
             units: units.into_iter().map(Some).collect(),
         }
+    }
+
+    /// Recovers the original units after all exclusive loans have returned.
+    pub fn into_units(self) -> Result<Vec<U>, ResidentUnitWindowError> {
+        self.units
+            .into_iter()
+            .enumerate()
+            .map(|(index, unit)| unit.ok_or(ResidentUnitWindowError::AlreadyAcquired { index }))
+            .collect()
     }
 }
 

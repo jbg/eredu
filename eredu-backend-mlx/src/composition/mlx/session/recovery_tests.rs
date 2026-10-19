@@ -412,12 +412,21 @@ fn restored_execution_error_excludes_reuse_until_native_retirement() {
     assert!(error.model_state_preserved());
 
     let entered = Cell::new(false);
+    let preparation_calls = Cell::new(0);
     let pending = session
-        .with_model_operation(|_| {
-            entered.set(true);
-            Ok(())
-        })
+        .with_prepared_model_operation(
+            |local| {
+                preparation_calls.set(preparation_calls.get() + 1);
+                assert!(local.is_err(), "busy acquisition still enters readiness");
+                local
+            },
+            |_, ()| {
+                entered.set(true);
+                Ok(())
+            },
+        )
         .unwrap_err();
+    assert_eq!(preparation_calls.get(), 1);
     assert!(
         !entered.get(),
         "pending recovery must exclude model mutation"
@@ -437,6 +446,25 @@ fn restored_execution_error_excludes_reuse_until_native_retirement() {
 
     native.set(status(true, false, false));
     recovery::wait_for_retirement(|| session.ensure_no_submission_in_flight().is_ok());
+    let rejected = session
+        .with_prepared_model_operation(
+            |local| {
+                local?;
+                Err::<(), _>(super::Error::Speculative(
+                    "peer rejected target ownership".into(),
+                ))
+            },
+            |_, ()| {
+                entered.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert!(rejected
+        .to_string()
+        .contains("peer rejected target ownership"));
+    assert!(!entered.get(), "rejected ownership never enters model work");
+    session.ensure_no_submission_in_flight().unwrap();
     super::MlxBackend::synchronize_session(&backend, &session).unwrap();
     super::MlxBackend::reset_session(&backend, &mut session).unwrap();
     session

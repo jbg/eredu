@@ -204,6 +204,7 @@ where
                 )));
             }
             match companion.role() {
+                LinearCompanionRole::GlobalScale => return Err(Error::Quantization("load-time NVFP4 encoding is unavailable".into())),
                 LinearCompanionRole::Scale => scales = Some(companion.name().to_owned()),
                 LinearCompanionRole::AffineBias => biases = Some(companion.name().to_owned()),
             }
@@ -487,6 +488,7 @@ where
                 WeightQuantization::Affine(_) => {
                     target.with_affine_companion_dtype(companions.affine_companion_dtype)
                 }
+                WeightQuantization::NvFp4 => Err(eredu_checkpoint::store::StoreError::InvalidSelection { key: target.weight_name().to_owned(), message: "load-time NVFP4 encoding is unavailable".into() }),
                 WeightQuantization::MxFp4 => Ok(target),
                 WeightQuantization::GgufIQuant { .. } => unreachable!(
                     "load-time materialization rejects checkpoint-native GGUF encodings"
@@ -601,6 +603,7 @@ where
                 WeightQuantization::Affine(_) => {
                     target.with_affine_companion_dtype(companions.affine_companion_dtype)
                 }
+                WeightQuantization::NvFp4 => Err(eredu_checkpoint::store::StoreError::InvalidSelection { key: target.weight_name().to_owned(), message: "load-time NVFP4 encoding is unavailable".into() }),
                 WeightQuantization::MxFp4 => Ok(target),
                 WeightQuantization::GgufIQuant { .. } => unreachable!(
                     "load-time materialization rejects checkpoint-native GGUF encodings"
@@ -711,6 +714,7 @@ where
                 WeightQuantization::Affine(_) => {
                     target.with_affine_companion_dtype(companions.affine_companion_dtype)
                 }
+                WeightQuantization::NvFp4 => Err(eredu_checkpoint::store::StoreError::InvalidSelection { key: target.weight_name().to_owned(), message: "load-time NVFP4 encoding is unavailable".into() }),
                 WeightQuantization::MxFp4 => Ok(target),
                 WeightQuantization::GgufIQuant { .. } => unreachable!(
                     "load-time materialization rejects checkpoint-native GGUF encodings"
@@ -836,6 +840,7 @@ where
                 WeightQuantization::Affine(_) => {
                     target.with_affine_companion_dtype(companions.affine_companion_dtype)
                 }
+                WeightQuantization::NvFp4 => Err(eredu_checkpoint::store::StoreError::InvalidSelection { key: target.weight_name().to_owned(), message: "load-time NVFP4 encoding is unavailable".into() }),
                 WeightQuantization::MxFp4 => Ok(target),
                 WeightQuantization::GgufIQuant { .. } => unreachable!(
                     "load-time materialization rejects checkpoint-native GGUF encodings"

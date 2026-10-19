@@ -155,6 +155,50 @@ impl<T: Tensor> eredu_nn::ProjectionInputObserver<T> for ComponentProjectionObse
     }
 }
 impl<T: Tensor> ComponentInstrumentation<'_, T> {
+    /// Selects once through the shared control/evidence policy before dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_groups<B, P>(
+        &mut self,
+        boundary: &str,
+        selector: &mut B::Selector,
+        input: &T,
+        provider: &mut P,
+        bank: eredu_runtime::RoutedBankId,
+        context: &T::Context,
+    ) -> Result<eredu_nn::GroupSelection<T>, Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend<Tensor = T>,
+        P: eredu_runtime::ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        match self.observer.as_deref_mut() {
+            Some(observer) => eredu_runtime::select_routes_with_observer(
+                selector, input, context, &format!("{}.{}", self.unit_path, boundary), observer,
+            ),
+            None => eredu_runtime::select_routes_with_provider::<B, P>(selector, input, context, provider, bank),
+        }
+    }
+
+    /// Emits one completed routing record after architecture-owned transforms,
+    /// then applies the shared intervention on that complete routed contribution.
+    pub(crate) fn routing_output(
+        &mut self,
+        boundary: &str,
+        routes: &eredu_nn::GroupSelection<T>,
+        output: T,
+        expert_count: i32,
+    ) -> Result<T, Error> {
+        let Some(observer) = self.observer.as_deref_mut() else { return Ok(output); };
+        let path = format!("{}.{}", self.unit_path, boundary);
+        observer.observe_routing(eredu_runtime::RoutingObservation {
+            path: &path, selected_experts: routes.group_indices(), selected_scores: routes.selected_scores(),
+            coefficients: routes.coefficients(), routed_output: &output,
+            local_routed_output: None, reduced_routed_output: None, shared_output: None,
+            combined_output: None, expert_count,
+        })?;
+        eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &output)
+    }
+
     /// Attaches unit evidence to the exact expert request consumed by a provider.
     /// The disabled path preserves the request without constructing a scope path.
     pub(crate) fn routed<'data, P, R>(
@@ -2505,6 +2549,7 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
         let norm = |name: String| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     groups: config.normalization_groups(),
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
@@ -3833,6 +3878,7 @@ impl StaticModuleSpec {
         let weight =
             ParameterSpec::trainable(&self.normalization_weight).map_err(Error::backend)?;
         let normalization = NormalizationConstructionSpec {
+            reduction: eredu_nn::NormalizationReduction::Native,
             groups: self.normalization_groups,
             dimensions: self.hidden_size,
             epsilon: self.normalization_epsilon,
@@ -3875,6 +3921,7 @@ impl StaticModuleSpec {
             return Err(Error::backend("static module dimensions must be positive"));
         }
         Ok(eredu_runtime::execution_topology::ProjectionTopology {
+            arithmetic: eredu_nn::LinearArithmetic::Native,
             input: self.hidden_size as u64,
             output: self.vocabulary as u64,
             format: if self.tied_head {
@@ -4772,6 +4819,7 @@ where
         .then(|| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     groups: config.normalization_groups(),
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),

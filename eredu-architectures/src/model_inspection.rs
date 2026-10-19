@@ -239,7 +239,11 @@ where
         Ok(preparation) => {
             let inspection = preparation.retained_architecture().map_or_else(
                 || inspection.clone(),
-                |architecture| inspection.clone().map_architecture_plan(|_| architecture.clone()),
+                |architecture| {
+                    inspection
+                        .clone()
+                        .map_architecture_plan(|_| architecture.clone())
+                },
             );
             let descriptor = inspection.architecture_plan().architecture_descriptor();
             let mut report = eredu_core::assemble_portable_model_inspection(
@@ -259,7 +263,10 @@ where
                         None => eredu_core::InputModalities::TEXT,
                     }
                 } else {
-                    capabilities.input_modalities()
+                    inspection
+                        .architecture_plan()
+                        .muse_input_modalities()
+                        .unwrap_or_else(|| capabilities.input_modalities())
                 },
                 capabilities.embedded_draft_layers(),
                 safetensors_processor(&inspection, media),
@@ -276,6 +283,7 @@ where
                 mechanisms,
             );
             record_gguf_media(&mut report, &inspection, media);
+            record_media_companions(&mut report, &inspection);
             record_discovery(&mut report, descriptor, Some(&preparation), mechanisms);
             let memory_materialization_workspace =
                 if let Some(rank) = report.resources.selected_rank.value() {
@@ -377,7 +385,15 @@ fn record_rank_resources(
 ) {
     use crate::configuration::{GgufModelConfig, SafetensorsModelConfig};
     let plan = inspection.architecture_plan();
-    if !matches!(plan.model_kind(), crate::ModelKind::K2Horizon | crate::ModelKind::NemotronLabsDiffusion) { return; }
+    if !matches!(
+        plan.model_kind(),
+        crate::ModelKind::K2Horizon
+            | crate::ModelKind::NemotronLabsDiffusion
+            | crate::ModelKind::MuseGlimmer
+            | crate::ModelKind::MuseSpark
+    ) {
+        return;
+    }
     let project = || -> Result<eredu_core::SelectedRankResourceProfile, String> {
         let nemotron = plan.gguf_media_projector().and_then(|projector| match projector.model() {
             crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => Some(config),
@@ -389,7 +405,25 @@ fn record_rank_resources(
             (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => Some(plan.text_config()),
             _ => None,
         });
-        let (parameters, layers, kv_width) = if let Some(config) = nemotron {
+        let muse = match crate::replicated_text::composite_config(plan)
+            .map_err(|error| error.to_string())?
+        {
+            Some(crate::replicated_text::CompositeConfig::Muse(config)) => Some(config),
+            _ => None,
+        };
+        let (parameters, layers, kv_width) = if let Some(config) = muse {
+            let config = crate::muse::with_checkpoint_formats(
+                config,
+                crate::replicated_text::selected_formats(selected.text_realization()),
+            )?;
+            let parameters = crate::muse::model::parameter_description(&config)
+                .map_err(|error| error.to_string())?;
+            (
+                parameters,
+                config.num_hidden_layers as usize,
+                (config.num_key_value_heads * config.head_dim) as usize,
+            )
+        } else if let Some(config) = nemotron {
             use crate::decoder::Config;
             let config = config.with_checkpoint_formats(crate::replicated_text::selected_formats(selected.text_realization())).map_err(|e| e.to_string())?;
             let parameters = if config.vision.is_some() {
@@ -545,6 +579,7 @@ fn record_media(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     media: MediaFeatureAvailability,
 ) {
+    record_media_companions(report, inspection);
     match inspection.format() {
         ArtifactFormat::SafeTensors => eredu_core::record_processor_inspection(
             report,
@@ -553,6 +588,20 @@ fn record_media(
         ),
         ArtifactFormat::Gguf => record_gguf_media(report, inspection, media),
         _ => {}
+    }
+}
+
+fn record_media_companions(
+    report: &mut ModelInspectionReport,
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+) {
+    for missing in inspection.architecture_plan().missing_media_companions() {
+        report.issue(
+            InspectionIssueCode::MissingMediaCompanion,
+            InspectionSeverity::Info,
+            missing.to_string(),
+            None,
+        );
     }
 }
 
@@ -573,9 +622,22 @@ fn record_gguf_media(
         GgufMediaProjectorRequirement::Optional => MediaProjectorRequirement::Optional,
         GgufMediaProjectorRequirement::Required => MediaProjectorRequirement::Required,
     };
+    // Explicit component sources can satisfy media without a sibling GGUF.
+    // Their retained configuration/processor is the authority for coverage.
+    if !inspection.architecture_plan().media_companions().is_empty() {
+        if let Some(modalities) = inspection.architecture_plan().muse_input_modalities() {
+            report.expected_modalities = eredu_core::inspection::artifact_modalities(modalities);
+            eredu_core::record_processor_inspection(
+                report,
+                inspection.architecture_plan().has_processor(),
+                media,
+            );
+            return;
+        }
+    }
     let projector = inspection
         .validated_gguf()
-        .and_then(|validated| validated.companion(&eredu_core::GgufCompanionRole::MediaProjector))
+        .and_then(|validated| validated.companion(&eredu_core::ArtifactCompanionRole::MediaProjector))
         .map(|companion| companion.path().to_owned());
     let composition = if eredu_core::record_media_projector_inspection(
         report,
@@ -587,8 +649,12 @@ fn record_gguf_media(
     } else {
         GgufArtifactComposition::ModelOnly
     };
-    report.expected_modalities =
-        eredu_core::inspection::artifact_modalities(plan.input_modalities(composition));
+    report.expected_modalities = eredu_core::inspection::artifact_modalities(
+        inspection
+            .architecture_plan()
+            .muse_input_modalities()
+            .unwrap_or_else(|| plan.input_modalities(composition)),
+    );
     if composition == GgufArtifactComposition::ValidatedMediaProjector {
         report.multimodal = eredu_core::media_feature_readiness(&report.expected_modalities, media);
     }
@@ -767,6 +833,7 @@ fn invalidate_architecture(report: &mut ModelInspectionReport, detail: String) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::preparation_selection::tests::{
         inspected_config, prediction_config, BoundedIndependentAdapter,

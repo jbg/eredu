@@ -43,25 +43,27 @@ impl MlxModel {
         self.floating_state_dtype_bytes
     }
 
-    pub(crate) fn with_capture_discovery(
+    pub(crate) fn with_target_discovery(
         mut self,
         discovery: eredu_architectures::prepared_sources::PreparedModelDiscovery,
     ) -> Result<Self, Error> {
-        self.capture_discovery = Some(
-            discovery
-                .bind_partition_parameters(
-                    self.executable
-                        .erased()
-                        .partition_parameter_description()
-                        .cloned(),
+        let discovery = discovery
+            .bind_partition_parameters(
+                self.executable
+                    .erased()
+                    .partition_parameter_description()
+                    .cloned(),
+            )
+            .and_then(|discovery| {
+                discovery.bind_partition_observation_hooks(
+                    self.executable.erased().partition_observation_hooks(),
                 )
-                .and_then(|discovery| {
-                    discovery.bind_partition_observation_hooks(
-                        self.executable.erased().partition_observation_hooks(),
-                    )
-                })
-                .map_err(|error| Error::Other(Box::new(error)))?,
-        );
+            })
+            .map_err(|error| Error::Other(Box::new(error)))?;
+        if let Some(target) = self.executable.erased_mut().external_prediction_mut() {
+            target.bind_target_discovery(std::sync::Arc::new(discovery.clone()));
+        }
+        self.capture_discovery = Some(discovery);
         Ok(self)
     }
 

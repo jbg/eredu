@@ -61,7 +61,7 @@ pub use eredu_core::decoding::{
     DecodingCapabilities, DecodingMode, DecodingModeError, DecodingState,
     ModeChangeAcknowledgement, SpeculationOptions, SpeculationOptionsRequest,
 };
-pub use eredu_core::DraftAdapterSource;
+pub use eredu_core::{DraftAdapterSource, MediaCompanionSources};
 pub use eredu_core::{GenerationTiming, PrefillChunkPolicy, TextSamplingStrategy};
 pub use eredu_runtime::execution_control::{SamplingOverride, SamplingStateFacts};
 pub use inspection::{

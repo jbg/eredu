@@ -55,6 +55,9 @@ impl eredu_nn::Tensor for ReferenceTensor {
     fn unloaded_i32(shape: &[i32], _: &()) -> Result<Self, Error> {
         Ok(Self(shape.to_vec()))
     }
+    fn unloaded_i64(shape: &[i32], _: &()) -> Result<Self, Error> {
+        Ok(Self(shape.to_vec()))
+    }
     fn from_f32_slice(_: &[f32], shape: &[i32], _: &()) -> Result<Self, Error> {
         Ok(Self(shape.to_vec()))
     }
@@ -86,6 +89,12 @@ impl eredu_nn::Tensor for ReferenceTensor {
         Ok(self.clone())
     }
     fn square(&self, _: &()) -> Result<Self, Error> {
+        Ok(self.clone())
+    }
+    fn sqrt(&self, _: &()) -> Result<Self, Error> {
+        Ok(self.clone())
+    }
+    fn cast_float(&self, _: eredu_nn::TensorElementType, _: &()) -> Result<Self, Error> {
         Ok(self.clone())
     }
     fn tanh(&self, _: &()) -> Result<Self, Error> {
@@ -142,6 +151,14 @@ impl eredu_nn::Tensor for ReferenceTensor {
     fn take_axis(&self, _: &Self, _: i32, _: &()) -> Result<Self, Error> {
         Ok(self.clone())
     }
+    fn ranked_topk(&self, count: i32, _: &()) -> Result<(Self, Self), Error> {
+        let mut shape = self.0.clone();
+        if shape.last().is_none_or(|&width| count <= 0 || count > width) { return Err(Error::backend("invalid ranked selection")); }
+        *shape.last_mut().unwrap() = count;
+        Ok((Self(shape.clone()), Self(shape)))
+    }
+    fn scatter_last_axis(&self, _: &Self, _: &Self, _: &()) -> Result<Self, Error> { Ok(self.clone()) }
+
     fn rope_with_frequencies(
         &self,
         _: i32,
@@ -221,6 +238,7 @@ impl eredu_nn::Tensor for ReferenceTensor {
         _: Option<&Self>,
         _: Option<&Self>,
         _: f32,
+        _: eredu_nn::LayerNormalizationArithmetic,
         _: &(),
     ) -> Result<Self, Error> {
         Ok(input.clone())
@@ -454,8 +472,7 @@ impl EmbeddingOperator<ReferenceTensor> for ReferenceEmbedding {
 
 #[derive(Debug, Clone)]
 struct ReferenceNorm {
-    weight: ReferenceTensor,
-    metadata: ParameterMetadata,
+    parameter: Option<(ReferenceTensor, ParameterMetadata)>,
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceNorm {
@@ -463,16 +480,22 @@ impl Parameterized<ReferenceTensor> for ReferenceNorm {
     where
         V: ParameterVisitor<'a, ReferenceTensor>,
     {
-        visit_parameter(&self.metadata, &self.weight, visitor);
+        if let Some((weight, metadata)) = &self.parameter {
+            visit_parameter(metadata, weight, visitor);
+        }
     }
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, ReferenceTensor>,
     {
-        visit_parameter_mut(&self.metadata, &mut self.weight, visitor);
+        if let Some((weight, metadata)) = &mut self.parameter {
+            visit_parameter_mut(metadata, weight, visitor);
+        }
     }
     fn set_trainable(&mut self, trainable: bool) {
-        self.metadata.trainable = trainable;
+        if let Some((_, metadata)) = &mut self.parameter {
+            metadata.trainable = trainable;
+        }
     }
 }
 
@@ -661,7 +684,7 @@ impl NeuralBackend for ReferenceBackend {
         eredu_architectures::operator_requirements::KIMI_LINEAR
             .union(eredu_architectures::operator_requirements::INKLING)
             .union(eredu_architectures::operator_requirements::GEMMA4)
-            .union(eredu_architectures::operator_requirements::MUSE_GLIMMER)
+            .union(eredu_architectures::operator_requirements::MUSE)
             .union(eredu_architectures::operator_requirements::QWEN_VL)
             .union(eredu_architectures::operator_requirements::QWEN_HYBRID)
             .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL)
@@ -671,6 +694,10 @@ impl NeuralBackend for ReferenceBackend {
             .union(eredu_nn::NeuralOperatorCapabilities::POOLED_POSITION_SELECTION)
             .union(eredu_nn::NeuralOperatorCapabilities::POOLED_MASK_GATHER)
             .union(eredu_nn::NeuralOperatorCapabilities::GROUPED_LINEAR)
+            .union(eredu_nn::NeuralOperatorCapabilities::CASCADED_RMS)
+            .union(eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT)
+            .union(eredu_nn::NeuralOperatorCapabilities::SQRT)
+            .union(eredu_nn::NeuralOperatorCapabilities::UNLOADED_I64)
             .union(eredu_nn::NeuralOperatorCapabilities::ROPE_WITH_FREQUENCIES);
 
     type Tensor = ReferenceTensor;
@@ -710,16 +737,12 @@ impl NeuralBackend for ReferenceBackend {
         spec.validate()?;
         let weight = match spec.scale {
             NormalizationScale::Learned(weight)
-            | NormalizationScale::LearnedOffset { weight, .. } => weight,
-            NormalizationScale::Unit => {
-                return Err(Error::backend(
-                    "reference backend does not model parameterless normalization",
-                ));
-            }
+            | NormalizationScale::LearnedOffset { weight, .. } => Some(weight),
+            NormalizationScale::Unit => None,
         };
         Ok(ReferenceNorm {
-            weight: ReferenceTensor(vec![spec.dimensions]),
-            metadata: ParameterMetadata::from_spec(&weight, weight.trainable),
+            parameter: weight.map(|weight| (ReferenceTensor(vec![spec.dimensions]),
+                ParameterMetadata::from_spec(&weight, weight.trainable))),
         })
     }
     fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {

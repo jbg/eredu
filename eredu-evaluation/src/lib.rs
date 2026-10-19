@@ -4,6 +4,8 @@
 #![warn(missing_docs)]
 
 mod checkpoint;
+/// Pinned SafeTensors payload evidence for released-checkpoint comparisons.
+pub mod checkpoint_reference;
 /// Host reference arithmetic for signed component reconstruction.
 pub mod component_attribution;
 mod distribution;

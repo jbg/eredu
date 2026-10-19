@@ -1,8 +1,6 @@
 // Fixed four-level FP32 row reduction shared with the CPU normalization mechanism.
-template <typename Pointer>
+template <size_t lanes = 4, size_t parallel = 4, typename Pointer>
 inline float cascade_sum_f32(Pointer values, size_t size) {
-  constexpr size_t lanes = 4;
-  constexpr size_t parallel = 4;
   const size_t vectors = size / lanes;
   const size_t steps = vectors / parallel;
   size_t ceil_log = 0;

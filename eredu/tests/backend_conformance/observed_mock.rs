@@ -392,7 +392,7 @@ impl InterventionEstimator for Estimates {
 pub(super) fn intervention_discovery(session: &str) -> InterventionDiscovery {
     let capture = discovery();
     InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: capture.artifact_identity,
         session_identity: Some(session.into()),
         points: vec![InterventionPoint {
@@ -440,7 +440,7 @@ pub(super) fn plan() -> CapturePlan {
 
 pub(super) fn intervention_plan(factor: f32) -> InterventionPlan {
     InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations: vec![InterventionOperation {
             id: "scale-logits".into(),
             target: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),

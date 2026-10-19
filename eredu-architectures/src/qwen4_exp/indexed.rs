@@ -106,6 +106,7 @@ impl IndexedSublayerSpec {
         ];
         let norm = |suffix: &str, dimensions| -> Result<NormalizationConstructionSpec, Error> {
             Ok(NormalizationConstructionSpec {
+                reduction: eredu_nn::NormalizationReduction::Native,
                 dimensions,
                 groups: None,
                 epsilon: config.norm_epsilon,

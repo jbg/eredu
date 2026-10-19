@@ -68,6 +68,7 @@ impl SpeculativeForecastBackend<EmbeddedFixture> for MockBackend {
         _: &eredu_core::SpeculativeDraft<'_, EmbeddedFixture>,
     ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> {
         Ok(Some(SpeculativeMemoryProfile {
+            conditioned: None,
             refinement: None,
             shared_backbone: None,
             embedded: Some(topology()),

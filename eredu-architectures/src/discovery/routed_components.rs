@@ -224,6 +224,7 @@ fn finish(
         effective_activation: format!("{}.units.effective", site.routing),
         write_input: None,
         write_output: None,
+        expert_output_transform: None,
         output: None,
         input: site.input,
         reads,

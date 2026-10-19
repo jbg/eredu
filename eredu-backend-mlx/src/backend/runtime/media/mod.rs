@@ -293,6 +293,8 @@ pub fn prepared_identity_wire_arrays(
 #[cfg(any(feature = "image", feature = "audio"))]
 /// Failure while converting application input into backend-ready model input.
 pub enum ProcessorPreparationError<E> {
+    /// Portable architecture admission rejected the selected media sources.
+    Capability(eredu_core::CapabilityError),
     /// MLX media preparation failed.
     Backend(Error),
     #[cfg_attr(not(feature = "image"), allow(dead_code))]

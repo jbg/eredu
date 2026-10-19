@@ -33,7 +33,8 @@ impl RoutingMechanism for Mechanism<'_> {
     fn project(&mut self, input: &NumericTensor) -> Result<NumericTensor, Error> {
         self.router
             .linear
-            .forward(&self.router.transformed_input(input), self.context)
+            .forward(&self.router.transformed_input(input), self.context)?
+            .multiply_scalar(self.router.logit_scale, self.context)
     }
     fn transform(&self, raw: &NumericTensor) -> Result<NumericTensor, Error> {
         let experts = self.router.selection.group_count() as usize;
@@ -243,6 +244,7 @@ fn routing_controls_preserve_stage_weights_and_unselected_rows() {
     let context = NumericContext::default();
     let parameter = ParameterSpec::trainable("fixture.router").unwrap();
     let mut router = NumericRouter {
+        logit_scale: 1.0,
         linear: NumericLinear {
             weight: NumericTensor::new(vec![3, 1], vec![4f32.ln(), 2f32.ln(), 0.]),
             weight_metadata: ParameterMetadata::from_spec(&parameter, true),

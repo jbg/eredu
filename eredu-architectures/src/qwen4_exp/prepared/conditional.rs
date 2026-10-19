@@ -194,6 +194,8 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
     }
     text = text
         .with_replicated_static_roles(old.replicated_static_roles().to_vec())
+        .map_err(invalid)?
+        .with_nonparameter_sources(old.nonparameter_sources().clone())
         .map_err(invalid)?;
     let mut requirements =
         crate::routed_text::RoutedTextRequirements::new(text, target.banks().clone(), source)

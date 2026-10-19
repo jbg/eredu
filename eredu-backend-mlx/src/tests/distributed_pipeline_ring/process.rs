@@ -762,6 +762,11 @@ enum WorkerMode {
     AddressableParameterBankRequantize,
     Requantize,
     OpaqueSession,
+    OpaqueExternalTargetCapture,
+    ExecutionPlanTarget,
+    ExecutionPlanMediaTarget,
+
+
     OpaquePredictionSession,
     OpaqueSessionPredictionFree,
     OpaquePreparedSpeculativeCapability,
@@ -1226,6 +1231,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
                 write_inkling_dense_multimodal_fixture(checkpoint.path())
             }
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
+            FixtureFamily::MuseSpark => execution_plan_target::write_spark_fixture(checkpoint.path(), safetensors::tensor::Dtype::F32),
             FixtureFamily::MuseGlimmer => {
                 write_muse_glimmer_tensor_parallel_fixture(checkpoint.path())
             }
@@ -1314,7 +1320,7 @@ fn run_ring_pipeline_processes(
         .exists();
     for rank in 0..world_size {
         let mut command = Command::new(&executable);
-        if family == FixtureFamily::Qwen4Exp {
+        if matches!(family, FixtureFamily::Qwen4Exp | FixtureFamily::MuseSpark) {
             // Prepared generic visitors retain large debug-build stack frames.
             command.env("RUST_MIN_STACK", "33554432");
         }
@@ -1388,6 +1394,18 @@ fn run_ring_pipeline_processes(
             }
             WorkerMode::Requantize => {
                 command.env(REQUANTIZE, "1");
+            }
+
+
+            WorkerMode::ExecutionPlanTarget | WorkerMode::ExecutionPlanMediaTarget => {
+                command.env(execution_plan_target::WORKER_FLAG, "1");
+                if matches!(mode, WorkerMode::ExecutionPlanMediaTarget) {
+                    command.env(execution_plan_target::MEDIA_WORKER_FLAG, "1");
+                }
+            }
+            WorkerMode::OpaqueExternalTargetCapture => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env("EREDU_RING_EXTERNAL_TARGET_CAPTURE", "1");
             }
             WorkerMode::OpaqueSession | WorkerMode::OpaquePredictionSession => {
                 command.env(OPAQUE_SESSION, "1");

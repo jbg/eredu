@@ -161,6 +161,65 @@ fn describe_selected(
         result.storage.push(storage);
     }
     match *invocation {
+        Float32GroupProjection { rows, input, groups } => {
+            let aligned_host = cfg!(target_vendor = "apple") && rows == 1
+                && device == Some(safemlx::DeviceType::Cpu);
+            if aligned_host {
+                for (name, count) in [
+                    ("router_aligned_input", input),
+                    ("router_aligned_weight", input.checked_mul(groups)
+                        .ok_or_else(|| Error::backend("router parameter size overflow"))?),
+                ] {
+                    let lines = count.checked_add(15).and_then(|n| (n / 16).checked_mul(64))
+                        .ok_or_else(|| Error::backend("aligned router allocation size overflow"))?;
+                    let mut item = allocation(name, lines, MechanismStorageRole::Scratch,
+                        StorageRetention::Evaluation);
+                    item.placement = MechanismPlacement::Host;
+                    item.capacity = MechanismBytes::unknown(lines);
+                    item.detail = "owned 64-byte-aligned FP32 operand copy; allocator capacity is unknown".into();
+                    result.storage.push(item);
+                }
+                let mut item = allocation("router_host_logits", bytes(&[groups], 4)?,
+                    MechanismStorageRole::Scratch, StorageRetention::Evaluation);
+                item.placement = MechanismPlacement::Host;
+                item.capacity = MechanismBytes::unknown(bytes(&[groups], 4)?);
+                item.detail = "completed BLAS output before native array construction".into();
+                result.storage.push(item);
+                result.missing.push("aligned BLAS private workspace, contiguous operand backing and native output-copy overlap".into());
+            } else {
+                result.missing.push("native FP32 router GEMM workspace and operand/output backing".into());
+                if device.is_none() {
+                    result.missing.push("selected device kind determines aligned host versus native projection".into());
+                }
+            }
+        }
+        GroupIndexSelection { rows, groups, selected, element, order } => {
+            describe_group_indices(&mut result, rows, groups, selected, element, order, device)?;
+        }
+        RmsNormalization { batch, time, width, element, reduction, weight, weight_element } => {
+            if reduction == eredu_nn::NormalizationReduction::Cascaded || (reduction == eredu_nn::NormalizationReduction::ChannelMajor && time > 1 && width > 1) {
+                for (name, dimensions, scalar) in [
+                    ("rms_fp32_input", vec![batch, time, width], 4),
+                    ("rms_fp32_squares", vec![batch, time, width], 4),
+                    ("rms_fp32_output", vec![batch, time, width], 4),
+                    ("rms_host_input", vec![batch, time, width], element_bytes(element)),
+                    ("rms_host_output", vec![batch, time, width], 4),
+                    ("rms_fp32_scale", vec![if weight { width } else { 1 }], 4),
+                ] {
+                    let mut storage = allocation(name, bytes(&dimensions, scalar)?,
+                        MechanismStorageRole::Scratch, StorageRetention::Evaluation);
+                    storage.payload.lower = 0;
+                    storage.capacity = MechanismBytes::unknown(0);
+                    storage.detail = "bounded ordered RMS intermediate; selected CPU, Metal or host-copy fallback, cast aliasing and fusion determine backing".into();
+                    result.storage.push(storage);
+                }
+                if weight && weight_element.is_none() {
+                    result.missing.push("bound RMS scale representation".into());
+                }
+            } else {
+                result.missing.push("selected native RMS normalization workspace".into());
+            }
+        }
         LayerNormalization { .. } => {
             return super::layer_norm_memory::describe(invocation, device);
         }
@@ -180,10 +239,39 @@ fn describe_selected(
             weight_element,
             bias,
             bias_element,
+            arithmetic,
         } => {
+            if let eredu_nn::LinearArithmetic::Compute(compute) = arithmetic {
+                if compute != element {
+                    for (name, dimensions) in [("projection_compute_input", vec![rows, input]),
+                        ("projection_compute_output", vec![rows, output])] {
+                        result.storage.push(allocation(name, bytes(&dimensions, element_bytes(compute))?,
+                            MechanismStorageRole::Scratch, StorageRetention::Evaluation));
+                    }
+                }
+            }
+            if matches!(arithmetic, eredu_nn::LinearArithmetic::ChannelMajorAffine | eredu_nn::LinearArithmetic::RowMajorAffine) {
+                for (name, dimensions, scalar, role) in [
+                    ("channel_affine_input_layout", vec![rows, input], element_bytes(element), MechanismStorageRole::Scratch),
+                    ("channel_affine_weight_layout", vec![output, input], weight_element.map(element_bytes).unwrap_or(4), MechanismStorageRole::Scratch),
+                    ("channel_affine_host_output", vec![rows, output], element_bytes(element), MechanismStorageRole::Scratch),
+                    ("channel_affine_fp32_input", vec![rows, input], 4, MechanismStorageRole::Scratch),
+                    ("channel_affine_fp32_weight", vec![output, input], 4, MechanismStorageRole::ParameterConversion),
+                    ("channel_affine_fp32_output", vec![rows, output], 4, MechanismStorageRole::Scratch),
+                ] {
+                    let mut storage = allocation(name, bytes(&dimensions, scalar)?, role, StorageRetention::Unknown);
+                    storage.payload.lower = 0;
+                    storage.capacity = MechanismBytes::unknown(0);
+                    storage.backing = MechanismBacking::Unknown;
+                    storage.detail = "conditional ordered-affine layout, CPU host output or FP32 fallback storage; exact branch needs bound dtype/layout and, for channel-major arithmetic, batch/time shape".into();
+                    if name == "channel_affine_host_output" { storage.placement = MechanismPlacement::Host; }
+                    result.storage.push(storage);
+                }
+                result.missing.push("ordered-affine layout sharing and retained fallback promotion need bound storage; channel-major singleton selection additionally needs batch/time shape, not flattened rows alone".into());
+            }
             match format {
                 LinearFormat::Dense => {
-                    if element == TensorElementType::F32
+                    if arithmetic.compute_element().unwrap_or(element) == TensorElementType::F32
                         && matches!(
                             weight_element,
                             Some(TensorElementType::Bf16 | TensorElementType::F16)
@@ -208,6 +296,25 @@ fn describe_selected(
                 LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
                     result.missing.push("native packed matmul's internal activation conversions/workspace are opaque; packed parameters are borrowed".into());
                     result.missing.push("packed matmul result promotion from scale and quantization-bias representations is not established; logical output representation remains conditional".into());
+                }
+                LinearFormat::NvFp4 => {
+                    let tile_rows = output.min(super::nvfp4::ROW_TILE as u64);
+                    let mut host = allocation(
+                        "nvfp4_host_tile",
+                        bytes(&[tile_rows, input], 6)?,
+                        MechanismStorageRole::Scratch,
+                        StorageRetention::NativeCompletion,
+                    );
+                    host.placement = MechanismPlacement::Host;
+                    host.detail =
+                        "bounded packed reads and F32 decode; expert banks remain packed".into();
+                    result.storage.push(host);
+                    result.storage.push(allocation(
+                        "nvfp4_native_tile",
+                        bytes(&[tile_rows, input], 8)?,
+                        MechanismStorageRole::ParameterConversion,
+                        StorageRetention::NativeCompletion,
+                    ));
                 }
                 LinearFormat::GgufIQuant { .. } => match device {
                     Some(device) if super::native_quantization::uses_metal_device(device) => {
@@ -328,10 +435,35 @@ fn describe_selected(
             softcap,
             sinks,
         } => {
+            if arithmetic == eredu_nn::AttentionArithmetic::Float32 && sinks {
+                let mut cast = allocation("attention_fp32_sinks", bytes(&[query_heads], 4)?,
+                    MechanismStorageRole::Scratch, StorageRetention::Evaluation);
+                cast.payload.lower = 0;
+                cast.capacity.lower = 0;
+                cast.detail = "optional FP32 sink conversion; same-dtype sources alias".into();
+                result.storage.push(cast);
+            }
+            let element = if arithmetic == eredu_nn::AttentionArithmetic::Float32 && element != TensorElementType::F32 {
+                for (name, dimensions) in [
+                    ("attention_fp32_queries", vec![batch, query_heads, queries, key_width]),
+                    ("attention_fp32_keys", vec![batch, kv_heads, keys, key_width]),
+                    ("attention_fp32_values", vec![batch, kv_heads, keys, value_width]),
+                    ("attention_fp32_output", vec![batch, query_heads, queries, value_width]),
+                ] {
+                    result.storage.push(allocation(name, bytes(&dimensions, 4)?,
+                        MechanismStorageRole::Scratch, StorageRetention::Evaluation));
+                }
+                TensorElementType::F32
+            } else { element };
             let path = super::attention::memory_path(queries, keys, arithmetic, softcap);
             if path == super::attention::AttentionMemoryPath::Fused {
                 if !unmasked_attention {
-                    let mut cast = allocation("sdpa_visibility_cast", bytes(&[batch, query_heads, queries, keys], element_bytes(element))?, MechanismStorageRole::Scratch, StorageRetention::Evaluation);
+                    let mut cast = allocation(
+                        "sdpa_visibility_cast",
+                        bytes(&[batch, query_heads, queries, keys], element_bytes(element))?,
+                        MechanismStorageRole::Scratch,
+                        StorageRetention::Evaluation,
+                    );
                     cast.payload.lower = 0;
                     cast.capacity.lower = 0;
                     cast.backing = MechanismBacking::Unknown;
@@ -420,6 +552,60 @@ fn describe_selected(
                     4
                 };
                 let tile = super::attention::memory_tile_geometry(queries, keys, path);
+                if arithmetic == eredu_nn::AttentionArithmetic::InputScores
+                    && element == TensorElementType::Bf16
+                    && device == Some(safemlx::DeviceType::Cpu)
+                {
+                    for (name, reduction, left, right, output) in [
+                        (
+                            "score",
+                            super::matrix::batched_dot_reduction(queries, key_width, keys, super::matrix::BatchedDotReduction::Row32),
+                            vec![batch, query_heads, tile.0, key_width],
+                            vec![batch, kv_heads, key_width, tile.1],
+                            vec![batch, query_heads, tile.0, tile.1],
+                        ),
+                        (
+                            "value",
+                            super::matrix::batched_dot_reduction(queries, keys, value_width, super::matrix::BatchedDotReduction::Native),
+                            vec![batch, query_heads, tile.0, tile.1],
+                            vec![batch, kv_heads, tile.1, value_width],
+                            vec![batch, query_heads, tile.0, value_width],
+                        ),
+                    ] {
+                        if reduction == super::matrix::BatchedDotReduction::Native {
+                            continue;
+                        }
+                        for (suffix, dimensions) in [
+                            ("left", left),
+                            ("right", right),
+                            ("host_output", output.clone()),
+                        ] {
+                            let mut storage = allocation(
+                                &format!("ordered_{name}_{suffix}"),
+                                bytes(&dimensions, 2)?,
+                                MechanismStorageRole::Scratch,
+                                StorageRetention::NativeCompletion,
+                            );
+                            storage.placement = MechanismPlacement::Host;
+                            if suffix != "host_output" { storage.payload.lower = 0; }
+                            storage.capacity = MechanismBytes::unknown(storage.payload.lower);
+                            storage.detail = "CPU ordered BF16 product borrows bounded BF16 layouts and converts products in registers; KV heads stay shared, and allocator capacity/contiguous sharing are not exposed".into();
+                            result.storage.push(storage);
+                        }
+                        let mut raw = allocation(
+                            &format!("ordered_{name}_result"),
+                            bytes(&output, 2)?,
+                            MechanismStorageRole::Scratch,
+                            StorageRetention::Evaluation,
+                        );
+                        raw.payload.lower = 0;
+                        raw.backing = MechanismBacking::Unknown;
+                        raw.capacity = MechanismBytes::unknown(0);
+                        raw.detail = "raw BF16 product before scaling/assembly; donation may share score or output storage, so this is not an assertion of separate backing".into();
+                        result.storage.push(raw);
+                        result.missing.push("CPU ordered product contiguous aliasing and host Vec capacity require bound-storage observations".into());
+                    }
+                }
                 let score_columns = tile
                     .1
                     .checked_add(u64::from(sinks))
@@ -566,6 +752,8 @@ fn describe_selected(
             result.missing.push("source cache pages, transfer buffers and metadata capacity remain owned by cache residency; native allocator capacity and fused-kernel private workspace are not exposed".into());
         }
         Convolution {
+            arithmetic,
+            bias,
             batch,
             tokens,
             channels,
@@ -589,6 +777,41 @@ fn describe_selected(
                 history.backing = MechanismBacking::Unknown;
             }
             result.storage.push(history);
+            if arithmetic == eredu_nn::ConvolutionArithmetic::FourLaneFloat32Affine {
+                for name in ["ordered_convolution_products", "ordered_convolution_partial_sums"] {
+                    let mut storage = allocation(name, bytes(&[kernel.checked_add(3).ok_or_else(|| Error::backend("convolution partial count overflow"))?, batch, tokens, channels], 4)?,
+                        MechanismStorageRole::Scratch, StorageRetention::Evaluation);
+                    storage.payload.lower = 0;
+                    storage.backing = MechanismBacking::Unknown;
+                    storage.capacity = MechanismBytes::unknown(0);
+                    storage.detail = "bounded four-lane FP32 tap graph; native fusion/donation can share intermediate storage".into();
+                    result.storage.push(storage);
+                }
+                for (name, dimensions) in [
+                    ("fp32_convolution_input", vec![batch, padded, channels]),
+                    ("fp32_convolution_weight", vec![channels, kernel]),
+                    ("fp32_convolution_output", vec![batch, tokens, channels]),
+                    ("fp32_convolution_bias", vec![channels]),
+                    ("fp32_convolution_affine", vec![batch, tokens, channels]),
+                ] {
+                    if !bias && matches!(name, "fp32_convolution_bias" | "fp32_convolution_affine")
+                    {
+                        continue;
+                    }
+                    let mut storage = allocation(
+                        name,
+                        bytes(&dimensions, 4)?,
+                        MechanismStorageRole::Scratch,
+                        StorageRetention::Evaluation,
+                    );
+                    // F32 inputs and parameters can make casts aliases. The
+                    // invocation does not establish parameter backing identity.
+                    if name != "fp32_convolution_output" && name != "fp32_convolution_affine" {
+                        storage.backing = MechanismBacking::Unknown;
+                    }
+                    result.storage.push(storage);
+                }
+            }
             result.missing.push("convolution native kernel workspace and activation/bias intermediates depend on implementation lowering".into());
         }
         Recurrent {
@@ -985,6 +1208,31 @@ mod contract_validation_tests {
         }
     }
     #[test]
+    fn fp32_attention_accounts_for_promotions_and_preserves_logical_bf16_output() {
+        let request = |element| MechanismInvocation::Attention {
+            batch: 1, query_heads: 4, kv_heads: 2, queries: 3, keys: 5,
+            key_width: 8, value_width: 6, element,
+            arithmetic: eredu_nn::AttentionArithmetic::Float32,
+            softcap: false, sinks: false,
+        };
+        let low = describe_for_device(&request(TensorElementType::Bf16), safemlx::DeviceType::Cpu).unwrap();
+        low.validate().unwrap();
+        assert_eq!(low.values.iter().find(|value| value.name == "output").unwrap().element, TensorElementType::Bf16);
+        let promotion_bytes: u64 = low.storage.iter().filter(|storage| storage.name.starts_with("attention_fp32_")).map(|storage| storage.payload.lower).sum();
+        // Q:96, K:80, V:60 and output:72 FP32 values, independent of BF16 storage.
+        assert_eq!(promotion_bytes, 1232);
+        let wide = describe_for_device(&request(TensorElementType::F32), safemlx::DeviceType::Cpu).unwrap();
+        assert!(!wide.storage.iter().any(|storage| storage.name.starts_with("attention_fp32_")));
+        // Post-product scaling cannot delegate to native SDPA's query-scaling
+        // fallback. Its selected score storage stays tiled for long requests.
+        let mut tall = request(TensorElementType::F32);
+        if let MechanismInvocation::Attention { queries, .. } = &mut tall { *queries = 10_000; }
+        let tall = describe_for_device(&tall, safemlx::DeviceType::Cpu).unwrap();
+        let scores = tall.storage.iter().find(|s| s.name == "score_tile").unwrap();
+        assert!(scores.payload.upper.unwrap() < 4 * 10_000 * 5 * 4);
+    }
+
+    #[test]
     fn mechanism_attention_sink_extent_overflow_is_rejected() {
         let request = MechanismInvocation::Attention {
             batch: 1,
@@ -1003,4 +1251,56 @@ mod contract_validation_tests {
         assert!(request.logical_values().is_ok());
         assert!(describe(&request).is_err());
     }
+}
+
+
+fn describe_group_indices(
+    result: &mut MechanismMemoryContract,
+    rows: u64, groups: u64, selected: u64, element: TensorElementType,
+    order: eredu_nn::GroupSelectionOrder, device: Option<safemlx::DeviceType>,
+) -> Result<(), Error> {
+    let mut scratch = |name: &str, size: u64, placement: MechanismPlacement, detail: &str| {
+        let mut storage = allocation(name, size, MechanismStorageRole::Scratch, StorageRetention::Evaluation);
+        storage.payload.lower = 0;
+        storage.backing = MechanismBacking::Unknown;
+        storage.capacity = MechanismBytes::unknown(0);
+        storage.placement = placement;
+        storage.detail = detail.into();
+        result.storage.push(storage);
+    };
+    if order == eredu_nn::GroupSelectionOrder::Ranked {
+        scratch("selection_descending_scores", bytes(&[rows, groups], element_bytes(element))?, MechanismPlacement::Execution,
+            "native score negation preserves the selected score representation; backing and fusion are unknown");
+        scratch("selection_partition_indices", bytes(&[rows, groups], 4)?, MechanismPlacement::Execution,
+            "native partition output; selected prefix can retain its full backing");
+        scratch("selection_ranked_prefix", bytes(&[rows, selected], 4)?, MechanismPlacement::Execution,
+            "selected scores, rank indices and gathered output have implementation-dependent overlap");
+        result.missing.push("native ranked selection, cutoff-tie repair, gather/sort backing and kernel-private workspace".into());
+        return Ok(());
+    }
+    if element != TensorElementType::F32 {
+        scratch("selection_scores_f32", bytes(&[rows, groups], 4)?, MechanismPlacement::Execution,
+            "bounded score conversion; backing donation is not established");
+    }
+    scratch("selection_descending_scores", bytes(&[rows, groups], 4)?, MechanismPlacement::Execution,
+        "negated FP32 selection scores; fusion and backing donation remain unknown");
+    let native_metal = cfg!(all(feature = "metal", not(feature = "cuda")))
+        && device == Some(safemlx::DeviceType::Gpu) && selected <= 16 && groups <= 1024;
+    if native_metal {
+        scratch("selection_thread_indices", bytes(&[rows, groups], 4)?, MechanismPlacement::Execution,
+            "one bounded thread-local index row per dispatched row; compiler registers and spills are not native heap capacity facts");
+        result.missing.push("median-partition kernel-private register/spill capacity and output donation".into());
+    } else {
+        scratch("selection_host_scores", bytes(&[rows, groups], 4)?, MechanismPlacement::Host,
+            "bounded FP32 score copy and contiguous host view; their backing can overlap");
+        scratch("selection_host_row_indices", bytes(&[groups], std::mem::size_of::<usize>() as u64)?, MechanismPlacement::Host,
+            "one reused host index vector, independent of the number of score rows");
+        scratch("selection_host_output_indices", bytes(&[rows, selected], 4)?, MechanismPlacement::Host,
+            "bounded output Vec before native array construction and optional selected-device transfer");
+        result.missing.push("host score-copy backing, native output construction and transfer overlap".into());
+        if device.is_none() {
+            result.missing.push("selected device kind determines native Metal versus bounded host partition".into());
+        }
+    }
+    Ok(())
 }

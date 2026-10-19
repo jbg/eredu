@@ -70,6 +70,7 @@ fn exercise(device: DeviceType) {
             GatedResidualSpec {
                 geometry: ResidualStreamGeometry::new(2, 2).unwrap(),
                 normalization: NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     dimensions: 4,
                     groups: Some(2),
                     epsilon: 1e-4,

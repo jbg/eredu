@@ -10,17 +10,19 @@ pub struct MlxGroupedLinear {
     weight: Parameter<MlxTensor>,
     scale: Option<Parameter<MlxTensor>>,
     affine_bias: Option<Parameter<MlxTensor>>,
+    global_scale: Option<Parameter<MlxTensor>>,
     bias: Option<Parameter<MlxTensor>>,
 }
 
 impl MlxGroupedLinear {
-    fn local_bindings(&self) -> [Option<String>; 4] {
+    fn local_bindings(&self) -> [Option<String>; 5] {
         let projection = self.spec.projection();
         [
             Some(projection.weight()),
             projection.format().scale(),
             projection.format().affine_bias(),
             projection.bias(),
+            projection.format().global_scale(),
         ]
         .map(|spec| {
             spec.map(|spec| {
@@ -60,6 +62,7 @@ impl MlxGroupedLinear {
             self.scale.as_ref(),
             self.affine_bias.as_ref(),
             self.bias.as_ref(),
+            self.global_scale.as_ref(),
         ]) {
             if let (Some(name), Some(parameter)) = (name, parameter) {
                 super::parameters::validate_compact_binding(
@@ -75,6 +78,7 @@ impl MlxGroupedLinear {
             self.scale.as_mut(),
             self.affine_bias.as_mut(),
             self.bias.as_mut(),
+            self.global_scale.as_mut(),
         ]) {
             if let (Some(name), Some(parameter)) = (name, parameter) {
                 parameter.replace(MlxTensor::from_array(
@@ -118,7 +122,7 @@ impl MlxGroupedLinear {
                 }
                 shape[2] = columns / values as i32 * bytes as i32;
             }
-            LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
+            LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4 => {
                 let quantization = encoding
                     .weight_quantization()
                     .expect("packed linear format");
@@ -131,13 +135,13 @@ impl MlxGroupedLinear {
         }
         let weight_dtype = match encoding {
             LinearFormat::Dense => safemlx::Dtype::Float32,
-            LinearFormat::Affine(_) | LinearFormat::MxFp4 => safemlx::Dtype::Uint32,
+            LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4 => safemlx::Dtype::Uint32,
             LinearFormat::E4M3BlockFp8(_) | LinearFormat::GgufIQuant { .. } => {
                 safemlx::Dtype::Uint8
             }
         };
         let scale_dtype = match encoding {
-            LinearFormat::MxFp4 => safemlx::Dtype::Uint8,
+            LinearFormat::MxFp4 | LinearFormat::NvFp4 => safemlx::Dtype::Uint8,
             LinearFormat::E4M3BlockFp8(fp8)
                 if fp8.scale_encoding == eredu_checkpoint::BlockFp8ScaleEncoding::Ue8m0 =>
             {
@@ -178,11 +182,19 @@ impl MlxGroupedLinear {
             .bias()
             .map(|p| Parameter::unloaded(p.clone(), &[groups, rows], context))
             .transpose()?;
+        let global_scale = projection.format().global_scale().map(|p| {
+            let mut shape = vec![groups];
+            if projection.format().row_layout().partitions() > 1 {
+                shape.push(projection.format().row_layout().partitions() as i32);
+            }
+            unloaded(bind_linear_companion(projection.weight(), p.clone()), &shape, safemlx::Dtype::Float32)
+        }).transpose()?;
         Ok(MlxGroupedLinear {
             spec,
             weight,
             scale,
             affine_bias,
+            global_scale,
             bias,
         })
     }
@@ -261,6 +273,11 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
                     ),
                 )?
             }
+            LinearFormat::NvFp4 => compute(common::nvfp4::grouped_linear(
+                &rows, weight, scale.ok_or_else(|| ComputeError::backend("NVFP4 scale is absent"))?,
+                self.global_scale.as_ref().ok_or_else(|| ComputeError::backend("NVFP4 global scale is absent"))?.as_ref().as_array(),
+                &plan.sorted_group_ids, self.spec.projection().format().row_layout(), context,
+            ))?,
             LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
                 compute(common::grouped::packed_grouped_linear(
                     &rows,

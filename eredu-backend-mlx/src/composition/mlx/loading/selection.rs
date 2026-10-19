@@ -26,6 +26,7 @@ pub(crate) fn prepare_selected_sources(
     let MlxSelectedPreparation {
         selected,
         rank_context,
+        world_backend: _,
     } = selected;
     let sources = prepare_model_sources(plan, selected)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -46,6 +47,7 @@ pub(crate) fn prepare_selected_sources(
 pub struct MlxSelectedPreparation {
     selected: eredu_architectures::SelectedPreparation,
     rank_context: Option<crate::backend::MlxRankContext>,
+    world_backend: Option<safemlx::distributed::Backend>,
 }
 
 impl MlxSelectedPreparation {
@@ -56,7 +58,25 @@ impl MlxSelectedPreparation {
         Self {
             selected,
             rank_context,
+            world_backend: None,
         }
+    }
+
+    pub(crate) fn with_world_backend(
+        mut self,
+        backend: safemlx::distributed::Backend,
+    ) -> Result<Self, Error> {
+        if self.rank_context.is_none() {
+            return Err(Error::Parallel(
+                "native world initialization requires a retained rank".into(),
+            ));
+        }
+        self.world_backend = Some(backend);
+        Ok(self)
+    }
+
+    pub(crate) const fn world_backend(&self) -> Option<safemlx::distributed::Backend> {
+        self.world_backend
     }
 
     pub(crate) const fn session_capabilities(&self) -> eredu_core::SessionCapabilities {
@@ -67,7 +87,6 @@ impl MlxSelectedPreparation {
         &self.selected
     }
 
-    #[cfg(test)]
     pub(crate) const fn rank_context(&self) -> Option<crate::backend::MlxRankContext> {
         self.rank_context
     }

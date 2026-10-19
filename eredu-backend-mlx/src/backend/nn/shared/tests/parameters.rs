@@ -17,6 +17,9 @@ fn test_format(weight: &str, format: LinearFormat) -> eredu_nn::LinearFormatSpec
             eredu_nn::LinearFormatSpec::scaled(format, parameter(&format!("{prefix}.scales")))
                 .unwrap()
         }
+        LinearFormat::NvFp4 => eredu_nn::LinearFormatSpec::nvfp4(
+            parameter(&format!("{prefix}.scales")), parameter(&format!("{prefix}.global_scale")),
+        ).unwrap(),
         LinearFormat::Affine(_) => eredu_nn::LinearFormatSpec::affine(
             format,
             parameter(&format!("{prefix}.scales")),
@@ -210,6 +213,7 @@ fn bind_linear(
             let mode = match quantization {
                 WeightQuantization::Affine(_) => QuantizationMode::Affine,
                 WeightQuantization::MxFp4 => QuantizationMode::MxFp4,
+                WeightQuantization::NvFp4 => panic!("NVFP4 tests bind pinned encoded fixtures"),
                 WeightQuantization::GgufIQuant { .. } => {
                     panic!("test helper does not synthesize GGUF blocks")
                 }

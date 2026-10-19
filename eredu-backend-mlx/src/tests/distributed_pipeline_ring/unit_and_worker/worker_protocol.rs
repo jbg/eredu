@@ -118,7 +118,6 @@ fn pipeline_ring_worker() {
     };
     let family = FixtureFamily::parse(&std::env::var(FIXTURE_FAMILY).unwrap());
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
-    let native_group = distributed::init(true, Backend::Ring).unwrap();
     let cartesian_axes = std::env::var(CARTESIAN_AXES).ok();
     let (tensor_parallel_size, pipeline_parallel_size, expert_parallel_size) =
         match cartesian_axes.as_deref() {
@@ -144,6 +143,13 @@ fn pipeline_ring_worker() {
     )
     .unwrap();
     assert_eq!(topology.global_rank(), expected_rank);
+    if std::env::var_os(execution_plan_target::WORKER_FLAG).is_some() {
+        execution_plan_target::worker(&checkpoint, topology);
+        return;
+    }
+
+
+    let native_group = distributed::init(true, Backend::Ring).unwrap();
     let pipeline_rank = topology.pipeline_parallel_rank();
     let neutral_gemma_config =
         (family == FixtureFamily::Gemma && std::env::var_os(OPAQUE_SESSION).is_some()).then(|| {
@@ -564,7 +570,8 @@ fn pipeline_ring_worker() {
             false
         };
         let composite_binding_counts =
-            (neutral_gemma_layers.is_some() || component_media).then(|| {
+            (neutral_gemma_layers.is_some() || component_media
+                || std::env::var_os("EREDU_RING_EXTERNAL_TARGET_CAPTURE").is_some()).then(|| {
                 let inspection = component_fixture_inspection(&checkpoint);
                 let selected = crate::composition::mlx::loading::select_preparation(
                     &inspection,
@@ -777,6 +784,13 @@ fn pipeline_ring_worker() {
                 },
                 "the complete prediction artifact must retain its embedded-draft capability on the neutral target"
             );
+        }
+        if std::env::var_os("EREDU_RING_EXTERNAL_TARGET_CAPTURE").is_some() {
+            let session = MlxModelSession::from_model(
+                model.into_inner(), eredu_core::SessionCapabilities::new(true, true, true),
+            ).unwrap();
+            capture_binding::verify(session, &checkpoint, &stream, expected_rank);
+            return;
         }
         let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, model).unwrap();
         let distributed_view =

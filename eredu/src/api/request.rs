@@ -1124,6 +1124,7 @@ fn recognize_muse_atem_protocol(
     tokenizer: &mut ChatTokenizer,
     selected_template: &ModelChatTemplate,
     model_id: &str,
+    requested_generation_prompt: bool,
 ) -> Option<crate::runtime::chat::PreparedFormatProfile> {
     use crate::runtime::chat::{
         atem::{self, EOM, EOT, MESSAGE, START},
@@ -1145,29 +1146,84 @@ fn recognize_muse_atem_protocol(
 
     let generation_messages =
         vec![serde_json::json!({"role": "user", "content": "__eredu_atem_prompt__"})];
-    for strength in ["low", "medium", "high", "xhigh"] {
-        let kwargs = serde_json::Map::from_iter([(
-            "reasoning_strength".into(),
-            serde_json::Value::String(strength.into()),
-        )]);
-        let prompt = tokenizer
-            .apply_chat_template_json(
-                selected_template.clone(),
-                [generation_messages.clone()],
-                Some(&[]),
-                model_id,
-                true,
-                Some(&kwargs),
-            )
-            .ok()?
+    let protocols = [
+        (
+            "muse-glimmer.atem.v1",
+            atem::AtemEffort::StrengthWords,
+            ["low", "medium", "high", "xhigh"],
+            "high",
+            GenerationPromptBehavior::Always,
+        ),
+        (
+            "muse-spark.atem.v1",
+            atem::AtemEffort::EffortBudget,
+            ["8", "32", "256", "512"],
+            "xhigh",
+            GenerationPromptBehavior::HonorRequest,
+        ),
+    ];
+    let (identity, effort, _, enabled_effort, generation_prompt_behavior) =
+        protocols
             .into_iter()
-            .next()?;
-        if !prompt.contains(&format!("Reasoning strength: {strength}."))
-            || !prompt.ends_with("<|start|>assistant")
-        {
-            return None;
-        }
+            .find(|(_, effort, rendered_strengths, _, _)| {
+                let kwarg = effort.template_kwarg();
+                ["low", "medium", "high", "xhigh"]
+                    .into_iter()
+                    .zip(rendered_strengths)
+                    .all(|(effort, rendered_strength)| {
+                        let kwargs = serde_json::Map::from_iter([(
+                            kwarg.into(),
+                            serde_json::Value::String(effort.into()),
+                        )]);
+                        let prompt = tokenizer
+                            .apply_chat_template_json(
+                                selected_template.clone(),
+                                [generation_messages.clone()],
+                                Some(&[]),
+                                model_id,
+                                true,
+                                Some(&kwargs),
+                            )
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .next();
+                        prompt.is_some_and(|prompt| {
+                            prompt.contains(&format!("Reasoning strength: {rendered_strength}."))
+                                && prompt.ends_with("<|start|>assistant")
+                        })
+                    })
+            })?;
+    let kwarg = effort.template_kwarg();
+    let kwargs = serde_json::Map::from_iter([(
+        kwarg.into(),
+        serde_json::Value::String(enabled_effort.into()),
+    )]);
+    let without_prompt = tokenizer
+        .apply_chat_template_json(
+            selected_template.clone(),
+            [generation_messages],
+            Some(&[]),
+            model_id,
+            false,
+            Some(&kwargs),
+        )
+        .ok()?
+        .into_iter()
+        .next()?;
+    if generation_prompt_behavior == GenerationPromptBehavior::HonorRequest
+        && without_prompt.ends_with("<|start|>assistant")
+    {
+        return None;
     }
+    let parameters = atem::parameters(
+        effort,
+        if generation_prompt_behavior.resolve(requested_generation_prompt) {
+            atem::AtemPrefix::PrefilledAssistant
+        } else {
+            atem::AtemPrefix::GeneratedAssistant
+        },
+    );
 
     let mapping = render_protocol_probe(
         tokenizer,
@@ -1190,19 +1246,18 @@ fn recognize_muse_atem_protocol(
     });
 
     Some(crate::runtime::chat::PreparedFormatProfile {
-        identity: Some("muse-glimmer.atem.v1".into()),
+        identity: Some(identity.into()),
         dialect: Some(&atem::ATEM_DIALECT),
-        dialect_parameters: Some(atem::parameters()),
+        dialect_parameters: Some(parameters),
         tool_dialect: mapping_tool_arguments.then_some(&atem::ATEM_DIALECT),
-        tool_dialect_parameters: mapping_tool_arguments.then_some(atem::parameters()),
-        generation_prompt_behavior: GenerationPromptBehavior::Always,
-        reasoning_template_control: ReasoningTemplateControl::NamedEffort {
-            kwarg: "reasoning_strength",
-            enabled: "high",
-            disabled: "high",
+        tool_dialect_parameters: mapping_tool_arguments.then_some(parameters),
+        generation_prompt_behavior,
+        reasoning_template_control: ReasoningTemplateControl::RequiredEffort {
+            kwarg,
+            enabled: enabled_effort,
         },
         reasoning_effort_control: Some(ReasoningEffortControl {
-            kwarg: "reasoning_strength",
+            kwarg,
             supported: &["low", "medium", "high", "xhigh"],
         }),
 
@@ -1211,7 +1266,7 @@ fn recognize_muse_atem_protocol(
         supports_mapping_tool_arguments: mapping_tool_arguments,
         supports_string_tool_arguments: false,
         native_tool_unavailable_reason: (!mapping_tool_arguments).then(|| {
-            "Muse-Glimmer ATEM channels were recognized, but mapping-valued tool history did not pass the behavioral probe".into()
+            "Muse ATEM channels were recognized, but mapping-valued tool history did not pass the behavioral probe".into()
         }),
         required_structural_tokens: structural_tokens.clone(),
         tool_required_structural_tokens: if mapping_tool_arguments {
@@ -1724,7 +1779,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
     }
     if profile.dialect.is_none() {
         if let Some(recognized) =
-            recognize_muse_atem_protocol(tokenizer, &selected_template, model_id)
+            recognize_muse_atem_protocol(tokenizer, &selected_template, model_id, request.add_generation_prompt)
                 .or_else(|| recognize_gemma_protocol(tokenizer, &selected_template, model_id))
                 .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
                 .or_else(|| harmony::recognize(tokenizer, &selected_template, model_id))
@@ -1878,27 +1933,27 @@ pub(super) fn prepare_chat_from_parts_with_history(
 
         validate_tagged_history(&request.messages, "</parameter>", "Qwen")?;
     }
-    if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
+    if let crate::runtime::chat::ReasoningTemplateControl::RequiredEffort { kwarg, .. } = profile.reasoning_template_control {
         if request.enable_thinking == Some(false) {
             return Err(ChatCapabilityRejection::ReasoningControl {
                 control: "enable_thinking".into(),
-                reason: "Muse-Glimmer does not expose a reasoning-disable control".into(),
+                reason: "This chat template does not expose a reasoning-disable control".into(),
             }
             .into());
         }
-        if let Some(value) = request.extra_template_kwargs.get("reasoning_strength") {
+        if let Some(value) = request.extra_template_kwargs.get(kwarg) {
             let Some(strength) = value.as_str() else {
                 return Err(ChatRequestError::InvalidOption {
-                    field: "reasoning_strength".into(),
+                    field: kwarg.into(),
                     reason: "must be one of low, medium, high, or xhigh".into(),
                 }
                 .into());
             };
             if !matches!(strength, "low" | "medium" | "high" | "xhigh") {
                 return Err(ChatRequestError::InvalidOption {
-                    field: "reasoning_strength".into(),
+                    field: kwarg.into(),
                     reason: format!(
-                        "unsupported value {strength:?}; expected low, medium, high, or xhigh"
+                        "unsupported {kwarg} {strength:?}; expected low, medium, high, or xhigh"
                     ),
                 }
                 .into());
@@ -2025,9 +2080,11 @@ pub(super) fn prepare_chat_from_parts_with_history(
         .resolve(request.add_generation_prompt);
 
     if let Some(enable_thinking) = request.enable_thinking {
-        let explicit_muse_strength = profile.identity.as_deref() == Some("muse-glimmer.atem.v1")
-            && extra_template_kwargs.contains_key("reasoning_strength");
-        if !explicit_muse_strength {
+        let explicit_required_effort = match profile.reasoning_template_control {
+            crate::runtime::chat::ReasoningTemplateControl::RequiredEffort { kwarg, .. } => extra_template_kwargs.contains_key(kwarg),
+            _ => false,
+        };
+        if !explicit_required_effort {
             let (kwarg, value) = profile
                 .reasoning_template_control
                 .template_entry(enable_thinking);

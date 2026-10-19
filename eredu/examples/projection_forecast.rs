@@ -181,6 +181,7 @@ fn main() -> anyhow::Result<()> {
     drop(run);
     drop(model);
     let speculative_plan = plan.with_drafting(eredu_core::DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: path.display().to_string(),
         placement: eredu_core::DraftPlacementPlan::Target,
         max_draft_tokens: 2,

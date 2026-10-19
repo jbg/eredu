@@ -625,7 +625,7 @@ fn normalized_target(
             use crate::artifact_preparation::{ArtifactSourceRole, PhysicalArtifactId};
             if let Some(vision) = &vision {
                 let id = if vision.gguf_source().is_some() {
-                    PhysicalArtifactId::Companion(eredu_core::GgufCompanionRole::MediaProjector)
+                    PhysicalArtifactId::Companion(eredu_core::ArtifactCompanionRole::MediaProjector)
                 } else {
                     PhysicalArtifactId::Primary
                 };

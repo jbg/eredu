@@ -1419,20 +1419,23 @@ where
         }
     }
 
-    fn apply_prediction_target_operation<O>(
+    fn apply_prediction_target_operation<O, X>(
         &mut self,
         state: &mut S,
         operation: O,
+        transport: &mut X,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<O::Output>, A::Error>
     where
         O: crate::PredictionTargetOperation<A, B, S>,
+        X: crate::PredictionTargetTransport<B>,
     {
         operation
-            .apply(
+            .apply_with_transport(
                 &mut self.architecture,
                 state,
                 self.parallel.as_ref(),
+                transport,
                 context,
             )
             .map(Some)

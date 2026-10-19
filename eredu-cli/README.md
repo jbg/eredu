@@ -44,6 +44,22 @@ features both imply `mlx`, while `nccl` implies `cuda`. A bare
 `--no-default-features` package check is supported but intentionally does not
 build or install an `eredu` executable.
 
+Converted checkpoints can select independently admitted tower sources with
+`--vision-companion DIRECTORY` and `--audio-companion DIRECTORY`. For example,
+inspect a text-only Spark conversion with official BF16 media sources:
+
+```sh
+eredu --model /path/to/spark-conversion \
+  --vision-companion /path/to/spark-bf16 \
+  --audio-companion /path/to/spark-bf16 \
+  --auto plan
+```
+
+The architecture validates geometry, token identities, processor assets and
+provenance before loading. Vision and audio can use different directories.
+Automatic overrides, benchmark candidates and exact-plan replay preserve these
+source roles; cached plans require the same requested companion selection.
+
 Run the command with `--help` for the complete option list.
 
 ## Input and output

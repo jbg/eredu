@@ -830,18 +830,18 @@ impl BroadcastBackend for MlxNeuralBackend {
         trace_partition_collective("broadcast", &input, group, &format!("root={root}"));
         validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
         // Preserve every rank's lazy predecessor graph in the submitted event.
-        // A zero-valued expression keeps non-roots in the same dependency order
-        // without performing an unbounded host synchronization before returning
-        // the exact communication completion.
+        // A typed zero depends on the original graph without using its values.
+        // Scalar F32 multiplication widens F16/BF16, and multiplying nonfinite
+        // ignored values by zero would contaminate the publication with NaNs.
         let contribution = if group.rank() == root {
             input.clone()
-        } else if input.dtype() == Dtype::Int32 {
-            // Integer control values remain exact, including values outside the
-            // F32 mantissa and both signed extrema. Every nonowner contributes
-            // typed zero without dropping its predecessor dependency.
-            input.multiply(Array::from_slice(&[0_i32], &[]), executor)?
         } else {
-            input.multiply(Array::from_f32(0.0), executor)?
+            let zero = safemlx::ops::zeros_dtype(input.shape(), input.dtype(), executor)?;
+            safemlx::transforms::depends([&zero], [&input])?
+                .pop()
+                .ok_or_else(|| {
+                    safemlx::error::Exception::custom("broadcast dependency returned no value")
+                })?
         };
         let output = crate::backend::runtime::distributed::all_sum_for(
             eredu_runtime::CommunicationOperation::Broadcast,

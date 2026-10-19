@@ -242,6 +242,7 @@ pub fn mlx_quantization_mode(config: WeightQuantization) -> Result<ops::Quantiza
     match config {
         WeightQuantization::Affine(_) => Ok(ops::QuantizationMode::Affine),
         WeightQuantization::MxFp4 => Ok(ops::QuantizationMode::MxFp4),
+        WeightQuantization::NvFp4 => Ok(ops::QuantizationMode::NvFp4),
         WeightQuantization::GgufIQuant { .. } => Err(Error::Quantization(
             "checkpoint-native GGUF blocks cannot be produced by dense quantization".into(),
         )),

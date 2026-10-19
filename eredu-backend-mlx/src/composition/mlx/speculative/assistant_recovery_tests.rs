@@ -8,8 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn drafter(stream: &Stream) -> MlxDrafter {
-    use super::super::external_materialization_tests::{assistant_artifact, ASSISTANT_CONFIG};
+fn drafter(
+    stream: &Stream,
+) -> (
+    MlxDrafter,
+    eredu_core::ModelRuntime<crate::composition::mlx::MlxBackend<'static>>,
+) {
+    use super::super::test_fixture::{assistant_artifact, ASSISTANT_CONFIG};
 
     let assistant = assistant_artifact();
     let source: serde_json::Value = serde_json::from_str(ASSISTANT_CONFIG).unwrap();
@@ -53,15 +58,20 @@ fn drafter(stream: &Stream) -> MlxDrafter {
         eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap(),
     )
     .with_drafting(eredu_core::DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: assistant.path().display().to_string(),
         placement: eredu_core::DraftPlacementPlan::Target,
         max_draft_tokens: 2,
         lookahead: false,
         adaptive_lookahead: false,
     });
+    let factory = super::super::super::automatic::MlxBackendFactory::default();
+    let target_selection =
+        eredu_core::select_execution_plan_target(&factory, &plan, inspection.clone()).unwrap();
     let prepared = eredu_architectures::prepare_execution_plan_assistant(
         &plan,
         &inspection,
+        target_selection.selected_preparation().neutral(),
         eredu_core::ExternalDraftArtifact {
             preparation: eredu_architectures::prepare_external_assistant(assistant.path()).unwrap(),
             tokenizer_compatibility: TokenizerCompatibilityProof::prove([9; 32], [9; 32]).unwrap(),
@@ -73,12 +83,18 @@ fn drafter(stream: &Stream) -> MlxDrafter {
         &speculative_mechanism_capabilities(),
     )
     .unwrap();
-    MlxDrafter::materialize(
+    let runtime = eredu_core::realize_execution_plan_target(&factory, &plan, target_selection)
+        .unwrap()
+        .into_runtime()
+        .unwrap();
+    let drafter = MlxDrafter::materialize(
         eredu_architectures::PreparedExternalDraft::Assistant(prepared.preparation),
+        runtime.session(),
         stream,
         stream,
     )
-    .unwrap()
+    .unwrap();
+    (drafter, runtime)
 }
 
 struct CountVisit<'a>(&'a Cell<usize>);
@@ -98,7 +114,9 @@ impl MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor> for Co
 #[test]
 fn terminal_retained_drafter_owner_rejects_mutation_until_exclusive_without_poisoning() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let mut drafter = drafter(&stream);
+    // Keep the bound target alive; dropping it would inject unrelated target
+    // retirement into the lock-contention boundary being measured here.
+    let (mut drafter, mut target) = drafter(&stream);
     let mut scope = SubmissionScope::begin().unwrap();
     let value = Array::from_slice(&[2.0_f32], &[1]).square(&stream).unwrap();
     eval([&value]).unwrap();
@@ -136,10 +154,19 @@ fn terminal_retained_drafter_owner_rejects_mutation_until_exclusive_without_pois
     assert!(!drafter.poisoned.get());
     let visits = Cell::new(0);
     let start = Instant::now();
-    let error = drafter.visit(CountVisit(&visits)).unwrap_err();
+    let preparation_calls = Cell::new(0);
+    let error = match drafter.prepare_operation(|local| {
+        preparation_calls.set(preparation_calls.get() + 1);
+        assert!(local.is_err(), "failed acquisition still enters readiness");
+        local
+    }) {
+        Ok(_) => panic!("retained drafter must reject acquisition"),
+        Err(error) => error,
+    };
     assert!(error.to_string().contains("still retained by prior work"));
     assert!(start.elapsed() < Duration::from_secs(1));
     assert_eq!(visits.get(), 0);
+    assert_eq!(preparation_calls.get(), 1);
     assert!(!drafter.poisoned.get());
     release_tx.send(()).unwrap();
     holder.join().unwrap();
@@ -148,7 +175,51 @@ fn terminal_retained_drafter_owner_rejects_mutation_until_exclusive_without_pois
         Rc::strong_count(&drafter.payload) == 1
     });
     assert_eq!(Rc::strong_count(&drafter.payload), 1);
-    drafter.visit(CountVisit(&visits)).unwrap();
+    let error = match drafter.prepare_operation(|local| {
+        local?;
+        Err(Error::Speculative(
+            "peer rejected mutation ownership".into(),
+        ))
+    }) {
+        Ok(_) => panic!("peer rejection must reject acquisition"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("peer rejected mutation ownership"));
+    assert_eq!(visits.get(), 0);
+    assert!(!drafter.poisoned.get());
+    // A real local assistant acquisition failure occurs inside the target's
+    // unused preparation scope. Neither executable may be visited or poisoned.
+    let retained = Rc::clone(&drafter.payload);
+    let failed = target
+        .session_mut()
+        .with_prepared_model_operation(
+            |local| {
+                local?;
+                drafter.prepare_operation(|local| {
+                    assert!(local.is_err());
+                    local
+                })
+            },
+            |_, draft| draft.visit(CountVisit(&visits)),
+        )
+        .unwrap_err();
+    assert!(failed.to_string().contains("still retained by prior work"));
+    assert_eq!(visits.get(), 0);
+    target.session().ensure_no_submission_in_flight().unwrap();
+    assert!(!drafter.poisoned.get());
+    drop(retained);
+    target
+        .session_mut()
+        .with_prepared_model_operation(
+            |local| {
+                local?;
+                drafter.prepare_operation(|local| local)
+            },
+            |_, draft| draft.visit(CountVisit(&visits)),
+        )
+        .unwrap();
     assert_eq!(visits.get(), 1);
     assert!(!drafter.poisoned.get());
 }

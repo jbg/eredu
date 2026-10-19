@@ -78,6 +78,7 @@ projector.
 | Nemotron-H | text | yes | `nemotron_h`, `nemotron_h_moe` | Mamba, attention, dense MLP, and MoE layers |
 | Inkling | text, image, audio | yes | `inkling` + projector | multimodal hMLP ingress and dense/MoE text execution |
 | Muse-Glimmer | text, image, video | yes | `muse-glimmer`; optional image-only projector | vision tower, mixed attention, ATEM/DFlash paths |
+| Muse Spark Open | text; image, audio, video where present | yes: official BF16/NVFP4, MLX 3/4-bit and oQ3e/oQ4e | `muse-spark` + selected media companions | compressed MoE, scheduled attention, ATEM, DSpark/DFlash2; [validation scope](#muse-spark-evidence-and-support-status) |
 | Moshi | realtime codec tokens | yes | no | temporal/depth generation without a codec dependency |
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 | NemotronLabs VoiceChat | realtime PCM speech, text, transcription, tools | yes | `nemotron_voicechat`; explicit split component bundle and companion | single-device controlled/iterator session; [validation](voicechat-validation.md) |
@@ -599,6 +600,133 @@ Qwen3.5 also admits converted MLX-VLM checkpoints with
 `mlx-community/Qwen3.5-0.8B-8bit` artifact. Official SafeTensors and GGUF retain
 their format-specific handling. See [MLX checkpoint validation](qwen35-mlx-validation.md)
 for conversion semantics, pinned reference results and remaining validation gaps.
+
+## Muse Spark evidence and support status
+
+Spark is a distinct registered identity using the shared neutral `muse` decoder,
+media, preparation, placement and execution implementation with Glimmer.
+Supported paths include resident, host-layerwise and disk-streamed parameters;
+TP, PP, EP and combined placement; resident or paged state; expert caching and
+eligible load-time quantization; text/image/waveform/video preparation;
+observations and interventions; prompt-cache identity; and ordinary/controlled
+sessions with snapshots, restore, fork, cancellation and termination. Independent
+external drafting and the published DSpark/DFlash2 assistants use shared proposal,
+verification and commitment drivers. Spark accepts media and produces text.
+
+The [pinned inventory](../validation/fixtures/muse-spark/inventory.json) records
+complete revisions, publisher file sizes/hashes and reference-source identities.
+It admits these checkpoint layouts:
+
+| Publisher | Selected layouts | Component coverage |
+| --- | --- | --- |
+| Meta | official BF16 and ModelOpt NVFP4 SafeTensors | text, vision and waveform towers |
+| ggml-org | BF16, Q2_K, Q4_K_S and Q8_0 GGUF | text plus selected published media companions |
+| Unsloth | the eight pinned Dynamic GGUF variants, including IQ1/IQ2/IQ3 and Q2/Q3/Q4 | text plus selected published media companions |
+| mlx-community | standard 3/4-bit and mixed oQ3e/oQ4e SafeTensors | standard releases are text-only; oQ releases include vision without audio |
+| Inferact / RadixArk | Spark DSpark and DFlash2 assistants | target-conditioned text proposals; target supplies tokenizer and media context |
+
+AMD Quark FP8/MXFP4 and Intel GPTQ admission are outside this selected scope.
+MLX oQ checkpoints retain each weight's actual physical encoding; oQ4e includes
+NVFP4 expert projections. GGUF admission preserves format-specific normalization,
+rotary transforms, split members and projector identities. Complete catalogs and
+companions are validated before native binding. Selected NVFP4 experts remain
+packed until bounded conversion; loading does not expand a complete checkpoint.
+
+Actual artifact coverage determines usable modalities. `MediaCompanionSources`
+selects independently admitted BF16 vision and audio sources, including complete
+indexed media members without unrelated decoder members. Geometry, token IDs,
+processor policy and provenance are checked before loading. Missing components
+produce a typed `MissingCompanion` error during request preparation; text-only
+loading remains usable. The text CLI exposes `--vision-companion DIRECTORY` and
+`--audio-companion DIRECTORY`. Plan overrides replace only the requested role;
+replay and benchmark candidates preserve both roles, and cached selections must
+match the request. See [model loading](model-loading.md#independent-media-sources).
+
+Decoder policy retains the released 62-layer attention schedule, compressed MoE,
+FP32 routing with selection-only correction bias, scale-before-RMS expert output
+normalization, and learned FP32 residual combination. TP reconstructs each expert
+output before nonlinear normalization, then applies route weights and accumulation.
+Queries split evenly; complete KV heads split or repeat across adjacent TP ranks.
+Routers, latent projections, gates and norms have explicit replica accounting.
+Vision uses the selected adapter/projection policy. Mono 24 kHz audio uses the
+four-stage causal pyramid, 1,920-sample cadence and retained convolution/input carry.
+
+Spark chat uses the published ATEM tools, recipient and termination semantics.
+`reasoning_effort` selects low/medium/high/xhigh strengths 8/32/256/512; the default
+is xhigh. The template supplies BOS and distinguishes intermediate-message from
+end-of-turn tokens. Official `l4_200k_base` reconstructs the tokenizer when
+`tokenizer.json` is absent; GGUF uses its admitted tokenizer metadata and BOS policy.
+DFlash2's `qwen3` configuration is recognized as an assistant before target-family
+discovery. Pure TP DSpark can shard its body with replicated scoring heads;
+DFlash2 and other selected placements use explicitly accounted replicas.
+
+Implementation coverage and validation coverage are separate. The concise
+[acceptance results](../validation/fixtures/muse-spark/acceptance-results.json)
+retain measured results and source-report digests. Detailed tensors, checkpoint
+payloads and run traces remain outside the repository.
+
+| Recorded acceptance | Result | Scope |
+| --- | --- | --- |
+| Complete official NVFP4 target | prefill plus three cached calls; 808,192 scores agree exactly | pinned independent Transformers/ModelOpt reference, same encoded artifact, bounded CPU execution |
+| NVFP4 mixed image/audio/video/text | prefill plus three cached calls; score error zero | prepared media tensors and pinned parent reference; excludes host preprocessing parity |
+| Released DSpark and DFlash2 | four generated IDs `[131, 50133, 220, 43810]` match ordinary target generation | bounded public facade text generation |
+| Released DSpark TP2 controlled | same IDs; two proposals, one accepted | snapshot/restore/fork and semantic text replay |
+| Released DFlash2 TP2 controlled | same IDs; three proposals, none accepted | initial and populated-context snapshot/restore/fork and semantic text replay |
+
+The reference pins Transformers `b0cdc61e607f39403e248b11c35aef4edfa7d216`
+and ModelOpt `f0daaa241ac6644e9bedd19a1af40c4a2aa8ca04`. Official BF16 is
+`0fb02478b02565b2ce7fc57e6051c91172774ac9`; NVFP4 is
+`4239e4db19376904f2e82c167e78f70abb5455fe`. The released assistants are
+DSpark `6f7aed1cac8d8b1c02a902988876172b39e49fc0` and DFlash2
+`46c90f412549c472941a68382d91a99e5e6372a0`. Serving-reference identities and
+all community layout revisions remain in the inventory.
+
+The validation machine is an Apple M3 Ultra with 256 GiB RAM. BF16 payloads total
+1,644,333,393,864 bytes and are storage-blocked. Verified NVFP4 payloads occupy
+533,011,023,472 bytes and exceed resident RAM; completed runs use bounded loading.
+Released controlled TP2 runs use target device/host caches of 20/14 GiB per rank,
+assistant caches of 8/8 GiB per rank and unused native allocator cache zero.
+These parameter budgets exclude native operator workspace and live state.
+Forecasting retains the ordinary MLX backend's unknown kernel-workspace and future
+allocator-capacity coverage; it supplies no extra Spark-specific finite fit claim.
+
+Full BF16 numerical acceptance, community-layout whole-model reference execution,
+native Metal, released distributed media and released coupled native PP/EP
+assistant sessions remain unvalidated. Catalog admission is not numerical parity.
+These are explicit validation gaps, not architectural restrictions. Shared
+execution conformance covers portable partition, state and lifecycle contracts.
+
+Reproduce metadata/payload preparation outside tracked source:
+
+```sh
+python3 validation/muse_spark_inventory.py validation/fixtures/muse-spark/inventory.json /tmp/eredu-spark-evidence --repository meta-models/Muse-Spark-Open-816B-A42B-NVFP4 --headers
+python3 validation/muse_spark_payload.py --help
+```
+
+The payload utility uses the existing Hugging Face credential/profile, verifies
+pinned SHA-256 values and retains 64 GiB free disk headroom. It never records a
+credential. Fetch the pinned independent sources into external paths, then run:
+
+```sh
+python3 validation/muse_spark_reference_run.py "$spark_checkpoint" "$spark_transformers_source" "$spark_modelopt_source" "$spark_reference_output"
+cargo run --profile conformance -p eredu-backend-mlx --no-default-features --example muse_spark_reference -- "$spark_checkpoint" "$spark_reference_output" "$spark_native_output" --atol 0 --rtol 0 --device cpu
+```
+
+Mixed-media acceptance adds `--multimodal --vision-utils PATH --configuration PATH`
+to the Python reference and `--multimodal` to the native comparison. Optional
+`--trace-layers` writes detailed diagnostics to the external output directory.
+Reference execution requires Python 3.11, PyTorch 2.9.0 and NumPy 2.3.4.
+
+`validation/muse_spark_dspark_released_reference.py` and
+`validation/muse_spark_dflash_released_reference.py` run complete released
+assistants against their pinned serving sources and retained target captures.
+`muse_spark_assistant_reference` compares complete assistant context/body/scoring
+outputs with explicit tolerances. The public `eredu` example
+`speculative_reference` compares ordinary and assisted generation and accepts
+controlled/snapshot and placement options. `validation/muse_spark_facade_text.py`
+checks delivered text against the pinned tokenizer bytes. Generated references,
+score arrays, debug tests and detailed run records belong outside the repository;
+there is no checked-in component numerical-regression fixture suite.
 
 ## Checkpoint formats
 

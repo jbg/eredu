@@ -377,6 +377,16 @@ impl WeightStore for MemoryWeightStore {
 }
 
 impl CheckpointSource for MemoryWeightStore {
+    fn has_direct_encoded_leases(&self) -> bool {
+        true
+    }
+
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        self.tensors.values().try_fold(0u64, |total, tensor| {
+            total.checked_add(tensor.metadata.encoded_byte_len)
+        })
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         Some(&self.recipes)
     }
@@ -400,6 +410,23 @@ impl CheckpointSource for MemoryWeightStore {
 
 /// Object-safe cold-path checkpoint source used by generic materializers.
 pub trait CheckpointSource: Send + Sync {
+    /// Every acquired lease exposes its selected encoded payload directly,
+    /// without a deferred portable format converter or a larger physical group.
+    /// Native recipe workspace accounting may rely on this fact; unknown or
+    /// converting sources keep the default. This does not acquire any lease.
+    fn has_direct_encoded_leases(&self) -> bool {
+        false
+    }
+
+    /// Upper payload bytes owned by the source independently of outstanding
+    /// leases, including caches populated by future reads. Excludes headers,
+    /// reader buffers, allocator overhead and lease-owned selected payloads.
+    /// Restricting a catalog does not release its backing source's ownership.
+    /// Unknown sources must keep the default rather than infer zero from files.
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        None
+    }
+
     /// Stable upper bound for native transformation temporaries, including after publication.
     fn preparation_working_set_bytes(&self) -> u64 {
         0
@@ -703,6 +730,14 @@ impl PreparedCheckpointSource {
 }
 
 impl CheckpointSource for PreparedCheckpointSource {
+    fn has_direct_encoded_leases(&self) -> bool {
+        self.source.has_direct_encoded_leases()
+    }
+
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        self.source.retained_payload_bytes_upper_bound()
+    }
+
     fn prepared_cache_policy(
         &self,
     ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
@@ -834,6 +869,18 @@ impl CompositeCheckpointSource {
 }
 
 impl CheckpointSource for CompositeCheckpointSource {
+    fn has_direct_encoded_leases(&self) -> bool {
+        self.sources.iter().all(|source| source.has_direct_encoded_leases())
+    }
+
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        // Child views can share backing. Summing is conservative even then;
+        // catalog disjointness does not prove allocation disjointness.
+        self.sources.iter().try_fold(0u64, |total, source| {
+            total.checked_add(source.retained_payload_bytes_upper_bound()?)
+        })
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         self.sources
             .iter()
@@ -1086,6 +1133,14 @@ impl RestrictedCheckpointSource {
 }
 
 impl CheckpointSource for RestrictedCheckpointSource {
+    fn has_direct_encoded_leases(&self) -> bool {
+        self.source.has_direct_encoded_leases()
+    }
+
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        self.source.retained_payload_bytes_upper_bound()
+    }
+
     fn preparation_working_set_bytes(&self) -> u64 {
         self.source.preparation_working_set_bytes()
     }
@@ -1227,6 +1282,14 @@ impl ResolvedCheckpointSource {
 }
 
 impl CheckpointSource for ResolvedCheckpointSource {
+    fn has_direct_encoded_leases(&self) -> bool {
+        self.source.has_direct_encoded_leases()
+    }
+
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        self.source.retained_payload_bytes_upper_bound()
+    }
+
     fn prepared_cache_policy(
         &self,
     ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
@@ -2064,6 +2127,15 @@ impl WeightStore for SafetensorsWeightStore {
 }
 
 impl CheckpointSource for SafetensorsWeightStore {
+    fn has_direct_encoded_leases(&self) -> bool {
+        true
+    }
+
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        // Full-tensor cache entries are weak; selected buffers belong to leases.
+        Some(0)
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         Some(self.shards.recipe_cache())
     }
@@ -2330,18 +2402,29 @@ fn plan_safetensors_reads(
                 context: format!("selection block bytes for {key:?}"),
             })?
     };
+    // Coalesce adjacent coordinates once rather than rebuilding the same run
+    // for every outer row of a column-partitioned matrix.
+    let mut runs = Vec::new();
+    for index in indices {
+        let end = index.checked_add(1).ok_or_else(|| StoreError::Overflow {
+            context: format!("selection index end for {key:?}"),
+        })?;
+        push_coalesced_range(&mut runs, index..end);
+    }
     let mut ranges = Vec::new();
     for outer_index in 0..outer {
-        for index in &indices {
+        for run in &runs {
             let start = outer_index
                 .checked_mul(axis_len)
-                .and_then(|value| value.checked_add(*index))
+                .and_then(|value| value.checked_add(run.start))
                 .and_then(|value| value.checked_mul(block_bytes))
                 .ok_or_else(|| StoreError::Overflow {
                     context: format!("selection byte start for {key:?}"),
                 })?;
-            let end = start
-                .checked_add(block_bytes)
+            let end = run
+                .len()
+                .checked_mul(block_bytes)
+                .and_then(|length| start.checked_add(length))
                 .ok_or_else(|| StoreError::Overflow {
                     context: format!("selection byte end for {key:?}"),
                 })?;
@@ -2424,16 +2507,24 @@ fn read_safetensors_range_pass(
             .ok_or_else(|| StoreError::Overflow {
                 context: format!("selected payload offset for {}", path.display()),
             })?;
-        file.seek(SeekFrom::Start(u64::try_from(absolute).map_err(|_| {
-            StoreError::Overflow {
-                context: format!("selected payload offset for {}", path.display()),
-            }
-        })?))
-        .map_err(|error| io_error(path, error))?;
+        let offset = u64::try_from(absolute).map_err(|_| StoreError::Overflow {
+            context: format!("selected payload offset for {}", path.display()),
+        })?;
         let start = output.len();
         output.resize(start + range.len(), 0);
-        file.read_exact(&mut output[start..])
-            .map_err(|error| io_error(path, error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(&mut output[start..], offset)
+                .map_err(|error| io_error(path, error))?;
+        }
+        #[cfg(not(unix))]
+        {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| io_error(path, error))?;
+            file.read_exact(&mut output[start..])
+                .map_err(|error| io_error(path, error))?;
+        }
         telemetry.physical_reads.fetch_add(1, Ordering::Relaxed);
         telemetry
             .physical_read_bytes
@@ -2743,6 +2834,38 @@ mod tests {
         validation::resolve_safetensors_plan,
     };
     use safetensors::tensor::{serialize_to_file, TensorView};
+
+    #[test]
+    fn source_payload_bound_keeps_hidden_backing_and_file_leases_separate() {
+        let source: SharedCheckpointSource = Arc::new(MemoryWeightStore::from_safetensors([
+            ("visible".into(), Dtype::U8, vec![2], vec![1, 2]),
+            ("hidden".into(), Dtype::U8, vec![7], vec![3; 7]),
+        ]).unwrap());
+        let restricted = RestrictedCheckpointSource::including(
+            source, "visible-only", BTreeSet::from(["visible".into()]),
+        ).unwrap();
+        assert_eq!(restricted.source_keys(), ["visible"]);
+        assert_eq!(restricted.retained_payload_bytes_upper_bound(), Some(9));
+        assert!(restricted.has_direct_encoded_leases());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        serialize_to_file(
+            [("weight", TensorView::new(Dtype::U8, vec![3], &[4, 5, 6]).unwrap())],
+            None, &path,
+        ).unwrap();
+        let source = SafetensorsWeightStore::open(&path).unwrap();
+        let lease = source.acquire_lease(TensorReadRequest {
+            key: "weight".into(), selection: TensorSelection::Full,
+            policy: ReadPolicy::RequireBounded,
+        }).unwrap();
+        assert_eq!(lease.encoded_bytes().unwrap(), &[4, 5, 6]);
+        assert!(source.has_direct_encoded_leases());
+        assert_eq!(source.retained_payload_bytes_upper_bound(), Some(0));
+        // The live lease owns these bytes; its weak cache entry does not add
+        // another retained source allocation, before or after the lease ends.
+        drop(lease);
+        assert_eq!(source.retained_payload_bytes_upper_bound(), Some(0));
+    }
 
     #[test]
     fn shard_admission_survives_views_stores_and_payload_cache_eviction() {
@@ -3313,6 +3436,31 @@ mod tests {
         expected.extend_from_slice(&selected[32..40]);
         assert_eq!(lease.encoded_bytes().unwrap(), expected);
         assert!(std::fs::metadata(&path).unwrap().len() > diagnostics.physical_read_bytes);
+
+        // Adjacent coordinates may share a read, but repeated and descending
+        // coordinates retain their requested output order on every outer row.
+        let gathered = store
+            .acquire(TensorReadRequest {
+                key: "selected".into(),
+                selection: TensorSelection::Indices {
+                    axis: 1,
+                    indices: vec![1, 2, 1, 0],
+                },
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
+        assert_eq!(gathered.output_shape(), &[2, 4, 2]);
+        assert_eq!(
+            gathered.encoded_bytes().unwrap(),
+            f32_bytes(&[
+                2.0, 3.0, 4.0, 5.0, 2.0, 3.0, 0.0, 1.0, 8.0, 9.0, 10.0, 11.0, 8.0, 9.0, 6.0, 7.0,
+            ])
+        );
+        assert!(gathered.bounded_read_proof().physically_bounded);
+        assert_eq!(
+            store.diagnostics().unwrap().physical_read_bytes - diagnostics.physical_read_bytes,
+            64
+        );
     }
 
     #[test]

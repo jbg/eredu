@@ -34,6 +34,7 @@ impl
                 return Self::shared_backbone_memory_profile(runtime);
             }
             return Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                conditioned: None,
                 refinement: Self::refinement_memory_plan(runtime, None)?,
                 shared_backbone: None,
                 embedded: None,
@@ -58,6 +59,7 @@ impl
             };
             return Ok(Some(
                 eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                    conditioned: None,
                     refinement: Self::refinement_memory_plan(runtime, None)?,
                     shared_backbone: None,
                     embedded: Some(topology.clone()),
@@ -84,18 +86,20 @@ impl
             // Cross-device copies need exact separate-pool identities/placement.
             return Ok(None);
         }
-        let Some(draft) = drafter.autoregressive_memory_profile(target)? else {
-            // Feature-conditioned assistants require their own architecture
-            // projection, including the captured target features they retain.
+        let conditioned = drafter.conditioned_memory_profile()?;
+        let draft = drafter.autoregressive_memory_profile(target)?;
+        if draft.is_none() && conditioned.is_none() {
+            // This selected assistant has no retained architecture resource projection.
             return Ok(None);
-        };
+        }
         Ok(Some(
             eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                conditioned,
                 refinement: Self::refinement_memory_plan(runtime, None)?,
                 shared_backbone: None,
                 embedded: None,
                 parameter_conversions: None,
-                draft: Some(draft),
+                draft,
                 auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(
                     0,
                 ),
@@ -124,6 +128,7 @@ impl GenerationForecastBackend for MlxBackend<'_> {
     fn shared_backbone_memory_profile(runtime: &ModelRuntime<Self>) -> Result<Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>, GenerationForecastError> {
         let Some(policy) = runtime.session().capability_estimate().map_err(|error| CapabilityError::Observation(error.to_string()))?.shared_backbone_draft() else { return Ok(None); };
         Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+            conditioned: None,
             refinement: Self::refinement_memory_plan(runtime, None)?,
             shared_backbone: Some(eredu_runtime::memory_forecast::SharedBackboneMemoryPlan::from_policy(policy)),
             embedded: None, draft: None, parameter_conversions: None,
@@ -196,6 +201,17 @@ impl GenerationForecastBackend for MlxBackend<'_> {
             None
         };
         ForecastExecutionContract {
+            input_retention: if runtime
+                .session()
+                .payload
+                .model
+                .erased()
+                .supports_retained_prefill()
+            {
+                eredu_runtime::memory_forecast::PrefillInputRetention::PreparedProducts
+            } else {
+                eredu_runtime::memory_forecast::PrefillInputRetention::TokenIds
+            },
             full_pass_reason,
             logits: if !instrumented
                 && runtime

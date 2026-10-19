@@ -266,6 +266,9 @@ impl BlockwiseAttentionAccumulator {
                 .as_dtype(Dtype::Float32, stream)?
                 .multiply(Array::from_f32(self.scale), stream)?
                 .as_dtype(self.output_dtype, stream)?
+        } else if self.arithmetic == eredu_nn::AttentionArithmetic::Float32 {
+            grouped_head_product(&self.queries, &keys.swap_axes(-1, -2, stream)?, stream)?
+                .multiply(Array::from_f32(self.scale), stream)?
         } else {
             grouped_head_product(
                 &self.queries.multiply(Array::from_f32(self.scale), stream)?,

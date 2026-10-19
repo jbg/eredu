@@ -141,6 +141,7 @@ fn run_speculative(
 ) -> anyhow::Result<GenerationResult> {
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?)
         .with_drafting(DraftingPlan::External {
+            residency: eredu_core::ResidencyPlan::FullyResident,
             model: assistant_dir.display().to_string(),
             placement: DraftPlacementPlan::Target,
             max_draft_tokens: 3,

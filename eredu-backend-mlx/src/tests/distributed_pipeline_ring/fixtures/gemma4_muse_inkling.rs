@@ -154,7 +154,7 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
     write_muse_glimmer_fixture(directory, false, false, false);
 }
 
-fn write_muse_glimmer_component_fixture(directory: &Path, routed: bool, quantizable: bool) {
+pub(crate) fn write_muse_glimmer_component_fixture(directory: &Path, routed: bool, quantizable: bool) {
     write_muse_glimmer_fixture(directory, true, routed, quantizable);
 }
 
@@ -240,14 +240,14 @@ fn write_muse_glimmer_fixture(directory: &Path, components: bool, routed: bool, 
     .unwrap();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
+    let args = eredu_architectures::muse::DecoderConfig::from_hf_json(
         &serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    type Architecture = eredu_architectures::muse_glimmer::LayeredModel<
+    type Architecture = eredu_architectures::muse::LayeredModel<
         crate::backend::nn::shared::MlxNeuralBackend,
     >;
-    type State = crate::backend::runtime::cache::state::MlxKeyValueState;
+    type State = crate::backend::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args, stream).unwrap();
     let mut arrays = Vec::<(String, Array)>::new();
     struct Collector<'a> {

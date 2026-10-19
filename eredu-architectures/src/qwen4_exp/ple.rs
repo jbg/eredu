@@ -73,6 +73,7 @@ impl LexicalInjectionSpec {
         };
         let norm = |suffix: &str| -> Result<NormalizationConstructionSpec, Error> {
             Ok(NormalizationConstructionSpec {
+                reduction: eredu_nn::NormalizationReduction::Native,
                 dimensions: geometry.flattened_width(),
                 groups: Some(geometry.streams()),
                 epsilon: config.norm_epsilon,
@@ -100,6 +101,7 @@ impl LexicalInjectionSpec {
             query_norm: norm("norm_query")?,
             convolution_norm: norm("norm_conv")?,
             convolution: CausalDepthwiseConvolutionSpec {
+                arithmetic: eredu_nn::ConvolutionArithmetic::Native,
                 channels: geometry.flattened_width(),
                 kernel_size: config.ngram.kernel,
                 dilation: config.ngram.order,

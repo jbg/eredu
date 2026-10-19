@@ -227,7 +227,7 @@ fn verify(device: LocalDevice) {
                 }
             }
             let plan = InterventionPlan {
-                schema_version: 1,
+                schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
                 operations,
             };
             let prepared = model

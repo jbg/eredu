@@ -307,6 +307,18 @@ struct Cli {
     #[arg(long, default_value = "target", value_name = "PLACEMENT")]
     speculative_draft_device: SpeculativeDraftDevice,
 
+    /// Retained external parameter policy from an exact execution plan.
+    #[arg(skip)]
+    draft_residency: ResidencyPlan,
+
+    /// Independently admitted image/video tower and processor directory.
+    #[arg(long, value_name = "DIRECTORY")]
+    vision_companion: Option<PathBuf>,
+
+    /// Independently admitted waveform tower and processor directory.
+    #[arg(long, value_name = "DIRECTORY")]
+    audio_companion: Option<PathBuf>,
+
     /// Prompt text. Reads the prompt from stdin when omitted and stdin is piped.
     #[arg(value_name = "PROMPT")]
     prompt: Option<String>,
@@ -471,6 +483,17 @@ struct Cli {
 }
 
 impl Cli {
+    fn media_companions(&self) -> eredu_core::MediaCompanionSources {
+        let mut sources = eredu_core::MediaCompanionSources::default();
+        if let Some(path) = &self.vision_companion {
+            sources = sources.with_vision(path);
+        }
+        if let Some(path) = &self.audio_companion {
+            sources = sources.with_audio(path);
+        }
+        sources
+    }
+
     fn generation_overrides(&self) -> GenerationConfigOverrides {
         GenerationConfigOverrides {
             temperature: self.common.temperature,
@@ -488,6 +511,8 @@ impl Cli {
 }
 
 const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
+    "vision_companion",
+    "audio_companion",
     "draft_model",
     "mlx_cache_limit_bytes",
     "speculative_draft_tokens",
@@ -561,6 +586,12 @@ impl AutomaticCliOverrides {
     }
 
     fn restore(&self, args: &mut Cli, original: &Cli) {
+        if self.contains("vision_companion") {
+            args.vision_companion = original.vision_companion.clone();
+        }
+        if self.contains("audio_companion") {
+            args.audio_companion = original.audio_companion.clone();
+        }
         if self.contains("mlx_cache_limit_bytes") {
             args.common.mlx_cache_limit_bytes = original.common.mlx_cache_limit_bytes;
         }
@@ -622,6 +653,7 @@ impl AutomaticCliOverrides {
             args.disable_speculative_adaptive_lookahead =
                 original.disable_speculative_adaptive_lookahead;
             args.speculative_draft_device = original.speculative_draft_device;
+            args.draft_residency = original.draft_residency.clone();
         } else {
             if self.contains("speculative_draft_tokens") {
                 args.speculative_draft_tokens = original.speculative_draft_tokens;
@@ -1506,6 +1538,7 @@ fn automatic_benchmark_candidates(
             .into_iter()
             .enumerate()
     {
+        let plan = plan.with_media_companions(heuristic.plan.media_companions().clone());
         if (index == 0 && !resident_fits) || (index == 1 && !layerwise_fits) {
             continue;
         }
@@ -1827,6 +1860,8 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
 }
 
 fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
+    args.vision_companion = plan.media_companions().vision().map(Path::to_path_buf);
+    args.audio_companion = plan.media_companions().audio().map(Path::to_path_buf);
     match plan.weight_transformation() {
         WeightTransformationPlan::PreserveCheckpoint => {
             args.common.quantize = None;
@@ -1892,11 +1927,13 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
             args.disable_speculative_adaptive_lookahead = !adaptive_lookahead;
         }
         DraftingPlan::External {
+            residency,
             max_draft_tokens,
             lookahead,
             adaptive_lookahead,
             ..
         } => {
+            args.draft_residency = residency.clone();
             args.speculative_draft_tokens = *max_draft_tokens;
             args.disable_speculative_lookahead = !lookahead;
             args.disable_speculative_adaptive_lookahead = !adaptive_lookahead;
@@ -1920,7 +1957,8 @@ fn automatic_report_with_cache(
         let key = automatic_cache_key(model_path, &observations)?;
         if prior_telemetry.is_empty() {
             if let Some(mut cached) = cached_automatic_report(path, &key)? {
-                if (!matches!(cached.plan.drafting(), DraftingPlan::External { .. })
+                if cached.plan.media_companions() == &args.media_companions()
+                    && (!matches!(cached.plan.drafting(), DraftingPlan::External { .. })
                     || args.draft_model.is_some())
                     && overrides.apply_to_plan(
                         &cached.plan,
@@ -2810,6 +2848,7 @@ fn cli_execution_plan(
             },
         };
         DraftingPlan::External {
+            residency: args.draft_residency.clone(),
             model: path.display().to_string(),
             placement,
             max_draft_tokens: args.speculative_draft_tokens,
@@ -2840,6 +2879,7 @@ fn cli_execution_plan(
                     .expect("the singleton topology is valid"),
             )
             .with_residency(residency)
+            .with_media_companions(args.media_companions())
             .with_weight_transformation(transformation)
             .with_max_cached_shards(args.common.cached_shards)
             .with_expert_cache(expert_cache)
@@ -3961,6 +4001,66 @@ mod tests {
                 plan
             );
         }
+    }
+
+    #[test]
+    fn independent_media_companions_survive_plan_overrides_and_replay() {
+        let original = Cli::try_parse_from([
+            "eredu", "--model", "text-model", "--no-auto",
+            "--vision-companion", "vision-source", "--audio-companion", "audio-source",
+        ]).unwrap();
+        let selected = cli_execution_plan(&original, None, false).unwrap();
+        assert_eq!(selected.media_companions().vision(), Some(Path::new("vision-source")));
+        assert_eq!(selected.media_companions().audio(), Some(Path::new("audio-source")));
+        let json = serde_json::to_vec(&selected).unwrap();
+        let selected: ExecutionPlan = serde_json::from_slice(&json).unwrap();
+        let mut replay = Cli::try_parse_from(["eredu", "--model", "text-model", "--no-auto"]).unwrap();
+        apply_automatic_plan(&mut replay, &selected).unwrap();
+        assert_eq!(cli_execution_plan(&replay, None, false).unwrap(), selected);
+        let resources = ModelResourceProfile::unmeasured(
+            "text-model".into(), eredu_core::ArtifactFormat::SafeTensors,
+        );
+        for (flag, replacement, expected_vision, expected_audio) in [
+            ("--audio-companion", "replacement-audio", "vision-source", "replacement-audio"),
+            ("--vision-companion", "replacement-vision", "replacement-vision", "audio-source"),
+        ] {
+            let matches = Cli::command().try_get_matches_from([
+                "eredu", "--model", "text-model", flag, replacement,
+            ]).unwrap();
+            let args = Cli::from_arg_matches(&matches).unwrap();
+            let plan = AutomaticCliOverrides::from_matches(&matches)
+                .apply_to_plan(&selected, &args, None, &resources).unwrap();
+            assert_eq!(plan.media_companions().vision(), Some(Path::new(expected_vision)));
+            assert_eq!(plan.media_companions().audio(), Some(Path::new(expected_audio)));
+        }
+    }
+
+    #[test]
+    fn automatic_overrides_preserve_external_parameter_policy() {
+        let matches = Cli::command().try_get_matches_from([
+            "eredu", "--model", "target", "--auto", "quick",
+            "--speculative-draft-tokens", "5", "prompt",
+        ]).unwrap();
+        let args = Cli::from_arg_matches(&matches).unwrap();
+        let residency = ResidencyPlan::DenseDiskStream {
+            device_budget_bytes: 8 << 30, host_budget_bytes: 4 << 30,
+            host_lookahead: 1, background_queue: 1,
+        };
+        let plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap())
+            .with_drafting(DraftingPlan::External {
+                model: "assistant".into(), placement: super::DraftPlacementPlan::Target,
+                residency: residency.clone(), max_draft_tokens: 2,
+                lookahead: true, adaptive_lookahead: true,
+            });
+        let mut replay = args.clone();
+        apply_automatic_plan(&mut replay, &plan).unwrap();
+        assert_eq!(cli_execution_plan(&replay, Some(Path::new("assistant")), false).unwrap(), plan);
+        let resources = ModelResourceProfile::unmeasured("target".into(), eredu_core::ArtifactFormat::SafeTensors);
+        let selected = AutomaticCliOverrides::from_matches(&matches)
+            .apply_to_plan(&plan, &args, Some(Path::new("assistant")), &resources).unwrap();
+        assert!(matches!(selected.drafting(), DraftingPlan::External {
+            residency: actual, max_draft_tokens: 5, ..
+        } if actual == &residency));
     }
 
     #[test]

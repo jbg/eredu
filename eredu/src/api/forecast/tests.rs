@@ -82,6 +82,7 @@ fn forecast(profile: LoadedMemoryProfile) -> Result<GenerationForecast, Generati
         3,
         eredu_core::PrefillChunkPolicy::Unchunked,
         ForecastExecutionContract {
+            input_retention: eredu_runtime::memory_forecast::PrefillInputRetention::TokenIds,
             full_pass_reason: None,
             logits: LogitsWorkspace::FinalPosition,
         },
@@ -175,6 +176,7 @@ fn generic_topology_credits_resident_conversions_without_losing_promotion() {
             input,
             output,
             format: eredu_checkpoint::LinearFormat::Dense,
+            arithmetic: eredu_nn::LinearArithmetic::Native,
             bias: false,
             parameter: format!("projection-{input}-{output}"),
         };
@@ -252,5 +254,31 @@ fn generic_topology_credits_resident_conversions_without_losing_promotion() {
                     .unwrap(),
             retained + retained / 2
         );
+    }
+}
+
+#[test]
+fn retained_decoder_products_cannot_be_reported_as_only_token_storage() {
+    for (retention, expected_upper) in [
+        (PrefillInputRetention::TokenIds, Some(68)),
+        (PrefillInputRetention::PreparedProducts, None),
+    ] {
+        let forecast = loaded_forecast(
+            profile(Observed::exact(0, "empty"), 1024),
+            InputTokenCount::text(17),
+            3,
+            eredu_core::PrefillChunkPolicy::Bounded(std::num::NonZeroUsize::new(2).unwrap()),
+            ForecastExecutionContract {
+                input_retention: retention,
+                full_pass_reason: None,
+                logits: LogitsWorkspace::FinalPosition,
+            },
+            &GenerationForecastOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(forecast.request.prefill_chunk_tokens, 2);
+        let retained = &forecast.request.domains[0].retained_input;
+        assert_eq!(retained.lower_bytes, 68);
+        assert_eq!(retained.upper_bytes, expected_upper);
     }
 }

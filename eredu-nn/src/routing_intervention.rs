@@ -9,7 +9,7 @@ pub use execution::{
 /// Precise stage at which router bias is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupScoreStage {
-    /// Projection output, including its learned bias, before the score transform.
+    /// Projection output, including its learned bias and logit scale, before scoring.
     RawLogits,
     /// Output of the score transform, before selection-only correction.
     TransformedScores,

@@ -11,9 +11,52 @@ use eredu_checkpoint::LinearFormat;
 /// One invocation's typed logical geometry, derived from ordinary operator inputs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MechanismInvocation {
+    /// Dense FP32 router projection after operand conversion, before bias,
+    /// logit scaling and scoring. Packed-source decoding and casts are separate.
+    Float32GroupProjection {
+        /// Independent input rows.
+        rows: u64,
+        /// Decoder/input width.
+        input: u64,
+        /// Available groups/output width.
+        groups: u64,
+    },
+    /// Index selection from already transformed/corrected score rows. Learned
+    /// projection, score transformation and coefficient normalization are separate.
+    GroupIndexSelection {
+        /// Independent score rows.
+        rows: u64,
+        /// Available groups in each score row.
+        groups: u64,
+        /// Selected group IDs per row.
+        selected: u64,
+        /// Physical score representation.
+        element: TensorElementType,
+        /// Order retained before coefficient normalization.
+        order: crate::GroupSelectionOrder,
+    },
+    /// RMS normalization with an explicit physical-reference reduction policy.
+    RmsNormalization {
+        /// Independent sequences.
+        batch: u64,
+        /// Rows per sequence; channel-major traversal depends on this boundary.
+        time: u64,
+        /// Features per row.
+        width: u64,
+        /// Activation representation.
+        element: TensorElementType,
+        /// Selected reduction order.
+        reduction: crate::NormalizationReduction,
+        /// Learned scale is present.
+        weight: bool,
+        /// Bound scale representation, when known.
+        weight_element: Option<TensorElementType>,
+    },
     /// Affine final-axis layer normalization. Logical outputs use the nominal
     /// input representation; the selected backend establishes actual promotion.
     LayerNormalization {
+        /// Moment reduction and affine rounding order.
+        arithmetic: crate::LayerNormalizationArithmetic,
         /// Independent normalized rows.
         rows: u64,
         /// Final-axis feature count.
@@ -48,6 +91,8 @@ pub enum MechanismInvocation {
         output: u64,
         /// Selected physical encoding.
         format: LinearFormat,
+        /// Exact reduced-precision affine reduction and bias boundary.
+        arithmetic: crate::LinearArithmetic,
         /// Activation scalar representation.
         element: TensorElementType,
         /// Dense weight representation, when known (packed encodings use `format`).
@@ -111,6 +156,10 @@ pub enum MechanismInvocation {
     },
     /// Causal depthwise convolution including its retained history.
     Convolution {
+        /// Explicit convolution and bias rounding policy.
+        arithmetic: crate::ConvolutionArithmetic,
+        /// A per-channel additive bias is present.
+        bias: bool,
         /// Batch size.
         batch: u64,
         /// Input token count.

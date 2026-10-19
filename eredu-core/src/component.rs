@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 mod coordinates;
 pub use coordinates::{ComponentCoordinateError, ComponentCoordinateMap};
+mod residual;
+pub use residual::{ComponentResidualCombination, ComponentResidualCycle};
 mod routed;
 mod routed_read;
 mod streams;
@@ -29,7 +31,7 @@ pub use write::{
 };
 
 /// Version of the portable component topology.
-pub const COMPONENT_SCHEMA_VERSION: u32 = 13;
+pub const COMPONENT_SCHEMA_VERSION: u32 = 14;
 
 /// Architecture readout equation. Decomposition is of the affine score before
 /// `output_transform`; a nonlinear transform cannot be distributed over components.
@@ -80,6 +82,11 @@ impl std::ops::DerefMut for ComponentReadout {
 /// The enclosing readout declares the residual base and component membership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentReadoutEquation {
+    /// Ordered channelwise residual combinations. When populated, these cycles
+    /// replace a constant-weight additive sum of sublayer writes. Component and
+    /// whole-write scales describe their inputs before the cycle coefficients.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_cycles: Vec<ComponentResidualCycle>,
     /// Optional multi-stream residual equation. Its measured mixing coefficients
     /// replace a plain sum of scalar-scaled writes; they are not derivatives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,13 +432,13 @@ impl ComponentScalar {
 /// Normalization equation, including the parameters needed for exact centering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentNormalization {
-    /// Identity, RMS, L2 or centered LayerNorm before optional gain and bias.
+    /// Normalization equation and the declared placement of its gain.
     pub kind: ComponentNormalizationKind,
     /// Epsilon added inside the square root.
     pub epsilon: ComponentScalar,
     /// Canonical effective gain parameter, if learned.
     pub gain: Option<String>,
-    /// Constant added to the learned gain before multiplying normalized input.
+    /// Constant added to the learned gain before its declared multiplication.
     pub gain_offset: ComponentScalar,
     /// Canonical additive normalization bias, if present.
     pub bias: Option<String>,
@@ -448,6 +455,20 @@ pub enum ComponentNormalizationKind {
     Identity,
     /// `x / sqrt(mean(x*x) + epsilon)`.
     Rms,
+    /// Output-scaled RMS in FP32, restoring the activation dtype after applying
+    /// the gain. A learned gain plus `gain_offset` is formed in FP32, rounded to
+    /// its parameter dtype, then promoted back to FP32 before multiplication.
+    /// Without a gain this is weightless FP32 RMS with one final activation cast.
+    RmsFloat32,
+    /// Output-scaled RMS with the same FP32 gain arithmetic as `RmsFloat32`,
+    /// retaining its FP32 result instead of restoring the activation dtype.
+    RmsFloat32Output,
+    /// Scale before RMS. Form the effective gain as for `RmsFloat32`, multiply
+    /// FP32 input by that gain, round the product to the activation dtype, then
+    /// promote it to FP32 for `scaled / sqrt(mean(scaled*scaled) + epsilon)`.
+    /// Restore the activation dtype at the output; do not multiply the gain a
+    /// second time. A declared bias is added after this normalization.
+    InputScaledRmsFloat32,
     /// `(x - mean(x)) / sqrt(mean((x-mean(x))^2) + epsilon)`.
     Layer,
     /// `x / sqrt(sum(x*x) + epsilon)`, with additive epsilon, not a clamp.
@@ -484,6 +505,11 @@ pub enum ComponentActivation {
         key_value_heads: usize,
         /// Channels per query head.
         head_width: usize,
+        /// Normalize each complete attended head after positional aggregation,
+        /// before flattening and applying any output gate. This is separate from
+        /// query/key normalization and from normalization after the output matrix.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attended_head_normalization: Option<ComponentAttendedHeadNormalization>,
         /// Activation on a separate output-gate projection.
         output_gate: Option<ComponentNonlinearity>,
     },
@@ -581,6 +607,15 @@ pub struct ComponentHeadNormalization {
     pub independent_gains: bool,
     /// Exact equation and parameter identity. Independent gains use the flattened
     /// head vector with `groups = heads`; shared gains apply separately to each head.
+    pub normalization: ComponentNormalization,
+}
+
+/// Complete attended heads before normalization and channel gating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentAttendedHeadNormalization {
+    /// Read-only `[batch, head, sequence, channel]` input before normalization.
+    pub input: String,
+    /// Equation applied independently over each complete head's channel axis.
     pub normalization: ComponentNormalization,
 }
 

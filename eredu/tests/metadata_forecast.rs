@@ -28,6 +28,7 @@ impl ReplicatedTextMechanismSupport for Mechanisms {
         .with_exact_completion(true)
         .with_session(SessionCapabilities::new(true, true, true))
         .with_chunked_prefill(true)
+        .with_grouped_operations([GroupedOperationRequirement::GatedProduct])
     }
     fn supports_direct(&self, _: &WeightLoweringDescriptor) -> bool {
         true
@@ -83,7 +84,7 @@ impl PreparationMechanismProvider for Mechanisms {
         synthesize_replicated_text_capabilities(r, q, self)
     }
     fn processor_capabilities(&self) -> MediaPrimitiveCapabilities {
-        MediaPrimitiveCapabilities::new([], [], [], [], u64::MAX)
+        MediaPrimitiveCapabilities::new([], [eredu_core::InputModality::Text], [], [], u64::MAX)
     }
     fn speculative_capabilities(&self) -> SpeculativeMechanismCapabilities {
         SpeculativeMechanismCapabilities::new([])

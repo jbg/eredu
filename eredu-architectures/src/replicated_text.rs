@@ -1111,7 +1111,7 @@ where
         | EligibleConfig::NemotronLabsDiffusion(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
-        | EligibleConfig::MuseGlimmer(_)
+        | EligibleConfig::Muse(_)
         | EligibleConfig::QwenVl(_)
         | EligibleConfig::QwenCompositeHybrid(_) => {
             unreachable!("ordinary replicated eligibility returned heterogeneous state")
@@ -1873,7 +1873,7 @@ where
         | EligibleConfig::NemotronLabsDiffusion(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
-        | EligibleConfig::MuseGlimmer(_)
+        | EligibleConfig::Muse(_)
         | EligibleConfig::QwenVl(_)
         | EligibleConfig::QwenCompositeHybrid(_) => {
             Err(ReplicatedTextIneligibility::Unrelated.into())
@@ -2601,7 +2601,7 @@ enum EligibleConfig<'a> {
     DiffusionGemma(&'a crate::diffusion_gemma::FamilyConfig),
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
-    MuseGlimmer(&'a crate::muse_glimmer::DecoderConfig),
+    Muse(&'a crate::muse::DecoderConfig),
     QwenVl(&'a crate::qwen::vl::ModelArgs),
     QwenCompositeHybrid(&'a crate::qwen::hybrid::ParsedHybridConfig),
 }
@@ -2627,6 +2627,14 @@ impl EligibleConfig<'_> {
         Ok(Some(topology))
     }
 
+    fn prefill_input_retention(&self) -> eredu_runtime::memory_forecast::PrefillInputRetention {
+        use eredu_runtime::memory_forecast::PrefillInputRetention;
+        match self {
+            Self::Muse(_) => PrefillInputRetention::PreparedProducts,
+            _ => PrefillInputRetention::TokenIds,
+        }
+    }
+
     fn supports_chunked_prefill(&self) -> bool {
         match self {
             Self::DiffusionGemma(args) => {
@@ -2640,6 +2648,7 @@ impl EligibleConfig<'_> {
             | Self::Gemma2(_)
             | Self::K2Horizon(_)
             | Self::GptOss(_) => crate::decoder::CHUNKED_TEXT_PREFILL,
+            Self::Muse(_) => crate::muse::model::RETAINED_PREFILL,
             Self::Lfm2(_) => crate::lfm2::CHUNKED_TEXT_PREFILL,
             Self::QwenHybrid(_) | Self::QwenCompositeHybrid(_) => {
                 crate::qwen::hybrid::CHUNKED_TEXT_PREFILL
@@ -2671,7 +2680,7 @@ impl EligibleConfig<'_> {
             Self::QwenHybrid(args) => standard(args.hidden_size),
             Self::GptOss(args) => standard(args.hidden_size),
             Self::Inkling(args) => standard(args.text_config.hidden_size),
-            Self::MuseGlimmer(args) => standard(args.hidden_size),
+            Self::Muse(args) => standard(args.hidden_size),
             Self::NemotronH(args) => crate::nemotron_h::TargetBoundarySchema::from_args(args)
                 .wire_schema()
                 .map_err(|error| error.to_string()),
@@ -2873,16 +2882,17 @@ impl EligibleConfig<'_> {
                     }
                 }
             }
-            Self::MuseGlimmer(args) => {
-                if args.weight_convention == crate::muse_glimmer::WeightConvention::Gguf {
-                    extend(crate::muse_glimmer::checkpoint::projector_gguf_recipes(
-                        args, source,
-                    )?)?;
+            Self::Muse(args) => {
+                if args.weight_convention == crate::muse::WeightConvention::Gguf {
+                    let vision_source = source.source_provenance("model.vision_tower.patch_embedder.patch_embedding.weight").ok();
+                    if !vision_source.as_ref().is_some_and(|source| matches!(source.source_encoding, SourceTensorEncoding::Safetensors(_))) {
+                        extend(crate::muse::checkpoint::projector_gguf_recipes(args, source)?)?;
+                    }
                     if args.is_moe() {
                         let text_layers = usize::try_from(args.num_hidden_layers)
                             .map_err(|_| "invalid Muse-Glimmer text layer count".to_owned())?;
                         for layer in 0..text_layers {
-                            let expert = crate::muse_glimmer::expert_recipes(source, layer)?;
+                            let expert = crate::muse::expert_recipes(source, layer)?;
                             extend(BTreeMap::from([
                                 (expert.target_gate_up, expert.gate_up),
                                 (expert.target_down, expert.down),
@@ -2891,19 +2901,20 @@ impl EligibleConfig<'_> {
                     }
                     return Ok(recipes);
                 }
-                extend(crate::muse_glimmer::static_safetensors_recipes(
+                extend(crate::muse::static_safetensors_recipes(
                     args, source,
                 )?)?;
-                let counts = [
+                let mut counts = vec![
                     args.vision_config
                         .as_ref()
                         .map_or(0, |vision| vision.layer_count()),
                     usize::try_from(args.num_hidden_layers)
                         .map_err(|_| "invalid Muse-Glimmer text layer count".to_owned())?,
                 ];
+                if let Some(audio) = &args.audio_config {counts.push(audio.execution_units().map_err(|error| error.to_string())?.len());}
                 for (group, count) in counts.into_iter().enumerate() {
                     for index in 0..count {
-                        extend(crate::muse_glimmer::unit_safetensors_recipes(
+                        extend(crate::muse::unit_safetensors_recipes(
                             args, source, group, index,
                         )?)?;
                     }
@@ -2971,7 +2982,7 @@ impl EligibleConfig<'_> {
             Self::DiffusionGemma(args) => args.architecture_fingerprint(),
             Self::Gemma4(args) => args.architecture_fingerprint(),
             Self::Inkling(args) => args.architecture_fingerprint(),
-            Self::MuseGlimmer(args) => args.architecture_fingerprint(),
+            Self::Muse(args) => args.architecture_fingerprint(),
             Self::QwenVl(args) => crate::qwen::vl::prompt_cache_architecture_fingerprint(args),
             Self::QwenCompositeHybrid(args) => {
                 crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(args)
@@ -2984,8 +2995,8 @@ impl EligibleConfig<'_> {
         if matches!(self, Self::DiffusionGemma(_)) {
             return crate::diffusion_gemma::canonical_safetensors_target(name);
         }
-        if matches!(self, Self::MuseGlimmer(_)) {
-            return crate::muse_glimmer::checkpoint::canonical_safetensors_target(name);
+        if matches!(self, Self::Muse(_)) {
+            return crate::muse::checkpoint::canonical_safetensors_target(name);
         }
         if name.contains(".experts.") {
             if let Some(prefix) = name.strip_suffix(".scales") {
@@ -3081,7 +3092,7 @@ impl EligibleConfig<'_> {
             | Self::DiffusionGemma(_)
             | Self::Gemma4(_)
             | Self::Inkling(_)
-            | Self::MuseGlimmer(_)
+            | Self::Muse(_)
             | Self::QwenVl(_) => false,
         }
     }
@@ -3171,7 +3182,7 @@ impl EligibleConfig<'_> {
                 .union(NeuralOperatorCapabilities::WEIGHTED_EMBEDDING),
             Self::Gemma4(_) => crate::operator_requirements::GEMMA4,
             Self::Inkling(_) => crate::operator_requirements::INKLING,
-            Self::MuseGlimmer(_) => crate::operator_requirements::MUSE_GLIMMER,
+            Self::Muse(args) => crate::operator_requirements::muse(args),
             Self::QwenVl(_) => crate::operator_requirements::QWEN_VL,
             Self::QwenCompositeHybrid(_) => crate::operator_requirements::QWEN_HYBRID
                 .union(crate::operator_requirements::QWEN_VISION),
@@ -3195,7 +3206,7 @@ impl EligibleConfig<'_> {
             Self::DiffusionGemma(_) => crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP,
             Self::Gemma4(_) => crate::gemma4::model::TEXT_EXECUTION_GROUP,
             Self::Inkling(_) => crate::inkling::model::TEXT_EXECUTION_GROUP,
-            Self::MuseGlimmer(_) => crate::muse_glimmer::model::TEXT_EXECUTION_GROUP,
+            Self::Muse(_) => crate::muse::model::TEXT_EXECUTION_GROUP,
             Self::QwenVl(_) => crate::qwen::vl::TEXT_EXECUTION_GROUP,
             Self::QwenCompositeHybrid(_) => crate::qwen::hybrid::VISION_EXECUTION_GROUP,
         }
@@ -3250,7 +3261,7 @@ impl EligibleConfig<'_> {
                     )
                     .ok_or_else(|| "Inkling execution unit count overflowed".to_owned());
             }
-            Self::MuseGlimmer(args) => {
+            Self::Muse(args) => {
                 return args
                     .vision_config
                     .as_ref()
@@ -3329,8 +3340,8 @@ impl EligibleConfig<'_> {
                 crate::inkling::composite_state_layout(&target, prediction.as_ref())
                     .map_err(|error| error.to_string())
             }
-            Self::MuseGlimmer(args) => {
-                crate::muse_glimmer::state_layout(args).map_err(|error| error.to_string())
+            Self::Muse(args) => {
+                crate::muse::state_layout(args).map_err(|error| error.to_string())
             }
             Self::QwenVl(args) => {
                 crate::qwen::vl::state_layout(args).map_err(|error| error.to_string())
@@ -3421,12 +3432,15 @@ impl EligibleConfig<'_> {
                 }
                 return args.text_config.linear_format_for(name);
             }
-            Self::MuseGlimmer(args) => {
+            Self::Muse(args) => {
                 if name.starts_with("model.vision_") {
                     return args
                         .vision_config
                         .as_ref()
                         .map_or(LinearFormat::Dense, |vision| vision.linear_format_for(name));
+                }
+                if name.starts_with("model.audio_tower.") {
+                    return args.audio_config.as_ref().map_or(LinearFormat::Dense, |audio| audio.linear_format_for(name));
                 }
                 return args.linear_format_for(name);
             }
@@ -3705,10 +3719,10 @@ impl EligibleConfig<'_> {
                 }
                 Ok(shapes)
             }
-            Self::MuseGlimmer(args) => {
+            Self::Muse(args) => {
                 let mut shapes = match args.weight_convention {
-                    crate::muse_glimmer::WeightConvention::HuggingFace => {
-                        let plan = crate::muse_glimmer::safetensors_plan(args)?;
+                    crate::muse::WeightConvention::HuggingFace => {
+                        let plan = crate::muse::safetensors_plan(args)?;
                         let canonical = plan
                             .common_tensors
                             .iter()
@@ -3738,11 +3752,11 @@ impl EligibleConfig<'_> {
                         .map(|(name, shape)| (canonical.get(&name).cloned().unwrap_or(name), shape))
                         .collect()
                     }
-                    crate::muse_glimmer::WeightConvention::Gguf => {
+                    crate::muse::WeightConvention::Gguf => {
                         // GGUF text admission has no required vision tower. Its
                         // declared shapes are logical, independent of encoded
                         // source blocks, and its names have their own translation.
-                        let mut shapes = crate::muse_glimmer::gguf_plan(args)?
+                        let mut shapes = crate::muse::gguf_plan(args)?
                             .common_tensors
                             .into_iter()
                             .filter(|tensor| {
@@ -3750,27 +3764,28 @@ impl EligibleConfig<'_> {
                             })
                             .map(|tensor| {
                                 (
-                                    crate::muse_glimmer::translate_text_gguf_name(&tensor.key),
+                                    crate::muse::translate_text_gguf_name(&tensor.key),
                                     tensor.shape,
                                 )
                             })
                             .collect::<BTreeMap<_, _>>();
                         if args.vision_config.is_some() {
                             shapes.extend(
-                                crate::muse_glimmer::projector_gguf_plan(args)?
+                                crate::muse::projector_gguf_plan(args)?
                                     .common_tensors
                                     .into_iter()
                                     .filter(|tensor| tensor.shape.len() == 2)
                                     .map(|tensor| {
                                         (
-                                            crate::muse_glimmer::translate_projector_gguf_name(
+                                            crate::muse::translate_projector_gguf_name(
                                                 &tensor.key,
+                                                args.audio_config.as_ref(),
                                             ),
                                             tensor.shape,
                                         )
                                     }),
                             );
-                            let patch = crate::muse_glimmer::projector_gguf_plan(args)?
+                            let patch = crate::muse::projector_gguf_plan(args)?
                                 .common_tensors
                                 .into_iter()
                                 .find(|tensor| tensor.key == "v.patch_embd.weight")
@@ -3784,7 +3799,7 @@ impl EligibleConfig<'_> {
                                         })
                                     })?;
                             shapes.insert(
-                                crate::muse_glimmer::translate_projector_gguf_name(&patch.key),
+                                crate::muse::translate_projector_gguf_name(&patch.key, args.audio_config.as_ref()),
                                 vec![patch.shape[0], width],
                             );
                         }
@@ -3852,7 +3867,7 @@ impl EligibleConfig<'_> {
             Self::DeepSeekV4(_) => "",
             Self::DiffusionGemma(_) => "model.decoder",
             Self::Gemma4(_) => "model.language_model",
-            Self::Inkling(_) | Self::MuseGlimmer(_) | Self::QwenCompositeHybrid(_) => "model",
+            Self::Inkling(_) | Self::Muse(_) | Self::QwenCompositeHybrid(_) => "model",
             Self::QwenVl(args) => &args.text.parameter_root,
         }
     }
@@ -3875,7 +3890,7 @@ impl EligibleConfig<'_> {
             Self::DiffusionGemma(args) => args.text.tie_word_embeddings,
             Self::Gemma4(args) => args.text.tie_word_embeddings,
             Self::Inkling(_) => false,
-            Self::MuseGlimmer(args) => args.tie_word_embeddings,
+            Self::Muse(args) => args.tie_word_embeddings,
             Self::QwenVl(args) => args.text.tie_word_embeddings,
             Self::QwenCompositeHybrid(args) => args.text.tie_word_embeddings,
         }
@@ -3905,7 +3920,7 @@ impl EligibleConfig<'_> {
             Self::DiffusionGemma(args) => (args.text.vocab_size, args.text.hidden_size),
             Self::Gemma4(args) => (args.text.vocab_size, args.text.hidden_size),
             Self::Inkling(args) => (args.text_config.vocab_size, args.text_config.hidden_size),
-            Self::MuseGlimmer(args) => (args.vocab_size, args.hidden_size),
+            Self::Muse(args) => (args.vocab_size, args.hidden_size),
             Self::QwenVl(args) => (args.text.vocab_size, args.text.hidden_size),
             Self::QwenCompositeHybrid(args) => (args.text.vocab_size, args.text.hidden_size),
         };
@@ -3938,7 +3953,7 @@ impl EligibleConfig<'_> {
             | Self::DiffusionGemma(_)
             | Self::Gemma4(_)
             | Self::Inkling(_)
-            | Self::MuseGlimmer(_)
+            | Self::Muse(_)
             | Self::QwenVl(_)
             | Self::QwenCompositeHybrid(_) => {
                 family_parameter_role(self, name, companion, linear_shapes)
@@ -3965,7 +3980,7 @@ impl EligibleConfig<'_> {
             Self::DeepSeekV4(_) => "embed.weight".into(),
             Self::DiffusionGemma(_) => "model.decoder.embed_tokens.weight".into(),
             Self::Gemma4(_) => "model.language_model.embed_tokens.weight".into(),
-            Self::Inkling(_) | Self::MuseGlimmer(_) | Self::QwenCompositeHybrid(_) => {
+            Self::Inkling(_) | Self::Muse(_) | Self::QwenCompositeHybrid(_) => {
                 "model.embed_tokens.weight".into()
             }
             Self::QwenVl(_) => "model.language_model.embed_tokens.weight".into(),
@@ -4013,7 +4028,7 @@ fn family_linear_parameter_shapes(
                     .and_then(|bits_total| bits_total.checked_div(bits))
                     .ok_or_else(|| format!("invalid affine geometry for {:?}", constraint.key))?;
             }
-            LinearFormat::MxFp4 => {
+            LinearFormat::MxFp4 | LinearFormat::NvFp4 => {
                 let packed = shape.last_mut().expect("rank checked above");
                 *packed = packed
                     .checked_mul(8)
@@ -4522,6 +4537,12 @@ fn replicated_text_requirements_for_structure(
     let auxiliary = normalized.prediction.clone();
     let floating_source = crate::preparation::prepared_floating_state_dtype_source(inspection)
         .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
+    let state_partition_plan = match &config {
+        EligibleConfig::Muse(args) => {
+            Some(crate::muse::model::state_partition_plan(args, &state_layout))
+        }
+        _ => None,
+    };
     let mut requirements = ReplicatedTextRequirements::new(
         config.architecture_identity(),
         config.operators(),
@@ -4535,6 +4556,7 @@ fn replicated_text_requirements_for_structure(
     .and_then(|requirements| {
         requirements
             .with_chunked_prefill(config.supports_chunked_prefill())
+            .with_prefill_input_retention(config.prefill_input_retention())
             .with_floating_state_source(floating_source.dtype().clone())
             .with_derived_recipes_and_shared_sources(
                 derived_recipes,
@@ -4543,6 +4565,9 @@ fn replicated_text_requirements_for_structure(
             )
     })
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
+    if let Some(plan) = state_partition_plan {
+        requirements = requirements.with_state_partition_plan(plan);
+    }
     requirements =
         requirements.with_execution_topology(config.execution_topology().map_err(|error| {
             ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
@@ -4572,7 +4597,9 @@ fn replicated_text_requirements_for_structure(
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
             })?;
     }
-    Ok(requirements)
+    requirements
+        .with_nonparameter_sources(artifact::nonparameter_sources(inspection, &normalized))
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
 }
 
 fn prediction_extension_materialization_parameters(
@@ -4602,7 +4629,7 @@ fn prediction_extension_materialization_parameters(
     let extra_recipes = prediction_extension_recipes(extension, recipe_source.as_ref())?;
     let extra_targets = extra_recipes.keys().cloned().collect::<BTreeSet<_>>();
     let (mut parameters, mut recipes, mut outputs) =
-        finalize_materialization_parameters_with_recipes(
+        finalize_materialization_parameters(
             &config,
             parameters,
             recipe_source.as_ref(),
@@ -4800,19 +4827,6 @@ type FinalizedMaterializationParameters = (
 
 fn finalize_materialization_parameters(
     config: &EligibleConfig<'_>,
-    parameters: Vec<ReplicatedTextParameterRequirement>,
-    recipe_source: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
-) -> Result<FinalizedMaterializationParameters, ReplicatedTextRequirementsError> {
-    finalize_materialization_parameters_with_recipes(
-        config,
-        parameters,
-        recipe_source,
-        BTreeMap::new(),
-    )
-}
-
-fn finalize_materialization_parameters_with_recipes(
-    config: &EligibleConfig<'_>,
     mut parameters: Vec<ReplicatedTextParameterRequirement>,
     recipe_source: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     extra_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
@@ -4987,7 +5001,7 @@ fn finalize_materialization_parameters_with_recipes(
             {
                 let packed_bits = match native {
                     LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
-                    LinearFormat::MxFp4 => Some(4),
+                    LinearFormat::MxFp4 | LinearFormat::NvFp4 => Some(4),
                     _ => None,
                 };
                 if let (Some(bits), Some(extent)) = (packed_bits, logical_shape.last_mut()) {
@@ -5064,7 +5078,7 @@ fn finalize_materialization_parameters_with_recipes(
             {
                 let packed_bits = match native {
                     LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
-                    LinearFormat::MxFp4 => Some(4),
+                    LinearFormat::MxFp4 | LinearFormat::NvFp4 => Some(4),
                     _ => None,
                 };
                 if let (Some(bits), Some(extent)) = (packed_bits, logical_shape.last_mut()) {
@@ -5153,7 +5167,10 @@ fn finalize_materialization_parameters_with_recipes(
                     || parameter.name().starts_with("model.embed_vision.")
                     || parameter.name().starts_with("model.embed_audio.")
             }
-            EligibleConfig::MuseGlimmer(_) => parameter.name().starts_with("model.vision_"),
+            EligibleConfig::Muse(_) => {
+                parameter.name().starts_with("model.vision_")
+                    || parameter.name().starts_with("model.audio_tower.")
+            }
             EligibleConfig::QwenVl(_) => parameter.name().starts_with("model.visual."),
             _ => false,
         };
@@ -5263,7 +5280,7 @@ fn safetensors_eligible_config(
         SafetensorsModelConfig::NemotronH(args) => Ok(EligibleConfig::NemotronH(args)),
         SafetensorsModelConfig::Gemma4(_)
         | SafetensorsModelConfig::Inkling(_)
-        | SafetensorsModelConfig::MuseGlimmer(_)
+        | SafetensorsModelConfig::Muse(_)
         | SafetensorsModelConfig::QwenVl(_) => Err(ReplicatedTextIneligibility::CompositeInput),
         SafetensorsModelConfig::Moshi(_) | SafetensorsModelConfig::VoiceChat(_) => {
             Err(ReplicatedTextIneligibility::Realtime)
@@ -5341,7 +5358,7 @@ fn gguf_eligible_config(
         GgufModelConfig::NemotronH(args) => Ok(EligibleConfig::NemotronH(args)),
         GgufModelConfig::Gemma4(_)
         | GgufModelConfig::Inkling(_)
-        | GgufModelConfig::MuseGlimmer(_) => Err(ReplicatedTextIneligibility::CompositeInput),
+        | GgufModelConfig::Muse(_) => Err(ReplicatedTextIneligibility::CompositeInput),
         GgufModelConfig::DeepSeekV3(args) if args.num_nextn_predict_layers > 0 => {
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
         }
@@ -5404,7 +5421,7 @@ fn ordinary_eligible_config(
         | EligibleConfig::NemotronLabsDiffusion(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
-        | EligibleConfig::MuseGlimmer(_)
+        | EligibleConfig::Muse(_)
         | EligibleConfig::QwenVl(_)
         | EligibleConfig::QwenCompositeHybrid(_) => Err(ReplicatedTextIneligibility::HybridState),
     }
@@ -5696,16 +5713,22 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
             crate::inkling::model::VISION_EXECUTION_GROUP,
         )
         .or_else(|| execution_unit("model.layers.", crate::inkling::model::TEXT_EXECUTION_GROUP)),
-        EligibleConfig::MuseGlimmer(_) => execution_unit(
-            "model.vision_tower.layers.",
-            crate::muse_glimmer::model::VISION_EXECUTION_GROUP,
-        )
-        .or_else(|| {
-            execution_unit(
-                "model.layers.",
-                crate::muse_glimmer::model::TEXT_EXECUTION_GROUP,
-            )
-        }),
+        EligibleConfig::Muse(args) => args
+            .audio_config
+            .as_ref()
+            .and_then(|audio| audio.execution_units().ok())
+            .and_then(|units| units.into_iter().position(|unit| unit.owns_parameter(name)))
+            .map(|unit| ReplicatedTextParameterOwner::ExecutionUnit {
+                group: crate::muse::audio::execution::AUDIO_EXECUTION_GROUP.into(),
+                unit,
+            })
+            .or_else(|| {
+                execution_unit(
+                    "model.vision_tower.layers.",
+                    crate::muse::model::VISION_EXECUTION_GROUP,
+                )
+            })
+            .or_else(|| execution_unit("model.layers.", crate::muse::model::TEXT_EXECUTION_GROUP)),
         EligibleConfig::QwenVl(_) => execution_unit(
             "model.visual.blocks.",
             crate::qwen::vl::VISION_EXECUTION_GROUP,
@@ -5763,16 +5786,16 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
             };
         }
     }
-    if let EligibleConfig::MuseGlimmer(args) = config {
+    if let EligibleConfig::Muse(args) = config {
         if let Some(consumers) =
-            crate::muse_glimmer::parallel::vision_static_consumer_units(args, name)
+            crate::muse::parallel::vision_static_consumer_units(args, name)
         {
             return ReplicatedTextParameterOwner::StaticUnitConsumers {
                 role: "vision".into(),
                 consumers: consumers
                     .map(|unit| {
                         (
-                            crate::muse_glimmer::model::VISION_EXECUTION_GROUP.into(),
+                            crate::muse::model::VISION_EXECUTION_GROUP.into(),
                             unit,
                         )
                     })
@@ -5867,10 +5890,10 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
         } else {
             "norm"
         }
-    } else if matches!(config, EligibleConfig::MuseGlimmer(_)) && name.starts_with("model.vision_")
+    } else if matches!(config, EligibleConfig::Muse(_)) && name.starts_with("model.vision_")
     {
         "vision"
-    } else if matches!(config, EligibleConfig::MuseGlimmer(_))
+    } else if matches!(config, EligibleConfig::Muse(_))
         && name == "model.embed_tokens.weight"
     {
         "embedding"
@@ -6768,7 +6791,7 @@ pub(crate) enum CompositeConfig<'a> {
     Diffusion(&'a crate::diffusion_gemma::FamilyConfig),
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
-    Muse(&'a crate::muse_glimmer::DecoderConfig),
+    Muse(&'a crate::muse::DecoderConfig),
     QwenVl(&'a crate::qwen::vl::ModelArgs),
     QwenHybrid(&'a crate::qwen::hybrid::ParsedHybridConfig),
 }
@@ -6780,7 +6803,7 @@ impl CompositeConfig<'_> {
             Self::Diffusion(args) => EligibleConfig::DiffusionGemma(args),
             Self::Gemma4(args) => EligibleConfig::Gemma4(args),
             Self::Inkling(args) => EligibleConfig::Inkling(args),
-            Self::Muse(args) => EligibleConfig::MuseGlimmer(args),
+            Self::Muse(args) => EligibleConfig::Muse(args),
             Self::QwenVl(args) => EligibleConfig::QwenVl(args),
             Self::QwenHybrid(args) => EligibleConfig::QwenCompositeHybrid(args),
         }
@@ -6809,7 +6832,7 @@ impl CompositeConfig<'_> {
             Self::Muse(args) => InputModalities {
                 text: true,
                 image: args.vision_config.is_some(),
-                audio: false,
+                audio: args.audio_config.is_some(),
                 video: args.vision_config.is_some(),
             },
             Self::QwenVl(_) | Self::QwenHybrid(_) => InputModalities {
@@ -6851,7 +6874,7 @@ impl CompositeConfig<'_> {
                     .map_err(|error| error.to_string())
             }
             Self::Muse(args) => {
-                crate::muse_glimmer::state_layout(args).map_err(|error| error.to_string())
+                crate::muse::state_layout(args).map_err(|error| error.to_string())
             }
             Self::QwenVl(args) => {
                 crate::qwen::vl::state_layout(args).map_err(|error| error.to_string())
@@ -7012,24 +7035,14 @@ impl CompositeConfig<'_> {
                 )
             }
             Self::Muse(args) => {
-                let graph = ExecutionGraph::chain([
-                    crate::muse_glimmer::model::VISION_EXECUTION_GROUP,
-                    crate::muse_glimmer::model::TEXT_EXECUTION_GROUP,
-                ])
-                .map_err(|error| error.to_string())?;
-                (
-                    graph,
-                    vec![
-                        args.vision_config
-                            .as_ref()
-                            .map_or(0, |vision| vision.layer_count()),
-                        args.num_hidden_layers as usize,
-                    ],
-                    vec![
-                        crate::muse_glimmer::model::vision_group_transport(args),
-                        crate::transport::decoder(),
-                    ],
-                )
+                let graph = crate::muse::graph::execution_graph(args).map_err(|error| error.to_string())?;
+                let mut counts = vec![args.vision_config.as_ref().map_or(0, |vision| vision.layer_count()), args.num_hidden_layers as usize];
+                let mut transports = vec![crate::muse::model::vision_group_transport(args), crate::transport::decoder()];
+                if let Some(audio) = &args.audio_config {
+                    counts.push(audio.execution_units().map_err(|error| error.to_string())?.len());
+                    transports.push(crate::muse::model::audio_group_transport());
+                }
+                (graph, counts, transports)
             }
             Self::QwenVl(args) => {
                 let graph = ExecutionGraph::new(
@@ -7093,7 +7106,7 @@ pub(crate) fn composite_config(
         return Ok(Some(match projector.model() {
             GgufMediaProjectorConfig::Gemma4(args) => CompositeConfig::Gemma4(args),
             GgufMediaProjectorConfig::Inkling(args) => CompositeConfig::Inkling(args),
-            GgufMediaProjectorConfig::MuseGlimmer(args) => CompositeConfig::Muse(args),
+            GgufMediaProjectorConfig::Muse(args) => CompositeConfig::Muse(args),
             GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => CompositeConfig::NemotronLabsDiffusion(config),
             GgufMediaProjectorConfig::Qwen3Vl(args) => CompositeConfig::QwenVl(args),
             GgufMediaProjectorConfig::Qwen35(args) => CompositeConfig::QwenHybrid(args),
@@ -7122,7 +7135,7 @@ pub(crate) fn composite_config(
         }
         (Some(SafetensorsModelConfig::Gemma4(args)), None) => Some(CompositeConfig::Gemma4(args)),
         (Some(SafetensorsModelConfig::Inkling(args)), None) => Some(CompositeConfig::Inkling(args)),
-        (Some(SafetensorsModelConfig::MuseGlimmer(args)), None) => {
+        (Some(SafetensorsModelConfig::Muse(args)), None) => {
             Some(CompositeConfig::Muse(args))
         }
         (Some(SafetensorsModelConfig::QwenVl(args)), None) => Some(CompositeConfig::QwenVl(args)),
@@ -7131,7 +7144,7 @@ pub(crate) fn composite_config(
         }
         (None, Some(GgufModelConfig::Gemma4(args))) => Some(CompositeConfig::Gemma4(args)),
         (None, Some(GgufModelConfig::Inkling(args))) => Some(CompositeConfig::Inkling(args)),
-        (None, Some(GgufModelConfig::MuseGlimmer(args))) => Some(CompositeConfig::Muse(args)),
+        (None, Some(GgufModelConfig::Muse(args))) => Some(CompositeConfig::Muse(args)),
         (None, Some(GgufModelConfig::QwenHybrid(args))) if args.vision.is_some() => {
             Some(CompositeConfig::QwenHybrid(args))
         }
@@ -7377,17 +7390,17 @@ fn gemma4_replicated_expert_realization_plan(
 }
 
 fn muse_replicated_expert_realization_plan(
-    args: &crate::muse_glimmer::DecoderConfig,
+    args: &crate::muse::DecoderConfig,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, String> {
     let global_experts = usize::try_from(args.num_experts).map_err(|error| error.to_string())?;
     let owner_group =
-        eredu_runtime::ExecutionGroupId::new(crate::muse_glimmer::model::TEXT_EXECUTION_GROUP)
+        eredu_runtime::ExecutionGroupId::new(crate::muse::model::TEXT_EXECUTION_GROUP)
             .map_err(|error| error.to_string())?;
     let mut specs = BTreeMap::new();
     for layer in 0..usize::try_from(args.num_hidden_layers).map_err(|error| error.to_string())? {
         specs.insert(
             (owner_group.clone(), layer),
-            crate::muse_glimmer::text::expert_bank_spec(args, layer)
+            crate::muse::text::expert_bank_spec(args, layer)
                 .map_err(|error| error.to_string())?,
         );
     }
@@ -7550,7 +7563,7 @@ fn composite_routed_requirements(
         }
         CompositeConfig::Muse(args) => {
             let owner_group = eredu_runtime::ExecutionGroupId::new(
-                crate::muse_glimmer::model::TEXT_EXECUTION_GROUP,
+                crate::muse::model::TEXT_EXECUTION_GROUP,
             )
             .map_err(|error| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
@@ -7559,7 +7572,7 @@ fn composite_routed_requirements(
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
             })?;
             let catalog =
-                crate::muse_glimmer::expert_residency_catalog(recipe_source.as_ref(), args)
+                crate::muse::expert_residency_catalog(recipe_source.as_ref(), args)
                     .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
             (
                 owner_group,
@@ -8145,26 +8158,26 @@ where
     #[inline(never)]
     fn muse(
         self,
-        args: &crate::muse_glimmer::DecoderConfig,
+        args: &crate::muse::DecoderConfig,
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
-        let capability = crate::capability::muse_glimmer(args)
+        let capability = crate::capability::muse(args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let source = self
             .has_transform
             .then(|| {
-                crate::muse_glimmer::with_checkpoint_formats(args, self.source_formats.clone())
+                crate::muse::with_checkpoint_formats(args, self.source_formats.clone())
             })
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::muse_glimmer::LayeredModel::<B>::new(args, self.context))
+            .map(|args| crate::muse::LayeredModel::<B>::new(args, self.context))
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target =
-            crate::muse_glimmer::with_checkpoint_formats(args, self.target_formats.clone())
+            crate::muse::with_checkpoint_formats(args, self.target_formats.clone())
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
-        let effective_model_type = target.model_type.clone();
+        let effective_model_type = target.identity.text_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::muse_glimmer::LayeredModel::<B>::new(target, self.context)
+        let architecture = crate::muse::LayeredModel::<B>::new(target, self.context)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
@@ -8841,7 +8854,7 @@ mod tests {
     #[test]
     fn muse_media_transform_admission_matches_load_time_configuration() {
         let value = muse_config();
-        let args = crate::muse_glimmer::DecoderConfig::from_hf_value(&value).unwrap();
+        let args = crate::muse::DecoderConfig::from_hf_value(&value).unwrap();
         let (_root, inspection) = inspected_config(value);
         let requirements = composite_text_requirements(&inspection).unwrap();
         let down = requirements
@@ -8867,7 +8880,7 @@ mod tests {
             WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap()),
             WeightQuantization::MxFp4,
         ] {
-            let target = crate::muse_glimmer::load_time_quantization(&args, quantization).unwrap();
+            let target = crate::muse::load_time_quantization(&args, quantization).unwrap();
             let request = match quantization {
                 WeightQuantization::Affine(format) => eredu_core::QuantizationRequest::Affine {
                     group_size: format.group_size as u32,
@@ -8903,9 +8916,9 @@ mod tests {
 
     #[test]
     fn muse_gguf_logical_geometry_does_not_require_a_vision_source() {
-        let mut args = crate::muse_glimmer::DecoderConfig::from_hf_value(&muse_config()).unwrap();
-        args.weight_convention = crate::muse_glimmer::WeightConvention::Gguf;
-        let shapes = EligibleConfig::MuseGlimmer(&args)
+        let mut args = crate::muse::DecoderConfig::from_hf_value(&muse_config()).unwrap();
+        args.weight_convention = crate::muse::WeightConvention::Gguf;
+        let shapes = EligibleConfig::Muse(&args)
             .linear_parameter_shapes()
             .unwrap();
         assert_eq!(
@@ -8917,9 +8930,9 @@ mod tests {
         assert!(transports[0].first_owner_static_roles.is_empty());
         assert_eq!(
             transports[0],
-            crate::muse_glimmer::model::vision_group_transport(&args)
+            crate::muse::model::vision_group_transport(&args)
         );
-        let shapes = EligibleConfig::MuseGlimmer(&args)
+        let shapes = EligibleConfig::Muse(&args)
             .linear_parameter_shapes()
             .unwrap();
         assert_eq!(shapes["model.layers.0.self_attn.q_proj.weight"], [64, 64]);
@@ -8938,8 +8951,8 @@ mod tests {
         value["text_config"]["num_experts"] = 4.into();
         value["text_config"]["num_experts_per_tok"] = 2.into();
         value["text_config"]["norm_topk_prob"] = true.into();
-        let mut args = crate::muse_glimmer::DecoderConfig::from_hf_value(&value).unwrap();
-        args.weight_convention = crate::muse_glimmer::WeightConvention::Gguf;
+        let mut args = crate::muse::DecoderConfig::from_hf_value(&value).unwrap();
+        args.weight_convention = crate::muse::WeightConvention::Gguf;
         let mut metadata = BTreeMap::new();
         for (name, shape) in [
             ("v.patch_embd.weight", vec![32, 3, 2, 2]),
@@ -8964,7 +8977,7 @@ mod tests {
             metadata,
             backend: eredu_checkpoint::store::WeightStoreBackend::Gguf,
         };
-        let selected = EligibleConfig::MuseGlimmer(&args);
+        let selected = EligibleConfig::Muse(&args);
         assert_eq!(selected.unit_count().unwrap(), 2);
         let recipes = selected.derived_recipes(&source).unwrap();
         assert_eq!(recipes.len(), 3);

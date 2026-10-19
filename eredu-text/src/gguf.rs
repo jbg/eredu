@@ -5,24 +5,24 @@ use std::collections::{HashMap, HashSet};
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use serde_json::{Map, Value};
 use tokenizers::{
-    AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer,
     decoders::{
         byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DecoderSequence,
         strip::Strip,
     },
     models::{
-        bpe::{BPE, Vocab},
+        bpe::{Vocab, BPE},
         unigram::Unigram,
     },
-    normalizers::{NFC, Replace},
+    normalizers::{Replace, NFC},
     pre_tokenizers::{
-        PreTokenizerWrapper,
         byte_level::ByteLevel,
         metaspace::{Metaspace, PrependScheme},
         sequence::Sequence as PreTokenizerSequence,
         split::{Split, SplitPattern},
+        PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
+    AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer,
 };
 
 use crate::error::Error;
@@ -100,8 +100,31 @@ fn build_gpt(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<Tokenizer, Error> {
     let merges = required_merges(metadata)?;
+    let mut vocabulary = vocab(tokens)?;
+    if let Some(types) = metadata
+        .get("tokenizer.ggml.token_type")
+        .and_then(GgufMetadataValue::as_array)
+        .and_then(|types| types.to_i64_vec())
+    {
+        if types.len() != tokens.len() {
+            return Err(tokenizer_error(
+                "tokenizer.ggml.token_type length does not match the vocabulary",
+            ));
+        }
+        for (id, kind) in types.into_iter().enumerate() {
+            if kind == 5 {
+                vocabulary.remove(&tokens[id]);
+            }
+        }
+    }
     let mut builder = BPE::builder()
-        .vocab_and_merges(vocab(tokens)?, merges)
+        .vocab_and_merges(vocabulary, merges)
+        .ignore_merges(
+            metadata
+                .get("tokenizer.ggml.pre")
+                .and_then(GgufMetadataValue::as_str)
+                == Some("gpt-4o"),
+        )
         .fuse_unk(true);
     if let Some(unknown) = special_token(metadata, tokens, "unknown_token_id")? {
         builder = builder.unk_token(unknown);
@@ -116,7 +139,6 @@ fn build_gpt(
         .get("general.architecture")
         .and_then(GgufMetadataValue::as_str)
         .unwrap_or_default();
-    const GPT4O_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     if pre_tokenizer == "k2-horizon" {
         // Publisher pattern: combining marks and joiners stay in words, while
         // numbers split into groups of at most three digits. No NFC transform.
@@ -153,7 +175,7 @@ fn build_gpt(
     {
         tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
             PreTokenizerWrapper::Split(Split::new(
-                SplitPattern::Regex(GPT4O_PATTERN.into()),
+                SplitPattern::Regex(super::tiktoken::LLAMA4_PATTERN.into()),
                 SplitDelimiterBehavior::Isolated,
                 false,
             )?),
@@ -824,19 +846,44 @@ mod tests {
 
     #[test]
     fn pixtral_separates_case_runs_and_individual_digits_before_bpe() {
-        let tokens = ["A", "B", "C", "a", "b", "c", "1", "2", "3", "AB", "ABC", "ab", "abc", "abcABC", "12", "123"];
+        let tokens = [
+            "A", "B", "C", "a", "b", "c", "1", "2", "3", "AB", "ABC", "ab", "abc", "abcABC", "12",
+            "123",
+        ];
         let merges = ["A B", "AB C", "a b", "ab c", "abc ABC", "1 2", "12 3"];
         let metadata = HashMap::from([
-            ("general.architecture".into(), GgufMetadataValue::String("mistral3".into())),
-            ("tokenizer.ggml.model".into(), GgufMetadataValue::String("gpt2".into())),
-            ("tokenizer.ggml.pre".into(), GgufMetadataValue::String("pixtral".into())),
-            ("tokenizer.ggml.tokens".into(), GgufMetadataValue::Array(GgufMetadataArray::String(tokens.map(str::to_owned).to_vec()))),
-            ("tokenizer.ggml.merges".into(), GgufMetadataValue::Array(GgufMetadataArray::String(merges.map(str::to_owned).to_vec()))),
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("mistral3".into()),
+            ),
+            (
+                "tokenizer.ggml.model".into(),
+                GgufMetadataValue::String("gpt2".into()),
+            ),
+            (
+                "tokenizer.ggml.pre".into(),
+                GgufMetadataValue::String("pixtral".into()),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(
+                    tokens.map(str::to_owned).to_vec(),
+                )),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(
+                    merges.map(str::to_owned).to_vec(),
+                )),
+            ),
         ]);
         let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
         let encoded = tokenizer.encode("abcABC123", false).unwrap();
         assert_eq!(encoded.get_ids(), &[12, 10, 6, 7, 8]);
-        assert_eq!(tokenizer.decode(encoded.get_ids(), false).unwrap(), "abcABC123");
+        assert_eq!(
+            tokenizer.decode(encoded.get_ids(), false).unwrap(),
+            "abcABC123"
+        );
     }
 
     #[test]
@@ -871,6 +918,38 @@ mod tests {
         assert!(serialized.contains(r"\\p{N}{1,3}"));
         assert!(serialized.contains("ByteLevel"));
         assert!(tokenizer.get_normalizer().is_none());
+    }
+
+    #[test]
+    fn gpt4o_direct_pieces_and_unused_rows_follow_embedded_metadata() {
+        let metadata = HashMap::from([
+            (
+                "tokenizer.ggml.model".into(),
+                GgufMetadataValue::String("gpt2".into()),
+            ),
+            (
+                "tokenizer.ggml.pre".into(),
+                GgufMetadataValue::String("gpt-4o".into()),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(
+                    ["a", "b", "ab", "[PAD3]"].map(str::to_owned).to_vec(),
+                )),
+            ),
+            (
+                "tokenizer.ggml.token_type".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Int32(vec![1, 1, 1, 5])),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(Vec::new())),
+            ),
+        ]);
+        let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+        assert_eq!(tokenizer.encode("ab", false).unwrap().get_ids(), &[2]);
+        assert!(tokenizer.id_to_token(3).is_none());
+        assert_eq!(tokenizer.get_vocab_size(true), 3);
     }
 
     #[test]

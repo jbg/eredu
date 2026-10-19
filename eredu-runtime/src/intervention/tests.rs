@@ -467,7 +467,7 @@ fn plans(
     };
     let geometry = point.observation_geometry();
     let discovery = InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: "source".into(),
         session_identity: Some("backend-session".into()),
         points: vec![point],
@@ -478,7 +478,7 @@ fn plans(
         max_predictions: 3,
     };
     let admitted = InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations,
     }
     .admit(&discovery, request, "session")

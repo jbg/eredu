@@ -1,7 +1,7 @@
 //! Portable model-artifact inspection results.
 
 use crate::{
-    artifact::ArtifactError, ArtifactFormat, ArtifactInspection, GgufCompanionRole,
+    artifact::ArtifactError, ArtifactFormat, ArtifactInspection, ArtifactCompanionRole,
     InputModalities, ModelResourceProfile, Observed, PreparationAdmission,
     PreparationAdmissionError, SessionCapabilities,
 };
@@ -139,7 +139,7 @@ pub fn reject_portable_artifact_inspection(
     let missing_media_projector = matches!(
         error,
         ArtifactError::MissingRequiredGgufCompanion {
-            role: GgufCompanionRole::MediaProjector,
+            role: ArtifactCompanionRole::MediaProjector,
             ..
         }
     );
@@ -162,7 +162,7 @@ pub fn reject_portable_artifact_inspection(
             None,
         ),
         ArtifactError::MissingRequiredGgufCompanion {
-            role: GgufCompanionRole::MediaProjector,
+            role: ArtifactCompanionRole::MediaProjector,
             ..
         } => (
             InspectionIssueCode::MissingMediaProjector,
@@ -277,6 +277,8 @@ pub enum InspectionIssueCode {
     MissingChatTemplate,
     /// A required multimodal projector is absent or ambiguous.
     MissingMediaProjector,
+    /// An optional media input requires an independently selected component source.
+    MissingMediaCompanion,
     /// A media processor or its build feature is unavailable.
     MissingProcessor,
     /// Requested on-load quantization is incompatible.

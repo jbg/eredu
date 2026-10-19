@@ -900,6 +900,14 @@ impl<B: ModelLoadingBackend> SelectedExecutionPlanTarget<B> {
         self.preparation.plan().inspection()
     }
 
+    /// Borrows the admitted backend selection without consuming or replacing it.
+    ///
+    /// Cold drafting adapters use its retained portable placement decisions;
+    /// borrowing this value does not realize native resources.
+    pub const fn selected_preparation(&self) -> &B::SelectedPreparation {
+        self.preparation.selected()
+    }
+
     /// Borrows the exact complete execution plan retained by this selection.
     pub const fn execution_plan(&self) -> &ExecutionPlan {
         &self.execution_plan
@@ -2384,6 +2392,7 @@ mod tests {
         let resources = backend.inspect_resources(&request.model_path).unwrap().0;
         let external = ExecutionPlan::fully_resident(request.device.clone()).with_drafting(
             DraftingPlan::External {
+                residency: crate::ResidencyPlan::FullyResident,
                 model: "missing-assistant".into(),
                 placement: crate::execution::DraftPlacementPlan::Target,
                 max_draft_tokens: 2,

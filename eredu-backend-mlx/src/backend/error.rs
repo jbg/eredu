@@ -194,9 +194,6 @@ pub enum Error {
     #[error("media processor error: {0}")]
     Processor(String),
 
-    /// Portable host-product admission failed before native preparation.
-    #[error(transparent)]
-    ProcessorAdmission(eredu_core::CapabilityError),
     /// Portable preprocessing buffer budget rejected the request.
     #[error(transparent)]
     ProcessorResources(eredu_runtime::processor_resources::ProcessorResourceError),

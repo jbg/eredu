@@ -228,6 +228,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V3Args, target_output: 
                 effective_output: format!("{path}.prediction.fusion.output.effective"),
             },
             readout: ComponentReadoutEquation {
+                residual_cycles: vec![],
                 block_transforms: vec![],
                 score_writes: vec![],
                 stream_residual: None,

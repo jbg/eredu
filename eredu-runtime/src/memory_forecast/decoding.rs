@@ -106,6 +106,7 @@ pub fn estimate_decoding_continuation_memory(
             retained_snapshots: MemoryBytes::exact(0),
         };
         let causal = SpeculativeMemoryPlan {
+            conditioned: None,
             shared_backbone: None,
             embedded: None,
             draft: None,

@@ -193,6 +193,7 @@ impl Tensor for FakeTensor {
         _: Option<&Self>,
         _: Option<&Self>,
         _: f32,
+        _: eredu_nn::LayerNormalizationArithmetic,
         _: &(),
     ) -> Result<Self, Error> {
         Ok(input.clone())
@@ -3959,10 +3960,11 @@ impl
 {
     type Pass<'a> = ReferencePartitionPass;
 
-    fn apply_prediction_target_operation<O>(
+    fn apply_prediction_target_operation<O, X>(
         &mut self,
         state: &mut DeviceState<FakeBackend, FakeLayerState>,
         operation: O,
+        transport: &mut X,
         context: &(),
     ) -> Result<Option<O::Output>, Error>
     where
@@ -3971,9 +3973,10 @@ impl
             FakeBackend,
             DeviceState<FakeBackend, FakeLayerState>,
         >,
+        X: eredu_runtime::PredictionTargetTransport<FakeBackend>,
     {
         operation
-            .apply(&mut self.architecture, state, None, context)
+            .apply_with_transport(&mut self.architecture, state, None, transport, context)
             .map(Some)
     }
 

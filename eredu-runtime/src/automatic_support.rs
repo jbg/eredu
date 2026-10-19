@@ -42,6 +42,58 @@ pub enum BoundedResidencySizingError {
     /// A selected physical output has no authoritative rank-local placement.
     #[error("selected parameter {0:?} has invalid or missing local geometry")]
     InvalidLocalGeometry(String),
+    /// Exact byte extents must cover each declared execution unit once.
+    #[error("execution layout has {expected} units but received {actual} byte extents")]
+    InvalidUnitCount {
+        /// Unit count retained by the architecture layout.
+        expected: usize,
+        /// Number of supplied physical payload extents.
+        actual: usize,
+    },
+}
+
+/// Immutable device-parameter payload for the selected unit policy.
+/// Resident execution retains all groups simultaneously; bounded execution uses
+/// the largest adjacent window within one semantic group. This excludes static
+/// roles, conversions, loading scratch, activations and mutable state.
+pub fn execution_unit_parameter_window_bytes(
+    layout: &crate::ExecutionUnitLayout,
+    unit_bytes: &[u64],
+    residency: LayerWeightResidency,
+) -> Result<u64, BoundedResidencySizingError> {
+    use BoundedResidencySizingError::ArithmeticOverflow;
+    if layout.len() != unit_bytes.len() {
+        return Err(BoundedResidencySizingError::InvalidUnitCount {
+            expected: layout.len(),
+            actual: unit_bytes.len(),
+        });
+    }
+    let sum = |values: &[u64]| {
+        values.iter().try_fold(0u64, |total, bytes| {
+            total
+                .checked_add(*bytes)
+                .ok_or(ArithmeticOverflow("execution-unit parameter bytes"))
+        })
+    };
+    if residency.is_fully_resident() {
+        return sum(unit_bytes);
+    }
+    let depth = residency.device_depth(layout.len());
+    if depth == 0 {
+        return Ok(0);
+    }
+    let mut largest = 0;
+    for group in 0..layout.group_count() {
+        let values = &unit_bytes[layout
+            .group_range(group)
+            .expect("validated execution layout")];
+        if !values.is_empty() {
+            for window in values.windows(depth.min(values.len())) {
+                largest = largest.max(sum(window)?);
+            }
+        }
+    }
+    Ok(largest)
 }
 
 /// Computes the pinned bytes and largest group-local device window.
@@ -524,7 +576,13 @@ where
     })?;
     let depth = residency.device_depth(unit_count);
     let mut window_bytes = 0u64;
-    if depth != 0 {
+    if residency.is_fully_resident() {
+        for bytes in groups.values().flat_map(|units| units.values()) {
+            window_bytes = window_bytes
+                .checked_add(*bytes)
+                .ok_or(ArithmeticOverflow("resident execution-group bytes"))?;
+        }
+    } else if depth != 0 {
         for units in groups.values() {
             let mut window = VecDeque::<(usize, u64)>::new();
             let mut current = 0u64;
@@ -738,6 +796,10 @@ mod tests {
             ("bank", unit("decoder", usize::MAX), u64::MAX),
         ];
         let excluded = BTreeSet::from(["bank".into()]);
+        let resident = size(&parameters, LayerWeightResidency::FullyResident, &excluded).unwrap();
+        assert_eq!(resident.static_bytes, 7);
+        assert_eq!(resident.window_bytes, 51);
+        assert_eq!(resident.required_bytes, 58);
         assert_eq!(
             size(&parameters, host(2), &excluded).unwrap(),
             BoundedResidencyRequirement {
@@ -755,6 +817,37 @@ mod tests {
             crate::DenseDiskStreamLoadOptions::new(1024, 2048, 5, 2).unwrap(),
         );
         assert_eq!(size(&parameters, streamed, &excluded).unwrap().depth, 2);
+    }
+
+    #[test]
+    fn selected_unit_payload_counts_all_resident_groups_and_group_local_windows() {
+        let graph = crate::ExecutionGraph::chain(["context", "decoder", "head"]).unwrap();
+        let layout = crate::ExecutionUnitLayout::new(&graph, [1, 3, 1]).unwrap();
+        let bytes = [5, 2, 11, 7, 17];
+        assert_eq!(
+            execution_unit_parameter_window_bytes(
+                &layout,
+                &bytes,
+                LayerWeightResidency::FullyResident
+            )
+            .unwrap(),
+            42
+        );
+        assert_eq!(
+            execution_unit_parameter_window_bytes(&layout, &bytes, host(1)).unwrap(),
+            17
+        );
+        assert_eq!(
+            execution_unit_parameter_window_bytes(&layout, &bytes, host(2)).unwrap(),
+            18
+        );
+        assert!(execution_unit_parameter_window_bytes(&layout, &bytes[..4], host(1)).is_err());
+        assert!(execution_unit_parameter_window_bytes(
+            &layout,
+            &[u64::MAX, 1, 0, 0, 0],
+            LayerWeightResidency::FullyResident
+        )
+        .is_err());
     }
 
     #[test]

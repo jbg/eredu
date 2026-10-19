@@ -174,10 +174,18 @@ fn link_cuda_dependencies(target_os: &str, target_arch: &str) {
 
 #[cfg(feature = "metal")]
 fn find_metal_compiler() -> PathBuf {
-    for arguments in [
+    // Respect an explicit installed toolchain before the generic Metal alias.
+    // Xcode can resolve that alias to its placeholder even after the separately
+    // downloaded compiler is installed.
+    let mut candidates = Vec::new();
+    if env::var_os("TOOLCHAINS").is_some() {
+        candidates.push(&["-find", "metal"][..]);
+    }
+    candidates.extend([
         &["--toolchain", "Metal", "-find", "metal"][..],
         &["-find", "metal"][..],
-    ] {
+    ]);
+    for arguments in candidates {
         let output = std::process::Command::new("xcrun")
             .args(arguments)
             // An SDKROOT for a mobile SDK can make xcrun select the placeholder
@@ -190,14 +198,20 @@ fn find_metal_compiler() -> PathBuf {
             let path = String::from_utf8(output.stdout)
                 .expect("xcrun returned a non-UTF-8 Metal compiler path");
             let path = PathBuf::from(path.trim());
-            if path.is_file() {
+            if path.is_file()
+                && std::process::Command::new(&path)
+                    .arg("--version")
+                    .env_remove("SDKROOT")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            {
                 return path;
             }
         }
     }
 
     panic!(
-        "Couldn't locate the Metal compiler. Install it with `xcodebuild -downloadComponent MetalToolchain`."
+        "Couldn't locate an executable Metal compiler. Install it with `xcodebuild -downloadComponent MetalToolchain`; if Xcode still resolves a placeholder, set TOOLCHAINS to the installed toolchainIdentifier from `xcodebuild -showComponent MetalToolchain -json`."
     );
 }
 
@@ -414,7 +428,7 @@ fn build_and_link_mlx_c(out_path: &Path) {
         };
         config.out_dir(
             root.join(&target)
-                .join(env::var("PROFILE").unwrap())
+                .join(config.get_profile())
                 .join(configuration),
         );
     }
@@ -425,14 +439,8 @@ fn build_and_link_mlx_c(out_path: &Path) {
         config.cxxflag("/EHsc");
     }
     config.define("CMAKE_INSTALL_PREFIX", ".");
-    config.define(
-        "CMAKE_BUILD_TYPE",
-        if env::var("PROFILE").as_deref() == Ok("release") {
-            "Release"
-        } else {
-            "Debug"
-        },
-    );
+    // The CMake crate derives optimization and debug information from Cargo's
+    // OPT_LEVEL and DEBUG, including optimized custom profiles.
     // On Windows, a DLL boundary lets CMake preserve MLX's transitive native
     // dependencies and its CUDA delay-load behavior. Other platforms retain
     // the existing static-library integration.
@@ -631,6 +639,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=SAFEMLX_SYS_GENERATE_BINDINGS");
     println!("cargo:rerun-if-env-changed=SAFEMLX_METALLIB_OUTPUT_DIR");
+    println!("cargo:rerun-if-env-changed=TOOLCHAINS");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-changed=src/mlx-c");
     println!("cargo:rerun-if-changed=vendor");

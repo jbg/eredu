@@ -1,5 +1,5 @@
 use super::*;
-use eredu_nn::{RoutingArithmetic, RoutingPrecision};
+use eredu_nn::{GroupSelectionOrder, RoutingArithmetic, RoutingPrecision};
 
 mod intervention;
 mod partition;
@@ -64,10 +64,22 @@ pub struct TopKGroupSelectorConfig {
     input_inverse_sqrt_dimensions: bool,
     /// Whether to allocate learned per-group selection multipliers.
     learned_coefficient_scale: bool,
+    order: GroupSelectionOrder,
     arithmetic: RoutingArithmetic,
+    logit_scale: f32,
 }
 
 impl TopKGroupSelectorConfig {
+    pub(crate) fn with_order(mut self, order: GroupSelectionOrder) -> Self {
+        self.order = order;
+        self
+    }
+
+    pub(crate) fn with_logit_scale(mut self, scale: f32) -> Self {
+        self.logit_scale = scale;
+        self
+    }
+
     pub(crate) fn with_arithmetic(mut self, arithmetic: RoutingArithmetic) -> Self {
         self.arithmetic = arithmetic;
         self
@@ -111,6 +123,8 @@ impl TopKGroupSelectorConfig {
             ));
         }
         Ok(Self {
+            order: GroupSelectionOrder::Ranked,
+            logit_scale: 1.0,
             arithmetic: RoutingArithmetic::uniform(if score_function.requires_fp32() {
                 RoutingPrecision::Float32
             } else {
@@ -152,7 +166,9 @@ pub struct TopKGroupSelector {
     pub(crate) normalization_epsilon: f32,
     /// Final multiplier applied to selection weights.
     pub(crate) coefficient_scale: f32,
+    order: GroupSelectionOrder,
     arithmetic: RoutingArithmetic,
+    logit_scale: f32,
     /// Number of selection groups.
     pub(crate) n_group: i32,
     /// Number of selected partitions.
@@ -235,6 +251,7 @@ impl TopKGroupSelector {
             .map_err(|error| Exception::custom(error.to_string()))?
             .unwrap_or(QuantizationMode::Affine);
         Ok(Self {
+            order: config.order,
             top_k: config.top_k,
             group_count: config.group_count,
             input_dims: config.hidden_size,
@@ -243,6 +260,7 @@ impl TopKGroupSelector {
             normalization_epsilon: config.normalization_epsilon,
             coefficient_scale: config.coefficient_scale,
             arithmetic: config.arithmetic,
+            logit_scale: config.logit_scale,
             n_group: config.n_group,
             topk_group: config.topk_group,
             weight: match quantization {
@@ -450,15 +468,7 @@ impl TopKGroupSelector {
                 stream,
             )?
         } else if self.arithmetic.projection == RoutingPrecision::Float32 {
-            matmul(
-                &flat.as_dtype(Dtype::Float32, stream)?,
-                &self
-                    .weight
-                    .as_ref()
-                    .as_dtype(Dtype::Float32, stream)?
-                    .transpose(stream)?,
-                stream,
-            )?
+            float32_router_projection(&flat, self.weight.as_ref(), stream)?
         } else {
             match super::super::matrix::bf16_row_projection(
                 &flat,
@@ -474,14 +484,22 @@ impl TopKGroupSelector {
             Some(bias) => logits.add(bias, stream)?,
             None => logits,
         };
-        logits.as_dtype(
-            routing_dtype(
-                self.arithmetic.projection,
-                hidden_states.dtype(),
-                logits.dtype(),
-            ),
-            stream,
-        )
+        let dtype = routing_dtype(
+            self.arithmetic.projection,
+            hidden_states.dtype(),
+            logits.dtype(),
+        );
+        let logits = logits.as_dtype(dtype, stream)?;
+        if self.logit_scale == 1.0 {
+            Ok(logits)
+        } else {
+            logits
+                .multiply(
+                    Array::from_f32(self.logit_scale).as_dtype(dtype, stream)?,
+                    stream,
+                )?
+                .as_dtype(dtype, stream)
+        }
     }
 
     fn weights_for_indices(
@@ -540,9 +558,16 @@ impl TopKGroupSelector {
         }
     }
 
+    fn ordered_topk_indices(&self, scores: &Array, stream: &Stream) -> Result<Array, Exception> {
+        match self.order {
+            GroupSelectionOrder::Ranked => largest_indices(scores, self.top_k, stream),
+            GroupSelectionOrder::Partition => partition::unranked(scores, self.top_k, stream),
+        }
+    }
+
     fn topk_indices(&self, scores_for_choice: &Array, stream: &Stream) -> Result<Array, Exception> {
         if self.n_group == 1 && self.topk_group == 1 {
-            return largest_indices(scores_for_choice, self.top_k, stream);
+            return self.ordered_topk_indices(scores_for_choice, stream);
         }
         if self.n_group <= 0
             || self.topk_group <= 0
@@ -584,7 +609,7 @@ impl TopKGroupSelector {
             Array::from_f32(f32::NEG_INFINITY),
             stream,
         )?;
-        largest_indices(&masked_scores, self.top_k, stream)
+        self.ordered_topk_indices(&masked_scores, stream)
     }
 }
 
@@ -640,7 +665,27 @@ fn partition_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Arra
     Ok(indices)
 }
 
-/// Applies selection weights and reduces group-major selection outputs back to source tokens.
+/// Restores group-major rows to the original token and selection-slot axes.
+pub(crate) fn restore_grouped_slots(
+    current: Array,
+    plan: &GroupedSelectionPlan,
+    num_tokens: i32,
+    top_k: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let selections = current.dim(0);
+    let width = current.dim(-1);
+    scatter_single(
+        zeros_dtype(&[selections, width], current.dtype(), stream)?,
+        &plan.selection_indices,
+        current.reshape(&[selections, 1, width], stream)?,
+        0,
+        stream,
+    )?
+    .reshape(&[num_tokens, top_k, width], stream)
+}
+
+/// Applies selection weights and reduces group-major outputs to source tokens.
 pub(crate) fn weighted_group_sum(
     current: Array,
     top_k_weights: &Array,
@@ -665,15 +710,8 @@ pub(crate) fn weighted_group_sum(
     // decisions between identical passes.
     let selections = weighted.dim(0);
     let width = weighted.dim(-1);
-    let ordered = scatter_single(
-        zeros_dtype(&[selections, width], weighted.dtype(), stream)?,
-        &plan.selection_indices,
-        weighted.reshape(&[selections, 1, width], stream)?,
-        0,
-        stream,
-    )?;
     let top_k = top_k_weights.dim(-1);
-    let ordered = ordered.reshape(&[num_tokens, top_k, width], stream)?;
+    let ordered = restore_grouped_slots(weighted, plan, num_tokens, top_k, stream)?;
     if reduction == eredu_nn::GroupReduction::Sum {
         return sum_axis(ordered, 1, false, stream);
     }
@@ -707,6 +745,26 @@ fn routing_dtype(precision: RoutingPrecision, input: Dtype, current: Dtype) -> D
         RoutingPrecision::Input => input,
         RoutingPrecision::Float32 => Dtype::Float32,
     }
+}
+
+fn float32_router_projection(
+    input: &Array,
+    weight: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let input = input.as_dtype(Dtype::Float32, stream)?;
+    let weight = weight.as_dtype(Dtype::Float32, stream)?;
+    #[cfg(target_vendor = "apple")]
+    if input.dim(0) == 1 && stream.get_device()?.get_type()? == safemlx::DeviceType::Cpu {
+        let rows = weight.dim(0);
+        let input = input.contiguous(false, stream)?.into_evaluated()?;
+        let weight = weight.contiguous(false, stream)?.into_evaluated()?;
+        let values = safemlx::ops::aligned_f32_row_projection(
+            input.as_slice::<f32>(), weight.as_slice::<f32>(),
+        )?;
+        return Ok(Array::from_slice(&values, &[1, rows]));
+    }
+    matmul(&input, weight.transpose(stream)?, stream)
 }
 
 fn routing_sum_last(input: &Array, stream: &Stream) -> Result<Array, Exception> {

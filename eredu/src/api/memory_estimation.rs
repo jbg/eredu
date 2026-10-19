@@ -339,6 +339,7 @@ pub fn inspected_speculative_generation_memory_plan(
     Ok((
         request,
         SpeculativeMemoryPlan {
+            conditioned: None,
             shared_backbone: None,
             embedded: Some(embedded),
             draft: None,
@@ -475,7 +476,9 @@ fn inspected_generation_memory_request_inner(
         loading_peak = MemoryBytes::estimated(resident_parameters.lower_bytes, add(add(parameters, *stored)?, conversion)?, "materialized destinations plus checkpoint source payload and conversion scratch; file pages may be reclaimable");
     }
     let chunk_tokens = if selected.preparation().prefill_chunking_support().is_ok()
-        && options.input.model_positions == options.input.text_tokens
+        && (options.input.model_positions == options.input.text_tokens
+            || text.requirements().prefill_input_retention()
+                == eredu_runtime::memory_forecast::PrefillInputRetention::PreparedProducts)
     {
         options.prefill_chunk_tokens
     } else {
@@ -484,9 +487,12 @@ fn inspected_generation_memory_request_inner(
     let token_bytes = mul(mul(options.input.text_tokens, options.batch_size)?, 4)?;
     let mut retained_input = options.retained_input.clone();
     // Input geometry alone cannot infer arbitrary image/audio buffers.
-    if options.input.model_positions != options.input.text_tokens {
+    if options.input.model_positions != options.input.text_tokens
+        || text.requirements().prefill_input_retention()
+            == eredu_runtime::memory_forecast::PrefillInputRetention::PreparedProducts
+    {
         retained_input = MemoryBytes::unknown(
-            "prepared media retention requires its actual host/tensor buffer sizes",
+            "prepared input retention requires actual host/tensor buffer sizes and backing precision",
         );
     }
     let execution_plan = ExecutionMemoryPlan {

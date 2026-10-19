@@ -319,7 +319,12 @@ fn point_to_point_worker() {
         .unwrap(),
         CommunicationOperationRequirement::tensors(
             CommunicationOperation::Broadcast,
-            [TensorDtype::F32, TensorDtype::I32],
+            [
+                TensorDtype::F16,
+                TensorDtype::Bf16,
+                TensorDtype::F32,
+                TensorDtype::I32,
+            ],
             CommunicationTensorLimits::new(1, 1, 4, None).unwrap(),
             true,
         )
@@ -424,6 +429,38 @@ fn point_to_point_worker() {
         published.as_array().evaluated().unwrap().as_slice::<f32>(),
         &[3.0]
     );
+    for dtype in [safemlx::Dtype::Float16, safemlx::Dtype::Bfloat16] {
+        for root in 0..2 {
+            let values = if rank == root {
+                [1.25, -2.5]
+            } else {
+                [f32::NAN, f32::INFINITY]
+            };
+            let input = Array::from_slice(&values, &[2])
+                .as_dtype(dtype, &stream)
+                .unwrap();
+            let published = <MlxNeuralBackend as BroadcastBackend>::broadcast(
+                MlxTensor::from_array(input),
+                root,
+                session_group,
+                &stream,
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+            assert_eq!(published.as_array().dtype(), dtype);
+            assert_eq!(
+                published
+                    .as_array()
+                    .as_dtype(safemlx::Dtype::Float32, &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap()
+                    .as_slice::<f32>(),
+                &[1.25, -2.5]
+            );
+        }
+    }
     let control = [i32::MIN, i32::MAX, 16_777_217, -16_777_217];
     let input = Array::from_slice(
         if rank == 1 {

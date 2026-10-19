@@ -1133,6 +1133,130 @@ impl PartitionOwnership {
 pub struct PartitionState {
     layout: StateLayout,
     global_layers: Range<usize>,
+    selected_layers: Vec<Range<usize>>,
+}
+
+impl ArchitectureStatePartitionPlan {
+    /// Resolves exact rank-local state from cold unit ownership or a constructed
+    /// partition. Global-ordinal packing keeps unowned gaps stateless.
+    pub fn resolve_partition(
+        &self,
+        complete: &StateLayout,
+        units: &ExecutionUnitLayout,
+        owned_units: impl Fn(usize) -> Option<Range<usize>>,
+        owns_output: bool,
+    ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
+        if self.rules().is_empty() {
+            if complete
+                .layers()
+                .iter()
+                .all(|policy| matches!(policy, eredu_core::cache::LayerCachePolicy::NoState))
+            {
+                return Ok(None);
+            }
+            return Err(ArchitectureStatePartitionError::EmptyPlan);
+        }
+
+        let mut rules = self.rules().iter().collect::<Vec<_>>();
+        rules.sort_by_key(|rule| rule.layers().start);
+        let mut frontier = 0usize;
+        for rule in &rules {
+            let layers = rule.layers();
+            if layers.is_empty() {
+                return Err(ArchitectureStatePartitionError::EmptyRange {
+                    start: layers.start,
+                    end: layers.end,
+                });
+            }
+            if layers.end > complete.len() {
+                return Err(ArchitectureStatePartitionError::RangeOutOfBounds {
+                    start: layers.start,
+                    end: layers.end,
+                    layers: complete.len(),
+                });
+            }
+            if layers.start < frontier {
+                return Err(ArchitectureStatePartitionError::OverlappingRange {
+                    start: layers.start,
+                    frontier,
+                });
+            }
+            if layers.start > frontier {
+                return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
+            }
+            if let ArchitectureStatePlacement::GroupUnits { group } = rule.placement() {
+                let units = units
+                    .group_range(group)
+                    .ok_or(ArchitectureStatePartitionError::UnknownGroup { group })?
+                    .len();
+                if layers.len() != units {
+                    return Err(ArchitectureStatePartitionError::GroupLengthMismatch {
+                        group,
+                        start: layers.start,
+                        end: layers.end,
+                        units,
+                    });
+                }
+            }
+            frontier = layers.end;
+        }
+        if frontier != complete.len() {
+            return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
+        }
+
+        let mut selected = Vec::new();
+        for rule in self.rules() {
+            let layers = rule.layers();
+            match rule.placement() {
+                ArchitectureStatePlacement::GroupUnits { group } => {
+                    if let Some(units) = owned_units(group) {
+                        if units.is_empty() || units.end > layers.len() {
+                            return Err(ArchitectureStatePartitionError::InvalidLayout(format!(
+                                "group {group} owned units {units:?} exceed its {} state slots",
+                                layers.len()
+                            )));
+                        }
+                        selected.push(layers.start + units.start..layers.start + units.end);
+                    }
+                }
+                ArchitectureStatePlacement::OutputOwner if owns_output => {
+                    selected.push(layers);
+                }
+                ArchitectureStatePlacement::OutputOwner => {}
+            }
+        }
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        selected.sort_by_key(|layers| layers.start);
+        let start = selected[0].start;
+        let mut ranges = vec![selected[0].clone()];
+        for layers in selected.into_iter().skip(1) {
+            let previous = ranges.last_mut().expect("nonempty state selection");
+            if layers.start != previous.end
+                && self.packing() == crate::StatePartitionPacking::Contiguous
+            {
+                return Err(ArchitectureStatePartitionError::DiscontiguousSelection {
+                    frontier: previous.end,
+                    start: layers.start,
+                });
+            }
+            if layers.start == previous.end {
+                previous.end = layers.end;
+            } else {
+                ranges.push(layers);
+            }
+        }
+        let end = ranges.last().expect("nonempty state selection").end;
+        let layout = complete
+            .selected_slice(start..end, &ranges)
+            .map_err(|error| ArchitectureStatePartitionError::InvalidLayout(error.to_string()))?;
+        Ok(Some(PartitionState {
+            layout,
+            global_layers: start..end,
+            selected_layers: ranges,
+        }))
+    }
 }
 
 impl PartitionState {
@@ -1150,6 +1274,7 @@ impl PartitionState {
         Ok(Self {
             layout,
             global_layers: global_layer_offset..end,
+            selected_layers: vec![global_layer_offset..end],
         })
     }
 
@@ -1163,9 +1288,24 @@ impl PartitionState {
         self.global_layers.start
     }
 
-    /// Returns the architecture-global state-layer range.
+    /// Returns the represented global span, including any stateless unowned gaps.
     pub fn global_layers(&self) -> Range<usize> {
         self.global_layers.clone()
+    }
+
+    /// Exact architecture-global slots selected by this coordinate. Adjacent
+    /// selections are coalesced; gaps in the represented span remain `NoState`.
+    pub fn selected_global_layers(&self) -> &[Range<usize>] { &self.selected_layers }
+
+    /// Whether this coordinate owns the supplied architecture-global state slot.
+    pub fn owns_global_layer(&self, layer: usize) -> bool {
+        self.selected_layers.iter().any(|range| range.contains(&layer))
+    }
+
+    /// Projects the full architecture layout using the retained exact ownership.
+    /// Families use this when checking cache identity and local construction.
+    pub fn selected_layout(&self, complete: &StateLayout) -> Result<StateLayout, crate::StateError> {
+        complete.selected_slice(self.global_layers.clone(), &self.selected_layers)
     }
 
     /// Derives prompt-cache identity from this canonical state partition.
@@ -1484,114 +1624,24 @@ impl<G, A> ArchitecturePartition<G, A> {
 
     /// Resolves the architecture-authored state plan for this realized partition.
     ///
-    /// The current partition representation stores one contiguous global state
-    /// interval. A valid plan may describe multiple semantic ranges, but the
-    /// ranges selected by any one partition must be adjacent.
+    /// Contiguous packing requires adjacent selected ranges. Global-ordinal
+    /// preservation instead represents unowned gaps as stateless slots.
     pub fn resolve_state_partition(
         &self,
         complete: &StateLayout,
         plan: &ArchitectureStatePartitionPlan,
     ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
-        if plan.rules().is_empty() {
-            if complete
-                .layers()
-                .iter()
-                .all(|policy| matches!(policy, eredu_core::cache::LayerCachePolicy::NoState))
-            {
-                return Ok(None);
-            }
-            return Err(ArchitectureStatePartitionError::EmptyPlan);
-        }
-
-        let mut rules = plan.rules().iter().collect::<Vec<_>>();
-        rules.sort_by_key(|rule| rule.layers().start);
-        let mut frontier = 0usize;
-        for rule in &rules {
-            let layers = rule.layers();
-            if layers.is_empty() {
-                return Err(ArchitectureStatePartitionError::EmptyRange {
-                    start: layers.start,
-                    end: layers.end,
-                });
-            }
-            if layers.end > complete.len() {
-                return Err(ArchitectureStatePartitionError::RangeOutOfBounds {
-                    start: layers.start,
-                    end: layers.end,
-                    layers: complete.len(),
-                });
-            }
-            if layers.start < frontier {
-                return Err(ArchitectureStatePartitionError::OverlappingRange {
-                    start: layers.start,
-                    frontier,
-                });
-            }
-            if layers.start > frontier {
-                return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
-            }
-            if let ArchitectureStatePlacement::GroupUnits { group } = rule.placement() {
-                let units = self
-                    .unit_layout
-                    .group_range(group)
-                    .ok_or(ArchitectureStatePartitionError::UnknownGroup { group })?
-                    .len();
-                if layers.len() != units {
-                    return Err(ArchitectureStatePartitionError::GroupLengthMismatch {
-                        group,
-                        start: layers.start,
-                        end: layers.end,
-                        units,
-                    });
-                }
-            }
-            frontier = layers.end;
-        }
-        if frontier != complete.len() {
-            return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
-        }
-
-        let mut selected = Vec::new();
-        for rule in plan.rules() {
-            let layers = rule.layers();
-            match rule.placement() {
-                ArchitectureStatePlacement::GroupUnits { group } => {
-                    if let Some(owned) = self
-                        .groups
-                        .iter()
-                        .find(|owned| owned.group_index() == group)
-                    {
-                        let units = owned.global_units();
-                        selected.push(layers.start + units.start..layers.start + units.end);
-                    }
-                }
-                ArchitectureStatePlacement::OutputOwner if self.ownership.owns_output() => {
-                    selected.push(layers);
-                }
-                ArchitectureStatePlacement::OutputOwner => {}
-            }
-        }
-        if selected.is_empty() {
-            return Ok(None);
-        }
-        selected.sort_by_key(|layers| layers.start);
-        let start = selected[0].start;
-        let mut end = selected[0].end;
-        for layers in selected.iter().skip(1) {
-            if layers.start != end {
-                return Err(ArchitectureStatePartitionError::DiscontiguousSelection {
-                    frontier: end,
-                    start: layers.start,
-                });
-            }
-            end = layers.end;
-        }
-        let layout = complete
-            .slice(start..end)
-            .map_err(|error| ArchitectureStatePartitionError::InvalidLayout(error.to_string()))?;
-        PartitionState::new(layout, start)
-            .map(Some)
-            .map_err(|error| ArchitectureStatePartitionError::InvalidLayout(error.to_string()))
+        plan.resolve_partition(
+            complete,
+            &self.unit_layout,
+            |group| {
+                self.groups
+                    .iter()
+                    .find(|owned| owned.group_index() == group)
+                    .map(PartitionGroup::global_units)
+            },
+            self.ownership.owns_output(),
+        )
     }
 
     /// Returns family-owned rank-local construction geometry.
@@ -1687,6 +1737,18 @@ impl LayeredPartitionDriver {
         storage_range: Range<usize>,
         group_owns_state: bool,
     ) -> Result<Self, LayeredPartitionError> {
+        let state_range = group_owns_state.then(|| storage_range.clone());
+        Self::new_with_state_range(partition, group_index, storage_range, state_range)
+    }
+
+    /// Validates architecture-authored state addresses independently of unit indices.
+    /// Stateful encoder units can follow the decoder in the global state layout.
+    pub fn new_with_state_range<G, A>(
+        partition: &ArchitecturePartition<G, A>,
+        group_index: usize,
+        storage_range: Range<usize>,
+        state_range: Option<Range<usize>>,
+    ) -> Result<Self, LayeredPartitionError> {
         let group = partition
             .groups()
             .iter()
@@ -1699,21 +1761,28 @@ impl LayeredPartitionDriver {
                 partition: range,
             });
         }
-        if group_owns_state {
+        if let Some(state_range) = &state_range {
             let state = partition
                 .state()
                 .ok_or(LayeredPartitionError::MissingState)?;
-            if state.global_layers().start > range.start || state.global_layers().end < range.end {
+            if state_range.len() != range.len()
+                || state.global_layers().start > state_range.start
+                || state.global_layers().end < state_range.end
+                || state_range
+                    .clone()
+                    .any(|layer| !state.owns_global_layer(layer))
+            {
                 return Err(LayeredPartitionError::StateRange {
                     state: state.global_layers(),
-                    partition: range,
+                    partition: state_range.clone(),
                 });
             }
         }
         Ok(Self {
             group: group.group_index(),
             range,
-            state_layout: group_owns_state
+            state_layout: state_range
+                .is_some()
                 .then(|| partition.state().map(|state| state.layout().clone()))
                 .flatten(),
             owns_input: partition.ownership().owns_input(),
@@ -2536,6 +2605,70 @@ mod tests {
                 start: 5,
             })
         );
+    }
+
+    #[test]
+    fn architecture_state_plan_rejects_cross_group_cold_ownership() {
+        let complete = state_layout(5);
+        let partition = state_plan_partition(
+            0..2,
+            PartitionOwnership::new(true, false, std::iter::empty::<&str>()).unwrap(),
+        );
+        let plan = ArchitectureStatePartitionPlan::new([
+            crate::ArchitectureStatePartitionRule::group_units(0, 0..4),
+            crate::ArchitectureStatePartitionRule::output_owner(4..5),
+        ]);
+        assert!(matches!(
+            plan.resolve_partition(&complete, &partition.unit_layout, |_| Some(0..5), false),
+            Err(ArchitectureStatePartitionError::InvalidLayout(_))
+        ));
+    }
+
+    #[test]
+    fn architecture_state_plan_preserves_global_keys_without_allocating_unowned_state() {
+        use eredu_core::cache::{LayerCachePolicy, StateTensorPolicy, StateTensorRole,
+            StateTensorDimension as Dim, StateTensorDtype, StateTensorPresence, StateResidencyClass};
+        let audio = LayerCachePolicy::FixedState { tensors: vec![StateTensorPolicy {
+            role: StateTensorRole::Convolution { slot: 0 },
+            shape: vec![Dim::Batch, Dim::Fixed(std::num::NonZeroU32::new(2).unwrap()),
+                Dim::Fixed(std::num::NonZeroU32::new(3).unwrap())],
+            dtype: StateTensorDtype::Floating, presence: StateTensorPresence::Optional,
+            residency: StateResidencyClass::AlwaysDeviceMutable,
+        }] };
+        let kv = LayerCachePolicy::key_value(eredu_core::AttentionPolicy::Full,2,4).unwrap();
+        let complete = StateLayout::new(eredu_core::LayerSchedule::new(6,
+            vec![audio.clone(),audio,kv.clone(),kv.clone(),kv.clone(),kv]).unwrap()).unwrap();
+        let plan = ArchitectureStatePartitionPlan::new([
+            crate::ArchitectureStatePartitionRule::output_owner(0..2),
+            crate::ArchitectureStatePartitionRule::group_units(0, 2..6),
+        ]).with_packing(crate::StatePartitionPacking::PreserveGlobalOrdinals);
+        let mut output = state_plan_partition(3..4,
+            PartitionOwnership::new(false,true,std::iter::empty::<&str>()).unwrap());
+        let selected = output.resolve_state_partition(&complete,&plan).unwrap().unwrap();
+        assert_eq!(selected.global_layers(),0..6);
+        assert_eq!(selected.selected_global_layers(), &[0..2,5..6]);
+        assert_eq!(selected.selected_layout(&complete).unwrap(),*selected.layout());
+        for layer in 0..6 {
+            let owned = matches!(layer,0|1|5);
+            assert_eq!(selected.owns_global_layer(layer),owned);
+            assert_eq!(selected.layout().layer(layer).unwrap(),
+                if owned {complete.layer(layer).unwrap()} else {&eredu_core::cache::LayerCachePolicy::NoState});
+            if !owned { assert!(selected.layout().components(layer).unwrap().is_empty()); }
+        }
+        let non_output = state_plan_partition(0..2,
+            PartitionOwnership::new(true,false,std::iter::empty::<&str>()).unwrap());
+        let other = non_output.resolve_state_partition(&complete,&plan).unwrap().unwrap();
+        assert_eq!(other.global_layers(),2..4);
+        assert_eq!(other.selected_global_layers(), &[2..4]);
+        // Global layer 5 keeps ordinal 5 in the first coordinate, while global
+        // layer 2 is local slot 0 in the other. No unowned KV state is created.
+        assert_eq!(selected.global_layer_offset()+5,5);
+        assert_eq!(other.global_layer_offset(),2);
+        let forged = PartitionState::new(selected.layout().clone(),0).unwrap();
+        assert_ne!(forged.selected_layout(&complete).unwrap(),*forged.layout());
+        output.state = Some(selected);
+        assert!(matches!(LayeredPartitionDriver::new(&output,0,3..4),
+            Err(LayeredPartitionError::StateRange { .. })), "a represented gap cannot authorize a stateful unit");
     }
 
     fn parameter_description(

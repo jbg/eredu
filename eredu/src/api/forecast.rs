@@ -3,10 +3,14 @@ use super::*;
 use eredu_core::{CapabilityError, InputTokenCount};
 use eredu_runtime::memory_forecast::LoadedMemoryProfile;
 pub use eredu_runtime::memory_forecast::{
+    ConditionedAssistantMemoryPlan, ConditionedBlockConvolution,
+    ConditionedPredictionBody, ConditionedPredictionScoring, ConditionedPredictionTopology,
+    ParameterResidencyMemoryBounds,
     CaptureMemoryPlan, ConversionRetentionGroupMemoryPlan, ConversionRetentionMemoryPlan,
     DecodingContinuationMemoryPlan, EmbeddedPredictionMemoryPlan, ForecastCalibration,
     ForecastExecutionContract, GenerationForecastBackend, GenerationForecastError,
     RefinementMemoryPlan, SpeculativeForecastBackend, SpeculativeMemoryPlan,
+    PrefillInputRetention,
 };
 use serde::{Deserialize, Serialize};
 mod continuation;
@@ -196,6 +200,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             ));
         }
         forecast.execution = ForecastExecutionContract {
+            input_retention: forecast.execution.input_retention,
             full_pass_reason: Some(
                 "selected speculative transaction uses full-pass prefill".into(),
             ),
@@ -225,7 +230,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
                 execution.logits = LogitsWorkspace::EveryPosition;
             }
         }
-        let draft = profile
+        let ordinary_draft = profile
             .draft
             .map(|profile| {
                 loaded_forecast(
@@ -241,12 +246,28 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
                 )
             })
             .transpose()?;
-        if let Some(draft) = &draft {
+        if let Some(draft) = &ordinary_draft {
             forecast
                 .estimate
                 .assumptions
                 .extend(draft.estimate.assumptions.clone());
         }
+        let (draft, conditioned) = match profile.conditioned {
+            Some(assistant) => {
+                if ordinary_draft.is_some() {
+                    return Err(eredu_core::CapabilityError::InvalidConfiguration {
+                        field: "speculative memory", detail: "conditioned and autoregressive draft owners are mutually exclusive".into(),
+                    }.into());
+                }
+                let (request, plan) = assistant.into_request(
+                    forecast.request.input,
+                    forecast.request.max_output_tokens.unwrap_or(forecast.request.forecast_output_tokens),
+                    options,
+                )?;
+                (Some(request), Some(plan))
+            },
+            None => (ordinary_draft.map(|f| f.request), None),
+        };
         let mut embedded = profile
             .embedded
             .as_ref()
@@ -268,9 +289,10 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             );
         }
         forecast.speculative = Some(SpeculativeMemoryPlan {
+            conditioned,
             shared_backbone: profile.shared_backbone.map(|mut shared| { if !matches!(mode, DecodingMode::SelfSpeculation(options) if options.request().draft_adapter) { shared.adapter = None; } shared }),
             embedded,
-            draft: draft.map(|f| f.request),
+            draft,
             auxiliary_bytes_per_position: profile.auxiliary_bytes_per_position,
             sampling_bytes_per_vocabulary_entry: profile.sampling_bytes_per_vocabulary_entry,
             max_draft_tokens: if matches!(mode, DecodingMode::SelfSpeculation(_)) { speculative.request().max_draft_tokens.get() as u64 } else { 0 },
@@ -495,7 +517,14 @@ pub fn forecast_inspected_generation(
         .err()
         .map(str::to_owned)
         .or_else(|| {
-            (options.input.model_positions != options.input.text_tokens)
+            (options.input.model_positions != options.input.text_tokens
+                && selected
+                    .preparation()
+                    .execution()
+                    .text_realization()
+                    .requirements()
+                    .prefill_input_retention()
+                    == eredu_runtime::memory_forecast::PrefillInputRetention::TokenIds)
                 .then(|| "prepared media input requires a complete prefill pass".into())
         });
     let modeled_final_position = full_pass_reason.is_none()
@@ -505,6 +534,12 @@ pub fn forecast_inspected_generation(
             .flat_map(|d| &d.executions)
             .all(|e| e.execution_topology.is_some());
     let execution = ForecastExecutionContract {
+        input_retention: selected
+            .preparation()
+            .execution()
+            .text_realization()
+            .requirements()
+            .prefill_input_retention(),
         full_pass_reason,
         logits: if modeled_final_position {
             LogitsWorkspace::FinalPosition

@@ -438,7 +438,7 @@ impl ModelProcessor {
                             ProcessorPreparationError::Backend(Error::ProcessorResources(error))
                         }
                         ProcessorExecutionError::Admission(error) => {
-                            ProcessorPreparationError::Backend(Error::ProcessorAdmission(error))
+                            ProcessorPreparationError::Capability(error)
                         }
                         ProcessorExecutionError::Plan(error) => {
                             ProcessorPreparationError::Backend(Error::Processor(error))

@@ -227,6 +227,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleLayer<B> {
             Some(self.norm_weight.as_ref()),
             None,
             self.epsilon,
+            eredu_nn::LayerNormalizationArithmetic::Native,
             context,
         )?
         .maximum_scalar(0.0, context)

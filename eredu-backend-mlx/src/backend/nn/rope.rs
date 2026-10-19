@@ -372,13 +372,14 @@ pub enum RopeVariant {
 
 mod input_products;
 
-/// Explicit input-dtype rotary products over precomputed frequency denominators.
+/// Explicit table and product rounding over precomputed frequency denominators.
 #[derive(Debug, Clone)]
 pub(super) struct ElementwiseRotary {
     dimensions: i32,
     traditional: bool,
     inverse_frequencies: Array,
     amplitude: f32,
+    arithmetic: eredu_nn::RotaryArithmetic,
 }
 
 impl ElementwiseRotary {
@@ -436,6 +437,7 @@ impl ElementwiseRotary {
             traditional: spec.traditional,
             inverse_frequencies,
             amplitude,
+            arithmetic: spec.arithmetic,
         })
     }
 
@@ -445,16 +447,18 @@ impl ElementwiseRotary {
         offset: i32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if let Some(output) = input_products::forward(
-            input,
-            &self.inverse_frequencies,
-            self.dimensions,
-            self.traditional,
-            offset,
-            self.amplitude,
-            stream,
-        )? {
-            return Ok(output);
+        if self.arithmetic == eredu_nn::RotaryArithmetic::InputProducts {
+            if let Some(output) = input_products::forward(
+                input,
+                &self.inverse_frequencies,
+                self.dimensions,
+                self.traditional,
+                offset,
+                self.amplitude,
+                stream,
+            )? {
+                return Ok(output);
+            }
         }
         let shape = input.shape();
         let length = input.dim(-2);
@@ -470,7 +474,19 @@ impl ElementwiseRotary {
         let sin = sin(&angles, stream)?
             .multiply(&amplitude, stream)?
             .as_dtype(input.dtype(), stream)?;
-        let rotary = x.try_index_device((.., .., ..self.dimensions), stream)?;
+        let (cos, sin, rotary) = match self.arithmetic {
+            eredu_nn::RotaryArithmetic::InputTableFloat32Products => (
+                cos.as_dtype(safemlx::Dtype::Float32, stream)?,
+                sin.as_dtype(safemlx::Dtype::Float32, stream)?,
+                x.try_index_device((.., .., ..self.dimensions), stream)?
+                    .as_dtype(safemlx::Dtype::Float32, stream)?,
+            ),
+            _ => (
+                cos,
+                sin,
+                x.try_index_device((.., .., ..self.dimensions), stream)?,
+            ),
+        };
         let half = self.dimensions / 2;
         let (first, second) = if self.traditional {
             let pairs = rotary.reshape(&[-1, length, half, 2], stream)?;
@@ -503,6 +519,7 @@ impl ElementwiseRotary {
         } else {
             concatenate_axis(&[left, right], -1, stream)?
         };
+        let rotated = rotated.as_dtype(input.dtype(), stream)?;
         let output = if width == self.dimensions {
             rotated
         } else {

@@ -535,6 +535,7 @@ fn mlx_general_normalization_matches_scalar_references() {
 
     let mut normalization = <MlxNeuralBackend as NeuralBackend>::normalization(
         NormalizationConstructionSpec {
+            reduction: eredu_nn::NormalizationReduction::Native,
             groups: None,
             dimensions: 4,
             epsilon,
@@ -645,6 +646,7 @@ fn mlx_learned_offset_rms_preserves_precision_and_float32_scale_arithmetic() {
                 .collect::<Vec<_>>();
             let mut normalization = MlxNeuralBackend::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     dimensions: 4,
                     groups: None,
                     epsilon,
@@ -1300,6 +1302,7 @@ fn mlx_dilated_causal_convolution_matches_scalar_history() {
     let stream = execution.stream();
     let mut conv = CausalDepthwiseConvolution::<MlxNeuralBackend>::new(
         CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             channels: 1,
             kernel_size: 3,
             dilation: 3,

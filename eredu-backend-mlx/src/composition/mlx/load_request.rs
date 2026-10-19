@@ -23,6 +23,16 @@ impl MlxLoadRequest {
         }
     }
 
+    /// Binds a device to an already normalized complete parallel request.
+    pub(crate) fn bind_parallel_device(
+        mut self,
+        device: crate::backend::DeviceAssignment,
+    ) -> Result<Self, Error> {
+        self.parallel_device = Some(device);
+        self.checked_normalized()?;
+        Ok(self)
+    }
+
     /// Returns the singular portable policy wrapped by this native adapter.
     pub const fn normalized(&self) -> &NormalizedLoadRequest {
         &self.normalized

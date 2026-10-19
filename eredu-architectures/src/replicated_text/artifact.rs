@@ -81,9 +81,7 @@ impl ArtifactRecipeCatalog {
             .as_ref()
             .is_some_and(|keys| !keys.contains(key))
         {
-            return Err(eredu_checkpoint::store::StoreError::UnknownTensor {
-                key: key.into(),
-            });
+            return Err(eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() });
         }
         Ok(())
     }
@@ -122,7 +120,12 @@ pub(crate) fn target_catalog(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
 ) -> Result<Arc<ArtifactRecipeCatalog>, ReplicatedTextRequirementsError> {
     let catalog = catalog(inspection)?;
-    if inspection.architecture_plan().prediction_extension().is_none() {
+    if inspection
+        .architecture_plan()
+        .prediction_extension()
+        .is_none()
+        && inspection.architecture_plan().media_companions().is_empty()
+    {
         return Ok(catalog);
     }
     let sources = crate::artifact_preparation::source_declarations(inspection)?;
@@ -157,12 +160,27 @@ pub(super) fn normalize(
                 plan.gguf_plan(),
                 inspection.gguf_checkpoint(),
             ) {
-                (Some(architecture), None, None) => safetensors_parameters(
-                    architecture,
-                    inspection.tensors(),
-                    config,
-                    recipe_source,
-                )?,
+                (Some(architecture), None, None) => {
+                    let mut schema = architecture.checkpoint().clone();
+                    let keep = |tensor: &eredu_checkpoint::schema::SafetensorsTensorConstraint| {
+                        !plan.replaces_media_parameter(&tensor.key)
+                    };
+                    schema.common_tensors.retain(keep);
+                    for group in &mut schema.layout_groups {
+                        for variant in &mut group.variants {
+                            variant.tensors.retain(keep);
+                        }
+                    }
+                    safetensors_schema_parameters(
+                        &schema,
+                        architecture
+                            .checkpoint_resolution()
+                            .expect("admitted target"),
+                        inspection.tensors(),
+                        config,
+                        recipe_source,
+                    )?
+                }
                 (None, Some(architecture), Some(checkpoint)) => {
                     let checkpoint = architecture.prepared_checkpoint(checkpoint);
                     let primary_mapping = plan
@@ -170,9 +188,14 @@ pub(super) fn normalize(
                         .map_or(architecture.tensor_mapping(), |projector| {
                             projector.primary_tensor_mapping()
                         });
+                    let primary_mapping = primary_mapping
+                        .iter()
+                        .filter(|mapping| !plan.replaces_media_parameter(&mapping.layout.name))
+                        .cloned()
+                        .collect::<Vec<_>>();
                     let metadata_sources = metadata_source_keys(architecture.checkpoint());
                     let mut parameters = gguf_parameters(
-                        primary_mapping,
+                        &primary_mapping,
                         &metadata_sources,
                         checkpoint,
                         config,
@@ -183,7 +206,7 @@ pub(super) fn normalize(
                             .validated_gguf()
                             .and_then(|validated| {
                                 validated.companion(
-                                    &eredu_core::artifact::GgufCompanionRole::MediaProjector,
+                                    &eredu_core::artifact::ArtifactCompanionRole::MediaProjector,
                                 )
                             })
                             .ok_or_else(|| {
@@ -191,17 +214,25 @@ pub(super) fn normalize(
                             "admitted GGUF media-projector plan omitted its exact companion".into(),
                         )
                             })?;
-                        parameters.extend(
-                            gguf_parameters(
-                                projector_plan.tensor_mapping(),
-                                &metadata_source_keys(projector_plan.checkpoint()),
-                                companion.checkpoint(),
-                                config,
-                                recipe_source,
-                            )?
-                            .into_iter()
-                            .filter(|parameter| parameter.presence().has_physical_source()),
-                        );
+                        let mappings = projector_plan
+                            .tensor_mapping()
+                            .iter()
+                            .filter(|mapping| !plan.replaces_media_parameter(&mapping.layout.name))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if !mappings.is_empty() {
+                            parameters.extend(
+                                gguf_parameters(
+                                    &mappings,
+                                    &metadata_source_keys(projector_plan.checkpoint()),
+                                    companion.checkpoint(),
+                                    config,
+                                    recipe_source,
+                                )?
+                                .into_iter()
+                                .filter(|parameter| parameter.presence().has_physical_source()),
+                            );
+                        }
                         parameters = finish_parameters(parameters)?;
                     }
                     parameters
@@ -215,12 +246,37 @@ pub(super) fn normalize(
 
             if let Some(adapter) = plan.draft_adapter() {
                 parameters.extend(safetensors_schema_parameters(
-                    &adapter.schema, &adapter.resolution, &adapter.tensors, config, recipe_source,
+                    &adapter.schema,
+                    &adapter.resolution,
+                    &adapter.tensors,
+                    config,
+                    recipe_source,
                 )?);
                 parameters = finish_parameters(parameters)?;
             }
-            let parameters =
-                finalize_materialization_parameters(config, parameters, recipe_source)?;
+            let mut media_recipes = BTreeMap::new();
+            for companion in plan.media_companions() {
+                let tensors = companion
+                    .tensor_catalog()
+                    .map_err(|e| ReplicatedTextRequirementsError::InvalidArtifact(e.to_string()))?;
+                parameters.extend(safetensors_schema_parameters(
+                    companion.schema(),
+                    companion.preparation().resolution(),
+                    &tensors,
+                    config,
+                    recipe_source,
+                )?);
+                media_recipes.extend(companion.recipes().clone());
+            }
+            if !plan.media_companions().is_empty() {
+                parameters = finish_parameters(parameters)?;
+            }
+            let parameters = finalize_materialization_parameters(
+                config,
+                parameters,
+                recipe_source,
+                media_recipes,
+            )?;
             let shared_source_keys = config.shared_derived_source_keys(&parameters.1);
             let prediction = plan
                 .prediction_extension()
@@ -243,6 +299,77 @@ pub(super) fn normalize(
             }))
         })
         .clone()
+}
+
+/// Preserve admission of source-only schema values without making them neural
+/// destinations. Inputs to any target or auxiliary derivation remain binding-owned.
+pub(super) fn nonparameter_sources(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    normalized: &NormalizedArtifactPreparation,
+) -> BTreeSet<String> {
+    fn safetensors(
+        schema: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
+    ) -> BTreeSet<String> {
+        schema
+            .common_tensors
+            .iter()
+            .chain(
+                schema
+                    .layout_groups
+                    .iter()
+                    .flat_map(|g| &g.variants)
+                    .flat_map(|v| &v.tensors),
+            )
+            .filter(|t| {
+                matches!(
+                    t.role,
+                    eredu_checkpoint::schema::TensorRole::ArtifactMetadata
+                        | eredu_checkpoint::schema::TensorRole::RecipeInput
+                )
+            })
+            .flat_map(|t| std::iter::once(t.key.clone()).chain(t.aliases.clone()))
+            .collect()
+    }
+    let plan = inspection.architecture_plan();
+    let mut candidates = BTreeSet::new();
+    if let Some(architecture) = plan.safetensors_architecture() {
+        candidates.extend(safetensors(architecture.checkpoint()));
+    }
+    if let Some(architecture) = plan.gguf_plan() {
+        candidates.extend(
+            metadata_source_keys(architecture.checkpoint())
+                .into_iter()
+                .map(str::to_owned),
+        );
+    }
+    if let Some(projector) = plan.gguf_media_projector() {
+        candidates.extend(
+            metadata_source_keys(projector.checkpoint())
+                .into_iter()
+                .map(str::to_owned),
+        );
+    }
+    if let Some(adapter) = plan.draft_adapter() {
+        candidates.extend(safetensors(&adapter.schema));
+    }
+    if let Some(extension) = plan.prediction_extension() {
+        candidates.extend(safetensors(extension.complete_architecture().checkpoint()));
+    }
+    for companion in plan.media_companions() {
+        candidates.extend(safetensors(companion.schema()));
+    }
+    let declarations = std::iter::once(&normalized.parameters).chain(normalized.prediction.iter());
+    let referenced = declarations
+        .flat_map(|(parameters, recipes, _)| {
+            parameters
+                .iter()
+                .flat_map(|p| p.sources().iter().map(String::as_str))
+                .chain(recipes.values().flat_map(|r| r.source_keys()))
+        })
+        .collect::<BTreeSet<_>>();
+    candidates
+        .retain(|key| normalized.physical.contains_key(key) && !referenced.contains(key.as_str()));
+    candidates
 }
 #[derive(Debug)]
 pub(super) struct InspectionCheckpointSource {
@@ -303,31 +430,84 @@ impl RecipeCatalog for InspectionCheckpointSource {
 #[derive(Debug)]
 struct GgufInspectionCatalog(eredu_checkpoint::gguf_store::GgufCatalog);
 impl RecipeCatalog for GgufInspectionCatalog {
-    fn tensor_metadata(&self, key: &str) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> { self.0.metadata(key) }
+    fn tensor_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        self.0.metadata(key)
+    }
 }
 impl ArtifactCatalog for GgufInspectionCatalog {
-    fn source_keys(&self) -> Vec<String> { self.0.keys() }
-    fn source_metadata(&self, key: &str) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> { self.0.metadata(key) }
-    fn source_provenance(&self, key: &str) -> Result<eredu_checkpoint::store::TensorSourceProvenance, eredu_checkpoint::store::StoreError> { self.0.source_provenance(key) }
-    fn source_backend(&self) -> Result<eredu_checkpoint::store::WeightStoreBackend, eredu_checkpoint::store::StoreError> { Ok(eredu_checkpoint::store::WeightStoreBackend::Gguf) }
+    fn source_keys(&self) -> Vec<String> {
+        self.0.keys()
+    }
+    fn source_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        self.0.metadata(key)
+    }
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, eredu_checkpoint::store::StoreError>
+    {
+        self.0.source_provenance(key)
+    }
+    fn source_backend(
+        &self,
+    ) -> Result<eredu_checkpoint::store::WeightStoreBackend, eredu_checkpoint::store::StoreError>
+    {
+        Ok(eredu_checkpoint::store::WeightStoreBackend::Gguf)
+    }
 }
 #[derive(Debug)]
 struct CompositeInspectionCatalog(Vec<Arc<dyn ColdCatalog>>);
 impl RecipeCatalog for CompositeInspectionCatalog {
-    fn tensor_metadata(&self, key: &str) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> { self.source_metadata(key) }
+    fn tensor_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        self.source_metadata(key)
+    }
 }
 impl ArtifactCatalog for CompositeInspectionCatalog {
-    fn source_keys(&self) -> Vec<String> { self.0.iter().flat_map(|c| c.source_keys()).collect() }
-    fn source_metadata(&self, key: &str) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
-        self.0.iter().find_map(|c| c.source_metadata(key).ok()).ok_or_else(|| eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() })
+    fn source_keys(&self) -> Vec<String> {
+        self.0.iter().flat_map(|c| c.source_keys()).collect()
     }
-    fn source_provenance(&self, key: &str) -> Result<eredu_checkpoint::store::TensorSourceProvenance, eredu_checkpoint::store::StoreError> {
-        self.0.iter().find_map(|c| c.source_provenance(key).ok()).ok_or_else(|| eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() })
+    fn source_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        self.0
+            .iter()
+            .find_map(|c| c.source_metadata(key).ok())
+            .ok_or_else(|| eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() })
     }
-    fn source_backend(&self) -> Result<eredu_checkpoint::store::WeightStoreBackend, eredu_checkpoint::store::StoreError> {
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, eredu_checkpoint::store::StoreError>
+    {
+        self.0
+            .iter()
+            .find_map(|c| c.source_provenance(key).ok())
+            .ok_or_else(|| eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() })
+    }
+    fn source_backend(
+        &self,
+    ) -> Result<eredu_checkpoint::store::WeightStoreBackend, eredu_checkpoint::store::StoreError>
+    {
         let mut kinds = self.0.iter().map(|c| c.source_backend());
-        let first = kinds.next().transpose()?.unwrap_or(eredu_checkpoint::store::WeightStoreBackend::Composite);
-        for kind in kinds { if kind? != first { return Ok(eredu_checkpoint::store::WeightStoreBackend::Composite); } }
+        let first = kinds
+            .next()
+            .transpose()?
+            .unwrap_or(eredu_checkpoint::store::WeightStoreBackend::Composite);
+        for kind in kinds {
+            if kind? != first {
+                return Ok(eredu_checkpoint::store::WeightStoreBackend::Composite);
+            }
+        }
         Ok(first)
     }
 }
@@ -363,28 +543,72 @@ fn derive_recipe_source(
     let declarations = crate::artifact_preparation::source_declarations(inspection)?;
     let mut catalogs: Vec<Arc<dyn ColdCatalog>> = Vec::new();
     let mut keys = BTreeSet::new();
-    for artifact in declarations.artifacts().values() {
+    for (id, artifact) in declarations.artifacts() {
+        let active = declarations
+            .roles
+            .values()
+            .filter_map(|roles| roles.get(id))
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if active.is_empty() {
+            continue;
+        }
         let catalog: Arc<dyn ColdCatalog> = match artifact {
-            PhysicalArtifactPreparation::Safetensors { catalog, resolution, .. } => Arc::new(InspectionCheckpointSource {
+            PhysicalArtifactPreparation::Safetensors {
+                catalog,
+                resolution,
+                ..
+            } => Arc::new(InspectionCheckpointSource {
                 recipes: Default::default(),
-                metadata: catalog.iter().filter(|(key, _)| resolution.source_keys().contains(*key)).map(|(key, value)| (key.clone(), value.clone())).collect(),
+                metadata: catalog
+                    .iter()
+                    .filter(|(key, _)| resolution.source_keys().contains(*key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
                 backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
             }),
-            PhysicalArtifactPreparation::Gguf { checkpoint, mapping, resolution } => Arc::new(GgufInspectionCatalog(
-                eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(checkpoint, resolution, mapping)
-                    .map_err(|e| ReplicatedTextRequirementsError::InvalidArtifact(e.to_string()))?,
+            PhysicalArtifactPreparation::Gguf {
+                checkpoint,
+                mapping,
+                resolution,
+            } => Arc::new(GgufInspectionCatalog(
+                eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(
+                    checkpoint, resolution, mapping,
+                )
+                .map_err(|e| ReplicatedTextRequirementsError::InvalidArtifact(e.to_string()))?,
             )),
             PhysicalArtifactPreparation::MetadataOnly { .. } => {
-                let architecture = inspection.architecture_plan().safetensors_architecture().ok_or_else(|| ReplicatedTextRequirementsError::InvalidArtifact("metadata-only source requires a SafeTensors schema".into()))?;
+                let architecture = inspection
+                    .architecture_plan()
+                    .safetensors_architecture()
+                    .ok_or_else(|| {
+                        ReplicatedTextRequirementsError::InvalidArtifact(
+                            "metadata-only source requires a SafeTensors schema".into(),
+                        )
+                    })?;
                 safetensors_inspection_recipe_source(inspection, architecture)?
             }
         };
+        let catalog: Arc<dyn ColdCatalog> = Arc::new(ArtifactRecipeCatalog {
+            source: catalog,
+            allowed_keys: Some(active),
+            recipes: Default::default(),
+        });
         for key in catalog.source_keys() {
-            if !keys.insert(key.clone()) { return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!("physical artifacts overlap at source {key:?}"))); }
+            if !keys.insert(key.clone()) {
+                return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                    "physical artifacts overlap at source {key:?}"
+                )));
+            }
         }
         catalogs.push(catalog);
     }
-    if catalogs.len() == 1 { Ok(catalogs.remove(0)) } else { Ok(Arc::new(CompositeInspectionCatalog(catalogs))) }
+    if catalogs.len() == 1 {
+        Ok(catalogs.remove(0))
+    } else {
+        Ok(Arc::new(CompositeInspectionCatalog(catalogs)))
+    }
 }
 
 pub(super) fn safetensors_inspection_recipe_source(
@@ -493,7 +717,13 @@ pub(super) fn safetensors_parameters(
             "SafeTensors architecture omitted exact catalog admission".into(),
         )
     })?;
-    safetensors_schema_parameters(architecture.checkpoint(), selected, catalog, config, source_catalog)
+    safetensors_schema_parameters(
+        architecture.checkpoint(),
+        selected,
+        catalog,
+        config,
+        source_catalog,
+    )
 }
 
 fn safetensors_schema_parameters(
@@ -503,7 +733,8 @@ fn safetensors_schema_parameters(
     config: &EligibleConfig<'_>,
     source_catalog: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
-    let source_linear_shapes = config.linear_parameter_shapes()
+    let source_linear_shapes = config
+        .linear_parameter_shapes()
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     let mut constraints = plan.common_tensors.iter().collect::<Vec<_>>();
     for group in &plan.layout_groups {
@@ -540,6 +771,9 @@ fn safetensors_schema_parameters(
                     .unwrap_or_else(|| companion.primary.clone());
                 let name = config.canonical_parameter_name(&constraint.key, &constraint.aliases);
                 let role = match companion.kind {
+                    eredu_checkpoint::schema::LinearCompanionKind::GlobalScale => {
+                        eredu_nn::LinearCompanionRole::GlobalScale
+                    }
                     eredu_checkpoint::schema::LinearCompanionKind::Scale => {
                         eredu_nn::LinearCompanionRole::Scale
                     }
@@ -564,10 +798,11 @@ fn safetensors_schema_parameters(
         .collect::<BTreeMap<_, _>>();
     let mut parameters = Vec::new();
     for constraint in constraints {
-        if matches!(constraint.role,
+        if matches!(
+            constraint.role,
             eredu_checkpoint::schema::TensorRole::ArtifactMetadata
-            | eredu_checkpoint::schema::TensorRole::RecipeInput)
-        {
+                | eredu_checkpoint::schema::TensorRole::RecipeInput
+        ) {
             continue;
         }
         let canonical = config.canonical_parameter_name(&constraint.key, &constraint.aliases);
@@ -715,11 +950,24 @@ fn safetensors_schema_parameters(
 
 /// Source-only GGUF entries are admitted and retained without neural bindings.
 fn metadata_source_keys(plan: &eredu_checkpoint::schema::GgufCheckpointPlan) -> BTreeSet<&str> {
-    plan.common_tensors.iter()
-        .chain(plan.layout_groups.iter().flat_map(|group| &group.variants).flat_map(|variant| &variant.tensors))
-        .filter(|tensor| matches!(tensor.role,
-            eredu_checkpoint::schema::TensorRole::ArtifactMetadata | eredu_checkpoint::schema::TensorRole::RecipeInput))
-        .flat_map(|tensor| std::iter::once(tensor.key.as_str()).chain(tensor.aliases.iter().map(String::as_str)))
+    plan.common_tensors
+        .iter()
+        .chain(
+            plan.layout_groups
+                .iter()
+                .flat_map(|group| &group.variants)
+                .flat_map(|variant| &variant.tensors),
+        )
+        .filter(|tensor| {
+            matches!(
+                tensor.role,
+                eredu_checkpoint::schema::TensorRole::ArtifactMetadata
+                    | eredu_checkpoint::schema::TensorRole::RecipeInput
+            )
+        })
+        .flat_map(|tensor| {
+            std::iter::once(tensor.key.as_str()).chain(tensor.aliases.iter().map(String::as_str))
+        })
         .collect()
 }
 

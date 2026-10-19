@@ -626,7 +626,12 @@ where
                         )
                     })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>();
+        let caches = runner.streams.finish_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Sampling,
+            caches,
+            |error| Error::Exception(Exception::from_source(error)),
+        )?;
         A::visit_executor::<
             crate::composition::mlx::speculative::external::MlxExternalAssistantMechanisms,
             _,
@@ -970,7 +975,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        self.runtime.session().ensure_no_submission_in_flight()?;
         let proposal_capacity = drafter
             .selected()
             .requirements()
@@ -979,67 +983,109 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             .get();
         let target_stream = self.runtime.backend().stream().clone();
         let draft_stream = drafter.stream().clone();
+        let partition_binding = self.runtime.session().speculative_partition_binding();
+        let preparation = SpeculativeExecutionStreams::single(&target_stream)
+            .with_capture_binding(partition_binding.as_ref());
+        preparation.finish_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Request,
+            self.runtime
+                .session()
+                .ensure_no_submission_in_flight()
+                .and_then(|()| drafter.validate_target(self.runtime.session())),
+            |error| Error::Exception(Exception::from_source(error)),
+        )?;
+        let streams = preparation.finish_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Request,
+            SpeculativeExecutionStreams::bind(&target_stream, &draft_stream, drafter.topology())
+                .map(|streams| streams.with_capture_binding(partition_binding.as_ref())),
+            Exception::from_source,
+        )?;
+        let agree_ownership = |local| {
+            streams.finish_preparation(
+                eredu_core::run_preparation::TextPreparationStage::Request,
+                local,
+                |error| Error::Exception(Exception::from_source(error)),
+            )
+        };
         if drafter.is_autoregressive() {
-            let topology = drafter.topology();
-            return self.runtime.session_mut().with_model_operation(|model| {
-                let streams =
-                    SpeculativeExecutionStreams::bind(&target_stream, &draft_stream, topology)?;
-                let prepared_lanes =
-                    Self::prepare_speculative_batch_lanes(lanes, proposal_capacity)?;
-                drafter.with_autoregressive(|draft| {
-                    let mut executor =
-                        eredu_runtime::speculative::autoregressive::AutoregressiveExecutor::<
-                            super::speculative::autoregressive::MlxAutoregressiveMechanisms,
-                            eredu_runtime::speculative::autoregressive::SharedTargetRefinement,
-                        >::new(
-                            model.erased_mut(),
-                            draft.executable_mut().erased_mut(),
-                            std::num::NonZeroUsize::new(proposal_capacity)
-                                .expect("selected nonzero capacity"),
-                            eredu_runtime::speculative::autoregressive::SharedTargetRefinement,
-                        );
-                    let prepared_lanes = prepared_lanes.into_iter().map(|lane| lane.map_input(|input, seed| {
-                        let root = safemlx::random::key(seed)?;
-                        let key = crate::backend::random::split_key_at(&root, 2, streams.target())?;
-                        super::speculative::state_snapshot::settle(vec![&key])?;
-                        Ok(eredu_runtime::speculative::autoregressive::AutoregressiveInput::new(input,
-                            eredu_runtime::speculative::autoregressive::SharedTargetRefinementState::new(crate::backend::random::RandomState::from_key(key))))
-                    })).collect::<Result<Vec<_>, Exception>>()?;
-                    let caches = (0..prepared_lanes.len())
-                        .map(|_| executor.new_cache(streams))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    run_speculative_batch(
-                        &mut executor,
-                        prepared_lanes,
-                        caches,
-                        Ok,
-                        streams,
-                        visitor,
-                    )
-                    .map_err(|error| Error::Exception(Exception::from_source(error)))
-                })
-            });
+            return self.runtime.session_mut().with_prepared_model_operation(move |local| {
+            agree_ownership(local)?;
+            let prepared_lanes = streams.finish_preparation(
+                eredu_core::run_preparation::TextPreparationStage::Sampling,
+                Self::prepare_speculative_batch_lanes(lanes, proposal_capacity),
+                |error| Error::Exception(Exception::from_source(error)),
+            )?;
+            let draft = drafter.prepare_operation(agree_ownership)?;
+            Ok((draft, prepared_lanes))
+            }, |model, (draft, prepared_lanes)| {
+            draft.with_autoregressive(|draft| {
+                let mut executor =
+                    eredu_runtime::speculative::autoregressive::AutoregressiveExecutor::<
+                        super::speculative::autoregressive::MlxAutoregressiveMechanisms,
+                        eredu_runtime::speculative::autoregressive::SharedTargetRefinement,
+                    >::new(
+                        model.erased_mut(),
+                        draft.executable_mut().erased_mut(),
+                        std::num::NonZeroUsize::new(proposal_capacity)
+                            .expect("selected nonzero capacity"),
+                        eredu_runtime::speculative::autoregressive::SharedTargetRefinement,
+                    );
+                let prepared_lanes = prepared_lanes.into_iter().map(|lane| lane.map_input(|input, seed| {
+                    let root = safemlx::random::key(seed)?;
+                    let key = crate::backend::random::split_key_at(&root, 2, streams.target())?;
+                    super::speculative::state_snapshot::settle(vec![&key])?;
+                    Ok(eredu_runtime::speculative::autoregressive::AutoregressiveInput::new(input,
+                        eredu_runtime::speculative::autoregressive::SharedTargetRefinementState::new(crate::backend::random::RandomState::from_key(key))))
+                })).collect::<Result<Vec<_>, Exception>>();
+                let prepared_lanes = streams.finish_preparation(
+                    eredu_core::run_preparation::TextPreparationStage::Sampling,
+                    prepared_lanes, Exception::from_source,
+                )?;
+                let caches = (0..prepared_lanes.len())
+                    .map(|_| executor.new_cache(streams))
+                    .collect::<Result<Vec<_>, _>>();
+                let caches = streams.finish_preparation(
+                    eredu_core::run_preparation::TextPreparationStage::Sampling,
+                    caches, Exception::from_source,
+                )?;
+                run_speculative_batch(
+                    &mut executor,
+                    prepared_lanes,
+                    caches,
+                    Ok,
+                    streams,
+                    visitor,
+                )
+                .map_err(|error| Error::Exception(Exception::from_source(error)))
+            })
+        });
         }
         let capture = drafter.capture().clone();
         let selected = drafter.selected().clone();
-        self.runtime.session_mut().with_model_operation(|model| {
-            let streams = SpeculativeExecutionStreams::bind(
-                &target_stream,
-                &draft_stream,
-                drafter.topology(),
-            )?;
-            let prepared_lanes = Self::prepare_speculative_batch_lanes(lanes, proposal_capacity)?;
-            drafter.visit(MlxExternalBatchVisitor {
-                runner: MlxExternalBatchRunner {
-                    target: model.erased_mut(),
-                    lanes: prepared_lanes,
-                    streams,
-                    visitor,
-                    capture,
-                    selected,
-                },
-            })
-        })
+        self.runtime.session_mut().with_prepared_model_operation(
+            move |local| {
+                agree_ownership(local)?;
+                let prepared_lanes = streams.finish_preparation(
+                    eredu_core::run_preparation::TextPreparationStage::Sampling,
+                    Self::prepare_speculative_batch_lanes(lanes, proposal_capacity),
+                    |error| Error::Exception(Exception::from_source(error)),
+                )?;
+                let draft = drafter.prepare_operation(agree_ownership)?;
+                Ok((draft, prepared_lanes))
+            },
+            |model, (draft, prepared_lanes)| {
+                draft.visit(MlxExternalBatchVisitor {
+                    runner: MlxExternalBatchRunner {
+                        target: model.erased_mut(),
+                        lanes: prepared_lanes,
+                        streams,
+                        visitor,
+                        capture,
+                        selected,
+                    },
+                })
+            },
+        )
     }
 
     fn generate_speculative_batch_with_embedded_draft<C, V>(

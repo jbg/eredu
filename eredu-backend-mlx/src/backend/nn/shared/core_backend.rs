@@ -193,7 +193,7 @@ impl NeuralBackend for MlxNeuralBackend {
             }
         }
         Ok(MlxLinear {
-            compute_element: spec.format.compute_element(),
+            arithmetic: spec.format.arithmetic(),
             module,
             topology,
             vocabulary_range: None,
@@ -240,6 +240,7 @@ impl NeuralBackend for MlxNeuralBackend {
             None => (None, BTreeMap::new()),
         };
         Ok(MlxRmsNorm {
+            reduction: spec.reduction,
             groups: spec.groups,
             module,
             topology,
@@ -257,7 +258,7 @@ impl NeuralBackend for MlxNeuralBackend {
             spec.algorithm,
             context,
         ))?;
-        let explicit = if spec.arithmetic == eredu_nn::RotaryArithmetic::InputProducts {
+        let explicit = if spec.arithmetic != eredu_nn::RotaryArithmetic::Native {
             Some(compute(rope::ElementwiseRotary::new(
                 spec, &native, context,
             ))?)
@@ -265,6 +266,7 @@ impl NeuralBackend for MlxNeuralBackend {
             None
         };
         Ok(MlxRotary {
+            arithmetic: spec.arithmetic,
             native,
             explicit,
             dimensions: spec.dimensions,
@@ -1147,7 +1149,7 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
             }
         }
         Ok(MlxLinear {
-            compute_element: spec.format.compute_element(),
+            arithmetic: spec.format.arithmetic(),
             module,
             topology,
             vocabulary_range: Some(range),
@@ -1161,42 +1163,15 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        let prepared = (|| {
-            policy.validate()?;
-            let range = embedding
-                .vocabulary_range
-                .as_ref()
-                .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-            let sentinel = match policy {
-                EmbeddingLookupPolicy::Strict => None,
-                EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Some(sentinel),
-            };
-            let input = compute(validate_token_domain(
-                input.as_array(),
-                embedding.vocabulary,
-                sentinel,
-                context,
-            ))?;
-            let start =
-                Array::from_int(i32::try_from(range.local.start).map_err(ComputeError::backend)?);
-            let end =
-                Array::from_int(i32::try_from(range.local.end).map_err(ComputeError::backend)?);
-            let valid = compute(input.ge(&start, context))?
-                .logical_and(&compute(input.lt(&end, context))?, context)
-                .map_err(ComputeError::backend)?;
-            let local = compute(input.subtract(&start, context))?;
-            let safe = compute(safemlx::ops::r#where(
-                &valid,
-                &local,
-                Array::from_int(0),
-                context,
-            ))?;
-            let value = compute(embedding.module.forward(&safe, context))?;
-            let mask = compute(valid.expand_dims(-1, context))?;
-            let zero_value = compute(safemlx::ops::zeros_like(&value, context))?;
-            let value = compute(safemlx::ops::r#where(&mask, &value, &zero_value, context))?;
-            Ok(value)
-        })();
+        let prepared = if embedding.vocabulary_range.is_none() {
+            Err(ComputeError::backend(
+                "embedding has no vocabulary ownership",
+            ))
+        } else {
+            embedding
+                .lookup(input, policy, context)
+                .map(MlxTensor::into_array)
+        };
         let value = agree_vocabulary_setup(parallel, 1, prepared, context)?;
         compute_tensor(crate::backend::runtime::distributed::all_sum(
             &value, parallel, context,

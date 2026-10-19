@@ -674,12 +674,18 @@ pub(crate) enum ReasoningTemplateControl {
         enabled: &'static str,
         disabled: &'static str,
     },
+    /// A template with an effort setting and no reasoning-disable value.
+    RequiredEffort {
+        kwarg: &'static str,
+        enabled: &'static str,
+    },
 }
 
 impl ReasoningTemplateControl {
     pub(crate) fn template_entry(self, enabled: bool) -> (&'static str, Value) {
         match self {
             Self::Boolean(kwarg) => (kwarg, Value::Bool(enabled)),
+            Self::RequiredEffort { kwarg, enabled } => (kwarg, Value::String(enabled.into())),
             Self::NamedEffort {
                 kwarg,
                 enabled: enabled_value,

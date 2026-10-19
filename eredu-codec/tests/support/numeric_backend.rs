@@ -985,6 +985,7 @@ impl Tensor for NumericTensor {
         weight: Option<&Self>,
         bias: Option<&Self>,
         epsilon: f32,
+        _: eredu_nn::LayerNormalizationArithmetic,
         _: &Context,
     ) -> Result<Self, Error> {
         let width = *input.shape.last().unwrap() as usize;

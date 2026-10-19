@@ -1005,7 +1005,7 @@ where
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
-    ) -> Result<Option<(i32, i32)>, String> {
+    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
         if group != 0 {
             return Ok(None);
         }
@@ -1017,7 +1017,7 @@ where
                 .as_ref()
                 .expect("validated tower")
                 .hidden_size,
-        )))
+        ).into()))
     }
     fn prepared_group_collective_waves(
         &self,

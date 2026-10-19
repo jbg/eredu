@@ -939,6 +939,7 @@ impl Tensor for PlanningTensor {
         _: Option<&Self>,
         _: Option<&Self>,
         _: f32,
+        _: eredu_nn::LayerNormalizationArithmetic,
         _: &Self::Context,
     ) -> Result<Self, eredu_nn::Error> {
         Self::unavailable()

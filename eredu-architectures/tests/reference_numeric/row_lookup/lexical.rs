@@ -30,6 +30,7 @@ fn construction() -> LexicalInjectionSpec {
         format: dense_linear_format(),
     };
     let norm = |name| NormalizationConstructionSpec {
+        reduction: eredu_nn::NormalizationReduction::Native,
         groups: Some(2),
         dimensions: 4,
         epsilon: 1e-5,
@@ -57,6 +58,7 @@ fn construction() -> LexicalInjectionSpec {
         query_norm: norm("qn"),
         convolution_norm: norm("cn"),
         convolution: CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             channels: 4,
             kernel_size: 3,
             dilation: 3,

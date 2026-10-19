@@ -1,6 +1,10 @@
 //! Import rank-ordered tiktoken byte-BPE files into a fast tokenizer.
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
@@ -30,6 +34,21 @@ pub(crate) const KIMI_K2_PATTERN: &str = concat!(
     r"\s*[\r\n]+|\s+(?!\S)|\s+"
 );
 
+/// Meta Llama 4's published O200K split expression, also used by Muse Spark.
+pub(crate) const LLAMA4_PATTERN: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*",
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+",
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|",
+    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+);
+
+#[derive(Clone, Copy)]
+enum MergePolicy {
+    RankedPair,
+    VocabularySplits,
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenizerConfig {
     #[serde(default)]
@@ -39,17 +58,25 @@ struct TokenizerConfig {
 #[derive(Debug, Deserialize)]
 struct AddedTokenConfig {
     content: String,
+    #[serde(default)]
+    single_word: bool,
+    #[serde(default)]
+    lstrip: bool,
+    #[serde(default)]
+    rstrip: bool,
+    #[serde(default)]
+    normalized: bool,
+    #[serde(default)]
+    special: Option<bool>,
 }
 
 fn tokenizer_error(message: impl Into<String>) -> Error {
-    Error::InvalidTokenizer(format!(
-        "invalid tiktoken.model checkpoint: {}",
-        message.into()
-    ))
+    Error::InvalidTokenizer(format!("invalid tiktoken checkpoint: {}", message.into()))
 }
 
 fn read_ranks(path: &Path) -> Result<Vec<Vec<u8>>, Error> {
     let contents = fs::read_to_string(path)?;
+    let line_count = contents.lines().count();
     let mut ranked = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
         let mut fields = line.split_ascii_whitespace();
@@ -82,6 +109,11 @@ fn read_ranks(path: &Path) -> Result<Vec<Vec<u8>>, Error> {
             return Err(tokenizer_error(format!(
                 "line {} contains an empty token",
                 line_index + 1
+            )));
+        }
+        if rank >= line_count {
+            return Err(tokenizer_error(format!(
+                "rank {rank} exceeds the {line_count}-entry file"
             )));
         }
         if rank >= ranked.len() {
@@ -150,7 +182,11 @@ fn bpe_parts(ranks: &HashMap<Vec<u8>, usize>, token: &[u8], max_rank: usize) -> 
     parts
 }
 
-fn build_byte_bpe(ranked: &[Vec<u8>]) -> Result<Tokenizer, Error> {
+fn build_byte_bpe(
+    ranked: &[Vec<u8>],
+    pattern: &str,
+    policy: MergePolicy,
+) -> Result<Tokenizer, Error> {
     let encoder = byte_encoder();
     let ranks = ranked
         .iter()
@@ -158,6 +194,12 @@ fn build_byte_bpe(ranked: &[Vec<u8>]) -> Result<Tokenizer, Error> {
         .enumerate()
         .map(|(rank, token)| (token, rank))
         .collect::<HashMap<_, _>>();
+    if ranks.len() != ranked.len() {
+        return Err(tokenizer_error("duplicate base token bytes"));
+    }
+    if (0..=255u8).any(|byte| !ranks.contains_key(&vec![byte])) {
+        return Err(tokenizer_error("base vocabulary does not cover every byte"));
+    }
     let vocab = ranked
         .iter()
         .enumerate()
@@ -169,24 +211,53 @@ fn build_byte_bpe(ranked: &[Vec<u8>]) -> Result<Tokenizer, Error> {
             ))
         })
         .collect::<Result<Vocab, Error>>()?;
-    let merges = ranked
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| token.len() > 1)
-        .filter_map(|(rank, token)| {
-            let parts = bpe_parts(&ranks, token, rank);
-            (parts.len() == 2).then(|| {
-                (
-                    encoded_token(&parts[0], &encoder),
-                    encoded_token(&parts[1], &encoder),
-                )
+    let merges = match policy {
+        MergePolicy::RankedPair => ranked
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| token.len() > 1)
+            .filter_map(|(rank, token)| {
+                let parts = bpe_parts(&ranks, token, rank);
+                (parts.len() == 2).then(|| {
+                    (
+                        encoded_token(&parts[0], &encoder),
+                        encoded_token(&parts[1], &encoder),
+                    )
+                })
             })
-        })
-        .collect();
-    let mut tokenizer = Tokenizer::new(BPE::builder().vocab_and_merges(vocab, merges).build()?);
+            .collect(),
+        MergePolicy::VocabularySplits => ranked
+            .iter()
+            .flat_map(|token| {
+                let mut splits = (1..token.len())
+                    .filter_map(|index| {
+                        let left = &token[..index];
+                        let right = &token[index..];
+                        Some((*ranks.get(left)?, *ranks.get(right)?, left, right))
+                    })
+                    .collect::<Vec<_>>();
+                splits.sort_by_key(|(left, right, _, _)| (*left, *right));
+                splits
+                    .into_iter()
+                    .map(|(_, _, left, right)| {
+                        (
+                            encoded_token(left, &encoder),
+                            encoded_token(right, &encoder),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+    };
+    let mut tokenizer = Tokenizer::new(
+        BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .ignore_merges(matches!(policy, MergePolicy::VocabularySplits))
+            .build()?,
+    );
     tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
         PreTokenizerWrapper::Split(Split::new(
-            SplitPattern::Regex(KIMI_K2_PATTERN.into()),
+            SplitPattern::Regex(pattern.into()),
             SplitDelimiterBehavior::Isolated,
             false,
         )?),
@@ -235,7 +306,7 @@ fn special_tokens(config_path: &Path, base_count: usize) -> Result<Vec<AddedToke
 /// contiguous reserved-token range without permitting partial registration.
 pub fn load_kimi_k2(model_dir: &Path) -> Result<Tokenizer, Error> {
     let ranked = read_ranks(&model_dir.join("tiktoken.model"))?;
-    let mut tokenizer = build_byte_bpe(&ranked)?;
+    let mut tokenizer = build_byte_bpe(&ranked, KIMI_K2_PATTERN, MergePolicy::RankedPair)?;
     let tokens = special_tokens(&model_dir.join("tokenizer_config.json"), ranked.len())?;
     tokenizer.add_special_tokens(tokens)?;
     for id in ranked.len()..ranked.len() + 258 {
@@ -248,10 +319,97 @@ pub fn load_kimi_k2(model_dir: &Path) -> Result<Tokenizer, Error> {
     Ok(tokenizer)
 }
 
+/// Reconstructs the published Muse Spark L4 byte-BPE tokenizer from
+/// `l4_200k_base` and `tokenizer_config.json`. Only the 1,818 declared added
+/// tokens are registered; unused model-output rows remain outside the vocabulary.
+/// Chat prompts supply their own BOS token, as in the published fast tokenizer.
+pub fn load_muse_spark(model_dir: &Path) -> Result<Tokenizer, Error> {
+    let ranked = read_ranks(&model_dir.join("l4_200k_base"))?;
+    if ranked.len() != 200_000 {
+        return Err(tokenizer_error("Muse Spark requires 200000 base ranks"));
+    }
+    let mut tokenizer = build_byte_bpe(&ranked, LLAMA4_PATTERN, MergePolicy::VocabularySplits)?;
+    let config: TokenizerConfig =
+        serde_json::from_slice(&fs::read(model_dir.join("tokenizer_config.json"))?)?;
+    register_complete_tokens(&mut tokenizer, config, 200_000, 1_818)?;
+    Ok(tokenizer)
+}
+
+fn register_complete_tokens(
+    tokenizer: &mut Tokenizer,
+    config: TokenizerConfig,
+    base_count: u32,
+    count: u32,
+) -> Result<(), Error> {
+    let end = base_count + count;
+    let mut configured = std::collections::BTreeMap::new();
+    let mut contents = HashSet::new();
+    for (id, token) in config.added_tokens_decoder {
+        let id = id
+            .parse::<u32>()
+            .map_err(|_| tokenizer_error("invalid added-token ID"))?;
+        if !(base_count..end).contains(&id) || configured.contains_key(&id) {
+            return Err(tokenizer_error(format!("unexpected added-token ID {id}")));
+        }
+        if token.single_word
+            || token.lstrip
+            || token.rstrip
+            || token.normalized
+            || token.special == Some(false)
+        {
+            return Err(tokenizer_error(format!(
+                "added-token flags at {id} differ from the Muse Spark contract"
+            )));
+        }
+        if token.content.is_empty()
+            || !contents.insert(token.content.clone())
+            || tokenizer.token_to_id(&token.content).is_some()
+        {
+            return Err(tokenizer_error(format!(
+                "duplicate or empty added token at {id}"
+            )));
+        }
+        configured.insert(id, token.content);
+    }
+    let tokens = (base_count..end)
+        .map(|id| {
+            configured
+                .get(&id)
+                .cloned()
+                .map(|token| AddedToken::from(token, true).normalized(false))
+                .ok_or_else(|| tokenizer_error(format!("missing added-token ID {id}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    tokenizer.add_special_tokens(tokens)?;
+    for (id, token) in configured {
+        if tokenizer.token_to_id(&token) != Some(id) {
+            return Err(tokenizer_error(format!("added-token ID {id} was remapped")));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{bpe_parts, byte_encoder, encoded_token, load_kimi_k2};
     use std::collections::HashMap;
+
+    #[test]
+    fn incomplete_or_colliding_added_tokens_never_return_a_partial_tokenizer() {
+        for added in [
+            serde_json::json!({"0":{"content":"first"}}),
+            serde_json::json!({"0":{"content":"same"},"1":{"content":"same"}}),
+            serde_json::json!({"0":{"content":"first"},"3":{"content":"third"}}),
+            serde_json::json!({"0":{"content":"first"},"1":{"content":"second","lstrip":true}}),
+        ] {
+            let config =
+                serde_json::from_value(serde_json::json!({"added_tokens_decoder":added})).unwrap();
+            let mut tokenizer =
+                tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+            assert!(super::register_complete_tokens(&mut tokenizer, config, 0, 2).is_err());
+            assert_eq!(tokenizer.get_vocab_size(true), 0);
+        }
+    }
 
     #[test]
     fn gpt2_byte_alphabet_is_bijective() {

@@ -332,7 +332,7 @@ where
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<(i32, i32)>, String> {
+    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
         if group != 0 {
             return Ok(None);
         }
@@ -362,7 +362,7 @@ where
             .as_ref()
             .ok_or_else(|| "conditional Qwen continuation has no vision config".to_owned())?
             .hidden_size;
-        Ok(Some((patches, width)))
+        Ok(Some((patches, width).into()))
     }
 
     fn prepared_group_continuation_batched(&self, group: usize) -> bool {

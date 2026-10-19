@@ -25,6 +25,28 @@ impl<M> ExternalMechanisms for ArchitectureExternalMechanisms<M>
 where
     M: ExternalAssistantExecutionMechanisms<Gemma4AssistantArchitecture> + 'static,
 {
+    fn coordinate_speculative_step(
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        M::coordinate_speculative_step(local, context)
+    }
+
+    fn agree_text_preparation(
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
+        M::agree_text_preparation(stage, status, context)
+    }
+
+    fn coordinate_decoding_control(
+        local: eredu_core::decoding::DecodingCoordination,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
+        M::coordinate_decoding_control(local, context)
+    }
+
     type Target = M::Target;
     type Assistant = M::Assistant;
     type Capture = crate::composite_execution::ExternalPredictionCaptureRequest;
@@ -443,6 +465,36 @@ impl<T: Clone> ExternalTargetState<T> {
 /// cache, and completion operations. Proposal ordering, target-state geometry, replay, and commit
 /// policy remain in [`ExternalExecutor`].
 pub trait ExternalMechanisms: 'static {
+    /// Resolves cancellation and completion across the retained target session.
+    fn coordinate_speculative_step(
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        _context: Self::Context<'_>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        Ok(local)
+    }
+
+    /// Agrees host preparation before any participant enters the next phase.
+    fn agree_text_preparation(
+        _stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
+        use eredu_core::run_preparation::{TextPreparationOutcome as O, TextPreparationStatus as S};
+        Ok(match status {
+            S::Ready => O::Ready,
+            S::Cancelled => O::Cancelled,
+            S::Failed => O::Rejected { rank: 0 },
+        })
+    }
+
+    /// Agrees explicit commands without executing model work or restoring credits.
+    fn coordinate_decoding_control(
+        local: eredu_core::decoding::DecodingCoordination,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
+        Ok(local)
+    }
+
     /// Complete score-row backing allowance for a settled mode handoff.
     fn control_logits_estimate(_logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> { None }
     /// Materialized ordinary target.
@@ -762,6 +814,37 @@ impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {
 }
 
 impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
+    fn coordinate_speculative_step<'context>(
+        &mut self,
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'context>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
+    where Self: 'context,
+    {
+        M::coordinate_speculative_step(local, context)
+    }
+
+    fn agree_text_preparation<'context>(
+        &mut self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        context: Self::Context<'context>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    where Self: 'context,
+    {
+        M::agree_text_preparation(stage, status, context)
+    }
+
+    fn coordinate_decoding_control<'context>(
+        &mut self,
+        local: eredu_core::decoding::DecodingCoordination,
+        context: Self::Context<'context>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>
+    where Self: 'context,
+    {
+        M::coordinate_decoding_control(local, context)
+    }
+
     fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
         eredu_core::decoding::DecodingCapabilities::causal_drafting(self.max_proposals()).with_completion_support(
             M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::NativeCancel),

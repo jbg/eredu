@@ -40,6 +40,7 @@ fn fixture() -> (ComponentGroup, ParameterDiscovery) {
             final_input: "latent.write_input".into(),
         }),
         activation_equation: ComponentActivation::Attention {
+            attended_head_normalization: None,
             query_heads: 2,
             key_value_heads: 1,
             head_width: 3,

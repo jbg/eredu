@@ -17,6 +17,13 @@ use eredu_nn::{NeuralBackend, Tensor};
 
 mod control;
 mod prediction;
+mod capture_bundle;
+mod target_transport;
+pub use target_transport::{
+    PredictionTargetTransport, PredictionTensorAssembly, PredictionTensorAssemblyPlan,
+    PredictionTensorSource,
+};
+pub use capture_bundle::{ForwardCaptureBundle, ForwardCaptureSlot};
 pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
 
 use crate::{
@@ -313,6 +320,23 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Output, A::Error>;
+
+    /// Executes through the selected bounded session transport when an operation
+    /// needs static values owned by other pipeline partitions. The default keeps
+    /// ordinary local prediction operations on their existing path.
+    fn apply_with_transport<T: PredictionTargetTransport<B>>(
+        self,
+        architecture: &mut A,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        _transport: &mut T,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Output, A::Error>
+    where
+        Self: Sized,
+    {
+        self.apply(architecture, state, parallel, context)
+    }
 }
 
 /// Reversible prompt-cache publication used by distributed session control.
@@ -709,6 +733,23 @@ where
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
     {
+        Ok(capture)
+    }
+
+    /// Publishes an architecture-selected complete tensor from an arbitrary world rank.
+    /// Direct execution has one local owner; partitioned strategies bind the retained
+    /// session publication group and preserve exact bounded completion ownership.
+    fn publish_capture_tensor(
+        _runtime: &mut Self::Runtime,
+        capture: B::Tensor,
+        slot: &ForwardCaptureSlot,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        if Self::PARTITIONED_SESSION || slot.owner() != 0 {
+            return Err(ReplicatedTextSessionError::Contract(
+                "execution strategy has no selected capture publication mechanism".into(),
+            ));
+        }
         Ok(capture)
     }
 
@@ -1119,6 +1160,7 @@ pub struct PreparedPartitionedSessionRuntime<R, S> {
     runtime: R,
     state: S,
     selected_state: SessionStateRealization,
+    partition_state: Option<PartitionState>,
     prompt_cache_identity: Option<PromptCacheModelIdentity>,
     output_selection: ReplicatedTextOutputSelection,
 }
@@ -1556,6 +1598,7 @@ where
         runtime,
         state,
         selected_state,
+        partition_state,
         prompt_cache_identity,
         output_selection,
     })
@@ -2238,6 +2281,7 @@ where
         runtime,
         state,
         selected_state,
+        partition_state,
         prompt_cache_identity,
         output_selection,
     } = binding;
@@ -2260,12 +2304,22 @@ where
                     "rank-local cache identity differs from selected state geometry".into(),
                 ));
             }
-            let partition =
-                PartitionState::new(local.layout().clone(), identity.global_layer_start())
-                    .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
+            let partition = partition_state.as_ref().ok_or_else(|| {
+                ReplicatedTextSessionError::Contract(
+                    "stateful runtime lost its exact partition state authority".into(),
+                )
+            })?;
+            if partition.global_layers()
+                != (identity.global_layer_start()..identity.global_layer_end())
+                || partition.layout() != local.layout()
+            {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "partition state authority differs from cache identity or local state".into(),
+                ));
+            }
             let expected = selected
                 .state()
-                .for_partitioned_geometry(&partition)
+                .for_partitioned_geometry(partition)
                 .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
             if &expected != local {
                 return Err(ReplicatedTextSessionError::Contract(
@@ -2274,7 +2328,10 @@ where
             }
         }
         None => {
-            if prompt_cache_identity.is_some() || state.optional_layout().is_some() {
+            if prompt_cache_identity.is_some()
+                || state.optional_layout().is_some()
+                || partition_state.is_some()
+            {
                 return Err(ReplicatedTextSessionError::Contract(
                     "stateless partition owns state or a prompt-cache shard identity".into(),
                 ));
@@ -3101,59 +3158,6 @@ where
         output
     }
 
-    /// Runs one ordinary non-partitioned target pass and atomically retains an additive capture.
-    ///
-    /// The capture is derived from the same forward context and observed unit outputs as the
-    /// canonical target logits. Capture failure restores target state before either value is
-    /// published. Partitioned capture requires an admitted multi-tensor publication contract and
-    /// therefore remains unavailable through this local-only seam.
-    pub fn prefill_input_with_capture<'a, O, C, F>(
-        &mut self,
-        input: A::Input<'a>,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-        observer: &mut O,
-        capture: F,
-    ) -> Result<(B::Tensor, C), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    where
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-        F: FnOnce(&A::ForwardContext) -> Result<C, A::Error>,
-    {
-        self.with_observation_transaction(observer, |session, observer| {
-            if D::PARTITIONED_SESSION {
-                return Err(ReplicatedTextSessionError::Contract(
-                "partitioned prediction capture requires a selected bundle publication contract"
-                    .into(),
-            ));
-            }
-            let (output, checkpoint, forward_context) = session.execute_input_before_publication(
-                input,
-                ExpertPass::Prefill,
-                context,
-                observer,
-            )?;
-            let captured = match capture(&forward_context) {
-                Ok(captured) => captured,
-                Err(error) => {
-                    return session.rollback_failure(
-                        checkpoint,
-                        ReplicatedTextSessionError::Architecture(error),
-                        context,
-                    );
-                }
-            };
-            let (output, checkpoint, forward_context) = session
-                .publish_observed_output_transaction(
-                    output,
-                    checkpoint,
-                    forward_context,
-                    context,
-                )?;
-            session
-                .publish(output, checkpoint, forward_context, context, observer)
-                .map(|output| (output, captured))
-        })
-    }
-
     /// Runs composite prompt processing and commits its cache-relevant input identity only after
     /// successful state publication and exact completion.
     pub fn prefill_input_with_cache_identity<'a>(
@@ -3266,53 +3270,6 @@ where
         self.decode_input_with_observer(input, context, &mut crate::NoopObserver)
     }
 
-    /// Runs one ordinary non-partitioned decode pass and atomically retains an additive capture.
-    pub fn decode_input_with_capture<'a, O, C, F>(
-        &mut self,
-        input: A::Input<'a>,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-        observer: &mut O,
-        capture: F,
-    ) -> Result<(B::Tensor, C), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
-    where
-        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-        F: FnOnce(&A::ForwardContext) -> Result<C, A::Error>,
-    {
-        self.with_observation_transaction(observer, |session, observer| {
-            if D::PARTITIONED_SESSION {
-                return Err(ReplicatedTextSessionError::Contract(
-                "partitioned prediction capture requires a selected bundle publication contract"
-                    .into(),
-            ));
-            }
-            let (output, checkpoint, forward_context) = session.execute_input_before_publication(
-                input,
-                ExpertPass::Decode,
-                context,
-                observer,
-            )?;
-            let captured = match capture(&forward_context) {
-                Ok(captured) => captured,
-                Err(error) => {
-                    return session.rollback_failure(
-                        checkpoint,
-                        ReplicatedTextSessionError::Architecture(error),
-                        context,
-                    );
-                }
-            };
-            let (output, checkpoint, forward_context) = session
-                .publish_observed_output_transaction(
-                    output,
-                    checkpoint,
-                    forward_context,
-                    context,
-                )?;
-            session
-                .publish(output, checkpoint, forward_context, context, observer)
-                .map(|output| (output, captured))
-        })
-    }
 
     /// Runs one observed decode step from an architecture-prepared input.
     pub fn decode_input_with_observer<'a, O>(
@@ -5284,7 +5241,7 @@ where
                             parameter.name()
                         )
                     })?,
-                eredu_checkpoint::LinearFormat::MxFp4 => 4,
+                eredu_checkpoint::LinearFormat::MxFp4 | eredu_checkpoint::LinearFormat::NvFp4 => 4,
                 eredu_checkpoint::LinearFormat::Dense
                 | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => return Ok(packed),
                 eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {

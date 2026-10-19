@@ -529,6 +529,7 @@ impl<B: NeuralBackend> GatedFusion<B> {
             )?,
             norm: B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     dimensions: width,
                     epsilon: 1e-6,
                     groups: Some(1),

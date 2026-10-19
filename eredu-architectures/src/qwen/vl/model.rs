@@ -307,7 +307,7 @@ where
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<(i32, i32)>, String> {
+    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
         if group != 0 {
             return Ok(None);
         }
@@ -338,7 +338,7 @@ where
             })?;
         let patches = i32::try_from(patches)
             .map_err(|_| "Qwen3-VL continuation patch count exceeds i32".to_owned())?;
-        Ok((patches > 0).then_some((patches, self.args.vision.hidden_size)))
+        Ok((patches > 0).then_some((patches, self.args.vision.hidden_size).into()))
     }
 
     fn prepared_group_collective_waves(

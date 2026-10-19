@@ -687,6 +687,7 @@ pub(crate) fn short_convolution_spec(
         input_projection: linear("in_proj", args.hidden_size, 3 * channels)?,
         output_projection: linear("out_proj", channels, args.hidden_size)?,
         convolution: CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             dilation: 1,
             channels,
             kernel_size: args.conv_l_cache,

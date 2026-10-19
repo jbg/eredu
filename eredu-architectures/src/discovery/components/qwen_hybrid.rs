@@ -147,6 +147,7 @@ fn unit_with_attention(
             write_parameter_group: format!("parameters:{prefix}"),
             write_bias: c.attention_bias.then(|| format!("{prefix}.o_proj.bias")),
             activation_equation: ComponentActivation::Attention {
+                attended_head_normalization: None,
                 query_heads: heads,
                 key_value_heads: kv,
                 head_width: dim,
@@ -361,6 +362,7 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &HybridConfig) {
         embedding_scale: ComponentScalar::new(1.0),
         tied_embeddings: c.tie_word_embeddings,
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             score_writes: vec![],
             stream_residual: None,

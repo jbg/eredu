@@ -69,6 +69,54 @@ fn with_observer<R>(
 }
 
 impl MlxGroupedGatedProduct {
+    pub(super) fn forward_uncombined_units(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        context: &Stream,
+        observer: Option<&mut dyn GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        let input = input.as_array();
+        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = with_observer(observer, |observer| {
+            self.module.forward_uncombined(
+                &flattened,
+                selections.group_indices().as_array(),
+                selections.coefficients().as_array(),
+                context,
+                observer,
+            )
+        })?;
+        Ok(MlxTensor::from_array(output))
+    }
+
+    pub(super) fn forward_uncombined_units_tensor_parallel(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        partitions: usize,
+        context: &Stream,
+        observer: Option<&mut dyn GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
+        let input = input.as_array();
+        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = with_observer(observer, |observer| {
+            self.module.forward_uncombined_tensor_parallel(
+                &flattened,
+                selections.group_indices().as_array(),
+                selections.coefficients().as_array(),
+                partitions,
+                context,
+                observer,
+            )
+        })?;
+        let (partial, bias) = output.into_parts();
+        Ok(TensorParallelGroupedOutput::new(
+            MlxTensor::from_array(partial),
+            bias.map(MlxTensor::from_array),
+        ))
+    }
+
     pub(super) fn forward_units(
         &mut self,
         input: &MlxTensor,

@@ -34,6 +34,7 @@ fn norm<B: NeuralBackend>(
 ) -> Result<B::Normalization, Error> {
     B::normalization(
         NormalizationConstructionSpec {
+            reduction: eredu_nn::NormalizationReduction::Native,
             groups: None,
             dimensions: width,
             epsilon,

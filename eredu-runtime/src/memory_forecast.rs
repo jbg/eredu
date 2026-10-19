@@ -9,6 +9,10 @@ use std::num::NonZeroU8;
 
 mod retention;
 pub use retention::*;
+mod parameter_loading;
+pub use parameter_loading::ParameterLoadingMemoryProfile;
+mod parameter_residency;
+pub use parameter_residency::ParameterResidencyMemoryBounds;
 mod loaded;
 pub use loaded::*;
 mod continuation;
@@ -136,9 +140,21 @@ pub struct LoadedMemoryProfile {
     pub allocator_cache_limit: eredu_core::Observed<u64>,
 }
 
+/// Input roots retained between consecutive decoder prefill invocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrefillInputRetention {
+    /// Only the original token IDs are retained for a text request.
+    TokenIds,
+    /// Prepared decoder inputs remain live alongside the original request.
+    /// Their physical backing and precision require a separate observation.
+    PreparedProducts,
+}
+
 /// The selected executor's actual prefill contract for this prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForecastExecutionContract {
+    /// Selected ownership of inputs between decoder prefix invocations.
+    pub input_retention: PrefillInputRetention,
     /// Absent when bounded ordinary prefill is supported.
     pub full_pass_reason: Option<String>,
     /// Rows actually projected by one prefill invocation.

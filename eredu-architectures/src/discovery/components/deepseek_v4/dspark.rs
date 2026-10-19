@@ -300,6 +300,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
             effective_output: format!("{base}.input.effective"),
         },
         readout: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             stream_residual: Some(ComponentStreamResidual {
                 streams: c.hc_mult as usize,

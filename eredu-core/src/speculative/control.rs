@@ -145,7 +145,8 @@ pub struct SpeculativeParameterMemoryObservation {
 pub struct SpeculativeContinuationObservation {
     /// Installed target state and residency.
     pub target: SpeculativeModelMemoryObservation,
-    /// Installed independent draft state and residency.
+    /// Installed separately parameterized draft state and residency, including
+    /// projected context for a conditioned assistant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<SpeculativeModelMemoryObservation>,
     /// Installed embedded owner, mutually exclusive with an independent draft.
@@ -154,7 +155,8 @@ pub struct SpeculativeContinuationObservation {
     /// Shared parameter conversion owners observed at this settled boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameter_conversions: Option<Vec<crate::residency::ResidentParameterConversion>>,
-    /// Durable assistant seed retained alongside the installed caches.
+    /// Durable assistant seed retained alongside the installed caches, including
+    /// target-owned pending captures for a conditioned assistant.
     pub seed_bytes: Option<u64>,
 }
 

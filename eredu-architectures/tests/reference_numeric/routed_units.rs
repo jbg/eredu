@@ -81,6 +81,29 @@ pub(super) fn gated(
     observer: &mut dyn GroupedUnitObserver<NumericTensor>,
     tp: bool,
 ) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
+    gated_output(bank, input, routes, context, observer, tp, false)
+}
+
+pub(super) fn gated_uncombined(
+    bank: &mut NumericExpertBank,
+    input: &NumericTensor,
+    routes: &GroupSelection<NumericTensor>,
+    context: &NumericContext,
+    observer: &mut dyn GroupedUnitObserver<NumericTensor>,
+    tp: bool,
+) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
+    gated_output(bank, input, routes, context, observer, tp, true)
+}
+
+fn gated_output(
+    bank: &mut NumericExpertBank,
+    input: &NumericTensor,
+    routes: &GroupSelection<NumericTensor>,
+    context: &NumericContext,
+    observer: &mut dyn GroupedUnitObserver<NumericTensor>,
+    tp: bool,
+    uncombined: bool,
+) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
     if context.bind_checkpoint_values {
         bank.refresh_bound_experts()?;
     }
@@ -116,12 +139,17 @@ pub(super) fn gated(
         }
     }
     let values = observe_units(input, routes, bank.experts.len(), values, observer)?;
-    let mut output = NumericTensor::zeros(input.shape.clone());
+    let output_shape = if uncombined {
+        vec![tokens as i32, top_k as i32, bank.spec.output_dimensions()]
+    } else {
+        input.shape.clone()
+    };
+    let mut output = NumericTensor::zeros(output_shape.clone());
     let mut bias = bank
         .experts
         .iter()
         .any(|e| e.down_bias.is_some())
-        .then(|| NumericTensor::zeros(input.shape.clone()));
+        .then(|| NumericTensor::zeros(output_shape));
     for token in 0..tokens {
         let mut order: Vec<usize> = (0..top_k).collect();
         if bank.spec.reduction() == eredu_nn::GroupReduction::SequentialGroupOrder {
@@ -136,11 +164,15 @@ pub(super) fn gated(
                 if tp { None } else { expert.down_bias.as_ref() },
             )?;
             for c in 0..hidden {
-                output.data[token * hidden + c] +=
-                    routes.coefficients().data[index] * result.data[c];
-                if let Some(bias) = &mut bias {
-                    bias.data[token * hidden + c] += routes.coefficients().data[index]
-                        * expert.down_bias.as_ref().unwrap().data[c];
+                let coefficient = if uncombined {
+                    1.0
+                } else {
+                    routes.coefficients().data[index]
+                };
+                let destination = if uncombined { index } else { token };
+                output.data[destination * hidden + c] += coefficient * result.data[c];
+                if let (Some(bias), Some(expert_bias)) = (&mut bias, &expert.down_bias) {
+                    bias.data[destination * hidden + c] += coefficient * expert_bias.data[c];
                 }
             }
         }

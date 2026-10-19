@@ -224,13 +224,13 @@ fn plans_for(actions: Vec<InterventionAction>) -> (AdmittedCapturePlan, Admitted
         }),
     };
     let discovery = InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: "source".into(),
         session_identity: Some("backend-session".into()),
         points: vec![point],
     };
     let plan = InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations: actions
             .into_iter()
             .enumerate()

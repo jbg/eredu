@@ -461,8 +461,7 @@ mod installed;
 #[path = "prediction/driver.rs"]
 mod driver;
 
-#[path = "prediction/sampling.rs"]
-mod sampling;
+use super::super::speculative_sampling as sampling;
 
 #[path = "prediction/snapshots.rs"]
 mod snapshots;

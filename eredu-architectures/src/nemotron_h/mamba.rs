@@ -103,6 +103,7 @@ impl<B: NeuralBackend> Mamba2<B> {
             in_proj: linear("in_proj", args.hidden_size, projection, args.use_bias)?,
             conv1d: CausalDepthwiseConvolution::new(
                 CausalDepthwiseConvolutionSpec {
+                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
                     dilation: 1,
                     channels: convolution_width,
                     kernel_size: args.conv_kernel,

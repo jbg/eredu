@@ -67,8 +67,8 @@ fn canonical_tensor_mapping(
         GgufModelConfig::Nanbeige(_) => {
             checkpoint.translated_outputs(crate::llama::translate_gguf_weight_name)
         }
-        GgufModelConfig::MuseGlimmer(_) => {
-            checkpoint.translated_outputs(crate::muse_glimmer::translate_text_gguf_name)
+        GgufModelConfig::Muse(_) => {
+            checkpoint.translated_outputs(crate::muse::translate_text_gguf_name)
         }
         GgufModelConfig::NemotronH(_) => {
             checkpoint.translated_outputs(crate::nemotron_h::translate_gguf_weight_name)
@@ -278,11 +278,11 @@ fn resolve_family(
             let plan = crate::llama::gguf_plan(&args)?;
             Ok((GgufModelConfig::Llama(args), plan, None))
         }
-        GgufArchitecture::MuseGlimmer => {
-            let args = crate::muse_glimmer::DecoderConfig::from_gguf_catalog(checkpoint, &metadata)
+        GgufArchitecture::MuseGlimmer | GgufArchitecture::MuseSpark => {
+            let args = crate::muse::DecoderConfig::from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
-            let plan = crate::muse_glimmer::gguf_plan(&args)?;
-            Ok((GgufModelConfig::MuseGlimmer(args), plan, None))
+            let plan = crate::muse::gguf_plan(&args)?;
+            Ok((GgufModelConfig::Muse(args), plan, None))
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let args = crate::nemotron_h::model_args_from_gguf_catalog(checkpoint, &metadata)

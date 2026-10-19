@@ -78,11 +78,18 @@ pub(super) fn load_tokenizer_for_kind(
     kind: ModelKind,
     model_dir: &Path,
 ) -> Result<Tokenizer, TextMetadataError> {
+    load_tokenizer_for_model_type(kind.canonical_name(), model_dir)
+}
+
+pub(super) fn load_tokenizer_for_model_type(
+    model_type: &str,
+    model_dir: &Path,
+) -> Result<Tokenizer, TextMetadataError> {
     if is_gguf_file(model_dir) {
         return Ok(load_gguf_tokenizer(model_dir)?.tokenizer);
     }
-    match kind {
-        ModelKind::KimiLinear => {
+    match model_type {
+        name if name == ModelKind::KimiLinear.canonical_name() => {
             let converted = model_dir.join("tokenizer.json");
             if converted.exists() {
                 Ok(Tokenizer::from_file(converted)?)
@@ -91,7 +98,16 @@ pub(super) fn load_tokenizer_for_kind(
                     .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
             }
         }
-        ModelKind::Moshi | ModelKind::VoiceChat => Err(TextMetadataError::UnsupportedArchitecture(
+        name if name == ModelKind::MuseSpark.canonical_name() => {
+            let converted = model_dir.join("tokenizer.json");
+            if converted.exists() {
+                Ok(Tokenizer::from_file(converted)?)
+            } else {
+                eredu_text::tiktoken::load_muse_spark(model_dir)
+                    .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
+            }
+        }
+        name if name == ModelKind::Moshi.canonical_name() || name == ModelKind::VoiceChat.canonical_name() => Err(TextMetadataError::UnsupportedArchitecture(
             "Moshi-family models use a realtime tokenizer contract; load it outside the chat tokenizer API".into(),
         )),
         _ => Ok(Tokenizer::from_file(model_dir.join("tokenizer.json"))?),

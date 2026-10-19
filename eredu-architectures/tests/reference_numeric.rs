@@ -19,7 +19,7 @@ use std::{
 use eredu_architectures::{
     agree_expert_route_counts, decoder, deepseek, exchange_expert_rows,
     execute_routed_gated_product, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, moshi,
-    muse_glimmer, nemotron_h, qwen,
+    muse, nemotron_h, qwen,
     replicated_text::{
         dispatch_replicated_text_architecture, CompositeTextArchitectureVisitor,
         PreparedCompositeTextArchitecture, PreparedReplicatedTextArchitecture,
@@ -98,6 +98,8 @@ mod k2_horizon;
 mod k2_speculative;
 #[path = "reference_numeric/rotary.rs"]
 mod rotary;
+#[path = "reference_numeric/rms.rs"]
+mod rms;
 
 #[path = "reference_numeric/grouped_linear.rs"]
 mod grouped_linear;
@@ -779,6 +781,7 @@ impl Tensor for NumericTensor {
         use eredu_nn::TensorElementType;
         match self.dtype {
             TensorDtype::I32 => Some(TensorElementType::I32),
+            TensorDtype::I64 => Some(TensorElementType::I64),
             TensorDtype::U32 => Some(TensorElementType::U32),
             TensorDtype::F32 => Some(TensorElementType::F32),
             TensorDtype::Bf16 => Some(TensorElementType::Bf16),
@@ -794,6 +797,9 @@ impl Tensor for NumericTensor {
 
     fn unloaded_i32(shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
         Ok(Self::zeros(shape.to_vec()).with_dtype(eredu_core::checkpoint::TensorDtype::I32))
+    }
+    fn unloaded_i64(shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
+        Ok(Self::zeros(shape.to_vec()).with_dtype(eredu_core::checkpoint::TensorDtype::I64))
     }
 
     fn from_f32_slice(values: &[f32], shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
@@ -846,7 +852,11 @@ impl Tensor for NumericTensor {
     }
 
     fn add(&self, rhs: &Self, _: &NumericContext) -> Result<Self, Error> {
-        self.zip(rhs, |left, right| left + right)
+        let output = self.zip(rhs, |left, right| left + right)?;
+        use eredu_core::checkpoint::TensorDtype as D;
+        if matches!(self.dtype, D::I32 | D::I64) && matches!(rhs.dtype, D::I32 | D::I64)
+            && (self.dtype == D::I64 || rhs.dtype == D::I64)
+        { Ok(output.with_dtype(D::I64)) } else { Ok(output) }
     }
 
     fn subtract(&self, rhs: &Self, _: &NumericContext) -> Result<Self, Error> {
@@ -1347,7 +1357,43 @@ impl Tensor for NumericTensor {
             output.data[output_row * row_width..(output_row + 1) * row_width]
                 .copy_from_slice(&self.data[row * row_width..(row + 1) * row_width]);
         }
-        Ok(output)
+        if self.dtype == eredu_core::checkpoint::TensorDtype::I64 {
+            Ok(output.with_dtype(self.dtype.clone()))
+        } else { Ok(output) }
+    }
+
+    fn ranked_topk(&self, count: i32, _: &NumericContext) -> Result<(Self, Self), Error> {
+        let width = self.shape.last().copied().unwrap_or(0);
+        if count <= 0 || count > width || self.data.iter().any(|v| !v.is_finite()) {
+            return Err(Error::backend("invalid numeric ranked selection"));
+        }
+        let mut values = Vec::new(); let mut ids = Vec::new();
+        for row in self.data.chunks_exact(width as usize) {
+            let mut order = (0..width as usize).collect::<Vec<_>>();
+            order.sort_by(|&a,&b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+            for index in order.into_iter().take(count as usize) { values.push(row[index]); ids.push(index as f32); }
+        }
+        let mut shape = self.shape.clone(); *shape.last_mut().unwrap() = count;
+        Ok((Self::new(shape.clone(), values).with_dtype(self.dtype.clone()), Self::new(shape, ids).with_dtype(eredu_core::checkpoint::TensorDtype::I32)))
+    }
+    fn scatter_last_axis(&self, indices: &Self, values: &Self, _: &NumericContext) -> Result<Self, Error> {
+        let rank = self.shape.len();
+        if rank == 0 || indices.shape.len() != rank || indices.shape != values.shape || self.shape[..rank-1] != indices.shape[..rank-1] || self.shape[rank-1] <= 0 || !matches!(indices.dtype, eredu_core::checkpoint::TensorDtype::I32 | eredu_core::checkpoint::TensorDtype::I64) {
+            return Err(Error::backend("invalid numeric scatter geometry"));
+        }
+        let width = self.shape[rank-1] as usize; let count = indices.shape[rank-1] as usize;
+        let mut result = self.clone();
+        for row in 0..self.data.len()/width {
+            let mut seen = std::collections::HashSet::new();
+            for slot in 0..count {
+                let index = indices.data[row*count+slot];
+                if !index.is_finite() || index < 0. || index >= width as f32 || index.fract() != 0. || !seen.insert(index as usize) {
+                    return Err(Error::backend("invalid numeric scatter indices"));
+                }
+                result.data[row*width+index as usize] = values.data[row*count+slot];
+            }
+        }
+        Ok(result)
     }
 
     fn rope_with_frequencies(
@@ -1804,6 +1850,7 @@ impl Tensor for NumericTensor {
         weight: Option<&Self>,
         bias: Option<&Self>,
         epsilon: f32,
+        _: eredu_nn::LayerNormalizationArithmetic,
         _: &NumericContext,
     ) -> Result<Self, Error> {
         let width = *input
@@ -2363,6 +2410,9 @@ impl Parameterized<NumericTensor> for NumericLinear {
 }
 
 impl LinearOperator<NumericTensor> for NumericLinear {
+    fn parameter_element_type(&self) -> Option<eredu_nn::TensorElementType> {
+        self.execution_weight.as_ref().unwrap_or(&self.weight).element_type()
+    }
     fn forward(
         &mut self,
         input: &NumericTensor,
@@ -2431,6 +2481,9 @@ impl Parameterized<NumericTensor> for NumericEmbedding {
 }
 
 impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
+    fn output_element_type(&self) -> Option<eredu_nn::TensorElementType> {
+        self.execution_weight().element_type()
+    }
     fn weighted_sum(
         &mut self,
         coefficients: &NumericTensor,
@@ -2492,7 +2545,7 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
                     .copy_from_slice(&weight.data[local * dimensions..(local + 1) * dimensions]);
             }
         }
-        Ok(output)
+        Ok(output.with_dtype(weight.dtype.clone()))
     }
 
     fn as_linear(
@@ -2544,6 +2597,7 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
 
 #[derive(Debug, Clone)]
 struct NumericNorm {
+    reduction: eredu_nn::NormalizationReduction,
     groups: usize,
     weight: NumericTensor,
     offset: f32,
@@ -2575,35 +2629,46 @@ impl NormalizationOperator<NumericTensor> for NumericNorm {
     fn forward(
         &mut self,
         input: &NumericTensor,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         let dimensions = self.weight.data.len();
         if input.shape.last().copied() != Some(dimensions as i32) {
             return Err(Error::backend("numeric RMSNorm geometry mismatch"));
         }
+        let channel_major = self.reduction == eredu_nn::NormalizationReduction::ChannelMajor;
+        if channel_major && input.shape.len() != 3 {
+            return Err(Error::backend("channel-major RMS requires [batch, time, channel]"));
+        }
+        let time = if channel_major { input.shape[1] as usize } else { 1 };
         let mut output = input.clone();
-        for (input_row, output_row) in input
+        for (row_index, (input_row, output_row)) in input
             .data
             .chunks_exact(dimensions)
             .zip(output.data.chunks_exact_mut(dimensions))
+            .enumerate()
         {
             let width = dimensions / self.groups;
             for group in 0..self.groups {
                 let start = group * width;
-                let rms = (input_row[start..start + width]
-                    .iter()
-                    .map(|x| x * x)
-                    .sum::<f32>()
-                    / width as f32
-                    + self.epsilon)
-                    .sqrt();
+                let row = &input_row[start..start + width];
+                let cascade = self.reduction == eredu_nn::NormalizationReduction::Cascaded
+                    || (channel_major && (time == 1 || width == 1));
+                let sum = if cascade { rms::cascaded_squares(row) } else if channel_major {
+                    rms::channel_squares(row, if row_index % time < time / 16 * 16 { 1 } else { 4 })
+                } else {
+                    row.iter().map(|x| x * x).sum::<f32>()
+                };
+                let denominator = (sum / width as f32 + self.epsilon).sqrt();
+                let inverse = 1.0 / denominator;
                 for index in start..start + width {
-                    output_row[index] =
-                        input_row[index] / rms * (self.weight.data[index] + self.offset);
+                    let normalized = if cascade || channel_major { input_row[index] * inverse } else {
+                        input_row[index] / denominator
+                    };
+                    output_row[index] = normalized * (self.weight.data[index] + self.offset);
                 }
             }
         }
-        Ok(output)
+        output.cast_float(input.element_type().unwrap_or(eredu_nn::TensorElementType::F32), context)
     }
 }
 
@@ -5010,6 +5075,7 @@ impl NeuralBackend for NumericBackend {
             }
         };
         Ok(NumericNorm {
+            reduction: spec.reduction,
             groups: spec.groups.unwrap_or(1) as usize,
             weight,
             offset,
@@ -6270,6 +6336,7 @@ fn select_pooled_positions(
 struct NumericRouter {
     linear: NumericLinear,
     selection: TopKGroupSelectionSpec,
+    logit_scale: f32,
     correction_bias: Option<(NumericTensor, ParameterMetadata)>,
     input_transform: Option<(f32, NumericTensor, ParameterMetadata, bool)>,
     coefficient_scale: Option<(NumericTensor, ParameterMetadata)>,
@@ -6762,6 +6829,33 @@ impl NumericExpertBank {
         Ok(())
     }
 
+    fn uncombined_bound(
+        &mut self,
+        input: &NumericTensor,
+        routes: &GroupSelection<NumericTensor>,
+    ) -> Result<NumericTensor, Error> {
+        let width = self.spec.input_dimensions();
+        let flat = input.reshape(&[-1, width], &NumericContext::default())?;
+        let tokens = flat.dim(0) as usize;
+        if routes.group_indices().shape.len() != 2
+            || routes.group_indices().dim(0) != tokens as i32
+            || routes.group_indices().shape != routes.coefficients().shape {
+            return Err(Error::backend("numeric uncombined route geometry mismatch"));
+        }
+        let slots = routes.group_indices().dim(1) as usize;
+        let mut values = Vec::new();
+        for token in 0..tokens {
+            let row = flat.axis_slice(0, token, token + 1);
+            for slot in 0..slots {
+                let ids = NumericTensor::new([1, 1], vec![routes.group_indices().data[token * slots + slot]]);
+                let one = NumericTensor::new([1, 1], vec![1.0]);
+                let selection = GroupSelection::new(ids, one.clone(), one);
+                values.extend(self.forward_bound(&row, &selection)?.data);
+            }
+        }
+        Ok(NumericTensor::new([tokens as i32, slots as i32, self.spec.output_dimensions()], values))
+    }
+
     fn forward_bound(
         &mut self,
         input: &NumericTensor,
@@ -6833,6 +6927,47 @@ impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
     fn spec(&self) -> &GroupedGatedProductSpec {
         &self.spec
     }
+    fn forward_uncombined(
+        &mut self, input: &NumericTensor, routes: &GroupSelection<NumericTensor>,
+        context: &NumericContext,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<NumericTensor>>,
+    ) -> Result<NumericTensor, Error> {
+        if let Some(observer) = observer {
+            return routed_units::gated_uncombined(self, input, routes, context, observer, false)
+                .map(|output| output.into_parts().0);
+        }
+        if context.bind_checkpoint_values { self.refresh_bound_experts()?; }
+        self.uncombined_bound(input, routes)
+    }
+
+    fn combine_outputs(
+        &self, outputs: &NumericTensor, routes: &GroupSelection<NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        let tokens = routes.group_indices().dim(0) as usize;
+        let slots = routes.group_indices().dim(1) as usize;
+        let width = self.spec.output_dimensions() as usize;
+        if outputs.shape != [tokens as i32, slots as i32, width as i32]
+            || routes.group_indices().shape != routes.coefficients().shape {
+            return Err(Error::backend("numeric uncombined output geometry mismatch"));
+        }
+        let mut output = NumericTensor::zeros([tokens as i32, width as i32]);
+        for token in 0..tokens {
+            let mut order = (0..slots).collect::<Vec<_>>();
+            if self.spec.reduction() == eredu_nn::GroupReduction::SequentialGroupOrder {
+                order.sort_by_key(|&slot| routes.group_indices().data[token * slots + slot] as usize);
+            }
+            for slot in order {
+                let index = token * slots + slot;
+                for dimension in 0..width {
+                    output.data[token * width + dimension] += outputs.data[index * width + dimension]
+                        * routes.coefficients().data[index];
+                }
+            }
+        }
+        Ok(output)
+    }
+
     fn forward_grouped(
         &mut self,
         input: &NumericTensor,
@@ -6860,6 +6995,35 @@ impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
 }
 
 impl TensorParallelGroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
+    fn forward_uncombined_tensor_parallel(
+        &mut self, input: &NumericTensor, routes: &GroupSelection<NumericTensor>,
+        partitions: usize, context: &NumericContext,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<NumericTensor>>,
+    ) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
+        if partitions == 0 {
+            return Err(Error::backend("invalid numeric uncombined TP request"));
+        }
+        if let Some(observer) = observer {
+            return routed_units::gated_uncombined(self, input, routes, context, observer, true);
+        }
+        if context.bind_checkpoint_values { self.refresh_bound_experts()?; }
+        let mut local = self.clone();
+        let has_bias = local.experts.iter().any(|expert| expert.down_bias.is_some());
+        for expert in &mut local.experts { expert.down_bias = None; }
+        let partial = local.uncombined_bound(input, routes)?;
+        let bias = if has_bias {
+            let width = self.spec.output_dimensions() as usize;
+            let mut values = NumericTensor::zeros(partial.shape.clone());
+            for (row, &id) in routes.group_indices().data.iter().enumerate() {
+                if let Some(bias) = self.experts[id as usize].down_bias.as_ref() {
+                    values.data[row * width..(row + 1) * width].copy_from_slice(&bias.data);
+                }
+            }
+            Some(values)
+        } else { None };
+        Ok(TensorParallelGroupedOutput::new(partial, bias))
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         input: &NumericTensor,
@@ -7302,6 +7466,7 @@ impl GroupedNeuralBackend for NumericBackend {
         Ok(NumericRouter {
             linear,
             selection: routing,
+            logit_scale: spec.logit_scale(),
             correction_bias,
             input_transform,
             coefficient_scale,
@@ -10376,6 +10541,67 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
             ..NumericBankReport::default()
         }
     );
+    let expected_slots = NumericTensor::new([3, 2, 2], (0..3).flat_map(|token| {
+        (0..2).flat_map(|slot| {
+            let scale = routes.group_indices().data[token * 2 + slot] + 1.0;
+            let gate = scale * input.data[token * 2];
+            let value = gate / (1.0 + (-gate).exp()) * input.data[token * 2 + 1] * scale;
+            [value, -value]
+        }).collect::<Vec<_>>()
+    }).collect());
+    let request = || RoutedExpertRequest {
+        unit_observer: None, bank: eredu_runtime::RoutedBankId::new(0), layer: 0,
+        input: &input, routes: &routes, pass: ExpertPass::Prefill,
+    };
+    let slots = provider.forward_grouped_uncombined(&mut resident, request(), &context).unwrap();
+    assert_tensor_close(&slots, &expected_slots, "bounded unweighted expert slots");
+    let partial = provider.forward_grouped_uncombined_tensor_parallel(
+        &mut resident, request(), 1, &context,
+    ).unwrap();
+    let eredu_runtime::RoutedExpertTensorParallelOutput::Partial(partial) = partial else { panic!("rank partial required") };
+    assert!(partial.post_reduce().is_none());
+    assert_tensor_close(partial.reducible(), &expected_slots, "bounded unweighted TP expert slots");
+    let compact_routes = GroupSelection::new(
+        NumericTensor::new([3, 1], vec![3.0, 0.0, 1.0]),
+        NumericTensor::new([3, 1], vec![0.7, 0.6, 0.8]),
+        NumericTensor::new([3, 1], vec![0.7, 0.6, 0.8]),
+    );
+    let compact_request = || RoutedExpertRequest { routes: &compact_routes, ..request() };
+    assert!(provider.forward_grouped_uncombined(&mut resident, compact_request(), &context).is_err());
+    let compact = provider.forward_compact_grouped_uncombined(&mut resident, compact_request(), &context).unwrap();
+    let expected_compact = expected_slots.axis_slice(1, 0, 1);
+    assert_tensor_close(&compact, &expected_compact, "owner-local raw slots bypass original top-k cardinality");
+    let compact_tp = provider.forward_compact_grouped_uncombined_tensor_parallel(
+        &mut resident, compact_request(), 1, &context,
+    ).unwrap();
+    let eredu_runtime::RoutedExpertTensorParallelOutput::Partial(compact_tp) = compact_tp else { panic!("rank partial required") };
+    assert_tensor_close(compact_tp.reducible(), &expected_compact, "owner-local raw TP slots");
+    struct ZeroUnits { origins: Vec<(usize, usize)> }
+    impl eredu_runtime::RoutedUnitObserver<NumericTensor> for ZeroUnits {
+        fn observe(&mut self, batch: &eredu_runtime::RoutedUnitBatch<'_, NumericTensor>) -> Result<(), Error> {
+            let slots = batch.units.coefficients.dim(1) as usize;
+            for (&token, &selection) in batch.units.token_indices.data.iter().zip(&batch.units.selection_indices.data) {
+                let origin = batch.route_origin(token as usize, selection as usize % slots).unwrap();
+                self.origins.push((origin.token, origin.slot));
+            }
+            Ok(())
+        }
+        fn intervene(&mut self, batch: &eredu_runtime::RoutedUnitBatch<'_, NumericTensor>) -> Result<Option<NumericTensor>, Error> {
+            Ok(Some(NumericTensor::zeros(batch.units.values.shape.clone())))
+        }
+        fn observe_effective(&mut self, batch: &eredu_runtime::RoutedUnitBatch<'_, NumericTensor>) -> Result<(), Error> {
+            assert!(batch.units.values.data.iter().all(|&value| value == 0.0));
+            Ok(())
+        }
+    }
+    let mut observer = ZeroUnits { origins: Vec::new() };
+    let masked = provider.forward_grouped_uncombined(&mut resident, RoutedExpertRequest {
+        unit_observer: Some(&mut observer), ..request()
+    }, &context).unwrap();
+    assert_eq!(masked.shape, expected_slots.shape);
+    assert!(masked.data.iter().all(|&value| value == 0.0));
+    observer.origins.sort_unstable();
+    assert_eq!(observer.origins, vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]);
     routed_units::verify_gated(&mut provider, &mut resident, &input, &routes, &context);
     routed_units::verify_failure(&mut provider, &mut resident, &input, &routes, &context);
 }
@@ -14170,291 +14396,9 @@ fn real_multimodal_model_matches_resident_and_dense_streamed_traversal() {
     assert_eq!(resident_state.layer(0).unwrap().position(), 3);
 }
 
-#[test]
-fn muse_text_decode_skips_vision_and_is_chunk_invariant() {
-    let value = serde_json::json!({
-        "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
-        "image_token_id":22,"video_token_id":23,"out_hidden_size":32,"projector_hidden_size":8,
-        "text_config":{"model_type":"muse_glimmer_text","hidden_size":8,"num_hidden_layers":2,
-          "intermediate_size":12,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
-          "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":24,
-          "max_position_embeddings":64,"rope_theta":10000.0,
-          "layer_types":["sliding_attention","full_attention"],
-          "layer_rope_theta":[10000.0,0.0],"sliding_window":4,"tie_word_embeddings":false,
-          "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
-          "output_multiplier":1.0,"final_logit_softcapping":7.0},
-        "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,
-          "intermediate_size":12,"num_attention_heads":2,"num_hidden_layers":1,
-          "patch_size":2,"patch_temporal":1,"merge_size":2,"pos_emb_height":2,
-          "pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
-          "hidden_act":"gelu","layer_types":["full_attention"],
-          "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
-    });
-    let args = muse_glimmer::DecoderConfig::from_hf_value(&value).unwrap();
-    let layout = muse_glimmer::state_layout(&args).unwrap();
-    let context = NumericContext::default();
-    let make_state = || {
-        DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
-            Ok::<_, Error>(NumericHybridLayerState::new(policy))
-        })
-        .unwrap()
-    };
-    let mut whole_state = make_state();
-    let mut chunked_state = make_state();
-    let mut whole = ResidentRuntime::new(
-        muse_glimmer::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
-        &context,
-    )
-    .unwrap();
-    let mut chunked = ResidentRuntime::new(
-        muse_glimmer::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
-        &context,
-    )
-    .unwrap();
-    let whole_tokens = NumericTensor::token_ids(&[1, 2, 3]);
-    let whole_parts = [muse_glimmer::DecoderInputPart::Text(&whole_tokens)];
-    let expected = whole
-        .forward(
-            muse_glimmer::ModelInput {
-                parts: &whole_parts,
-                vision: None,
-                mask: None,
-            },
-            &mut whole_state,
-            &context,
-        )
-        .unwrap();
-    let prefix_tokens = NumericTensor::token_ids(&[1, 2]);
-    let prefix_parts = [muse_glimmer::DecoderInputPart::Text(&prefix_tokens)];
-    let prefix = chunked
-        .forward(
-            muse_glimmer::ModelInput {
-                parts: &prefix_parts,
-                vision: None,
-                mask: None,
-            },
-            &mut chunked_state,
-            &context,
-        )
-        .unwrap();
-    let decode_tokens = NumericTensor::token_ids(&[3]);
-    let decode_parts = [muse_glimmer::DecoderInputPart::Text(&decode_tokens)];
-    let decode = chunked
-        .forward(
-            muse_glimmer::ModelInput {
-                parts: &decode_parts,
-                vision: None,
-                mask: None,
-            },
-            &mut chunked_state,
-            &context,
-        )
-        .unwrap();
-    let actual = NumericTensor::concatenate(&[prefix, decode], 1, &context).unwrap();
-    assert_tensor_close(&actual, &expected, "Muse-Glimmer text logits");
-    assert_eq!(actual.shape, [1, 3, 24]);
-}
 
-#[test]
-fn muse_glimmer_tp2_ordered_vision_text_matches_replicated_multimodal_graph() {
-    let args = muse_glimmer::DecoderConfig::from_hf_value(&serde_json::json!({
-        "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
-        "image_token_id":5,"video_token_id":6,"out_hidden_size":32,"projector_hidden_size":8,
-        "text_config":{"model_type":"muse_glimmer_text","hidden_size":8,"num_hidden_layers":2,
-          "intermediate_size":10,"num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
-          "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":7,
-          "max_position_embeddings":64,"rope_theta":10000.0,
-          "layer_types":["sliding_attention","full_attention"],
-          "layer_rope_theta":[10000.0,0.0],"sliding_window":4,"tie_word_embeddings":false,
-          "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
-          "output_multiplier":1.0,"final_logit_softcapping":7.0},
-        "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,
-          "intermediate_size":10,"num_attention_heads":2,"num_hidden_layers":1,
-          "patch_size":2,"patch_temporal":1,"merge_size":1,"pos_emb_height":2,
-          "pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
-          "hidden_act":"gelu","layer_types":["full_attention"],
-          "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
-    }))
-    .unwrap();
-    let context = NumericContext::default();
-    let architecture =
-        muse_glimmer::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
-    let mut groups = muse_glimmer::static_parameter_groups(&args).unwrap();
-    for layer in 0..2 {
-        groups.extend(muse_glimmer::layer_parameter_groups(&args, layer).unwrap());
-    }
-    let mut expected_state = DeviceState::<NumericBackend, _>::create(
-        muse_glimmer::state_layout(&args).unwrap(),
-        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
-    )
-    .unwrap();
-    let mut expected_runtime = ResidentRuntime::new(architecture, &context).unwrap();
-    let text_before = NumericTensor::token_ids(&[0]);
-    let media_tokens = NumericTensor::token_ids(&[5, 5, 5, 5]);
-    let text_after = NumericTensor::token_ids(&[6]);
-    let pixels = NumericTensor::new(
-        [4, 12],
-        (0..48).map(|index| (index as f32 - 24.0) / 100.0).collect(),
-    );
-    let grid = [(1, 2, 2)];
-    let parts = [
-        muse_glimmer::DecoderInputPart::Text(&text_before),
-        muse_glimmer::DecoderInputPart::Media(&media_tokens),
-        muse_glimmer::DecoderInputPart::Text(&text_after),
-    ];
-    let expected = expected_runtime
-        .forward(
-            muse_glimmer::ModelInput {
-                parts: &parts,
-                vision: Some(muse_glimmer::VisionInput {
-                    pixels: &pixels,
-                    grid: &grid,
-                }),
-                mask: None,
-            },
-            &mut expected_state,
-            &context,
-        )
-        .unwrap();
-    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
-    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
-    let tp1_geometry = muse_glimmer::local_geometry(&args, &tp1_layout).unwrap();
-    let tp1_state_layout = tp1_geometry.state_layout().clone();
-    let tp1_architecture = muse_glimmer::LayeredModel::<NumericBackend>::new_parallel(
-        args.clone(),
-        tp1_geometry,
-        &tp1_context,
-    )
-    .unwrap();
-    let tp1_units = [(0, 0), (1, 0), (1, 1)]
-        .into_iter()
-        .map(|(group, index)| {
-            <muse_glimmer::LayeredModel<NumericBackend> as LayeredArchitecture<
-                NumericBackend,
-                DeviceState<NumericBackend, NumericHybridLayerState>,
-            >>::build_unit(&tp1_architecture, group, index, &tp1_context)
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let mut tp1_runtime =
-        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
-    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
-        Ok::<_, Error>(NumericHybridLayerState::new(policy))
-    })
-    .unwrap();
-    let tp1_parts = [
-        muse_glimmer::DecoderInputPart::Text(&text_before),
-        muse_glimmer::DecoderInputPart::Media(&media_tokens),
-        muse_glimmer::DecoderInputPart::Text(&text_after),
-    ];
-    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
-    let tp1_logits = tp1_runtime
-        .forward_parallel(
-            muse_glimmer::ModelInput {
-                parts: &tp1_parts,
-                vision: Some(muse_glimmer::VisionInput {
-                    pixels: &pixels,
-                    grid: &grid,
-                }),
-                mask: None,
-            },
-            &mut tp1_state,
-            &tp1_parallel,
-            &tp1_context,
-        )
-        .unwrap();
-    assert_tensor_exact(&tp1_logits, &expected, "Muse-Glimmer TP1 logits");
-    assert_state_exact(&tp1_state, &expected_state, 2, "Muse-Glimmer TP1 state");
-    let layouts = (0..2)
-        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
-        .collect::<Vec<_>>();
-    let collective_group = NumericParallelGroup::new(2);
-    let outputs =
-        std::thread::scope(|scope| {
-            let handles =
-                layouts
-                    .into_iter()
-                    .enumerate()
-                    .map(|(rank, layout)| {
-                        let args = args.clone();
-                        let text_before = text_before.clone();
-                        let media_tokens = media_tokens.clone();
-                        let text_after = text_after.clone();
-                        let pixels = pixels.clone();
-                        let collective_group = Arc::clone(&collective_group);
-                        scope.spawn(move || {
-                            let context = NumericContext::with_local_layout(layout.clone());
-                            let geometry = muse_glimmer::local_geometry(&args, &layout).unwrap();
-                            let state_layout = geometry.state_layout().clone();
-                            let architecture =
-                                muse_glimmer::LayeredModel::<NumericBackend>::new_parallel(
-                                    args, geometry, &context,
-                                )
-                                .unwrap();
-                            let addresses = [(0, 0), (1, 0), (1, 1)];
-                            let units = addresses.into_iter().map(|(group, index)| {
-                    <muse_glimmer::LayeredModel<NumericBackend> as LayeredArchitecture<
-                        NumericBackend,
-                        DeviceState<NumericBackend, NumericHybridLayerState>,
-                    >>::build_unit(&architecture, group, index, &context).unwrap()
-                }).collect::<Vec<_>>();
-                            let mut runtime =
-                                LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
-                            let mut state = DeviceState::<NumericBackend, _>::create(
-                                state_layout,
-                                |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
-                            )
-                            .unwrap();
-                            let parallel = NumericParallelContext::new(rank, collective_group);
-                            let grid = [(1, 2, 2)];
-                            let parts = [
-                                muse_glimmer::DecoderInputPart::Text(&text_before),
-                                muse_glimmer::DecoderInputPart::Media(&media_tokens),
-                                muse_glimmer::DecoderInputPart::Text(&text_after),
-                            ];
-                            let logits = runtime
-                                .forward_parallel(
-                                    muse_glimmer::ModelInput {
-                                        parts: &parts,
-                                        vision: Some(muse_glimmer::VisionInput {
-                                            pixels: &pixels,
-                                            grid: &grid,
-                                        }),
-                                        mask: None,
-                                    },
-                                    &mut state,
-                                    &parallel,
-                                    &context,
-                                )
-                                .unwrap();
-                            (logits, parallel.trace())
-                        })
-                    })
-                    .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-    assert_tensor_close(&outputs[0].0, &expected, "Muse-Glimmer TP2 rank 0 logits");
-    assert_tensor_close(&outputs[1].0, &expected, "Muse-Glimmer TP2 rank 1 logits");
-    assert_eq!(outputs[0].0.shape, [1, 6, 7]);
-    for (_, trace) in &outputs {
-        assert_eq!(trace.len(), 7);
-        assert_eq!(
-            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
-            [
-                NumericCollectiveKind::Sum,
-                NumericCollectiveKind::Sum,
-                NumericCollectiveKind::Sum,
-                NumericCollectiveKind::Sum,
-                NumericCollectiveKind::Sum,
-                NumericCollectiveKind::Sum,
-                NumericCollectiveKind::GatherVocabulary,
-            ]
-        );
-    }
-}
+
+
 
 #[test]
 fn explicit_rotary_embeddings_match_offset_positions() {
@@ -14701,6 +14645,7 @@ fn reference_router_and_packed_experts_match_analytical_values() {
     let context = NumericContext::default();
     let router_spec = ParameterSpec::trainable("router.weight").unwrap();
     let mut router = NumericRouter {
+        logit_scale: 1.0,
         linear: NumericLinear {
             weight: NumericTensor::new(
                 vec![3, 2],
@@ -14891,6 +14836,7 @@ fn selected_softmax_router_applies_rms_input_and_per_expert_scales() {
     let input_scale = ParameterSpec::trainable("router.selected.input_scale").unwrap();
     let coefficient_scale = ParameterSpec::trainable("router.selected.coefficient_scale").unwrap();
     let mut router = NumericRouter {
+        logit_scale: 1.0,
         linear: NumericLinear {
             weight: NumericTensor::new(vec![3, 2], vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.0]),
             weight_metadata: ParameterMetadata::from_spec(&weight, true),
@@ -15140,6 +15086,7 @@ fn causal_depthwise_convolution_matches_prefill_and_incremental_reference() {
     let parameter = |name: &str| ParameterSpec::trainable(name).unwrap();
     let mut convolution = CausalDepthwiseConvolution::<NumericBackend>::new(
         CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             dilation: 1,
             channels: 2,
             kernel_size: 3,
@@ -15203,6 +15150,7 @@ fn dilated_causal_convolution_preserves_exact_history_across_arbitrary_chunks() 
         for kernel_size in [1, 3] {
             let mut convolution = CausalDepthwiseConvolution::<NumericBackend>::new(
                 CausalDepthwiseConvolutionSpec {
+                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
                     channels: 2,
                     kernel_size,
                     dilation,
@@ -15297,6 +15245,7 @@ fn gated_short_convolution_matches_chunked_state_continuation() {
         input_projection: linear(2, 6, "short.in.weight"),
         output_projection: linear(2, 2, "short.out.weight"),
         convolution: CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             dilation: 1,
             channels: 2,
             kernel_size: 3,
@@ -18566,7 +18515,32 @@ type NumericCompositeRefinement = dyn FnMut(
     Option<&NumericTensor>,
 ) -> Result<NumericTensor, Error>;
 
+type NumericCompositeChunkedPrefill = dyn FnMut(
+    &eredu_runtime::PreparedModelInput<NumericTensor>,
+    usize,
+    &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
+) -> Result<Vec<NumericTensor>, Error>;
+
+type NumericCompositeCapture = dyn FnMut(
+    &eredu_runtime::PreparedModelInput<NumericTensor>, bool,
+    &eredu_runtime::ForwardCaptureBundle, Option<&'static str>,
+) -> Result<(NumericTensor,Vec<NumericTensor>),Error>;
+
+type NumericCompositeLaneCapture = dyn FnMut(
+    &eredu_runtime::PreparedModelInput<NumericTensor>, bool,
+    &eredu_runtime::ForwardCaptureBundle,
+    &mut DeviceState<NumericBackend, NumericHybridLayerState>,
+) -> Result<(NumericTensor, Vec<NumericTensor>), Error>;
+
+type NumericTargetTransport = dyn for<'a> FnMut(eredu_architectures::composite_execution::ExternalPredictionTargetOperation<'a,NumericTensor>, &eredu_runtime::PredictionTensorAssemblyPlan, Option<&'static str>) -> Result<NumericTensor, Error>;
+
 struct NumericCompositePartitionExecutable {
+    parallel: Option<NumericParallelContext>,
+    prepare_lane: Box<dyn FnMut() -> Result<DeviceState<NumericBackend, NumericHybridLayerState>, Error>>,
+    capture_lane: Box<NumericCompositeLaneCapture>,
+    target_transport: Box<NumericTargetTransport>,
+    capture: Box<NumericCompositeCapture>,
+    chunked_prefill: Box<NumericCompositeChunkedPrefill>,
     attention: Box<dyn FnMut(&eredu_runtime::PreparedModelInput<NumericTensor>, eredu_core::decoding::AttentionInvocation) -> Result<NumericTensor, Error>>,
     refine: Box<NumericCompositeRefinement>,
     forward: Box<NumericCompositePartitionForward>,
@@ -18696,6 +18670,7 @@ impl
         };
         let admission = prepared.prepared().architecture().admission_config();
         let factory_world = Arc::clone(&self.world);
+        let retained_parallel = std::rc::Rc::new(RefCell::new(None));
         let binding = prepared
             .prepare_session_runtime::<NumericBackend, _, _, _, _>(
                 prompt,
@@ -18752,6 +18727,7 @@ impl
                     let parallel = tensor_group
                         .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
                         .transpose()?;
+                    *retained_parallel.borrow_mut() = parallel.clone();
                     let status_parallel = match executor_plan.row_lookup_status_group() {
                         Some(id) if Some(id) != tensor_group => {
                             let mut status =
@@ -18833,7 +18809,58 @@ impl
         let attention_session = std::rc::Rc::clone(&session);
         let attention_context = context.clone();
         let attention_admission = admission.clone();
+        let capture_session = std::rc::Rc::clone(&session);
+        let capture_context = context.clone();
+        let capture_admission = admission.clone();
+        let transport_session = std::rc::Rc::clone(&session);
+        let transport_context = context.clone();
+        let prefill_session = std::rc::Rc::clone(&session);
+        let prefill_context = context.clone();
+        let prefill_admission = admission.clone();
+        let lane_session = std::rc::Rc::clone(&session);
+        let lane_context = context.clone();
+        let lane_admission = admission.clone();
+        let prepare_lane_session = std::rc::Rc::clone(&session);
+        let prepare_lane_context = context.clone();
+        let parallel = retained_parallel.borrow_mut().take();
         Ok(NumericCompositePartitionExecutable {
+            parallel,
+            prepare_lane: Box::new(move || prepare_lane_session.borrow_mut()
+                .prepare_prediction_target_state(&prepare_lane_context).map_err(Error::backend_source)),
+            capture_lane: Box::new(move |input, prefill, bundle, state| {
+                let admitted = A::admit_prepared_input(&lane_admission, input, &NumericInputInspector).map_err(Error::backend)?;
+                let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(input, &admitted).map_err(Error::backend)?;
+                forward_capture_bundle::run_lane(&mut lane_session.borrow_mut(), paired, prefill, bundle, state, &lane_context)
+            }),
+            target_transport: Box::new(move |operation,plan,fault| {
+                transport_session.borrow_mut().apply_prediction_target_operation(
+                    prediction_target_transport::Operation { operation, plan, fault }, &transport_context
+                ).map_err(Error::backend_source)
+            }),
+            capture: Box::new(move |input,prefill,bundle,fault| {
+                let admitted = A::admit_prepared_input(&capture_admission,input,&NumericInputInspector).map_err(Error::backend)?;
+                let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(input,&admitted).map_err(Error::backend)?;
+                forward_capture_bundle::run(&mut capture_session.borrow_mut(),paired,prefill,bundle,fault,&capture_context)
+            }),
+            chunked_prefill: Box::new(move |input, chunk_tokens, observer| {
+                let request = A::admit_prepared_input(&prefill_admission, input, &NumericInputInspector)
+                    .map_err(Error::backend)
+                    .and_then(|admitted| {
+                        A::prepare_prefill_request(input.clone(), admitted, &prefill_context)
+                    });
+                let mut session = prefill_session.borrow_mut();
+                let mut cursor = session
+                    .start_prefill(request, chunk_tokens, None, &prefill_context)
+                    .map_err(Error::backend_source)?;
+                let mut outputs = Vec::new();
+                while !cursor.is_complete() {
+                    let step = session
+                        .advance_prefill(&mut cursor, &prefill_context, observer)
+                        .map_err(Error::backend_source)?;
+                    outputs.push(step.output);
+                }
+                Ok(outputs)
+            }),
             attention: Box::new(move |input, invocation| {
                 let admitted = A::admit_prepared_input(&attention_admission, input, &NumericInputInspector).map_err(Error::backend)?;
                 let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(input, &admitted)
@@ -23935,8 +23962,8 @@ pub(crate) fn non_mlx_muse_glimmer_composite_matches_established_image_video_tex
         .iter()
         .any(|value| (*value - 0.75).abs() < f32::EPSILON));
 
-    let args = muse_glimmer::DecoderConfig::from_hf_value(&config).unwrap();
-    let architecture = muse_glimmer::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let args = muse::DecoderConfig::from_hf_value(&config).unwrap();
+    let architecture = muse::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
     let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
         Ok::<_, Error>(NumericHybridLayerState::new(policy))
     })
@@ -23949,22 +23976,22 @@ pub(crate) fn non_mlx_muse_glimmer_composite_matches_established_image_video_tex
             .unwrap();
     let grids = [(1, 2, 2), (1, 2, 2)];
     let parts = [
-        muse_glimmer::DecoderInputPart::Text(&text_before),
-        muse_glimmer::DecoderInputPart::Media(&image_tokens),
-        muse_glimmer::DecoderInputPart::Text(&text_between),
-        muse_glimmer::DecoderInputPart::Media(&video_tokens),
-        muse_glimmer::DecoderInputPart::Text(&text_after),
+        muse::DecoderInputPart::Text(&text_before),
+        muse::DecoderInputPart::Media(&image_tokens),
+        muse::DecoderInputPart::Text(&text_between),
+        muse::DecoderInputPart::Media(&video_tokens),
+        muse::DecoderInputPart::Text(&text_after),
     ];
     let mut expected = vec![numeric_text_output(
         runtime
             .forward(
-                muse_glimmer::ModelInput {
+                muse::ModelInput {
                     parts: &parts,
-                    vision: Some(muse_glimmer::VisionInput {
+                    vision: Some(muse::VisionInput {
                         pixels: &pixels,
                         grid: &grids,
                     }),
-                    mask: None,
+                    audio: None, mask: None,
                 },
                 &mut state,
                 &context,
@@ -23974,15 +24001,15 @@ pub(crate) fn non_mlx_muse_glimmer_composite_matches_established_image_video_tex
     .unwrap()];
     for token in [4, 5] {
         let tokens = NumericTensor::token_ids(&[token]);
-        let parts = [muse_glimmer::DecoderInputPart::Text(&tokens)];
+        let parts = [muse::DecoderInputPart::Text(&tokens)];
         expected.push(
             numeric_text_output(
                 runtime
                     .forward(
-                        muse_glimmer::ModelInput {
+                        muse::ModelInput {
                             parts: &parts,
                             vision: None,
-                            mask: None,
+                            audio: None, mask: None,
                         },
                         &mut state,
                         &context,
@@ -25926,6 +25953,7 @@ fn grouped_sigmoid_and_caller_selected_routes_preserve_unbiased_scores() {
         .with_weight_policy(1e-20, 2.0)
         .unwrap();
     let mut router = NumericRouter {
+        logit_scale: 1.0,
         linear: NumericLinear {
             weight: NumericTensor::new(vec![4, 1], vec![2.0, 1.0, 3.0, 0.0]),
             weight_metadata: ParameterMetadata::from_spec(&router_weight, true),
@@ -27216,6 +27244,7 @@ fn qwen_partition_route_mechanism_combines_duplicates_with_zero_peer_rows() {
         &scores,
         &coefficients,
         eredu_runtime::ExpertRouteInvocation {
+            combination: eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum,
             reduction: eredu_nn::GroupReduction::Sum,
             bank: eredu_runtime::RoutedBankId::new(0),
             unit: 0,
@@ -27283,6 +27312,7 @@ fn pp2_ep2_route_exchange_uses_complete_provider_output_without_tp_reduction() {
         &scores,
         &coefficients,
         eredu_runtime::ExpertRouteInvocation {
+            combination: eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum,
             reduction: eredu_nn::GroupReduction::Sum,
             bank: eredu_runtime::RoutedBankId::new(0),
             unit: 0,
@@ -27358,6 +27388,7 @@ fn gpt_oss_partition_route_mechanism_keeps_weighted_bias_for_one_tp_add() {
             &scores,
             &coefficients,
             eredu_runtime::ExpertRouteInvocation {
+                combination: eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum,
                 reduction: eredu_nn::GroupReduction::Sum,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 unit: 0,
@@ -27752,8 +27783,8 @@ fn numeric_composite_parameter_description(
                 .parameter_description(&context)
                 .unwrap()
         }
-        "muse_glimmer" => muse_glimmer::LayeredModel::<NumericBackend>::new(
-            muse_glimmer::DecoderConfig::from_hf_value(config).unwrap(),
+        "muse_glimmer" | "muse_spark" => muse::LayeredModel::<NumericBackend>::new(
+            muse::DecoderConfig::from_hf_value(config).unwrap(),
             &context,
         )
         .unwrap()
@@ -29281,6 +29312,19 @@ mod qsa;
 
 #[path = "reference_numeric/row_lookup.rs"]
 mod row_lookup;
+
+#[path = "reference_numeric/bounded_transport.rs"]
+mod bounded_transport;
+
+#[path = "reference_numeric/forward_capture_bundle.rs"]
+mod forward_capture_bundle;
+#[path = "reference_numeric/prediction_target_transport.rs"]
+mod prediction_target_transport;
+
+#[path = "reference_numeric/speculative_sampling.rs"]
+mod speculative_sampling;
+#[path = "reference_numeric/speculative_snapshot.rs"]
+mod speculative_snapshot;
 
 #[path = "reference_numeric/qwen4_target.rs"]
 mod qwen4_target;

@@ -11,6 +11,7 @@ fn output_element(invocation: &MechanismInvocation) -> Option<TensorElementType>
         weight_element,
         bias,
         bias_element,
+        arithmetic,
         ..
     } = *invocation
     else {
@@ -18,7 +19,7 @@ fn output_element(invocation: &MechanismInvocation) -> Option<TensorElementType>
     };
     // Pinned fast.cpp deliberately ignores bias promotion if weight is absent:
     // passed_bias is cast to the activation dtype in that case.
-    if !weight {
+    if arithmetic == eredu_nn::LayerNormalizationArithmetic::CascadedMoments || !weight {
         return Some(element);
     }
     let mut output = promoted_element(element, weight_element?);
@@ -40,6 +41,7 @@ pub(crate) fn describe(
         weight_element,
         bias,
         bias_element,
+        arithmetic,
     } = *invocation
     else {
         return Err(Error::backend(
@@ -76,6 +78,64 @@ pub(crate) fn describe(
         );
     }
     report.storage.push(storage);
+
+    if arithmetic == eredu_nn::LayerNormalizationArithmetic::CascadedMoments {
+        let chunks = (width / 4).div_ceil(16);
+        let depth = (u64::BITS - chunks.saturating_sub(1).leading_zeros()).max(1) as u64;
+        for (name, size) in [
+            ("cascaded_input_f32", bytes(&[rows, width], 4)?),
+            ("cascaded_output_f32", bytes(&[rows, width], 4)?),
+            ("cascaded_host_output_vec", bytes(&[rows, width], 4)?),
+            ("cascaded_moments_stack", bytes(&[depth], 40)?),
+            ("cascaded_gain_f32", bytes(&[u64::from(weight), width], 4)?),
+            ("cascaded_bias_f32", bytes(&[u64::from(bias), width], 4)?),
+            (
+                "cascaded_host_input_copy",
+                bytes(&[rows, width], element_bytes(element))?,
+            ),
+        ] {
+            let mut storage = allocation(
+                name,
+                size,
+                MechanismStorageRole::Scratch,
+                StorageRetention::Evaluation,
+            );
+            storage.payload.lower = 0;
+            storage.backing = MechanismBacking::Unknown;
+            storage.capacity = MechanismBytes::unknown(0);
+            storage.placement = MechanismPlacement::Host;
+            storage.detail = "bounded CPU moments/affine operation; non-CPU execution uses host activation/parameter copies; aliasing and cast backing remain unknown".into();
+            report.storage.push(storage);
+        }
+        for (name, present, element) in [
+            ("cascaded_host_gain_copy", weight, weight_element),
+            ("cascaded_host_bias_copy", bias, bias_element),
+        ] {
+            if !present {
+                continue;
+            }
+            let mut storage = allocation(
+                name,
+                0,
+                MechanismStorageRole::ParameterConversion,
+                StorageRetention::Evaluation,
+            );
+            storage.payload = match element {
+                Some(element) => MechanismBytes {
+                    lower: 0,
+                    upper: Some(bytes(&[width], element_bytes(element))?),
+                },
+                None => MechanismBytes::unknown(0),
+            };
+            storage.backing = MechanismBacking::Unknown;
+            storage.capacity = MechanismBytes::unknown(0);
+            storage.placement = MechanismPlacement::Host;
+            storage.detail = "conditional original-precision parameter copy for the selected-device host fallback; bound scalar metadata fixes the payload upper bound".into();
+            report.storage.push(storage);
+        }
+        report.missing.push("selected-device copy backing and result-transfer overlap require bound native storage facts".into());
+        return Ok(report);
+    }
 
     let mut graph_value =
         |name: &str, count: u64, dtype: TensorElementType, detail: &str| -> Result<(), Error> {
@@ -153,6 +213,7 @@ mod tests {
 
     fn invocation(weight: bool, bias: bool) -> MechanismInvocation {
         MechanismInvocation::LayerNormalization {
+            arithmetic: eredu_nn::LayerNormalizationArithmetic::Native,
             rows: 3,
             width: 5,
             element: TensorElementType::F16,

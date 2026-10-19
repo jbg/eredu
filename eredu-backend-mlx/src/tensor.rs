@@ -169,6 +169,9 @@ impl Tensor for MlxTensor {
     fn unloaded_i32(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::zeros::<i32>(shape, context))
     }
+    fn unloaded_i64(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        tensor(Array::zeros::<i64>(shape, context))
+    }
 
     fn from_f32_slice(
         values: &[f32],
@@ -488,6 +491,113 @@ impl Tensor for MlxTensor {
         tensor(Array::take_axis(self.as_array(), &indexes, axis, context))
     }
 
+    fn ranked_topk(&self, count: i32, context: &Stream) -> Result<(Self, Self), Error> {
+        use safemlx::ops::{arange, concatenate_axis, r#where};
+        let width = self.shape().last().copied().unwrap_or(0);
+        if count <= 0 || count > width || !self.0.dtype().is_float() {
+            return Err(Error::backend("invalid ranked final-axis selection"));
+        }
+        let mut work = self.0.clone();
+        let finite =
+            backend(backend(work.abs(context))?.lt(Array::from_f32(f32::INFINITY), context))?;
+        backend(crate::backend::nn::tensor::register_device_validation(
+            backend(backend(finite.logical_not(context))?.any(false, context))?,
+            "nonfinite ranked selection score",
+        ))?;
+        work = backend(work.reshape(&[-1, width], context))?;
+        let positions = backend(arange::<_, i32>(None, width, None, context))?;
+        let mut selected_values = Vec::with_capacity(count as usize);
+        let mut selected_indices = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let maximum = backend(work.max_axis(-1, true, context))?;
+            let tied = backend(work.eq(&maximum, context))?;
+            let first = backend(
+                backend(r#where(
+                    &tied,
+                    &positions,
+                    Array::from_int(i32::MAX),
+                    context,
+                ))?
+                .min_axis(-1, true, context),
+            )?;
+            let selected = backend(positions.eq(&first, context))?;
+            work = backend(r#where(
+                &selected,
+                Array::from_f32(f32::NEG_INFINITY),
+                &work,
+                context,
+            ))?;
+            selected_values.push(maximum);
+            selected_indices.push(first);
+        }
+        let mut shape = self.shape().to_vec();
+        *shape.last_mut().unwrap() = count;
+        let values = backend(concatenate_axis(&selected_values, -1, context))?;
+        let indices = backend(concatenate_axis(&selected_indices, -1, context))?;
+        Ok((
+            tensor(backend(values.as_dtype(self.0.dtype(), context))?.reshape(&shape, context))?,
+            tensor(indices.reshape(&shape, context))?,
+        ))
+    }
+
+    fn scatter_last_axis(
+        &self,
+        indices: &Self,
+        values: &Self,
+        context: &Stream,
+    ) -> Result<Self, Error> {
+        let shape = self.shape();
+        let index_shape = indices.shape();
+        let rank = shape.len();
+        if rank == 0
+            || index_shape.len() != rank
+            || values.shape() != index_shape
+            || shape[..rank - 1] != index_shape[..rank - 1]
+            || shape[rank - 1] <= 0
+            || !matches!(indices.0.dtype(), Dtype::Int32 | Dtype::Int64)
+        {
+            return Err(Error::backend("invalid strict final-axis scatter geometry"));
+        }
+        let width = shape[rank - 1];
+        let valid = backend(
+            backend(indices.0.ge(Array::from_int(0), context))?.logical_and(
+                backend(indices.0.lt(Array::from_int(width), context))?,
+                context,
+            ),
+        )?;
+        let mut invalid = backend(backend(valid.logical_not(context))?.any(false, context))?;
+        if index_shape[rank - 1] > 1 {
+            let sorted = backend(
+                backend(safemlx::ops::sort_axis(&indices.0, -1, context))?
+                    .reshape(&[-1, index_shape[rank - 1]], context),
+            )?;
+            let left =
+                backend(sorted.try_index_device((.., ..index_shape[rank - 1] - 1), context))?;
+            let right = backend(sorted.try_index_device((.., 1..), context))?;
+            invalid = backend(invalid.logical_or(
+                backend(backend(left.eq(right, context))?.any(false, context))?,
+                context,
+            ))?;
+        }
+        backend(crate::backend::nn::tensor::register_device_validation(
+            invalid,
+            "scatter indices must be unique and within the destination axis",
+        ))?;
+        let safe = backend(safemlx::ops::r#where(
+            &valid,
+            &indices.0,
+            Array::from_int(0),
+            context,
+        ))?;
+        let safe = backend(safe.as_dtype(Dtype::Int32, context))?;
+        tensor(self.0.put_along_axis(
+            &safe,
+            backend(values.0.as_dtype(self.0.dtype(), context))?,
+            -1,
+            context,
+        ))
+    }
+
     fn zeros_like(&self, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::zeros_like(self.as_array(), context))
     }
@@ -767,8 +877,18 @@ impl Tensor for MlxTensor {
         weight: Option<&Self>,
         bias: Option<&Self>,
         epsilon: f32,
+        arithmetic: eredu_nn::LayerNormalizationArithmetic,
         context: &Self::Context,
     ) -> Result<Self, Error> {
+        if arithmetic == eredu_nn::LayerNormalizationArithmetic::CascadedMoments {
+            return tensor(crate::backend::nn::normalization::cascaded_layer_norm(
+                input.as_array(),
+                weight.map(MlxTensor::as_array),
+                bias.map(MlxTensor::as_array),
+                epsilon,
+                context,
+            ));
+        }
         tensor(safemlx::fast::layer_norm(
             input.as_array(),
             weight.map(MlxTensor::as_array),

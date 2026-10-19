@@ -47,6 +47,26 @@ impl<B: GroupedNeuralBackend, P: ParameterProvider<B>, L: RowLookupProvider<B>> 
     fn routing_failed(&mut self, bank: RoutedBankId, message: &str) {
         self.grouped.routing_failed(bank, message)
     }
+    fn forward_compact_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        self.grouped
+            .forward_compact_grouped_uncombined(resident, request, context)
+    }
+
+    fn forward_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        self.grouped
+            .forward_grouped_uncombined(resident, request, context)
+    }
+
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
@@ -86,6 +106,30 @@ impl<B: GroupedNeuralBackend, P: ParameterProvider<B>, L: RowLookupProvider<B>> 
 impl<B: GroupedNeuralBackend, P: TensorParallelParameterProvider<B>, L: RowLookupProvider<B>>
     TensorParallelParameterProvider<B> for ParameterProviders<P, L>
 {
+    fn forward_compact_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        self.grouped
+            .forward_compact_grouped_uncombined_tensor_parallel(
+                resident, request, partitions, context,
+            )
+    }
+
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        self.grouped
+            .forward_grouped_uncombined_tensor_parallel(resident, request, partitions, context)
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,

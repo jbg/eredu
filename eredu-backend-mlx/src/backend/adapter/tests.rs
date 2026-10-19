@@ -171,7 +171,7 @@ fn planned_backend_rejects_a_stream_that_differs_from_its_realized_device() {
     let realized = Device::new(DeviceType::Cpu, 0);
     let identity = MlxDeviceIdentity::from_realized_device(&realized, None).unwrap();
     let other = ExecutionContext::new(Device::new(DeviceType::Cpu, 1));
-    let backend = MlxBackend::for_execution_plan(other.stream(), other.stream(), identity);
+    let backend = MlxBackend::for_execution_plan(other.stream(), other.stream(), identity, None);
 
     let error = backend.devices().unwrap_err();
     assert!(error
@@ -212,7 +212,7 @@ fn missing_world_rejects_before_payload_or_architecture_construction() {
 
     assert!(error
         .to_string()
-        .contains("distributed model preparation requires native::distributed_backend"));
+        .contains("distributed model preparation requires a bound native world"));
     assert_eq!(
         path_instrumentation::communication_realization_attempts(),
         1

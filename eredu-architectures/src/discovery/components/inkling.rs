@@ -334,6 +334,7 @@ pub(in crate::discovery) fn decoder_scalars(
         shared_write_weight: format!("{prefix}.o_proj.weight"),
         write_bias: text.o_bias.then(|| format!("{prefix}.o_proj.bias")),
         activation_equation: ComponentActivation::Attention {
+            attended_head_normalization: None,
             query_heads: heads,
             key_value_heads: kv,
             head_width: dim,
@@ -523,6 +524,7 @@ pub(in crate::discovery) fn target_readout(g: &mut Builder, text: &TextArgs) {
         embedding_normalization: Some(normalization("model.embed_norm.weight")),
         tied_embeddings: false,
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             residual: "readout.residual".into(),
             normalized: "readout.normalized".into(),

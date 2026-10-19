@@ -56,12 +56,12 @@ fn write_muse_glimmer_gguf_component_fixture(path: &Path, routed: bool) {
             predicate("output.weight")
         }
     }
-    let args = eredu_architectures::muse_glimmer::DecoderConfig::from_gguf_catalog(
+    let args = eredu_architectures::muse::DecoderConfig::from_gguf_catalog(
         &Untied,
         &metadata.clone().into_iter().collect(),
     )
     .unwrap();
-    let plan = eredu_architectures::muse_glimmer::gguf_plan(&args).unwrap();
+    let plan = eredu_architectures::muse::gguf_plan(&args).unwrap();
     let tensors = plan
         .common_tensors
         .iter()

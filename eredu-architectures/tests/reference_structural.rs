@@ -7,7 +7,7 @@ use eredu_architectures::{
     decoder::{self, AttentionProjectionLayout, GatedProjectionLayout, TransformerBlock},
     deepseek, gemma4, gpt_oss, inkling, kimi_linear, lfm2,
     llama::{self, ModelArgs},
-    moshi, muse_glimmer, qwen,
+    moshi, muse, qwen,
     replicated_text::{
         replicated_text_requirements, visit_replicated_text_architecture,
         PreparedReplicatedTextArchitecture, ReplicatedTextArchitectureVisitor,
@@ -3341,7 +3341,7 @@ fn external_assistant_safetensors_schemas_equal_neutral_parameter_topology() {
         &ordered,
         gemma4::assistant_safetensors_plan(&ordered_config).unwrap(),
     );
-    let dflash_config = muse_glimmer::DFlashConfig::from_hf_json(
+    let dflash_config = muse::DFlashConfig::from_hf_json(
         &serde_json::to_vec(&serde_json::json!({
           "model_type":"muse_glimmer_assistant","hidden_size":6656,
           "intermediate_size":19968,"num_hidden_layers":5,"num_attention_heads":32,
@@ -3356,12 +3356,18 @@ fn external_assistant_safetensors_schemas_equal_neutral_parameter_topology() {
         .unwrap(),
     )
     .unwrap();
-    let dflash = muse_glimmer::DFlash::<ReferenceBackend>::new(dflash_config.clone(), &()).unwrap();
+    let dflash = muse::DFlash::<ReferenceBackend>::new(dflash_config.clone(), &()).unwrap();
     assert_assistant_plan_matches_topology(
         &dflash,
-        muse_glimmer::dflash_safetensors_plan(&dflash_config).unwrap(),
+        muse::dflash_safetensors_plan(&dflash_config).unwrap(),
     );
 }
+
+
+
+
+
+
 
 fn assert_assistant_plan_matches_topology<M: Parameterized<ReferenceTensor>>(
     module: &M,
@@ -4552,8 +4558,8 @@ fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling
             "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
         }
     });
-    let muse_args = muse_glimmer::DecoderConfig::from_hf_value(&muse_config).unwrap();
-    let muse_model = muse_glimmer::LayeredModel::<ReferenceBackend>::new(muse_args, &()).unwrap();
+    let muse_args = muse::DecoderConfig::from_hf_value(&muse_config).unwrap();
+    let muse_model = muse::LayeredModel::<ReferenceBackend>::new(muse_args, &()).unwrap();
     assert_two_stage_composite_dispatch(
         "muse",
         muse_config,

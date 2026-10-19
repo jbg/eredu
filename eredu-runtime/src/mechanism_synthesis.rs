@@ -374,7 +374,7 @@ impl WeightLoweringDescriptor {
                 }
                 let bits = match self.executable() {
                     LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
-                    LinearFormat::MxFp4 => Some(4),
+                    LinearFormat::MxFp4 | LinearFormat::NvFp4 => Some(4),
                     _ => None,
                 };
                 bits.is_some_and(|bits| {
@@ -445,6 +445,7 @@ impl WeightLoweringDescriptor {
                         .is_some_and(|group| extent.is_multiple_of(group))
             }
             LinearFormat::MxFp4 => extent.is_multiple_of(32),
+            LinearFormat::NvFp4 => extent.is_multiple_of(16),
             LinearFormat::GgufIQuant { ggml_type, .. } => ggml_type
                 .block_and_bytes()
                 .ok()

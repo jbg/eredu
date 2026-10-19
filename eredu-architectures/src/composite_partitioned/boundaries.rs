@@ -31,22 +31,20 @@ impl CompositeSequenceExtent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Schemas {
-    Fixed(BoundaryWireSchema),
-    AfterUnits(Vec<BoundaryWireSchema>),
+    Fixed(BoundaryWireSchema, CompositeSequenceExtent),
+    AfterUnits(Vec<(BoundaryWireSchema, CompositeSequenceExtent)>),
 }
 
 /// Exact schema for one semantic edge, including source-unit-dependent context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositePartitionBoundary {
     schemas: Schemas,
-    sequence: CompositeSequenceExtent,
 }
 impl CompositePartitionBoundary {
     /// Declares one unchanged schema for every owner of this edge.
     pub fn fixed(schema: BoundaryWireSchema, sequence: CompositeSequenceExtent) -> Self {
         Self {
-            schemas: Schemas::Fixed(schema),
-            sequence,
+            schemas: Schemas::Fixed(schema, sequence),
         }
     }
     /// Declares the context after each source unit, in architecture order.
@@ -55,12 +53,24 @@ impl CompositePartitionBoundary {
         schemas: Vec<BoundaryWireSchema>,
         sequence: CompositeSequenceExtent,
     ) -> Result<Self, String> {
-        if schemas.is_empty() {
+        Self::after_unit_geometry(
+            schemas
+                .into_iter()
+                .map(|schema| (schema, sequence))
+                .collect(),
+        )
+    }
+
+    /// Declares each source unit's schema and sequence bound together. Patch
+    /// pyramids can change both frame rate and activation width at a cut.
+    pub fn after_unit_geometry(
+        geometry: Vec<(BoundaryWireSchema, CompositeSequenceExtent)>,
+    ) -> Result<Self, String> {
+        if geometry.is_empty() {
             return Err("composite boundary has no source-unit schemas".into());
         }
         Ok(Self {
-            schemas: Schemas::AfterUnits(schemas),
-            sequence,
+            schemas: Schemas::AfterUnits(geometry),
         })
     }
 }
@@ -80,7 +90,16 @@ impl CompositePartitionBoundaries {
         destination_group: usize,
         boundary: CompositePartitionBoundary,
     ) -> Result<Self, String> {
-        boundary.sequence.resolve(1)?;
+        match &boundary.schemas {
+            Schemas::Fixed(_, sequence) => {
+                sequence.resolve(1)?;
+            }
+            Schemas::AfterUnits(geometry) => {
+                for (_, sequence) in geometry {
+                    sequence.resolve(1)?;
+                }
+            }
+        }
         if source_group != destination_group && matches!(boundary.schemas, Schemas::AfterUnits(_)) {
             return Err("source-unit schemas require an intra-group continuation".into());
         }
@@ -134,8 +153,8 @@ impl CompositePartitionBoundaries {
         let Some(boundary) = self.edges.get(&(source_group, destination_group)) else {
             return Ok(None);
         };
-        let schema = match &boundary.schemas {
-            Schemas::Fixed(schema) => schema,
+        let (schema, sequence) = match &boundary.schemas {
+            Schemas::Fixed(schema, sequence) => (schema, sequence),
             Schemas::AfterUnits(schemas) => {
                 let range = eredu_core::balanced_contiguous_range(
                     schemas.len(),
@@ -144,12 +163,13 @@ impl CompositePartitionBoundaries {
                     false,
                 )
                 .map_err(|error| error.to_string())?;
-                &schemas[range.end - 1]
+                let (schema, sequence) = &schemas[range.end - 1];
+                (schema, sequence)
             }
         };
         Ok(Some((
             schema.clone(),
-            boundary.sequence.resolve(maximum_decoder_sequence)?,
+            sequence.resolve(maximum_decoder_sequence)?,
         )))
     }
 }
@@ -178,13 +198,29 @@ pub(crate) fn from_config(
     let mut plan = CompositePartitionBoundaries::default();
     match config {
         CompositeConfig::NemotronLabsDiffusion(args) => {
-            let factor = args.spatial_merge_size.checked_mul(args.spatial_merge_size)
+            let factor = args
+                .spatial_merge_size
+                .checked_mul(args.spatial_merge_size)
                 .ok_or("image patch expansion overflows i32")?;
             let factor = i32::try_from(factor).map_err(|_| "image patch expansion exceeds i32")?;
-            for (source, destination, extent) in [(0, 0, DecoderMultiple(factor)), (0, 1, DecoderMultiple(factor)), (1, 2, Decoder)] {
-                plan = plan.with_boundary(source, destination, CompositePartitionBoundary::fixed(
-                    crate::nemotron_labs_diffusion::composite::group_boundary_schema(args, source, destination)
-                        .map_err(|error| error.to_string())?, extent))?;
+            for (source, destination, extent) in [
+                (0, 0, DecoderMultiple(factor)),
+                (0, 1, DecoderMultiple(factor)),
+                (1, 2, Decoder),
+            ] {
+                plan = plan.with_boundary(
+                    source,
+                    destination,
+                    CompositePartitionBoundary::fixed(
+                        crate::nemotron_labs_diffusion::composite::group_boundary_schema(
+                            args,
+                            source,
+                            destination,
+                        )
+                        .map_err(|error| error.to_string())?,
+                        extent,
+                    ),
+                )?;
             }
         }
         CompositeConfig::Diffusion(args) => {
@@ -226,6 +262,27 @@ pub(crate) fn from_config(
             }
         }
         CompositeConfig::Muse(args) => {
+            if let Some(audio) = &args.audio_config {
+                let mut factor = audio.samples_per_token().map_err(|error| error.to_string())?;
+                let mut width = 1;
+                let mut geometry = Vec::new();
+                let schema = |width, continuation| BoundaryWireSchema::new(
+                    if continuation {"muse.audio_continuation"} else {"muse.audio_to_decoder"},
+                    BoundaryTensorSpec::new("hidden", [Dim::Batch, Dim::Sequence, Dim::Fixed(width)], Dtype::Activation), [],
+                ).map_err(|error| error.to_string());
+                for kind in audio.execution_units().map_err(|error| error.to_string())? {
+                    match kind {
+                        crate::muse::AudioUnitKind::Patch {stage} => {
+                            factor /= audio.patch_sizes[stage]; width = audio.hidden_sizes[stage];
+                        },
+                        crate::muse::AudioUnitKind::Projection => width = audio.out_hidden_size,
+                        crate::muse::AudioUnitKind::Convolution {..} => {},
+                    }
+                    geometry.push((schema(width, true)?, DecoderMultiple(factor)));
+                }
+                plan = plan.with_boundary(2, 2, CompositePartitionBoundary::after_unit_geometry(geometry)?)?
+                    .with_boundary(2, 1, CompositePartitionBoundary::fixed(schema(args.hidden_size, false)?, Decoder))?;
+            }
             if let Some(vision) = &args.vision_config {
                 let factor = vision
                     .merge_size
@@ -234,11 +291,9 @@ pub(crate) fn from_config(
                 for (destination, continuation, sequence) in
                     [(0, true, DecoderMultiple(factor)), (1, false, Decoder)]
                 {
-                    let schema = crate::muse_glimmer::model::vision_partition_boundary_schema(
-                        args,
-                        continuation,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let schema =
+                        crate::muse::model::vision_partition_boundary_schema(args, continuation)
+                            .map_err(|error| error.to_string())?;
                     plan = plan.with_boundary(
                         0,
                         destination,
@@ -492,6 +547,37 @@ mod tests {
     }
 
     #[test]
+    fn pyramid_cuts_resolve_both_frame_reduction_and_width_from_the_producing_unit() {
+        let (graph, units) = graph();
+        let geometry = [(12, 4), (12, 4), (4, 8), (4, 8), (1, 16)]
+            .into_iter()
+            .map(|(factor, width)| {
+                Ok((
+                    hidden(width, false)?,
+                    CompositeSequenceExtent::DecoderMultiple(factor),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .unwrap();
+        let boundaries = CompositePartitionBoundaries::default()
+            .with_boundary(
+                1,
+                1,
+                CompositePartitionBoundary::after_unit_geometry(geometry).unwrap(),
+            )
+            .unwrap();
+        boundaries.validate(&graph, &units).unwrap();
+        // Five units across three stages produce cuts after units 2,4,5.
+        for (rank, expected) in [[2, 84, 4], [2, 28, 8], [2, 7, 16]].into_iter().enumerate() {
+            let (schema, sequence) = boundaries.resolve(1, 1, rank, 3, 7).unwrap().unwrap();
+            assert_eq!(
+                schema.resolve(2, sequence).unwrap().primary().shape(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn inkling_retains_only_executable_vision_cuts_and_no_static_audio_continuation() {
         let args = crate::inkling::ModelArgs::from_hf_json(
             br#"{"text_config":{"hidden_size":16,"num_hidden_layers":1,"vocab_size":32,
@@ -522,5 +608,24 @@ mod tests {
             schema.resolve(1, extent).unwrap().primary().shape(),
             [1, 8, 512]
         );
+    }
+
+    #[test]
+    fn muse_released_audio_cut_retains_reduced_frames_and_replicated_width() {
+        let args = crate::muse::DecoderConfig::from_hf_json(include_bytes!(
+            "../../../validation/fixtures/muse-spark/bf16-config.json"
+        )).unwrap();
+        let graph = crate::muse::graph::execution_graph(&args).unwrap();
+        let units = ExecutionUnitLayout::new(&graph, [50, 62, 13]).unwrap();
+        let boundaries = from_config(&crate::replicated_text::CompositeConfig::Muse(&args)).unwrap();
+        boundaries.validate(&graph, &units).unwrap();
+        // TP replicas retain full audio widths. A PP2 cut after unit seven is
+        // the third patch projection: 1,920 / (16*6*5) = 4 internal frames/token.
+        let (schema, sequence) = boundaries.resolve(2, 2, 0, 2, 9).unwrap().unwrap();
+        assert_eq!(schema.resolve(2, sequence).unwrap().primary().shape(), [2, 36, 1024]);
+        let (schema, sequence) = boundaries.resolve(2, 2, 1, 2, 9).unwrap().unwrap();
+        assert_eq!(schema.resolve(2, sequence).unwrap().primary().shape(), [2, 9, 8192]);
+        let (schema, sequence) = boundaries.resolve(2, 1, 1, 2, 9).unwrap().unwrap();
+        assert_eq!(schema.resolve(2, sequence).unwrap().primary().shape(), [2, 9, 8192]);
     }
 }

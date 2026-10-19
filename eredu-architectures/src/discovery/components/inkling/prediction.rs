@@ -307,6 +307,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, args: &crate::inkling::Mode
                 effective_output: format!("{hooks}.fusion.output.effective"),
             },
             readout: ComponentReadoutEquation {
+                residual_cycles: vec![],
                 block_transforms: vec![],
                 stream_residual: None,
                 score_writes: Vec::new(),

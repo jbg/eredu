@@ -45,22 +45,41 @@ where
                 draft_adapter |= speculation.request().draft_adapter;
             }
             scheduler.lookahead_blocks = scheduler.lookahead_blocks.max(options.lookahead_blocks);
-            scheduler.max_optimistic_branches = scheduler.max_optimistic_branches.max(options.max_optimistic_branches);
-            scheduler.max_in_flight_verifications = scheduler.max_in_flight_verifications.max(options.max_in_flight_verifications);
+            scheduler.max_optimistic_branches = scheduler
+                .max_optimistic_branches
+                .max(options.max_optimistic_branches);
+            scheduler.max_in_flight_verifications = scheduler
+                .max_in_flight_verifications
+                .max(options.max_in_flight_verifications);
         }
         if width > mechanism.proposal_capacity {
             return Err(unsupported(
                 "configured proposals exceed the selected mechanism capacity",
             ));
         }
-        let refinement_active = policies.iter().any(|(mode, _)| matches!(mode, eredu_core::decoding::DecodingMode::Diffusion { .. }));
+        let refinement_active = policies
+            .iter()
+            .any(|(mode, _)| matches!(mode, eredu_core::decoding::DecodingMode::Diffusion { .. }));
         let mut refinement_plan = if refinement_active {
-            Some(mechanism.refinement.as_ref().ok_or_else(|| unsupported("retained refinement geometry is unavailable"))?.clone())
-        } else { None };
+            Some(
+                mechanism
+                    .refinement
+                    .as_ref()
+                    .ok_or_else(|| unsupported("retained refinement geometry is unavailable"))?
+                    .clone(),
+            )
+        } else {
+            None
+        };
         if let Some(refinement) = &mut refinement_plan {
             for (mode, _) in &policies {
-                if let eredu_core::decoding::DecodingMode::Diffusion { policy: Some(policy) } = mode {
-                    refinement.stability_history = refinement.stability_history.max(policy.stability_history_length());
+                if let eredu_core::decoding::DecodingMode::Diffusion {
+                    policy: Some(policy),
+                } = mode
+                {
+                    refinement.stability_history = refinement
+                        .stability_history
+                        .max(policy.stability_history_length());
                 }
             }
         }
@@ -69,8 +88,13 @@ where
             .max(request.forecast_mode_settlement_positions());
         if additional_tokens > 0 {
             if let Some(refinement) = refinement {
-                extra = extra.max(additional_tokens.checked_add(u64::from(refinement.canvas_positions.get()))
-                    .ok_or(eredu_core::CapabilityError::ArithmeticOverflow { operation: "refinement continuation canvas" })?);
+                extra = extra.max(
+                    additional_tokens
+                        .checked_add(u64::from(refinement.canvas_positions.get()))
+                        .ok_or(eredu_core::CapabilityError::ArithmeticOverflow {
+                            operation: "refinement continuation canvas",
+                        })?,
+                );
             }
         }
         let native = request
@@ -114,6 +138,7 @@ where
                 0,
                 eredu_core::PrefillChunkPolicy::Unchunked,
                 ForecastExecutionContract {
+                    input_retention: crate::memory_forecast::PrefillInputRetention::TokenIds,
                     full_pass_reason: None,
                     logits: LogitsWorkspace::EveryPosition,
                 },
@@ -135,38 +160,89 @@ where
             Ok((request, plan))
         };
         let (mut target, target_state) = model(target_profile.clone(), native.target)?;
-        let (draft, draft_state, mut embedded, embedded_state) = match (
-            &mechanism.draft,
-            &mechanism.embedded,
-            native.draft,
-            native.embedded,
-        ) {
-            (Some(profile), None, Some(observation), None) => {
-                let (draft, state) = model(profile.clone(), observation)?;
-                (Some(draft), Some(state), None, None)
+        let mut conditioned_plan = None;
+        let (draft, draft_state, mut embedded, embedded_state) = if let Some(profile) =
+            &mechanism.conditioned
+        {
+            let observation = native.draft.ok_or_else(|| {
+                unsupported("installed conditioned context observations are unavailable")
+            })?;
+            if native.embedded.is_some()
+                || observation.current_positions != target_state.current_positions
+            {
+                return Err(unsupported(
+                    "conditioned context observations do not cover the installed target frontier",
+                ));
             }
-            (None, Some(topology), None, Some(observation)) => {
-                let prediction = EmbeddedPredictionMemoryPlan::from_topology(
-                    topology,
-                    &target,
-                    &options.calibration,
-                )?;
-                let (_, _, prefix_features) =
-                    prediction.costs(&target, target_state.current_positions, 0, false)?;
-                let state = EmbeddedContinuationMemoryPlan {
+            let current_positions = observation.current_positions;
+            let current_state = allowance(
+                observation.current_state_bytes,
+                "installed projected conditioned context and descriptor allowance",
+            );
+            let peak_state = allowance(observation.peak_state_bytes,
+                "future native conditioned buffer capacity is unavailable; logical context growth is accounted separately");
+            let refreshed = ConditionedAssistantMemoryProfile {
+                topology: profile.topology.clone(),
+                parameters: eredu_core::speculative::SpeculativeParameterMemoryObservation {
+                    parameters: observation.parameters,
+                    parameter_conversions: observation.parameter_conversions,
+                    available: observation.available,
+                    allocator_cache_limit: observation.allocator_cache_limit,
+                },
+                host_execution: profile.host_execution,
+                residency: profile.residency.clone(),
+                parameter_bounds: profile.parameter_bounds.clone(),
+                parameter_loading: profile.parameter_loading.clone(),
+                native_workspace: profile.native_workspace.clone(),
+            };
+            let (draft, selected) = refreshed.into_request(
+                eredu_core::InputTokenCount::text(current_positions),
+                extra,
+                options,
+            )?;
+            let state = ContinuationMemoryPlan {
+                current_positions,
+                additional_input_tokens: extra,
+                query_tokens: selected.topology.body.block_positions,
+                current_state,
+                peak_state,
+            };
+            conditioned_plan = Some(selected);
+            (Some(draft), Some(state), None, None)
+        } else {
+            match (
+                &mechanism.draft,
+                &mechanism.embedded,
+                native.draft,
+                native.embedded,
+            ) {
+                (Some(profile), None, Some(observation), None) => {
+                    let (draft, state) = model(profile.clone(), observation)?;
+                    (Some(draft), Some(state), None, None)
+                }
+                (None, Some(topology), None, Some(observation)) => {
+                    let prediction = EmbeddedPredictionMemoryPlan::from_topology(
+                        topology,
+                        &target,
+                        &options.calibration,
+                    )?;
+                    let (_, _, prefix_features) =
+                        prediction.costs(&target, target_state.current_positions, 0, false)?;
+                    let state = EmbeddedContinuationMemoryPlan {
                     layer_positions: observation.prediction.layer_positions,
                     additional_input_tokens: extra,
                     current_state: allowance(observation.prediction.current_state_bytes, "installed prediction state and native backing-capacity allowance"),
                     peak_state: allowance(observation.prediction.peak_state_bytes, "prediction native horizon capacity including speculative overshoot and interior peaks"),
                     retained_features: allowance(observation.retained_feature_bytes, "retained target capture descriptor/copy allowance").add(&prefix_features)?,
                 };
-                (None, None, Some(prediction), Some(state))
-            }
-            (None, None, None, None) => (None, None, None, None),
-            _ => {
-                return Err(unsupported(
-                    "settled observations do not match the selected speculative mechanism",
-                ))
+                    (None, None, Some(prediction), Some(state))
+                }
+                (None, None, None, None) => (None, None, None, None),
+                _ => {
+                    return Err(unsupported(
+                        "settled observations do not match the selected speculative mechanism",
+                    ))
+                }
             }
         };
         let conversion_assumptions = if let Some(prediction) = &mut embedded {
@@ -207,10 +283,19 @@ where
         let seed = allowance(
             native.seed_bytes,
             "currently retained assistant seed snapshot",
-        ).add(&allowance(request.retained_next_scores_estimate(self.scheduler.executor).map(|estimate| estimate.retained_bytes),
-            "settled next-target score row retained across the mode boundary"))?
-            .add(&allowance(request.retained_refinement_estimate(self.scheduler.executor).map(|estimate| estimate.retained_bytes),
-                "tentative position rows and complete refinement commitment cursor"))?;
+        )
+        .add(&allowance(
+            request
+                .retained_next_scores_estimate(self.scheduler.executor)
+                .map(|estimate| estimate.retained_bytes),
+            "settled next-target score row retained across the mode boundary",
+        ))?
+        .add(&allowance(
+            request
+                .retained_refinement_estimate(self.scheduler.executor)
+                .map(|estimate| estimate.retained_bytes),
+            "tentative position rows and complete refinement commitment cursor",
+        ))?;
         let seed = embedded_state
             .as_ref()
             .map_or(seed.clone(), |state| seed.maximum(&state.current_state));
@@ -226,9 +311,12 @@ where
         };
         let mut shared_backbone = mechanism.shared_backbone.clone();
         if !draft_adapter {
-            if let Some(shared) = &mut shared_backbone { shared.adapter = None; }
+            if let Some(shared) = &mut shared_backbone {
+                shared.adapter = None;
+            }
         }
         let speculative = SpeculativeMemoryPlan {
+            conditioned: conditioned_plan,
             shared_backbone,
             embedded,
             draft,
@@ -251,17 +339,31 @@ where
             let mut refinement_request = target.clone();
             refinement_request.forecast_output_tokens = additional_tokens;
             refinement_request.max_output_tokens = Some(additional_tokens);
-            if request.has_tentative_refinement() && request.forecast_mode_settlement_positions() > 0 {
-                refinement_request.forecast_output_tokens = refinement_request.forecast_output_tokens.max(1);
+            if request.has_tentative_refinement()
+                && request.forecast_mode_settlement_positions() > 0
+            {
+                refinement_request.forecast_output_tokens =
+                    refinement_request.forecast_output_tokens.max(1);
                 refinement_request.max_output_tokens = Some(additional_tokens.max(1));
             }
 
             for pool in &mut refinement_request.domains {
-                pool.retained_input = pool.retained_input.add(&continuation.seed)?
-                    .add(&continuation.host_retention)?.add(&continuation.retained_snapshots)?;
+                pool.retained_input = pool
+                    .retained_input
+                    .add(&continuation.seed)?
+                    .add(&continuation.host_retention)?
+                    .add(&continuation.retained_snapshots)?;
             }
-            let refined = estimate_refinement_continuation_memory(&refinement_request, refinement, &continuation.target)?;
-            crate::memory_forecast::merge_decoding_phase_estimate(&mut estimate, refined, &refinement_request)?;
+            let refined = estimate_refinement_continuation_memory(
+                &refinement_request,
+                refinement,
+                &continuation.target,
+            )?;
+            crate::memory_forecast::merge_decoding_phase_estimate(
+                &mut estimate,
+                refined,
+                &refinement_request,
+            )?;
         }
         estimate.assumptions.extend(conversion_assumptions);
         if policies.len() > 1 {

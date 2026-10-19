@@ -14,7 +14,7 @@ use eredu_checkpoint::{
 };
 use eredu_core::{
     artifact::{
-        ArtifactError, ArtifactFile, ArtifactIdentity, DeferredArtifactIdentity, GgufCompanionRole,
+        ArtifactError, ArtifactFile, ArtifactIdentity, DeferredArtifactIdentity, ArtifactCompanionRole,
     },
     ArtifactFormat, ModelArtifact, ModelPreparationPlan,
 };
@@ -38,8 +38,8 @@ enum MediaProjectorSourcePolicy {
 pub struct PreparedSourceResolutions {
     primary: ResolvedCheckpointPlan,
     target: ResolvedCheckpointPlan,
-    companions: BTreeMap<GgufCompanionRole, ResolvedCheckpointPlan>,
-    target_companions: BTreeMap<GgufCompanionRole, ResolvedCheckpointPlan>,
+    companions: BTreeMap<ArtifactCompanionRole, ResolvedCheckpointPlan>,
+    target_companions: BTreeMap<ArtifactCompanionRole, ResolvedCheckpointPlan>,
 }
 
 impl PreparedSourceResolutions {
@@ -54,26 +54,26 @@ impl PreparedSourceResolutions {
     }
 
     /// Contract used to construct one separately admitted companion source.
-    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&ResolvedCheckpointPlan> {
+    pub fn companion(&self, role: &ArtifactCompanionRole) -> Option<&ResolvedCheckpointPlan> {
         self.companions.get(role)
     }
 
     /// All companion contracts in deterministic semantic-role order.
     pub fn companions(
         &self,
-    ) -> impl Iterator<Item = (&GgufCompanionRole, &ResolvedCheckpointPlan)> {
+    ) -> impl Iterator<Item = (&ArtifactCompanionRole, &ResolvedCheckpointPlan)> {
         self.companions.iter()
     }
 
     /// Companion contract that is an explicit member of the target graph.
-    pub fn target_companion(&self, role: &GgufCompanionRole) -> Option<&ResolvedCheckpointPlan> {
+    pub fn target_companion(&self, role: &ArtifactCompanionRole) -> Option<&ResolvedCheckpointPlan> {
         self.target_companions.get(role)
     }
 
     /// All companion contracts consumed by the exact target graph.
     pub fn target_companions(
         &self,
-    ) -> impl Iterator<Item = (&GgufCompanionRole, &ResolvedCheckpointPlan)> {
+    ) -> impl Iterator<Item = (&ArtifactCompanionRole, &ResolvedCheckpointPlan)> {
         self.target_companions.iter()
     }
 }
@@ -98,10 +98,11 @@ pub struct PreparedModelSourceGraph {
     prediction_extension: Option<PredictionExtensionPlan>,
     pub(crate) prediction_placement: crate::prediction_extension::PredictionPlacementSlot,
     primary: SharedCheckpointSource,
-    companions: BTreeMap<GgufCompanionRole, SharedCheckpointSource>,
+    companions: BTreeMap<ArtifactCompanionRole, SharedCheckpointSource>,
     complete: SharedCheckpointSource,
     target: SharedCheckpointSource,
     extension: Option<SharedCheckpointSource>,
+    media: BTreeMap<crate::artifact_preparation::ArtifactSourceRole, SharedCheckpointSource>,
     resolutions: PreparedSourceResolutions,
     source_metadata: BTreeMap<String, TensorMetadata>,
     retained_construction: Option<crate::prepared_execution::RetainedArchitectureConstruction>,
@@ -116,6 +117,7 @@ pub struct PreparedModelDiscovery {
     execution_identity: String,
     descriptor: eredu_core::ArchitectureDescriptor,
     partition_selection: Option<crate::SelectedExecution>,
+    target_static: Result<Option<crate::external_assistant::TargetStaticDescription>, String>,
     partition_parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
     partition_parameter_index: Option<Arc<crate::parameter_partition::ParameterMemberIndex>>,
     partition_hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
@@ -134,6 +136,21 @@ struct PreparedPredictionDiscovery {
 }
 
 impl PreparedModelDiscovery {
+    /// Exact tensor group and complete manifest retained by this target discovery.
+    /// Native binding validates the manifest before borrowing the realized group.
+    pub fn tensor_parallel_communication(
+        &self,
+    ) -> Option<(
+        eredu_core::CollectiveGroupId,
+        &eredu_runtime::CommunicationManifest,
+    )> {
+        let selected = self.partition_selection.as_ref()?;
+        Some((
+            selected.partitioned_tensor_group()?,
+            selected.communication_manifest()?,
+        ))
+    }
+
     /// Retained selected geometry for loaded request forecasts; never resolves source identity.
     pub fn generation_memory(
         &self,
@@ -347,6 +364,60 @@ impl PreparedModelDiscovery {
             )
         })?;
         selected.component_partition_layouts(&self.descriptor, parameters, max_ranks)
+    }
+
+    pub(crate) fn static_partition_selection(&self) -> Option<&crate::SelectedExecution> {
+        self.partition_selection.as_ref()
+    }
+
+    /// Selects authoritative static sources using the exact constructed parameter
+    /// coordinates. No payload, source identity hash, device or tensor is read.
+    pub fn prepare_target_static_placement(
+        &self,
+        kind: crate::composite_execution::ExternalPredictionTargetOperationKind,
+    ) -> Result<Option<crate::external_assistant::PreparedTargetStaticPlacement>, eredu_nn::Error>
+    {
+        if self.partition_selection.is_none() {
+            return Ok(None);
+        }
+        let description = self
+            .target_static
+            .as_ref()
+            .map_err(eredu_nn::Error::backend)?;
+        description
+            .as_ref()
+            .map(|description| {
+                crate::external_assistant::PreparedTargetStaticPlacement::prepare(
+                    self,
+                    description,
+                    kind,
+                )
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Prepares complete decoder-hidden capture producers from retained selection
+    /// and parameter ownership. No artifact identity, source or native value is read.
+    /// Direct sessions return no transport declaration.
+    pub fn prepare_target_capture_placement(
+        &self,
+        paths: &[String],
+    ) -> Result<
+        Option<crate::external_assistant::PreparedTargetCapturePlacement>,
+        crate::component_partition::ComponentPartitionError,
+    > {
+        let Some(selected) = &self.partition_selection else {
+            return Ok(None);
+        };
+        crate::external_assistant::PreparedTargetCapturePlacement::prepare(
+            selected,
+            &self.descriptor,
+            &self.execution_identity,
+            paths,
+            |maximum_ranks| self.component_partition_layouts(maximum_ranks),
+        )
+        .map(Some)
     }
 
     /// Combines target ownership with the actual prepared prediction modules.
@@ -691,6 +762,7 @@ impl PreparedModelSources {
                 .execution()
                 .parallel_topology()
                 .map(|_| self.selected().execution().clone()),
+            target_static: crate::external_assistant::TargetStaticDescription::from_plan(self.architecture()),
             partition_parameters: None,
             partition_parameter_index: None,
             partition_hooks: None,
@@ -789,14 +861,14 @@ impl PreparedModelSources {
     }
 
     /// Separately stored source for one architecture-declared semantic role.
-    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&SharedCheckpointSource> {
+    pub fn companion(&self, role: &ArtifactCompanionRole) -> Option<&SharedCheckpointSource> {
         self.graph.companion(role)
     }
 
     /// Separately stored companions in deterministic semantic-role order.
     pub fn companions(
         &self,
-    ) -> impl Iterator<Item = (&GgufCompanionRole, &SharedCheckpointSource)> {
+    ) -> impl Iterator<Item = (&ArtifactCompanionRole, &SharedCheckpointSource)> {
         self.graph.companions()
     }
 
@@ -813,6 +885,12 @@ impl PreparedModelSources {
     /// Explicit extension-only projection, when embedded prediction was selected.
     pub fn extension(&self) -> Option<&SharedCheckpointSource> {
         self.graph.extension()
+    }
+
+    /// Exact tower/projector view for the selected modality, sharing its already
+    /// opened physical artifacts with every other role.
+    pub fn media_source(&self, modality: eredu_core::InputModality) -> Option<&SharedCheckpointSource> {
+        self.graph.media_source(modality)
     }
 
     /// Exact resolved contracts used to build and project this source graph.
@@ -865,14 +943,14 @@ impl PreparedModelSourceGraph {
     }
 
     /// Separately stored source for one architecture-declared semantic role.
-    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&SharedCheckpointSource> {
+    pub fn companion(&self, role: &ArtifactCompanionRole) -> Option<&SharedCheckpointSource> {
         self.companions.get(role)
     }
 
     /// Separately stored companions in deterministic semantic-role order.
     pub fn companions(
         &self,
-    ) -> impl Iterator<Item = (&GgufCompanionRole, &SharedCheckpointSource)> {
+    ) -> impl Iterator<Item = (&ArtifactCompanionRole, &SharedCheckpointSource)> {
         self.companions.iter()
     }
 
@@ -889,6 +967,18 @@ impl PreparedModelSourceGraph {
     /// Explicit extension-only projection, when embedded prediction was selected.
     pub fn extension(&self) -> Option<&SharedCheckpointSource> {
         self.extension.as_ref()
+    }
+
+    /// Independently projected vision or audio parameters. A missing view does
+    /// not prevent text execution and cannot authorize opening another artifact.
+    pub fn media_source(&self, modality: eredu_core::InputModality) -> Option<&SharedCheckpointSource> {
+        use crate::artifact_preparation::ArtifactSourceRole;
+        let role = match modality {
+            eredu_core::InputModality::Image | eredu_core::InputModality::Video => ArtifactSourceRole::Vision,
+            eredu_core::InputModality::Audio => ArtifactSourceRole::Audio,
+            _ => return None,
+        };
+        self.media.get(&role)
     }
 
     /// Exact resolved contracts used to build and project this source graph.
@@ -1093,7 +1183,7 @@ fn retained_source_declarations(
         declarations.roles.remove(&ArtifactSourceRole::Vision);
     }
     if let Some(prediction) = selected.prediction_source() {
-        let id = PhysicalArtifactId::Companion(GgufCompanionRole::Named("prediction".into()));
+        let id = PhysicalArtifactId::Companion(ArtifactCompanionRole::Named("prediction".into()));
         let artifact = prediction.artifact_declaration()?;
         declarations.roles.insert(
             ArtifactSourceRole::Prediction,
@@ -1129,11 +1219,14 @@ fn prepare_retained_qwen4_sources(
         _ => unreachable!("validated artifact"),
     };
     let vision = bound.roles.remove(&ArtifactSourceRole::Vision);
+    let mut media = BTreeMap::new();
+    if let Some(source) = &vision { media.insert(ArtifactSourceRole::Vision, source.clone()); }
+    if let Some(source) = bound.roles.remove(&ArtifactSourceRole::Audio) { media.insert(ArtifactSourceRole::Audio, source); }
     let mut companions = bound
         .physical
         .iter()
         .filter_map(|(id, source)| match id {
-            PhysicalArtifactId::Companion(role) if *role == GgufCompanionRole::MediaProjector => {
+            PhysicalArtifactId::Companion(role) if *role == ArtifactCompanionRole::MediaProjector => {
                 Some((role.clone(), source.clone()))
             }
             _ => None,
@@ -1143,7 +1236,7 @@ fn prepare_retained_qwen4_sources(
         .artifacts()
         .iter()
         .filter_map(|(id, artifact)| match id {
-            PhysicalArtifactId::Companion(role) if *role == GgufCompanionRole::MediaProjector => {
+            PhysicalArtifactId::Companion(role) if *role == ArtifactCompanionRole::MediaProjector => {
                 Some((role.clone(), artifact.resolution().clone()))
             }
             _ => None,
@@ -1160,7 +1253,7 @@ fn prepare_retained_qwen4_sources(
         .roles
         .remove(&ArtifactSourceRole::Prediction)
         .map(|source| {
-            let role = PhysicalArtifactId::Companion(GgufCompanionRole::Named("prediction".into()));
+            let role = PhysicalArtifactId::Companion(ArtifactCompanionRole::Named("prediction".into()));
             (source, declarations.artifacts()[&role].resolution().clone())
         });
     use crate::prepared_execution::RetainedArchitectureConstruction;
@@ -1268,7 +1361,7 @@ fn prepare_retained_qwen4_sources(
     };
     let target_companions = companion_resolutions.clone();
     if let Some((source, resolution)) = prediction {
-        let role = GgufCompanionRole::Named("prediction".into());
+        let role = ArtifactCompanionRole::Named("prediction".into());
         companions.insert(role.clone(), source);
         companion_resolutions.insert(role, resolution);
     }
@@ -1285,6 +1378,7 @@ fn prepare_retained_qwen4_sources(
         target,
         complete,
         extension,
+        media,
         resolutions: PreparedSourceResolutions {
             primary: resolution.clone(),
             target: target_resolution,
@@ -1312,8 +1406,8 @@ fn source_graph_identity(
             files.extend(validated.checkpoint().shards().iter().map(|shard| ArtifactFile::new(format!("primary/split/{:05}", shard.split_no()), shard.path())));
             for (role, companion) in validated.companions() {
                 let role = match role {
-                    GgufCompanionRole::MediaProjector => "media-projector".to_owned(),
-                    GgufCompanionRole::Named(name) => format!("named/{name}"),
+                    ArtifactCompanionRole::MediaProjector => "media-projector".to_owned(),
+                    ArtifactCompanionRole::Named(name) => format!("named/{name}"),
                     _ => return Err(ArtifactError::InvalidArtifact("unsupported GGUF companion role in source identity".into())),
                 };
                 files.extend(companion.checkpoint().shards().iter().map(|shard| ArtifactFile::new(format!("companion/{role}/split/{:05}", shard.split_no()), shard.path())));
@@ -1326,8 +1420,15 @@ fn source_graph_identity(
         adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?;
         files.extend(adapter.files());
     }
+    for source in inspection.architecture_plan().media_companions() {
+        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+        files.extend(source.files().iter().cloned());
+    }
     let identity = DeferredArtifactIdentity::filesystem(execution_identity, files)?;
     if let Some(adapter) = inspection.architecture_plan().draft_adapter() { adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?; }
+    for source in inspection.architecture_plan().media_companions() {
+        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+    }
     Ok(identity)
 }
 
@@ -1347,15 +1448,21 @@ fn prepare_ordinary_sources(
         && declarations
             .artifacts()
             .contains_key(&PhysicalArtifactId::Companion(
-                GgufCompanionRole::MediaProjector,
+                ArtifactCompanionRole::MediaProjector,
             ))
     {
         return Err(PreparedModelSourcesError::InvalidSelection(
             "selected execution cannot consume the admitted GGUF media projector".into(),
         ));
     }
+    for source in architecture.media_companions() {
+        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+    }
     let mut bound = declarations.bind(cache)?;
     if let Some(adapter) = architecture.draft_adapter() { adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?; }
+    for source in architecture.media_companions() {
+        source.verify_unchanged().map_err(|e| ArtifactError::InvalidArtifact(e.to_string()))?;
+    }
     let primary = bound
         .physical
         .remove(&PhysicalArtifactId::Primary)
@@ -1368,18 +1475,18 @@ fn prepare_ordinary_sources(
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    let complete: SharedCheckpointSource = if companions.is_empty() {
-        primary.clone()
-    } else {
-        Arc::new(CompositeCheckpointSource::new(
-            std::iter::once(primary.clone()).chain(companions.values().cloned()),
-        )?)
-    };
     let target = bound
         .roles
         .remove(&ArtifactSourceRole::Target)
         .expect("target declaration");
     let extension = bound.roles.remove(&ArtifactSourceRole::Prediction);
+    let complete: SharedCheckpointSource = match &extension {
+        None => target.clone(),
+        Some(extension) => Arc::new(CompositeCheckpointSource::new([target.clone(), extension.clone()])?),
+    };
+    let media = [ArtifactSourceRole::Vision, ArtifactSourceRole::Audio].into_iter()
+        .filter_map(|role| bound.roles.remove(&role).map(|source| (role, source)))
+        .collect();
     let primary_resolution = declarations.artifacts()[&PhysicalArtifactId::Primary]
         .resolution()
         .clone();
@@ -1411,6 +1518,7 @@ fn prepare_ordinary_sources(
         complete,
         target,
         extension,
+        media,
         resolutions: PreparedSourceResolutions {
             primary: primary_resolution,
             target: target_resolution,
@@ -1794,7 +1902,7 @@ mod tests {
         .unwrap();
         let sources = prepare_model_sources(plan, selected).unwrap();
 
-        let role = GgufCompanionRole::MediaProjector;
+        let role = ArtifactCompanionRole::MediaProjector;
         let primary = sources.primary().source_keys();
         let companion = sources.companion(&role).unwrap().source_keys();
         let complete = sources.complete().source_keys();

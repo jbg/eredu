@@ -786,6 +786,53 @@ where
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)
             .map_err(LoadedModelLoadError::Artifact)?;
+        Self::load_inspected_execution_plan_with_text_options(
+            factory,
+            inspection,
+            plan,
+            text_options,
+        )
+    }
+
+    /// Realizes a plan using the exact artifact inspection retained by the planner.
+    /// Use [`Self::load_inspected_execution_plan_with_text_options`] to override
+    /// the checkpoint chat template.
+    pub fn load_inspected_execution_plan<F>(
+        factory: &F,
+        inspection: eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        plan: &eredu_core::ExecutionPlan,
+    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
+    where
+        F: eredu_core::ExecutionPlanBackendFactory<
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
+    {
+        Self::load_inspected_execution_plan_with_text_options(
+            factory,
+            inspection,
+            plan,
+            TextModelOptions::default(),
+        )
+    }
+
+    /// Realizes a retained artifact inspection with facade-owned text overrides.
+    pub fn load_inspected_execution_plan_with_text_options<F>(
+        factory: &F,
+        inspection: eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        plan: &eredu_core::ExecutionPlan,
+        text_options: TextModelOptions,
+    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
+    where
+        F: eredu_core::ExecutionPlanBackendFactory<
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
+    {
         super::PreparedTextModel::from_artifact(inspection, text_options)?
             .select_execution_plan(factory, plan)?
             .load()

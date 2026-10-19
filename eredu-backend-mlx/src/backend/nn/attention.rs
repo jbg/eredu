@@ -31,8 +31,10 @@ pub(crate) fn memory_path(
     if !softcap && arithmetic == eredu_nn::AttentionArithmetic::Fused {
         return AttentionMemoryPath::Fused;
     }
-    if arithmetic == eredu_nn::AttentionArithmetic::InputScores
-        && queries.saturating_mul(keys) > INPUT_SCORE_WORKSPACE.score_tile_elements
+    if matches!(
+        arithmetic,
+        eredu_nn::AttentionArithmetic::InputScores | eredu_nn::AttentionArithmetic::Float32
+    ) && queries.saturating_mul(keys) > INPUT_SCORE_WORKSPACE.score_tile_elements
     {
         if keys > INPUT_SCORE_WORKSPACE.score_tile_elements {
             AttentionMemoryPath::KeyTiles
@@ -70,6 +72,28 @@ pub fn apply_rotary_embeddings(
     sin: &Array,
     dimensions: i32,
     traditional: bool,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    apply_rotary_embeddings_with_arithmetic(
+        value,
+        cos,
+        sin,
+        dimensions,
+        traditional,
+        eredu_nn::RotaryArithmetic::InputProducts,
+        stream,
+    )
+}
+
+/// Applies explicit rotary tables with the declared product-rounding boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_rotary_embeddings_with_arithmetic(
+    value: &Array,
+    cos: &Array,
+    sin: &Array,
+    dimensions: i32,
+    traditional: bool,
+    arithmetic: eredu_nn::RotaryArithmetic,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     if value.shape().len() != 4
@@ -126,9 +150,16 @@ pub fn apply_rotary_embeddings(
             concatenate_axis(&[embedding.clone(), embedding], -1, stream)
         }
     };
-    let cos = canonical(cos)?;
-    let sin = canonical(sin)?;
-    let prefix = value.try_index_device((.., .., .., ..dimensions), stream)?;
+    let work_type = if arithmetic == eredu_nn::RotaryArithmetic::InputTableFloat32Products {
+        Dtype::Float32
+    } else {
+        value.dtype()
+    };
+    let cos = canonical(cos)?.as_dtype(work_type, stream)?;
+    let sin = canonical(sin)?.as_dtype(work_type, stream)?;
+    let prefix = value
+        .try_index_device((.., .., .., ..dimensions), stream)?
+        .as_dtype(work_type, stream)?;
     let rotated = if traditional {
         let pairs = prefix.reshape(&[value.dim(0), value.dim(1), value.dim(2), half, 2], stream)?;
         let first = pairs.try_index_device((.., .., .., .., 0), stream)?;
@@ -149,7 +180,8 @@ pub fn apply_rotary_embeddings(
     };
     let output = prefix
         .multiply(&cos, stream)?
-        .add(rotated.multiply(&sin, stream)?, stream)?;
+        .add(rotated.multiply(&sin, stream)?, stream)?
+        .as_dtype(value.dtype(), stream)?;
     if dimensions == value.dim(-1) {
         Ok(output)
     } else {
@@ -336,14 +368,47 @@ pub fn attention_with_softcap(
     arithmetic: eredu_nn::AttentionArithmetic,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    if arithmetic == eredu_nn::AttentionArithmetic::Float32 {
+        let output_type = Dtype::from_promoting_types(
+            Dtype::from_promoting_types(queries.dtype(), keys.dtype()),
+            values.dtype(),
+        );
+        let sinks = sinks
+            .map(|value| value.as_dtype(Dtype::Float32, stream))
+            .transpose()?;
+        return attention_with_softcap(
+            &queries.as_dtype(Dtype::Float32, stream)?,
+            &keys.as_dtype(Dtype::Float32, stream)?,
+            &values.as_dtype(Dtype::Float32, stream)?,
+            scale,
+            mask,
+            sinks.as_ref(),
+            softcap,
+            // Native SDPA may scale Q before its product. The explicit score
+            // mechanism preserves post-product scaling and bounds large QK
+            // matrices through its ordinary query/key tiles. F32 inputs make
+            // InputScores' intermediate stores F32 throughout.
+            eredu_nn::AttentionArithmetic::InputScores,
+            stream,
+        )?
+        .as_dtype(output_type, stream);
+    }
     if memory_path(0, 0, arithmetic, softcap.is_some()) == AttentionMemoryPath::Fused {
         // Additive visibility masks do not select projection or cache precision.
         // Native SDPA promotes its result when a wider floating mask is supplied.
-        let dtype = Dtype::from_promoting_types(Dtype::from_promoting_types(queries.dtype(), keys.dtype()), values.dtype());
-        let mask = mask.map(|mask| {
-            if mask.dtype() == Dtype::Bool { Ok(mask.clone()) }
-            else { mask.as_dtype(dtype, stream) }
-        }).transpose()?;
+        let dtype = Dtype::from_promoting_types(
+            Dtype::from_promoting_types(queries.dtype(), keys.dtype()),
+            values.dtype(),
+        );
+        let mask = mask
+            .map(|mask| {
+                if mask.dtype() == Dtype::Bool {
+                    Ok(mask.clone())
+                } else {
+                    mask.as_dtype(dtype, stream)
+                }
+            })
+            .transpose()?;
         return safemlx::fast::scaled_dot_product_attention(
             queries,
             keys,
@@ -401,6 +466,8 @@ struct PreparedAttentionKeyValues {
     key_product: Option<super::matrix::PreparedBf16BatchedProduct>,
     value_product: Option<super::matrix::PreparedBf16BatchedProduct>,
     score_dtype: Dtype,
+    score_reduction: super::matrix::BatchedDotReduction,
+    value_reduction: super::matrix::BatchedDotReduction,
 }
 
 impl PreparedAttentionKeyValues {
@@ -423,14 +490,30 @@ impl PreparedAttentionKeyValues {
             .as_dtype(score_dtype, stream)?
             .swap_axes(-1, -2, stream)?;
         let values = values.clone();
-        let key_product = super::matrix::PreparedBf16BatchedProduct::new(&keys, false, stream)?;
-        let value_product = super::matrix::PreparedBf16BatchedProduct::new(&values, true, stream)?;
+        let score_reduction = super::matrix::batched_dot_reduction(
+            queries.dim(2) as u64,
+            queries.dim(3) as u64,
+            values.dim(2) as u64,
+            super::matrix::BatchedDotReduction::Row32,
+        );
+        let value_reduction = super::matrix::batched_dot_reduction(
+            queries.dim(2) as u64,
+            values.dim(2) as u64,
+            values.dim(3) as u64,
+            super::matrix::BatchedDotReduction::Native,
+        );
+        let key_product =
+            super::matrix::PreparedBf16BatchedProduct::new(&keys, false, score_reduction, stream)?;
+        let value_product =
+            super::matrix::PreparedBf16BatchedProduct::new(&values, true, value_reduction, stream)?;
         Ok(Self {
             keys,
             values,
             key_product,
             value_product,
             score_dtype,
+            score_reduction,
+            value_reduction,
         })
     }
 }
@@ -484,7 +567,17 @@ fn attention_with_prepared_key_values(
         .flatten()
     {
         Some(scores) => scores,
-        None => grouped_head_product(&query, &prepared.keys, stream)?,
+        None => {
+            match super::matrix::ordered_bf16_batched_product(
+                &query,
+                &prepared.keys,
+                prepared.score_reduction,
+                stream,
+            )? {
+                Some(scores) => scores,
+                None => grouped_head_product(&query, &prepared.keys, stream)?,
+            }
+        }
     };
     #[cfg(feature = "projection-profiling")]
     if prepared.key_product.is_none() {
@@ -544,7 +637,22 @@ fn attention_with_prepared_key_values(
         .flatten()
     {
         Some(output) => Ok(output),
-        None => grouped_head_product(&probabilities, &prepared.values, stream),
+        None => {
+            let ordered = if score_dtype == Dtype::Bfloat16 {
+                super::matrix::ordered_bf16_batched_product(
+                    &probabilities,
+                    &prepared.values,
+                    prepared.value_reduction,
+                    stream,
+                )?
+            } else {
+                None
+            };
+            match ordered {
+                Some(output) => Ok(output),
+                None => grouped_head_product(&probabilities, &prepared.values, stream),
+            }
+        }
     }?;
     #[cfg(feature = "projection-profiling")]
     if prepared.value_product.is_none() {

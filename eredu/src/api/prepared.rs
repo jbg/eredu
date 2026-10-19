@@ -17,7 +17,7 @@ pub use eredu_checkpoint::safetensors::{
     SafetensorsMetadataCatalog as SafetensorsSnapshot, SafetensorsShardError,
 };
 pub use eredu_core::artifact::{
-    ArtifactError, ArtifactSource, CompanionSelection, GgufCompanionRole,
+    ArtifactError, ArtifactSource, CompanionSelection, ArtifactCompanionRole,
 };
 
 /// Admitted local artifact and architecture facts, without native resources.
@@ -104,14 +104,25 @@ impl PreparedTextModel {
             DraftingPlan::External { model, .. } => {
                 let preparation = eredu_architectures::prepare_external_draft(model)
                     .map_err(LoadedModelLoadError::Artifact)?;
-                let draft_tokenizer = super::tokenizer::load_tokenizer_for_kind(
-                    preparation.tokenizer_model_kind(),
-                    Path::new(model),
-                )
-                .map_err(LoadedModelLoadError::Metadata)?;
+                let target_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
+                let draft_fingerprint = match preparation.tokenizer_source() {
+                    eredu_architectures::external_draft::ExternalDraftTokenizerSource::Target => {
+                        target_fingerprint
+                    }
+                    eredu_architectures::external_draft::ExternalDraftTokenizerSource::Artifact {
+                        model_type,
+                    } => {
+                        let draft_tokenizer = super::tokenizer::load_tokenizer_for_model_type(
+                            model_type,
+                            Path::new(model),
+                        )
+                        .map_err(LoadedModelLoadError::Metadata)?;
+                        eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer)
+                    }
+                };
                 let compatibility = TokenizerCompatibilityProof::prove(
-                    eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer),
-                    eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer),
+                    target_fingerprint,
+                    draft_fingerprint,
                 )
                 .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))?;
                 Some(ExternalDraftArtifact {

@@ -13,6 +13,7 @@ fn spec(inject: bool) -> GatedResidualSpec {
     GatedResidualSpec {
         geometry: ResidualStreamGeometry::new(2, 2).unwrap(),
         normalization: NormalizationConstructionSpec {
+            reduction: eredu_nn::NormalizationReduction::Native,
             groups: Some(2),
             dimensions: 4,
             epsilon: 1e-4,

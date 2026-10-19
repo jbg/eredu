@@ -147,10 +147,16 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     bank: &GatedProductExpertRecipes,
 ) -> Result<std::collections::BTreeMap<String, DerivedWeightRecipe>, String> {
+    #[derive(Clone, Copy)]
+    enum Companion {
+        Scale,
+        Bias,
+        GlobalScale,
+    }
     fn companion<C: RecipeCatalog + ?Sized>(
         catalog: &C,
         weight: &DerivedWeightRecipe,
-        bias: bool,
+        kind: Companion,
     ) -> Result<Option<DerivedWeightRecipe>, String> {
         let (axis, inputs, stack) = match weight {
             DerivedWeightRecipe::Source {
@@ -158,16 +164,21 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
                 selection: TensorSelection::Full,
             } => {
                 let prefix = key.strip_suffix(".weight").unwrap_or(key);
-                let names = if bias {
-                    vec![format!("{key}_biases"), format!("{prefix}.biases")]
-                } else {
-                    vec![
+                let names = match kind {
+                    Companion::Bias => vec![format!("{key}_biases"), format!("{prefix}.biases")],
+                    Companion::GlobalScale => vec![
+                        format!("{key}_global_scale"),
+                        format!("{key}_weight_scale_2"),
+                        format!("{prefix}.global_scale"),
+                    ],
+                    Companion::Scale => vec![
                         format!("{key}_scale_inv"),
                         format!("{key}_scales"),
+                        format!("{key}_weight_scale"),
                         format!("{prefix}.weight_scale_inv"),
                         format!("{prefix}.scale"),
                         format!("{prefix}.scales"),
-                    ]
+                    ],
                 };
                 return Ok(names
                     .into_iter()
@@ -182,7 +193,7 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
         };
         let mapped = inputs
             .iter()
-            .map(|input| companion(catalog, input, bias))
+            .map(|input| companion(catalog, input, kind))
             .collect::<Result<Vec<_>, _>>()?;
         if mapped.iter().all(Option::is_none) {
             return Ok(None);
@@ -191,7 +202,7 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| "encoded expert bank has an incomplete companion family".to_string())?;
-        Ok(Some(if stack {
+        Ok(Some(if stack || matches!(kind, Companion::GlobalScale) {
             DerivedWeightRecipe::Stack { axis, inputs }
         } else {
             DerivedWeightRecipe::Concatenate { axis, inputs }
@@ -203,11 +214,58 @@ pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
         (&bank.target_down, &bank.down),
     ] {
         outputs.insert(target.clone(), weight.clone());
-        for (suffix, bias) in [("scales", false), ("biases", true)] {
-            if let Some(recipe) = companion(catalog, weight, bias)? {
+        for (suffix, kind) in [
+            ("scales", Companion::Scale),
+            ("biases", Companion::Bias),
+            ("global_scale", Companion::GlobalScale),
+        ] {
+            if let Some(recipe) = companion(catalog, weight, kind)? {
                 recipe.infer(catalog).map_err(|error| error.to_string())?;
                 outputs.insert(format!("{target}_{suffix}"), recipe);
             }
+        }
+    }
+    // NVFP4 byte-packed values and native E4M3 scales retain their exact bytes
+    // in the canonical word/U8 encoding. No floating expansion occurs here.
+    for (target, weight) in [
+        (&bank.target_gate_up, &bank.gate_up),
+        (&bank.target_down, &bank.down),
+    ] {
+        let Some(global) = outputs.get(&format!("{target}_global_scale")) else {
+            continue;
+        };
+        global.infer(catalog).map_err(|error| error.to_string())?;
+        let metadata = weight.infer(catalog).map_err(|error| error.to_string())?;
+        if metadata.dtype == RecipeDtype::U8 {
+            let mut shape = metadata.shape;
+            let columns = shape.last_mut().ok_or("NVFP4 weight is scalar")?;
+            if !columns.is_multiple_of(4) {
+                return Err("NVFP4 byte row is not word aligned".into());
+            }
+            *columns /= 4;
+            outputs.insert(
+                target.clone(),
+                DerivedWeightRecipe::View {
+                    input: Box::new(weight.clone()),
+                    dtype: RecipeDtype::U32,
+                    shape,
+                },
+            );
+        }
+        let key = format!("{target}_scales");
+        let scales = outputs
+            .get(&key)
+            .ok_or("NVFP4 weight has no block scales")?;
+        let metadata = scales.infer(catalog).map_err(|error| error.to_string())?;
+        if metadata.dtype == RecipeDtype::F8E4M3 {
+            outputs.insert(
+                key,
+                DerivedWeightRecipe::View {
+                    input: Box::new(scales.clone()),
+                    dtype: RecipeDtype::U8,
+                    shape: metadata.shape,
+                },
+            );
         }
     }
     Ok(outputs)

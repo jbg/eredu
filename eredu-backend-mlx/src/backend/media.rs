@@ -23,6 +23,7 @@ impl MlxBackend<'_> {
     where
         E: std::error::Error + Send + Sync + 'static,
     {
+        runtime.session().admit_raw_media_request(request)?;
         let processor = runtime.session().processor().ok_or_else(|| {
             MultimodalPreparationFailure::Backend(Error::Processor(format!(
                 "MLX model session {} has no multimodal processor",
@@ -32,6 +33,9 @@ impl MlxBackend<'_> {
         let prepared = processor
             .prepare_portable_input_with_observer(request, encode_backend_text, observer)
             .map_err(|error| match error {
+                ProcessorPreparationError::Capability(error) => {
+                    MultimodalPreparationFailure::Capability(error)
+                }
                 ProcessorPreparationError::Backend(error) => {
                     MultimodalPreparationFailure::Backend(error)
                 }
@@ -50,6 +54,7 @@ impl MultimodalPreparationBackend for MlxBackend<'_> {
     where
         E: std::error::Error + Send + Sync + 'static,
     {
+        runtime.session().admit_raw_media_request(request)?;
         let processor = runtime.session().processor().ok_or_else(|| {
             MultimodalPreparationFailure::Backend(Error::Processor(format!(
                 "MLX model session {} has no multimodal processor",
@@ -59,6 +64,9 @@ impl MultimodalPreparationBackend for MlxBackend<'_> {
         let prepared = processor
             .prepare_portable_input(request, encode_backend_text)
             .map_err(|error| match error {
+                ProcessorPreparationError::Capability(error) => {
+                    MultimodalPreparationFailure::Capability(error)
+                }
                 ProcessorPreparationError::Backend(error) => {
                     MultimodalPreparationFailure::Backend(error)
                 }
