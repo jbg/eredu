@@ -60,24 +60,33 @@ pub(crate) fn inspect_selected_artifact(
 ) -> ModelInspectionReport {
     inspect_selected_preparation(inspection.clone(), &options)
         .expect("automatic inspection already validated its MLX load request")
+        .0
         .into_report()
 }
 
-/// Retains the exact neutral preparation selected while producing the report.
+/// Retains the exact neutral preparation and validated native rank while
+/// producing the report. Realization consumes both without repeating selection.
 pub(crate) fn inspect_selected_preparation(
     inspection: eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
     options: &MlxInspectionOptions,
-) -> Result<eredu_architectures::ModelInspectionOutcome, Error> {
-    let (request, _rank) = options.load.checked_normalized()?;
+) -> Result<
+    (
+        eredu_architectures::ModelInspectionOutcome,
+        Option<crate::backend::MlxRankContext>,
+    ),
+    Error,
+> {
+    let (request, rank) = options.load.checked_normalized()?;
     let mechanisms = crate::inspection_mechanisms();
-    Ok(eredu_architectures::inspect_selected_model(
+    let outcome = eredu_architectures::inspect_selected_model(
         inspection,
         request,
         &mechanisms,
         media_feature_availability(),
-    ))
+    );
+    Ok((outcome, rank))
 }
 
 /// Returns authoritative cold preparation capabilities for this MLX build.

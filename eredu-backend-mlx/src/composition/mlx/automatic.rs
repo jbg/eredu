@@ -285,7 +285,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
         let options = self.load_request_for_plan(plan)?;
-        let outcome = super::inspection::inspect_selected_preparation(
+        let (outcome, rank_context) = super::inspection::inspect_selected_preparation(
             inspection.clone(),
             &MlxInspectionOptions::new(options),
         )
@@ -302,7 +302,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
             )
         })?;
         let (_, neutral) = selected.into_parts();
-        let selected = super::loading::MlxSelectedPreparation::new(neutral, None);
+        let selected = super::loading::MlxSelectedPreparation::new(neutral, rank_context);
         let selected = match self.parallel {
             Some(parallel) => selected
                 .with_world_backend(parallel.backend)
