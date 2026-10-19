@@ -37,6 +37,10 @@ impl ReferenceTensor {
 impl eredu_nn::Tensor for ReferenceTensor {
     type Context = ();
 
+    fn element_type(&self) -> Option<eredu_nn::TensorElementType> {
+        Some(eredu_nn::TensorElementType::F32)
+    }
+
     fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
         Ok(self.clone())
     }
@@ -316,6 +320,10 @@ impl Parameterized<ReferenceTensor> for ReferenceLinear {
 }
 
 impl LinearOperator<ReferenceTensor> for ReferenceLinear {
+    fn parameter_element_type(&self) -> Option<eredu_nn::TensorElementType> {
+        self.weight.element_type()
+    }
+
     fn forward(&mut self, input: &ReferenceTensor, _: &()) -> Result<ReferenceTensor, Error> {
         if self.metadata.id.as_str() == "text_linear.weight" {
             if let Some(encoded) = self.weight.0.last().filter(|value| **value < -1_000) {
