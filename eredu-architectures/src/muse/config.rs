@@ -1100,7 +1100,7 @@ impl DecoderConfig {
             || legacy.as_deref().or(vision_type.as_deref()) != Some("muse-glimmer")
         {
             return Err(invalid(
-                "Muse projector vision type is absent or inconsistent",
+                "Muse projector clip.projector_type or clip.vision.projector_type must declare muse-glimmer; declarations must agree",
             ));
         }
         if gguf_optional_bool(metadata, "clip.has_vision_encoder")? != Some(true) {
