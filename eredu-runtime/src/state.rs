@@ -101,7 +101,9 @@ impl ArchitectureStatePartitionPlan {
     }
 
     /// Returns the architecture-declared treatment of unowned state gaps.
-    pub const fn packing(&self) -> StatePartitionPacking { self.packing }
+    pub const fn packing(&self) -> StatePartitionPacking {
+        self.packing
+    }
 
     /// Returns the declared state placement rules.
     pub fn rules(&self) -> &[ArchitectureStatePartitionRule] {
@@ -508,15 +510,32 @@ impl StateLayout {
         )
     }
 
-    pub(crate) fn selected_slice(&self, layers: Range<usize>, selected: &[Range<usize>]) -> Result<Self, StateError> {
+    pub(crate) fn selected_slice(
+        &self,
+        layers: Range<usize>,
+        selected: &[Range<usize>],
+    ) -> Result<Self, StateError> {
         let sliced = self.slice(layers.clone())?;
-        let policies = sliced.layers.iter().enumerate().map(|(local, policy)| {
-            if selected.iter().any(|range| range.contains(&(layers.start + local))) {
-                policy.clone()
-            } else { LayerCachePolicy::NoState }
-        }).collect::<Vec<_>>();
-        Self::segmented(LayerSchedule::new(policies.len(), policies)
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))?, sliced.segments)
+        let policies = sliced
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(local, policy)| {
+                if selected
+                    .iter()
+                    .any(|range| range.contains(&(layers.start + local)))
+                {
+                    policy.clone()
+                } else {
+                    LayerCachePolicy::NoState
+                }
+            })
+            .collect::<Vec<_>>();
+        Self::segmented(
+            LayerSchedule::new(policies.len(), policies)
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
+            sliced.segments,
+        )
     }
 }
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use safemlx::{Device, DeviceType};
-use safetensors::tensor::{Dtype as SafeDtype, TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 
 use super::*;
 use eredu_checkpoint::store::SafetensorsWeightStore;

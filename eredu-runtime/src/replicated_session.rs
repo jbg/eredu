@@ -15,16 +15,16 @@ use eredu_core::cache::{
 use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCommitPhase};
 use eredu_nn::{NeuralBackend, Tensor};
 
+mod capture_bundle;
 mod control;
 mod prediction;
-mod capture_bundle;
 mod target_transport;
+pub use capture_bundle::{ForwardCaptureBundle, ForwardCaptureSlot};
+pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
 pub use target_transport::{
     PredictionTargetTransport, PredictionTensorAssembly, PredictionTensorAssemblyPlan,
     PredictionTensorSource,
 };
-pub use capture_bundle::{ForwardCaptureBundle, ForwardCaptureSlot};
-pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
 
 use crate::{
     observe_model_logits, partitioned_replicated_text_materialization_tasks,
@@ -744,7 +744,8 @@ where
         capture: B::Tensor,
         slot: &ForwardCaptureSlot,
         _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    {
         if Self::PARTITIONED_SESSION || slot.owner() != 0 {
             return Err(ReplicatedTextSessionError::Contract(
                 "execution strategy has no selected capture publication mechanism".into(),
@@ -1358,8 +1359,10 @@ where
         })
         .transpose()?;
     let local_state = partition.state();
-    let selected_state = local_state.map(|local| selected.state().for_partitioned_geometry(local))
-        .transpose().map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
+    let selected_state = local_state
+        .map(|local| selected.state().for_partitioned_geometry(local))
+        .transpose()
+        .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
     let rank = eredu_core::cache::CacheRankIdentity::new(
         topology.stage().map(|(_, rank)| rank),
         topology.shard().map(|(_, rank)| rank),
@@ -1386,10 +1389,14 @@ where
         )
         .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
     let state = match selected_state.as_ref() {
-        Some(selected) => mechanisms.realize_state(selected, context)
+        Some(selected) => mechanisms
+            .realize_state(selected, context)
             .map_err(PartitionedRuntimeConstructionError::Mechanism)?,
-        None => mechanisms.realize_stateless_state().ok_or_else(||
-            PartitionedRuntimeConstructionError::Contract("mechanism cannot realize a stateless partition".into()))?,
+        None => mechanisms.realize_stateless_state().ok_or_else(|| {
+            PartitionedRuntimeConstructionError::Contract(
+                "mechanism cannot realize a stateless partition".into(),
+            )
+        })?,
     };
     if state.optional_layout() != selected_state.as_ref().map(|selected| selected.layout()) {
         return Err(PartitionedRuntimeConstructionError::Contract(
@@ -3270,7 +3277,6 @@ where
         self.decode_input_with_observer(input, context, &mut crate::NoopObserver)
     }
 
-
     /// Runs one observed decode step from an architecture-prepared input.
     pub fn decode_input_with_observer<'a, O>(
         &mut self,
@@ -3493,9 +3499,13 @@ where
                 validate_realized_state(&self.state, selected)?;
                 validate_realized_state(replacement, selected)?;
             }
-            None if self.state.optional_layout().is_none() && replacement.optional_layout().is_none() => {}
-            None => return Err(ReplicatedTextSessionError::Contract(
-                "stateless prediction target received stateful lane ownership".into())),
+            None if self.state.optional_layout().is_none()
+                && replacement.optional_layout().is_none() => {}
+            None => {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "stateless prediction target received stateful lane ownership".into(),
+                ))
+            }
         }
         std::mem::swap(&mut self.state, replacement);
         Ok(())
@@ -3512,14 +3522,25 @@ where
     ) -> Result<M::State, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.ensure_commit_resolved()?;
         let provisional = match self.selected_state.state() {
-            None => self.mechanisms.realize_stateless_state().ok_or_else(||
-                ReplicatedTextSessionError::Contract("mechanism cannot realize a stateless prediction lane".into()))
+            None => self
+                .mechanisms
+                .realize_stateless_state()
+                .ok_or_else(|| {
+                    ReplicatedTextSessionError::Contract(
+                        "mechanism cannot realize a stateless prediction lane".into(),
+                    )
+                })
                 .and_then(|state| {
                     if state.optional_layout().is_some() {
-                        Err(ReplicatedTextSessionError::Contract("stateless prediction lane contains mutable state geometry".into()))
-                    } else { Ok(state) }
+                        Err(ReplicatedTextSessionError::Contract(
+                            "stateless prediction lane contains mutable state geometry".into(),
+                        ))
+                    } else {
+                        Ok(state)
+                    }
                 }),
-            Some(selected) => self.mechanisms
+            Some(selected) => self
+                .mechanisms
                 .fork_prediction_target_state(&self.state, selected, context)
                 .map_err(ReplicatedTextSessionError::Mechanism)
                 .and_then(|state| {

@@ -395,16 +395,29 @@ fn record_rank_resources(
         return;
     }
     let project = || -> Result<eredu_core::SelectedRankResourceProfile, String> {
-        let nemotron = plan.gguf_media_projector().and_then(|projector| match projector.model() {
-            crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => Some(config),
-            _ => None,
-        }).or_else(|| match (
-            plan.safetensors_architecture().map(|p| p.model()), plan.gguf_plan().map(|p| p.model()),
-        ) {
-            (Some(SafetensorsModelConfig::NemotronLabsDiffusion(config)), None) => Some(config),
-            (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => Some(plan.text_config()),
-            _ => None,
-        });
+        let nemotron = plan
+            .gguf_media_projector()
+            .and_then(|projector| match projector.model() {
+                crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion {
+                    config,
+                    ..
+                } => Some(config),
+                _ => None,
+            })
+            .or_else(|| {
+                match (
+                    plan.safetensors_architecture().map(|p| p.model()),
+                    plan.gguf_plan().map(|p| p.model()),
+                ) {
+                    (Some(SafetensorsModelConfig::NemotronLabsDiffusion(config)), None) => {
+                        Some(config)
+                    }
+                    (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => {
+                        Some(plan.text_config())
+                    }
+                    _ => None,
+                }
+            });
         let muse = match crate::replicated_text::composite_config(plan)
             .map_err(|error| error.to_string())?
         {
@@ -425,20 +438,40 @@ fn record_rank_resources(
             )
         } else if let Some(config) = nemotron {
             use crate::decoder::Config;
-            let config = config.with_checkpoint_formats(crate::replicated_text::selected_formats(selected.text_realization())).map_err(|e| e.to_string())?;
+            let config = config
+                .with_checkpoint_formats(crate::replicated_text::selected_formats(
+                    selected.text_realization(),
+                ))
+                .map_err(|e| e.to_string())?;
             let parameters = if config.vision.is_some() {
                 crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&config)
-            } else { crate::nemotron_labs_diffusion::parallel::parameter_description(&config) }.map_err(|e| e.to_string())?;
-            (parameters, config.num_hidden_layers() as usize, (config.num_key_value_heads()*config.head_dim()) as usize)
+            } else {
+                crate::nemotron_labs_diffusion::parallel::parameter_description(&config)
+            }
+            .map_err(|e| e.to_string())?;
+            (
+                parameters,
+                config.num_hidden_layers() as usize,
+                (config.num_key_value_heads() * config.head_dim()) as usize,
+            )
         } else {
             let args = match (
-                plan.safetensors_architecture().map(|p| p.model()), plan.gguf_plan().map(|p| p.model()),
+                plan.safetensors_architecture().map(|p| p.model()),
+                plan.gguf_plan().map(|p| p.model()),
             ) {
-                (Some(SafetensorsModelConfig::K2Horizon(args)), None) | (None, Some(GgufModelConfig::K2Horizon(args))) => args,
+                (Some(SafetensorsModelConfig::K2Horizon(args)), None)
+                | (None, Some(GgufModelConfig::K2Horizon(args))) => args,
                 _ => return Err("rank resource projection is unavailable for this family".into()),
             };
-            let args = crate::replicated_text::selected_k2_horizon_args(args, selected.text_realization())?;
-            (crate::k2_horizon::parameter_description(&args).map_err(|e| e.to_string())?, args.num_hidden_layers as usize, (args.num_key_value_heads*args.head_dim) as usize)
+            let args = crate::replicated_text::selected_k2_horizon_args(
+                args,
+                selected.text_realization(),
+            )?;
+            (
+                crate::k2_horizon::parameter_description(&args).map_err(|e| e.to_string())?,
+                args.num_hidden_layers as usize,
+                (args.num_key_value_heads * args.head_dim) as usize,
+            )
         };
         let (resources, layout) = match selected.partition_parameter_resources(&parameters)? {
             Some((resources, layout)) => (resources, Some(layout)),
@@ -637,7 +670,9 @@ fn record_gguf_media(
     }
     let projector = inspection
         .validated_gguf()
-        .and_then(|validated| validated.companion(&eredu_core::ArtifactCompanionRole::MediaProjector))
+        .and_then(|validated| {
+            validated.companion(&eredu_core::ArtifactCompanionRole::MediaProjector)
+        })
         .map(|companion| companion.path().to_owned());
     let composition = if eredu_core::record_media_projector_inspection(
         report,

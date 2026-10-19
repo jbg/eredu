@@ -33,11 +33,11 @@ use crate::{
 };
 
 mod assistant;
-pub(super) mod memory_observation;
-mod parameter_policy;
 pub(crate) mod autoregressive;
 mod completion;
 mod execution_streams;
+pub(super) mod memory_observation;
+mod parameter_policy;
 mod sampling;
 pub(crate) mod state_snapshot;
 
@@ -46,14 +46,14 @@ pub(crate) use assistant::{
     speculative_mechanism_capabilities, MlxAssistantPreparationVisitor, MlxExternalAssistant,
 };
 pub use completion::MlxSpeculativeCompletion;
-pub use execution_streams::SpeculativeExecutionStreams;
 pub(in crate::composition::mlx) use execution_streams::BorrowedTargetObserver;
+pub use execution_streams::SpeculativeExecutionStreams;
 #[cfg(test)]
 use sampling::array_probability_at;
 pub(crate) use sampling::validate_control_capture;
 pub use sampling::MlxSpeculativeSampling;
 
 #[cfg(test)]
-mod test_fixture;
-#[cfg(test)]
 mod completion_tests;
+#[cfg(test)]
+mod test_fixture;

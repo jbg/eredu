@@ -1010,10 +1010,20 @@ where
             .map(MlxPredictionTargetState::new)
             .map_err(|e| Error::Other(Box::new(e)))
     }
-    fn exchange_autoregressive_cache(&mut self, cache: &mut MlxPredictionTargetState, stream: &Stream) -> Result<(), Error> {
-        if !cache.is::<MlxHybridState>() { return Err(Error::ArchitectureModel("canonical causal state type differs".into())); }
+    fn exchange_autoregressive_cache(
+        &mut self,
+        cache: &mut MlxPredictionTargetState,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if !cache.is::<MlxHybridState>() {
+            return Err(Error::ArchitectureModel(
+                "canonical causal state type differs".into(),
+            ));
+        }
         let mut state = cache.take_state::<MlxHybridState>()?;
-        let result = self.session.exchange_prediction_target_state(&mut state, stream)
+        let result = self
+            .session
+            .exchange_prediction_target_state(&mut state, stream)
             .map_err(|error| Error::Other(Box::new(error)));
         cache.restore_state(state);
         result
@@ -1025,16 +1035,30 @@ where
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<(Array, usize), Error> {
-        let plans = self.prepared_input_plans(input).map_err(|error| Error::Other(Box::new(error)))?;
-        let count = plans.iter().try_fold(0usize, |total, plan| {
-            total.checked_add(usize::try_from(plan.decoder_positions()).ok()?)
-        }).ok_or_else(|| Error::ArchitectureModel("prepared context position count overflows".into()))?;
-        let (prepared, admitted, _) = prepare_composite_input::<A>(&self.admission, &self.processor, input, false)?;
+        let plans = self
+            .prepared_input_plans(input)
+            .map_err(|error| Error::Other(Box::new(error)))?;
+        let count = plans
+            .iter()
+            .try_fold(0usize, |total, plan| {
+                total.checked_add(usize::try_from(plan.decoder_positions()).ok()?)
+            })
+            .ok_or_else(|| {
+                Error::ArchitectureModel("prepared context position count overflows".into())
+            })?;
+        let (prepared, admitted, _) =
+            prepare_composite_input::<A>(&self.admission, &self.processor, input, false)?;
         let paired = PreparedCompositeInput::new(&prepared, &admitted)
             .map_err(Error::ArchitectureModel)?
             .with_attention_invocation(eredu_core::decoding::AttentionInvocation::CAUSAL);
         let output = self.with_native_prediction_target_state(cache, |session| {
-            session.sequence_output_with_observer(paired, eredu_runtime::ExpertPass::Prefill, stream, &mut crate::composition::NeutralActivationObserver::new(observer))
+            session
+                .sequence_output_with_observer(
+                    paired,
+                    eredu_runtime::ExpertPass::Prefill,
+                    stream,
+                    &mut crate::composition::NeutralActivationObserver::new(observer),
+                )
                 .map_err(|error| Error::Other(Box::new(error)))
         })?;
         Ok((self.published(output.into_array()), count))
@@ -1061,22 +1085,38 @@ where
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
         if !A::supports_attention_invocation(&self.admission, invocation)
-            || (invocation == eredu_core::decoding::AttentionInvocation::CAUSAL && feedback.is_some()) {
-            return Err(Error::ArchitectureModel("selected composite rejects attention invocation".into()));
+            || (invocation == eredu_core::decoding::AttentionInvocation::CAUSAL
+                && feedback.is_some())
+        {
+            return Err(Error::ArchitectureModel(
+                "selected composite rejects attention invocation".into(),
+            ));
         }
         let (prepared, admitted, _) = self.text_input(tokens)?;
         let feedback = feedback.cloned().map(MlxTensor::from_array);
         let mut paired = PreparedCompositeInput::new(&prepared, &admitted)
-            .map_err(Error::ArchitectureModel)?.with_attention_invocation(invocation);
+            .map_err(Error::ArchitectureModel)?
+            .with_attention_invocation(invocation);
         if invocation.visibility == eredu_core::decoding::AttentionVisibility::PrefixAndBlock {
             paired = paired.with_refinement(feedback.as_ref());
         }
-        let pass = if prefill { eredu_runtime::ExpertPass::Prefill } else { eredu_runtime::ExpertPass::Decode };
+        let pass = if prefill {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
         let mut execute = |session: &mut ReplicatedTextSession<_, _, _, _>| {
             let before = session.successful_state_restoration_generation();
-            session.sequence_output_with_observer(paired, pass, stream, &mut observer)
-                .map_err(|error| Error::after_replicated_model_call(error, before, session.successful_state_restoration_generation()))
+            session
+                .sequence_output_with_observer(paired, pass, stream, &mut observer)
+                .map_err(|error| {
+                    Error::after_replicated_model_call(
+                        error,
+                        before,
+                        session.successful_state_restoration_generation(),
+                    )
+                })
         };
         let output = match cache {
             Some(cache) => self.with_native_prediction_target_state(cache, execute)?,
@@ -1143,7 +1183,9 @@ where
     }
 
     fn estimate_installed_control_growth(&self, additional: u64) -> Result<Option<u64>, Error> {
-        Ok(self.session.estimate_installed_control_state_growth(additional))
+        Ok(self
+            .session
+            .estimate_installed_control_state_growth(additional))
     }
 
     fn estimate_native_control_growth(
@@ -1219,7 +1261,10 @@ where
     fn speculative_activation_execution(
         &self,
     ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
-        self.prediction.activation_execution().or_else(|| self.capability_estimate.shared_backbone_activation_execution())
+        self.prediction.activation_execution().or_else(|| {
+            self.capability_estimate
+                .shared_backbone_activation_execution()
+        })
     }
 
     fn install_embedded_prediction_observers(
@@ -1761,7 +1806,6 @@ where
             None => Ok(report),
         }
     }
-
 }
 
 impl<A, D, P> ErasedExternalPredictionExecutable for CompletedComposite<A, D, P>
@@ -1876,11 +1920,13 @@ where
                             )
                         },
                         |forward, values| {
-                            A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
-                                eredu_nn::Error::backend(
+                            A::external_prediction_capture(&request, forward, values)?.ok_or_else(
+                                || {
+                                    eredu_nn::Error::backend(
                                     "architecture did not produce its selected assistant capture",
                                 )
-                            })
+                                },
+                            )
                         },
                     )
                     .map_err(|error| Error::Other(Box::new(error)))
@@ -1923,11 +1969,13 @@ where
                             )
                         },
                         |forward, values| {
-                            A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
-                                eredu_nn::Error::backend(
+                            A::external_prediction_capture(&request, forward, values)?.ok_or_else(
+                                || {
+                                    eredu_nn::Error::backend(
                                     "architecture did not produce its selected assistant capture",
                                 )
-                            })
+                                },
+                            )
                         },
                     )
                     .map_err(|error| Error::Other(Box::new(error)))

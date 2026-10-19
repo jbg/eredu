@@ -33,7 +33,10 @@ pub struct NoTargetRefinement;
 impl<M: AutoregressiveMechanisms> TargetRefinement<M> for NoTargetRefinement {
     type State = ();
     fn capabilities(&self, _: &M::Model) -> DecodingCapabilities {
-        DecodingCapabilities { autoregressive: true, ..Default::default() }
+        DecodingCapabilities {
+            autoregressive: true,
+            ..Default::default()
+        }
     }
     fn advance(
         &mut self,

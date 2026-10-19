@@ -1,7 +1,7 @@
 use super::*;
-use eredu_runtime::{SamplingConfigurationError, SpeculativeSampler};
-use eredu_runtime::speculative::shared_backbone::SharedBackboneTransaction;
 use crate::composition::mlx::speculative::autoregressive::MlxAutoregressiveMechanisms;
+use eredu_runtime::speculative::shared_backbone::SharedBackboneTransaction;
+use eredu_runtime::{SamplingConfigurationError, SpeculativeSampler};
 
 /// MLX sampling and randomness state for backend-generic text generation.
 pub struct MlxTextGenerationState {
@@ -196,14 +196,19 @@ pub(super) fn sample_text_submission(
     let sampled = (|| {
         // Instrumented context execution may retain every physical score row.
         // One causal decision always consumes the final conditional row.
-        let logits = submission.output.logits().map(|logits| {
-            let array = logits.as_array();
-            match array.shape() {
-                [_, sequence, _] if *sequence > 0 =>
-                    array.try_index_device((.., -1, ..), &stream).map(MlxTensor::from_array),
-                _ => Ok(logits.clone()),
-            }
-        }).transpose()?;
+        let logits = submission
+            .output
+            .logits()
+            .map(|logits| {
+                let array = logits.as_array();
+                match array.shape() {
+                    [_, sequence, _] if *sequence > 0 => array
+                        .try_index_device((.., -1, ..), &stream)
+                        .map(MlxTensor::from_array),
+                    _ => Ok(logits.clone()),
+                }
+            })
+            .transpose()?;
         let MlxTextSamplingState {
             temperature,
             prng,
@@ -245,7 +250,9 @@ pub(super) fn sample_text_submission(
         .checked_add(1)
         .ok_or_else(|| Error::ArchitectureModel("text prediction overflow".into()))?;
     if let Some(capture) = &mut state.capture {
-        capture.set_commitment_boundary(state.sampling.next_prediction).map_err(Error::observation)?;
+        capture
+            .set_commitment_boundary(state.sampling.next_prediction)
+            .map_err(Error::observation)?;
     }
     Ok(Submission {
         output: MlxTextToken {

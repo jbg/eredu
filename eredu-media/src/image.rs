@@ -1,7 +1,7 @@
 //! Shared decoded-image validation and transforms.
 
 #[cfg(feature = "image")]
-use image::{ImageBuffer, Rgb, imageops::FilterType};
+use image::{imageops::FilterType, ImageBuffer, Rgb};
 
 use crate::{MediaError, ProcessedMediaDtype};
 
@@ -511,7 +511,7 @@ pub fn resize_and_normalize_rgb8_cubic(
 #[cfg(all(test, feature = "image"))]
 mod tests {
     use super::{
-        RgbImageView, rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3,
+        rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, RgbImageView,
     };
 
     #[test]

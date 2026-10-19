@@ -561,9 +561,16 @@ pub(crate) fn phase(
     let mut persistent = MemoryBytes::exact(0);
     let mut retained = plan.retained_input.clone();
     if matches!(plan.domain, MemoryDomain::Host | MemoryDomain::Unified) {
-        let output = request.max_output_tokens.unwrap_or(request.forecast_output_tokens);
-        let sequence = mul(add(std::mem::size_of::<eredu_core::GenerationSequence>() as u64,
-            mul(output, 4)?)?, request.batch_size)?;
+        let output = request
+            .max_output_tokens
+            .unwrap_or(request.forecast_output_tokens);
+        let sequence = mul(
+            add(
+                std::mem::size_of::<eredu_core::GenerationSequence>() as u64,
+                mul(output, 4)?,
+            )?,
+            request.batch_size,
+        )?;
         retained = retained.add(&MemoryBytes::estimated(0, sequence,
             "common request canonical sequence: host payload horizon; allocator overhead is separate"))?;
     }

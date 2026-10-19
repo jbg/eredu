@@ -155,23 +155,42 @@ fn register_one(
         };
     let mut output = input.clone();
     match &transform.equation {
-        Equation::AffineProjection { weight, bias, input_width, output_width } => {
+        Equation::AffineProjection {
+            weight,
+            bias,
+            input_width,
+            output_width,
+        } => {
             let token_axes = |axes: &[eredu_core::TensorAxis]| {
                 matches!(axes, [token, _] if token.dimension == SymbolicDimension::TokenRows)
                     || matches!(axes, [batch, sequence, _] if batch.dimension == SymbolicDimension::Batch && sequence.dimension == SymbolicDimension::Sequence)
             };
-            if *input_width == 0 || *output_width == 0
-                || !token_axes(input_axes) || !token_axes(output_axes)
-                || input_axes.last().map(|axis| &axis.dimension) != Some(&SymbolicDimension::Known(*input_width))
-                || output_axes.last().map(|axis| &axis.dimension) != Some(&SymbolicDimension::Known(*output_width))
-                || input.coordinates.as_ref().is_some_and(|coordinates| coordinates.contiguous_range() != Some(0..*input_width))
+            if *input_width == 0
+                || *output_width == 0
+                || !token_axes(input_axes)
+                || !token_axes(output_axes)
+                || input_axes.last().map(|axis| &axis.dimension)
+                    != Some(&SymbolicDimension::Known(*input_width))
+                || output_axes.last().map(|axis| &axis.dimension)
+                    != Some(&SymbolicDimension::Known(*output_width))
+                || input.coordinates.as_ref().is_some_and(|coordinates| {
+                    coordinates.contiguous_range() != Some(0..*input_width)
+                })
             {
                 return Err(invalid().into());
             }
             replicated_parameter(&weight.parameter, &[*output_width, *input_width])?;
-            if let Some(bias) = bias { replicated_parameter(&bias.parameter, &[*output_width])?; }
-            output.axis = output_axes.last().expect("validated projection axes").name.clone();
-            output.coordinates = local.then(|| ComponentCoordinateMap::range(*output_width, 0..*output_width)).transpose()?;
+            if let Some(bias) = bias {
+                replicated_parameter(&bias.parameter, &[*output_width])?;
+            }
+            output.axis = output_axes
+                .last()
+                .expect("validated projection axes")
+                .name
+                .clone();
+            output.coordinates = local
+                .then(|| ComponentCoordinateMap::range(*output_width, 0..*output_width))
+                .transpose()?;
         }
         Equation::ConstantScale { .. } => {
             if input_axes != output_axes {

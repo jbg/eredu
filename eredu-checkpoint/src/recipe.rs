@@ -6,8 +6,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::StoredDtype;
 use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection, WeightStore};
+use crate::StoredDtype;
 
 /// Metadata-only catalog used to validate a derived-weight recipe.
 pub trait RecipeCatalog {
@@ -2270,7 +2270,9 @@ pub enum RecipeError {
     MatrixBiasWithoutScales,
     #[error("matrix-family weight must have rank at least two, got {shape:?}")]
     InvalidMatrixFamilyWeight { shape: Vec<usize> },
-    #[error("matrix-family {member} geometry {companion:?} is incompatible with weight {weight:?}")]
+    #[error(
+        "matrix-family {member} geometry {companion:?} is incompatible with weight {weight:?}"
+    )]
     MatrixCompanionGeometry {
         member: &'static str,
         weight: Vec<usize>,

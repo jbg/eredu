@@ -1,7 +1,7 @@
 //! Constrained commitment of one position from a completed refinement block.
 
 use crate::generation::{SamplingBackend, TokenDomain};
-use eredu_core::{TokenFilter, refinement::PredictionScoreKind};
+use eredu_core::{refinement::PredictionScoreKind, TokenFilter};
 use eredu_nn::{Index, Tensor};
 
 /// Selected masked tokens and the identity reserved for unresolved positions.

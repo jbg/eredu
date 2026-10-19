@@ -982,7 +982,10 @@ where
     }
 
     fn boundary_participates(&self, route: CommunicationRouteId) -> bool {
-        self.manifest.routes().iter().find(|descriptor| descriptor.id() == route)
+        self.manifest
+            .routes()
+            .iter()
+            .find(|descriptor| descriptor.id() == route)
             .is_some_and(|descriptor| descriptor.participates(self.manifest.rank()))
     }
 
@@ -1895,7 +1898,6 @@ where
     {
         Ok(None)
     }
-
 }
 
 /// Additive policy for an optional point-to-point boundary path.
@@ -2420,7 +2422,12 @@ where
         if bounded != bounded_policy.is_some() {
             return Err(PartitionExecutionError::ResidencyPolicyMismatch);
         }
-        if (!V::PHASE_FAILURE_AGREEMENT && communication.manifest().routes().iter().any(|route| route.world_broadcast()))
+        if (!V::PHASE_FAILURE_AGREEMENT
+            && communication
+                .manifest()
+                .routes()
+                .iter()
+                .any(|route| route.world_broadcast()))
             || (!T::ENABLED && !plan.routes.is_empty())
             || (!U::ENABLED && plan.publication.is_some())
             || (!V::ENABLED && plan.commit_barrier.is_some())
@@ -3331,10 +3338,16 @@ where
             };
             // Owners and placeholders enter publication with the same retained
             // wire contract. Compute precision remains with local layer state.
-            output.cast_float(element, context).map_err(|error| ReplicatedTextSessionError::Partition(
-                PartitionExecutionError::OutputPreparationFailed(eredu_core::BackendFailure::from_error(error))
-            ))?
-        } else { output };
+            output.cast_float(element, context).map_err(|error| {
+                ReplicatedTextSessionError::Partition(
+                    PartitionExecutionError::OutputPreparationFailed(
+                        eredu_core::BackendFailure::from_error(error),
+                    ),
+                )
+            })?
+        } else {
+            output
+        };
         Ok((output, forward))
     }
 
@@ -3509,9 +3522,7 @@ where
         };
         runtime
             .executor
-            .apply_prediction_target_operation(
-                state, operation, &mut transport, context,
-            )
+            .apply_prediction_target_operation(state, operation, &mut transport, context)
             .map_err(ReplicatedTextSessionError::Architecture)
     }
 
@@ -3627,8 +3638,10 @@ where
         .map_err(PartitionRouteTransferError::Contract)?;
     Ok(PreparedPartitionBoundary {
         source,
-        destination: communication.manifest.routes().iter().any(|descriptor|
-            descriptor.id() == route.route && descriptor.destination() == communication.manifest.rank()),
+        destination: communication.manifest.routes().iter().any(|descriptor| {
+            descriptor.id() == route.route
+                && descriptor.destination() == communication.manifest.rank()
+        }),
         schema,
         values,
     })
@@ -4334,7 +4347,6 @@ mod plan_tests {
         ));
     }
 }
-
 
 /// Borrows the already-selected communication resources for one static operation.
 /// It creates no group, completion policy or independent submission authority.

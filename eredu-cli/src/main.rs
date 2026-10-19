@@ -1960,7 +1960,7 @@ fn automatic_report_with_cache(
             if let Some(mut cached) = cached_automatic_report(path, &key)? {
                 if cached.plan.media_companions() == &args.media_companions()
                     && (!matches!(cached.plan.drafting(), DraftingPlan::External { .. })
-                    || args.draft_model.is_some())
+                        || args.draft_model.is_some())
                     && overrides.apply_to_plan(
                         &cached.plan,
                         args,
@@ -4007,59 +4007,111 @@ mod tests {
     #[test]
     fn independent_media_companions_survive_plan_overrides_and_replay() {
         let original = Cli::try_parse_from([
-            "eredu", "--model", "text-model", "--no-auto",
-            "--vision-companion", "vision-source", "--audio-companion", "audio-source",
-        ]).unwrap();
+            "eredu",
+            "--model",
+            "text-model",
+            "--no-auto",
+            "--vision-companion",
+            "vision-source",
+            "--audio-companion",
+            "audio-source",
+        ])
+        .unwrap();
         let selected = cli_execution_plan(&original, None, false).unwrap();
-        assert_eq!(selected.media_companions().vision(), Some(Path::new("vision-source")));
-        assert_eq!(selected.media_companions().audio(), Some(Path::new("audio-source")));
+        assert_eq!(
+            selected.media_companions().vision(),
+            Some(Path::new("vision-source"))
+        );
+        assert_eq!(
+            selected.media_companions().audio(),
+            Some(Path::new("audio-source"))
+        );
         let json = serde_json::to_vec(&selected).unwrap();
         let selected: ExecutionPlan = serde_json::from_slice(&json).unwrap();
-        let mut replay = Cli::try_parse_from(["eredu", "--model", "text-model", "--no-auto"]).unwrap();
+        let mut replay =
+            Cli::try_parse_from(["eredu", "--model", "text-model", "--no-auto"]).unwrap();
         apply_automatic_plan(&mut replay, &selected).unwrap();
         assert_eq!(cli_execution_plan(&replay, None, false).unwrap(), selected);
         let resources = ModelResourceProfile::unmeasured(
-            "text-model".into(), eredu_core::ArtifactFormat::SafeTensors,
+            "text-model".into(),
+            eredu_core::ArtifactFormat::SafeTensors,
         );
         for (flag, replacement, expected_vision, expected_audio) in [
-            ("--audio-companion", "replacement-audio", "vision-source", "replacement-audio"),
-            ("--vision-companion", "replacement-vision", "replacement-vision", "audio-source"),
+            (
+                "--audio-companion",
+                "replacement-audio",
+                "vision-source",
+                "replacement-audio",
+            ),
+            (
+                "--vision-companion",
+                "replacement-vision",
+                "replacement-vision",
+                "audio-source",
+            ),
         ] {
-            let matches = Cli::command().try_get_matches_from([
-                "eredu", "--model", "text-model", flag, replacement,
-            ]).unwrap();
+            let matches = Cli::command()
+                .try_get_matches_from(["eredu", "--model", "text-model", flag, replacement])
+                .unwrap();
             let args = Cli::from_arg_matches(&matches).unwrap();
             let plan = AutomaticCliOverrides::from_matches(&matches)
-                .apply_to_plan(&selected, &args, None, &resources).unwrap();
-            assert_eq!(plan.media_companions().vision(), Some(Path::new(expected_vision)));
-            assert_eq!(plan.media_companions().audio(), Some(Path::new(expected_audio)));
+                .apply_to_plan(&selected, &args, None, &resources)
+                .unwrap();
+            assert_eq!(
+                plan.media_companions().vision(),
+                Some(Path::new(expected_vision))
+            );
+            assert_eq!(
+                plan.media_companions().audio(),
+                Some(Path::new(expected_audio))
+            );
         }
     }
 
     #[test]
     fn automatic_overrides_preserve_external_parameter_policy() {
-        let matches = Cli::command().try_get_matches_from([
-            "eredu", "--model", "target", "--auto", "quick",
-            "--speculative-draft-tokens", "5", "prompt",
-        ]).unwrap();
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "eredu",
+                "--model",
+                "target",
+                "--auto",
+                "quick",
+                "--speculative-draft-tokens",
+                "5",
+                "prompt",
+            ])
+            .unwrap();
         let args = Cli::from_arg_matches(&matches).unwrap();
         let residency = ResidencyPlan::DenseDiskStream {
-            device_budget_bytes: 8 << 30, host_budget_bytes: 4 << 30,
-            host_lookahead: 1, background_queue: 1,
+            device_budget_bytes: 8 << 30,
+            host_budget_bytes: 4 << 30,
+            host_lookahead: 1,
+            background_queue: 1,
         };
         let plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap())
             .with_drafting(DraftingPlan::External {
-                model: "assistant".into(), placement: super::DraftPlacementPlan::Target,
-                residency: residency.clone(), max_draft_tokens: 2,
-                lookahead: true, adaptive_lookahead: true,
+                model: "assistant".into(),
+                placement: super::DraftPlacementPlan::Target,
+                residency: residency.clone(),
+                max_draft_tokens: 2,
+                lookahead: true,
+                adaptive_lookahead: true,
             });
         let mut replay = args.clone();
         replay.common.device = Some(CliDevice::Gpu(0));
         apply_automatic_plan(&mut replay, &plan).unwrap();
-        assert_eq!(cli_execution_plan(&replay, Some(Path::new("assistant")), false).unwrap(), plan);
-        let resources = ModelResourceProfile::unmeasured("target".into(), eredu_core::ArtifactFormat::SafeTensors);
+        assert_eq!(
+            cli_execution_plan(&replay, Some(Path::new("assistant")), false).unwrap(),
+            plan
+        );
+        let resources = ModelResourceProfile::unmeasured(
+            "target".into(),
+            eredu_core::ArtifactFormat::SafeTensors,
+        );
         let selected = AutomaticCliOverrides::from_matches(&matches)
-            .apply_to_plan(&plan, &args, Some(Path::new("assistant")), &resources).unwrap();
+            .apply_to_plan(&plan, &args, Some(Path::new("assistant")), &resources)
+            .unwrap();
         assert!(matches!(selected.drafting(), DraftingPlan::External {
             residency: actual, max_draft_tokens: 5, ..
         } if actual == &residency));

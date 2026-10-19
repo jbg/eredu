@@ -295,7 +295,7 @@ fn verify_native_partition_components(
                 1
             };
             let invocation = independent.then_some(CaptureInvocationShape {
-            media: None,
+                media: None,
                 batch: 1,
                 sequence,
                 context: (!speculative).then_some(if step_index == 0 {

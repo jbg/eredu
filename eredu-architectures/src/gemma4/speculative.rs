@@ -36,7 +36,8 @@ where
         stage: eredu_core::run_preparation::TextPreparationStage,
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
         M::agree_text_preparation(stage, status, context)
     }
 
@@ -60,7 +61,9 @@ where
     type Telemetry = M::Telemetry;
     type Error = M::Error;
 
-    fn control_logits_estimate(logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+    fn control_logits_estimate(
+        logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         M::control_logits_estimate(logits)
     }
 
@@ -476,8 +479,11 @@ pub trait ExternalMechanisms: 'static {
         _stage: eredu_core::run_preparation::TextPreparationStage,
         status: eredu_core::run_preparation::TextPreparationStatus,
         _context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
-        use eredu_core::run_preparation::{TextPreparationOutcome as O, TextPreparationStatus as S};
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        use eredu_core::run_preparation::{
+            TextPreparationOutcome as O, TextPreparationStatus as S,
+        };
         Ok(match status {
             S::Ready => O::Ready,
             S::Cancelled => O::Cancelled,
@@ -494,7 +500,11 @@ pub trait ExternalMechanisms: 'static {
     }
 
     /// Complete score-row backing allowance for a settled mode handoff.
-    fn control_logits_estimate(_logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> { None }
+    fn control_logits_estimate(
+        _logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        None
+    }
     /// Materialized ordinary target.
     type Target: ?Sized;
     /// Materialized Gemma 4 assistant.
@@ -817,7 +827,8 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         local: Vec<eredu_core::SpeculativeScheduleState>,
         context: Self::Context<'context>,
     ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
-    where Self: 'context,
+    where
+        Self: 'context,
     {
         M::coordinate_speculative_step(local, context)
     }
@@ -828,7 +839,8 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: Self::Context<'context>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    where Self: 'context,
+    where
+        Self: 'context,
     {
         M::agree_text_preparation(stage, status, context)
     }
@@ -838,19 +850,28 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         local: eredu_core::decoding::DecodingCoordination,
         context: Self::Context<'context>,
     ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>
-    where Self: 'context,
+    where
+        Self: 'context,
     {
         M::coordinate_decoding_control(local, context)
     }
 
     fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
-        eredu_core::decoding::DecodingCapabilities::causal_drafting(self.max_proposals()).with_completion_support(
-            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::NativeCancel),
-            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::QuarantineUntilComplete),
-        )
+        eredu_core::decoding::DecodingCapabilities::causal_drafting(self.max_proposals())
+            .with_completion_support(
+                M::Completion::supports_cancellation(
+                    eredu_core::CompletionCancellationMode::NativeCancel,
+                ),
+                M::Completion::supports_cancellation(
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                ),
+            )
     }
 
-    fn logits_snapshot_estimate(&self, logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+    fn logits_snapshot_estimate(
+        &self,
+        logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         M::control_logits_estimate(logits)
     }
 
@@ -859,9 +880,13 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     type TargetState = ExternalTargetState<M::Tensor>;
     type DraftState = AssistantState<M::Tensor>;
     type CacheCheckpoint = M::CacheCheckpoint;
-    type Verification = eredu_runtime::speculative::CausalVerification<ExternalTargetOutput<M::Tensor>, M::Tensor>;
+    type Verification =
+        eredu_runtime::speculative::CausalVerification<ExternalTargetOutput<M::Tensor>, M::Tensor>;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a> where Self: 'a;
+    type Context<'a>
+        = M::Context<'a>
+    where
+        Self: 'a;
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
@@ -905,7 +930,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     ) -> Result<
         Option<(Self::CacheCheckpoint, Self::TargetState)>,
         eredu_core::speculative::SpeculativeControlError,
-    >  where Self: 'a {
+    >
+    where
+        Self: 'a,
+    {
         if self.control_snapshot_estimate(cache, state).is_none() {
             return Ok(None);
         }
@@ -924,7 +952,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>  where Self: 'a {
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'a,
+    {
         let state = state
             .map(|t| M::control_copy_tensor(t, ExternalAssistantTensorPlacement::Target, context))
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
@@ -946,7 +977,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         M::bind_prepared_input(&input, cache)?;
         let checkpoint = M::checkpoint(cache)?;
         let result = (|| {
@@ -990,7 +1024,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         _last_token: u32,
         _proposal_capacity: usize,
         context: M::Context<'context>,
-    ) -> Result<Self::DraftState, Self::Error>  where Self: 'context {
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'context,
+    {
         let state = Self::state_on_draft(state, context)?;
         Ok(AssistantState {
             shared_kv: state.shared_kv,
@@ -1004,7 +1041,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         state: &mut Self::DraftState,
         last_token: u32,
         context: M::Context<'context>,
-    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         let embedding = M::proposal_embedding(self.target, last_token, context)?;
         M::draft_step(self.assistant, &embedding, state, context)
             .map(eredu_core::speculative::SpeculativeProposalStep::CausalLogits)
@@ -1019,7 +1059,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         context: Self::Context<'a>,
-    ) -> Result<(), Self::Error>  where Self: 'a {
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
         M::restore_checkpoint(cache, checkpoint, context)
     }
 
@@ -1028,7 +1071,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         input_tokens: &[u32],
         cache: &mut Self::Cache,
         context: M::Context<'context>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'context {
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
+    where
+        Self: 'context,
+    {
         let inputs = M::target_tokens(input_tokens, context)?;
         let mut output = M::verify_target(
             self.target,
@@ -1058,7 +1104,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         output: &Self::Verification,
         index: usize,
         context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error>  where Self: 'a {
+    ) -> Result<Self::Logits, Self::Error>
+    where
+        Self: 'a,
+    {
         M::logits_row(&output.output().logits, index, context)
     }
 
@@ -1070,7 +1119,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         checkpoint: &Self::CacheCheckpoint,
         verified_inputs: usize,
         context: M::Context<'context>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
+    where
+        Self: 'context,
+    {
         let (verified, inputs) = output.into_parts();
         let input_len = M::sequence_len(&inputs)?;
         if verified_inputs == 0 || verified_inputs > input_len {

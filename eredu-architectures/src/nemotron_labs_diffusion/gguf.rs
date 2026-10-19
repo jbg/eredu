@@ -434,7 +434,11 @@ impl TextGgufPlan {
         Ok(Self {
             fingerprints,
             source: checkpoint.clone(),
-            text_config: { let mut text = config.clone(); text.vision = None; text },
+            text_config: {
+                let mut text = config.clone();
+                text.vision = None;
+                text
+            },
             config,
             checkpoint: plan,
             resolution,
@@ -461,7 +465,10 @@ impl TextGgufPlan {
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
         Ok(source)
     }
-    pub(crate) fn with_draft_adapter(mut self, adapter: super::adapter::DraftAdapterConfig) -> Self {
+    pub(crate) fn with_draft_adapter(
+        mut self,
+        adapter: super::adapter::DraftAdapterConfig,
+    ) -> Self {
         self.config = self.config.with_draft_adapter(adapter.clone());
         self.text_config = self.text_config.with_draft_adapter(adapter);
         self
@@ -472,7 +479,9 @@ impl TextGgufPlan {
         &self.config
     }
     /// Text-only execution retains vocabulary and equations without advertising image ingress.
-    pub fn text_config(&self) -> &FamilyConfig { &self.text_config }
+    pub fn text_config(&self) -> &FamilyConfig {
+        &self.text_config
+    }
     /// Strict physical catalog contract.
     pub fn checkpoint(&self) -> &GgufCheckpointPlan {
         &self.checkpoint

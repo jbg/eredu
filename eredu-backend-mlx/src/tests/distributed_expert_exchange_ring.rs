@@ -378,12 +378,12 @@ fn expert_exchange_ring_worker() {
         gate_up_proj_bias: PhysicalParam::new(None),
         gate_up_proj_scales: PhysicalParam::new(None),
         gate_up_proj_biases: PhysicalParam::new(None),
-                gate_up_proj_global_scale: PhysicalParam::new(None),
+        gate_up_proj_global_scale: PhysicalParam::new(None),
         down_proj: PhysicalParam::new(f32_array(&qwen_down, &[4, 1, 1], &stream)),
         down_proj_bias: PhysicalParam::new(None),
         down_proj_scales: PhysicalParam::new(None),
         down_proj_biases: PhysicalParam::new(None),
-                down_proj_global_scale: PhysicalParam::new(None),
+        down_proj_global_scale: PhysicalParam::new(None),
     };
     let expected_qwen = full_qwen
         .forward(&qwen_hidden, &qwen_ids, &qwen_weights, &stream)

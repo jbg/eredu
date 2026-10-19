@@ -1,6 +1,6 @@
 //! Complete decoding commands over the retained fixed-frame session transport.
 use super::*;
-use eredu_core::decoding::{DecodingCoordination, agree_decoding_controls};
+use eredu_core::decoding::{agree_decoding_controls, DecodingCoordination};
 
 const CONTROL_MAGIC: u32 = 0x4552_4443;
 // Modes contain validated scalar options only. This bound is independent of

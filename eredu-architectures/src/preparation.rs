@@ -143,7 +143,12 @@ pub const fn gguf_composite_artifact_plan(
     let (model_modalities, projector_modalities, projector_requirement) = match architecture {
         GgufArchitecture::NemotronLabsDiffusion => (
             InputModalities::TEXT,
-            Some(InputModalities { text: true, image: true, audio: false, video: false }),
+            Some(InputModalities {
+                text: true,
+                image: true,
+                audio: false,
+                video: false,
+            }),
             Optional,
         ),
         GgufArchitecture::VoiceChat => (
@@ -197,7 +202,12 @@ pub const fn gguf_composite_artifact_plan(
         ),
         GgufArchitecture::MuseSpark => (
             InputModalities::TEXT,
-            Some(InputModalities { text: true, image: true, audio: true, video: true }),
+            Some(InputModalities {
+                text: true,
+                image: true,
+                audio: true,
+                video: true,
+            }),
             Optional,
         ),
         GgufArchitecture::MuseGlimmer => (
@@ -383,8 +393,10 @@ pub fn prepared_safetensors_floating_state_dtype_source(
                 // admitted F32 scale establishes cache arithmetic even when
                 // embeddings and normalization gains retain BF16 storage.
                 "model.layers.0.self_attn.q_proj.weight_scale".into()
-            } else { "model.embed_tokens.weight".into() }
-        },
+            } else {
+                "model.embed_tokens.weight".into()
+            }
+        }
         SafetensorsModelConfig::DiffusionGemma(_) => "model.decoder.embed_tokens.weight".into(),
         SafetensorsModelConfig::Gemma4(_) | SafetensorsModelConfig::Muse(_) => {
             "model.language_model.embed_tokens.weight".into()
@@ -493,7 +505,12 @@ pub fn prepared_safetensors_capabilities(
             SafetensorsModelConfig::NemotronLabsDiffusion(args) => (
                 ParallelCapabilityPlan::TENSOR_PIPELINE,
                 false,
-                InputModalities { text: true, image: args.vision.is_some(), audio: false, video: false },
+                InputModalities {
+                    text: true,
+                    image: args.vision.is_some(),
+                    audio: false,
+                    video: false,
+                },
                 0,
             ),
             SafetensorsModelConfig::DeepSeekV3(args) => {
@@ -572,8 +589,7 @@ pub fn prepared_safetensors_capabilities(
                         text: true,
                         image: true,
                         audio: false,
-                        video: args.weight_convention
-                            == crate::muse::WeightConvention::HuggingFace,
+                        video: args.weight_convention == crate::muse::WeightConvention::HuggingFace,
                     },
                     0,
                 )

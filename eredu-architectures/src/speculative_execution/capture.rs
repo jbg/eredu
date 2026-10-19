@@ -1,6 +1,6 @@
 use eredu_core::{
-    ArchitectureDescriptor, ArchitectureNodeKind, capture::CaptureError,
-    component::ComponentExecutionScopeKind,
+    capture::CaptureError, component::ComponentExecutionScopeKind, ArchitectureDescriptor,
+    ArchitectureNodeKind,
 };
 use eredu_runtime::capture::SpeculativeCaptureScope;
 

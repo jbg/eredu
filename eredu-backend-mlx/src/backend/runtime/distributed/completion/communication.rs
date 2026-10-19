@@ -445,7 +445,10 @@ impl MlxCommunicationCompletion {
                 ))
             })?;
             if actual != header.expected {
-                let mismatch = actual.iter().zip(&header.expected).position(|(actual, expected)| actual != expected)
+                let mismatch = actual
+                    .iter()
+                    .zip(&header.expected)
+                    .position(|(actual, expected)| actual != expected)
                     .unwrap_or(actual.len().min(header.expected.len()));
                 return Err(safemlx::error::Exception::custom(format!(
                     "received boundary frame header differs from the selected route/schema/role contract at byte {mismatch}: received {:?}, expected {:?} (lengths {} / {})",

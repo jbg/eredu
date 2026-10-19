@@ -52,7 +52,8 @@ where
         stage: eredu_core::run_preparation::TextPreparationStage,
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
         context.agree_text_preparation(stage, status)
     }
 
@@ -63,11 +64,14 @@ where
         context.coordinate_decoding_control(local)
     }
 
-    fn control_logits_estimate(logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+    fn control_logits_estimate(
+        logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         super::state_snapshot::estimate_array(logits)
     }
     type NeuralBackend = MlxNeuralBackend;
-    type ParameterPolicy = super::parameter_policy::MlxAssistantParameterPolicy<A::Unit<MlxNeuralBackend>>;
+    type ParameterPolicy =
+        super::parameter_policy::MlxAssistantParameterPolicy<A::Unit<MlxNeuralBackend>>;
     type AttentionCache = ConcatKeyValueCache;
     type Target = dyn ErasedExternalPredictionExecutable;
     type Assistant = MlxExternalAssistant<A>;
@@ -143,7 +147,9 @@ where
         &assistant.config
     }
 
-    fn module(assistant: &mut Self::Assistant) -> &mut A::Execution<Self::NeuralBackend, Self::ParameterPolicy> {
+    fn module(
+        assistant: &mut Self::Assistant,
+    ) -> &mut A::Execution<Self::NeuralBackend, Self::ParameterPolicy> {
         &mut assistant.module.inner
     }
 

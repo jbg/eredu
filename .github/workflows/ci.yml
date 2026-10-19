@@ -22,6 +22,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  format:
+    name: Rust formatting
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
+      - name: Check workspace formatting
+        run: cargo fmt --all -- --check
+
   tests:
     uses: ./.github/workflows/preflight.yml
     with:

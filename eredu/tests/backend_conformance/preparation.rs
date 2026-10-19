@@ -651,7 +651,12 @@ fn invalid_speculation_options_do_not_prepare_native_input() {
             let error =
                 run_speculative_with_scheduler(&mut model, &chat, settings, controlled, scheduler)
                     .unwrap_err();
-            assert!(error.downcast_ref::<eredu_core::GenerationError>().is_some(), "{error}");
+            assert!(
+                error
+                    .downcast_ref::<eredu_core::GenerationError>()
+                    .is_some(),
+                "{error}"
+            );
             assert!(snapshot().votes.is_empty());
             assert!(snapshot().native.is_empty());
             assert_eq!(snapshot().forwards, 0);

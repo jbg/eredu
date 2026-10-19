@@ -433,7 +433,9 @@ impl DistributedBackend for MockBackend {
 }
 
 impl TextGenerationBackend for MockBackend {
-    fn decoding_capabilities(runtime: &ModelRuntime<Self>) -> eredu_core::decoding::DecodingCapabilities {
+    fn decoding_capabilities(
+        runtime: &ModelRuntime<Self>,
+    ) -> eredu_core::decoding::DecodingCapabilities {
         eredu_core::decoding::DecodingCapabilities {
             autoregressive: runtime.session().switchable || !runtime.session().iterative,
             diffusion: runtime.session().switchable || runtime.session().iterative,
@@ -460,7 +462,9 @@ impl TextGenerationBackend for MockBackend {
         _: &eredu_core::PendingTextInput<Vec<u32>, MockToken>,
         state: &Self::TextGenerationState,
     ) -> eredu_core::TextOperationKind {
-        if runtime.session().switchable { return decoding_modes::operation_kind(state); }
+        if runtime.session().switchable {
+            return decoding_modes::operation_kind(state);
+        }
         use eredu_core::{
             refinement::{GenerationPhase, PredictionScoreKind},
             TextOperationKind,
@@ -627,7 +631,9 @@ impl TextGenerationBackend for MockBackend {
         >,
         eredu_core::TextOperationError<Self::Error>,
     > {
-        if runtime.session().switchable { return decoding_modes::submit(runtime, input, decision, state); }
+        if runtime.session().switchable {
+            return decoding_modes::submit(runtime, input, decision, state);
+        }
         if runtime.session().iterative {
             return iterative::submit(runtime, input, decision, state);
         }
@@ -1113,8 +1119,14 @@ struct MockSpeculativeExecutor {
 const CONTROL_REJECTION_PROMPT_TOKEN: u32 = u32::MAX - 32;
 
 impl SpeculativeExecutor for MockSpeculativeExecutor {
-    fn logits_snapshot_estimate(&self, _: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        Some(eredu_core::execution_control::SnapshotEstimate { retained_bytes: 4, copy_bytes: 4 })
+    fn logits_snapshot_estimate(
+        &self,
+        _: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: 4,
+            copy_bytes: 4,
+        })
     }
     fn trim_parameter_conversions(
         &mut self,
@@ -1741,7 +1753,8 @@ impl SpeculativeGenerationBackend for MockBackend {
                     SpeculativeSemanticConstraint::semantic(lane.take_semantic()),
                     SpeculativeCallbackPublisher::semantic(lane.take_on_event()),
                     lane.take_cancellation(),
-                ).with_control_handle(lane.take_control_handle()),
+                )
+                .with_control_handle(lane.take_control_handle()),
                 SpeculativeRandomness::new(None, None),
             ));
         }

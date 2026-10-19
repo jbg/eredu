@@ -220,8 +220,12 @@ impl GenerationSequence {
     pub fn with_remaining(&self, remaining: usize) -> Self {
         let mut child = self.clone();
         child.max_tokens = child.tokens.len().saturating_add(remaining);
-        if child.finish_reason == Some(FinishReason::MaxTokens) && remaining > 0 { child.finish_reason = None; }
-        if remaining == 0 && child.finish_reason.is_none() { child.finish_reason = Some(FinishReason::MaxTokens); }
+        if child.finish_reason == Some(FinishReason::MaxTokens) && remaining > 0 {
+            child.finish_reason = None;
+        }
+        if remaining == 0 && child.finish_reason.is_none() {
+            child.finish_reason = Some(FinishReason::MaxTokens);
+        }
         child
     }
 
@@ -331,12 +335,13 @@ impl VerificationRound {
     /// Starts a target verification round. Zero proposals selects one causal
     /// target token through the same continuation and cache-commit boundary.
     pub fn new(proposal_count: usize) -> Result<Self, GenerationError> {
-        let committed_capacity = proposal_count.checked_add(1).ok_or(
-            GenerationError::ProposalCapacityExceeded {
-                proposed: proposal_count,
-                capacity: usize::MAX - 1,
-            },
-        )?;
+        let committed_capacity =
+            proposal_count
+                .checked_add(1)
+                .ok_or(GenerationError::ProposalCapacityExceeded {
+                    proposed: proposal_count,
+                    capacity: usize::MAX - 1,
+                })?;
         Ok(Self {
             proposal_count,
             accepted: 0,

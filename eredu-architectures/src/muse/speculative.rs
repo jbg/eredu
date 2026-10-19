@@ -39,7 +39,8 @@ where
         stage: eredu_core::run_preparation::TextPreparationStage,
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
         M::agree_text_preparation(stage, status, context)
     }
 
@@ -650,8 +651,11 @@ pub trait ExternalMechanisms: 'static {
         _stage: eredu_core::run_preparation::TextPreparationStage,
         status: eredu_core::run_preparation::TextPreparationStatus,
         _context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
-        use eredu_core::run_preparation::{TextPreparationOutcome as O, TextPreparationStatus as S};
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        use eredu_core::run_preparation::{
+            TextPreparationOutcome as O, TextPreparationStatus as S,
+        };
         Ok(match status {
             S::Ready => O::Ready,
             S::Cancelled => O::Cancelled,
@@ -1034,7 +1038,8 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         local: Vec<eredu_core::SpeculativeScheduleState>,
         context: Self::Context<'context>,
     ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
-    where Self: 'context,
+    where
+        Self: 'context,
     {
         M::coordinate_speculative_step(local, context)
     }
@@ -1045,7 +1050,8 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: Self::Context<'context>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    where Self: 'context,
+    where
+        Self: 'context,
     {
         M::agree_text_preparation(stage, status, context)
     }
@@ -1055,7 +1061,8 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         local: eredu_core::decoding::DecodingCoordination,
         context: Self::Context<'context>,
     ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>
-    where Self: 'context,
+    where
+        Self: 'context,
     {
         M::coordinate_decoding_control(local, context)
     }

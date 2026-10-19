@@ -658,7 +658,12 @@ pub struct MlxHybridState {
 impl MlxHybridState {
     /// Explicit state-free owner; no sentinel layers or native cache allocation.
     pub(crate) fn stateless() -> Self {
-        Self { layout: None, global_layer_start: 0, layers: Vec::new(), manager: None }
+        Self {
+            layout: None,
+            global_layer_start: 0,
+            layers: Vec::new(),
+            manager: None,
+        }
     }
     pub(super) fn has_same_snapshot_layout(&self, other: &Self) -> bool {
         self.layout == other.layout
@@ -1215,18 +1220,39 @@ impl MlxHybridState {
     }
 
     /// Retains only verified full-attention K/V, without replaying target equations.
-    pub(crate) fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception> {
+    pub(crate) fn retain_causal_prefix(
+        &mut self,
+        length: i32,
+        stream: &Stream,
+    ) -> Result<bool, Exception> {
         // Stateless media owners retain no decoder positions and therefore do
         // not constrain another pipeline owner's accepted causal frontier.
-        if self.layout.as_ref().is_none_or(|layout| layout.layers().iter().all(|policy| matches!(policy, LayerCachePolicy::NoState))) {
+        if self.layout.as_ref().is_none_or(|layout| {
+            layout
+                .layers()
+                .iter()
+                .all(|policy| matches!(policy, LayerCachePolicy::NoState))
+        }) {
             return Ok(true);
         }
-        if !self.layout().layers().iter().all(|policy| policy.fixed_state().is_empty() && policy.append_streams().is_empty() && match policy {
-            LayerCachePolicy::NoState => true,
-            LayerCachePolicy::KeyValue { attention, .. } => attention.sliding_window_i32().is_ok_and(|window| window.is_none()),
-            _ => false,
-        }) { return Ok(false); }
-        if length < 0 || length > self.offset() { return Err(Exception::custom("causal prefix is outside the verified frontier")); }
+        if !self.layout().layers().iter().all(|policy| {
+            policy.fixed_state().is_empty()
+                && policy.append_streams().is_empty()
+                && match policy {
+                    LayerCachePolicy::NoState => true,
+                    LayerCachePolicy::KeyValue { attention, .. } => attention
+                        .sliding_window_i32()
+                        .is_ok_and(|window| window.is_none()),
+                    _ => false,
+                }
+        }) {
+            return Ok(false);
+        }
+        if length < 0 || length > self.offset() {
+            return Err(Exception::custom(
+                "causal prefix is outside the verified frontier",
+            ));
+        }
         let saved = self.deep_clone_state()?;
         for layer in &mut self.layers {
             if let Some(MlxHybridAttentionState::KeyValue(cache)) = &mut layer.attention {
@@ -1297,7 +1323,8 @@ impl MlxHybridState {
     pub fn segment_range(&self, segment: &str) -> Result<Range<usize>, Exception> {
         let segment =
             StateSegmentId::new(segment).map_err(|error| Exception::custom(error.to_string()))?;
-        self.layout.as_ref()
+        self.layout
+            .as_ref()
             .and_then(|layout| layout.segment(&segment))
             .map(StateSegmentSpec::layers)
             .ok_or_else(|| Exception::custom(format!("unknown hybrid state segment {segment:?}")))
@@ -1337,7 +1364,13 @@ impl MlxHybridState {
         for (layer, ((state, policy), delta)) in self
             .layers
             .iter_mut()
-            .zip(self.layout.as_ref().ok_or_else(|| Exception::custom("stateless owner has no prompt cache"))?.layers().iter())
+            .zip(
+                self.layout
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("stateless owner has no prompt cache"))?
+                    .layers()
+                    .iter(),
+            )
             .zip(layer_prefix_offsets)
             .enumerate()
         {
@@ -1397,7 +1430,8 @@ impl MlxHybridState {
         for (relative, layer) in range.enumerate() {
             let state = &mut self.layers[layer];
             let policy = self
-                .layout.as_ref()
+                .layout
+                .as_ref()
                 .ok_or_else(|| Exception::custom("stateless owner has no prompt cache"))?
                 .layers()
                 .get(layer)
@@ -1572,10 +1606,14 @@ impl RuntimeState<MlxNeuralBackend> for MlxHybridState {
     type RetainedValues<'a> = std::vec::IntoIter<&'a MlxTensor>;
 
     fn layout(&self) -> &StateLayout {
-        self.layout.as_ref().expect("layout requires stateful hybrid storage")
+        self.layout
+            .as_ref()
+            .expect("layout requires stateful hybrid storage")
     }
 
-    fn optional_layout(&self) -> Option<&StateLayout> { self.layout.as_ref() }
+    fn optional_layout(&self) -> Option<&StateLayout> {
+        self.layout.as_ref()
+    }
 
     fn retained_values(
         &self,

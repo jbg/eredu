@@ -3,8 +3,9 @@
 use std::marker::PhantomData;
 
 use eredu_core::speculative::{
-    AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationOrigin,
-    SpeculativeActivationPhase, SpeculativeControlError, GenerationExecutorTypes, GenerationExecutorCacheFactory,
+    AdmittedSpeculativeActivations, GenerationExecutorCacheFactory, GenerationExecutorTypes,
+    SpeculativeActivationCapture, SpeculativeActivationOrigin, SpeculativeActivationPhase,
+    SpeculativeControlError,
 };
 use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill,
@@ -361,11 +362,18 @@ pub enum EmbeddedPredictionCacheAccessError<E> {
 /// policy. The selected execution context determines where each operation runs.
 pub trait SpeculativeTensorMechanisms: 'static {
     /// Complete immutable score-row backing allowance for settled handoffs.
-    fn control_logits_estimate(_logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> { None }
+    fn control_logits_estimate(
+        _logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        None
+    }
     /// Source-free mode agreement through the retained request transport.
     fn coordinate_decoding_control<'a>(
-        local: eredu_core::decoding::DecodingCoordination, _context: Self::Context<'a>,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> { Ok(local) }
+        local: eredu_core::decoding::DecodingCoordination,
+        _context: Self::Context<'a>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
+        Ok(local)
+    }
     /// Native retained tensor value.
     type Tensor: Clone;
     /// Native logits value consumed by the selected sampling mechanism.
@@ -1707,13 +1715,19 @@ where
     I: ReplicatedPredictionInput<A, B, S, M::Error, Input = N::Input>,
     M: SpeculativeTensorMechanisms<Tensor = B::Tensor>,
 {
-    fn new_cache<'a>(&mut self, _context: Self::Context<'a>) -> Result<Self::Cache, Self::Error>  where Self: 'a {
+    fn new_cache<'a>(&mut self, _context: Self::Context<'a>) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'a,
+    {
         self.strategy_mut().new_cache()
     }
 
     fn bind_context<'a>(
         context: <N::ExecutorTypes as GenerationExecutorTypes>::Context<'a>,
-    ) -> Self::Context<'a>  where Self: 'a {
+    ) -> Self::Context<'a>
+    where
+        Self: 'a,
+    {
         N::executor_context(context)
     }
 }
@@ -1846,12 +1860,20 @@ where
     S: EmbeddedPredictionStrategy<M>,
 {
     fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
-        eredu_core::decoding::DecodingCapabilities::causal_drafting(self.max_proposals()).with_completion_support(
-            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::NativeCancel),
-            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::QuarantineUntilComplete),
-        )
+        eredu_core::decoding::DecodingCapabilities::causal_drafting(self.max_proposals())
+            .with_completion_support(
+                M::Completion::supports_cancellation(
+                    eredu_core::CompletionCancellationMode::NativeCancel,
+                ),
+                M::Completion::supports_cancellation(
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                ),
+            )
     }
-    fn logits_snapshot_estimate(&self, logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+    fn logits_snapshot_estimate(
+        &self,
+        logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         M::control_logits_estimate(logits)
     }
     type Input = S::Input;
@@ -1859,9 +1881,15 @@ where
     type TargetState = EmbeddedPredictionTargetState<M::Tensor, S::PredictionCache>;
     type DraftState = EmbeddedPredictionDraftState<M::Tensor, S::PredictionCache>;
     type CacheCheckpoint = EmbeddedPredictionCheckpoint<S::TargetCache>;
-    type Verification = eredu_runtime::speculative::CausalVerification<EmbeddedPredictionOutput<M::Tensor>, M::Tensor>;
+    type Verification = eredu_runtime::speculative::CausalVerification<
+        EmbeddedPredictionOutput<M::Tensor>,
+        M::Tensor,
+    >;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a> where Self: 'a;
+    type Context<'a>
+        = M::Context<'a>
+    where
+        Self: 'a;
     type Completion = M::Completion;
     type Telemetry = S::Telemetry;
     type Error = M::Error;
@@ -1943,7 +1971,10 @@ where
         cache: &Self::Cache,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, SpeculativeControlError>  where Self: 'a {
+    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, SpeculativeControlError>
+    where
+        Self: 'a,
+    {
         if self.control_snapshot_estimate(cache, state).is_none() {
             return Ok(None);
         }
@@ -1969,7 +2000,10 @@ where
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<Self::TargetState>, SpeculativeControlError>  where Self: 'a {
+    ) -> Result<Option<Self::TargetState>, SpeculativeControlError>
+    where
+        Self: 'a,
+    {
         let prepared = match (self.observers.internal.as_mut(), saved.activations.as_ref()) {
             (Some(observer), Some(saved)) => Some(observer.prepare_activation_restore(saved)?),
             (None, None) => None,
@@ -2003,9 +2037,14 @@ where
             .readmit_activation_interventions(plan)
     }
 
-    fn coordinate_decoding_control<'a>(&mut self,
-        local: eredu_core::decoding::DecodingCoordination, context: M::Context<'a>,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>  where Self: 'a {
+    fn coordinate_decoding_control<'a>(
+        &mut self,
+        local: eredu_core::decoding::DecodingCoordination,
+        context: M::Context<'a>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
         M::coordinate_decoding_control(local, context)
     }
 
@@ -2013,7 +2052,10 @@ where
         &mut self,
         local: Vec<eredu_core::SpeculativeScheduleState>,
         context: M::Context<'a>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>  where Self: 'a {
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
         M::coordinate_speculative_step(local, context)
     }
 
@@ -2023,7 +2065,9 @@ where
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: M::Context<'a>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-     where Self: 'a {
+    where
+        Self: 'a,
+    {
         M::agree_text_preparation(stage, status, context)
     }
 
@@ -2032,7 +2076,10 @@ where
         plan: AdmittedSpeculativeActivations,
         request: eredu_core::SpeculativeRequestId,
         context: M::Context<'a>,
-    ) -> Result<(), SpeculativeControlError>  where Self: 'a {
+    ) -> Result<(), SpeculativeControlError>
+    where
+        Self: 'a,
+    {
         if self.execution_started || self.prior_internal.is_some() {
             return Err(SpeculativeControlError::Unsupported(
                 "activation authority must be installed once, before speculative execution",
@@ -2097,7 +2144,10 @@ where
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         self.execution_started = true;
         if self.observers.internal.is_some() && !self.strategy.supports_internal_observations() {
             return Err(M::observation_error(
@@ -2137,7 +2187,10 @@ where
         last_token: u32,
         proposal_capacity: usize,
         context: M::Context<'context>,
-    ) -> Result<Self::DraftState, Self::Error>  where Self: 'context {
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'context,
+    {
         let mut prediction_cache = DraftStateTransaction::fork(&state.prediction_cache);
         let fused_logits = if proposal_capacity == 0 {
             None
@@ -2173,7 +2226,10 @@ where
         state: &mut Self::DraftState,
         last_token: u32,
         context: M::Context<'context>,
-    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         if state.depth.max(state.fused_cursor) >= state.proposal_capacity {
             return Err(M::fused_prediction_exhausted());
         }
@@ -2222,7 +2278,10 @@ where
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         context: Self::Context<'a>,
-    ) -> Result<(), Self::Error>  where Self: 'a {
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
         S::restore_target_checkpoint(cache, &checkpoint.cache, context)
     }
 
@@ -2231,7 +2290,10 @@ where
         input_tokens: &[u32],
         cache: &mut Self::Cache,
         context: M::Context<'context>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'context {
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
+    where
+        Self: 'context,
+    {
         let inputs = M::target_tokens(input_tokens, context)?;
         let mut output = self.strategy.verify_target(
             &inputs,
@@ -2259,7 +2321,10 @@ where
         output: &Self::Verification,
         index: usize,
         context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error>  where Self: 'a {
+    ) -> Result<Self::Logits, Self::Error>
+    where
+        Self: 'a,
+    {
         M::logits_row(output.output().logits(), index, context)
     }
 
@@ -2271,7 +2336,10 @@ where
         checkpoint: &Self::CacheCheckpoint,
         verified_inputs: usize,
         context: M::Context<'context>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
+    where
+        Self: 'context,
+    {
         let (verified, inputs) = output.into_parts();
         let result = (|| {
             let input_len = M::sequence_len(&inputs)?;
@@ -2297,8 +2365,7 @@ where
                 )?;
             }
             if verified_inputs > 1 {
-                let captures =
-                    M::tensor_prefix(verified.capture(), verified_inputs - 1, context)?;
+                let captures = M::tensor_prefix(verified.capture(), verified_inputs - 1, context)?;
                 let tokens = M::token_range(&inputs, 1, verified_inputs, context)?;
                 self.strategy.advance_prediction_cache(
                     &captures,

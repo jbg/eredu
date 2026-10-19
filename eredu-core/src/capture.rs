@@ -802,7 +802,7 @@ impl AdmittedCapturePlan {
             }
             (None, None) => match (phase, self.prefill_span) {
                 (CapturePhase::Prefill, Some(span)) => Ok(CaptureInvocationShape {
-            media: None,
+                    media: None,
                     batch: self.request.batch,
                     sequence: span.end - span.start,
                     context: Some(span.end),

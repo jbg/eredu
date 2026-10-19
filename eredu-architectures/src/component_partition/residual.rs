@@ -1,9 +1,9 @@
 //! Replicated channelwise residual cycles on their invocation owners.
 use super::*;
 use eredu_core::{
-    SymbolicDimension,
     capture::CaptureError,
     component::{ComponentResidualCombination, ComponentResidualCycle},
+    SymbolicDimension,
 };
 
 pub(super) fn register(

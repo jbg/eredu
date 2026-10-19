@@ -63,11 +63,13 @@ fn fixture_conditioned_profile(scratch: MemoryBytes) -> ConditionedAssistantMemo
         },
         residency: eredu_runtime::LayerWeightResidency::FullyResident,
         parameter_bounds: None,
-        parameter_loading: Some(eredu_runtime::memory_forecast::ParameterLoadingMemoryProfile {
-            source_payload: MemoryBytes::exact(0),
-            host_workspace: MemoryBytes::exact(0),
-            execution_workspace: MemoryBytes::exact(0),
-        }),
+        parameter_loading: Some(
+            eredu_runtime::memory_forecast::ParameterLoadingMemoryProfile {
+                source_payload: MemoryBytes::exact(0),
+                host_workspace: MemoryBytes::exact(0),
+                execution_workspace: MemoryBytes::exact(0),
+            },
+        ),
         host_execution: false,
         native_workspace: scratch,
     }
@@ -223,7 +225,11 @@ fn conditioned_parameter_pools_use_capacity_and_cache_limits_without_hiding_unkn
     // Source backing belongs to the host pool; native intermediates belong to
     // execution. Unified and host execution combine both contributions once.
     for (semantics, host_execution, expected) in [
-        (PhysicalMemorySemantics::SeparateTiers, false, vec![170, 131]),
+        (
+            PhysicalMemorySemantics::SeparateTiers,
+            false,
+            vec![170, 131],
+        ),
         (PhysicalMemorySemantics::Unified, false, vec![301]),
         (PhysicalMemorySemantics::SeparateTiers, true, vec![301]),
     ] {
@@ -237,7 +243,11 @@ fn conditioned_parameter_pools_use_capacity_and_cache_limits_without_hiding_unkn
         );
         let (request, _) = prepare(profile).unwrap();
         assert_eq!(
-            request.domains.iter().map(|d| d.staging.upper_bytes.unwrap()).collect::<Vec<_>>(),
+            request
+                .domains
+                .iter()
+                .map(|d| d.staging.upper_bytes.unwrap())
+                .collect::<Vec<_>>(),
             expected,
         );
     }

@@ -19,7 +19,7 @@ mod communication_tests;
 
 pub(crate) use group::{
     all_gather, all_gather_for, all_gather_unchecked, all_sum, all_sum_for, all_to_all_v,
-    payload_free_all_sum_for, recv, recv_like, send, broadcast_boundary_frame, Group,
+    broadcast_boundary_frame, payload_free_all_sum_for, recv, recv_like, send, Group,
 };
 
 #[cfg(test)]

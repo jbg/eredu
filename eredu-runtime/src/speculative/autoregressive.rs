@@ -2,10 +2,10 @@
 //!
 //! Models retain their ordinary equations, residency and state geometry. This
 //! mechanism owns only proposal isolation, verification and accepted-prefix replay.
-use super::{CausalVerification, causal_verification};
+use super::{causal_verification, CausalVerification};
 use eredu_core::{
-    BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
-    execution_control::SnapshotEstimate,
+    execution_control::SnapshotEstimate, BoundedCompletion, SpeculativeCommit, SpeculativeExecutor,
+    SpeculativePrefill, Submission,
 };
 
 mod refinement;
@@ -295,7 +295,9 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         temperature: f32,
         context: Self::Context<'a>,
     ) -> Result<Option<eredu_core::speculative::RefinementProgress<Self::Logits>>, Self::Error>
-     where Self: 'a {
+    where
+        Self: 'a,
+    {
         let Some(prefix) = &state.target else {
             return Ok(None);
         };
@@ -317,7 +319,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         &mut self,
         local: Vec<eredu_core::SpeculativeScheduleState>,
         context: Self::Context<'context>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>  where Self: 'context {
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
+    where
+        Self: 'context,
+    {
         M::coordinate_speculative_step(local, context)
     }
     fn agree_text_preparation<'context>(
@@ -326,14 +331,19 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: Self::Context<'context>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-     where Self: 'context {
+    where
+        Self: 'context,
+    {
         M::agree_text_preparation(stage, status, context)
     }
     fn coordinate_decoding_control<'context>(
         &mut self,
         local: eredu_core::decoding::DecodingCoordination,
         context: Self::Context<'context>,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>  where Self: 'context {
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>
+    where
+        Self: 'context,
+    {
         M::coordinate_decoding_control(local, context)
     }
     type Input = AutoregressiveInput<M::Input, R::State>;
@@ -343,7 +353,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
     type CacheCheckpoint = AutoregressiveCheckpoint<M::Checkpoint>;
     type Verification = CausalVerification<M::Output>;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a> where Self: 'a;
+    type Context<'a>
+        = M::Context<'a>
+    where
+        Self: 'a;
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
@@ -361,7 +374,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         let (output, count) = M::prefill(
             self.target,
             &input.input,
@@ -405,7 +421,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         _: u32,
         capacity: usize,
         _: Self::Context<'context>,
-    ) -> Result<Self::DraftState, Self::Error>  where Self: 'context {
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'context,
+    {
         if capacity > self.capacity.get() {
             return Err(M::invalid("invalid independent draft proposal capacity"));
         }
@@ -420,7 +439,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         proposal: &mut Self::DraftState,
         last_token: u32,
         context: Self::Context<'context>,
-    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'context {
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>
+    where
+        Self: 'context,
+    {
         let mut state = M::restore(&proposal.saved, context)?;
         let output = M::decode(
             self.draft,
@@ -446,7 +468,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         cache: &mut Self::Cache,
         saved: &Self::CacheCheckpoint,
         context: Self::Context<'context>,
-    ) -> Result<(), Self::Error>  where Self: 'context {
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'context,
+    {
         // Prepare both copies before replacing either installed state.
         let target = M::restore(&saved.target, context)?;
         let draft = M::restore(&saved.draft, context)?;
@@ -459,7 +484,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         tokens: &[u32],
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'context {
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
+    where
+        Self: 'context,
+    {
         if tokens.is_empty() || tokens.len() > self.capacity.get().saturating_add(1) {
             return Err(M::invalid("invalid independent draft verification width"));
         }
@@ -471,7 +499,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         output: &Self::Verification,
         index: usize,
         context: Self::Context<'context>,
-    ) -> Result<Self::Logits, Self::Error>  where Self: 'context {
+    ) -> Result<Self::Logits, Self::Error>
+    where
+        Self: 'context,
+    {
         causal_verification::logits::<M>(output, index, context)
     }
 
@@ -483,7 +514,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         saved: &Self::CacheCheckpoint,
         verified: usize,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'context {
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
+    where
+        Self: 'context,
+    {
         if verified == 0 || verified > output.inputs.len() {
             return Err(M::invalid("invalid independent verification commitment"));
         }
@@ -637,7 +671,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
     ) -> Result<
         Option<(Self::CacheCheckpoint, Self::TargetState)>,
         eredu_core::speculative::SpeculativeControlError,
-    >  where Self: 'context {
+    >
+    where
+        Self: 'context,
+    {
         Ok(Some((
             self.checkpoint(cache)
                 .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
@@ -651,7 +688,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
         context: Self::Context<'context>,
-    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>  where Self: 'context {
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'context,
+    {
         self.restore_checkpoint(cache, saved, context)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         Ok(Some(state.clone()))

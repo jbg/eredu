@@ -2149,18 +2149,19 @@ mod tests {
         let source = ArtifactSource::new(&primary)
             .with_projector(CompanionSelection::Explicit(exact.clone()));
         let selected = resolve_selected_gguf_companions(&source, &[requirement.clone()]).unwrap();
-        assert_eq!(selected[&ArtifactCompanionRole::MediaProjector].path(), exact);
+        assert_eq!(
+            selected[&ArtifactCompanionRole::MediaProjector].path(),
+            exact
+        );
         // A stale explicit path cannot silently switch to a discovered file.
         std::fs::remove_file(&exact).unwrap();
         assert!(resolve_selected_gguf_companions(&source, &[requirement.clone()]).is_err());
         write_gguf_fixture(&exact, GgmlType::Q8_0);
         assert!(resolve_selected_gguf_companions(&source, &[requirement.clone()]).is_err());
         let disabled = ArtifactSource::new(&primary).with_projector(CompanionSelection::Disabled);
-        assert!(
-            resolve_selected_gguf_companions(&disabled, &[requirement])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(resolve_selected_gguf_companions(&disabled, &[requirement])
+            .unwrap()
+            .is_empty());
         let required = GgufCompanionRequirement::new(
             ArtifactCompanionRole::MediaProjector,
             true,
@@ -2180,7 +2181,9 @@ mod tests {
             Err(ArtifactError::UndeclaredGgufCompanion { .. })
         ));
         let reset = source.with_projector(CompanionSelection::Discover);
-        assert!(resolve_selected_gguf_companions(&reset, &[]).unwrap().is_empty());
+        assert!(resolve_selected_gguf_companions(&reset, &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

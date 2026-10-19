@@ -132,10 +132,13 @@ pub fn generation_memory_geometry(
         plan.safetensors_architecture().map(|p| p.model()),
         plan.gguf_plan().map(|p| p.model()),
     ) {
-        (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => crate::capability::nemotron_labs_diffusion(plan.text_config(), false)?,
+        (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => {
+            crate::capability::nemotron_labs_diffusion(plan.text_config(), false)?
+        }
 
-        (Some(SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) =>
-            crate::capability::nemotron_labs_diffusion(args, args.vision.is_some())?,
+        (Some(SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) => {
+            crate::capability::nemotron_labs_diffusion(args, args.vision.is_some())?
+        }
         (Some(SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(GgufModelConfig::Llama(args))) => crate::capability::llama(args)?,
         (Some(SafetensorsModelConfig::Qwen(args)), None)
@@ -163,9 +166,7 @@ pub fn generation_memory_geometry(
         (Some(SafetensorsModelConfig::KimiLinear(args)), None)
         | (None, Some(GgufModelConfig::KimiLinear(args))) => crate::capability::kimi_linear(args)?,
         (Some(SafetensorsModelConfig::Muse(args)), None)
-        | (None, Some(GgufModelConfig::Muse(args))) => {
-            crate::capability::muse(args)?
-        }
+        | (None, Some(GgufModelConfig::Muse(args))) => crate::capability::muse(args)?,
         (Some(SafetensorsModelConfig::Lfm2(args)), None)
         | (None, Some(GgufModelConfig::Lfm2(args))) => crate::capability::lfm2(args)?,
         (Some(SafetensorsModelConfig::NemotronH(args)), None)

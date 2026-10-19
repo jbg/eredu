@@ -4557,9 +4557,11 @@ impl RoutedGroupedOperationValidation for GatedProductOperation {
                 shapes.insert(bias.id.to_string(), shape[..shape.len() - 1].to_vec());
             }
             if let Some(global) = projection.format().global_scale() {
-                let mut global_shape = shape[..shape.len()-2].to_vec();
+                let mut global_shape = shape[..shape.len() - 2].to_vec();
                 let parts = projection.format().row_layout().partitions();
-                if parts > 1 { global_shape.push(parts); }
+                if parts > 1 {
+                    global_shape.push(parts);
+                }
                 shapes.insert(global.id.to_string(), global_shape);
             }
             if let Some(companion_shape) = grouped_companion_shape(projection.format(), &shape) {
@@ -4740,9 +4742,11 @@ impl RoutedGroupedOperationValidation for Relu2Operation {
                 shapes.insert(bias.id.to_string(), shape[..shape.len() - 1].to_vec());
             }
             if let Some(global) = projection.format().global_scale() {
-                let mut global_shape = shape[..shape.len()-2].to_vec();
+                let mut global_shape = shape[..shape.len() - 2].to_vec();
                 let parts = projection.format().row_layout().partitions();
-                if parts > 1 { global_shape.push(parts); }
+                if parts > 1 {
+                    global_shape.push(parts);
+                }
                 shapes.insert(global.id.to_string(), global_shape);
             }
             if let Some(companion_shape) = grouped_companion_shape(projection.format(), &shape) {

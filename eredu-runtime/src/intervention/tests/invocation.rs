@@ -85,7 +85,7 @@ fn setup(captures: u64, sliced: bool) -> (CaptureSession, CaptureDiscovery, Inte
 }
 fn shape(sequence: u64) -> CaptureInvocationShape {
     CaptureInvocationShape {
-            media: None,
+        media: None,
         batch: 1,
         sequence,
         context: None,

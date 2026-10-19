@@ -4,14 +4,14 @@ use std::num::NonZeroU32;
 
 use eredu_core::refinement::{MaskedRefinementConfig, MaskedSampling};
 use eredu_runtime::{
+    generation::refinement::{masked, MaskedRefinementStep, RefinementBackend},
     SamplingBackend, TokenDomain,
-    generation::refinement::{MaskedRefinementStep, RefinementBackend, masked},
 };
 use safemlx::ops::indexing::TryIndexOp;
-use safemlx::{Array, Dtype, Stream, error::Exception};
+use safemlx::{error::Exception, Array, Dtype, Stream};
 
 use super::MlxSamplingBackend;
-use crate::{MlxTensor, backend::random::RandomState};
+use crate::{backend::random::RandomState, MlxTensor};
 
 fn entropy(logits: &MlxTensor, stream: &Stream) -> Result<Array, Exception> {
     let scores = logits.as_array().as_dtype(Dtype::Float32, stream)?;
@@ -707,7 +707,7 @@ mod tests {
     fn finalization_preserves_an_unmasked_sample_until_constraints_replace_it() {
         use eredu_core::TokenFilter;
         use eredu_runtime::generation::refinement::finalization::{
-            RefinementSelection, finalize_refinement_position,
+            finalize_refinement_position, RefinementSelection,
         };
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let scores = MlxTensor::from_array(Array::from_slice(&[4.0f32, 1.0, 0.0], &[1, 3]));
@@ -756,9 +756,9 @@ mod tests {
 
     #[test]
     fn constrained_finalization_uses_each_final_position_domain() {
-        use eredu_core::{TokenFilter, refinement::PredictionScoreKind};
+        use eredu_core::{refinement::PredictionScoreKind, TokenFilter};
         use eredu_runtime::generation::refinement::finalization::{
-            FinalizationError, finalize_refinement_position,
+            finalize_refinement_position, FinalizationError,
         };
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let scores = MlxTensor::from_array(Array::from_slice(
@@ -883,17 +883,15 @@ mod tests {
         )
         .unwrap());
         let changed = MlxTensor::from_array(Array::from_slice(&[1i32, 0], &[2]));
-        assert!(
-            !MlxSamplingBackend::stable_and_confident(
-                &high,
-                &argmax,
-                &[changed],
-                0.005,
-                None,
-                &stream
-            )
-            .unwrap()
-        );
+        assert!(!MlxSamplingBackend::stable_and_confident(
+            &high,
+            &argmax,
+            &[changed],
+            0.005,
+            None,
+            &stream
+        )
+        .unwrap());
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let scores = MlxTensor::from_array(Array::from_slice(&[invalid, invalid], &[1, 2]));
             assert!(

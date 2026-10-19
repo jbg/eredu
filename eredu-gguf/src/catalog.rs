@@ -370,7 +370,10 @@ impl Checkpoint {
     /// applies to subsequent logical tensor decoding and bounded selections.
     pub fn into_allocation_limit(mut self, bytes: u64) -> Result<Self> {
         if bytes == 0 || bytes > isize::MAX as u64 {
-            return Err(Error::tensor("conversion", "allocation ceiling must fit a positive host allocation"));
+            return Err(Error::tensor(
+                "conversion",
+                "allocation ceiling must fit a positive host allocation",
+            ));
         }
         self.limits.max_allocation_bytes = bytes;
         Ok(self)

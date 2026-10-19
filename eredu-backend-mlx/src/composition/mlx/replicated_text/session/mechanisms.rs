@@ -365,7 +365,11 @@ where
         let layout = prepared.layout.clone();
         let mut ignored_sources = self.ignored_checkpoint_sources.clone();
         ignored_sources.extend(
-            selected.requirements().nonparameter_sources().iter().cloned(),
+            selected
+                .requirements()
+                .nonparameter_sources()
+                .iter()
+                .cloned(),
         );
         ignored_sources.extend(
             selected
@@ -595,7 +599,9 @@ where
         Ok(())
     }
 
-    fn realize_stateless_state(&mut self) -> Option<S> { S::stateless() }
+    fn realize_stateless_state(&mut self) -> Option<S> {
+        S::stateless()
+    }
 
     fn realize_state(
         &mut self,

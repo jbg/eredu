@@ -146,5 +146,4 @@ impl PreparedPhraseSelection {
             copy_bytes: 0,
         })
     }
-
 }

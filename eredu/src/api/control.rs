@@ -313,9 +313,23 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
         match advancement {
             Some(eredu_core::TextAdvancement::ModeChanged(acknowledgement)) => {
                 if let Some(event) = delivery.drafts.clear() {
-                    delivery.send(ObservedGenerationEvent::Draft { event, position: self.state.position() }, emit);
+                    delivery.send(
+                        ObservedGenerationEvent::Draft {
+                            event,
+                            position: self.state.position(),
+                        },
+                        emit,
+                    );
                 }
-                delivery.send(ObservedGenerationEvent::ModeChanged { acknowledgement, position: self.state.position(), captures, step_seconds: started.elapsed().as_secs_f64() }, emit);
+                delivery.send(
+                    ObservedGenerationEvent::ModeChanged {
+                        acknowledgement,
+                        position: self.state.position(),
+                        captures,
+                        step_seconds: started.elapsed().as_secs_f64(),
+                    },
+                    emit,
+                );
                 Ok(SourceAdvancement::Progress)
             }
             None => Ok(SourceAdvancement::Finished),
@@ -416,9 +430,13 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         self.delivery.control.clone()
     }
     /// Active policy, pending transition and effective committed position.
-    pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState { self.state.decoding_state() }
+    pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState {
+        self.state.decoding_state()
+    }
     /// Modes already realized by the retained execution.
-    pub fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities { self.state.decoding_capabilities() }
+    pub fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
+        self.state.decoding_capabilities()
+    }
     /// Queues one validated mode change for the next settled block or transaction.
     pub fn request_decoding_mode(
         &self,

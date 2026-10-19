@@ -254,12 +254,15 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
         write_input_projection: None,
         write_bias: None,
         activation_equation: ComponentActivation::Attention {
-            attended_head_normalization: matches!(c.attention_equation,
-                crate::muse::AttentionEquation::NormalizedHeads | crate::muse::AttentionEquation::NormalizedHeadsScoreScaled)
-                .then(|| ComponentAttendedHeadNormalization {
-                    input: format!("{path}.attention.attended_heads"),
-                    normalization: norm(c, None, NormStage::Head),
-                }),
+            attended_head_normalization: matches!(
+                c.attention_equation,
+                crate::muse::AttentionEquation::NormalizedHeads
+                    | crate::muse::AttentionEquation::NormalizedHeadsScoreScaled
+            )
+            .then(|| ComponentAttendedHeadNormalization {
+                input: format!("{path}.attention.attended_heads"),
+                normalization: norm(c, None, NormStage::Head),
+            }),
             query_heads: heads,
             key_value_heads: kv,
             head_width: dim,
@@ -286,7 +289,11 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
         "Value aggregation after per-channel sigmoid gating",
         channels,
     );
-    if matches!(c.attention_equation, crate::muse::AttentionEquation::NormalizedHeads | crate::muse::AttentionEquation::NormalizedHeadsScoreScaled) {
+    if matches!(
+        c.attention_equation,
+        crate::muse::AttentionEquation::NormalizedHeads
+            | crate::muse::AttentionEquation::NormalizedHeadsScoreScaled
+    ) {
         g.read_only_observation(
             &attention,
             format!("{path}.attention.attended_heads"),

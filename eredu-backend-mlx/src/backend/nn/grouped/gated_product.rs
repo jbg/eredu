@@ -162,7 +162,10 @@ impl PackedGatedProductGroups {
                             out_features,
                             in_features / quantization.group_size(),
                         ],
-                        if matches!(quantization, WeightQuantization::MxFp4 | WeightQuantization::NvFp4) {
+                        if matches!(
+                            quantization,
+                            WeightQuantization::MxFp4 | WeightQuantization::NvFp4
+                        ) {
                             Dtype::Uint8
                         } else {
                             Dtype::Float16
@@ -215,8 +218,11 @@ impl PackedGatedProductGroups {
             down_iquant,
             native_fp8: false,
             gate_up_row_layout: if gate_up_affine == Some(WeightQuantization::NvFp4) {
-                eredu_nn::LinearRowLayout::equal_partitions(2).map_err(|error| Exception::custom(error.to_string()))?
-            } else { eredu_nn::LinearRowLayout::Contiguous },
+                eredu_nn::LinearRowLayout::equal_partitions(2)
+                    .map_err(|error| Exception::custom(error.to_string()))?
+            } else {
+                eredu_nn::LinearRowLayout::Contiguous
+            },
             gate_up_proj,
             gate_up_proj_bias: if projection_biases[0] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
@@ -230,8 +236,14 @@ impl PackedGatedProductGroups {
             gate_up_proj_scales,
             gate_up_proj_biases,
             gate_up_proj_global_scale: if gate_up_affine == Some(WeightQuantization::NvFp4) {
-                PhysicalParam::<Option<Array>>::unloaded_some(&[group_count, 2], Dtype::Float32, stream)?
-            } else { PhysicalParam::new(None) },
+                PhysicalParam::<Option<Array>>::unloaded_some(
+                    &[group_count, 2],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                PhysicalParam::new(None)
+            },
             down_proj,
             down_proj_bias: if projection_biases[1] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
@@ -245,8 +257,14 @@ impl PackedGatedProductGroups {
             down_proj_scales,
             down_proj_biases,
             down_proj_global_scale: if down_affine == Some(WeightQuantization::NvFp4) {
-                PhysicalParam::<Option<Array>>::unloaded_some(&[group_count], Dtype::Float32, stream)?
-            } else { PhysicalParam::new(None) },
+                PhysicalParam::<Option<Array>>::unloaded_some(
+                    &[group_count],
+                    Dtype::Float32,
+                    stream,
+                )?
+            } else {
+                PhysicalParam::new(None)
+            },
         })
     }
 
@@ -348,9 +366,18 @@ impl PackedGatedProductGroups {
                 stream,
             )?
         } else if let Some(global) = self.gate_up_proj_global_scale.as_ref() {
-            super::super::nvfp4::grouped_linear(&hidden, self.gate_up_proj.as_ref(),
-                self.gate_up_proj_scales.as_ref().as_ref().ok_or_else(|| Exception::custom("NVFP4 gate/up block scales are absent"))?,
-                global, &plan.sorted_group_ids, self.gate_up_row_layout, stream)?
+            super::super::nvfp4::grouped_linear(
+                &hidden,
+                self.gate_up_proj.as_ref(),
+                self.gate_up_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("NVFP4 gate/up block scales are absent"))?,
+                global,
+                &plan.sorted_group_ids,
+                self.gate_up_row_layout,
+                stream,
+            )?
         } else if let Some(quantization) = self.gate_up_affine {
             packed_grouped_linear(
                 &hidden,
@@ -442,9 +469,18 @@ impl PackedGatedProductGroups {
                 stream,
             )?
         } else if let Some(global) = self.down_proj_global_scale.as_ref() {
-            super::super::nvfp4::grouped_linear(&activated, self.down_proj.as_ref(),
-                self.down_proj_scales.as_ref().as_ref().ok_or_else(|| Exception::custom("NVFP4 down block scales are absent"))?,
-                global, &plan.sorted_group_ids, eredu_nn::LinearRowLayout::Contiguous, stream)?
+            super::super::nvfp4::grouped_linear(
+                &activated,
+                self.down_proj.as_ref(),
+                self.down_proj_scales
+                    .as_ref()
+                    .as_ref()
+                    .ok_or_else(|| Exception::custom("NVFP4 down block scales are absent"))?,
+                global,
+                &plan.sorted_group_ids,
+                eredu_nn::LinearRowLayout::Contiguous,
+                stream,
+            )?
         } else if let Some(quantization) = self.down_affine {
             packed_grouped_linear(
                 &activated,

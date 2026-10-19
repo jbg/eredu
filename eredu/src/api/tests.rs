@@ -29,8 +29,8 @@ use std::{
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
 mod ifm;
-mod refinement_preparation;
 mod reasoning;
+mod refinement_preparation;
 mod sampler;
 
 static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);

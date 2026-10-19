@@ -79,8 +79,14 @@ impl TextSnapshotBackend for MockBackend {
             return Some(0);
         }
         if runtime.session().switchable {
-            let prompt = match input? { PendingTextInput::Prefill(prompt) => prompt.len() as u64, _ => 0 };
-            return prompt.checked_add(predictions)?.checked_add(sampling.mode_suffix.len() as u64)?.checked_add(3);
+            let prompt = match input? {
+                PendingTextInput::Prefill(prompt) => prompt.len() as u64,
+                _ => 0,
+            };
+            return prompt
+                .checked_add(predictions)?
+                .checked_add(sampling.mode_suffix.len() as u64)?
+                .checked_add(3);
         }
         if runtime.session().iterative {
             let prompt = match input? {
@@ -96,7 +102,8 @@ impl TextSnapshotBackend for MockBackend {
         }
     }
     fn decoding_settlement_input_tokens(
-        _: &ModelRuntime<Self>, sampling: &Sampling,
+        _: &ModelRuntime<Self>,
+        sampling: &Sampling,
         _: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
     ) -> Option<u64> {
         Some((sampling.mode_suffix.len() + sampling.mode_candidates.len()) as u64)
@@ -128,9 +135,15 @@ impl TextSnapshotBackend for MockBackend {
         sampling: &Sampling,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
         let bytes = if runtime.session().switchable {
-            std::mem::size_of::<Sampling>() as u64 + (sampling.mode_candidates.capacity() + sampling.mode_suffix.capacity()) as u64 * 4
-        } else { 64 };
-        Ok(Some(SnapshotEstimate { retained_bytes: bytes, copy_bytes: bytes }))
+            std::mem::size_of::<Sampling>() as u64
+                + (sampling.mode_candidates.capacity() + sampling.mode_suffix.capacity()) as u64 * 4
+        } else {
+            64
+        };
+        Ok(Some(SnapshotEstimate {
+            retained_bytes: bytes,
+            copy_bytes: bytes,
+        }))
     }
     fn copy_sampling_state(
         _: &mut ModelRuntime<Self>,

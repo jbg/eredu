@@ -12,8 +12,8 @@ use eredu_runtime::{
 use crate::media_plan::AdmittedCompositeInput;
 
 mod prefill;
-pub use prefill::DecoderPrefillRequest;
 pub(crate) use prefill::DecoderPrefillChunk;
+pub use prefill::DecoderPrefillRequest;
 
 /// One request-bounded tensor collective in a composite pipeline wave.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -233,10 +233,11 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
     }
 
     pub(crate) fn decoder_chunk(&self) -> Option<DecoderPrefillChunk<'a, T>> {
-        self.decoder_chunk.map(|(start, end, assembled)| DecoderPrefillChunk {
-            range: start..end,
-            assembled,
-        })
+        self.decoder_chunk
+            .map(|(start, end, assembled)| DecoderPrefillChunk {
+                range: start..end,
+                assembled,
+            })
     }
 
     /// Exact backend-native prepared tensor handles.
@@ -540,9 +541,11 @@ where
         _group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
     ) -> Result<i32, String> {
-        let positions = input.decoder_chunk().map_or(
-            input.admitted().decoder_positions(), |chunk| chunk.range.len() as u64,
-        );
+        let positions = input
+            .decoder_chunk()
+            .map_or(input.admitted().decoder_positions(), |chunk| {
+                chunk.range.len() as u64
+            });
         i32::try_from(positions)
             .map_err(|_| "prepared composite boundary sequence exceeds i32".to_owned())
     }

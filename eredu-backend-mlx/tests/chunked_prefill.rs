@@ -316,10 +316,7 @@ fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
 fn run(device: DeviceType) {
     run_cases(
         device,
-        vec![
-            ("llama", fixture(false)),
-            ("mistral", fixture(true)),
-        ],
+        vec![("llama", fixture(false)), ("mistral", fixture(true))],
     );
 }
 

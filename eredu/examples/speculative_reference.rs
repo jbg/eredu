@@ -418,7 +418,11 @@ fn main() -> anyhow::Result<()> {
     report["snapshot_round_trips"] = json!(lifecycle);
     report["continuation_forecasts"] = json!(forecasts);
     planned.model().synchronize()?;
-    let stats = assisted.stats().drafting.as_ref().expect("assisted generation retains draft statistics");
+    let stats = assisted
+        .stats()
+        .drafting
+        .as_ref()
+        .expect("assisted generation retains draft statistics");
     let equal = assisted.token_ids() == ordinary_ids
         && (!snapshots || lifecycle.len() == snapshot_boundaries)
         && (!forecast || forecasts.len() == snapshot_boundaries);

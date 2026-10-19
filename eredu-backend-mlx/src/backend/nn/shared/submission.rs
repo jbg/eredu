@@ -795,12 +795,15 @@ impl PointToPointBackend for MlxNeuralBackend {
         let descriptor = route.descriptor();
         let receiving = group.rank() != descriptor.source() && descriptor.world_broadcast()
             || matches!(route.endpoint(), Some(crate::backend::runtime::distributed::topology::CommunicationRouteEndpoint::Destination));
-        let peer_rank = route.peer_rank().or(descriptor.world_broadcast().then_some(0)).ok_or_else(|| {
-            safemlx::error::Exception::custom(format!(
-                "communication route {} endpoint has no local peer rank",
-                descriptor.id().value()
-            ))
-        })?;
+        let peer_rank = route
+            .peer_rank()
+            .or(descriptor.world_broadcast().then_some(0))
+            .ok_or_else(|| {
+                safemlx::error::Exception::custom(format!(
+                    "communication route {} endpoint has no local peer rank",
+                    descriptor.id().value()
+                ))
+            })?;
         let logical = values
             .iter()
             .map(|value| value.tensor().clone())
@@ -827,20 +830,38 @@ impl PointToPointBackend for MlxNeuralBackend {
             expected_headers.push(header);
         }
         let broadcasts = if descriptor.world_broadcast() {
-            Some(frames.iter().map(|frame| {
-                crate::backend::runtime::distributed::broadcast_boundary_frame(frame, descriptor.source(), group, executor)
-            }).collect::<Result<Vec<_>, _>>()?)
-        } else { None };
+            Some(
+                frames
+                    .iter()
+                    .map(|frame| {
+                        crate::backend::runtime::distributed::broadcast_boundary_frame(
+                            frame,
+                            descriptor.source(),
+                            group,
+                            executor,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            None
+        };
         let (submitted, outputs, received_headers) = if !receiving {
             let submitted = match broadcasts {
                 Some(values) => values,
-                None => frames.iter().map(|frame| send(frame, peer_rank, group, executor)).collect::<Result<Vec<_>, _>>()?,
+                None => frames
+                    .iter()
+                    .map(|frame| send(frame, peer_rank, group, executor))
+                    .collect::<Result<Vec<_>, _>>()?,
             };
             (submitted, inputs.clone(), Vec::new())
         } else {
             let received = match broadcasts {
                 Some(values) => values,
-                None => frames.iter().map(|placeholder| recv_like(placeholder, peer_rank, group, executor)).collect::<Result<Vec<_>, _>>()?,
+                None => frames
+                    .iter()
+                    .map(|placeholder| recv_like(placeholder, peer_rank, group, executor))
+                    .collect::<Result<Vec<_>, _>>()?,
             };
             let mut outputs = Vec::with_capacity(received.len());
             let mut received_headers = Vec::with_capacity(received.len());

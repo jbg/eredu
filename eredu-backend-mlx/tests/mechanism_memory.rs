@@ -3,7 +3,7 @@ use eredu_backend_mlx::backend::{
     nn::{attention::attention_with_softcap, shared::MlxNeuralBackend},
     runtime::generation::MlxSamplingBackend,
 };
-use eredu_nn::{AttentionArithmetic, NeuralBackend, TensorElementType, mechanism_memory::*};
+use eredu_nn::{mechanism_memory::*, AttentionArithmetic, NeuralBackend, TensorElementType};
 use eredu_runtime::{GenerationSampler, SamplingBackend};
 use safemlx::{Array, Device, DeviceType, Stream};
 
@@ -44,18 +44,15 @@ fn cold_attention_keeps_aliases_and_native_unknowns_explicit() {
         if queries * keys > 8192 {
             assert!(scores.payload.upper.unwrap() < 2 * queries * keys * 4);
         }
-        assert!(
-            contract
-                .storage
-                .iter()
-                .any(|storage| storage.name == "prepared_keys"
-                    && storage.backing == MechanismBacking::Unknown)
-        );
-        assert!(
-            contract.storage.iter().any(
-                |storage| storage.name == "native_workspace" && storage.payload.upper.is_none()
-            )
-        );
+        assert!(contract
+            .storage
+            .iter()
+            .any(|storage| storage.name == "prepared_keys"
+                && storage.backing == MechanismBacking::Unknown));
+        assert!(contract
+            .storage
+            .iter()
+            .any(|storage| storage.name == "native_workspace" && storage.payload.upper.is_none()));
         assert!(!contract.missing.is_empty());
     }
 }
@@ -285,11 +282,11 @@ fn shared_vision_report_uses_selected_segment_facts_without_a_physical_fit_claim
             .find(|storage| storage.name == "sdpa_full_scores")
             .unwrap();
         assert_eq!(score.payload, MechanismBytes::exact(2 * 16 * 16 * 4));
-        assert!(
-            group.memory.storage.iter().any(
-                |storage| storage.name == "native_workspace" && storage.payload.upper.is_none()
-            )
-        );
+        assert!(group
+            .memory
+            .storage
+            .iter()
+            .any(|storage| storage.name == "native_workspace" && storage.payload.upper.is_none()));
         let mut impossible = group.invocation.clone();
         if let MechanismInvocation::Attention { sinks, .. } = &mut impossible {
             *sinks = true;
@@ -345,15 +342,14 @@ fn quantized_conversion_facts_follow_selected_device_without_loading_weights() {
         bias_element: None,
     };
     let cold = MlxNeuralBackend::mechanism_memory(&invocation).unwrap();
-    assert!(
-        cold.storage
-            .iter()
-            .find(|value| value.name == "output")
-            .unwrap()
-            .payload
-            .upper
-            .is_none()
-    );
+    assert!(cold
+        .storage
+        .iter()
+        .find(|value| value.name == "output")
+        .unwrap()
+        .payload
+        .upper
+        .is_none());
     let cpu = describe_for_device(&invocation, DeviceType::Cpu).unwrap();
     assert_eq!(
         cpu.values
@@ -382,12 +378,10 @@ fn quantized_conversion_facts_follow_selected_device_without_loading_weights() {
                 .element,
             TensorElementType::Bf16
         );
-        assert!(
-            !metal
-                .storage
-                .iter()
-                .any(|value| value.name == "decoded_weight_row")
-        );
+        assert!(!metal
+            .storage
+            .iter()
+            .any(|value| value.name == "decoded_weight_row"));
     }
 }
 
@@ -434,12 +428,10 @@ fn median_partition_keeps_host_index_scratch_to_one_row() {
         {
             let metal = describe_for_device(&invocation, DeviceType::Gpu).unwrap();
             metal.validate().unwrap();
-            assert!(
-                !metal
-                    .storage
-                    .iter()
-                    .any(|value| value.placement == MechanismPlacement::Host)
-            );
+            assert!(!metal
+                .storage
+                .iter()
+                .any(|value| value.placement == MechanismPlacement::Host));
             assert_eq!(
                 metal
                     .storage
@@ -482,11 +474,9 @@ fn single_row_router_workspace_includes_alignment_padding() {
             groups: 3,
         };
         let contract = describe_for_device(&invocation, device).unwrap();
-        assert!(
-            !contract
-                .storage
-                .iter()
-                .any(|v| v.name == "router_aligned_weight")
-        );
+        assert!(!contract
+            .storage
+            .iter()
+            .any(|v| v.name == "router_aligned_weight"));
     }
 }

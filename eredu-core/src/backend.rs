@@ -1480,10 +1480,7 @@ impl TextGenerationConfig {
 
     /// Selects the initial execution policy. Absent uses causal generation when
     /// available, or the trained policy of an intrinsically iterative architecture.
-    pub const fn with_decoding_mode(
-        mut self,
-        mode: Option<crate::decoding::DecodingMode>,
-    ) -> Self {
+    pub const fn with_decoding_mode(mut self, mode: Option<crate::decoding::DecodingMode>) -> Self {
         self.decoding_mode = mode;
         self
     }
@@ -2036,7 +2033,9 @@ pub trait TextGenerationBackend: BackendProvider {
     }
 
     /// Source-free facts for all modes already realized by this loaded execution.
-    fn decoding_capabilities(runtime: &ModelRuntime<Self>) -> crate::decoding::DecodingCapabilities {
+    fn decoding_capabilities(
+        runtime: &ModelRuntime<Self>,
+    ) -> crate::decoding::DecodingCapabilities {
         let iterative = Self::supports_block_refinement(runtime);
         crate::decoding::DecodingCapabilities {
             autoregressive: !iterative,
@@ -2077,16 +2076,23 @@ pub trait TextGenerationBackend: BackendProvider {
         _previous: crate::decoding::DecodingMode,
         _requested: crate::decoding::DecodingMode,
     ) -> Result<bool, TextOperationError<Self::Error>> {
-        Err(TextOperationPolicyError::DecodingMode(crate::decoding::DecodingModeError::Unsupported("settled execution handoff")).into())
+        Err(TextOperationPolicyError::DecodingMode(
+            crate::decoding::DecodingModeError::Unsupported("settled execution handoff"),
+        )
+        .into())
     }
 
     /// Publishes backend state for one controller-accepted token. It settles native
     /// work before returning and retains no unaccepted verification suffix in the
     /// canonical cache. Ordinary causal execution needs no additional publication.
     fn commit_text_token(
-        _runtime: &mut ModelRuntime<Self>, _token_id: u32,
-        _position: crate::refinement::GenerationPosition, _state: &mut Self::TextGenerationState,
-    ) -> Result<(), Self::Error> { Ok(()) }
+        _runtime: &mut ModelRuntime<Self>,
+        _token_id: u32,
+        _position: crate::refinement::GenerationPosition,
+        _state: &mut Self::TextGenerationState,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Exact numerical policy supported by the retained iterative architecture.
     /// A mechanism implementing unmasking does not imply family support for it.
@@ -2333,7 +2339,6 @@ where
     inner: TextRequestDriver<B, C>,
 }
 
-
 type ControlledGenerationResult<B, C> = Result<
     <B as TextGenerationBackend>::Token,
     ControlledTextGenerationError<
@@ -2352,10 +2357,18 @@ where
         self.inner.position
     }
     /// Active/pending mode and effective handoff position of this shared driver.
-    pub fn decoding_state(&self) -> crate::decoding::DecodingState { self.inner.decoding.state() }
+    pub fn decoding_state(&self) -> crate::decoding::DecodingState {
+        self.inner.decoding.state()
+    }
     /// Binds cross-thread mode commands to uninterrupted or explicit advancement.
-    pub fn bind_control_handle(&self, handle: &crate::execution_control::GenerationControlHandle) -> Result<(), crate::decoding::DecodingModeError> {
-        handle.bind_decoding(self.inner.decoding.clone(), self.inner.cancellation.as_ref())
+    pub fn bind_control_handle(
+        &self,
+        handle: &crate::execution_control::GenerationControlHandle,
+    ) -> Result<(), crate::decoding::DecodingModeError> {
+        handle.bind_decoding(
+            self.inner.decoding.clone(),
+            self.inner.cancellation.as_ref(),
+        )
     }
 
     /// Advances one physical operation using the same driver as the token iterator.
@@ -2485,8 +2498,7 @@ where
         if self.inner.position.execution_step == u64::MAX {
             return Err(TextOperationPolicyError::PositionOverflow.into());
         }
-        self.inner
-            .advance_prefill(self.runtime)
+        self.inner.advance_prefill(self.runtime)
     }
 }
 
@@ -2502,7 +2514,6 @@ where
         self.inner.next_committed(self.runtime)
     }
 }
-
 
 /// Backend-generic iterator over committed native token handles.
 ///
@@ -2554,10 +2565,14 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
     }
 
     /// Canonical sequence owned by the common request driver.
-    pub fn committed_sequence(&self) -> &crate::GenerationSequence { self.inner.sequence() }
+    pub fn committed_sequence(&self) -> &crate::GenerationSequence {
+        self.inner.sequence()
+    }
 
     /// Read-only active and queued policies of this logical generation.
-    pub fn decoding_state(&self) -> crate::decoding::DecodingState { self.inner.decoding.state() }
+    pub fn decoding_state(&self) -> crate::decoding::DecodingState {
+        self.inner.decoding.state()
+    }
 
     /// Starts generation from portable prompt token ids.
     pub fn new(
@@ -3374,9 +3389,15 @@ mod tests {
 
     impl TokenFilterController for &mut FixedController {
         type Error = Infallible;
-        fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> { (**self).current_filter() }
-        fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> { (**self).commit_token(token) }
-        fn is_complete(&mut self) -> Result<bool, Self::Error> { (**self).is_complete() }
+        fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+            (**self).current_filter()
+        }
+        fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> {
+            (**self).commit_token(token)
+        }
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            (**self).is_complete()
+        }
     }
 
     struct PhasedMock;
@@ -3535,12 +3556,14 @@ mod tests {
         let sampling =
             crate::resolve_generation_config(None, crate::GenerationConfigOverrides::default())
                 .unwrap();
-        let config = TextGenerationConfig::new(sampling).with_decoding_mode(Some(crate::decoding::DecodingMode::Diffusion { policy: Some(
-            crate::refinement::RefinementPolicy::MaskedUnmasking {
-                config: Default::default(),
-                mask_token_id: 2,
+        let config = TextGenerationConfig::new(sampling).with_decoding_mode(Some(
+            crate::decoding::DecodingMode::Diffusion {
+                policy: Some(crate::refinement::RefinementPolicy::MaskedUnmasking {
+                    config: Default::default(),
+                    mask_token_id: 2,
+                }),
             },
-        ) }));
+        ));
         let mut runtime = ModelRuntime::prepare(PhasedMock, 10).unwrap();
         let controller = FixedController {
             queries: 0,
@@ -3551,7 +3574,9 @@ mod tests {
         assert!(matches!(
             result,
             Err(ControlledTextGenerationError::Operation(
-                TextOperationPolicyError::DecodingMode(crate::decoding::DecodingModeError::Unsupported("refinement numerical policy"))
+                TextOperationPolicyError::DecodingMode(
+                    crate::decoding::DecodingModeError::Unsupported("refinement numerical policy")
+                )
             ))
         ));
         drop(result);
@@ -3803,8 +3828,10 @@ mod tests {
         assert!(!handle.decoding_state().unwrap().terminal);
         assert_eq!(generation.next().unwrap().unwrap().token_id(), 8);
         assert!(handle.decoding_state().unwrap().terminal);
-        assert_eq!(handle.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive),
-            Err(crate::decoding::DecodingModeError::Terminal));
+        assert_eq!(
+            handle.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive),
+            Err(crate::decoding::DecodingModeError::Terminal)
+        );
         assert!(generation.controller_mut().is_complete().unwrap());
         assert!(generation.next().is_none());
         drop(generation);

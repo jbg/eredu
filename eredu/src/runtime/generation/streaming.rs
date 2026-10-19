@@ -875,7 +875,8 @@ impl fmt::Debug for ToolRuntimeParser {
 
 impl ToolRuntimeParser {
     pub(crate) fn text<'a>(caller_stops: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut parser = Self::new_with_structural_stops(Box::new(TextParser), [], caller_stops, []);
+        let mut parser =
+            Self::new_with_structural_stops(Box::new(TextParser), [], caller_stops, []);
         parser.stream.sink.tool_calls_enabled = false;
         parser
     }

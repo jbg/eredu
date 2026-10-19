@@ -2,8 +2,8 @@
 use super::FamilyConfig;
 use crate::decoder::Config;
 use eredu_media::{
+    image::{resize_and_normalize_rgb8_cubic, RgbImageView},
     MediaError,
-    image::{RgbImageView, resize_and_normalize_rgb8_cubic},
 };
 
 /// Invalid architecture image policy or portable pixel preparation failure.
@@ -72,11 +72,17 @@ pub struct PreparedImage {
 }
 impl ImageProcessor {
     /// Complete channel-major patch vector width, independent of native tensors.
-    pub fn patch_vector_width(&self) -> usize { 3 * self.patch as usize * self.patch as usize }
+    pub fn patch_vector_width(&self) -> usize {
+        3 * self.patch as usize * self.patch as usize
+    }
     /// Spatial merge factor used for marker and decoder geometry.
-    pub const fn merge_size(&self) -> u32 { self.merge }
+    pub const fn merge_size(&self) -> u32 {
+        self.merge
+    }
     /// Pixel width of one unmerged patch.
-    pub const fn patch_size(&self) -> u32 { self.patch }
+    pub const fn patch_size(&self) -> u32 {
+        self.patch
+    }
 
     /// Composites transparent RGBA pixels on the published white background
     /// before executing the same RGB resizing and patch policy.

@@ -42,7 +42,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
     type CacheCheckpoint = M::Checkpoint;
     type Verification = CausalVerification<M::Output>;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a> where Self: 'a;
+    type Context<'a>
+        = M::Context<'a>
+    where
+        Self: 'a;
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
@@ -69,7 +72,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         policy: Option<eredu_core::refinement::RefinementPolicy>,
         temperature: f32,
         context: M::Context<'a>,
-    ) -> Result<Option<eredu_core::speculative::RefinementProgress<M::Logits>>, M::Error>  where Self: 'a {
+    ) -> Result<Option<eredu_core::speculative::RefinementProgress<M::Logits>>, M::Error>
+    where
+        Self: 'a,
+    {
         let Some(prefix) = &state.prefix else {
             return Ok(None);
         };
@@ -94,14 +100,20 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         &mut self,
         local: Vec<eredu_core::SpeculativeScheduleState>,
         context: M::Context<'context>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>  where Self: 'context {
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
+    where
+        Self: 'context,
+    {
         M::coordinate_speculative_step(local, context)
     }
     fn coordinate_decoding_control<'context>(
         &mut self,
         local: eredu_core::decoding::DecodingCoordination,
         context: M::Context<'context>,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>  where Self: 'context {
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>
+    where
+        Self: 'context,
+    {
         M::coordinate_decoding_control(local, context)
     }
     fn agree_text_preparation<'context>(
@@ -110,7 +122,9 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: M::Context<'context>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-     where Self: 'context {
+    where
+        Self: 'context,
+    {
         M::agree_text_preparation(stage, status, context)
     }
     fn prefill<'context>(
@@ -118,7 +132,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         input: Self::Input,
         cache: &mut M::State,
         context: M::Context<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, M::Logits>, M::Error>  where Self: 'context {
+    ) -> Result<SpeculativePrefill<Self::TargetState, M::Logits>, M::Error>
+    where
+        Self: 'context,
+    {
         let (output, count) = M::prefill(
             self.model,
             &input.input,
@@ -148,7 +165,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         _: u32,
         capacity: usize,
         _: M::Context<'context>,
-    ) -> Result<Self::DraftState, M::Error>  where Self: 'context {
+    ) -> Result<Self::DraftState, M::Error>
+    where
+        Self: 'context,
+    {
         if capacity != 0 {
             return Err(M::invalid("causal execution has no retained draft source"));
         }
@@ -159,7 +179,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         _: &mut Self::DraftState,
         _: u32,
         _: M::Context<'context>,
-    ) -> Result<eredu_core::SpeculativeProposalStep<M::Logits>, M::Error>  where Self: 'context {
+    ) -> Result<eredu_core::SpeculativeProposalStep<M::Logits>, M::Error>
+    where
+        Self: 'context,
+    {
         Err(M::invalid("causal execution has no retained draft source"))
     }
     fn checkpoint(&self, cache: &M::State) -> Result<M::Checkpoint, M::Error> {
@@ -170,7 +193,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         cache: &mut M::State,
         saved: &M::Checkpoint,
         context: M::Context<'context>,
-    ) -> Result<(), M::Error>  where Self: 'context {
+    ) -> Result<(), M::Error>
+    where
+        Self: 'context,
+    {
         *cache = M::restore(saved, context)?;
         Ok(())
     }
@@ -179,7 +205,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         tokens: &[u32],
         cache: &mut M::State,
         context: M::Context<'context>,
-    ) -> Result<Submission<Self::Verification, M::Completion>, M::Error>  where Self: 'context {
+    ) -> Result<Submission<Self::Verification, M::Completion>, M::Error>
+    where
+        Self: 'context,
+    {
         causal_verification::submit::<M>(self.model, tokens, cache, context)
     }
     fn verification_logits<'context>(
@@ -187,7 +216,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         output: &Self::Verification,
         position: usize,
         context: M::Context<'context>,
-    ) -> Result<M::Logits, M::Error>  where Self: 'context {
+    ) -> Result<M::Logits, M::Error>
+    where
+        Self: 'context,
+    {
         causal_verification::logits::<M>(output, position, context)
     }
 
@@ -199,7 +231,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         _: &M::Checkpoint,
         retained: usize,
         _: M::Context<'context>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, M::Error>  where Self: 'context {
+    ) -> Result<SpeculativeCommit<Self::TargetState>, M::Error>
+    where
+        Self: 'context,
+    {
         // Every input in a causal append is already committed. There is no
         // speculative proposal suffix that can be rejected or replayed.
         if retained == 0 || retained != output.inputs.len() {
@@ -307,7 +342,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
     ) -> Result<
         Option<(M::Checkpoint, Self::TargetState)>,
         eredu_core::speculative::SpeculativeControlError,
-    >  where Self: 'context {
+    >
+    where
+        Self: 'context,
+    {
         Ok(Some((
             M::checkpoint(cache)
                 .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
@@ -320,7 +358,10 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         saved: &M::Checkpoint,
         state: &Self::TargetState,
         context: M::Context<'context>,
-    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>  where Self: 'context {
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'context,
+    {
         self.restore_checkpoint(cache, saved, context)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         Ok(Some(state.clone()))

@@ -240,7 +240,10 @@ pub(super) fn with_text_observer<R>(
     prediction: u64,
     phase: CapturePhase,
     geometry: Result<(u64, Option<CaptureMediaShape>), CaptureError>,
-    submit: impl FnOnce(&mut MlxModelSession, &mut dyn RuntimeActivationObserver<MlxTensor, Error>) -> Result<R, Error>,
+    submit: impl FnOnce(
+        &mut MlxModelSession,
+        &mut dyn RuntimeActivationObserver<MlxTensor, Error>,
+    ) -> Result<R, Error>,
 ) -> Result<R, Error> {
     if capture.plan().invocation_bounds().is_some() {
         let invocation = geometry.and_then(|(sequence, media)| {

@@ -95,10 +95,16 @@ impl PreparedPartitionSessionFacts {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "selected partition has no output publication authority".to_owned())?;
         let topology = selected.prompt_cache_topology()?;
-        let identity = selected.partition().state().map(|_| {
-            selected.partition().prompt_cache_identity::<B, A>(prepared.architecture(), topology.clone())
-                .map_err(|error| error.to_string())
-        }).transpose()?;
+        let identity = selected
+            .partition()
+            .state()
+            .map(|_| {
+                selected
+                    .partition()
+                    .prompt_cache_identity::<B, A>(prepared.architecture(), topology.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
         let session_group = selected
             .session_group()
             .ok_or_else(|| "selected partition has no session group".to_owned())?;

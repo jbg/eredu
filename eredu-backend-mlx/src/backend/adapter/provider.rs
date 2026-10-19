@@ -77,9 +77,7 @@ impl<'a> MlxBackend<'a> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::communication_realization_attempt();
         let world = self.world.as_deref().ok_or_else(|| {
-            Error::Parallel(
-                "distributed model preparation requires a bound native world".into(),
-            )
+            Error::Parallel("distributed model preparation requires a bound native world".into())
         })?;
         rank.validate_execution_stream(&self.stream)?;
         #[cfg(test)]

@@ -92,19 +92,20 @@ pub fn gelu(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array
     let stream = stream.as_ref();
     let dtype = x.as_ref().dtype();
     let work = match dtype {
-        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16 => x.as_ref().as_dtype(safemlx::Dtype::Float32, stream)?,
+        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16 => {
+            x.as_ref().as_dtype(safemlx::Dtype::Float32, stream)?
+        }
         _ => x.as_ref().clone(),
     };
-    work
-        .multiply(
-            array!(1).add(
-                erf(work.divide(array!(2f32.sqrt()), stream)?, stream)?,
-                stream,
-            )?,
+    work.multiply(
+        array!(1).add(
+            erf(work.divide(array!(2f32.sqrt()), stream)?, stream)?,
             stream,
-        )?
-        .divide(array!(2.0), stream)?
-        .as_dtype(dtype, stream)
+        )?,
+        stream,
+    )?
+    .divide(array!(2.0), stream)?
+    .as_dtype(dtype, stream)
 }
 
 /// Applies the tanh GELU approximation.

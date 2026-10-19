@@ -1,13 +1,13 @@
 //! Normal loader and generation-driver comparison using pinned released references.
-use eredu_backend_mlx::{MlxLoadRequest, backend::MlxBackend};
+use eredu_backend_mlx::{backend::MlxBackend, MlxLoadRequest};
 use eredu_core::{
-    ControlledTextGeneration, ModelRuntime, TextAdvancement, TextGenerationBackend,
-    TokenFilterController,
     decoding::{DecodingMode, SpeculationOptionsRequest},
     execution_control::GenerationControlHandle,
+    ControlledTextGeneration, ModelRuntime, TextAdvancement, TextGenerationBackend,
+    TokenFilterController,
 };
 use eredu_runtime::{DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency};
-use safemlx::{Array, Device, DeviceType, Dtype, Stream, ops::indexing::TryIndexOp};
+use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, Dtype, Stream};
 use std::{error::Error, path::PathBuf};
 
 struct ExcludeMask {

@@ -253,12 +253,20 @@ where
 
     /// Observes the partially finalized canvas without reading native values.
     pub fn refinement_proposals(&self) -> Option<RefinementProposalView> {
-        self.refinement.as_ref().map(|canvas| RefinementProposalView {
-            position: self.sequence().tokens().len(), finalized_positions: canvas.committed.len(),
-            canvas_positions: canvas.width,
-            token_ids: canvas.positions.as_ref().map(|rows| rows.iter().skip(canvas.committed.len()).map(|(token, _)| *token).collect()),
-            score_kind: crate::refinement::PredictionScoreKind::RefinementPosition,
-        })
+        self.refinement
+            .as_ref()
+            .map(|canvas| RefinementProposalView {
+                position: self.sequence().tokens().len(),
+                finalized_positions: canvas.committed.len(),
+                canvas_positions: canvas.width,
+                token_ids: canvas.positions.as_ref().map(|rows| {
+                    rows.iter()
+                        .skip(canvas.committed.len())
+                        .map(|(token, _)| *token)
+                        .collect()
+                }),
+                score_kind: crate::refinement::PredictionScoreKind::RefinementPosition,
+            })
     }
 
     /// Canonical proposals, including the block retained during verification.
@@ -383,8 +391,13 @@ where
     /// A previously settled score row needs no second append.
     pub fn forecast_mode_settlement_positions(&self) -> u64 {
         if self.decoding.state().pending.is_some() {
-            self.refinement.as_ref().map_or(self.pending_committed_tokens.len(), |canvas| canvas.width) as u64
-        } else { 0 }
+            self.refinement
+                .as_ref()
+                .map_or(self.pending_committed_tokens.len(), |canvas| canvas.width)
+                as u64
+        } else {
+            0
+        }
     }
 
     /// Effective per-request scheduler controls under shared resource ceilings.
@@ -396,22 +409,32 @@ where
     }
 
     /// Active and admitted pending policies over one retained execution.
-    pub fn forecast_decoding_policies(&self, ceiling: crate::generation::SpeculativeSchedulerOptions)
-        -> Vec<(crate::decoding::DecodingMode, crate::generation::SpeculativeSchedulerOptions)> {
+    pub fn forecast_decoding_policies(
+        &self,
+        ceiling: crate::generation::SpeculativeSchedulerOptions,
+    ) -> Vec<(
+        crate::decoding::DecodingMode,
+        crate::generation::SpeculativeSchedulerOptions,
+    )> {
         let state = self.decoding.state();
-        std::iter::once(state.active).chain(state.pending.filter(|mode| *mode != state.active))
+        std::iter::once(state.active)
+            .chain(state.pending.filter(|mode| *mode != state.active))
             .map(|mode| {
                 let mut config = self.config.clone();
                 config.decoding_mode = mode;
                 (mode, config.scheduler_options(ceiling))
-            }).collect()
+            })
+            .collect()
     }
 
     /// Immutable next-target row retained independently of the source's seed.
     pub fn retained_next_scores_estimate(&self, executor: &E) -> Option<SnapshotEstimate> {
         match &self.next_logits {
             Some(logits) => executor.logits_snapshot_estimate(logits),
-            None => Some(SnapshotEstimate { retained_bytes: 0, copy_bytes: 0 }),
+            None => Some(SnapshotEstimate {
+                retained_bytes: 0,
+                copy_bytes: 0,
+            }),
         }
     }
 
@@ -460,12 +483,22 @@ where
     /// Complete conservative retention and copy bound for tentative position rows
     /// and their partially finalized commitment cursor.
     pub fn retained_refinement_estimate(&self, executor: &E) -> Option<SnapshotEstimate> {
-        let Some(canvas) = &self.refinement else { return Some(SnapshotEstimate { retained_bytes: 0, copy_bytes: 0 }); };
+        let Some(canvas) = &self.refinement else {
+            return Some(SnapshotEstimate {
+                retained_bytes: 0,
+                copy_bytes: 0,
+            });
+        };
         let host = (std::mem::size_of::<RefinementContinuation<E::Logits>>() as u64)
             .checked_add((canvas.committed.len() as u64).checked_mul(4)?)?
-            .checked_add((canvas.positions.as_ref().map_or(0, Vec::len) as u64)
-                .checked_mul(std::mem::size_of::<(u32, E::Logits)>() as u64)?)?;
-        let mut estimate = SnapshotEstimate { retained_bytes: host, copy_bytes: host };
+            .checked_add(
+                (canvas.positions.as_ref().map_or(0, Vec::len) as u64)
+                    .checked_mul(std::mem::size_of::<(u32, E::Logits)>() as u64)?,
+            )?;
+        let mut estimate = SnapshotEstimate {
+            retained_bytes: host,
+            copy_bytes: host,
+        };
         for (_, logits) in canvas.positions.iter().flatten() {
             let row = executor.logits_snapshot_estimate(logits)?;
             estimate.retained_bytes = estimate.retained_bytes.checked_add(row.retained_bytes)?;
@@ -479,7 +512,8 @@ where
         if !self.is_control_boundary() {
             return None;
         }
-        let native = executor.control_snapshot_estimate(&self.cache, self.target_state.as_ref()?)?;
+        let native =
+            executor.control_snapshot_estimate(&self.cache, self.target_state.as_ref()?)?;
         let host = self
             .runtime
             .sampler()
@@ -498,12 +532,23 @@ where
             .checked_add(std::mem::size_of::<SpeculativeControlSnapshot<E, S, C>>() as u64)?;
         let next = match self.next_logits.as_ref() {
             Some(logits) => executor.logits_snapshot_estimate(logits)?,
-            None => SnapshotEstimate { retained_bytes: 0, copy_bytes: 0 },
+            None => SnapshotEstimate {
+                retained_bytes: 0,
+                copy_bytes: 0,
+            },
         };
         let refinement = self.retained_refinement_estimate(executor)?;
         Some(SnapshotEstimate {
-            retained_bytes: native.retained_bytes.checked_add(host)?.checked_add(next.retained_bytes)?.checked_add(refinement.retained_bytes)?,
-            copy_bytes: native.copy_bytes.checked_add(host)?.checked_add(next.copy_bytes)?.checked_add(refinement.copy_bytes)?,
+            retained_bytes: native
+                .retained_bytes
+                .checked_add(host)?
+                .checked_add(next.retained_bytes)?
+                .checked_add(refinement.retained_bytes)?,
+            copy_bytes: native
+                .copy_bytes
+                .checked_add(host)?
+                .checked_add(next.copy_bytes)?
+                .checked_add(refinement.copy_bytes)?,
         })
     }
 
@@ -546,36 +591,54 @@ where
     /// Command identity of the active logical continuation.
     pub fn decoding_owner(&self) -> crate::decoding::GenerationCommandOwner {
         crate::decoding::GenerationCommandOwner {
-            identity: Arc::clone(&self.control_identity), control: self.decoding.clone(),
+            identity: Arc::clone(&self.control_identity),
+            control: self.decoding.clone(),
         }
     }
 
     /// Gives an inactive fork an independent mailbox initialized from its snapshot.
-    pub fn fork_decoding_owner(&self, snapshot: &SpeculativeControlSnapshot<E, S, C>)
-        -> Result<crate::decoding::GenerationCommandOwner, SpeculativeControlError> {
+    pub fn fork_decoding_owner(
+        &self,
+        snapshot: &SpeculativeControlSnapshot<E, S, C>,
+    ) -> Result<crate::decoding::GenerationCommandOwner, SpeculativeControlError> {
         if !Arc::ptr_eq(&self.control_identity, &snapshot.identity) {
             return Err(SpeculativeControlError::IncompatibleSnapshot);
         }
         Ok(crate::decoding::GenerationCommandOwner {
-            identity: Arc::clone(&self.control_identity), control: self.decoding.fork(snapshot.decoding),
+            identity: Arc::clone(&self.control_identity),
+            control: self.decoding.fork(snapshot.decoding),
         })
     }
 
     /// Restores snapshot commands along with matching native and output state.
     pub fn restore_control_snapshot<'a>(
-        &mut self, executor: &mut E, snapshot: &SpeculativeControlSnapshot<E, S, C>, context: E::Context<'a>,
-    ) -> Result<(), SpeculativeControlError> where E: 'a {
+        &mut self,
+        executor: &mut E,
+        snapshot: &SpeculativeControlSnapshot<E, S, C>,
+        context: E::Context<'a>,
+    ) -> Result<(), SpeculativeControlError>
+    where
+        E: 'a,
+    {
         self.install_snapshot_state(executor, snapshot, context)?;
         self.decoding.restore(snapshot.decoding);
         Ok(())
     }
 
     /// Exchanges active branch ownership while retaining its independently queued commands.
-    pub fn activate_control_snapshot<'a>(&mut self, executor: &mut E,
-        snapshot: &SpeculativeControlSnapshot<E, S, C>, owner: &crate::decoding::GenerationCommandOwner,
+    pub fn activate_control_snapshot<'a>(
+        &mut self,
+        executor: &mut E,
+        snapshot: &SpeculativeControlSnapshot<E, S, C>,
+        owner: &crate::decoding::GenerationCommandOwner,
         context: E::Context<'a>,
-    ) -> Result<(), SpeculativeControlError> where E: 'a {
-        if !Arc::ptr_eq(&self.control_identity, &owner.identity) || owner.state().active != snapshot.decoding.active {
+    ) -> Result<(), SpeculativeControlError>
+    where
+        E: 'a,
+    {
+        if !Arc::ptr_eq(&self.control_identity, &owner.identity)
+            || owner.state().active != snapshot.decoding.active
+        {
             return Err(SpeculativeControlError::IncompatibleBranch);
         }
         self.install_snapshot_state(executor, snapshot, context)?;
@@ -616,7 +679,8 @@ where
         self.lifecycle = snapshot.lifecycle.clone();
         self.stats = snapshot.stats.clone();
         self.config = snapshot.config.clone();
-        self.pending_committed_tokens.clone_from(&snapshot.pending_committed_tokens);
+        self.pending_committed_tokens
+            .clone_from(&snapshot.pending_committed_tokens);
         self.next_logits = snapshot.next_logits.clone();
         self.refinement = snapshot.refinement.clone();
         Ok(())

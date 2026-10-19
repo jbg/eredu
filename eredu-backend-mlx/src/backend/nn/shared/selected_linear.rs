@@ -135,7 +135,9 @@ impl MlxGroupedLinear {
         }
         let weight_dtype = match encoding {
             LinearFormat::Dense => safemlx::Dtype::Float32,
-            LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4 => safemlx::Dtype::Uint32,
+            LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4 => {
+                safemlx::Dtype::Uint32
+            }
             LinearFormat::E4M3BlockFp8(_) | LinearFormat::GgufIQuant { .. } => {
                 safemlx::Dtype::Uint8
             }
@@ -182,13 +184,21 @@ impl MlxGroupedLinear {
             .bias()
             .map(|p| Parameter::unloaded(p.clone(), &[groups, rows], context))
             .transpose()?;
-        let global_scale = projection.format().global_scale().map(|p| {
-            let mut shape = vec![groups];
-            if projection.format().row_layout().partitions() > 1 {
-                shape.push(projection.format().row_layout().partitions() as i32);
-            }
-            unloaded(bind_linear_companion(projection.weight(), p.clone()), &shape, safemlx::Dtype::Float32)
-        }).transpose()?;
+        let global_scale = projection
+            .format()
+            .global_scale()
+            .map(|p| {
+                let mut shape = vec![groups];
+                if projection.format().row_layout().partitions() > 1 {
+                    shape.push(projection.format().row_layout().partitions() as i32);
+                }
+                unloaded(
+                    bind_linear_companion(projection.weight(), p.clone()),
+                    &shape,
+                    safemlx::Dtype::Float32,
+                )
+            })
+            .transpose()?;
         Ok(MlxGroupedLinear {
             spec,
             weight,
@@ -269,9 +279,17 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
                 )?
             }
             LinearFormat::NvFp4 => compute(common::nvfp4::grouped_linear(
-                &rows, weight, scale.ok_or_else(|| ComputeError::backend("NVFP4 scale is absent"))?,
-                self.global_scale.as_ref().ok_or_else(|| ComputeError::backend("NVFP4 global scale is absent"))?.as_ref().as_array(),
-                &plan.sorted_group_ids, self.spec.projection().format().row_layout(), context,
+                &rows,
+                weight,
+                scale.ok_or_else(|| ComputeError::backend("NVFP4 scale is absent"))?,
+                self.global_scale
+                    .as_ref()
+                    .ok_or_else(|| ComputeError::backend("NVFP4 global scale is absent"))?
+                    .as_ref()
+                    .as_array(),
+                &plan.sorted_group_ids,
+                self.spec.projection().format().row_layout(),
+                context,
             ))?,
             LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
                 compute(common::grouped::packed_grouped_linear(

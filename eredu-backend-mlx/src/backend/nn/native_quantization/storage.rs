@@ -137,7 +137,6 @@ pub struct NativeQuantizedTensor {
 }
 
 impl NativeQuantizedTensor {
-
     /// Retains an already materialized MLX byte array in native GGML blocks.
     pub fn from_iq_array(
         bytes: Array,

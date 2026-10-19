@@ -109,7 +109,9 @@ impl ArtifactFingerprintSource {
             let path = pinned.member.path();
             let file = File::open(path).map_err(|source| io_error("open", path, source))?;
             if StableFileMetadata::read(path, &file)? != pinned.admitted {
-                return Err(ArtifactFingerprintError::Changed { path: path.to_path_buf() });
+                return Err(ArtifactFingerprintError::Changed {
+                    path: path.to_path_buf(),
+                });
             }
         }
         Ok(())
@@ -397,7 +399,10 @@ mod tests {
         let replacement = directory.path().join("replacement");
         std::fs::write(&replacement, b"different file contents").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        assert!(matches!(source.validate_unchanged(), Err(ArtifactFingerprintError::Changed { .. })));
+        assert!(matches!(
+            source.validate_unchanged(),
+            Err(ArtifactFingerprintError::Changed { .. })
+        ));
         assert!(matches!(
             source.fingerprint(),
             Err(ArtifactFingerprintError::Changed { .. })

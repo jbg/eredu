@@ -49,9 +49,8 @@ use eredu_checkpoint::{
 };
 use eredu_gguf::{MetadataArray, MetadataValue};
 use eredu_nn::{
-    Error, Index, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationOperator, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, Tensor,
+    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, ParameterSpec,
+    Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -702,7 +701,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
                 RotarySpec {
                     arithmetic: match config.equation {
                         DFlashDecoderEquation::InputRounded => eredu_nn::RotaryArithmetic::Native,
-                        DFlashDecoderEquation::Float32ResidualNorm => eredu_nn::RotaryArithmetic::InputProducts,
+                        DFlashDecoderEquation::Float32ResidualNorm => {
+                            eredu_nn::RotaryArithmetic::InputProducts
+                        }
                     },
                     dimensions: config.head_dim,
                     base: config.rope_theta,
@@ -717,7 +718,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
             scale: (config.head_dim as f32).sqrt().recip(),
             arithmetic: match config.equation {
                 DFlashDecoderEquation::InputRounded => eredu_nn::AttentionArithmetic::Fused,
-                DFlashDecoderEquation::Float32ResidualNorm => eredu_nn::AttentionArithmetic::Float32,
+                DFlashDecoderEquation::Float32ResidualNorm => {
+                    eredu_nn::AttentionArithmetic::Float32
+                }
             },
         })
     }
@@ -790,10 +793,19 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
             ProposalAttentionPolicy::Bidirectional,
             context,
         )?;
-        let attended = B::attention_with_sinks(eredu_nn::AttentionRequest {
-            queries, keys, values, scale: self.scale, mask: Some(&mask), sinks: None,
-            softcap: None, arithmetic: self.arithmetic,
-        }, context)?;
+        let attended = B::attention_with_sinks(
+            eredu_nn::AttentionRequest {
+                queries,
+                keys,
+                values,
+                scale: self.scale,
+                mask: Some(&mask),
+                sinks: None,
+                softcap: None,
+                arithmetic: self.arithmetic,
+            },
+            context,
+        )?;
         instrumentation.observe("attention.attended_heads", &attended)?;
         let attended = attended
             .transpose_axes(&[0, 2, 1, 3], context)?
@@ -892,15 +904,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<body::AssistantBodyState<B::Tensor>, Error> {
         let hidden = &state.hidden;
-        let dtype = hidden.element_type().ok_or_else(|| Error::backend("assistant state has no dtype"))?;
+        let dtype = hidden
+            .element_type()
+            .ok_or_else(|| Error::backend("assistant state has no dtype"))?;
         let input = match &state.residual {
-            Some(residual) => hidden.cast_float(eredu_nn::TensorElementType::F32, context)?
-                .add(&residual.cast_float(eredu_nn::TensorElementType::F32, context)?, context)?,
+            Some(residual) => hidden
+                .cast_float(eredu_nn::TensorElementType::F32, context)?
+                .add(
+                    &residual.cast_float(eredu_nn::TensorElementType::F32, context)?,
+                    context,
+                )?,
             None => hidden.clone(),
         };
         let residual = input.cast_float(dtype, context)?;
         instrumentation.observe("input", &residual)?;
-        let normalized = self.input_norm.forward(&input, context)?.cast_float(dtype, context)?;
+        let normalized = self
+            .input_norm
+            .forward(&input, context)?
+            .cast_float(dtype, context)?;
         let (normalized, attention_kernel) = match &mut self.attention_conv {
             Some(conv) => {
                 let (input, kernel) = conv.prepare(&normalized, context)?;
@@ -923,11 +944,18 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
         };
         let sum = match self.equation {
             DFlashDecoderEquation::InputRounded => residual.add(&attended, context)?,
-            DFlashDecoderEquation::Float32ResidualNorm => residual.cast_float(eredu_nn::TensorElementType::F32, context)?
-                .add(&attended.cast_float(eredu_nn::TensorElementType::F32, context)?, context)?,
+            DFlashDecoderEquation::Float32ResidualNorm => residual
+                .cast_float(eredu_nn::TensorElementType::F32, context)?
+                .add(
+                    &attended.cast_float(eredu_nn::TensorElementType::F32, context)?,
+                    context,
+                )?,
         };
         let hidden = sum.cast_float(dtype, context)?;
-        let normalized = self.post_attention_norm.forward(&sum, context)?.cast_float(dtype, context)?;
+        let normalized = self
+            .post_attention_norm
+            .forward(&sum, context)?
+            .cast_float(dtype, context)?;
         let (normalized, mlp_kernel) = match &mut self.mlp_conv {
             Some(conv) => {
                 let (input, kernel) = conv.prepare(&normalized, context)?;
@@ -948,13 +976,19 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
             DFlashDecoderEquation::InputRounded => {
                 let output = hidden.add(&feed_forward, context)?;
                 instrumentation.observe("output", &output)?;
-                body::AssistantBodyState { hidden: output, residual: None }
+                body::AssistantBodyState {
+                    hidden: output,
+                    residual: None,
+                }
             }
             DFlashDecoderEquation::Float32ResidualNorm => {
                 if instrumentation.enabled() {
                     instrumentation.observe("output", &hidden.add(&feed_forward, context)?)?;
                 }
-                body::AssistantBodyState { hidden: feed_forward, residual: Some(hidden) }
+                body::AssistantBodyState {
+                    hidden: feed_forward,
+                    residual: Some(hidden),
+                }
             }
         })
     }

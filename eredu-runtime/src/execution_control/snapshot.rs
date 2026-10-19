@@ -70,7 +70,9 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
         _runtime: &ModelRuntime<Self>,
         _sampling: &Self::SamplingState,
         _input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
-    ) -> Option<u64> { None }
+    ) -> Option<u64> {
+        None
+    }
     /// Additional sampler and pending-input retention through those decisions.
     /// Includes future history and lazily created native RNG/input storage.
     fn estimate_sampling_growth(
@@ -247,15 +249,31 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
         self.state.position()
     }
     /// Active/pending modes and last settled transition.
-    pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState { self.state.decoding_state() }
+    pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState {
+        self.state.decoding_state()
+    }
     /// Exact modes realized before this run began.
-    pub fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities { self.state.decoding_capabilities() }
+    pub fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
+        self.state.decoding_capabilities()
+    }
     /// Queues one validated change for the shared driver.
-    pub fn request_decoding_mode(&self, mode: eredu_core::decoding::DecodingMode) -> Result<(), eredu_core::decoding::DecodingModeError> { self.state.request_decoding_mode(mode) }
+    pub fn request_decoding_mode(
+        &self,
+        mode: eredu_core::decoding::DecodingMode,
+    ) -> Result<(), eredu_core::decoding::DecodingModeError> {
+        self.state.request_decoding_mode(mode)
+    }
     /// Binds a thread-safe command handle to this logical run.
-    pub fn bind_control_handle(&self, handle: &eredu_core::execution_control::GenerationControlHandle) -> Result<(), eredu_core::decoding::DecodingModeError> { self.state.bind_control_handle(handle) }
+    pub fn bind_control_handle(
+        &self,
+        handle: &eredu_core::execution_control::GenerationControlHandle,
+    ) -> Result<(), eredu_core::decoding::DecodingModeError> {
+        self.state.bind_control_handle(handle)
+    }
     /// Stops mode commands when facade termination precedes the backend allowance.
-    pub fn finish_decoding(&self) { self.state.finish_decoding(); }
+    pub fn finish_decoding(&self) {
+        self.state.finish_decoding();
+    }
 
     /// Canonical logical constraint state.
     pub fn controller(&self) -> &C {
@@ -274,7 +292,12 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
 }
 impl<B: TextSnapshotBackend, C: TokenFilterController> TextContinuationBranch<B, C> {
     /// Binds commands to the independently owned logical child, even while inactive.
-    pub fn bind_control_handle(&self, handle: &eredu_core::execution_control::GenerationControlHandle) -> Result<(), eredu_core::decoding::DecodingModeError> { self.continuation.bind_control_handle(handle) }
+    pub fn bind_control_handle(
+        &self,
+        handle: &eredu_core::execution_control::GenerationControlHandle,
+    ) -> Result<(), eredu_core::decoding::DecodingModeError> {
+        self.continuation.bind_control_handle(handle)
+    }
     /// Swaps this branch with the installed ordinary continuation. The facade
     /// must also swap its matching semantic state before executing a prediction.
     pub fn exchange(
@@ -311,7 +334,9 @@ pub struct TextContinuationSnapshot<B: TextSnapshotBackend, C: TokenFilterContro
 
 impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapshot<B, C> {
     /// Logical policy at the same boundary as the saved sampler and cache.
-    pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState { self.decoding }
+    pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState {
+        self.decoding
+    }
     /// Logical reservation retained by this snapshot, including facade host data.
     pub fn retained_bytes(&self) -> u64 {
         self._reservation.retained_bytes()
@@ -375,7 +400,10 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let remaining_tokens = boundary.remaining_tokens();
         let position = boundary.position();
         let decoding = boundary.decoding_state();
-        let sequence_bytes = boundary.sequence().snapshot_storage_bytes().ok_or(ExecutionControlError::UnknownEstimate)?;
+        let sequence_bytes = boundary
+            .sequence()
+            .snapshot_storage_bytes()
+            .ok_or(ExecutionControlError::UnknownEstimate)?;
         let (runtime, state, pending) = boundary.parts();
         let discovery = B::capture_run(state)
             .map(|_| B::capture_discovery(runtime))
@@ -393,7 +421,9 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
                     .map_err(TextSnapshotError::Backend)?,
                 B::estimate_pending_input(runtime, pending).map_err(TextSnapshotError::Backend)?,
             ],
-            host_bytes.checked_add(sequence_bytes).ok_or(ExecutionControlError::Overflow)?
+            host_bytes
+                .checked_add(sequence_bytes)
+                .ok_or(ExecutionControlError::Overflow)?
                 .checked_add(
                     boundary
                         .controller()
@@ -460,7 +490,13 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
                 )
                 .map_err(TextSnapshotError::Backend)?,
             ],
-            self.host_bytes.checked_add(self.sequence.snapshot_storage_bytes().ok_or(ExecutionControlError::UnknownEstimate)?).ok_or(ExecutionControlError::Overflow)?
+            self.host_bytes
+                .checked_add(
+                    self.sequence
+                        .snapshot_storage_bytes()
+                        .ok_or(ExecutionControlError::UnknownEstimate)?,
+                )
+                .ok_or(ExecutionControlError::Overflow)?
                 .checked_add(
                     self.controller
                         .snapshot_storage_bytes()
@@ -537,7 +573,14 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             restore.commit();
         }
         B::install_sampling_state(state, sampling);
-        boundary.install_host_state(controller, pending, self.remaining_tokens, self.position, self.decoding, self.sequence.clone());
+        boundary.install_host_state(
+            controller,
+            pending,
+            self.remaining_tokens,
+            self.position,
+            self.decoding,
+            self.sequence.clone(),
+        );
         Ok(host)
     }
 

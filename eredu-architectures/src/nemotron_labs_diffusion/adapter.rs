@@ -2,13 +2,13 @@
 use super::FamilyConfig;
 use crate::decoder::Config;
 use eredu_checkpoint::{
-    StoredDtype,
     schema::{
         CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
         StoredDtypeConstraint,
     },
+    StoredDtype,
 };
-use eredu_nn::{Error, NeuralBackend, ParameterSpec, Tensor, low_rank::LowRankProjection};
+use eredu_nn::{low_rank::LowRankProjection, Error, NeuralBackend, ParameterSpec, Tensor};
 
 /// Validated bias-free, ordinary low-rank output projection adapter.
 #[derive(Debug, Clone)]

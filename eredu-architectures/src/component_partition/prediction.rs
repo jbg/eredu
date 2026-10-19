@@ -215,7 +215,13 @@ impl ComponentPartitionLayouts {
                         Ok(true)
                     },
                 )?;
-                residual::register(&mut projected.observations, descriptor, &scope.readout.residual_cycles, local, &owns)?;
+                residual::register(
+                    &mut projected.observations,
+                    descriptor,
+                    &scope.readout.residual_cycles,
+                    local,
+                    &owns,
+                )?;
                 transforms::register(
                     &mut projected.observations,
                     descriptor,

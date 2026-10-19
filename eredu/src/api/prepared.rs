@@ -17,7 +17,7 @@ pub use eredu_checkpoint::safetensors::{
     SafetensorsMetadataCatalog as SafetensorsSnapshot, SafetensorsShardError,
 };
 pub use eredu_core::artifact::{
-    ArtifactError, ArtifactSource, CompanionSelection, ArtifactCompanionRole,
+    ArtifactCompanionRole, ArtifactError, ArtifactSource, CompanionSelection,
 };
 
 /// Admitted local artifact and architecture facts, without native resources.
@@ -87,13 +87,13 @@ impl PreparedTextModel {
     ) -> Result<SelectedTextModel<'a, F>, PlannedModelLoadError>
     where
         F: ExecutionPlanBackendFactory<
-                Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-            >,
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+        >,
         B: ModelLoadingBackend + TextGenerationBackend,
         B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
-                ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-            >,
+            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
     {
         let Self {
             artifact,
@@ -120,11 +120,11 @@ impl PreparedTextModel {
                         eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer)
                     }
                 };
-                let compatibility = TokenizerCompatibilityProof::prove(
-                    target_fingerprint,
-                    draft_fingerprint,
-                )
-                .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))?;
+                let compatibility =
+                    TokenizerCompatibilityProof::prove(target_fingerprint, draft_fingerprint)
+                        .map_err(|error| {
+                            eredu_core::AutomaticPlanningError::Invalid(error.to_string())
+                        })?;
                 Some(ExternalDraftArtifact {
                     preparation,
                     tokenizer_compatibility: compatibility,
@@ -155,8 +155,8 @@ impl PreparedTextModel {
     where
         B: ModelLoadingBackend + TextGenerationBackend,
         B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
-                ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-            >,
+            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
     {
         LoadedModel::from_inspected(backend, self.artifact, options, self.tokenizer, self.config)
     }
@@ -180,8 +180,8 @@ where
     F::Backend: TextGenerationBackend,
     <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
         eredu_core::ModelConfigurationResolver<
-                ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-            >,
+            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
 {
     /// Exact execution plan whose target and drafting admission are retained.
     pub fn execution_plan(&self) -> &eredu_core::ExecutionPlan {

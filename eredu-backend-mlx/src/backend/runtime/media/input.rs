@@ -34,9 +34,11 @@ pub(crate) fn host_token_ids(tokens: &Array) -> Result<Vec<u32>, crate::backend:
             .map_err(|error| Error::Other(Box::new(error)))?
             .into_iter()
             .map(|id| {
-                u32::try_from(id).map_err(|_| Error::ArchitectureModel(
-                    "decoder alignment contains a negative token ID".into(),
-                ))
+                u32::try_from(id).map_err(|_| {
+                    Error::ArchitectureModel(
+                        "decoder alignment contains a negative token ID".into(),
+                    )
+                })
             })
             .collect(),
         _ => Err(Error::ArchitectureModel(

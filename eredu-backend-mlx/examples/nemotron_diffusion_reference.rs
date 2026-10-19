@@ -2,14 +2,13 @@
 use eredu_architectures::{
     decoder::{self, Config},
     nemotron_labs_diffusion::{
-        self, FamilyConfig,
+        self,
         model::{TextInput, TextModel},
+        FamilyConfig,
     },
 };
 use eredu_backend_mlx::{
-    MlxTensor,
     backend::{
-        ExecutionContext,
         nn::shared::MlxNeuralBackend,
         runtime::{
             cache::state::MlxKeyValueState,
@@ -19,13 +18,15 @@ use eredu_backend_mlx::{
             },
             execution::generic::prepare_layerwise_policy_with_bindings,
         },
+        ExecutionContext,
     },
+    MlxTensor,
 };
 use eredu_checkpoint::{
     safetensors::SafetensorsMetadataCatalog,
     store::{
-        CheckpointSource, CompositeCheckpointSource, SharedCheckpointSource,
-        open_prepared_safetensors_source,
+        open_prepared_safetensors_source, CheckpointSource, CompositeCheckpointSource,
+        SharedCheckpointSource,
     },
     validation::resolve_safetensors_plan,
 };
@@ -471,10 +472,10 @@ fn validate_text<P>(
 ) -> Result<(), Box<dyn Error>>
 where
     P: eredu_runtime::LayerwisePolicy<
-            Backend,
-            nemotron_labs_diffusion::model::TextLayer<Backend>,
-            Error = eredu_backend_mlx::backend::error::Error,
-        >,
+        Backend,
+        nemotron_labs_diffusion::model::TextLayer<Backend>,
+        Error = eredu_backend_mlx::backend::error::Error,
+    >,
 {
     let mut state = State::device(decoder::state_layout(config)?)?;
     let cases: [&[i32]; 4] = [&[1, 100, 200], &[17], &[31], &[421]];
@@ -635,10 +636,10 @@ fn validate_vlm_context<P>(
 ) -> Result<(), Box<dyn Error>>
 where
     P: eredu_runtime::LayerwisePolicy<
-            Backend,
-            nemotron_labs_diffusion::composite::Unit<Backend>,
-            Error = eredu_backend_mlx::backend::error::Error,
-        >,
+        Backend,
+        nemotron_labs_diffusion::composite::Unit<Backend>,
+        Error = eredu_backend_mlx::backend::error::Error,
+    >,
 {
     use eredu_architectures::composite_execution::{CompositeArchitecture, PreparedCompositeInput};
     type Composite = nemotron_labs_diffusion::composite::Model<Backend>;

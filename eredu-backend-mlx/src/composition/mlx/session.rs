@@ -58,8 +58,8 @@ use generation::sample_text_submission;
 pub(crate) use generation::MlxTextSampler;
 #[cfg(test)]
 use model_session::model_submission;
-use observation::{observe_tensor, InspectionCollector};
 pub(in crate::composition::mlx) use observation::ArrayObserverAdapter;
+use observation::{observe_tensor, InspectionCollector};
 use output_completion::MlxSessionCompletionKind;
 
 #[cfg(test)]

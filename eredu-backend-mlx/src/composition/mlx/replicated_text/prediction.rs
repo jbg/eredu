@@ -361,8 +361,8 @@ impl MlxPredictionTargetState {
 }
 
 mod capture;
-pub(super) use capture::ExternalTargetBinding;
 pub(super) use capture::collect as collect_external_capture;
+pub(super) use capture::ExternalTargetBinding;
 
 pub(super) struct ExactPredictionCaptureObserver {
     paths: Vec<String>,

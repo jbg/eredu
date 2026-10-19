@@ -132,13 +132,21 @@ pub(crate) fn merge_decoding_phase_estimate(
     request: &GenerationMemoryRequest,
 ) -> Result<(), CapabilityError> {
     for extra in candidate.domains {
-        let domain = result.domains.iter_mut().find(|domain| domain.domain == extra.domain)
+        let domain = result
+            .domains
+            .iter_mut()
+            .find(|domain| domain.domain == extra.domain)
             .ok_or_else(|| CapabilityError::InvalidConfiguration {
-                field: "decoding phase domain", detail: "phase belongs to an undeclared source pool".into(),
+                field: "decoding phase domain",
+                detail: "phase belongs to an undeclared source pool".into(),
             })?;
-        let pool = request.domains.iter().find(|pool| pool.domain == extra.domain)
+        let pool = request
+            .domains
+            .iter()
+            .find(|pool| pool.domain == extra.domain)
             .ok_or_else(|| CapabilityError::InvalidConfiguration {
-                field: "decoding phase domain", detail: "phase has no request pool".into(),
+                field: "decoding phase domain",
+                detail: "phase has no request pool".into(),
             })?;
         domain.phases.extend(
             extra
@@ -147,7 +155,9 @@ pub(crate) fn merge_decoding_phase_estimate(
                 .filter(|p| p.phase != MemoryPhase::ContinuationStart),
         );
         domain.generation_peak = domain.generation_peak.maximum(&extra.generation_peak);
-        domain.overall_peak = domain.overall_peak.maximum(&extra.overall_peak)
+        domain.overall_peak = domain
+            .overall_peak
+            .maximum(&extra.overall_peak)
             .maximum(&domain.generation_peak);
         domain.additional_generation_peak = domain
             .generation_peak
@@ -157,7 +167,11 @@ pub(crate) fn merge_decoding_phase_estimate(
             pool.already_resident_bytes,
             &pool.budget,
         )?;
-        domain.fit = fit(&domain.overall_peak, pool.already_resident_bytes, &pool.budget)?;
+        domain.fit = fit(
+            &domain.overall_peak,
+            pool.already_resident_bytes,
+            &pool.budget,
+        )?;
     }
     for assumption in candidate.assumptions {
         if !result.assumptions.contains(&assumption) {

@@ -314,7 +314,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
             keys.dim(2)
         };
         let mask_window = if blockwise { None } else { self.window };
-        let mask = mask::attention_mask::<B>(explicit_mask, sequence, mask_keys, mask_window, context)?;
+        let mask =
+            mask::attention_mask::<B>(explicit_mask, sequence, mask_keys, mask_window, context)?;
         instrumentation.observe("attention.keys", &keys)?;
         instrumentation.observe("attention.values", &values)?;
         let request = AttentionRequest {

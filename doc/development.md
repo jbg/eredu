@@ -1,5 +1,14 @@
 # Development iteration
 
+Format Rust changes with the toolchain pinned in `rust-toolchain.toml`:
+
+```sh
+cargo fmt --all
+```
+
+CI runs `cargo fmt --all -- --check` as an independent job on pull requests and
+main pushes that trigger the CI workflow. Formatting drift fails that check.
+
 On Apple silicon, run the shared native preflight before starting a broad
 platform build:
 

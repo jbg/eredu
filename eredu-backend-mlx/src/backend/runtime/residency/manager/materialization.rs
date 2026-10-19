@@ -279,12 +279,12 @@ pub(super) fn prepare_from_disk(
                     if execution_stream == source_stream {
                         Ok(host)
                     } else {
-                        let output = host.ensure_device_storage(execution_stream).map_err(|source| {
-                            ResidencyError::Recipe {
-                                binding: binding.name().to_owned(),
-                                source: WeightRecipeError::Mlx(source),
-                            }
-                        })?;
+                        let output =
+                            host.ensure_device_storage(execution_stream)
+                                .map_err(|source| ResidencyError::Recipe {
+                                    binding: binding.name().to_owned(),
+                                    source: WeightRecipeError::Mlx(source),
+                                })?;
                         Ok(output)
                     }
                 }

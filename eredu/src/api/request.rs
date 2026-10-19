@@ -26,8 +26,8 @@ use crate::runtime::generation::streaming::{
 };
 use std::collections::HashMap;
 
-mod ifm;
 mod harmony;
+mod ifm;
 mod reasoning;
 
 /// Model sampling and stopping settings for one prepared chat generation.
@@ -133,11 +133,12 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
         }
     }
 
-    pub(super) fn validate_session(
-        &self,
-        session: &str,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        if let Self::SessionBound { prepared_chat, payload } = self {
+    pub(super) fn validate_session(&self, session: &str) -> Result<(), eredu_core::BackendFailure> {
+        if let Self::SessionBound {
+            prepared_chat,
+            payload,
+        } = self
+        {
             payload.validate_session(session, prepared_chat)?;
         }
         Ok(())
@@ -145,7 +146,10 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
 
     pub(super) fn into_unbound(self) -> Self {
         match self {
-            Self::SessionBound { prepared_chat, payload } => payload.into_unbound(prepared_chat),
+            Self::SessionBound {
+                prepared_chat,
+                payload,
+            } => payload.into_unbound(prepared_chat),
             input => input,
         }
     }
@@ -569,7 +573,10 @@ pub(super) fn prepared_text_control_runtime(
 }
 
 pub(super) enum GenerationStepKind {
-    ModeChanged { acknowledgement: eredu_core::decoding::ModeChangeAcknowledgement, position: eredu_core::refinement::GenerationPosition },
+    ModeChanged {
+        acknowledgement: eredu_core::decoding::ModeChangeAcknowledgement,
+        position: eredu_core::refinement::GenerationPosition,
+    },
     Token {
         token: u32,
         score_kind: eredu_core::refinement::PredictionScoreKind,
@@ -646,7 +653,11 @@ where
             .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
         let (outcome, record) = match advance {
             Some(eredu_core::TextAdvancement::ModeChanged(acknowledgement)) => (
-                SourceAdvancement::Progress, GenerationStepKind::ModeChanged { acknowledgement, position: self.generator.position() }
+                SourceAdvancement::Progress,
+                GenerationStepKind::ModeChanged {
+                    acknowledgement,
+                    position: self.generator.position(),
+                },
             ),
             None => return Ok(SourceAdvancement::Finished),
             Some(eredu_core::TextAdvancement::Progress(progress)) => (
@@ -1778,12 +1789,16 @@ pub(super) fn prepare_chat_from_parts_with_history(
         }
     }
     if profile.dialect.is_none() {
-        if let Some(recognized) =
-            recognize_muse_atem_protocol(tokenizer, &selected_template, model_id, request.add_generation_prompt)
-                .or_else(|| recognize_gemma_protocol(tokenizer, &selected_template, model_id))
-                .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
-                .or_else(|| harmony::recognize(tokenizer, &selected_template, model_id))
-                .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
+        if let Some(recognized) = recognize_muse_atem_protocol(
+            tokenizer,
+            &selected_template,
+            model_id,
+            request.add_generation_prompt,
+        )
+        .or_else(|| recognize_gemma_protocol(tokenizer, &selected_template, model_id))
+        .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
+        .or_else(|| harmony::recognize(tokenizer, &selected_template, model_id))
+        .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
         {
             profile = recognized;
         }
@@ -1933,7 +1948,9 @@ pub(super) fn prepare_chat_from_parts_with_history(
 
         validate_tagged_history(&request.messages, "</parameter>", "Qwen")?;
     }
-    if let crate::runtime::chat::ReasoningTemplateControl::RequiredEffort { kwarg, .. } = profile.reasoning_template_control {
+    if let crate::runtime::chat::ReasoningTemplateControl::RequiredEffort { kwarg, .. } =
+        profile.reasoning_template_control
+    {
         if request.enable_thinking == Some(false) {
             return Err(ChatCapabilityRejection::ReasoningControl {
                 control: "enable_thinking".into(),
@@ -2081,7 +2098,9 @@ pub(super) fn prepare_chat_from_parts_with_history(
 
     if let Some(enable_thinking) = request.enable_thinking {
         let explicit_required_effort = match profile.reasoning_template_control {
-            crate::runtime::chat::ReasoningTemplateControl::RequiredEffort { kwarg, .. } => extra_template_kwargs.contains_key(kwarg),
+            crate::runtime::chat::ReasoningTemplateControl::RequiredEffort { kwarg, .. } => {
+                extra_template_kwargs.contains_key(kwarg)
+            }
             _ => false,
         };
         if !explicit_required_effort {

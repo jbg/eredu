@@ -46,7 +46,8 @@ impl SelectedTargetExecution {
             .map_err(|e| CaptureError::Invalid(e.to_string()))?;
         if binding.session.is_empty()
             || execution.depth != prediction.units.len()
-            || execution.strategy != Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential)
+            || execution.strategy
+                != Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential)
         {
             return Err(CaptureError::Invalid(
                 "prediction observation binding differs from selected execution".into(),

@@ -13,8 +13,8 @@ use std::sync::Mutex;
 
 const MAGIC: u32 = 0x4552_5052;
 const VERSION: u32 = 1;
-mod speculative;
 mod decoding;
+mod speculative;
 /// Fixed words in one preparation frame, independent of model and prompt size.
 pub const TEXT_PREPARATION_WORDS: usize = 18;
 

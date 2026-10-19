@@ -421,9 +421,12 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     } else {
         None
     };
-    let parameter_loading = crate::backend::runtime::residency::manager::parameter_loading_memory_profile(
-        prepared.store.as_ref(), &prepared.units, prepared.residency,
-    )?;
+    let parameter_loading =
+        crate::backend::runtime::residency::manager::parameter_loading_memory_profile(
+            prepared.store.as_ref(),
+            &prepared.units,
+            prepared.residency,
+        )?;
     let policy = if let Some(layout) = prepared.layout.take() {
         use crate::backend::runtime::execution::generic::MlxSelectedLayerwisePolicy;
         let addresses = (0..layout.len())

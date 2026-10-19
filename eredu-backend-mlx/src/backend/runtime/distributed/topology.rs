@@ -89,7 +89,10 @@ impl CommunicationRouteRealization {
             }
             _ => None,
         };
-        let group = if descriptor.world_broadcast() { Some(world.clone()) } else { endpoint
+        let group = if descriptor.world_broadcast() {
+            Some(world.clone())
+        } else {
+            endpoint
             .map(|_| world.logical_subgroup(&[descriptor.source(), descriptor.destination()]))
             .transpose()
             .map(|group| group.map(|group| group.with_world_collective_wave(world_collective_wave)))
@@ -100,7 +103,8 @@ impl CommunicationRouteRealization {
                     descriptor.source(),
                     descriptor.destination()
                 ))
-            })? };
+            })?
+        };
         let peer_rank = endpoint.map(|endpoint| match endpoint {
             CommunicationRouteEndpoint::Source => 1,
             CommunicationRouteEndpoint::Destination => 0,

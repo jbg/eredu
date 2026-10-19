@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 mod error_bridge;
 pub use error_bridge::ObserverErrorBridge;
 mod speculative;
-pub use speculative::{with_speculative_activation, SpeculativeActivationObserver, SpeculativeActivationGeometry};
+pub use speculative::{
+    with_speculative_activation, SpeculativeActivationGeometry, SpeculativeActivationObserver,
+};
 
 /// Execution site responsible for an architecture-declared internal observation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

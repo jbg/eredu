@@ -1,7 +1,7 @@
 //! Shared invocation transport across independently owned text-layer partitions.
 use super::{
-    FamilyConfig,
     model::{TextInput, TextLayer},
+    FamilyConfig,
 };
 use crate::decoder::{
     self, ComponentInstrumentation, Config, PartitionStaticModules, PartitionedLayeredModel,

@@ -14,7 +14,11 @@ pub enum MlxKeyValueLayerState {
 }
 
 impl MlxKeyValueLayerState {
-    pub(crate) fn truncate_prefix(&mut self, length: i32, stream: &Stream) -> Result<(), Exception> {
+    pub(crate) fn truncate_prefix(
+        &mut self,
+        length: i32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
         match self {
             Self::Stateless => Ok(()),
             Self::Device(cache) => cache.truncate(length, stream),
@@ -487,13 +491,25 @@ impl MlxKeyValueState {
     }
 
     /// Retains a full-attention causal prefix atomically; sliding histories use replay.
-    pub(crate) fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception> {
-        if !self.layout.layers().iter().all(|policy| match policy { LayerCachePolicy::NoState => true,
-            LayerCachePolicy::KeyValue { attention, .. } => attention.sliding_window_i32().is_ok_and(|window| window.is_none()),
-            _ => false }) {
+    pub(crate) fn retain_causal_prefix(
+        &mut self,
+        length: i32,
+        stream: &Stream,
+    ) -> Result<bool, Exception> {
+        if !self.layout.layers().iter().all(|policy| match policy {
+            LayerCachePolicy::NoState => true,
+            LayerCachePolicy::KeyValue { attention, .. } => attention
+                .sliding_window_i32()
+                .is_ok_and(|window| window.is_none()),
+            _ => false,
+        }) {
             return Ok(false);
         }
-        if length < 0 || length > self.offset() { return Err(Exception::custom("causal prefix is outside the verified frontier")); }
+        if length < 0 || length > self.offset() {
+            return Err(Exception::custom(
+                "causal prefix is outside the verified frontier",
+            ));
+        }
         let saved = self.deep_clone_state()?;
         for layer in &mut self.layers {
             if let Err(error) = layer.truncate_prefix(length, stream) {
@@ -501,7 +517,9 @@ impl MlxKeyValueState {
                 return Err(error);
             }
         }
-        for value in self.retained_arrays() { value.evaluated()?; }
+        for value in self.retained_arrays() {
+            value.evaluated()?;
+        }
         Ok(true)
     }
 

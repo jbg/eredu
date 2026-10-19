@@ -870,7 +870,9 @@ impl CompositeCheckpointSource {
 
 impl CheckpointSource for CompositeCheckpointSource {
     fn has_direct_encoded_leases(&self) -> bool {
-        self.sources.iter().all(|source| source.has_direct_encoded_leases())
+        self.sources
+            .iter()
+            .all(|source| source.has_direct_encoded_leases())
     }
 
     fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
@@ -2837,27 +2839,41 @@ mod tests {
 
     #[test]
     fn source_payload_bound_keeps_hidden_backing_and_file_leases_separate() {
-        let source: SharedCheckpointSource = Arc::new(MemoryWeightStore::from_safetensors([
-            ("visible".into(), Dtype::U8, vec![2], vec![1, 2]),
-            ("hidden".into(), Dtype::U8, vec![7], vec![3; 7]),
-        ]).unwrap());
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([
+                ("visible".into(), Dtype::U8, vec![2], vec![1, 2]),
+                ("hidden".into(), Dtype::U8, vec![7], vec![3; 7]),
+            ])
+            .unwrap(),
+        );
         let restricted = RestrictedCheckpointSource::including(
-            source, "visible-only", BTreeSet::from(["visible".into()]),
-        ).unwrap();
+            source,
+            "visible-only",
+            BTreeSet::from(["visible".into()]),
+        )
+        .unwrap();
         assert_eq!(restricted.source_keys(), ["visible"]);
         assert_eq!(restricted.retained_payload_bytes_upper_bound(), Some(9));
         assert!(restricted.has_direct_encoded_leases());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.safetensors");
         serialize_to_file(
-            [("weight", TensorView::new(Dtype::U8, vec![3], &[4, 5, 6]).unwrap())],
-            None, &path,
-        ).unwrap();
+            [(
+                "weight",
+                TensorView::new(Dtype::U8, vec![3], &[4, 5, 6]).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
         let source = SafetensorsWeightStore::open(&path).unwrap();
-        let lease = source.acquire_lease(TensorReadRequest {
-            key: "weight".into(), selection: TensorSelection::Full,
-            policy: ReadPolicy::RequireBounded,
-        }).unwrap();
+        let lease = source
+            .acquire_lease(TensorReadRequest {
+                key: "weight".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
         assert_eq!(lease.encoded_bytes().unwrap(), &[4, 5, 6]);
         assert!(source.has_direct_encoded_leases());
         assert_eq!(source.retained_payload_bytes_upper_bound(), Some(0));

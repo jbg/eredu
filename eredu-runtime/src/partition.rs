@@ -1295,16 +1295,23 @@ impl PartitionState {
 
     /// Exact architecture-global slots selected by this coordinate. Adjacent
     /// selections are coalesced; gaps in the represented span remain `NoState`.
-    pub fn selected_global_layers(&self) -> &[Range<usize>] { &self.selected_layers }
+    pub fn selected_global_layers(&self) -> &[Range<usize>] {
+        &self.selected_layers
+    }
 
     /// Whether this coordinate owns the supplied architecture-global state slot.
     pub fn owns_global_layer(&self, layer: usize) -> bool {
-        self.selected_layers.iter().any(|range| range.contains(&layer))
+        self.selected_layers
+            .iter()
+            .any(|range| range.contains(&layer))
     }
 
     /// Projects the full architecture layout using the retained exact ownership.
     /// Families use this when checking cache identity and local construction.
-    pub fn selected_layout(&self, complete: &StateLayout) -> Result<StateLayout, crate::StateError> {
+    pub fn selected_layout(
+        &self,
+        complete: &StateLayout,
+    ) -> Result<StateLayout, crate::StateError> {
         complete.selected_slice(self.global_layers.clone(), &self.selected_layers)
     }
 
@@ -2198,7 +2205,11 @@ where
         ))
     })?;
     let primary_transport = architecture.group_transport(primary_index);
-    if !matches!(primary_transport.placement, crate::ArchitectureGroupPlacement::Pipeline | crate::ArchitectureGroupPlacement::PipelineSequence) {
+    if !matches!(
+        primary_transport.placement,
+        crate::ArchitectureGroupPlacement::Pipeline
+            | crate::ArchitectureGroupPlacement::PipelineSequence
+    ) {
         return Err(ArchitecturePartitionError::ArchitectureTopology(format!(
             "primary execution group {primary:?} must have pipeline placement"
         )));
@@ -2626,49 +2637,90 @@ mod tests {
 
     #[test]
     fn architecture_state_plan_preserves_global_keys_without_allocating_unowned_state() {
-        use eredu_core::cache::{LayerCachePolicy, StateTensorPolicy, StateTensorRole,
-            StateTensorDimension as Dim, StateTensorDtype, StateTensorPresence, StateResidencyClass};
-        let audio = LayerCachePolicy::FixedState { tensors: vec![StateTensorPolicy {
-            role: StateTensorRole::Convolution { slot: 0 },
-            shape: vec![Dim::Batch, Dim::Fixed(std::num::NonZeroU32::new(2).unwrap()),
-                Dim::Fixed(std::num::NonZeroU32::new(3).unwrap())],
-            dtype: StateTensorDtype::Floating, presence: StateTensorPresence::Optional,
-            residency: StateResidencyClass::AlwaysDeviceMutable,
-        }] };
-        let kv = LayerCachePolicy::key_value(eredu_core::AttentionPolicy::Full,2,4).unwrap();
-        let complete = StateLayout::new(eredu_core::LayerSchedule::new(6,
-            vec![audio.clone(),audio,kv.clone(),kv.clone(),kv.clone(),kv]).unwrap()).unwrap();
+        use eredu_core::cache::{
+            LayerCachePolicy, StateResidencyClass, StateTensorDimension as Dim, StateTensorDtype,
+            StateTensorPolicy, StateTensorPresence, StateTensorRole,
+        };
+        let audio = LayerCachePolicy::FixedState {
+            tensors: vec![StateTensorPolicy {
+                role: StateTensorRole::Convolution { slot: 0 },
+                shape: vec![
+                    Dim::Batch,
+                    Dim::Fixed(std::num::NonZeroU32::new(2).unwrap()),
+                    Dim::Fixed(std::num::NonZeroU32::new(3).unwrap()),
+                ],
+                dtype: StateTensorDtype::Floating,
+                presence: StateTensorPresence::Optional,
+                residency: StateResidencyClass::AlwaysDeviceMutable,
+            }],
+        };
+        let kv = LayerCachePolicy::key_value(eredu_core::AttentionPolicy::Full, 2, 4).unwrap();
+        let complete = StateLayout::new(
+            eredu_core::LayerSchedule::new(
+                6,
+                vec![audio.clone(), audio, kv.clone(), kv.clone(), kv.clone(), kv],
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let plan = ArchitectureStatePartitionPlan::new([
             crate::ArchitectureStatePartitionRule::output_owner(0..2),
             crate::ArchitectureStatePartitionRule::group_units(0, 2..6),
-        ]).with_packing(crate::StatePartitionPacking::PreserveGlobalOrdinals);
-        let mut output = state_plan_partition(3..4,
-            PartitionOwnership::new(false,true,std::iter::empty::<&str>()).unwrap());
-        let selected = output.resolve_state_partition(&complete,&plan).unwrap().unwrap();
-        assert_eq!(selected.global_layers(),0..6);
-        assert_eq!(selected.selected_global_layers(), &[0..2,5..6]);
-        assert_eq!(selected.selected_layout(&complete).unwrap(),*selected.layout());
+        ])
+        .with_packing(crate::StatePartitionPacking::PreserveGlobalOrdinals);
+        let mut output = state_plan_partition(
+            3..4,
+            PartitionOwnership::new(false, true, std::iter::empty::<&str>()).unwrap(),
+        );
+        let selected = output
+            .resolve_state_partition(&complete, &plan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.global_layers(), 0..6);
+        assert_eq!(selected.selected_global_layers(), &[0..2, 5..6]);
+        assert_eq!(
+            selected.selected_layout(&complete).unwrap(),
+            *selected.layout()
+        );
         for layer in 0..6 {
-            let owned = matches!(layer,0|1|5);
-            assert_eq!(selected.owns_global_layer(layer),owned);
-            assert_eq!(selected.layout().layer(layer).unwrap(),
-                if owned {complete.layer(layer).unwrap()} else {&eredu_core::cache::LayerCachePolicy::NoState});
-            if !owned { assert!(selected.layout().components(layer).unwrap().is_empty()); }
+            let owned = matches!(layer, 0 | 1 | 5);
+            assert_eq!(selected.owns_global_layer(layer), owned);
+            assert_eq!(
+                selected.layout().layer(layer).unwrap(),
+                if owned {
+                    complete.layer(layer).unwrap()
+                } else {
+                    &eredu_core::cache::LayerCachePolicy::NoState
+                }
+            );
+            if !owned {
+                assert!(selected.layout().components(layer).unwrap().is_empty());
+            }
         }
-        let non_output = state_plan_partition(0..2,
-            PartitionOwnership::new(true,false,std::iter::empty::<&str>()).unwrap());
-        let other = non_output.resolve_state_partition(&complete,&plan).unwrap().unwrap();
-        assert_eq!(other.global_layers(),2..4);
+        let non_output = state_plan_partition(
+            0..2,
+            PartitionOwnership::new(true, false, std::iter::empty::<&str>()).unwrap(),
+        );
+        let other = non_output
+            .resolve_state_partition(&complete, &plan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.global_layers(), 2..4);
         assert_eq!(other.selected_global_layers(), &[2..4]);
         // Global layer 5 keeps ordinal 5 in the first coordinate, while global
         // layer 2 is local slot 0 in the other. No unowned KV state is created.
-        assert_eq!(selected.global_layer_offset()+5,5);
-        assert_eq!(other.global_layer_offset(),2);
-        let forged = PartitionState::new(selected.layout().clone(),0).unwrap();
-        assert_ne!(forged.selected_layout(&complete).unwrap(),*forged.layout());
+        assert_eq!(selected.global_layer_offset() + 5, 5);
+        assert_eq!(other.global_layer_offset(), 2);
+        let forged = PartitionState::new(selected.layout().clone(), 0).unwrap();
+        assert_ne!(forged.selected_layout(&complete).unwrap(), *forged.layout());
         output.state = Some(selected);
-        assert!(matches!(LayeredPartitionDriver::new(&output,0,3..4),
-            Err(LayeredPartitionError::StateRange { .. })), "a represented gap cannot authorize a stateful unit");
+        assert!(
+            matches!(
+                LayeredPartitionDriver::new(&output, 0, 3..4),
+                Err(LayeredPartitionError::StateRange { .. })
+            ),
+            "a represented gap cannot authorize a stateful unit"
+        );
     }
 
     fn parameter_description(

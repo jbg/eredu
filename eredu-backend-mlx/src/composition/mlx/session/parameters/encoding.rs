@@ -66,9 +66,14 @@ impl EffectiveLayout {
                     && self.packed_geometry(actual_shape, 4, 32)
             }
             LinearFormat::NvFp4 => {
-                actual_dtype == Dtype::Uint32 && self.scale.is_some() && self.global_scale.is_some()
+                actual_dtype == Dtype::Uint32
+                    && self.scale.is_some()
+                    && self.global_scale.is_some()
                     && self.packed_geometry(actual_shape, 4, 16)
-                    && self.row_layout.rows_per_partition(self.shape[self.shape.len()-2] as usize).is_ok()
+                    && self
+                        .row_layout
+                        .rows_per_partition(self.shape[self.shape.len() - 2] as usize)
+                        .is_ok()
             }
             LinearFormat::E4M3BlockFp8(_) => {
                 self.matrix_geometry()
@@ -129,7 +134,10 @@ impl EffectiveLayout {
     }
     pub(super) fn selection_metadata_bytes(&self, id: &str) -> Result<u64, ParameterError> {
         let mut bytes = id.len() as u64;
-        for companion in [&self.scale, &self.affine_bias, &self.global_scale].into_iter().flatten() {
+        for companion in [&self.scale, &self.affine_bias, &self.global_scale]
+            .into_iter()
+            .flatten()
+        {
             bytes = add(bytes, companion.len() as u64)?;
         }
         Ok(add(1024, mul(bytes, 8)?)?)
@@ -137,7 +145,10 @@ impl EffectiveLayout {
     pub(super) fn host_conversion_bytes(&self) -> Result<u64, ParameterError> {
         // The native GGUF decoder has an explicit host implementation. Account
         // for packed reads, temporary decoded vectors and native re-upload.
-        if matches!(self.format, LinearFormat::GgufIQuant { .. } | LinearFormat::NvFp4) {
+        if matches!(
+            self.format,
+            LinearFormat::GgufIQuant { .. } | LinearFormat::NvFp4
+        ) {
             Ok(add(
                 mul(elements(&self.shape)?, 32)?,
                 self.bank_loan.host_bytes,
@@ -229,9 +240,13 @@ impl EffectiveLayout {
                 stream,
             )?,
             LinearFormat::NvFp4 => crate::backend::nn::nvfp4::dequantize(
-                weight, scale()?, get(self.global_scale.as_deref()
-                    .ok_or_else(|| Error::ArchitectureModel("NVFP4 global scale is absent".into()))?)?,
-                self.row_layout, stream,
+                weight,
+                scale()?,
+                get(self.global_scale.as_deref().ok_or_else(|| {
+                    Error::ArchitectureModel("NVFP4 global scale is absent".into())
+                })?)?,
+                self.row_layout,
+                stream,
             )?,
             LinearFormat::E4M3BlockFp8(_) => crate::backend::nn::fp8::dequantize_with_row_layout(
                 weight,
