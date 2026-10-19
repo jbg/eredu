@@ -3,8 +3,8 @@
 use eredu_architectures::voicechat::{
     tts_conditioning::CharacterBatch,
     tts_conditioning_layered::{
-        ConditioningArchitecture, ConditioningDimensions, ConditioningExecution,
-        ConditioningRuntimeState, ConditioningUnit, LayerwiseConditioning,
+        ConditioningDimensions, ConditioningExecution, ConditioningKernel, ConditioningUnit,
+        LayerwiseConditioning,
     },
     tts_conditioning_preparation::PreparedConditioningBindings,
     tts_ingress::{ConditioningLanes, PromptLayout, SpeakerPrompt},
@@ -259,16 +259,17 @@ fn materialize(
             let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
                 Some(local) => {
-                    ConditioningArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local)
+                    ConditioningKernel::<MlxNeuralBackend>::new_parallel(dimensions, local)
                 }
-                None => ConditioningArchitecture::<MlxNeuralBackend>::new(dimensions),
+                None => ConditioningKernel::<MlxNeuralBackend>::new(dimensions),
             }
+            .and_then(ConditioningKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<ConditioningRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -283,7 +284,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<ConditioningRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseConditioning::new(architecture, policy))

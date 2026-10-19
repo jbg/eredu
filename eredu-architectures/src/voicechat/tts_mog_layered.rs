@@ -4,18 +4,17 @@ use super::tts_mog::{
     f32_shape, MogBlock, MogComponentBank, MogDimensions, MogPrediction, MogPredictionHead,
     MogSample, TtsError,
 };
-use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
+use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
+    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
     LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, RuntimeState, StateError, StateLayout, StaticParameterVisitor,
-    StaticParameterVisitorMut, SubmissionBackend, TensorPlacement,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -129,21 +128,7 @@ pub enum MogUnit<B: NeuralBackend> {
     /// Selected-component residual, scale and low-rank parameter bank.
     Components(MogComponentBank<B>),
 }
-/// All learned MoG parameters belong to execution units.
-pub struct MogStaticModules;
-impl<T: 'static> Parameterized<T> for MogStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
-}
+
 /// Ordinary and bounded MoG execution with externally supplied random decisions.
 pub trait MogExecution<B: NeuralBackend> {
     /// Exact residual-stack and mixture geometry.
@@ -166,48 +151,8 @@ pub trait MogExecution<B: NeuralBackend> {
     ) -> Result<MogSample<B::Tensor>, TtsError>;
 }
 
-/// Explicit stateless traversal owner; random and refinement state remain external.
-pub struct MogRuntimeState {
-    layout: StateLayout,
-}
-impl MogRuntimeState {
-    /// Constructs host-only empty state metadata.
-    pub fn new() -> Result<Self, TtsError> {
-        Ok(Self {
-            layout: mog_state_layout()?,
-        })
-    }
-}
-impl<B: NeuralBackend> RuntimeState<B> for MogRuntimeState {
-    type RetainedValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    fn layout(&self) -> &StateLayout {
-        &self.layout
-    }
-    fn optional_layout(&self) -> Option<&StateLayout> {
-        None
-    }
-    fn retained_values(
-        &self,
-        ordinal: usize,
-        _: ExecutionUnitAddress,
-    ) -> Result<Self::RetainedValues<'_>, StateError> {
-        if ordinal != 0 {
-            return Err(StateError::UnknownLayer {
-                layer: ordinal,
-                count: 1,
-            });
-        }
-        Ok(std::iter::empty())
-    }
-}
 fn mog_state_layout() -> Result<StateLayout, TtsError> {
-    Ok(StateLayout::new(LayerSchedule::new(
-        1,
-        vec![LayerCachePolicy::NoState],
-    )?)?)
+    Ok(StatelessComponentState::state_layout()?)
 }
 
 /// One of the two explicit MoG invocation modes.
@@ -256,14 +201,13 @@ impl<T> MogForward<T> {
 }
 
 /// One architecture graph whose request policy activates only required parameter units.
-pub struct MogArchitecture<B: NeuralBackend> {
+pub struct MogKernel<B: NeuralBackend> {
     precision: super::precision::SpeechPrecision,
     dimensions: MogDimensions,
     parallel: Option<(MogLocalDimensions, LocalModelLayout)>,
-    empty: MogStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> MogArchitecture<B> {
+impl<B: NeuralBackend> MogKernel<B> {
     /// Selects storage/arithmetic policy for all independently constructed units.
     pub fn with_precision(
         mut self,
@@ -280,7 +224,6 @@ impl<B: NeuralBackend> MogArchitecture<B> {
             precision: Default::default(),
             dimensions,
             parallel: None,
-            empty: MogStaticModules,
             backend: PhantomData,
         })
     }
@@ -294,6 +237,13 @@ impl<B: NeuralBackend> MogArchitecture<B> {
         architecture.parallel = Some((local, layout.clone()));
         Ok(architecture)
     }
+    /// Combines selected semantic equations with the validated component declaration.
+    pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, TtsError> {
+        Ok(ComponentAdapter::new(
+            tts_mog_component_definition(self.dimensions)?,
+            self,
+        )?)
+    }
     /// Whether execution requires the selected tensor communicator.
     pub fn is_parallel(&self) -> bool {
         self.parallel.is_some()
@@ -301,9 +251,9 @@ impl<B: NeuralBackend> MogArchitecture<B> {
     fn begin_input(
         &self,
         input: MogInput<'_, B::Tensor>,
-        state: &MogRuntimeState,
+        state: &StatelessComponentState,
     ) -> Result<LayeredForwardState<B::Tensor, MogForward<B::Tensor>>, TtsError> {
-        if state.layout != mog_state_layout()? {
+        if *state.layout() != mog_state_layout()? {
             return Err(TtsError::Configuration("MoG runtime layout mismatch"));
         }
         let mut forward = MogForward {
@@ -368,59 +318,49 @@ impl<B: NeuralBackend> MogArchitecture<B> {
     pub fn dimensions(&self) -> MogDimensions {
         self.dimensions
     }
-    /// Stable parameter graph for both invocation modes.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, TtsError> {
-        mog_graph()
-    }
-    /// Number of residual or independently leased head units.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, TtsError> {
-        match group {
-            0 => Ok(self.dimensions.layers),
-            1 | 2 => Ok(1),
-            _ => Err(TtsError::Configuration("unknown MoG execution group")),
-        }
-    }
-    /// Stable logical path of a block or head unit.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, TtsError> {
-        if index >= self.group_unit_count(group)? {
-            return Err(TtsError::Configuration("MoG unit exceeds group"));
-        }
-        Ok(match group {
-            0 => format!("tts_model.tts_model.mog_head.mlp_stack.{index}"),
-            1 => PREDICTION.into(),
-            _ => COMPONENTS.into(),
-        })
-    }
-    /// Constructs only the requested unloaded module.
-    pub fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<MogUnit<B>, TtsError> {
-        self.unit_path(group, index)?;
-        let local = self
-            .parallel
-            .as_ref()
-            .map(|(local, _)| *local)
-            .unwrap_or(MogLocalDimensions {
-                intermediate: self.dimensions.intermediate,
-                rank: self.dimensions.rank,
-            });
-        Ok(match group {
-            0 => MogUnit::Block(
-                MogBlock::new_local(self.dimensions, local.intermediate, index, context)?
-                    .with_precision(self.precision)?,
-            ),
-            1 => MogUnit::Prediction(MogPredictionHead::new(self.dimensions, context)?),
-            _ => MogUnit::Components(MogComponentBank::new_local(
-                self.dimensions,
-                local.rank,
-                context,
-            )?),
-        })
-    }
 }
+/// Validated logical invocations, independent parameter units and transport semantics.
+pub fn tts_mog_component_definition(
+    dimensions: MogDimensions,
+) -> Result<ComponentDefinition, TtsError> {
+    let parameters = mog_parameter_description(dimensions)?;
+    let paths: Vec<String> = (0..dimensions.layers)
+        .map(|index| format!("tts_model.tts_model.mog_head.mlp_stack.{index}"))
+        .chain([PREDICTION.into(), COMPONENTS.into()])
+        .collect();
+    let transport = (0..parameters.graph().groups().len())
+        .map(|group| {
+            let _ = group;
+            ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: if group == 0 {
+                    ArchitectureGroupKind::Decoder
+                } else {
+                    ArchitectureGroupKind::Projector
+                },
+                first_owner_static_roles: vec![],
+                last_owner_static_roles: vec![],
+                merge_destination: ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            }
+        })
+        .collect();
+    Ok(ComponentDefinition::new(
+        "voicechat.tts_mog",
+        parameters,
+        paths
+            .into_iter()
+            .map(|path| ComponentUnit { path, state: 0..0 })
+            .collect(),
+        transport,
+        BLOCKS,
+        vec![],
+        mog_state_layout()?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
+    )?)
+}
+
 fn mog_graph() -> Result<ExecutionGraph, TtsError> {
     Ok(ExecutionGraph::new(
         vec![
@@ -556,11 +496,18 @@ pub fn mog_parameter_description(
         &graph, &layout, expected, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for MogArchitecture<B> {
-    type DefinitionError = TtsError;
-    fn state_layout(&self) -> Result<StateLayout, TtsError> {
-        mog_state_layout()
-    }
+
+impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {
+    type State = StatelessComponentState;
+    type Input<'a> = MogInput<'a, B::Tensor>;
+    type Unit = MogUnit<B>;
+    type ForwardContext = MogForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::iter::Flatten<std::array::IntoIter<Option<&'a B::Tensor>, 6>>
+    where
+        B::Tensor: 'a;
+    type Error = TtsError;
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -585,83 +532,39 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for MogArchitecture<B> {
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, TtsError> {
-        mog_parameter_description(self.dimensions)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, MogRuntimeState> for MogArchitecture<B> {
-    type Input<'a> = MogInput<'a, B::Tensor>;
-    type StaticModules = MogStaticModules;
-    type Unit = MogUnit<B>;
-    type ForwardContext = MogForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Flatten<std::array::IntoIter<Option<&'a B::Tensor>, 6>>
-    where
-        B::Tensor: 'a;
-    type Error = TtsError;
-    fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: if group == 0 {
-                ArchitectureGroupKind::Decoder
-            } else {
-                ArchitectureGroupKind::Projector
-            },
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        BLOCKS
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, TtsError> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, TtsError> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, TtsError> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &MogStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut MogStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogUnit<B>, TtsError> {
-        self.build_unit(group, index, context)
+        let group = address.group();
+        let index = address.index();
+
+        let local = self
+            .parallel
+            .as_ref()
+            .map(|(local, _)| *local)
+            .unwrap_or(MogLocalDimensions {
+                intermediate: self.dimensions.intermediate,
+                rank: self.dimensions.rank,
+            });
+        Ok(match group {
+            0 => MogUnit::Block(
+                MogBlock::new_local(self.dimensions, local.intermediate, index, context)?
+                    .with_precision(self.precision)?,
+            ),
+            1 => MogUnit::Prediction(MogPredictionHead::new(self.dimensions, context)?),
+            _ => MogUnit::Components(MogComponentBank::new_local(
+                self.dimensions,
+                local.rank,
+                context,
+            )?),
+        })
     }
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut MogRuntimeState,
+        state: &mut StatelessComponentState,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         if self.is_parallel() {
@@ -671,12 +574,12 @@ impl<B: NeuralBackend> LayeredArchitecture<B, MogRuntimeState> for MogArchitectu
         }
         self.begin_input(input, state)
     }
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
-        _: &mut MogRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
@@ -688,27 +591,24 @@ impl<B: NeuralBackend> LayeredArchitecture<B, MogRuntimeState> for MogArchitectu
             )),
         }
     }
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
         if forward.selected {
             group == 2
         } else {
             group != 2
         }
     }
-    fn retained_state_ordinals(&self, _: usize, _: usize, _: usize) -> std::ops::Range<usize> {
-        0..0
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut MogUnit<B>,
         hidden: &B::Tensor,
-        _: &mut MogRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.unit_path(group, index)?;
+        let group = address.group();
+
         if self.is_parallel() {
             return Err(TtsError::Configuration(
                 "rank-local MoG execution requires its tensor communicator",
@@ -745,20 +645,19 @@ impl<B: NeuralBackend> LayeredArchitecture<B, MogRuntimeState> for MogArchitectu
             )),
         }
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
-        _: &mut MogRuntimeState,
+        _: &mut StatelessComponentState,
         _: &Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
+    fn retained_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
+        _: ExecutionUnitAddress,
     ) -> Self::RetainedContextValues<'a> {
         [
             forward.prediction.as_ref().map(|p| &p.hidden),
@@ -773,7 +672,7 @@ impl<B: NeuralBackend> LayeredArchitecture<B, MogRuntimeState> for MogArchitectu
     }
 }
 
-impl<B: DistributedNeuralBackend> MogArchitecture<B> {
+impl<B: DistributedNeuralBackend> MogKernel<B> {
     /// Validates exact communicator membership before parameter acquisition or collectives.
     pub fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), TtsError> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
@@ -811,7 +710,6 @@ impl<B: DistributedNeuralBackend> MogArchitecture<B> {
         ) -> Result<bool, TtsError>,
     ) -> Result<B::Tensor, TtsError> {
         let valid = (|| {
-            self.unit_path(group, index)?;
             let local = self
                 .parallel
                 .as_ref()
@@ -908,31 +806,29 @@ impl<B: DistributedNeuralBackend> MogArchitecture<B> {
     }
 }
 
-impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, MogRuntimeState>
-    for MogArchitecture<B>
-{
-    fn begin_forward_parallel<'a>(
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for MogKernel<B> {
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut MogRuntimeState,
+        state: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         self.validate_parallel(parallel)?;
         self.begin_input(input, state)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        _: &mut MogRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.unit_path(group, index)?;
+        let group = address.group();
+
         let (local, _) = self.parallel.as_ref().ok_or(TtsError::Configuration(
             "parallel MoG execution requires rank-local construction",
         ))?;
@@ -972,15 +868,15 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, MogRuntimeState
             )),
         }
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut MogRuntimeState,
+        state: &mut StatelessComponentState,
         forward: &Self::ForwardContext,
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
 }
 
@@ -990,7 +886,12 @@ where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, MogUnit<B>>,
 {
-    runtime: LayerwiseRuntime<MogArchitecture<B>, B, MogRuntimeState, P>,
+    runtime: LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >,
 }
 impl<B, P> LayerwiseMog<B, P>
 where
@@ -999,19 +900,34 @@ where
     P::Error: std::fmt::Display,
 {
     /// Adopts the existing provider without materializing unused head parameters.
-    pub fn new(architecture: MogArchitecture<B>, policy: P) -> Self {
+    pub fn new(
+        architecture: ComponentAdapter<ComponentDefinition, MogKernel<B>>,
+        policy: P,
+    ) -> Self {
         Self {
             runtime: LayerwiseRuntime::new(architecture, policy),
         }
     }
     /// Existing provider/runtime for diagnostics and parameter operations.
-    pub fn runtime(&self) -> &LayerwiseRuntime<MogArchitecture<B>, B, MogRuntimeState, P> {
+    pub fn runtime(
+        &self,
+    ) -> &LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &self.runtime
     }
     /// Existing provider/runtime for bounded parameter operations.
     pub fn runtime_mut(
         &mut self,
-    ) -> &mut LayerwiseRuntime<MogArchitecture<B>, B, MogRuntimeState, P> {
+    ) -> &mut LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &mut self.runtime
     }
 }
@@ -1037,7 +953,7 @@ where
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> MogDimensions {
-        self.runtime.architecture().dimensions()
+        self.runtime.architecture().kernel().dimensions()
     }
     fn predict(
         &mut self,
@@ -1045,7 +961,7 @@ where
         guidance: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogPrediction<B::Tensor>, TtsError> {
-        let mut state = MogRuntimeState::new()?;
+        let mut state = StatelessComponentState::new()?;
         let (_, forward) = self
             .runtime
             .invoke_with_context(MogInput::Predict { hidden, guidance }, &mut state, context)
@@ -1060,7 +976,7 @@ where
         noise_scale: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogSample<B::Tensor>, TtsError> {
-        let mut state = MogRuntimeState::new()?;
+        let mut state = StatelessComponentState::new()?;
         let (_, forward) = self
             .runtime
             .invoke_with_context(
@@ -1094,7 +1010,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogPrediction<B::Tensor>, TtsError> {
-        let mut state = MogRuntimeState::new()?;
+        let mut state = StatelessComponentState::new()?;
         let (_, forward) = self
             .runtime
             .forward_parallel_with_context_hook(
@@ -1117,7 +1033,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogSample<B::Tensor>, TtsError> {
-        let mut state = MogRuntimeState::new()?;
+        let mut state = StatelessComponentState::new()?;
         let (_, forward) = self
             .runtime
             .forward_parallel_with_context_hook(
@@ -1212,11 +1128,11 @@ where
         self.runtime
             .forward_parallel_with_unit_executor_and_traversal_hook(
                 input,
-                &mut MogRuntimeState::new()?,
+                &mut StatelessComponentState::new()?,
                 parallel,
                 context,
                 |architecture, group, index, unit, hidden, _, forward, parallel, context| {
-                    architecture.forward_unit_guarded(
+                    architecture.kernel().forward_unit_guarded(
                         group, index, unit, hidden, forward, parallel, context, &mut agree,
                     )
                 },

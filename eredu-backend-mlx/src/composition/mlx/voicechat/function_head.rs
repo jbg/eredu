@@ -3,8 +3,7 @@
 use eredu_architectures::voicechat::{
     channels::{ChannelError, FunctionHead},
     function_head_layered::{
-        FunctionHeadArchitecture, FunctionHeadDimensions, FunctionHeadExecution,
-        FunctionHeadRuntimeState, LayerwiseFunctionHead,
+        FunctionHeadDimensions, FunctionHeadExecution, FunctionHeadKernel, LayerwiseFunctionHead,
     },
     function_head_preparation::{validate_parallel_communication, PreparedFunctionHeadBindings},
 };
@@ -179,17 +178,18 @@ fn materialize(
         || {
             let (dimensions, format, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
-                Some(local) => FunctionHeadArchitecture::<MlxNeuralBackend>::new_parallel(
-                    dimensions, format, local,
-                ),
-                None => FunctionHeadArchitecture::<MlxNeuralBackend>::new(dimensions, format),
+                Some(local) => {
+                    FunctionHeadKernel::<MlxNeuralBackend>::new_parallel(dimensions, format, local)
+                }
+                None => FunctionHeadKernel::<MlxNeuralBackend>::new(dimensions, format),
             }
+            .and_then(FunctionHeadKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<FunctionHeadRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -204,7 +204,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<FunctionHeadRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseFunctionHead::new(architecture, policy))

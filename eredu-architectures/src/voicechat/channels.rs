@@ -27,6 +27,9 @@ pub const TEXT_PAD_ID: i32 = 12;
 /// Invalid channel geometry, precision or bounded prompt admission.
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
+    /// Shared component declaration or invocation is invalid.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// The configuration changes the released channel equations.
     #[error("{0}")]
     Configuration(&'static str),

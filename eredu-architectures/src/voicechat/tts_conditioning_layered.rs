@@ -9,18 +9,17 @@ use super::{
     tts_mog::{f32_shape, TtsError},
     tts_rvq_layered::RvqExecution,
 };
-use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
+use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
+    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
+    LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
     ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ResidentRuntime,
-    RuntimeState, StateError, StateLayout, StaticParameterVisitor, StaticParameterVisitorMut,
-    SubmissionBackend, TensorPlacement,
+    StateLayout, StatelessComponentState, SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -289,65 +288,11 @@ pub enum ConditioningUnit<B: NeuralBackend> {
     /// Final audio/text gated fusion.
     Fusion(GatedFusion<B>),
 }
-/// All learned conditioning parameters belong to execution units.
-pub struct ConditioningStaticModules;
-impl<T: 'static> Parameterized<T> for ConditioningStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
+
+fn conditioning_state_layout() -> Result<StateLayout, TtsError> {
+    Ok(StatelessComponentState::state_layout()?)
 }
 
-/// Stateless phase traversal owner; mutable transformer and refinement state belong to callers.
-pub struct ConditioningRuntimeState {
-    layout: StateLayout,
-}
-impl ConditioningRuntimeState {
-    /// Constructs host-only empty state metadata.
-    pub fn new() -> Result<Self, TtsError> {
-        Ok(Self {
-            layout: conditioning_state_layout()?,
-        })
-    }
-}
-impl<B: NeuralBackend> RuntimeState<B> for ConditioningRuntimeState {
-    type RetainedValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    fn layout(&self) -> &StateLayout {
-        &self.layout
-    }
-    fn optional_layout(&self) -> Option<&StateLayout> {
-        None
-    }
-    fn retained_values(
-        &self,
-        ordinal: usize,
-        _: ExecutionUnitAddress,
-    ) -> Result<Self::RetainedValues<'_>, StateError> {
-        if ordinal != 0 {
-            return Err(StateError::UnknownLayer {
-                layer: ordinal,
-                count: 1,
-            });
-        }
-        Ok(std::iter::empty())
-    }
-}
-fn conditioning_state_layout() -> Result<StateLayout, TtsError> {
-    Ok(StateLayout::new(LayerSchedule::new(
-        1,
-        vec![LayerCachePolicy::NoState],
-    )?)?)
-}
 /// One conditioning phase, with immutable inputs retained until completion.
 pub enum ConditioningInput<T> {
     /// Packed character lookup.
@@ -364,6 +309,7 @@ pub enum ConditioningInput<T> {
         speaker: SpeakerPrompt,
         /// Optional character output for the conditional lane.
         conditioning: Option<T>,
+
         /// Whether to append the unconditional guidance lane.
         guidance: bool,
     },
@@ -402,20 +348,26 @@ impl<T> ConditioningForward<T> {
     }
 }
 /// Shared graph for resident and bounded conditioning phases.
-pub struct ConditioningArchitecture<B: NeuralBackend> {
+pub struct ConditioningKernel<B: NeuralBackend> {
     dimensions: ConditioningDimensions,
     parallel: Option<(ConditioningLocalDimensions, LocalModelLayout)>,
-    empty: ConditioningStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> ConditioningArchitecture<B> {
+impl<B: NeuralBackend> ConditioningKernel<B> {
+    /// Combines selected semantic equations with the validated component declaration.
+    pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, TtsError> {
+        Ok(ComponentAdapter::new(
+            tts_conditioning_component_definition(self.dimensions)?,
+            self,
+        )?)
+    }
+
     /// Validates geometry without learned parameter allocation.
     pub fn new(dimensions: ConditioningDimensions) -> Result<Self, TtsError> {
         ConditioningDimensions::new(dimensions.character, dimensions.speaker_frames)?;
         Ok(Self {
             dimensions,
             parallel: None,
-            empty: ConditioningStaticModules,
             backend: PhantomData,
         })
     }
@@ -448,64 +400,15 @@ impl<B: NeuralBackend> ConditioningArchitecture<B> {
     pub fn dimensions(&self) -> ConditioningDimensions {
         self.dimensions
     }
-    /// Stable phase graph.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, TtsError> {
-        conditioning_graph()
-    }
-    /// Each phase owns one parameter unit.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, TtsError> {
-        if group < 3 {
-            Ok(1)
-        } else {
-            Err(TtsError::Configuration("unknown conditioning group"))
-        }
-    }
-    /// Canonical phase identity.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, TtsError> {
-        if index != 0 {
-            return Err(TtsError::Configuration("unknown conditioning unit"));
-        }
-        self.group_unit_count(group)?;
-        Ok([CHARACTER, INGRESS, FUSION][group].into())
-    }
-    /// Constructs only the selected unloaded learned unit.
-    pub fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ConditioningUnit<B>, TtsError> {
-        self.unit_path(group, index)?;
-        let d = self.dimensions;
-        Ok(match group {
-            0 => ConditioningUnit::Character(CharacterEmbedding::new_local(
-                d.character,
-                self.local().character,
-                self.local().output,
-                context,
-            )?),
-            1 => ConditioningUnit::Ingress(TtsIngress::new_local(
-                d.character.output_width,
-                d.speaker_frames,
-                self.local().output,
-                context,
-            )?),
-            _ => ConditioningUnit::Fusion(GatedFusion::new_local(
-                d.character.output_width,
-                self.local().output,
-                context,
-            )?),
-        })
-    }
 }
-impl<B: NeuralBackend> ConditioningArchitecture<B> {
+impl<B: NeuralBackend> ConditioningKernel<B> {
     fn begin_input(
         &mut self,
         input: ConditioningInput<B::Tensor>,
-        state: &mut ConditioningRuntimeState,
+        state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ConditioningForward<B::Tensor>>, TtsError> {
-        if state.layout != conditioning_state_layout()? {
+        if *state.layout() != conditioning_state_layout()? {
             return Err(TtsError::Configuration(
                 "conditioning runtime layout mismatch",
             ));
@@ -565,6 +468,41 @@ impl<B: NeuralBackend> ConditioningArchitecture<B> {
         })
     }
 }
+/// Validated logical invocations, independent parameter units and transport semantics.
+pub fn tts_conditioning_component_definition(
+    dimensions: ConditioningDimensions,
+) -> Result<ComponentDefinition, TtsError> {
+    let parameters = conditioning_parameter_description(dimensions)?;
+    let paths: Vec<String> = [CHARACTER, INGRESS, FUSION].map(str::to_owned).to_vec();
+    let transport = (0..parameters.graph().groups().len())
+        .map(|group| {
+            let _ = group;
+            ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::Projector,
+                first_owner_static_roles: vec![],
+                last_owner_static_roles: vec![],
+                merge_destination: ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            }
+        })
+        .collect();
+    Ok(ComponentDefinition::new(
+        "voicechat.tts_conditioning",
+        parameters,
+        paths
+            .into_iter()
+            .map(|path| ComponentUnit { path, state: 0..0 })
+            .collect(),
+        transport,
+        CHARACTER,
+        vec![],
+        conditioning_state_layout()?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
+    )?)
+}
+
 fn conditioning_graph() -> Result<ExecutionGraph, TtsError> {
     Ok(ExecutionGraph::new(
         vec![
@@ -730,11 +668,18 @@ pub fn conditioning_parameter_description(
         &graph, &layout, expected, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for ConditioningArchitecture<B> {
-    type DefinitionError = TtsError;
-    fn state_layout(&self) -> Result<StateLayout, TtsError> {
-        conditioning_state_layout()
-    }
+
+impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {
+    type State = StatelessComponentState;
+    type Input<'a> = ConditioningInput<B::Tensor>;
+    type Unit = ConditioningUnit<B>;
+    type ForwardContext = ConditioningForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = TtsError;
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -755,81 +700,38 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for ConditioningArchitecture<B>
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, TtsError> {
-        conditioning_parameter_description(self.dimensions)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, ConditioningRuntimeState>
-    for ConditioningArchitecture<B>
-{
-    type Input<'a> = ConditioningInput<B::Tensor>;
-    type StaticModules = ConditioningStaticModules;
-    type Unit = ConditioningUnit<B>;
-    type ForwardContext = ConditioningForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = TtsError;
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::Projector,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        CHARACTER
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, TtsError> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, TtsError> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, TtsError> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &ConditioningStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut ConditioningStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditioningUnit<B>, TtsError> {
-        self.build_unit(group, index, context)
+        let group = address.group();
+
+        let d = self.dimensions;
+        Ok(match group {
+            0 => ConditioningUnit::Character(CharacterEmbedding::new_local(
+                d.character,
+                self.local().character,
+                self.local().output,
+                context,
+            )?),
+            1 => ConditioningUnit::Ingress(TtsIngress::new_local(
+                d.character.output_width,
+                d.speaker_frames,
+                self.local().output,
+                context,
+            )?),
+            _ => ConditioningUnit::Fusion(GatedFusion::new_local(
+                d.character.output_width,
+                self.local().output,
+                context,
+            )?),
+        })
     }
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut ConditioningRuntimeState,
+        state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         if self.is_parallel() {
@@ -839,13 +741,12 @@ impl<B: NeuralBackend> LayeredArchitecture<B, ConditioningRuntimeState>
         }
         self.begin_input(input, state, context)
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
-        _: &mut ConditioningRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
@@ -857,23 +758,18 @@ impl<B: NeuralBackend> LayeredArchitecture<B, ConditioningRuntimeState>
             )),
         }
     }
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
         group == forward.input.group()
     }
-    fn retained_state_ordinals(&self, _: usize, _: usize, _: usize) -> std::ops::Range<usize> {
-        0..0
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        _address: ExecutionUnitAddress,
         unit: &mut ConditioningUnit<B>,
         _: &B::Tensor,
-        _: &mut ConditioningRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.unit_path(group, index)?;
         if self.is_parallel() {
             return Err(TtsError::Configuration(
                 "sharded conditioning requires parallel execution",
@@ -935,20 +831,19 @@ impl<B: NeuralBackend> LayeredArchitecture<B, ConditioningRuntimeState>
             )),
         }
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
-        _: &mut ConditioningRuntimeState,
+        _: &mut StatelessComponentState,
         _: &Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
+    fn retained_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
+        _: ExecutionUnitAddress,
     ) -> Self::RetainedContextValues<'a> {
         let mut roots = Vec::with_capacity(4);
         match &forward.input {
@@ -985,7 +880,12 @@ where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, ConditioningUnit<B>>,
 {
-    runtime: LayerwiseRuntime<ConditioningArchitecture<B>, B, ConditioningRuntimeState, P>,
+    runtime: LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >,
 }
 impl<B, P> LayerwiseConditioning<B, P>
 where
@@ -994,7 +894,10 @@ where
     P::Error: std::fmt::Display,
 {
     /// Adopts an exact conditioning unit policy.
-    pub fn new(architecture: ConditioningArchitecture<B>, policy: P) -> Self {
+    pub fn new(
+        architecture: ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        policy: P,
+    ) -> Self {
         Self {
             runtime: LayerwiseRuntime::new(architecture, policy),
         }
@@ -1002,13 +905,23 @@ where
     /// Existing shared provider/runtime for diagnostics and parameter inspection.
     pub fn runtime(
         &self,
-    ) -> &LayerwiseRuntime<ConditioningArchitecture<B>, B, ConditioningRuntimeState, P> {
+    ) -> &LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &self.runtime
     }
     /// Existing shared provider/runtime for bounded parameter operations.
     pub fn runtime_mut(
         &mut self,
-    ) -> &mut LayerwiseRuntime<ConditioningArchitecture<B>, B, ConditioningRuntimeState, P> {
+    ) -> &mut LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &mut self.runtime
     }
 }
@@ -1030,7 +943,11 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
 
 /// Resident owner of the same three phase units and graph.
 pub struct ResidentConditioning<B: NeuralBackend> {
-    runtime: ResidentRuntime<ConditioningArchitecture<B>, B, ConditioningRuntimeState>,
+    runtime: ResidentRuntime<
+        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        B,
+        StatelessComponentState,
+    >,
 }
 impl<B: NeuralBackend> ResidentConditioning<B> {
     /// Constructs the three unloaded learned units exactly once.
@@ -1065,7 +982,7 @@ impl<B: NeuralBackend> ResidentConditioning<B> {
                 "resident conditioning units differ from complete geometry",
             ));
         }
-        let architecture = ConditioningArchitecture::new(dimensions)?;
+        let architecture = ConditioningKernel::new(dimensions)?.into_component()?;
         let runtime = ResidentRuntime::from_units(
             architecture,
             vec![
@@ -1084,7 +1001,10 @@ impl<B: NeuralBackend> ResidentConditioning<B> {
 impl<B: NeuralBackend> std::fmt::Debug for ResidentConditioning<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResidentConditioning")
-            .field("dimensions", &self.runtime.architecture().dimensions())
+            .field(
+                "dimensions",
+                &self.runtime.architecture().kernel().dimensions(),
+            )
             .finish()
     }
 }
@@ -1121,14 +1041,14 @@ impl<B: NeuralBackend> Parameterized<B::Tensor> for ResidentConditioning<B> {
 macro_rules! conditioning_methods {
     ($map:expr) => {
         fn dimensions(&self) -> ConditioningDimensions {
-            self.runtime.architecture().dimensions()
+            self.runtime.architecture().kernel().dimensions()
         }
         fn character_embed(
             &mut self,
             batch: &CharacterBatch,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, TtsError> {
-            let mut state = ConditioningRuntimeState::new()?;
+            let mut state = StatelessComponentState::new()?;
             self.runtime
                 .invoke(
                     ConditioningInput::CharacterEmbed(batch.clone()),
@@ -1143,7 +1063,7 @@ macro_rules! conditioning_methods {
             hidden: &B::Tensor,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, TtsError> {
-            let mut state = ConditioningRuntimeState::new()?;
+            let mut state = StatelessComponentState::new()?;
             self.runtime
                 .invoke(
                     ConditioningInput::CharacterFinish(batch.clone(), hidden.clone()),
@@ -1161,7 +1081,7 @@ macro_rules! conditioning_methods {
             guidance: bool,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<ConditioningLanes<B::Tensor>, TtsError> {
-            let mut state = ConditioningRuntimeState::new()?;
+            let mut state = StatelessComponentState::new()?;
             self.runtime
                 .invoke_with_context(
                     ConditioningInput::Prefill {
@@ -1185,7 +1105,7 @@ macro_rules! conditioning_methods {
             guidance: bool,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<ConditioningLanes<B::Tensor>, TtsError> {
-            let mut state = ConditioningRuntimeState::new()?;
+            let mut state = StatelessComponentState::new()?;
             self.runtime
                 .invoke_with_context(
                     ConditioningInput::Decode {
@@ -1206,7 +1126,7 @@ macro_rules! conditioning_methods {
             text: &B::Tensor,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, TtsError> {
-            let mut state = ConditioningRuntimeState::new()?;
+            let mut state = StatelessComponentState::new()?;
             self.runtime
                 .invoke(
                     ConditioningInput::Fuse(audio.clone(), text.clone()),
@@ -1229,7 +1149,7 @@ where
     conditioning_methods!(runtime_error);
 }
 
-impl<B: DistributedNeuralBackend> ConditioningArchitecture<B> {
+impl<B: DistributedNeuralBackend> ConditioningKernel<B> {
     /// Checks the retained physical layout against the actual communicator before acquisition.
     pub fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), TtsError> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
@@ -1289,31 +1209,27 @@ fn gather_features<B: DistributedNeuralBackend>(
     )?)
 }
 
-impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, ConditioningRuntimeState>
-    for ConditioningArchitecture<B>
-{
-    fn begin_forward_parallel<'a>(
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for ConditioningKernel<B> {
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut ConditioningRuntimeState,
+        state: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         self.validate_parallel(parallel)?;
         self.begin_input(input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        _address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         _: &B::Tensor,
-        _: &mut ConditioningRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.unit_path(group, index)?;
         let local = self.local();
         let gather = |value| {
             gather_features::<B>(
@@ -1387,15 +1303,15 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, ConditioningRun
             )),
         }
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut ConditioningRuntimeState,
+        state: &mut StatelessComponentState,
         forward: &Self::ForwardContext,
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
 }
 
@@ -1412,7 +1328,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, ConditioningForward<B::Tensor>), TtsError> {
-        let mut state = ConditioningRuntimeState::new()?;
+        let mut state = StatelessComponentState::new()?;
         self.runtime
             .forward_parallel_with_context_hook(input, &mut state, parallel, context, |_, _, _| {
                 Ok(())

@@ -2,9 +2,7 @@
 
 use eredu_architectures::voicechat::{
     tts_mog::{MogDimensions, MogPrediction, MogSample, TtsError},
-    tts_mog_layered::{
-        LayerwiseMog, MogArchitecture, MogExecution, MogInput, MogRuntimeState, MogUnit,
-    },
+    tts_mog_layered::{LayerwiseMog, MogExecution, MogInput, MogKernel, MogUnit},
     tts_mog_preparation::{validate_parallel_communication, PreparedMogBindings},
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
@@ -235,16 +233,17 @@ fn materialize(
             let precision = prepared.precision();
             let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
-                Some(local) => MogArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local),
-                None => MogArchitecture::<MlxNeuralBackend>::new(dimensions),
+                Some(local) => MogKernel::<MlxNeuralBackend>::new_parallel(dimensions, local),
+                None => MogKernel::<MlxNeuralBackend>::new(dimensions),
             }
-            .and_then(|architecture| architecture.with_precision(precision))
+            .and_then(|kernel| kernel.with_precision(precision))
+            .and_then(MogKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<MogRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -259,7 +258,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<MogRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseMog::new(architecture, policy))

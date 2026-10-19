@@ -692,9 +692,9 @@ and family cache identity. Parallel adaptation requires the separate
 `ParallelComponentKernel` bound. The adapter rejects pinned parameter declarations;
 it does not infer missing capabilities from equation defaults.
 
-VoiceChat RVQ and codec PRVQ use this adapter with `RvqKernel` and
-`QuantizerKernel`. Both use runtime-owned empty pinned modules and stateless
-traversal metadata. RVQ retains bank-only sum and refinement operations and the
+VoiceChat RVQ, MoG, character conditioning, the function head and codec PRVQ
+use this adapter with their typed kernels. They use runtime-owned empty pinned
+modules and stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
 bank-to-projection embedding operation. PRVQ retains selected depth ranges and
 ordered residual subtraction. Their collective-bearing equations retain explicit
 rank agreement and transient input/candidate roots through ordinary completion.
@@ -816,7 +816,7 @@ and completion authority in vocabulary mechanisms and architecture agreements.
 `FunctionHeadExecution` supplies the same readout to ordinary and controlled
 coupled execution. Its shared dual-head method projects agent and function logits
 from one retained normalized tensor, without a second Nemotron traversal.
-`FunctionHeadArchitecture` declares one independently leased projection unit and
+`FunctionHeadKernel` declares one independently leased projection unit and
 no static learned parameters. Shape, hidden width and floating dtype are checked
 before provider acquisition; the shared traversal retains input and output through
 exact unit completion. Resident, host-layerwise and disk-streamed function-head
@@ -1505,7 +1505,7 @@ family equations and parameter declarations remain with their portable owners.
 
 VoiceChat's `tts_mog` owns the offset RMS-normalized residual MLPs, post-stack
 classifier-free guidance, selected low-rank Gaussian mean and noise equations.
-`MogArchitecture` declares one unit per residual block, a separate final-normalization
+`MogKernel` declares one unit per residual block, a separate final-normalization
 and logits head, and a selected-component bank containing residual/scale projections
 and low-rank means. `MogExecution::predict` executes only the residual and prediction
 groups; `selected` leases only the component bank and consumes the retained prediction
@@ -2090,7 +2090,7 @@ conditional/unconditional lane order. Causal ingress and iterative refinement
 share one `embed_code` parameter. The frozen speaker projection explicitly uses
 the stored matrix orientation; learned speech equations remain outside MLX.
 
-`ConditioningArchitecture` leases character parameters, ingress parameters and
+`ConditioningKernel` leases character parameters, ingress parameters and
 gated fusion as three separate units, with no learned static leases. Character
 lookup and pooling/flag projection are separate invocations around the selected
 character transformer. Prompt/decode ingress consumes feedback only after the

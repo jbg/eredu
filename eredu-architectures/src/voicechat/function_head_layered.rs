@@ -4,21 +4,20 @@ use super::channels::{
     DualChannelLogits, FunctionHead,
 };
 use crate::decoder::StaticModules;
-use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
+use eredu_core::BackendFailure;
 use eredu_nn::{
-    DistributedNeuralBackend, LinearFormatSpec, NeuralBackend, Parameterized, Tensor,
-    VocabularyParallelRange,
+    DistributedNeuralBackend, LinearFormatSpec, NeuralBackend, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
+    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
     LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelLayeredInvocation, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, RuntimeState, StateError, StateLayout,
-    StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend, TensorPlacement,
+    ParallelComponentKernel, ParallelLayeredInvocation, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -183,66 +182,12 @@ where
             .project_parallel(normalized, self.parallel, context)
     }
 }
-/// All learned function-head parameters belong to execution units.
-pub struct FunctionHeadStaticModules;
-impl<T: 'static> Parameterized<T> for FunctionHeadStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
+
+/// Neutral traversal metadata for a parameter-only function projection.
+pub fn function_head_state_layout() -> Result<StateLayout, ChannelError> {
+    Ok(StatelessComponentState::state_layout()?)
 }
 
-/// Explicit stateless traversal owner; input and result tensors belong to the invocation.
-pub struct FunctionHeadRuntimeState {
-    layout: StateLayout,
-}
-impl FunctionHeadRuntimeState {
-    /// Constructs host-only empty state metadata.
-    pub fn new() -> Result<Self, ChannelError> {
-        Ok(Self {
-            layout: function_head_state_layout()?,
-        })
-    }
-}
-impl<B: NeuralBackend> RuntimeState<B> for FunctionHeadRuntimeState {
-    type RetainedValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    fn layout(&self) -> &StateLayout {
-        &self.layout
-    }
-    fn optional_layout(&self) -> Option<&StateLayout> {
-        None
-    }
-    fn retained_values(
-        &self,
-        ordinal: usize,
-        _: ExecutionUnitAddress,
-    ) -> Result<Self::RetainedValues<'_>, StateError> {
-        if ordinal != 0 {
-            return Err(StateError::UnknownLayer {
-                layer: ordinal,
-                count: 1,
-            });
-        }
-        Ok(std::iter::empty())
-    }
-}
-/// Function readout metadata declares no persistent carry.
-pub fn function_head_state_layout() -> Result<StateLayout, ChannelError> {
-    Ok(StateLayout::new(LayerSchedule::new(
-        1,
-        vec![LayerCachePolicy::NoState],
-    )?)?)
-}
 // The callback retains the additive vocabulary mechanism without requiring ordinary
 // replicated backends to implement distributed construction.
 struct ParallelFunctionHeadDefinition<B: NeuralBackend> {
@@ -330,14 +275,13 @@ pub fn function_head_parallel_range(
 }
 
 /// Architecture-owned independent readout and physical matrix declaration.
-pub struct FunctionHeadArchitecture<B: NeuralBackend> {
+pub struct FunctionHeadKernel<B: NeuralBackend> {
     dimensions: FunctionHeadDimensions,
     format: LinearFormatSpec,
     parallel: Option<ParallelFunctionHeadDefinition<B>>,
-    empty: FunctionHeadStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> FunctionHeadArchitecture<B> {
+impl<B: NeuralBackend> FunctionHeadKernel<B> {
     /// Validates dimensions and exact physical companions without allocating tensors.
     pub fn new(
         dimensions: FunctionHeadDimensions,
@@ -350,9 +294,17 @@ impl<B: NeuralBackend> FunctionHeadArchitecture<B> {
             dimensions,
             format,
             parallel: None,
-            empty: FunctionHeadStaticModules,
             backend: PhantomData,
         })
+    }
+    /// Combines selected semantic equations with the validated component declaration.
+    pub fn into_component(
+        self,
+    ) -> Result<ComponentAdapter<ComponentDefinition, Self>, ChannelError> {
+        Ok(ComponentAdapter::new(
+            function_head_component_definition(self.dimensions, &self.format)?,
+            self,
+        )?)
     }
     /// Whether projection requires collective execution.
     pub fn is_parallel(&self) -> bool {
@@ -376,52 +328,8 @@ impl<B: NeuralBackend> FunctionHeadArchitecture<B> {
     pub fn format(&self) -> &LinearFormatSpec {
         &self.format
     }
-    /// Independent single-unit readout graph.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, ChannelError> {
-        function_head_graph()
-    }
-    /// The readout has exactly one independently leased unit.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, ChannelError> {
-        if group == 0 {
-            Ok(1)
-        } else {
-            Err(ChannelError::Configuration("unknown function-head group"))
-        }
-    }
-    /// Canonical source namespace of the readout.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, ChannelError> {
-        self.group_unit_count(group)?;
-        if index != 0 {
-            return Err(ChannelError::Configuration("unknown function-head unit"));
-        }
-        Ok("stt_model.function_head".into())
-    }
-    /// Constructs the selected unloaded projection with its exact row ownership.
-    pub fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<FunctionHead<B>, ChannelError> {
-        self.unit_path(group, index)?;
-        if let Some(parallel) = &self.parallel {
-            return (parallel.build)(
-                self.dimensions.width,
-                self.dimensions.vocabulary,
-                self.format.clone(),
-                parallel.range.clone(),
-                context,
-            );
-        }
-        FunctionHead::new(
-            self.dimensions.width,
-            self.dimensions.vocabulary,
-            self.format.clone(),
-            context,
-        )
-    }
 }
-impl<B: DistributedNeuralBackend> FunctionHeadArchitecture<B> {
+impl<B: DistributedNeuralBackend> FunctionHeadKernel<B> {
     /// Admits exact vocabulary rows and their physical companions without allocation.
     pub fn new_parallel(
         dimensions: FunctionHeadDimensions,
@@ -468,13 +376,7 @@ impl<B: DistributedNeuralBackend> FunctionHeadArchitecture<B> {
         }
         Ok(())
     }
-    fn validate_parallel_unit(
-        &self,
-        group: usize,
-        index: usize,
-        unit: &FunctionHead<B>,
-    ) -> Result<(), ChannelError> {
-        self.unit_path(group, index)?;
+    fn validate_parallel_unit(&self, unit: &FunctionHead<B>) -> Result<(), ChannelError> {
         let selected = self.parallel.as_ref().ok_or(ChannelError::Configuration(
             "collective function projection requires rank-local construction",
         ))?;
@@ -488,6 +390,42 @@ impl<B: DistributedNeuralBackend> FunctionHeadArchitecture<B> {
         }
         Ok(())
     }
+}
+
+/// Validated logical invocations, independent parameter units and transport semantics.
+pub fn function_head_component_definition(
+    dimensions: FunctionHeadDimensions,
+    format: &LinearFormatSpec,
+) -> Result<ComponentDefinition, ChannelError> {
+    let parameters = function_head_parameter_description(dimensions, format)?;
+    let paths: Vec<String> = vec!["stt_model.function_head".into()];
+    let transport = (0..parameters.graph().groups().len())
+        .map(|group| {
+            let _ = group;
+            ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::Prediction,
+                first_owner_static_roles: vec![],
+                last_owner_static_roles: vec![],
+                merge_destination: ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            }
+        })
+        .collect();
+    Ok(ComponentDefinition::new(
+        "voicechat.function_head",
+        parameters,
+        paths
+            .into_iter()
+            .map(|path| ComponentUnit { path, state: 0..0 })
+            .collect(),
+        transport,
+        FUNCTION,
+        vec![],
+        function_head_state_layout()?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
+    )?)
 }
 
 fn function_head_graph() -> Result<ExecutionGraph, ChannelError> {
@@ -534,11 +472,18 @@ pub fn function_head_parameter_description(
         &graph, &layout, expected, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for FunctionHeadArchitecture<B> {
-    type DefinitionError = ChannelError;
-    fn state_layout(&self) -> Result<StateLayout, ChannelError> {
-        function_head_state_layout()
-    }
+
+impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
+    type State = StatelessComponentState;
+    type Input<'a> = &'a B::Tensor;
+    type Unit = FunctionHead<B>;
+    type ForwardContext = ();
+    type RetainedContextValues<'a>
+        = std::iter::Empty<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = ChannelError;
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -564,84 +509,34 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for FunctionHeadArchitecture<B>
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, ChannelError> {
-        function_head_parameter_description(self.dimensions, &self.format)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, FunctionHeadRuntimeState>
-    for FunctionHeadArchitecture<B>
-{
-    type Input<'a> = &'a B::Tensor;
-    type StaticModules = FunctionHeadStaticModules;
-    type Unit = FunctionHead<B>;
-    type ForwardContext = ();
-    type RetainedContextValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = ChannelError;
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::Prediction,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        FUNCTION
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, ChannelError> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, ChannelError> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, ChannelError> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &FunctionHeadStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut FunctionHeadStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        _address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, ChannelError> {
-        self.build_unit(group, index, context)
+    ) -> Result<FunctionHead<B>, ChannelError> {
+        if let Some(parallel) = &self.parallel {
+            return (parallel.build)(
+                self.dimensions.width,
+                self.dimensions.vocabulary,
+                self.format.clone(),
+                parallel.range.clone(),
+                context,
+            );
+        }
+        FunctionHead::new(
+            self.dimensions.width,
+            self.dimensions.vocabulary,
+            self.format.clone(),
+            context,
+        )
     }
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         hidden: Self::Input<'a>,
-        state: &mut FunctionHeadRuntimeState,
+        state: &mut StatelessComponentState,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ()>, ChannelError> {
-        if state.layout != function_head_state_layout()? {
+        if *state.layout() != function_head_state_layout()? {
             return Err(ChannelError::Configuration(
                 "function-head runtime layout mismatch",
             ));
@@ -652,12 +547,12 @@ impl<B: NeuralBackend> LayeredArchitecture<B, FunctionHeadRuntimeState>
             context: (),
         })
     }
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
-        _: &mut FunctionHeadRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut (),
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
@@ -668,20 +563,18 @@ impl<B: NeuralBackend> LayeredArchitecture<B, FunctionHeadRuntimeState>
         }
         Ok(initial.clone())
     }
-    fn retained_state_ordinals(&self, _: usize, _: usize, _: usize) -> std::ops::Range<usize> {
-        0..0
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
     }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        _address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        _: &mut FunctionHeadRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut (),
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
-        self.unit_path(group, index)?;
         if unit.dimensions() != self.dimensions || unit.format() != &self.format {
             return Err(ChannelError::Configuration(
                 "leased function head differs from selected geometry or format",
@@ -689,36 +582,33 @@ impl<B: NeuralBackend> LayeredArchitecture<B, FunctionHeadRuntimeState>
         }
         unit.project(hidden, context)
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
-        _: &mut FunctionHeadRuntimeState,
+        _: &mut StatelessComponentState,
         _: &(),
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
+    fn retained_values<'a>(
         &'a self,
         _: &'a (),
-        _: usize,
-        _: usize,
+        _: ExecutionUnitAddress,
     ) -> Self::RetainedContextValues<'a> {
         std::iter::empty()
     }
 }
-impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, FunctionHeadRuntimeState>
-    for FunctionHeadArchitecture<B>
-{
-    fn begin_forward_parallel<'a>(
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for FunctionHeadKernel<B> {
+    fn begin_parallel<'a>(
         &mut self,
         hidden: Self::Input<'a>,
-        state: &mut FunctionHeadRuntimeState,
+        state: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ()>, ChannelError> {
         self.validate_parallel_projection(hidden, parallel)?;
-        if state.layout != function_head_state_layout()? {
+        if *state.layout() != function_head_state_layout()? {
             return Err(ChannelError::Configuration(
                 "function-head runtime layout mismatch",
             ));
@@ -728,29 +618,28 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, FunctionHeadRun
             context: (),
         })
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        _address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        _: &mut FunctionHeadRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut (),
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
-        self.validate_parallel_unit(group, index, unit)?;
+        self.validate_parallel_unit(unit)?;
         unit.project_parallel(hidden, parallel, context)
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut FunctionHeadRuntimeState,
+        state: &mut StatelessComponentState,
         forward: &(),
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
 }
 
@@ -760,7 +649,12 @@ where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, FunctionHead<B>>,
 {
-    runtime: LayerwiseRuntime<FunctionHeadArchitecture<B>, B, FunctionHeadRuntimeState, P>,
+    runtime: LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >,
 }
 impl<B, P> LayerwiseFunctionHead<B, P>
 where
@@ -769,7 +663,10 @@ where
     P::Error: std::fmt::Display,
 {
     /// Adopts an exact function head unit policy.
-    pub fn new(architecture: FunctionHeadArchitecture<B>, policy: P) -> Self {
+    pub fn new(
+        architecture: ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+        policy: P,
+    ) -> Self {
         Self {
             runtime: LayerwiseRuntime::new(architecture, policy),
         }
@@ -777,13 +674,23 @@ where
     /// Existing shared provider/runtime for diagnostics and parameter inspection.
     pub fn runtime(
         &self,
-    ) -> &LayerwiseRuntime<FunctionHeadArchitecture<B>, B, FunctionHeadRuntimeState, P> {
+    ) -> &LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &self.runtime
     }
     /// Existing shared provider/runtime for bounded parameter operations.
     pub fn runtime_mut(
         &mut self,
-    ) -> &mut LayerwiseRuntime<FunctionHeadArchitecture<B>, B, FunctionHeadRuntimeState, P> {
+    ) -> &mut LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &mut self.runtime
     }
 }
@@ -810,11 +717,12 @@ where
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> FunctionHeadDimensions {
-        self.runtime.architecture().dimensions()
+        self.runtime.architecture().kernel().dimensions()
     }
     fn validate_projection(&self, normalized: &B::Tensor) -> Result<(), ChannelError> {
         self.runtime
             .architecture()
+            .kernel()
             .validate_replicated_projection(normalized)
     }
     fn project(
@@ -822,7 +730,7 @@ where
         normalized: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
-        let mut state = FunctionHeadRuntimeState::new()?;
+        let mut state = StatelessComponentState::new()?;
         self.runtime
             .invoke(normalized, &mut state, context)
             .map_err(runtime_error)
@@ -843,7 +751,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
-        let mut state = FunctionHeadRuntimeState::new()?;
+        let mut state = StatelessComponentState::new()?;
         self.runtime
             .invoke_parallel(normalized, &mut state, parallel, context)
             .map_err(runtime_error)
@@ -865,8 +773,9 @@ where
         let prepared = (|| {
             self.runtime
                 .architecture()
+                .kernel()
                 .validate_parallel_projection(normalized, parallel)?;
-            FunctionHeadRuntimeState::new()
+            Ok::<_, ChannelError>(StatelessComponentState::new()?)
         })();
         let agreement = agree_parallel_projection::<B, _>(
             self.dimensions(),
@@ -885,7 +794,7 @@ where
                 parallel,
                 context,
                 |architecture, group, index, unit, hidden, _, _, parallel, context| {
-                    let valid = architecture.validate_parallel_unit(group, index, unit);
+                    let valid = architecture.kernel().validate_parallel_unit(unit);
                     let accepted = agree(
                         [
                             0x46554e4348554e49,
@@ -924,6 +833,7 @@ where
     ) -> Result<DualChannelLogits<B::Tensor>, ChannelError> {
         self.runtime
             .architecture()
+            .kernel()
             .validate_parallel_projection(normalized, parallel)?;
         let agent = backbone.project_normalized_parallel(normalized, parallel, context)?;
         let function = self.project_parallel(normalized, parallel, context)?;
@@ -946,6 +856,7 @@ where
     ) -> Result<(), ChannelError> {
         self.runtime
             .architecture()
+            .kernel()
             .validate_parallel_projection(normalized, parallel)
     }
     fn project_parallel(
