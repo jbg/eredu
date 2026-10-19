@@ -246,17 +246,6 @@ fn long_policy(chunk: i32) -> eredu_runtime::BoundedExecutionPolicy {
 
 #[test]
 fn ordinary_qwen4_embedded_prediction_long_prefill_preserves_shifted_capture_and_replay() {
-    // Nested typed construction and long-prefill execution exceed libtest's
-    // default stack in unoptimized builds; keep the fixture's stack bounded.
-    std::thread::Builder::new()
-        .stack_size(16 << 20)
-        .spawn(check_long_prefill_shifted_capture_and_replay)
-        .unwrap()
-        .join()
-        .unwrap();
-}
-
-fn check_long_prefill_shifted_capture_and_replay() {
     let directory = tempfile::tempdir().unwrap();
     let fixtures = eredu_evaluation::qwen4_exp::PreparedFixtures::write(directory.path()).unwrap();
     eredu_evaluation::qwen4_exp::add_prediction_weights(&fixtures.safetensors_path).unwrap();
