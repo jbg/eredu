@@ -7004,11 +7004,16 @@ public final-output seam. Missing decomposition metadata cannot remove an
 otherwise implemented final-output observation.
 
 Whole residual-write ownership joins the architecture node's declared canonical
-parameter namespaces to retained logical execution-unit owners. All matching
-parameters must agree on one unit; static roles, missing namespaces and ambiguous
-owners reject. Physical aliases and a node's display ordinal do not determine
-placement. Whole-write values are complete hidden-axis contributions after the
+parameter namespaces to retained logical execution-unit owners. An exact logical
+parameter group identifies its own invocation; a nested invocation keeps its
+separate ownership. Other namespaces match an exact tensor or its dot-delimited
+descendants. Matches must agree on one unit; static roles, missing namespaces and
+ambiguous owners reject. Blocks with their own parameter groups use those owners;
+structural blocks derive one owner from their parameter-bearing descendants.
+Physical aliases and a node's display ordinal do not determine placement. Whole-write values are complete hidden-axis contributions after the
 operator's selected collective reduction, and still require actual driver hooks.
+A block boundary is registered only when its observation path is declared by that
+node; changing the observation catalog alone cannot create a driver hook.
 LFM2's ordinary, tensor-parallel and partition methods share block residual
 ordering and readout instrumentation. Its dense feed-forward scalar hook precedes
 the row-parallel projection; the convolution hook follows the complete mixer
@@ -10558,9 +10563,10 @@ row decoders/scalars and reports pool occupancy. Stages without lexical units ha
 
 `ParallelCompositeArchitecture` separates parallel ingress from ordinary composite admission.
 `CompositeTextRequirements` retains architecture-authored wire schemas, sequence bounds and
-source-unit continuation geometry. The shared composite executor consumes typed reductions
-and retained row sources. Conditional partitioning composes target TP/PP/EP with shared Qwen
-vision sharding. Receiving vision stages construct geometry/rotary state without accessing
+source-unit continuation geometry. Inactive media groups have no continuation
+geometry; active encoders validate every source-unit shape before execution. The
+shared composite executor consumes typed reductions and retained row sources.
+Conditional partitioning composes target TP/PP/EP with shared Qwen vision sharding. Receiving vision stages construct geometry/rotary state without accessing
 another stage's patch parameters, then consume transported activation. Encoder edges use
 full-request extent; target edges use decoder chunks. Boundaries retain complete residual
 streams, original IDs, visibility and rotary state.

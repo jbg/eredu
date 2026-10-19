@@ -56,15 +56,21 @@ impl ComponentPartitionLayouts {
     }
 }
 
-/// Composite block nodes can contain only structural metadata. Their parameter
-/// declarations belong to descendant sublayers, all of which must prove the
-/// same physical invocation owner before the block boundary can be replicated.
+/// A block's declared parameter group identifies its logical invocation.
+/// Structural blocks without their own groups derive ownership from descendant
+/// sublayers, which must agree before their complete boundary can be replicated.
 pub(super) fn block_invocation_owner<'a>(
     descriptor: &ArchitectureDescriptor,
     parameters: &'a ArchitectureParameterDescription,
     block: &str,
 ) -> Result<&'a eredu_runtime::ParameterGroupOwner, ComponentPartitionError> {
     use eredu_core::capture::CaptureError;
+    let node = descriptor.node(block).ok_or_else(|| {
+        CaptureError::Invalid("decoder block is absent from architecture discovery".into())
+    })?;
+    if !node.parameter_groups.is_empty() {
+        return node_invocation_owner(descriptor, parameters, block);
+    }
     let parents = descriptor
         .nodes
         .iter()

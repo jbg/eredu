@@ -1860,6 +1860,7 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
 }
 
 fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
+    args.common.device = Some(cli_device_for_plan(plan.device())?);
     args.vision_companion = plan.media_companions().vision().map(Path::to_path_buf);
     args.audio_companion = plan.media_companions().audio().map(Path::to_path_buf);
     match plan.weight_transformation() {
@@ -4053,6 +4054,7 @@ mod tests {
                 lookahead: true, adaptive_lookahead: true,
             });
         let mut replay = args.clone();
+        replay.common.device = Some(CliDevice::Gpu(0));
         apply_automatic_plan(&mut replay, &plan).unwrap();
         assert_eq!(cli_execution_plan(&replay, Some(Path::new("assistant")), false).unwrap(), plan);
         let resources = ModelResourceProfile::unmeasured("target".into(), eredu_core::ArtifactFormat::SafeTensors);
