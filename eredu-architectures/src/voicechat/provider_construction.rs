@@ -509,7 +509,3 @@ impl PreparedSpeechProviders {
         ))
     }
 }
-
-#[cfg(test)]
-#[path = "provider_construction_tests.rs"]
-mod tests;

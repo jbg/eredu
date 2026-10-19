@@ -24,7 +24,7 @@ The integration guide records exact loaded capabilities and protocol limitations
 | Required outcome | Public path and behavioral evidence |
 | --- | --- |
 | Stable topology and equations | `inspect_architecture`, [component IDs and equations](../eredu-core/src/component.rs), and loaded capture/intervention discovery; architecture unit/numerical suites and family-native matrices |
-| Actual component capture and causal masks | [Exact-token observed/intervened preparation](../eredu/src/api/observed.rs) and shared controlled drivers; [nonzero numerical fixtures](../eredu-architectures/tests/reference_numeric/components.rs) cover unit/channel masks, survivor recomputation and original/effective evidence |
+| Actual component capture and causal masks | [Exact-token observed/intervened preparation](../eredu/src/api/observed.rs) and shared controlled drivers; [shared execution conformance](family-acceptance.md#shared-execution-conformance) covers snapshot isolation and consumed budgets; numerical localization runs outside the tracked tree |
 | Effective reads and bounded projections | [`parameter_discovery`, `query_parameter`, `project_parameter`](../eredu/src/api/parameters.rs); independent packed-source decoding, selected geometry and reservation failures |
 | Fixed-prefix scoring and repeatable trials | Exact-token replay, controlled snapshots/forks and full-vocabulary `TokenScores`; public reference consumers and neutral lifecycle conformance |
 | Reversible coordinated edits | [Overlay admission, activation and removal](../eredu/src/api/parameters.rs); independent edited references, [peer transaction tests](../eredu-runtime/src/parameter_operations/coordination/tests.rs), cache-version rejection and restoration |

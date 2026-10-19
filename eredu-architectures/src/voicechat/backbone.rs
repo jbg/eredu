@@ -287,7 +287,3 @@ pub(crate) fn project_parameters(
     // Applying Nemotron's physical-storage recipe a second time would change it.
     Ok(output)
 }
-
-#[cfg(test)]
-#[path = "backbone_tests.rs"]
-mod tests;

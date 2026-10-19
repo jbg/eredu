@@ -60,32 +60,12 @@ use crate::backend::{
         PagedKeyValueCache,
     },
 };
-#[cfg(test)]
-use crate::module::ModuleParamMut;
 use crate::MlxTensor;
 use crate::{
     module::{Module, ModuleParamRef, PhysicalParameters},
     nested::NestedValue,
     nn,
 };
-
-#[cfg(test)]
-fn trace_partition_collective(operation: &str, input: &Array, group: &Group, detail: &str) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    if std::env::var_os("EREDU_TEST_PARTITION_COLLECTIVE_TRACE").is_some() {
-        static ORDINAL: AtomicUsize = AtomicUsize::new(0);
-        eprintln!(
-            "partition-schedule rank={} ordinal={} operation={} subgroup={}/{} shape={:?} {}",
-            std::env::var("MLX_RANK").unwrap_or_else(|_| "?".into()),
-            ORDINAL.fetch_add(1, Ordering::Relaxed),
-            operation,
-            group.rank(),
-            group.size(),
-            input.shape(),
-            detail,
-        );
-    }
-}
 
 mod core_backend;
 mod extensions;
@@ -103,6 +83,3 @@ pub use submission::*;
 /// Zero-sized MLX backend selector. All calls are statically dispatched.
 #[derive(Debug, Clone, Copy)]
 pub struct MlxNeuralBackend;
-
-#[cfg(test)]
-mod tests;

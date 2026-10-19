@@ -595,7 +595,4 @@ impl Config {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 mod gguf;

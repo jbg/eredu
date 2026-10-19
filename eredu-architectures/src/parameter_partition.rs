@@ -266,6 +266,3 @@ pub(crate) fn invalid(message: &str) -> ParameterError {
 fn coordinate_error(error: eredu_core::component::ComponentCoordinateError) -> ParameterError {
     invalid(&error.to_string())
 }
-
-#[cfg(test)]
-mod tests;

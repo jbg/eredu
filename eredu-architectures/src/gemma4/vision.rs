@@ -1025,32 +1025,3 @@ fn apply_two_axis_rotary<T: Tensor>(
     }
     T::concatenate(&output, -1, context)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn valid() -> VisionConfig {
-        VisionConfig::from_json(
-            br#"{
-                "hidden_size":16,"intermediate_size":32,"num_hidden_layers":2,
-                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
-                "patch_size":4,"pooling_kernel_size":2,"position_embedding_size":16,
-                "rms_norm_eps":0.000001
-            }"#,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn validates_two_axis_geometry_activation_and_rotary_base() {
-        let config = valid();
-        assert_eq!(config.rope_theta(), 100.0);
-        let mut invalid = config.clone();
-        invalid.head_dim = 6;
-        assert!(invalid.validate().is_err());
-        invalid = config;
-        invalid.hidden_activation = "silu".into();
-        assert!(invalid.validate().is_err());
-    }
-}

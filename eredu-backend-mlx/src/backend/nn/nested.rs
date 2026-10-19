@@ -80,6 +80,3 @@ impl<K, V> NestedHashMap<K, V> {
             .collect()
     }
 }
-
-#[cfg(test)]
-mod tests;

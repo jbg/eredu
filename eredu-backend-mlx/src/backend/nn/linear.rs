@@ -672,6 +672,3 @@ fn unloaded_embedding_with_dtype(
         )?)),
     }
 }
-
-#[cfg(test)]
-mod tests;

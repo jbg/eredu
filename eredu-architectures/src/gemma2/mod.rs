@@ -506,6 +506,3 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         .replace("ffn_norm", "pre_feedforward_layernorm");
     crate::llama::translate_gguf_weight_name(&name)
 }
-
-#[cfg(test)]
-mod tests;

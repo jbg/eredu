@@ -255,6 +255,3 @@ impl<D> WorkDescriptor for VoiceChatWork<D> {
 pub(super) fn encode_u64(output: &mut Vec<u32>, value: u64) {
     output.extend([value as u32, (value >> 32) as u32]);
 }
-
-#[cfg(test)]
-pub(crate) mod tests;

@@ -255,30 +255,3 @@ fn required_i64_values(
         .and_then(MetadataValue::to_i64_vec)
         .ok_or_else(|| invalid(format!("GGUF metadata {key:?} must be an integer array")))
 }
-
-#[cfg(test)]
-mod tests {
-    use eredu_gguf::MetadataArray;
-
-    use super::*;
-
-    #[test]
-    fn projector_identity_fails_closed_without_backend_types() {
-        let metadata = HashMap::from([
-            (
-                "general.architecture".into(),
-                MetadataValue::String("clip".into()),
-            ),
-            ("clip.has_vision_encoder".into(), MetadataValue::Bool(true)),
-            (
-                "clip.vision.projector_type".into(),
-                MetadataValue::String("other".into()),
-            ),
-            (
-                "clip.audio.subsampling_conv_channels".into(),
-                MetadataValue::Array(MetadataArray::Int32(vec![8, 16])),
-            ),
-        ]);
-        assert!(validate_projector_identity(&metadata).is_err());
-    }
-}

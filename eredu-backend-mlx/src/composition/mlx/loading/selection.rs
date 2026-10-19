@@ -118,14 +118,6 @@ impl<'a> MlxPreparationMechanisms<'a> {
         }
     }
 
-    #[cfg(test)]
-    const fn with_communication(
-        mut self,
-        communication: &'a eredu_runtime::CommunicationCapabilities,
-    ) -> Self {
-        self.communication = Some(communication);
-        self
-    }
 }
 
 impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechanisms<'_> {
@@ -230,33 +222,6 @@ impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechani
             crate::backend::runtime::distributed::topology::mlx_communication_capabilities()
         })
     }
-}
-
-#[cfg(test)]
-pub(crate) fn select_preparation_with_grouped_capabilities(
-    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
-    options: MlxLoadRequest,
-    grouped_capabilities: &[eredu_runtime::GroupedOperationRequirement],
-) -> Result<MlxSelectedPreparation, Error> {
-    select_preparation_with_mechanisms(
-        inspection,
-        options,
-        &MlxPreparationMechanisms::new(grouped_capabilities),
-    )
-}
-
-#[cfg(test)]
-pub(super) fn select_preparation_with_mechanism_capabilities(
-    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
-    options: MlxLoadRequest,
-    grouped_capabilities: &[eredu_runtime::GroupedOperationRequirement],
-    communication: &eredu_runtime::CommunicationCapabilities,
-) -> Result<MlxSelectedPreparation, Error> {
-    select_preparation_with_mechanisms(
-        inspection,
-        options,
-        &MlxPreparationMechanisms::new(grouped_capabilities).with_communication(communication),
-    )
 }
 
 fn select_preparation_with_mechanisms(

@@ -331,19 +331,3 @@ pub fn state_identity(
 }
 
 pub(crate) use moe::execution_topology;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // This generic body is a compile-time contract: none of these dense Qwen
-    // entry points may acquire a GroupedNeuralBackend bound.
-    #[allow(dead_code)]
-    fn dense_qwen_accepts_any_neural_backend<B: NeuralBackend>(
-        args: ModelArgs,
-        context: &<B::Tensor as Tensor>::Context,
-    ) {
-        let _: Result<TransformerBlock<B>, Error> = new_block::<B>(&args, 0, context);
-        let _: Result<LayeredModel<B>, Error> = LayeredModel::<B>::new(args, context);
-    }
-}

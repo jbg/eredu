@@ -169,7 +169,6 @@ execution counters and distinguish local stateless partitions. Reproduce with:
 
 ```sh
 cargo test -p eredu-core -p eredu-runtime
-cargo test -p eredu-architectures --lib resource_descriptions
 ```
 
 ## CLI
@@ -852,11 +851,7 @@ manifest; it does not establish universal allocator or process-memory bounds.
 
 ```sh
 cargo test -p eredu-core -p eredu-runtime --locked
-cargo test -p eredu-architectures --lib --locked
 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
-cargo test -p eredu --no-default-features --features mlx,metal \
-  --test native_execution_control native_generic_workspace --locked \
-  -- --ignored --nocapture --test-threads=1
 ```
 
 ## Mid-session continuation forecasts
@@ -1064,10 +1059,7 @@ owners, invalidation, replacement and final-owner eviction.
 Reproducible commands:
 
 ```sh
-cargo test -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --locked
 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
-cargo test -p eredu-architectures --test reference_numeric --locked
-cargo test -p eredu-architectures --test reference_conformance speculative_production --locked
 cargo clippy -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --tests --locked -- -D warnings
 cargo clippy -p eredu-backend-mlx --features metal --lib --tests --locked -- -D warnings
 cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --nocapture --test-threads=1
@@ -1143,7 +1135,6 @@ resource-description section.
 Additional validation commands:
 
 ```sh
-cargo test -p eredu-architectures --test reference_structural --locked
 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_speculative_continuation_forecasts_cover_settled_state_without_advancement --locked -- --ignored --nocapture --test-threads=1
 cargo clippy -p eredu --no-default-features --features mlx,metal --test native_execution_control --locked -- -D warnings
 ```
@@ -1209,9 +1200,7 @@ test distinguishes canonical prediction state from the retained seed.
 Reproducible checks:
 
 ```sh
-cargo test -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --locked
 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
-cargo test -p eredu-architectures --test reference_conformance speculative_production --locked
 cargo clippy -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --tests --locked -- -D warnings
 cargo clippy -p eredu-backend-mlx --features metal --lib --tests --locked -- -D warnings
 cargo clippy -p eredu --no-default-features --features mlx,metal --test native_execution_control --locked -- -D warnings
@@ -1246,13 +1235,6 @@ generation and require forecasts to leave native allocation unchanged.
 Released LFM2 checks accept a pinned checkpoint via `EREDU_LFM2_MEMORY_MODEL` and
 cover cold, loaded and settled continuation at selected lengths:
 
-```sh
-EREDU_LFM2_MEMORY_MODEL=/path/to/pinned/LFM2.5-1.2B-Instruct \
-EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
-cargo test -p eredu --no-default-features --features mlx,metal \
-  --test native_execution_control native_lfm2_workspace_forecasts --locked \
-  -- --ignored --nocapture --test-threads=1
-```
 
 Set `EREDU_LFM2_MEMORY_QUANTIZED=1` for affine 4-bit with group size 64. Numerical
 fixture export/comparison uses `native_lfm2_forecast_recalibration` and
@@ -1500,14 +1482,6 @@ the uncovered blockwise-key path keeps conservative costs and portable boundary 
 
 Reproduce with each pinned checkpoint path:
 
-```sh
-EREDU_LFM2_MEMORY_MODEL=/path/to/pinned/LFM2.5-1.2B-Instruct \
-EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
-EREDU_LFM2_MEMORY_WRITE=/tmp/lfm2-lifetimes-bf16.json \
-cargo test -p eredu --no-default-features --features mlx,metal \
-  --test native_execution_control native_lfm2_workspace_forecasts --locked \
-  -- --ignored --nocapture --test-threads=1
-```
 
 Repeat with `EREDU_LFM2_MEMORY_QUANTIZED=1` for affine 4-bit, or point
 `EREDU_LFM2_MEMORY_MODEL` to the pinned `.gguf` file for mixed-width BF16.

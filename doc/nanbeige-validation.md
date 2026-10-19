@@ -12,18 +12,9 @@ parameter aliases include the normalization between passes. The portable
 discovery example prints “22 layers × 2 passes · shared weights” and expands
 the group into selectable executions. See [architecture discovery](architecture-discovery.md).
 
-Descriptor coverage includes the pinned released configuration below, one/two/three
-passes, both inter-pass normalization policies, and legacy JSON deserialization.
-The nonzero scalar fixture checks distinct per-pass captures through prefill
-and two cached decode steps, with exact agreement between selected and complete
-captures. The existing GGUF numerical fixture also verifies that SafeTensors
-and GGUF expose identical descriptors. Reproduce with:
-
-```sh
-cargo test -p eredu-architectures --lib discovery::tests
-cargo test -p eredu-architectures --test reference_numeric discovery::
-cargo test -p eredu-architectures --test reference_numeric nanbeige_official_gguf_layout
-```
+Complete-model numerical evidence uses the pinned independent routes below.
+Discovery, state and execution behavior use the [shared conformance
+contracts](family-acceptance.md#shared-execution-conformance).
 
 ## Native tools and reasoning
 
@@ -288,12 +279,8 @@ conformance coverage, rather than a claim of native distributed validation.
 Run the checked-in behavioral suites with:
 
 ```sh
-CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib \
-  --test reference_numeric --test reference_conformance
 CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features \
   --test portable_facade --test backend_conformance
-CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --features mlx \
-  --test native_execution_control nanbeige
 CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features \
   --test nanbeige_template
 ```

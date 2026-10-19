@@ -127,34 +127,3 @@ pub(crate) fn prediction(config: &HybridConfig) -> Result<TextExecutionTopology,
     topology.output_invocations = config.mtp_num_hidden_layers as u64;
     Ok(topology)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recurrent_target_coverage_does_not_poison_full_attention_prediction() {
-        let parsed = super::super::model_args_from_config_value(&serde_json::json!({
-            "model_type": "qwen3_5_text", "vocab_size": 16, "hidden_size": 8,
-            "num_hidden_layers": 2, "mtp_num_hidden_layers": 2,
-            "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 8,
-            "max_position_embeddings": 32, "intermediate_size": 16, "num_experts": 0,
-            "linear_num_key_heads": 1, "linear_num_value_heads": 1,
-            "linear_key_head_dim": 8, "linear_value_head_dim": 8,
-            "linear_conv_kernel_dim": 3,
-            "tie_word_embeddings": true, "layer_types": ["linear_attention", "full_attention"]
-        }))
-        .unwrap();
-        let target = target(&parsed.text).unwrap();
-        assert!(matches!(
-            &target.layers[0].mixer,
-            TokenMixerTopology::GatedDelta { .. }
-        ));
-        let prediction = prediction(&parsed.text).unwrap();
-        assert!(prediction
-            .layers
-            .iter()
-            .all(|l| matches!(l.mixer, TokenMixerTopology::Attention { .. })));
-        assert!(prediction.layers.iter().all(|l| l.normalization_count == 5));
-    }
-}

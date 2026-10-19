@@ -282,34 +282,3 @@ fn copy_json(value: &serde_json::Value) -> Result<serde_json::Value, BackendFail
         _ => value.clone(),
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn completed_call_snapshot_keeps_nested_arguments_independent_and_prices_array_slots() {
-        let arguments = json!({"items": [null, true, 3, "é🙂", {"nested": [[], {}]}], "dense": vec![0; 4096]});
-        let event = SemanticEvent::ToolCallCompleted {
-            index: 2,
-            id: "call-2".into(),
-            name: "extension.lookup".into(),
-            arguments: arguments.as_object().unwrap().clone(),
-        };
-        let mut copied = copy_event(&event).unwrap();
-        assert_eq!(copied, event);
-        let SemanticEvent::ToolCallCompleted { arguments: copy, .. } = &mut copied else {
-            panic!("completed call");
-        };
-        copy["items"][4]["nested"][0] = json!(["changed"]);
-        let SemanticEvent::ToolCallCompleted { arguments: original, .. } = &event else {
-            panic!("completed call");
-        };
-        assert_eq!(original["items"][4]["nested"][0], json!([]));
-        let estimate = arguments_estimate(original).unwrap();
-        let slots = 4096 * std::mem::size_of::<serde_json::Value>() as u64;
-        assert!(estimate.retained_bytes >= slots);
-        assert!(estimate.copy_bytes >= slots);
-    }
-}

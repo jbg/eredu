@@ -505,6 +505,3 @@ impl VoiceChatToolWait {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

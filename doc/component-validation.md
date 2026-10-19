@@ -17,23 +17,10 @@ execution share preparation, advancement and lifecycle mechanisms.
 - Pinned SmolLM2-135M, LFM2-350M and LFM2-8B-A1B comparisons cover prefill,
   cached decode, causal masks, signed reconstruction, parameter queries, edits
   and exact restoration. Their revisions, digests and tolerances appear below.
-- Native matrices cover resident, host-layerwise and disk-streamed weights,
-  applicable TP/PP/EP combinations, independently cached expert banks, effective
-  source decoding, coordinated edits, rejection rollback and controlled replay.
-- Published V3 FP8 coverage includes 42 placements. Mixed V4/DSpark encodings,
-  sequential pure FP8 and fused pure FP8 each cover 84 placements.
-- Muse's published-geometry packed projector covers 51 native placements and
-  its neutral media fixture covers 102 placements.
-- Failure coverage includes admission, preparation, submission, completion,
-  delivery, original error sources and poisoned retry non-entry. Query, capture,
-  edit and trial reservations retain their cumulative accounting.
-
-Distributed GPU validation uses local CPU Ring transport with every rank on one
-physical Metal device. It does not establish multiple-device or multiple-host
-behavior. Independent-bank matrices use ordinary cache limits unless a case
-explicitly forces eviction. Resource counters describe logical work reservations
-and owned resources, not exact physical allocator peaks. Illustrative edits
-establish API behavior, not general editing efficacy.
+Shared execution conformance covers completion, cancellation, rollback and budget
+preservation. Per-family placement matrices and component tensor fixtures are not
+a numerical acceptance route. Released complete-model comparisons and the scope
+of each result are indexed in [family acceptance](family-acceptance.md).
 
 Realtime frame protocols are outside the text-prefix experiment API. Consult
 loaded capability reports before admitting an experiment: a static declaration
@@ -146,13 +133,6 @@ comparison covers 921,600 component terms and 150 writes; 136 writes are exact,
 and maximum physical-write error is `0.00048828125`. Signed projections use
 `atol=rtol=1e-6`; physical writes use `atol=rtol=0.001`.
 
-Machine-readable evidence includes provenance, artifact hashes and tolerances:
-
-- [Component comparisons](../eredu-backend-mlx/validation/lfm2_sparse_components.json).
-- [Write reconstruction](../eredu-backend-mlx/validation/lfm2_sparse_write_reconstruction.json).
-- [BF16 RMS input rounding fixture](../eredu-backend-mlx/validation/bf16_rms_input_rounding.json)
-  and its [generator](../eredu-backend-mlx/validation/bf16_rms_input_rounding.py).
-
 ```sh
 /tmp/eredu-component-reference-env/bin/python \
   eredu-evaluation/scripts/download_component_fixture.py \
@@ -175,262 +155,14 @@ CARGO_INCREMENTAL=0 cargo run -j1 -p eredu \
 
 `--report-only` emits diagnostics without declaring acceptance.
 
-## Released sparse selected-token and token-difference reconstruction
 
-The `scores` mode queries two head rows and the normalization gain through the
-public parameter API. At each prediction, the baseline winner and strongest
-competitor define fixed target/alternative IDs for every trial. Trials follow
-their own unforced trajectories; reference and native comparisons use matching
-contexts within each trial.
+## Shared conformance and temporary investigation
 
-Measured residuals determine covectors through the declared RMS equation. Public
-output-axis contractions return signed projections for thirty component groups.
-The consumer captures the effective embedding, eighteen convolution writes,
-final residual and actual head input, and replays forty-eight ordered BF16
-residual additions at each prediction. Convolution writes remain whole terms.
-Component terms, operator rounding, embedding, other writes, residual-addition
-rounding, direction conversion and normalization rounding are separate numerical
-terms. No correction is inferred from the final score error.
-
-The strict comparison accepts 10,944,290 values with no failures; all 9,629,120
-captured non-logit values match exactly. Reconstruction covers 600 component
-groups, 3,686,400 component terms and forty selected/difference scores. Maximum
-error between the explicit sum and a direct F64 head dot is
-`3.552713678800501e-15`. Individual signed projections use `atol=rtol=1e-6`;
-aggregate bounds propagate per-group uncertainty, including uncertainty in both
-large quantities when calculating a small rounding remainder.
-
-Actual BF16 target scores permit one representable output step. Differences use
-the sum of target and alternative bounds. Maximum score error is
-`0.051227287272922695`, within `0.36512885708361864` of that bound. Maximum
-propagated projection bound is `8.884391134091838e-5`. This output-rounding
-comparison is separate from the affine-sum check. The consumer requires additive
-residuals, identity output transformation, BF16 head rows/outputs and the declared
-bias-free RMS equation; incompatible equations receive an explicit error.
-
-[Score evidence](../eredu-backend-mlx/validation/lfm2_sparse_scores.json) contains
-fixed IDs, provenance, tolerances, artifact hashes, usage and controlled replay
-results. Reproduce with:
-
-```sh
-/tmp/eredu-component-reference-env/bin/python \
-  eredu-evaluation/scripts/component_sparse_reference.py \
-  /tmp/eredu-lfm2-sparse-validation/provenance.json \
-  /tmp/eredu-lfm2-sparse-validation/transformers-score-reconstruction.json \
-  --score-reconstruction
-CARGO_INCREMENTAL=0 cargo run -j1 -p eredu \
-  --no-default-features --features mlx,metal --example component_sparse_probe -- \
-  /tmp/eredu-lfm2-sparse-validation/transformers-score-reconstruction.json \
-  /tmp/eredu-lfm2-sparse-validation/native-scores.json gpu controlled scores
-/tmp/eredu-component-reference-env/bin/python \
-  eredu-evaluation/scripts/compare_component_sparse.py \
-  /tmp/eredu-lfm2-sparse-validation/transformers-score-reconstruction.json \
-  /tmp/eredu-lfm2-sparse-validation/native-scores.json \
-  --bf16-logit-ulps 1 --require-controlled \
-  --require-write-reconstruction --require-score-reconstruction
-```
-
-## Native encoding and placement coverage
-
-The [family matrix](component-analysis.md#execution-coverage) lists applicable
-text, media, recurrent and prediction workflows. Native fixtures use deterministic
-nonzero values and independent source decoders or edited checkpoint bytes.
-Comparison requires unchanged source artifacts, effective-value queries,
-coordinated overlays, rollback, cached predictions and exact restoration.
-
-| Matrix | Coverage |
-| --- | --- |
-| Mixed V3 F32 SafeTensors/GGUF and affine 4-bit/group-32 | 63 ordinary and 63 independently cached placements across all seven TP/PP/EP combinations and three residencies |
-| V3 published FP8 | 21 ordinary and 21 independently cached placements |
-| V4/DSpark mixed FP8 attention and MXFP4 experts | 84 placements across both prediction modes and both bank policies |
-| V4 sequential pure FP8 | 84 placements with F32/UE8M0 scales and both bank policies |
-| DSpark fused pure FP8 | 84 placements with F32/UE8M0 scales and both bank policies |
-| K2 grouped FP8 | 42 dense/MoVA placements plus 42 explicitly evicting bank-cache placements; separate matrices cover dense, fused gate/up and attention-head partial blocks |
-| Muse published-geometry Q8_0/IQ4_NL projector | 30 ordinary and 21 independently cached placements |
-
-Packed-parameter mechanisms cover MXFP4 E2M1/E8M0, E4M3 with floating and E8M0
-scales, and GGUF encodings in both byte orders. Exactly representable mechanism
-fixtures require exact effective values, projections, floating replacements and
-restoration. Public affine comparisons with independent decoded/edited F32
-checkpoints use `3e-5 + 3e-5 * abs(reference)`. GGUF device coverage includes IQ
-batched linear/embedding/grouped operations, repeated IDs, partial tiles and
-big-endian fields, plus Q4_K, Q5_1, Q5_K, Q6_K and Q8_0 paths.
-
-For FP8, actual multiplication inputs are separate from pre-quantization captures.
-`LoadedParameter::input_transform` and `ComponentGroup::write_input` identify the
-loaded equation. Edited F32 matrices report identity input transformation.
-Independent signed F64 checks validate edited gate/value units, shared/routed FFN
-writes, stream mixing and readout before comparing executions. Bounds propagate
-measured input/coefficient differences and FP32 arithmetic error; parameter
-queries and route identities still require exact agreement. See the guide's
-[numerical conventions](component-analysis.md#numerical-conventions-for-packed-parameters).
-
-Muse's projector fixture uses fifty vision layers, width 1536, FFN width 8960,
-sixteen heads and fourteen-pixel patches, with a bounded patch grid and a small
-two-layer decoder. Q8_0 and IQ4_NL encodings alternate. Its native coverage
-includes mid-vision pipeline cuts, separate patch/media/text extents, static
-parameter ownership, vision-to-decoder continuation and deferred token ingress.
-Measured suite times are 1957.01 seconds for thirty ordinary placements and
-1913.65 seconds for twenty-one independent-bank placements. These synthetic
-values do not establish released Muse accuracy.
-
-Reproduce selected native matrices on a machine with Metal and loopback sockets:
-
-```sh
-CARGO_INCREMENTAL=0 EREDU_TEST_RING_DEVICE=gpu cargo test --release -j1 \
-  -p eredu-backend-mlx --no-default-features --features metal,image --lib \
-  ring_muse_projector_gguf_components_matrix -- --ignored --nocapture --test-threads=1
-CARGO_INCREMENTAL=0 EREDU_TEST_RING_DEVICE=gpu cargo test --release -j1 \
-  -p eredu-backend-mlx --no-default-features --features metal,image --lib \
-  ring_muse_projector_gguf_components_independent_bank_matrix \
-  -- --ignored --nocapture --test-threads=1
-CARGO_INCREMENTAL=0 EREDU_TEST_RING_DEVICE=gpu cargo test --release -j1 \
-  -p eredu-backend-mlx --no-default-features --features metal,image --lib \
-  ring_deepseek_v3_fp8_components_matrix -- --ignored --nocapture --test-threads=1
-CARGO_INCREMENTAL=0 EREDU_TEST_RING_DEVICE=gpu cargo test --release -j1 \
-  -p eredu-backend-mlx --no-default-features --features metal,image --lib \
-  ring_deepseek_v4_fp8_components_focused -- --ignored --nocapture --test-threads=1
-```
-
-The DeepSeek suite declares full ordinary and independent-bank matrix tests for
-each encoding and prediction mode in
-[`suites/deepseek.rs`](../eredu-backend-mlx/src/tests/distributed_pipeline_ring/suites/deepseek.rs).
-Run the named matrix with the same Cargo options. Native Ring tests create two
-to eight local processes; execute these suites serially.
-
-## Nemotron-H partition component execution
-
-SafeTensors and GGUF fixtures cover dense/shared/routed ReLU² units, attention,
-complete Mamba/sparse writes, normalized inputs and readout across all forty-two
-source/residency/parallel placements. Mamba convolution parameters use independent
-value/input-state/output-state segments; materialization, queries and overlays
-share those coordinates. Captures, selected-position masks, parameter queries,
-signed contractions, edits, rollback, snapshots and isolated siblings compare
-with an ordinary native session.
-
-Tensor captures use `2e-4 + 2e-4 * abs(reference)`; intervention evidence uses
-`3e-4 + 3e-4 * abs(reference)`. Parameter queries, sampled tokens and restored
-captures compare exactly. Edited prediction arrays use `1e-3` absolute tolerance.
-The ReLU² provider-failure matrix covers eighty-four asymmetric scenarios across
-ordinary/controlled prefill/decode and all topology/residency combinations.
-
-```sh
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-backend-mlx --features metal --lib \
-  ring_public_component_capture_nemotron_ -- --ignored --test-threads=1
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-backend-mlx --features metal --lib \
-  ring_provider_failure_relu2_ -- --ignored --test-threads=1
-```
-
-### Shared-expert scalar extension
-
-`decoder.layers.N.operator.shared.units` joins the shared child's up rows, down
-columns, optional biases, ReLU² activation and RMSNorm geometry. The
-`model.layers.N.shared.feed_forward` input, units, write and output scopes expose
-original/effective values in ordinary, controlled and partitioned execution.
-Shared scalar contributions reconstruct the shared affine write. That write is
-part of the complete sparse term in `ComponentReadout::other_writes`; use the
-scalar decomposition to replace its shared subterm, without counting both.
-
-The neutral fixture checks independent F64 reads/ReLU² (`2e-6`) and write sums
-(`2e-4`), position-local deletion, survivor recomputation and no-op equivalence.
-All forty-two native placements include shared hooks and seven-wide FFNs split
-across two TP ranks.
-
-## Effective parameter coordinates for parallel execution
-
-Loaded discovery resolves global semantic coordinates to exact retained parameter
-owners, including grouped banks and packed companions. Queries and signed
-projections use the selected encoding and source precision. Overlays prepare all
-replacements before coordinated publication; a peer rejection preserves the
-original weights and state. Shared checkpoint parameters and repeated logical
-invocations retain distinct identities. Native coverage compares independent
-source decoding and independent edited checkpoints across ordinary and separately
-cached experts, resident/host/disk execution and applicable TP/PP/EP placements.
-
-## Effective prediction parameters and coordinated overlays
-
-Prediction modules use the same parameter discovery, query, projection and overlay
-APIs as target modules. Component scopes identify fusion weights, normalization
-gains, decoder reads/writes and prediction heads. Physical module owners are
-independent of proposal depth. Shared embeddings retain one owner; separately
-published heads retain distinct owners.
-
-Target/prediction edits can occupy one admitted plan. Activate it before creating
-the speculative controller, then prepare observation/intervention admission for
-the resulting identity. Exact-ID replay starts each trial. Durable snapshots
-preserve active-overlay identity and complete prediction state. An overlay
-transition invalidates incompatible caches and admissions.
-
-Native CPU/Metal and distributed matrices cover phase-tagged captures, masks,
-effective queries, coordinated target/prediction edits, actual extension paging,
-peer rollback, active-overlay snapshots and exact restoration. Public F32 signed
-parameter contractions compare with independent F64 at absolute tolerance `2e-6`.
-
-## Additive tensor-parallel write mechanism
-
-`ComponentGroup::write_partition` distinguishes complete writes from
-`TensorParallelSum` terms. Summed receipts require every authoritative term,
-including empty acknowledgments. Floating terms use compensated F64 host
-summation in world-rank order and final F32 conversion; summaries and histograms
-follow assembly. This is a measured host sum, not a claim of bitwise equality
-with a fused native reduction.
-
-Zero, Scale and masks apply to every term. Add uses one designated offset owner;
-Replace uses that owner and zeros the others. Geometry agreement binds ownership.
-Runtime tests cover cancellation-heavy sums, nonfinite values, strided positions,
-missing/duplicate peers, empty selections, reservations, completion, abort and
-restore without refunds. Vocabulary transforms are outside this sum contract.
-
-## Observation error causes
-
-Capture and intervention adapters preserve structured backend causes through the
-facade's neutral `BackendFailure`; portable `CaptureError` and observation causes
-remain available for downcasting. A source chain does not establish completion
-or restoration. Shared transactions and native recovery determine safe reuse.
-Failed capture reservations remain consumed after checkpoint restore.
-
-Neutral and native tests exercise original submission/completion causes, typed
-peer rejection, aborted captures, poisoned retry without additional backend calls,
-settlement and safe retention. Public CPU/Metal cases include capture-limit
-failure, nonfinite scoring, controlled replay and exact retry payloads. They do
-not establish that every unrelated native conversion has equivalent coverage.
-
-## Cold text-run preparation
-
-Ordinary, observed and controlled text entry points agree request, prompt,
-sampling, instrumentation and initial-delivery readiness before the first forward.
-Local errors retain their native source or portable policy variant; peers receive
-`TextPreparationRejected` with stage and rank. Initial cancellation propagates
-without publishing a token. Participants enter the same stages in the same order.
-Protocol or transport failure fences communication authority; a ready result does
-not establish that every peer observes completion. The next preparation or
-forward boundary must settle before model-state work.
-
-The shared speculative scheduler similarly agrees cancellation, completion,
-deadline and proposal eligibility. Native delivery tests cover owner cancellation,
-record/capture budget failures and caller failures across TP2, PP2 and TP2/PP2
-with resident, host and disk weights. Per-proposal agreement prevents another
-native draft forward after an owner or peer sampling/capture failure.
-
-## Reproduction and repository checks
-
-Portable checks use neutral backends. Native tests require their selected device
-and explicitly ignored local-process tests require loopback access. Use the
-feature-boundary commands in [AGENTS.md](../AGENTS.md) alongside these suites:
-
-```sh
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-checkpoint --lib
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-core --lib
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-runtime --lib --test backend_independence
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-architectures --lib --test reference_numeric
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu --no-default-features --test portable_facade
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu --no-default-features --test backend_conformance
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu --no-default-features --features mlx,metal \
-  --test native_execution_control -- --include-ignored --test-threads=1
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
-  backend::nn::native_quantization::tests -- --include-ignored --test-threads=1
-CARGO_INCREMENTAL=0 cargo test -j1 -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
-  ring_provider_failure_ -- --ignored --test-threads=1
-```
+Completion, rollback, snapshots, state isolation and consumed budgets use the
+[shared execution drivers](family-acceptance.md#shared-execution-conformance).
+Component captures, signed reconstructions, rounding counterexamples and
+format/placement matrices are temporary investigations outside the tracked tree.
+The generic reference tools above operate on complete pinned checkpoints and
+write their detailed evidence outside the repository. Retained family numerical
+acceptance compares complete prefill scores and cached continuations; component
+agreement alone does not establish it.

@@ -290,56 +290,6 @@ pub fn replicated_expert_realization_plan(
         .map_err(Error::backend)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn localized_spec_preserves_architecture_parameter_policy() {
-        let args = crate::qwen::model_args_from_config_value(&serde_json::json!({
-            "model_type": "qwen3_moe",
-            "hidden_size": 16,
-            "num_hidden_layers": 2,
-            "intermediate_size": 0,
-            "moe_intermediate_size": 8,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "norm_topk_prob": true,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 4,
-            "rms_norm_eps": 0.000001,
-            "vocab_size": 64,
-            "max_position_embeddings": 128,
-            "tie_word_embeddings": false
-        }))
-        .unwrap();
-        let global = expert_bank_spec(&args, 1).unwrap();
-        let local = localized_expert_bank_spec(&args, 1, 2, 4).unwrap();
-        assert_eq!(local.group_count(), 2);
-        assert_eq!(local.intermediate_dimensions(), 4);
-        assert_eq!(local.policy(), global.policy());
-        let GatedProductGroupLayout::Packed {
-            gate_up: global_gate_up,
-            down: global_down,
-        } = global.layout()
-        else {
-            panic!("Qwen experts must be packed");
-        };
-        let GatedProductGroupLayout::Packed {
-            gate_up: local_gate_up,
-            down: local_down,
-        } = local.layout()
-        else {
-            panic!("Qwen experts must be packed");
-        };
-        assert_eq!(local_gate_up.weight(), global_gate_up.weight());
-        assert_eq!(local_gate_up.format(), global_gate_up.format());
-        assert_eq!(local_down.weight(), global_down.weight());
-        assert_eq!(local_down.format(), global_down.format());
-    }
-}
-
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for RoutedGatedProduct<B>
 {

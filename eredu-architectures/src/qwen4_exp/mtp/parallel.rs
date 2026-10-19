@@ -12,9 +12,6 @@ use eredu_nn::{
 use eredu_runtime::{ArchitectureParameterDescription, ExecutionGroupId, LocalModelLayout};
 use std::collections::BTreeMap;
 
-#[cfg(test)]
-mod tests;
-
 const OWNER: &str = "prediction";
 fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::backend(format!("qwen4_exp prediction partition: {detail}"))

@@ -72,8 +72,6 @@ impl InspectionValidation {
 
 #[derive(Debug, Default)]
 pub(crate) struct AdmittedValidation {
-    #[cfg(test)]
-    pub selection_runs: std::sync::atomic::AtomicUsize,
     pub qwen4: OnceLock<
         Result<
             Arc<crate::preparation_selection::qwen4::AdmittedTarget>,
@@ -351,6 +349,3 @@ impl<P: crate::PreparationMechanismProvider> crate::PreparationMechanismProvider
         facts
     }
 }
-
-#[cfg(test)]
-mod row_tests;

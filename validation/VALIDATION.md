@@ -1,5 +1,12 @@
 # Checkpoint validation tools
 
+The [family acceptance index](../doc/family-acceptance.md) maps every model
+family to retained reference routes and precise validation gaps. Manifests pin
+workloads; they do not by themselves establish passing numerical evidence.
+Store checkpoints, full score tensors and detailed run artifacts outside the
+repository, for example under `/private/tmp/eredu-acceptance` or a mounted
+artifact volume. Retain only compact provenance and measured result summaries.
+
 The text-checkpoint path uses three artifacts:
 
 1. `checkpoint_probe` runs Eredu and writes JSON metadata plus F32 logits in

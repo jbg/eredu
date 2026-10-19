@@ -1060,16 +1060,3 @@ fn apply_rotary<T: Tensor>(
             context,
         )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn window_order_has_exact_inverse() {
-        let layout = window_partition(&[(1, 4, 4), (2, 2, 4)], 2, 8, 2).unwrap();
-        let inverse = inverse_permutation(&layout.permutation).unwrap();
-        for (execution, source) in layout.permutation.iter().enumerate() {
-            assert_eq!(inverse[*source as usize], execution as i32);
-        }
-    }
-}

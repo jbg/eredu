@@ -54,10 +54,6 @@ pub use observation::{MlxFrameSessionBranch, MlxPrepublicationFrame, MlxRealtime
 pub use selection_loading::{MlxPreparedRealtimeExecution, MlxRealtimeExecutionContext};
 
 use frame_execution::submit_scheduled_realtime_frame;
-#[cfg(test)]
-use selection_loading::{
-    mlx_realtime_mechanisms, mlx_supports_realtime_lowering, realtime_session_capabilities,
-};
 
 #[cfg(test)]
 mod completion_ownership_tests;

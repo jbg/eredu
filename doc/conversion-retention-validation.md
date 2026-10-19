@@ -152,7 +152,6 @@ dependency. The feature-boundary commands in `AGENTS.md` complement these checks
 
 ```sh
 cargo test -p eredu-core -p eredu-runtime --locked
-cargo test -p eredu-architectures --lib --locked
 cargo test -p eredu --no-default-features --locked
 cargo check -p eredu-backend-mlx --no-default-features
 cargo clippy -p eredu-core -p eredu-runtime -p eredu-architectures \

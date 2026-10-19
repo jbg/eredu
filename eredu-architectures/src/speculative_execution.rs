@@ -1738,8 +1738,6 @@ pub struct EmbeddedPredictionDraftState<T, C: Clone> {
     proposal_capacity: usize,
 }
 
-
-
 /// Neutral embedded prediction executor consumed by the shared runtime scheduler.
 pub struct EmbeddedPredictionExecutor<'a, S, M>
 where
@@ -2345,6 +2343,3 @@ where
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

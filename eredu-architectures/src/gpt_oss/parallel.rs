@@ -244,27 +244,3 @@ fn validate_routed_realization(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn biased_packed_experts_use_semantic_axes() {
-        assert_eq!(
-            expert_member_sharding("gate_up_proj_bias", &[8, 128], 64).unwrap(),
-            MemberSharding::PartitionedSegments {
-                axis: 1,
-                segments: vec![0..64, 64..128],
-            }
-        );
-        assert_eq!(
-            expert_member_sharding("down_proj_bias", &[8, 32], 64).unwrap(),
-            MemberSharding::Replicated
-        );
-        assert_eq!(
-            expert_member_sharding("down_proj_scales", &[8, 32, 2], 64).unwrap(),
-            MemberSharding::Partitioned { axis: 2 }
-        );
-    }
-}

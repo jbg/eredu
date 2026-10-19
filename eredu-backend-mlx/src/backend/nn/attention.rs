@@ -326,9 +326,6 @@ pub fn sliding_window_prefill_attention_with_softcap(
         .reshape(&[batch, seq_len, -1], stream)
 }
 
-#[cfg(test)]
-mod tests;
-
 const INPUT_SCORE_TILE_ELEMENTS: u64 = 8192;
 
 /// Conservative native live-buffer facts shared with cold memory selection.

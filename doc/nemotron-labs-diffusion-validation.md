@@ -57,192 +57,11 @@ cargo run -p eredu-backend-mlx --no-default-features --features metal \
   PINNED_INTELLAGENTS_3B_Q4_K_M_GGUF INDEPENDENT_REFERENCE_F32_SAFETENSORS disk
 ```
 
-The native loader test
-`loaded_nemotron_shared_drafts_preserve_causal_frontier_across_residency_policies`
-compares nonzero resident, host-layerwise and disk-streamed AR outputs. A masked
-shared-backbone source preserves the prefix frontier while drafting complete
-canvases with shortened proposal capacities; verification and partial rollback
-retain the expected accepted frontier. The VLM loader test
-`loaded_pixtral_context_survives_shared_backbone_drafting_in_bounded_execution`
-compares prepared Pixtral context logits and selected proposals across the same
-residency policies. Its causal prefix includes the image markers.
-
-`loaded_mode_changes_append_pending_suffix_once_and_preserve_next_causal_logits`
-compares AR/diffusion/AR transitions with a fresh causal run conditioned on the
-exact committed prefix. A request during finalization waits for the complete
-block, appends its committed tokens once and preserves the next conditional
-logits. The native physical driver realizes AR, masked diffusion and shared-backbone
-self-speculation. Its nonzero test
-`physical_shared_speculation_matches_greedy_ar_and_all_mode_handoffs_settle`
-compares greedy self-speculation with AR and exercises all six directed mode
-changes across resident, host-layerwise and disk-streamed execution. Native full
-attention caches retain accepted verification K/V by transactional truncation;
-state mechanisms without that operation use checkpoint replay.
-
-`nemotron_standard_prepared_partitions_preserve_cached_and_complete_canvas_equations`
-enters ordinary cold selection, exact SafeTensors source preparation and total
-prepared construction. Nonzero scalar execution compares TP2, PP2 and combined
-TP2/PP2 with resident ordinary equations across resident, host-layerwise and
-disk-streamed policies. It covers cached causal positions and all six directed
-causal/diffusion/draft invocation transitions, including full-canvas transport and
-unaltered prefix frontiers during transient calls. The fixture retains independent
-head width and complete GQA head-group ownership.
-
-`pixtral_standard_prepared_partitions_keep_image_context_across_transient_invocations`
-uses the same ordinary cold/source/total-construction route for VLM. Its nonzero
-three-layer tower gives one stage two vision units and separates vision, projector,
-text ingress and readout. TP2, PP5 and TP2/PP5 agree with resident image-conditioned
-equations under all three residency policies, through prefill, cached decode and
-all six causal/diffusion/draft invocation transitions. Media-only owners retain no
-mutable state or cache-shard identity; inactive image groups do no decoder work.
-
-Native MLX CPU Ring execution passes text TP2, PP2 and TP2/PP2, plus VLM TP2,
-PP5 and TP2/PP5. Each topology runs resident, host-layerwise and disk-streamed
-construction, compares greedy AR and shared self-speculation against a
-single-owner model, and compares all six directed mode-change trajectories.
-Only rank zero queues the command; every rank acknowledges the same committed
-position. The VLM tower has three layers, with two sharing its first pipeline
-stage. Vision/projector/text boundaries preserve the image-conditioned context.
-Combined VLM snapshots after two target decisions reproduce continuation through
-restore and fork; restoring increases cumulative copy usage on every rank,
-including stateless media owners. The complete native matrix passes in 154.27 s.
-
-The same complete matrix passes with BF16 base weights in 152.66 s. Native
-collective admission retains parameter/recipe precision independently from F32
-wire encoding; text, vision and projector boundaries restore source precision
-before local computation. Output owners and placeholders publish a consistent
-wire dtype. This covers native BF16 tensor and pipeline execution, including
-media cuts, dynamic handoffs and snapshot branches on the nonzero fixture.
-
-The adapter-enabled combined VLM Ring test passes in 102.49 s. TP2/PP5
-uses separately admitted nonzero low-rank parameters, compares all six mode
-handoffs against its single-owner model and repeats restore/fork under each
-residency policy. Its primary-stage schedule includes the rank-sized reduction
-only during adapted drafting. Causal target verification keeps adapters disabled.
-
-The same adapted combined VLM sequence passes with BF16 base weights and FP32
-low-rank parameters in 103.74 s. Its rank-sized draft reductions preserve FP32,
-while base residuals, image activations and canonical K/V retain BF16. All six
-handoffs and restored/forked continuations agree with the single-owner model
-under each residency policy.
-
-This exercises retained command agreement, full score/canvas publication,
-accepted-prefix retention and complete dense/media collective ordering. Multi-role
-world boundary frames complete in route order before another role is submitted.
-It is local CPU Ring evidence; GPU collectives and multi-host placement remain
-separate native hardware validation gaps.
-
-```sh
-cargo test -p eredu-backend-mlx --no-default-features --features metal --lib \
-  native_shared_decoding_ring_tp_pp_and_combined_match_single_owner \
-  -- --ignored --nocapture
-```
-
-`shared_target_matching_preserves_stochastic_sampler_and_evolving_penalties`
-compares native AR and shared drafting under three target seeds, temperature 0.8
-and evolving repetition, frequency and presence penalties. Proposal draws leave
-the target stream intact. The independent enumerable portable target-matching
-fixture supplies distributional evidence in addition to this native integration
-comparison. `shared_transactions_capture_physical_verification_and_replay_isolated_snapshot_branches`
-captures full verification rows, checkpoints after a causal target decision and
-compares continuation, restore and fork. Restoring increases cumulative copy usage;
-immutable verification evidence remains separate from the canonical cache.
-
-The portable processor test
-`published_pixels_lower_without_duplicate_markers_and_admit_buffers_before_processing`
-compares lowered floating patches with the independent Pixtral pixel fixture,
-checks architecture marker placement and rejects insufficient host-buffer budgets
-before preprocessing.
-
-`prepared_draft_adapter_is_scoped_and_sharded_without_duplicating_base_weights`
-and `pixtral_prepared_draft_adapter_keeps_media_context_and_exact_rank_collective_schedule`
-enter standard cold/source/prepared construction with separate PEFT artifacts.
-Text TP2/PP2/combined and VLM TP2/PP5/combined agree under all residency policies.
-The text fixture checks changed draft scores, unchanged ordinary diffusion and
-causal scores, and stable parameter-storage identities. The native normal-loader
-adapter test repeats draft-only effects and greedy target parity under each policy.
-
-The native nonzero fixture
-`prepared_shared_request_table_handoffs_match_ar_and_restore_retained_scores`
-passes resident, host-layerwise and disk-streamed Metal execution through the
-common request table. It compares six generated tokens with ordinary AR, changes
-self-speculation to AR at committed position 1 and back to speculation with a
-different proposal allowance at position 2, and checks the physical cache
-frontier before and after sampling retained next-token scores. A reserved durable
-snapshot restores the settled row and reproduces the continuation. The focused
-run passes in 4.55 seconds. Portable facade fixtures separately compare
-uninterrupted and controlled command schedules, inactive branch mailboxes,
-terminal callback fencing and pending-mode memory forecasts.
-`single_model_causal_requests_match_ar_and_restore_the_pending_suffix` passes
-the common request table without an assistant under all three residency policies
-in 4.36 seconds. Eight tokens match ordinary AR, a paid snapshot restores the
-pending committed suffix at position 3, and replay preserves delivery history.
-Native observations report one target cache, no assistant state and no seed
-checkpoint. The nonzero neutral suffix fixture also appends five committed
-tokens without a masked canvas or proposal stream and matches fresh causal
-cache and final next-token scores.
-
-`independent_causal_source_handoffs_preserve_both_frontiers_and_target_output`
-passes the common request table with distinct nonzero target and causal draft
-models under all three residency policies in 5.78 seconds. AR → speculation
-settles both cache frontiers once; sampling the retained target row advances
-neither frontier. A queued return to AR waits for the speculative transaction,
-then aligns both owners with the committed prefix. Eight tokens agree with
-ordinary target AR; an oversized proposal request leaves the command state
-unchanged.
-
-`erased_embedded_prediction_mode_handoffs_match_ordinary_ar_across_residencies`
-passes a nonzero Qwen4-Exp embedded-prediction fixture through native typed
-executor erasure under all three residency policies in 5.15 seconds. It starts
-in AR, settles a handoff at committed position 1, samples the retained target
-row without another append, and waits for pending prediction verification
-before returning to AR. Target cache frontiers agree with the committed prompt
-and eight tokens match ordinary target AR. The debug typed visitor fixture uses
-an explicitly bounded 16 MiB test-thread stack.
-
-`incremental_shared_target_matching_keeps_exact_causal_prefixes_and_isolated_cursors`
-passes the portable incremental verification cursor against nonzero independent
-causal replays. Partial rejection, full acceptance and its bonus preserve the
-exact accepted cache prefix; a cloned cursor retains independent commitment
-progress and the spent proposal stream. Native greedy handoff, stochastic
-penalty and captured snapshot/fork comparisons also pass the portable cursor.
-
-The common request table passes initial diffusion, per-position commitment,
-all six directed mode changes and partial-canvas snapshot replay on the nonzero
-native fixture under resident, host-layerwise and disk-streamed policies.
-`shared_request_table_refines_initial_blocks_and_all_six_handoffs` passes in
-4.13 seconds. An AR command queued after one diffusion commitment remains pending
-through the other two canvas positions and acknowledges position 3 after one
-causal append. Paid snapshots preserve that partial canvas and its finalized
-suffix. The neutral table fixtures cover selected-token preservation, dependent
-suffix replacement, shortened budgets, EOS inside blocks, cancellation priority
-and failed publication without committing tentative output.
-The generalized core executor erasure passes this same native matrix in
-4.87 seconds. Embedded MTP handoffs pass the same erasure in 5.45 seconds.
-`controlled_shared_diffusion_forks_partial_canvases_and_refines_forced_suffixes`
-passes partial-canvas forks, independent forced choices, dependent suffix
-refinement and zero-output handoff forecasts. Its scoped activation matrix
-passes resident, host-layerwise and disk-streamed execution in 4.27 seconds.
-Causal prefill, ordinary refinement, masked drafting and verification retain
-separate physical records. Corrected suffixes carry their evolving committed
-prefix, and restored position rows produce no duplicate forward. Restoring a
-branch increases copy usage and preserves monotone delivery and invocation
-identities. Position-score captures and later causal captures retain their
-respective score semantics.
-
-The common request table also passes native local Ring TP2, PP2 and combined
-TP2/PP2 text execution, plus TP2, PP5 and combined TP2/PP5 VLM execution, under
-all three residency policies. Root-only commands drive all six mode changes;
-every rank restores a reserved snapshot and reproduces its continuation.
-Twenty-eight tokens agree with the same common-table single-owner command
-schedule; the matrix passes in 114.88 seconds. The adapter-enabled combined
-TP2/PP5 VLM matrix passes in 61.14 seconds with the same mode sequence. Draft-only
-adapter equations remain disabled during ordinary diffusion and causal work.
-Set `EREDU_NEMOTRON_RING_REQUEST_TABLE_ONLY=1` when running
-`native_shared_decoding_ring_tp_pp_and_combined_match_single_owner` or
-`native_adapted_shared_decoding_ring_combined_vlm_matches_single_owner` to select
-this contract. The ranks use CPU Ring transport; the single-owner comparator
-uses Metal.
+Execution state, controlled advancement, cancellation, speculation, snapshot
+isolation and consumed budgets use the shared conformance drivers described in
+[family acceptance](family-acceptance.md). Numerical acceptance uses a complete
+model and an independent pinned reference. Native distributed released-checkpoint
+parity is unvalidated unless explicitly recorded below.
 
 ## Pinned admission evidence
 
@@ -536,11 +355,6 @@ EREDU_NEMOTRON_RELEASE_ROOT=/private/tmp/eredu-nemotron-reference/VLM-8B \
   --no-default-features --features metal --lib \
   normal_loader_released_pixtral_prepared_context_matches_independent_rows \
   -- --ignored --nocapture --test-threads=1
-EREDU_NEMOTRON_RELEASE_ROOT=/private/tmp/eredu-nemotron-reference/VLM-8B \
-  env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
-  released_prepared_image_context_survives_all_six_sampled_handoffs \
-  -- --ignored --nocapture --test-threads=1
 python eredu-evaluation/scripts/nemotron_pixtral_precision.py \
   /private/tmp/eredu-nemotron-reference/VLM-8B \
   /private/tmp/eredu-nemotron-reference/VLM-8B/reference-bf16-context.safetensors
@@ -671,7 +485,6 @@ cargo run -p eredu-backend-mlx --no-default-features --features metal \
 python eredu-evaluation/scripts/nemotron_pixtral_fixture.py \
   /private/tmp/eredu-nemotron-reference/VLM-8B \
   eredu-evaluation/fixtures/nemotron_labs_diffusion/pixtral-numeric.json
-cargo test -p eredu-architectures --test reference_numeric nemotron_pixtral::
 ```
 
 ## Pinned GGUF execution
@@ -848,13 +661,6 @@ EREDU_NEMOTRON_RELEASE_ROOT=OFFICIAL_VLM_DIRECTORY \
   --no-default-features --features metal --lib \
   normal_loader_released_pixtral_prepared_context_matches_independent_rows \
   -- --ignored --nocapture --test-threads=1
-EREDU_NEMOTRON_RELEASE_ROOT=OFFICIAL_VLM_DIRECTORY \
-  EREDU_NEMOTRON_MODEL_SOURCE=GGUF_DIRECTORY/VLM8B-F16.gguf \
-  EREDU_NEMOTRON_IMAGE_REFERENCE=GGUF_DIRECTORY/reference-context-mixed.safetensors \
-  env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
-  released_prepared_image_context_survives_all_six_sampled_handoffs \
-  -- --ignored --nocapture --test-threads=1
 ```
 
 Add `--residency host` or `--residency disk` for the bounded comparisons. Source
@@ -978,11 +784,6 @@ EREDU_NEMOTRON_RELEASE_ROOT=PINNED_FP8_DIRECTORY \
   --no-default-features --features metal --lib \
   normal_loader_released_pixtral_prepared_context_matches_independent_rows \
   -- --ignored --nocapture --test-threads=1
-EREDU_NEMOTRON_RELEASE_ROOT=PINNED_FP8_DIRECTORY \
-  env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx \
-  --no-default-features --features metal --lib \
-  released_prepared_image_context_survives_all_six_sampled_handoffs \
-  -- --ignored --nocapture --test-threads=1
 ```
 
 Host-layerwise execution passes the same image and text comparisons with the
@@ -1040,7 +841,7 @@ ceiling; these logical bounds cover native transport and bounded receipt parsing
 on all receivers, separately from model parameter residency.
 
 The captured combined runs use the explicit native test binary built with
-`cargo test -p eredu-backend-mlx --no-default-features --features metal --lib --no-run`:
+`cargo check -p eredu-backend-mlx --no-default-features --features metal --tests`:
 
 ```sh
 EREDU_NEMOTRON_RING_REQUEST_TABLE_ONLY=1 EREDU_NEMOTRON_RING_ACTIVATIONS=1 EREDU_NEMOTRON_RING_COMBINED_ONLY=1 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 native_shared_decoding_ring_tp_pp_and_combined_match_single_owner --ignored --nocapture
@@ -1073,7 +874,6 @@ speculative conformance cases pass in 0.22 seconds; the focused diffusion table
 selection, EOS, cancellation and failed-publication cases pass in 0.01 seconds.
 
 ```sh
-env CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric pixtral_internal_hooks -- --nocapture
 env CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib packed_media_extents -- --nocapture
 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 controlled_shared_diffusion_forks_partial_canvases_and_refines_forced_suffixes --nocapture
 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 shared_request_table_refines_initial_blocks_and_all_six_handoffs --nocapture
@@ -1100,7 +900,6 @@ handoff.
 
 ```sh
 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 independent_causal_source_handoffs_preserve_both_frontiers_and_target_output --nocapture
-env CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric k2_independent -- --nocapture
 ```
 
 A single native storage survey compares canonical KV arrays with their settled
@@ -1115,7 +914,6 @@ controlled/uninterrupted output parity, forks, captures and snapshot budgets.
 
 ```sh
 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 loaded_nemotron_shared_drafts_preserve_causal_frontier_across_residency_policies --nocapture
-env CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --features mlx --test native_execution_control k2_independent_draft_control_matches_uninterrupted_and_preserves_budgets -- --nocapture
 ```
 
 The common entropy/feedback driver matches DiffusionGemma's existing physical
@@ -1126,7 +924,6 @@ including controlled and uninterrupted visitors. Its paid numerical snapshot
 replays the same continuation. The extended fixture passes in 0.57 seconds:
 
 ```sh
-env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --lib common_refinement_driver_preserves_entropy_feedback_outputs_iterations_and_snapshot_state -- --nocapture
 ```
 
 The finalized entropy-score semantics remain `ConstrainedFinalization`.
@@ -1152,7 +949,6 @@ stochastic controlled/uninterrupted parity passes in 7.00 seconds with shared pr
 
 ```sh
 target/debug/deps/eredu_backend_mlx-1d5f204e48b47786 common_refinement_driver_preserves_entropy_feedback_outputs_iterations_and_snapshot_state --nocapture
-env CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric committed_block_suffix_settles_once -- --nocapture
 ```
 
 ## Common generation request driver
@@ -1194,8 +990,6 @@ env CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib backend::tests
 env CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib memory_forecast::
 env CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance
 env CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --features mlx --test native_execution_control native_cpu_ -- --nocapture
-env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --lib native_shared_decoding_ring_tp_pp_and_combined_match_single_owner -- --ignored --nocapture
-env CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --lib native_adapted_bfloat_shared_decoding_ring_combined_vlm_matches_single_owner -- --ignored --nocapture
 ```
 
 These Ring results validate local CPU participants. GPU collectives, multi-host

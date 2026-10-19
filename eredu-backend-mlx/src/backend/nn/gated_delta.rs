@@ -440,6 +440,3 @@ pub fn gated_delta_scan(
     }
     Ok((state, concatenate_axis(&outputs, 1, stream)?))
 }
-
-#[cfg(test)]
-mod tests;

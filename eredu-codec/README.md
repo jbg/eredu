@@ -36,6 +36,12 @@ playback, resampling, and device selection remain application concerns.
 
 ## Evaluation tools
 
+Codec numerical acceptance uses the complete released codec and an independent
+reference over the same encoded weights, code IDs and streaming PCM. See the
+[family acceptance index](../doc/family-acceptance.md) for current evidence and
+gaps. Component equations and captured tensor fixtures are temporary diagnostics
+outside the tracked tree.
+
 Executable Mimi benchmarks and PersonaPlex evaluation entry points select a
 backend's general parameter mechanisms and use this crate's neutral
 constructor. This crate has no concrete-backend feature or accelerator

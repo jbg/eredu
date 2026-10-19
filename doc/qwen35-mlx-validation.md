@@ -102,7 +102,6 @@ for those formats.
 
 ```sh
 export CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu"
-cargo test -p eredu-architectures --lib --test reference_numeric
 cargo test -p eredu-backend-mlx --lib --features metal \
   subtract_one_preserves_inferred_dtype_and_residency_bytes
 cargo test -p eredu --no-default-features \

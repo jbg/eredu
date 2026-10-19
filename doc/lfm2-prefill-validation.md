@@ -23,35 +23,13 @@ structured inputs, prediction extensions and distributed generation retain their
 existing full-pass restrictions; these are implementation gaps with the reasons
 recorded in `doc/execution-control.md`, not LFM2 architectural limitations.
 
-## Reproducible checks
+## Shared execution conformance
 
-```sh
-CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric lfm2_prefill --locked
-CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence --locked
-CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib prefill --locked
-CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib cold_prefill_chunking --locked
-CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --test chunked_prefill --locked -- --test-threads=1
-CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_lfm2_workspace_forecasts --locked -- --ignored --test-threads=1
-```
-
-The scalar neutral fixture has nonzero weights, dense/routed feed-forward layers,
-mixed, attention-only and convolution-only schedules, prompts of 1/2/3/4/11 tokens,
-chunks of 1/2/3/4/32 tokens, and three cached decode steps. It compares complete
-prompt logits, fixed history, layer positions and subsequent logits across resident
-and unit-window traversal. The completion fixture verifies publication, rollback
-and reuse after a completion failure without changing ordinary decode scheduling.
-Core tests verify cancellation after a completed prefix without sampling/decode.
-
-Native nonzero fixtures cover Llama/Mistral regressions plus dense/routed LFM2
-SafeTensors and GGUF, and a convolution-only LFM2 schedule. Each covers resident,
-host-layerwise and disk-streamed execution; SafeTensors also covers load-time affine
-four-bit quantization. Prompts have 1/3/9 tokens,
-chunks of 1/2/3/4/32, and three cached decode steps. Maximum absolute full/chunk
-logit tolerance is `2e-4`; ordinary unchunked and controlled chunked greedy output
-must match. Full observed prefill retains all vocabulary rows. Cold and loaded
-chunk capabilities agree. The native convolution retention check compares histories
-from 1,024 and 16,384 positions after synchronization, allowing at most 32 KiB of
-retained storage, including native allocation overhead, in either case.
+Execution state, controlled advancement, cancellation, speculation, snapshot
+isolation and consumed budgets use the shared conformance drivers described in
+[family acceptance](family-acceptance.md). Numerical acceptance uses a complete
+model and an independent pinned reference. Native distributed released-checkpoint
+parity is unvalidated unless explicitly recorded below.
 
 ## Pinned released checkpoint
 

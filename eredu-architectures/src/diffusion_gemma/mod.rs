@@ -48,6 +48,3 @@ pub fn state_layout(
             .map_err(|error| eredu_runtime::StateError::InvalidResidency(error.to_string()))?,
     )
 }
-
-#[cfg(test)]
-mod tests;

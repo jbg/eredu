@@ -137,125 +137,6 @@ pub struct NativeQuantizedTensor {
 }
 
 impl NativeQuantizedTensor {
-    /// Copies the packed storage to another execution stream while preserving
-    /// this tensor's logical matrix and row view.
-    #[cfg(test)]
-    pub(super) fn copy_to_stream(&self, stream: &Stream) -> Result<Self, Exception> {
-        let bytes = self.storage.bytes.copy(stream)?;
-        eval([&bytes])?;
-        Ok(Self {
-            storage: Arc::new(NativeStorage {
-                format: self.storage.format,
-                endian: self.storage.endian,
-                bytes,
-            }),
-            matrix_count: self.matrix_count,
-            physical_rows: self.physical_rows,
-            row_start: self.row_start,
-            rows: self.rows,
-            columns: self.columns,
-        })
-    }
-
-    /// Copies one little-endian Q4_K physical matrix bank into raw MLX storage.
-    ///
-    /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    #[cfg(test)]
-    pub(super) fn from_q4k_bytes(
-        data: &[u8],
-        shape: &[i32],
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        Self::from_native_bytes(
-            data,
-            shape,
-            NativeQuantizationFormat::GgufQ4K,
-            Q4_K_BLOCK_VALUES,
-            Q4_K_BLOCK_BYTES,
-            GgufEndian::Little,
-            stream,
-        )
-    }
-
-    /// Copies one little-endian Q5_K physical matrix bank into raw MLX storage.
-    ///
-    /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    #[cfg(test)]
-    pub(super) fn from_q5k_bytes(
-        data: &[u8],
-        shape: &[i32],
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        Self::from_native_bytes(
-            data,
-            shape,
-            NativeQuantizationFormat::GgufQ5K,
-            Q5_K_BLOCK_VALUES,
-            Q5_K_BLOCK_BYTES,
-            GgufEndian::Little,
-            stream,
-        )
-    }
-
-    /// Copies one little-endian Q6_K physical matrix bank into raw MLX storage.
-    ///
-    /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    #[cfg(test)]
-    pub(super) fn from_q6k_bytes(
-        data: &[u8],
-        shape: &[i32],
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        Self::from_native_bytes(
-            data,
-            shape,
-            NativeQuantizationFormat::GgufQ6K,
-            Q6_K_BLOCK_VALUES,
-            Q6_K_BLOCK_BYTES,
-            GgufEndian::Little,
-            stream,
-        )
-    }
-
-    /// Copies one little-endian Q5_1 physical matrix bank into raw MLX storage.
-    ///
-    /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    #[cfg(test)]
-    pub(super) fn from_q5_1_bytes(
-        data: &[u8],
-        shape: &[i32],
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        Self::from_native_bytes(
-            data,
-            shape,
-            NativeQuantizationFormat::GgufQ5_1,
-            Q5_1_BLOCK_VALUES,
-            Q5_1_BLOCK_BYTES,
-            GgufEndian::Little,
-            stream,
-        )
-    }
-
-    /// Copies one little-endian Q8_0 physical matrix bank into raw MLX storage.
-    ///
-    /// `shape` may be `[rows, columns]` or `[matrices, rows, columns]`.
-    #[cfg(test)]
-    pub(super) fn from_q8_0_bytes(
-        data: &[u8],
-        shape: &[i32],
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        Self::from_native_bytes(
-            data,
-            shape,
-            NativeQuantizationFormat::GgufQ8_0,
-            Q8_0_BLOCK_VALUES,
-            Q8_0_BLOCK_BYTES,
-            GgufEndian::Little,
-            stream,
-        )
-    }
 
     /// Retains an already materialized MLX byte array in native GGML blocks.
     pub fn from_iq_array(
@@ -268,60 +149,6 @@ impl NativeQuantizedTensor {
             .ok_or_else(|| Exception::custom(format!("{ty:?} has no native execution support")))?;
         let (block_values, block_bytes) = format.block_geometry();
         Self::from_native_array(bytes, shape, format, block_values, block_bytes, endian)
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_native_bytes(
-        data: &[u8],
-        shape: &[i32],
-        format: NativeQuantizationFormat,
-        block_values: i32,
-        block_bytes: i32,
-        endian: GgufEndian,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        let (matrix_count, physical_rows, columns) = match shape {
-            [rows, columns] => (1, *rows, *columns),
-            [matrices, rows, columns] => (*matrices, *rows, *columns),
-            _ => {
-                return Err(Exception::custom(format!(
-                    "native {format:?} expects rank-2 or rank-3 shape, got {shape:?}"
-                )))
-            }
-        };
-        if matrix_count <= 0 || physical_rows <= 0 || columns <= 0 || columns % block_values != 0 {
-            return Err(Exception::custom(format!(
-                "invalid native {format:?} shape {shape:?}; input columns must be a positive multiple of {block_values}"
-            )));
-        }
-        let expected = i64::from(matrix_count)
-            * i64::from(physical_rows)
-            * i64::from(columns / block_values)
-            * i64::from(block_bytes);
-        if expected != data.len() as i64 {
-            return Err(Exception::custom(format!(
-                "native {format:?} payload has {} bytes, expected {expected} for shape {shape:?}",
-                data.len()
-            )));
-        }
-        let len = i32::try_from(data.len())
-            .map_err(|_| Exception::custom("native tensor exceeds MLX i32 array limits"))?;
-        let source = Array::from_slice(data, &[len]);
-        let bytes = source.copy(stream)?;
-        eval([&bytes])?;
-        let storage = Arc::new(NativeStorage {
-            format,
-            endian,
-            bytes,
-        });
-        Ok(Self {
-            storage,
-            matrix_count,
-            physical_rows,
-            row_start: 0,
-            rows: physical_rows,
-            columns,
-        })
     }
 
     pub(super) fn from_native_array(
@@ -376,12 +203,6 @@ impl NativeQuantizedTensor {
         })
     }
 
-    /// Physical storage shared by this logical view.
-    #[cfg(test)]
-    pub(super) fn storage(&self) -> &Arc<NativeStorage> {
-        &self.storage
-    }
-
     /// Native encoding.
     pub fn format(&self) -> NativeQuantizationFormat {
         self.storage.format
@@ -394,38 +215,6 @@ impl NativeQuantizedTensor {
         } else {
             vec![self.matrix_count, self.rows, self.columns]
         }
-    }
-
-    /// Logical starting row within every physical matrix.
-    #[cfg(test)]
-    pub(super) fn row_start(&self) -> i32 {
-        self.row_start
-    }
-
-    /// Number of physical rows per matrix.
-    #[cfg(test)]
-    pub(super) fn physical_rows(&self) -> i32 {
-        self.physical_rows
-    }
-
-    /// Creates a zero-copy logical row segment inside every physical matrix.
-    #[cfg(test)]
-    pub(super) fn row_view(&self, row_start: i32, rows: i32) -> Result<Self, Exception> {
-        if row_start < 0 || rows <= 0 || row_start + rows > self.rows {
-            return Err(Exception::custom(format!(
-                "native row view {row_start}..{} exceeds {} logical rows",
-                row_start + rows,
-                self.rows
-            )));
-        }
-        Ok(Self {
-            storage: Arc::clone(&self.storage),
-            matrix_count: self.matrix_count,
-            physical_rows: self.physical_rows,
-            row_start: self.row_start + row_start,
-            rows,
-            columns: self.columns,
-        })
     }
 
     /// Applies this native matrix to `input`.

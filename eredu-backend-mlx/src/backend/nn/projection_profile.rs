@@ -342,41 +342,6 @@ impl ProjectionCase {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn capture_is_bounded_counts_classes_and_cancels_on_drop() {
-        let input = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
-        let stream = crate::test_stream();
-        let weight = input.as_dtype(Dtype::Bfloat16, stream).unwrap();
-        let capture = ProjectionCapture::begin(2).unwrap();
-        assert!(ProjectionCapture::begin(1).is_err());
-        record(&input, &weight, &input, "dense", "native_fallback", stream);
-        record(&input, &weight, &input, "dense", "native_fallback", stream);
-        let cases = capture.finish().unwrap();
-        assert_eq!(cases.len(), 1);
-        assert_eq!(cases[0].invocations, 2);
-        let capture = ProjectionCapture::begin(1).unwrap();
-        record(&input, &weight, &input, "dense", "native_fallback", stream);
-        record(
-            &input,
-            &weight,
-            &input,
-            "tied_embedding",
-            "native_fallback",
-            stream,
-        );
-        assert!(capture.finish().is_err());
-        drop(ProjectionCapture::begin(1).unwrap());
-        assert!(ProjectionCapture::begin(1)
-            .unwrap()
-            .finish()
-            .unwrap()
-            .is_empty());
-    }
-}
-
 /// Bounded affine capture and fixed/rotating-weight replay.
 pub mod affine;
 

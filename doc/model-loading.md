@@ -100,9 +100,6 @@ with the configured layer count and override map restricted to that layer. It
 checks admission, the independent packed shapes, missing companions, and alias
 ambiguity without allocating model tensors:
 
-```sh
-CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu" cargo test --locked -p eredu-architectures --test gemma4_checkpoint_compat
-```
 
 ## Weight residency
 

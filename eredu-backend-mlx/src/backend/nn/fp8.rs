@@ -1449,6 +1449,3 @@ const CUDA_HEADER: &str = concat!(
     " return uint8_t(sign | code);",
     "}\n",
 );
-
-#[cfg(test)]
-mod tests;

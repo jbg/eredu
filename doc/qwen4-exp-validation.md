@@ -9,12 +9,12 @@ checkpoint recipes, equations, state geometry and parallel plans belong to
 
 | Surface | Implementation and evidence |
 | --- | --- |
-| Artifacts | Official BF16/FP8 SafeTensors catalog fixtures cover exact aliases, integer controls, scale companions and exclusions. Published GGUF recipes cover target weights, quantized table rows and vision projectors. |
+| Artifacts | Official BF16/FP8 SafeTensors recipes retain exact aliases, integer controls, scale companions and exclusions. Published GGUF recipes cover target weights, quantized table rows and vision projectors. |
 | Text and media | Ordinary prepared text, image and video loading supports resident, host-layerwise and disk-streamed weights. Original token IDs survive media embedding replacement and pipeline transport. |
 | Sparse attention and lexical injection | QSA retains full K/V history and pooled index summaries, selects visible blocks in bounded tiles and includes the causal tail. N-gram hashing uses exact integers; lexical convolution retains its dilated history. |
 | Table residency | Compact recipes expose 128 shards as one logical row source. Lookup deduplicates/coalesces rows, decodes required blocks and retains source/residency leases through completion. |
 | Embedded MTP | SafeTensors supports joint target/prediction construction. GGUF targets accept matching SafeTensors prediction companions through `ExecutionPlan::with_prediction_source`. Prediction state is independent; declared embedding/output parameters belong to the target. |
-| Parallel execution | Ordinary text and media construction supports TP, PP, EP and their combinations. Native CPU Ring fixtures cover both formats, three weight residencies, prompt-cache replay and controlled MTP capture through eight ranks. |
+| Parallel execution | Ordinary text and media construction supports TP, PP, EP and their combinations. Shared execution conformance covers partition, cache and controlled-session contracts; released distributed numerical parity is unvalidated. |
 | Chunked media/control | `prepare_observed_input` takes a prepared prompt and explicit original decoder IDs. Controlled steps commit one nonfinal chunk without sampling. Captures carry absolute spans; snapshots, restore and fork retain prepared media and completed encoder products. |
 | Tools | Pinned template/tokenizer fixtures exercise thinking controls, preserved reasoning, tagged parameters, EOS and tool-result replay through shared ordinary/controlled drivers. |
 
@@ -89,9 +89,7 @@ payload verification or inference parity.
 | FP8 `config.json` | `c22eb0a053eed62e18f0184d3ca62d3798f208c3e00b9feee939fc3dbacdc8ca` |
 
 The compact fixtures in `eredu-architectures/src/qwen4_exp/checkpoint/fixtures/`
-retain each header's URL revision, filename and SHA-256, exact tensor geometry,
-constant bytes/hashes, and the published FP8 exclusions. Tests expand the complete
-catalogs without allocating model weights. Table preparation performs exactly
+retain each header's URL revision, filename and SHA-256, plus the published FP8 exclusions. Table preparation performs exactly
 three small control reads for BF16 and four for FP8. Recipe construction for
 static, target, prediction, vision and individual expert owners adds no payload reads.
 
@@ -105,79 +103,27 @@ Reproduce metadata inspection outside the tracked tree, without weight downloads
 
 ```sh
 python3 eredu-evaluation/scripts/qwen4_exp_catalog.py /external/qwen4-exp-metadata --download
-cargo test -p eredu-architectures --lib qwen4_exp::checkpoint
 ```
 
 Add `--fixture /tmp/qwen4-exp-catalog-fixtures` to independently regenerate compact
 fixtures. The script verifies the pinned index hashes, checks all header/index
 identities and physical sizes, caps every response, and reads only bounded constants.
 
-## Numerical fixtures and comparison policy
+## Numerical acceptance
 
-Independent nonzero fixtures cover recurrent sigmoid/SiLU gates, unequal head counts, gated
-residual streams, dilated convolution, selected GQA, QSA budget crossings, padding, partial
-blocks, EOS-separated n-grams, large integer constants, quantized rows and MTP fusion.
-QSA float64 reference equations cover 23 tokens, compression three, budget six and two-summary
-tiles. Ties choose the earlier block deterministically; reference top-k tie order is unspecified.
-Lexical/MTP checks use absolute `2e-4` and exact chunk replay. Native output-gate bounds are
-`1e-5` for FP32 and exact final BF16 rounding; convolution uses `1e-6`.
+The published BF16/FP8 and GGUF layouts require complete-model prefill score rows
+and several cached decode steps against an independent implementation at the
+revisions above. The CLI route below provides the text probe and common
+comparison engine. No released full-vocabulary acceptance result is recorded
+here for Flash-Next. Text, image/video, embedded prediction and encoded GGUF
+parity remain validation gaps; miniature equations and local rank agreement do
+not establish them.
 
-Resident/paged cache tests cover selected positions, duplicates, invalid indices, sinks,
-evicted pages, tails and completion leases. Row tests cover BF16, scalar E4M3 and GGUF block
-encodings, malformed companions, shard boundaries, coalescing, eviction and request-order
-restoration. Integer-history tests include I32 extrema and IDs above 2^24.
-
-The native TP4 fixture uses recurrent K4/V8 and attention Q4/KV2. It exercises pairwise K/V
-replication with 19-token prefill, sixteen cached teacher-forced steps and exact paged-cache
-replay. Q8 query and expert gate/up fixtures compare with independently scalar-decoded
-identical F32 weights under resident TP2, host TP2×EP2 and disk TP2×PP2×EP2. The bound is
-`abs(actual-reference) <= 2e-4 + 2e-4 * abs(reference)`. Down projections are F32 because the
-fixture's TP-local widths cut 32-value blocks.
-
-Public distributed target/MTP capture covers ten format/topology/residency combinations.
-The five capture points compare finite F32 values at absolute `2e-4`; snapshot replay is exact.
-Native image/video checks compare target/internal MTP capture to a resident single-rank
-baseline. Ordinary media/control fixtures cross the 512-token boundary in both containers,
-capture rows on both sides and exercise initial/mid-prefill snapshots and fork/exchange.
-
-Unquantized released-logit acceptance uses relative L2 <= `0.02`, cosine >= `0.999`,
-top-five overlap >= four and unambiguous argmax agreement. Encoded execution compares
-against independently decoded identical weights to separate quantization loss from execution
-errors. Fixture tolerances are fixed independently of Eredu outputs.
-
-## Reproducible checks
-
-Native Ring tests require local loopback sockets. CPU-only native media checks use the
-explicit facade feature selection below. GPU-specific cases require suitable hardware.
-
-```sh
-CARGO_INCREMENTAL=0 RUST_MIN_STACK=33554432 cargo test -p eredu --no-default-features --features mlx,image --test selected_backend_api
-CARGO_INCREMENTAL=0 RUST_MIN_STACK=33554432 cargo test -p eredu-backend-mlx --features image --lib tests::distributed_pipeline_ring::qwen4_exp:: -- --include-ignored --test-threads=1
-CARGO_INCREMENTAL=0 RUST_MIN_STACK=33554432 cargo test -p eredu-cli --no-default-features --features mlx --test qwen4_controlled_distributed qwen4_facade_controlled -- --include-ignored --test-threads=1
-cargo test -p eredu-core --lib
-cargo test -p eredu-runtime --lib
-cargo test -p eredu-runtime --test backend_independence prefill
-cargo test -p eredu-architectures --lib --test reference_numeric --test reference_conformance
-cargo test -p eredu-evaluation --lib
-cargo test -p eredu --no-default-features --test backend_conformance --test portable_facade
-```
-
-The feature-boundary commands are in [AGENTS.md](../AGENTS.md). The seven selected-backend
-API cases and 32 native Ring cases pass; these are fixture-level results, not a released-model
-performance claim.
-
-## Lookup measurements
-
-A disk-backed CPU fixture reads two adjacent Q8 rows in one 68-byte physical read. Thirty-two
-warm requests require no further reads, and cache occupancy is at most 68 bytes.
-
-| Source | Cold lookup | Mean warm lookup |
-| --- | ---: | ---: |
-| SafeTensors | 6.393834 ms | 280.138 µs |
-| GGUF | 404.666 µs | 240.859 µs |
-
-The SafeTensors cold measurement includes MLX startup. These measurements describe a small
-mechanism workload; they are not a format performance comparison or whole-model throughput.
+Execution state, controlled advancement, cancellation, speculation, snapshot
+isolation and consumed budgets use the shared conformance drivers described in
+[family acceptance](family-acceptance.md). Numerical acceptance uses a complete
+model and an independent pinned reference. Native distributed released-checkpoint
+parity is unvalidated unless explicitly recorded below.
 
 ## CLI and released-reference tools
 

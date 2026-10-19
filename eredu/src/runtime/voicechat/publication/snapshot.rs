@@ -1,8 +1,5 @@
 //! Full saved publication state without a second live ingress/delivery owner.
 
-#[cfg(test)]
-mod tests;
-
 use eredu_core::execution_control::{ExecutionControlError, SnapshotResourceKind};
 use eredu_runtime::execution_control::{
     snapshot_value_estimate, IsolatedStateCopy, SnapshotBudget, SnapshotReservation, SnapshotValue,

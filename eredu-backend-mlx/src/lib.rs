@@ -24,32 +24,11 @@ pub(crate) use backend::nn::{module, native_quantization, nested, primitives as 
 pub(crate) use safemlx::{ops, Array, Dtype, Stream};
 
 #[cfg(test)]
-pub(crate) use safemlx::{array, Device};
-
-#[cfg(test)]
 pub(crate) fn test_stream() -> &'static Stream {
     Box::leak(Box::new(Stream::new_with_device(&safemlx::Device::new(
         safemlx::DeviceType::Cpu,
         0,
     ))))
-}
-
-#[cfg(test)]
-pub(crate) mod array {
-    use safemlx::{Array, ArrayElement};
-
-    pub(crate) fn eval_vec<T>(array: &Array) -> Vec<T>
-    where
-        T: ArrayElement + Clone,
-    {
-        array.evaluated().unwrap().as_slice::<T>().to_vec()
-    }
-
-    pub(crate) fn eval_equal_values(lhs: &Array, rhs: &Array) -> bool {
-        let lhs = lhs.evaluated().unwrap();
-        let rhs = rhs.evaluated().unwrap();
-        lhs.equal_values(&rhs)
-    }
 }
 
 /// Composition-owned MLX integrations for backend tooling.

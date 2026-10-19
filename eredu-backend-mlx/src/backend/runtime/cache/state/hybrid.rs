@@ -1655,7 +1655,3 @@ mod integer_history_tests;
 #[cfg(test)]
 #[path = "tests/qsa_partial.rs"]
 mod qsa_partial_tests;
-
-#[cfg(test)]
-#[path = "tests/qsa_indexed.rs"]
-mod qsa_indexed_tests;

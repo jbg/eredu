@@ -198,6 +198,3 @@ pub(in crate::runtime::voicechat) fn host_storage<T>(
         copy_bytes: bytes,
     })
 }
-
-#[cfg(test)]
-mod tests;

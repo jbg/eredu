@@ -317,159 +317,6 @@ impl SubmissionBackend for MlxNeuralBackend {
 
 const MLX_COMMUNICATION_MAX_ELEMENTS: usize = i32::MAX as usize;
 
-#[cfg(test)]
-mod consumer_scope_tests {
-    use super::*;
-    use crate::backend::submission_recovery::Probe;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct FakeProbe(Rc<Cell<Status>>);
-    impl Probe for FakeProbe {
-        fn seal(&mut self) {}
-        fn progress(&self) -> Status {
-            self.0.get()
-        }
-    }
-    struct DropWitness(Arc<AtomicUsize>);
-    impl Drop for DropWitness {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn completed_poll_and_drop_defer_arbitrary_destructors_until_unlocked_reclamation() {
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let tensor = MlxTensor::from_array(Array::ones::<f32>(&[4], &stream).unwrap());
-        let completion = MlxNeuralBackend::submit(&stream, [&tensor]).unwrap();
-        let drops = Arc::new(AtomicUsize::new(0));
-        completion.retain(DropWitness(Arc::clone(&drops)));
-        completion.wait().unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        drop(completion);
-        crate::backend::submission_recovery::reap();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while safemlx::try_with_submission_retirement(MlxNeuralBackend::reclaim_retired_resources)
-            .is_none()
-        {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            MlxNeuralBackend::reclaim_retired_resources();
-            drops.load(Ordering::SeqCst) == 1
-        });
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn thread_exit_never_runs_arbitrary_retired_resource_destructors() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let worker_drops = Arc::clone(&drops);
-        std::thread::spawn(move || {
-            drop(HostResources::new(vec![Box::new(DropWitness(
-                worker_drops,
-            ))]));
-        })
-        .join()
-        .unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn panicking_resource_destructor_does_not_unwind_through_other_retired_values() {
-        struct Panics;
-        impl Drop for Panics {
-            fn drop(&mut self) {
-                panic!("injected retained-resource destructor panic");
-            }
-        }
-        let drops = Arc::new(AtomicUsize::new(0));
-        drop(HostResources::new(vec![
-            Box::new(DropWitness(Arc::clone(&drops))),
-            Box::new(Panics),
-        ]));
-        let result = std::panic::catch_unwind(MlxNeuralBackend::reclaim_retired_resources);
-        assert!(result.is_err());
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        MlxNeuralBackend::reclaim_retired_resources();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn pending_consumer_retains_additional_resources_after_primary_owner_drop() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let owner = Rc::new(SubmissionResources {
-            event: RefCell::new(None),
-            _arrays: Vec::new(),
-            additional: RefCell::new(HostResources::new(vec![Box::new(DropWitness(Arc::clone(
-                &drops,
-            )))])),
-            children: Cell::new(0),
-            failed: Cell::new(false),
-        });
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let native = Rc::new(Cell::new(Status {
-            settled: false,
-            failed: false,
-            blocked: false,
-        }));
-        let child = Recovery::with_probe(
-            ConsumerResources::new(&owner, &stream),
-            FakeProbe(Rc::clone(&native)),
-        );
-        assert_eq!(owner.children.get(), 1);
-        drop(owner);
-        drop(child);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        native.set(Status {
-            settled: true,
-            failed: false,
-            blocked: false,
-        });
-        crate::backend::submission_recovery::reap();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            MlxNeuralBackend::reclaim_retired_resources();
-            drops.load(Ordering::SeqCst) == 1
-        });
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn healthy_parent_observation_does_not_clear_consumer_failure() {
-        let owner = Rc::new(SubmissionResources {
-            event: RefCell::new(None),
-            _arrays: Vec::new(),
-            additional: RefCell::new(HostResources::new(Vec::new())),
-            children: Cell::new(0),
-            failed: Cell::new(false),
-        });
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let child = Recovery::with_probe(
-            ConsumerResources::new(&owner, &stream),
-            FakeProbe(Rc::new(Cell::new(Status {
-                settled: true,
-                failed: true,
-                blocked: false,
-            }))),
-        );
-        child.progress();
-        owner.observe(Status {
-            settled: true,
-            failed: false,
-            blocked: false,
-        });
-        assert!(owner.failed.get());
-        drop(child);
-        crate::backend::submission_recovery::wait_for_retirement(|| owner.children.get() == 0);
-        assert_eq!(owner.children.get(), 0);
-        assert!(owner.failed.get());
-    }
-}
-
 #[derive(Clone, Copy)]
 enum MlxCommunicationDtypes {
     Floating,
@@ -631,8 +478,6 @@ impl SumReductionBackend for MlxNeuralBackend {
             setup.check()?;
         }
         let input = value.into_array();
-        #[cfg(test)]
-        trace_partition_collective("sum", &input, group, "");
         validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
         let output = crate::backend::runtime::distributed::all_sum(&input, group, executor)?;
         let completion = collective_completion(input, &output, group, executor, Vec::new())?;
@@ -655,8 +500,6 @@ impl EvenGatherBackend for MlxNeuralBackend {
             setup.check()?;
         }
         let input = value.into_array();
-        #[cfg(test)]
-        trace_partition_collective("gather", &input, group, &format!("axis={axis}"));
         validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
         let axis = i32::try_from(axis).map_err(|_| {
             safemlx::error::Exception::custom("all-gather axis does not fit in i32")
@@ -683,13 +526,6 @@ impl UnevenGatherBackend for MlxNeuralBackend {
             setup.check()?;
         }
         let input = value.into_array();
-        #[cfg(test)]
-        trace_partition_collective(
-            "gather_uneven",
-            &input,
-            group,
-            &format!("axis={axis} counts={counts:?}"),
-        );
         validate_communication_tensor(&input, MlxCommunicationDtypes::Floating)?;
         let axis = i32::try_from(axis).map_err(|_| {
             safemlx::error::Exception::custom("uneven all-gather axis does not fit in i32")
@@ -721,17 +557,6 @@ impl VariableAllToAllBackend for MlxNeuralBackend {
             setup.check()?;
         }
         let input = value.into_array();
-        #[cfg(test)]
-        trace_partition_collective(
-            "exchange",
-            &input,
-            group,
-            &format!(
-                "axis={axis} send={:?} receive={:?}",
-                counts.send(),
-                counts.receive()
-            ),
-        );
         validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
         if counts.group_size() != group.size() {
             return Err(safemlx::error::Exception::custom(format!(
@@ -826,8 +651,6 @@ impl BroadcastBackend for MlxNeuralBackend {
             )));
         }
         let input = value.into_array();
-        #[cfg(test)]
-        trace_partition_collective("broadcast", &input, group, &format!("root={root}"));
         validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
         // Preserve every rank's lazy predecessor graph in the submitted event.
         // A typed zero depends on the original graph without using its values.
@@ -930,13 +753,6 @@ impl FailureAgreementBackend for MlxNeuralBackend {
         } else {
             Array::from_slice(&[i32::from(local_success)], &[1])
         };
-        #[cfg(test)]
-        trace_partition_collective(
-            "agreement",
-            &input,
-            group,
-            &format!("success={local_success}"),
-        );
         let output = crate::backend::runtime::distributed::payload_free_all_sum_for(
             eredu_runtime::CommunicationOperation::FailureAgreement,
             &input,

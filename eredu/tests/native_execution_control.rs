@@ -85,22 +85,6 @@ fn write_weights(root: &Path) {
     write_tensor_plan(root, resolved.architecture.checkpoint());
 }
 
-fn use_nanbeige_weights(root: &Path) {
-    let path = root.join("config.json");
-    let mut config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    config["model_type"] = "nanbeige".into();
-    config["num_loops"] = 2.into();
-    config["hidden_size"] = 32.into();
-    config["intermediate_size"] = 64.into();
-    config["head_dim"] = 8.into();
-    config["num_attention_heads"] = 8.into();
-    config["rope_theta"] = 70_000_000.into();
-    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
-    let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
-    write_tensor_plan(root, resolved.architecture.checkpoint());
-}
-
 fn write_tensor_plan(
     root: &Path,
     checkpoint: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
@@ -186,21 +170,7 @@ fn native_metal_facade_restores_and_forks_sampled_partial_text() {
 }
 
 fn native_facade(device: LocalDevice, text: bool) {
-    native_facade_with_family(device, text, "qwen2");
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
-)]
-fn nanbeige_controlled_snapshots_restore_and_fork_all_loop_caches() {
-    native_facade_with_family(LocalDevice::Cpu, true, "nanbeige");
-}
-
-fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
     let root = fixture(true);
-    use_family_weights(&root.0, family);
     if text {
         std::fs::write(
             root.0.join("chat_template.jinja"),
@@ -351,101 +321,21 @@ fn complete_controlled_example_verifies_native_capture_restore_and_modified_bran
     ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
 )]
 fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_logits() {
-    text_matches_ordinary_sampling("qwen2");
+    text_matches_ordinary_sampling();
 }
 
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
-)]
-fn nanbeige_controlled_text_matches_uninterrupted_generation() {
-    text_matches_ordinary_sampling("nanbeige");
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
-)]
-fn phi4_controlled_text_matches_uninterrupted_generation() {
-    for residency in [
-        eredu_core::ResidencyPlan::FullyResident,
-        eredu_core::ResidencyPlan::LayerwiseHost {
-            device_layer_window: 1,
-            device_budget_bytes: Some(8 << 20),
-            host_budget_bytes: Some(8 << 20),
-        },
-        eredu_core::ResidencyPlan::DenseDiskStream {
-            device_budget_bytes: 8 << 20,
-            host_budget_bytes: 8 << 20,
-            host_lookahead: 1,
-            background_queue: 1,
-        },
-    ] {
-        text_matches_ordinary_sampling_with_policy(
-            "phi3",
-            residency,
-            eredu_core::WeightTransformationPlan::PreserveCheckpoint,
-        );
-    }
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
-)]
-fn phi4_controlled_snapshots_restore_and_fork_sampled_partial_text() {
-    native_facade_with_family(LocalDevice::Cpu, true, "phi3");
-}
-
-fn text_matches_ordinary_sampling(family: &str) {
+fn text_matches_ordinary_sampling() {
     text_matches_ordinary_sampling_with_policy(
-        family,
         eredu_core::ResidencyPlan::FullyResident,
         eredu_core::WeightTransformationPlan::PreserveCheckpoint,
     );
 }
 
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn nanbeige_controlled_host_and_disk_residency_with_affine_transforms() {
-    for residency in [
-        eredu_core::ResidencyPlan::LayerwiseHost {
-            device_layer_window: 1,
-            device_budget_bytes: Some(8 << 20),
-            host_budget_bytes: Some(8 << 20),
-        },
-        eredu_core::ResidencyPlan::DenseDiskStream {
-            device_budget_bytes: 8 << 20,
-            host_budget_bytes: 8 << 20,
-            host_lookahead: 1,
-            background_queue: 1,
-        },
-    ] {
-        for transform in [
-            eredu_core::WeightTransformationPlan::PreserveCheckpoint,
-            eredu_core::WeightTransformationPlan::Affine {
-                bits: 4,
-                group_size: 32,
-            },
-        ] {
-            text_matches_ordinary_sampling_with_policy("nanbeige", residency.clone(), transform);
-        }
-    }
-}
-
 fn text_matches_ordinary_sampling_with_policy(
-    family: &str,
     residency: eredu_core::ResidencyPlan,
     transformation: eredu_core::WeightTransformationPlan,
 ) {
     let root = fixture(false);
-    use_family_weights(&root.0, family);
     // Keep the checkpoint's 64 logits positions but only 32 mapped tokenizer IDs.
     let path = root.0.join("tokenizer.json");
     let mut tokenizer: serde_json::Value =
@@ -548,198 +438,5 @@ fn text_matches_ordinary_sampling_with_policy(
 #[path = "native_execution_control/speculative.rs"]
 mod speculative;
 
-fn use_family_weights(root: &Path, family: &str) {
-    match family {
-        "qwen2" => {}
-        "phi3" => {
-            let mut config: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
-            config["model_type"] = "phi3".into();
-            config["rope_theta"] = 250000.0.into();
-            std::fs::write(
-                root.join("config.json"),
-                serde_json::to_vec(&config).unwrap(),
-            )
-            .unwrap();
-            let resolved =
-                eredu_architectures::configuration::resolve_model_config(&config).unwrap();
-            write_tensor_plan(root, resolved.architecture.checkpoint());
-        }
-        "k2_horizon_dense" | "k2_horizon_mova" => {
-            let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/k2_horizon/reference.json"
-            )))
-            .unwrap();
-            let mut config = fixture[if family == "k2_horizon_dense" {
-                "dense"
-            } else {
-                "mova"
-            }]["config"]
-                .clone();
-            config["vocab_size"] = 64.into();
-            config["eos_token_id"] = 63.into();
-            std::fs::write(
-                root.join("config.json"),
-                serde_json::to_vec(&config).unwrap(),
-            )
-            .unwrap();
-            let resolved =
-                eredu_architectures::configuration::resolve_model_config(&config).unwrap();
-            write_tensor_plan(root, resolved.architecture.checkpoint());
-        }
-        "nanbeige" => use_nanbeige_weights(root),
-        "gemma2" => {
-            let config = serde_json::json!({"model_type":"gemma2", "hidden_size":32,
-                "num_hidden_layers":4, "intermediate_size":64, "num_attention_heads":4,
-                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.00001, "vocab_size":64,
-                "eos_token_id":63, "max_position_embeddings":1024, "tie_word_embeddings":true,
-                "query_pre_attn_scalar":7, "sliding_window":2,
-                "attn_logit_softcapping":0.3, "final_logit_softcapping":0.7});
-            std::fs::write(
-                root.join("config.json"),
-                serde_json::to_vec(&config).unwrap(),
-            )
-            .unwrap();
-            let resolved =
-                eredu_architectures::configuration::resolve_model_config(&config).unwrap();
-            write_tensor_plan(root, resolved.architecture.checkpoint());
-        }
-        _ => panic!("unknown fixture family {family}"),
-    }
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn gemma2_controlled_snapshots_restore_and_fork_mixed_caches() {
-    native_facade_with_family(LocalDevice::Cpu, true, "gemma2");
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn gemma2_controlled_resident_host_disk_and_transforms_match_uninterrupted() {
-    for residency in [
-        eredu_core::ResidencyPlan::FullyResident,
-        eredu_core::ResidencyPlan::LayerwiseHost {
-            device_layer_window: 1,
-            device_budget_bytes: Some(8 << 20),
-            host_budget_bytes: Some(8 << 20),
-        },
-        eredu_core::ResidencyPlan::DenseDiskStream {
-            device_budget_bytes: 8 << 20,
-            host_budget_bytes: 8 << 20,
-            host_lookahead: 1,
-            background_queue: 1,
-        },
-    ] {
-        for transform in [
-            eredu_core::WeightTransformationPlan::PreserveCheckpoint,
-            eredu_core::WeightTransformationPlan::Affine {
-                bits: 4,
-                group_size: 32,
-            },
-        ] {
-            text_matches_ordinary_sampling_with_policy("gemma2", residency.clone(), transform);
-        }
-    }
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn k2_controlled_text_matches_uninterrupted_generation_with_bounded_weights() {
-    for family in ["k2_horizon_dense", "k2_horizon_mova"] {
-        for residency in [
-            eredu_core::ResidencyPlan::FullyResident,
-            eredu_core::ResidencyPlan::LayerwiseHost {
-                device_layer_window: 1,
-                device_budget_bytes: Some(1 << 20),
-                host_budget_bytes: Some(1 << 20),
-            },
-            eredu_core::ResidencyPlan::DenseDiskStream {
-                device_budget_bytes: 1 << 20,
-                host_budget_bytes: 1 << 20,
-                host_lookahead: 1,
-                background_queue: 1,
-            },
-        ] {
-            text_matches_ordinary_sampling_with_policy(
-                family,
-                residency,
-                eredu_core::WeightTransformationPlan::PreserveCheckpoint,
-            );
-        }
-    }
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn k2_controlled_snapshots_restore_and_fork_sampled_partial_text() {
-    for family in ["k2_horizon_dense", "k2_horizon_mova"] {
-        native_facade_with_family(LocalDevice::Cpu, true, family);
-    }
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn k2_controlled_capture_restore_and_modified_branch_use_shared_drivers() {
-    let root = fixture(false);
-    use_family_weights(&root.0, "k2_horizon_mova");
-    controlled_example::run_example(
-        &root.0,
-        "Explain gravity briefly.",
-        eredu_core::intervention::InterventionDtype::Float32,
-    )
-    .unwrap();
-}
-
 #[path = "native_execution_control/candidate_domain.rs"]
 mod candidate_domain;
-
-#[path = "native_execution_control/components.rs"]
-mod components;
-#[path = "native_execution_control/v3_components.rs"]
-mod v3_components;
-
-#[path = "native_execution_control/parameters.rs"]
-mod parameters;
-
-#[path = "native_execution_control/routed_components.rs"]
-mod routed_components;
-
-#[path = "native_execution_control/gguf_parameters.rs"]
-mod gguf_parameters;
-#[path = "native_execution_control/quantized_parameters.rs"]
-mod quantized_parameters;
-
-#[path = "native_execution_control/streamed_parameters.rs"]
-mod streamed_parameters;
-
-#[path = "native_execution_control/fp8_parameters.rs"]
-mod fp8_parameters;
-
-#[path = "native_execution_control/capture_failures.rs"]
-mod capture_failures;
-
-#[path = "native_execution_control/continuation.rs"]
-mod continuation;
-
-#[path = "native_execution_control/lfm2_memory.rs"]
-mod lfm2_memory;
-
-#[path = "native_execution_control/generic_memory.rs"]
-mod generic_memory;

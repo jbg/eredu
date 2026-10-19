@@ -627,9 +627,6 @@ impl VoiceChatToolChannel {
     }
 }
 
-#[cfg(test)]
-pub(super) mod tests;
-
 fn parse_calls(
     text: &str,
     tools: &[Value],

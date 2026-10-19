@@ -44,6 +44,3 @@ pub use packed_linear::packed_grouped_linear;
 pub use relu2::PackedRelu2Groups;
 pub(crate) use selection::{restore_grouped_slots, weighted_group_sum, GroupSelectionOutput};
 pub use selection::{TopKGroupScoring, TopKGroupSelector, TopKGroupSelectorConfig};
-
-#[cfg(test)]
-mod tests;

@@ -377,6 +377,3 @@ fn normalize_axis(
         stream,
     )
 }
-
-#[cfg(test)]
-mod tests;

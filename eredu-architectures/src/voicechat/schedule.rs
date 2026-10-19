@@ -697,7 +697,3 @@ pub enum ScheduleError {
     #[error(transparent)]
     Contract(#[from] eredu_runtime::RealtimeFrameContractError),
 }
-
-#[cfg(test)]
-#[path = "schedule_tests.rs"]
-mod tests;

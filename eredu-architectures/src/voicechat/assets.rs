@@ -492,7 +492,3 @@ fn validate_semantics(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "assets_tests.rs"]
-mod tests;

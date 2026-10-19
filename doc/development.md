@@ -29,11 +29,6 @@ workspace-wide command when only one crate's tests are needed.
 The custom reference harness accepts Cargo-compatible filters, `--exact`,
 `--skip`, `--list`, and ignored-test selection through `libtest-mimic`:
 
-```sh
-cargo test --locked -p eredu-architectures --test reference_conformance -- --list
-cargo test --locked -p eredu-architectures --test reference_conformance typed_extension
-cargo test --locked -p eredu-architectures --test reference_conformance -- --skip speculative
-```
 
 A filter with no matches executes no cases. Listing also executes no cases.
 The eight aggregate suites run serially by default; `--test-threads` can

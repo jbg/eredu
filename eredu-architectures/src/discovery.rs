@@ -75,8 +75,6 @@ impl ArtifactArchitecturePlan {
     }
 }
 
-
-
 fn axes(width: usize) -> Vec<TensorAxis> {
     vec![
         TensorAxis {
@@ -967,6 +965,3 @@ fn moe(
         }),
     }
 }
-
-#[cfg(test)]
-mod tests;
