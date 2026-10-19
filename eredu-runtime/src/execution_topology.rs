@@ -18,6 +18,9 @@ pub struct ProjectionTopology {
     /// Physical matrix encoding.
     #[serde(with = "linear_format")]
     pub format: LinearFormat,
+    /// Retained affine reduction and rounding equation.
+    #[serde(default, with = "linear_arithmetic")]
+    pub arithmetic: eredu_nn::LinearArithmetic,
     /// Whether an output bias is applied.
     pub bias: bool,
     /// Canonical parameter identity, preserving explicit aliases.
@@ -36,6 +39,7 @@ impl ProjectionTopology {
             input: spec.input as u64,
             output: spec.output as u64,
             format: spec.format.encoding(),
+            arithmetic: spec.format.arithmetic(),
             bias: spec.bias.is_some(),
             parameter: spec
                 .weight
@@ -192,6 +196,7 @@ impl FeedForwardTopology {
         };
         let projection =
             |spec: &eredu_nn::GroupedProjectionSpec, input: i32, output: i32| ProjectionTopology {
+                arithmetic: eredu_nn::LinearArithmetic::Native,
                 input: input as u64,
                 output: output as u64,
                 format: spec.format().encoding(),
@@ -213,6 +218,7 @@ impl FeedForwardTopology {
             selected: selector.selection().top_k() as u64,
             intermediate_size: bank.intermediate_dimensions() as u64,
             router: ProjectionTopology {
+                arithmetic: eredu_nn::LinearArithmetic::Native,
                 input: selector.input_dimensions() as u64,
                 output: selector.selection().group_count() as u64,
                 format: selector.format().encoding(),
@@ -362,6 +368,7 @@ mod linear_format {
             LinearFormat::Dense => Wire::Dense,
             format @ (LinearFormat::Affine(_)
             | LinearFormat::MxFp4
+            | LinearFormat::NvFp4
             | LinearFormat::GgufIQuant { .. }) => Wire::Quantized {
                 quantization: format
                     .weight_quantization()
@@ -446,6 +453,42 @@ mod tests {
                     ..
                 }
             ));
+        }
+    }
+}
+
+mod linear_arithmetic {
+    use eredu_nn::{LinearArithmetic, TensorElementType};
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(
+        value: &LinearArithmetic,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match value {
+            LinearArithmetic::Native => "native",
+            LinearArithmetic::Compute(TensorElementType::F32) => "float32",
+            LinearArithmetic::Compute(TensorElementType::F16) => "float16",
+            LinearArithmetic::Compute(TensorElementType::Bf16) => "bfloat16",
+            LinearArithmetic::Compute(_) => {
+                return Err(serde::ser::Error::custom(
+                    "projection compute precision must be floating",
+                ))
+            }
+            LinearArithmetic::RowMajorAffine => "row_major_affine",
+            LinearArithmetic::ChannelMajorAffine => "channel_major_affine",
+        })
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<LinearArithmetic, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "native" => Ok(LinearArithmetic::Native),
+            "float32" => Ok(LinearArithmetic::Compute(TensorElementType::F32)),
+            "float16" => Ok(LinearArithmetic::Compute(TensorElementType::F16)),
+            "bfloat16" => Ok(LinearArithmetic::Compute(TensorElementType::Bf16)),
+            "row_major_affine" => Ok(LinearArithmetic::RowMajorAffine),
+            "channel_major_affine" => Ok(LinearArithmetic::ChannelMajorAffine),
+            _ => Err(serde::de::Error::custom("unknown projection arithmetic")),
         }
     }
 }

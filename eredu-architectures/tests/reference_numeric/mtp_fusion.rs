@@ -6,6 +6,7 @@ fn prediction_fusion_normalizes_complete_target_before_shared_stream_projection(
     let context = NumericContext::default();
     let parameter = |name| ParameterSpec::trainable(name).unwrap();
     let norm = |name, dimensions| NormalizationConstructionSpec {
+        reduction: eredu_nn::NormalizationReduction::Native,
         dimensions,
         groups: None,
         epsilon: 1e-4,

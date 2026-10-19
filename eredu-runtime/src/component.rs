@@ -9,7 +9,7 @@ pub enum ComponentDomain {
     TokenIds,
     /// Prepacked image or video patches.
     PatchMatrix,
-    /// Prepared audio features or codebook identities.
+    /// Prepared audio tensors: PCM, spectral features or codebook identities.
     AudioFeatures,
     /// Decoder-width hidden activations.
     HiddenStates,

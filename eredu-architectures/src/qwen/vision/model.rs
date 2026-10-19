@@ -168,6 +168,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
             Some(self.weight.as_ref()),
             Some(self.bias.as_ref()),
             Self::EPSILON,
+            eredu_nn::LayerNormalizationArithmetic::Native,
             context,
         )
     }

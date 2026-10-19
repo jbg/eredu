@@ -125,16 +125,23 @@ pub fn loaded_generation_request(
         if budget.available_bytes.is_none() && (!separate || !executes) {
             budget.available_bytes = observed(&profile.available.available_memory_bytes);
         }
-        let retained_input = if input.model_positions != input.text_tokens {
-            MemoryBytes::unknown(
-                "prepared media retention and transformations are not fully projected",
-            )
-        } else {
-            MemoryBytes::exact(input.text_tokens.checked_mul(4).ok_or(
-                CapabilityError::ArithmeticOverflow {
+        let token_bytes =
+            input
+                .text_tokens
+                .checked_mul(4)
+                .ok_or(CapabilityError::ArithmeticOverflow {
                     operation: "retained prompt bytes",
-                },
-            )?)
+                })?;
+        let retained_input = if input.model_positions != input.text_tokens
+            || contract.input_retention == PrefillInputRetention::PreparedProducts
+        {
+            let mut retained = MemoryBytes::unknown(
+                "prepared input retention, backing precision, and transformations are not fully projected; lower end includes token IDs",
+            );
+            retained.lower_bytes = token_bytes;
+            retained
+        } else {
+            MemoryBytes::exact(token_bytes)
         };
         domains.push(DomainMemoryPlan {
             domain,

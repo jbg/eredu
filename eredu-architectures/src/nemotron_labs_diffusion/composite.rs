@@ -960,12 +960,12 @@ where
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
-    ) -> Result<Option<(i32, i32)>, String> {
+    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
         if group != 0 {
             return Ok(None);
         }
         let patches = native_patch_positions(input)?;
-        Ok((patches > 0).then_some((patches, self.config.vision.as_ref().unwrap().hidden_size)))
+        Ok((patches > 0).then_some((patches, self.config.vision.as_ref().unwrap().hidden_size).into()))
     }
 }
 impl<B, S> ParallelCompositeArchitecture<B, S> for Model<B>

@@ -408,6 +408,7 @@ fn mla(g: &mut Builder, c: &ModelArgs, layer: usize, path: &str, attention: &str
         write_parameter_group: format!("parameters:{prefix}"),
         write_bias: None,
         activation_equation: ComponentActivation::Attention {
+            attended_head_normalization: None,
             query_heads: heads,
             key_value_heads: heads,
             head_width: value,
@@ -451,6 +452,7 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &ModelArgs) {
         embedding_scale: ComponentScalar::new(1.0),
         tied_embeddings: c.tie_word_embeddings,
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             score_writes: vec![],
             stream_residual: None,

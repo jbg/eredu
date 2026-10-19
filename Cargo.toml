@@ -86,3 +86,9 @@ debug = 0
 debug-assertions = true
 overflow-checks = true
 incremental = false
+
+# Released quantized-checkpoint conformance decodes selected NVFP4 tiles on the
+# host. Optimize these portable kernels without adding debug data or disabling
+# the conformance profile's assertions and overflow checks.
+[profile.conformance.package.eredu-checkpoint]
+opt-level = 3

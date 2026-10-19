@@ -1,5 +1,7 @@
 #[path = "forecast/embedded.rs"]
 mod embedded;
+#[path = "forecast/conditioned.rs"]
+mod conditioned;
 #[path = "forecast/retention.rs"]
 mod retention;
 use super::*;
@@ -35,6 +37,7 @@ impl GenerationForecastBackend for MockBackend {
     fn shared_backbone_memory_profile(runtime: &ModelRuntime<Self>) -> Result<Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>, GenerationForecastError> {
         if !runtime.session().switchable { return Ok(None); }
         Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+            conditioned: None,
             refinement: Self::refinement_memory_plan(runtime, None)?,
             shared_backbone: Some(eredu_runtime::memory_forecast::SharedBackboneMemoryPlan { canvas_positions: 3, adapter: None }),
             embedded: None, parameter_conversions: None, draft: None,
@@ -76,6 +79,7 @@ impl GenerationForecastBackend for MockBackend {
         instrumented: bool,
     ) -> ForecastExecutionContract {
         ForecastExecutionContract {
+            input_retention: eredu_runtime::memory_forecast::PrefillInputRetention::TokenIds,
             full_pass_reason: if instrumented {
                 Some("capture full pass".into())
             } else if prompt.is_some() {
@@ -102,6 +106,7 @@ impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for
     > {
         if matches!(drafting, eredu_core::SpeculativeDraft::Target) {
             return Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                conditioned: None,
                 refinement: Self::refinement_memory_plan(runtime, None)?,
                 shared_backbone: None, embedded: None, parameter_conversions: None, draft: None,
                 auxiliary_bytes_per_position: MemoryBytes::exact(0),
@@ -118,6 +123,7 @@ impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for
         }
         Ok(Some(
             eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                conditioned: None,
                 refinement: None,
                 shared_backbone: None,
                 embedded: None,

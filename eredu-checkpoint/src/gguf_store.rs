@@ -634,6 +634,11 @@ impl WeightStore for GgufWeightStore {
 }
 
 impl CheckpointSource for GgufWeightStore {
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        // Materializers cache readers, not converted tensor payloads.
+        Some(0)
+    }
+
     fn prepare_encoded_read(
         &self,
         requests: &[TensorReadRequest],

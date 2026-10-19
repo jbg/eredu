@@ -75,6 +75,7 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
                     LinearFormat::E4M3BlockFp8(fp8) => fp8.block_columns as usize,
                     LinearFormat::Affine(quant) => quant.group_size as usize,
                     LinearFormat::MxFp4 => 32,
+                    LinearFormat::NvFp4 => 16,
                     LinearFormat::GgufIQuant { ggml_type, .. } => {
                         ggml_type
                             .block_and_bytes()
@@ -143,7 +144,7 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
                                         .ok_or("expert packed selection overflowed")?
                                         / 32
                             }
-                            LinearFormat::MxFp4 => range.start / 8..range.end / 8,
+                            LinearFormat::MxFp4 | LinearFormat::NvFp4 => range.start / 8..range.end / 8,
                             // GGUF recipes expose logical coordinates; the
                             // source store owns their physical block mapping.
                             _ => range.clone(),

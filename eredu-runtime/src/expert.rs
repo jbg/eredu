@@ -215,6 +215,12 @@ impl AddressableBankParameter {
             }
             for companion in task.output_companions() {
                 let local = match companion.role() {
+                    eredu_nn::LinearCompanionRole::GlobalScale => {
+                        return Err(AddressableBankMemberError::InvalidParameter {
+                            parameter: task.name().to_owned(),
+                            detail: "load-time quantization does not produce NVFP4 global scales".into(),
+                        });
+                    }
                     eredu_nn::LinearCompanionRole::Scale => companions.scale(),
                     eredu_nn::LinearCompanionRole::AffineBias => companions
                         .affine_bias()
@@ -968,11 +974,16 @@ pub trait ExpertRouteExchange<T> {
 pub enum ExpertRouteCombination {
     /// Apply each route coefficient once, then add routes targeting one token.
     CoefficientWeightedSum,
+    /// Return complete unweighted rows to their original token/selection slots.
+    /// Nonlinear expert transformations and weighted accumulation occur later.
+    PerSelection,
 }
 
 /// Architecture-selected identity and result geometry for one exchange wave.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ExpertRouteInvocation {
+    /// Whether reverse dispatch accumulates tokens or retains individual slots.
+    pub combination: ExpertRouteCombination,
     /// Independently identified bank within the logical layer.
     pub bank: RoutedBankId,
     /// Global logical layer ordinal.
@@ -1306,6 +1317,32 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
+    /// Returns complete, unweighted expert outputs in original route-slot order.
+    /// The shape is `[tokens, selected_slots, output_dimensions]`. Acquisition,
+    /// chunking and unit-observer semantics match the combined operation.
+    /// Provider failures retain their original error as the neural error's source.
+    fn forward_grouped_uncombined(
+        &mut self,
+        _resident_bank: &mut B::GatedProductGroups,
+        _request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        Err(eredu_nn::Error::backend_source(
+            eredu_nn::UncombinedGroupedOutputUnavailable,
+        ))
+    }
+
+    /// Returns unweighted outputs for destination-local, one-expert-per-row work.
+    /// The original top-k cardinality does not apply to this compact batch.
+    fn forward_compact_grouped_uncombined(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        self.forward_grouped_uncombined(resident_bank, request, context)
+    }
+
     /// Executes destination-local rows that were already expanded to one
     /// owner-local expert per row by the neutral expert exchange.
     ///
@@ -1342,6 +1379,20 @@ pub trait TensorParallelParameterProvider<B>: ParameterProvider<B>
 where
     B: GroupedNeuralBackend,
 {
+    /// Returns unweighted per-slot partials and replicated bias. The caller
+    /// reconstructs complete experts before nonlinear normalization or routing.
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        _resident_bank: &mut B::GatedProductGroups,
+        _request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        _partitions: usize,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        Err(eredu_nn::Error::backend_source(
+            eredu_nn::UncombinedGroupedOutputUnavailable,
+        ))
+    }
+
     /// Executes a rank-local gated-product contribution.
     fn forward_grouped_tensor_parallel(
         &mut self,
@@ -1350,6 +1401,17 @@ where
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>;
+
+    /// Returns unweighted TP partials for destination-local compact rows.
+    fn forward_compact_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        self.forward_grouped_uncombined_tensor_parallel(resident_bank, request, partitions, context)
+    }
 
     /// Executes destination-local, one-expert-per-row contributions while
     /// preserving the backend's TP reduction and post-bias structure.
@@ -1618,6 +1680,54 @@ where
         }
     }
 
+    fn forward_compact_grouped_uncombined(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or_else(|| {
+                eredu_nn::Error::backend_source(ObservedExpertProviderError::<P::Error, E>::Bank(
+                    request.bank,
+                ))
+            })?
+            .clone();
+        // Raw expert values are transformed by the architecture before they
+        // become a logical routed output. Only unit observations run here.
+        with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider
+                .forward_compact_grouped_uncombined(resident_bank, request, context)
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn forward_grouped_uncombined(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or_else(|| {
+                eredu_nn::Error::backend_source(ObservedExpertProviderError::<P::Error, E>::Bank(
+                    request.bank,
+                ))
+            })?
+            .clone();
+        // Raw expert values are transformed by the architecture before they
+        // become a logical routed output. Only unit observations run here.
+        with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider
+                .forward_grouped_uncombined(resident_bank, request, context)
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
@@ -1697,6 +1807,65 @@ where
     O: ActivationObserver<B::Tensor, E> + ?Sized,
     E: std::error::Error + Send + Sync + 'static,
 {
+    fn forward_compact_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or_else(|| {
+                eredu_nn::Error::backend_source(ObservedExpertProviderError::<P::Error, E>::Bank(
+                    request.bank,
+                ))
+            })?
+            .clone();
+        // Raw expert values are transformed by the architecture before they
+        // become a logical routed output. Only unit observations run here.
+        with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider
+                .forward_compact_grouped_uncombined_tensor_parallel(
+                    resident_bank,
+                    request,
+                    partitions,
+                    context,
+                )
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or_else(|| {
+                eredu_nn::Error::backend_source(ObservedExpertProviderError::<P::Error, E>::Bank(
+                    request.bank,
+                ))
+            })?
+            .clone();
+        // Raw expert values are transformed by the architecture before they
+        // become a logical routed output. Only unit observations run here.
+        with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider.forward_grouped_uncombined_tensor_parallel(
+                resident_bank,
+                request,
+                partitions,
+                context,
+            )
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
@@ -1864,6 +2033,23 @@ where
 {
     type Error = eredu_nn::Error;
 
+    fn forward_grouped_uncombined(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            None,
+            0,
+            |observer| {
+                resident_bank.forward_uncombined(request.input, request.routes, context, observer)
+            },
+        )
+    }
+
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
@@ -1928,6 +2114,32 @@ impl<B> TensorParallelParameterProvider<B> for ResidentExpertProvider
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
 {
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            None,
+            0,
+            |observer| {
+                B::gated_product_groups_uncombined_tensor_parallel(
+                    resident_bank,
+                    request.input,
+                    request.routes,
+                    partitions,
+                    context,
+                    observer,
+                )
+            },
+        )
+        .map(RoutedExpertTensorParallelOutput::Partial)
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,

@@ -316,6 +316,15 @@ rounded coefficients instead of dividing by reconstructed denominators.
 The CPU realization uses complete FP32 matrix accumulations, cascade row sums
 and a fixed softmax reduction with a pinned exponential polynomial. These are
 generic native numerical operations, independent of checkpoint and family policy.
+Small BF16 batched products use sequential FP32 accumulation when
+`rows * width * columns < 400`, excluding batch and head axes. The selection
+uses the complete invocation geometry before query tiling. This preserves the
+pinned reference's rounding at halfway BF16 boundaries. Larger score products
+use an explicit 32-lane FP32 row reduction; value products retain their ordinary
+GEMM reduction above the cutoff. The CPU path borrows bounded BF16 layouts and
+converts products in registers, sharing physical KV heads. Its memory report
+includes conditional layout copies and BF16 host results, with unresolved
+allocator capacity, donation and contiguous sharing stated explicitly.
 Metal realizes complete BF16 row and batched products, cascade normalization
 and FP32 softmax/sigmoid with the same accumulation and rounding boundaries.
 The Metal FP32 last-axis softmax uses one cooperative SIMD group per row.
@@ -342,6 +351,9 @@ These operators select by device, dtype and geometry. Router cutoff ties use
 value-only CPU partitioning of the small score/index tensors; expert parameters
 remain on their selected device. Independent PyTorch fixtures verify the native
 operations without importing architecture equations.
+The native build locates an executable Metal compiler rather than accepting
+Xcode's placeholder path. An explicit `TOOLCHAINS` selection takes precedence
+over the generic Metal alias and participates in build invalidation.
 Grouped linear and gated-product specifications also declare their reduction
 policy. Sequential group-order reduction sorts each token's selected global
 group IDs and rounds every weighted addition to the output dtype. Compact-bank
@@ -404,6 +416,16 @@ bounds include JSON container expansion. Immutable validators are shared across
 forks while partial arguments remain
 private to each parser. Backends continue to consume neutral token filters and
 do not interpret schemas or decide which tool calls applications execute.
+
+`eredu-text::tiktoken` owns rank-file reconstruction. Muse Spark's official
+`l4_200k_base` uses the published Llama 4 split expression and complete BPE split
+pairs, with direct vocabulary-piece matches before merging. Its declared added
+IDs are complete and contiguous; missing, duplicate or incompatible declarations
+fail before returning a tokenizer. The facade selects this importer only when
+its selected Spark artifact has no converted tokenizer. Embedded GPT-4o GGUF
+metadata selects the same split rule and direct-piece behavior. `UNUSED` rows
+remain absent from the tokenizer vocabulary while model output geometry retains
+the complete declared width. No backend owns these text-side policies.
 
 Tokenizer ID membership and model output width are separate domains. The facade
 builds a closed validity mask from actual canonical, round-tripping tokenizer IDs,
@@ -2278,53 +2300,6 @@ eredu-core / eredu-checkpoint / eredu-nn / eredu-media
                          eredu
 ```
 
-The neutral crates contain no native accelerator dependency under any feature.
-`safemlx` is the native-binding dependency of `eredu-backend-mlx`. It owns safe
-wrappers for MLX arrays, operations, devices, streams, collectives, graph
-transforms, serialization, host-resource observations, and accelerator/runtime
-handles. It owns no
-framework abstractions: neural-network modules, quantization policy, mutable
-execution state, GGUF materialization, and composed backend operations belong
-to `eredu-backend-mlx`. This includes native distributed groups and axis-aware
-gathers composed over MLX's native collective primitives;
-`safemlx::distributed` exposes only MLX-native groups and communication calls.
-Logical rank placement, communication manifests, routes, validation, and
-realization-wave proofs belong to `eredu-runtime`; the MLX backend realizes
-only the prepared native groups and routes.
-Model-family construction and equations remain in
-`eredu-architectures`; MLX-specific realization remains in
-`eredu-backend-mlx`.
-`eredu-codec` owns backend-neutral neural audio codec architectures, exact
-released checkpoint schemas, parameter topology, layout recipes, and typed
-artifact construction. It uses neutral tensor and runtime parameter contracts.
-Concrete backends implement general checkpoint materialization, recipe,
-completion, and binding mechanisms without depending on a codec family.
-Application composition combines a prepared codec artifact with those generic
-mechanisms and receives the ordinary neutral codec type.
-`eredu-media` owns deterministic host audio, image, and video validation and
-processing. Its image and audio implementations are optional portable
-features. Architecture-owned processor requests select the semantics; a
-backend converts the resulting owned buffers to native tensors.
-The workspace forbids unsafe Rust in every package except the native `safemlx`
-wrapper, its raw `safemlx-sys` bindings, and the `eredu-ios` C-ABI example.
-Unsafe MLX and operating-system calls remain encapsulated by safe `safemlx`
-APIs; the iOS exception is limited to its foreign entry points, callbacks, and
-pointer ownership boundary.
-`eredu-gguf` is likewise a backend-neutral storage dependency. Backends that
-execute nonlinear GGUF IQ blocks consume their canonical values through the
-typed `IQuantCodebook` API; generated table modules remain private and cannot
-serve as an undocumented cross-crate integration surface.
-The `eredu` facade is also portable when built with
-`default-features = false`. Concrete adapter and native-platform features stay
-optional; capability features configure an enabled adapter rather than making
-portable contracts depend on it. APIs for target-specific runtime
-configuration are available only on their native targets, even when Cargo
-features are enabled elsewhere for build-matrix validation. The facade exposes
-a flat, application-facing local adapter under `eredu::api`; it does not
-reproduce an implementation crate's backend or composition module tree. The
-MLX feature mapping and native build requirements are documented with
-the [MLX backend](../eredu-backend-mlx/doc/README.md).
-
 Backend-internal
 fixtures and composition tests are crate-private unit tests; published crates
 expose no test-support feature or fixture namespace. The facade does not
@@ -2636,6 +2611,15 @@ and exact transform constraints. Transform constraints include the packed
 axis, linear input extent, affine group size and bit width, or the physical
 block geometry needed by the requested format.
 
+Requirements also retain exact schema-admitted nonparameter source keys. The
+architecture derives these from metadata and recipe-input roles, subtracting
+every learned parameter and target or auxiliary recipe dependency. Requirement
+builders reject overlapping declarations in either order. Native strict loading
+consumes this retained set rather than recognizing checkpoint suffixes; every
+other unconsumed source remains an error. Spark's ModelOpt calibration-only input
+scales use this contract without allocating neural destinations or weakening
+packed-weight and conversion-scale validation.
+
 Caller-selected topology, weight residency, mutable-state residency, load-time
 transformation, cache, observation, persistence, and completion facilities
 live in a separate `ReplicatedTextSelectionRequest`. A concrete backend reports
@@ -2650,6 +2634,16 @@ requirements, request, and capabilities into one
 payloads are constructed. Its opaque
 `SelectedStateRealization` records the accepted layout, typed access profile,
 per-component placement, residency policy, and lifecycle facilities.
+
+Parameter groups retain a typed `PartitionUnitAssignment`. `Distinct` balances
+nonempty ranges, `Even` requires equal logical-unit counts, and
+`Repeat { semantic_units }` repeats a complete semantic unit across adjacent ranks
+when the tensor width exceeds that domain. Encoding expansion and chunk conversion
+preserve this policy and the original semantic count; coarsened physical blocks
+must still form equal whole-unit ranges. Companions follow their declared physical
+placements, including replicated NVFP4 global scales. Muse declares even query-head
+placement and repeated KV-head placement. Its cold state geometry and native
+construction derive head counts from the same layout.
 
 Each architecture-derived parameter requirement also retains exact physical
 provenance: the admitted catalog key, canonical shard, physical tensor
@@ -2799,13 +2793,6 @@ apply the same `[profile.dev.package.sha2] opt-level = 3` override.
 measures fresh deferred resolutions and memoized lookups. Compare profiles on the
 same file and require identical artifact identities; throughput depends on build
 configuration, hardware and filesystem caching.
-
-Each uncached SafeTensors range is read once into an owned buffer, with file
-identity and change metadata checked before and after the read. The shard cache
-weakly shares full-tensor buffers between live leases; it does not retain payload
-copies after their final lease retires. Native materialization retains its source
-leases until completion, then releases those host buffers independently of the
-resident native weights.
 
 For byte-preserving leading-axis joins, checkpoint recipes can instead compile
 an exact encoded read batch. The batch retains admitted metadata and file
@@ -3986,7 +3973,9 @@ returned rows only when their tags reproduce the dispatched permutation, then
 additively combines duplicate routes into architecture source-token order.
 Zero-count peers remain explicit. Generic movement and exchange mechanisms own
 native tensor storage, selected dtype/count/shape enforcement, exact
-completion, and resource retention. Production routed architectures bind this
+completion, and resource retention. Expert exchange admits the retained native
+compute-precision envelope independently of pipeline-wire precision, plus exact
+integer routing tags. Production routed architectures bind this
 primitive through their prepared routed execution handoff. MLX provides generic
 arbitrary-row gather, flattened route-value gather,
 scatter-add, and addressable-provider adapters for this primitive. It
@@ -4338,6 +4327,275 @@ multimodal readiness, and loader requirements describe one composition.
 Muse-Glimmer's base GGUF is a complete text decoder; its optional official
 image-only projector adds the vision graph, parameters, processor plan, and
 image modality without changing text checkpoint admission.
+
+The neutral `eredu-architectures::muse` module owns the shared Glimmer/Spark
+configuration, checkpoint recipes, parameter topology, media preparation, state
+geometry and construction. Distinct registered identities select typed attention,
+normalization, residual, feed-forward and media policies. The backend binds the
+retained declarations through ordinary native mechanisms and selects no family
+semantics. Spark preserves its exact released attention schedule and FP32
+compressed-expert/residual equations. An expert operation exposes complete
+unweighted outputs so TP reduction precedes nonlinear per-expert normalization;
+weighting and accumulation follow it.
+
+Vision, waveform and decoder units use the same resident, host-layerwise and
+disk-streamed providers. The waveform pyramid retains convolution and incomplete
+input carry. Encoder products are prepared once and retained across controlled
+decoder prefixes. State plans explicitly map decoder KV and audio histories to
+stage-local ownership. Media-to-decoder and decoder pipeline boundaries carry the
+same retained geometry, positions and completion obligations as ordinary execution.
+
+`MediaCompanionSources` selects independent vision/audio directories in normalized
+load requests and execution plans. Muse admits each physical source once, validates
+BF16 component schemas, decoder/token/processor geometry and provenance, and
+restricts source authority to the selected roles. Indexed media sources need only
+the complete members containing those roles. The CLI exposes both roles, retains
+them through overrides/replay/benchmark candidates and requires matching companion
+selection for a cached plan. Missing components reject media preparation with a
+typed missing-companion error while text loading remains available.
+
+Muse assistants retain one body/head parameter layout and `LayerwisePolicy`:
+12 released DSpark units and 10 DFlash2 units. Context, blocks, final norm,
+vocabulary and auxiliary tables have explicit acquisition owners. DFlash2 and
+Glimmer share the normalized DFlash body; DSpark reuses Muse decoder blocks.
+Prepared sources retain checkpoint identity, exact recipes, selected encodings,
+tokenizer authority and target compatibility before native materialization.
+Pure TP DSpark may shard its body and replicate scoring heads; other selected
+placements retain explicitly accounted complete replicas. DFlash2's assistant
+architecture marker takes precedence over its `qwen3` model type.
+
+External target invocation admission proves capture, verification and static
+operation geometry against the retained target selection and communication group.
+It checks producer precision, ownership, sequence limits and exact completion
+before assistant payload acquisition. Capture publication and proposal preparation
+use the shared transaction: tentative values stay separate from committed state,
+peer failures agree before publication, and aborted work publishes no output or
+candidate state. Borrowed target groups retain exact native-world authority.
+
+The common speculative scheduler owns sampling, verification, accepted-prefix
+commitment, rejected-suffix rollback, cancellation and output. Muse supplies
+architecture equations and typed state. Snapshots preserve projected assistant
+context, pending target captures, positions, RNG and consumed copy/observation
+budgets. Raw target embedding/readout operations remain distinct from ordinary
+normalized target ingress/output; the selected assistant owns their finishing
+policy and required transports.
+
+`CheckpointSource` describes independently retained payload ownership and whether
+leases expose direct selected encoded bytes. In-memory backing survives restricted
+views; file weak caches retain no independent tensor payload. Shared loading
+profiles combine exact unit recipe envelopes with enforced host/device reservations.
+Conditioned forecasts compose architecture geometry with these observations and
+retain the ordinary MLX contract's unknown native workspace and allocator capacity.
+They do not promise finite total-process admission.
+
+Family verification retains pinned layout/reference manifests, whole-model
+acceptance runners and concise results. Shared execution conformance uses compact
+Muse fixtures alongside other families. Component numerical diagnostics, tensor
+dumps and historical experiment archives are not checked in. See
+[model support](model-support.md#muse-spark-evidence-and-support-status) for current
+released acceptance and explicit validation gaps.
+
+Intervention schema 2 includes the router's ranked or unranked partition order in
+its exact coefficient policy. Admission retains that order when constructing
+neutral route controls. Muse's observed ordinary and tensor-parallel paths apply
+these controls before provider dispatch and publish one completed routing event
+after per-expert normalization, weighting and decoder projection. The event names
+global expert IDs even when the selected bank is partitioned. Cold routing
+declarations and loaded bank metadata use the same canonical routing boundary.
+Pinned nonzero decoder fixtures cover observer and provider controls through
+prefill and three cached steps, including reconstruction of complete TP2 expert
+outputs before normalization. These component checks do not establish Spark
+controlled-session or speculative-assistant acceptance.
+
+The shared decoder consumes typed attention, block-normalization, residual and
+routed-feed-forward policies. Normalized-head attention rounds weightless Q/K
+normalization before query scaling and normalizes each attended head before
+sigmoid gating. Weightless branch norms have no parameter slot. Learned residual
+gates and compressed expert projections participate in ordinary parameter
+traversal. Compressed routing reads decoder-width input before latent projection;
+latent input normalization precedes expert execution. Each complete expert output
+is input-scaled and normalized before coefficient multiplication, group-ordered
+accumulation and the replicated latent-to-decoder projection. TP plans partition
+expert intermediates and replicate routers, correction buffers, latent projections,
+norms and residual gates. These policies are included in architecture fingerprints.
+Top-k selection retains a neutral `GroupSelectionOrder` before selected-score
+normalization. Ranked selection sorts by selection score; partition selection
+retains value-only median-partition order. CPU selection uses bounded score and
+index rows; the bounded Metal kernel shares the value-only partition mechanism
+with cutoff-tie repair. Other devices copy bounded score rows through the host
+operation. This ordering is independent of expert-output
+accumulation order: FP32 denominator rounding can change a later BF16 weighted
+expert value even when the selected set, raw outputs and normalization agree.
+The compressed Hugging Face Muse equation requests partition order. Ordinary
+ranked selectors retain their existing policy.
+The neutral `GroupIndexSelection` memory invocation describes already transformed
+score rows separately from projection and coefficient normalization. It retains
+selection order and reports the index output, negated score buffer, reused host
+index row and bounded output copy, or Metal thread-local indices. Native capacity,
+cast aliasing, register spills and transfer overlap remain explicit unknowns.
+Compressed expert TP sums have shape `[batch * sequence, selected_slots,
+expert_width]`. The composite and partitioned Muse plans declare those exact
+axes for inactive pipeline participants; their scalar representation follows the
+selected activation dtype through `RoutedTensorReduction::Activation`.
+
+The neutral Muse waveform pyramid composes biased patch projections, direct
+FP32 RMS normalization, causal depthwise convolution, exact GELU MLPs and
+residual addition. Patch and convolution modules have separate parameter
+topologies; their canonical names follow `model.audio_tower`. The caller owns
+bounded convolution histories. Forward evaluation borrows the previous carry
+and returns a candidate, leaving commitment to the execution driver. State
+geometry includes stage widths, patch sizes, kernel width and batch size.
+Incomplete waveform frames and final zero-padding use the existing portable
+`PcmFrameQueue`; encoder math accepts complete cadence-aligned chunks. These
+encoder contracts are independent of public Spark source admission and sessions.
+Explicit audio segments distinguish continuation of one stream from a new clip.
+Patch reduction respects cadence-aligned boundaries, and every causal block
+resets history at each new clip before publishing only the final clip's candidate
+carry. Segment metadata participates in forward-context snapshot accounting.
+The component and composite seams share audio ingress and unit-execution functions.
+SafeTensors and GGUF audio schemas share one logical tensor geometry. GGUF
+normalization retains explicit stage widths, patch cadence, flattened convolution
+block identities and the waveform projector's direct RMS epsilon. Source mappings
+use the declared stage depths to recover canonical convolution owners. Vision and
+waveform quantization maps are selected independently from actual source encodings.
+`muse::audio::execution::AudioArchitecture` declares each patch, each causal block
+and the final perception projection as its own execution unit. It uses the ordinary
+resident and layerwise drivers and `RuntimeStateComponents`; convolution histories
+remain bounded, full-width, device-resident mutable state. Unit frontiers count
+emitted audio tokens and must agree before another chunk begins, independently
+of internal stage frame rates. The caller retains unpublished candidate
+state until the invocation completes. The audio component's final adapter shares
+its equations and parameter topology with `AudioPyramid`.
+The parent Muse graph retains vision group zero and decoder group one, with an
+independent waveform root at group two when the selected source contains audio.
+That root uses the same small modules and unit-execution function as the audio
+component. Prepared ingress packs waveforms separately from image patches and
+keeps each attachment's convolution-reset boundary. Decoder assembly consumes
+separate ordered vision and audio placeholder spans. Parent fixed-state frontiers
+advance by the complete decoder invocation length, including text-only steps;
+PCM cadence and internal stage frame rates remain separate quantities.
+All 72 released audio parameters belong to 13 execution-unit recipes rather than
+pinned modules. Local Muse construction retains the exact `PartitionState` proof,
+including ownership gaps, instead of inferring ownership from a scalar offset.
+Audio continuation declarations retain each producing unit's width and frame
+reduction in both cold and request-specific transport geometry.
+
+Prepared source declarations distinguish `ArtifactSourceRole::Vision` and
+`ArtifactSourceRole::Audio`. Muse source spelling is normalized only to assign
+ownership; each restricted view retains the exact admitted physical keys and
+shares the already opened artifact with target execution. A combined Muse GGUF
+projector supplies disjoint vision and waveform views. `media_source` exposes the
+selected view without reopening any artifact. `CapabilityError::MissingCompanion`
+identifies an absent required tower during media request preparation; text requests
+remain independent of that tower. Architecture capability estimates admit raw
+modalities against retained component coverage before processor lookup. Missing
+encoder/projector coverage takes precedence over absent processor assets; a
+present tower without a selected processor reports the processor assets instead.
+The neutral `MultimodalPreparationFailure::Capability` and public
+`MultimodalPreparationError::Capability` retain this typed admission error without
+converting it into a native backend failure. Ordinary and observed preparation
+share this preflight. Cold inspection consumes the same component-coverage policy
+and records optional `MissingMediaCompanion` information without rejecting text
+loading. These source views do not admit an unselected external SafeTensors
+companion.
+
+`ArchitectureStatePartitionPlan` normally requires a contiguous selected state
+slice. Its explicit `StatePartitionPacking::PreserveGlobalOrdinals` policy also
+represents disjoint component ownership: unowned gaps become `NoState` slots,
+while owned KV and fixed buffers retain their original global cache keys.
+`PartitionState` retains exact selected ranges separately from that represented
+span and projects the complete layout through `selected_layout` for family
+identity checks. Stateless gaps allocate no attention history or fixed tensors;
+their ordinary host slot metadata remains part of the local layout. Existing
+contiguous selections retain their contiguous packing policy.
+
+`CompositeContinuationGeometry` distinguishes uniform encoder geometry from
+shapes after individual units. Selected composite routes retain the producing
+unit frontier along with their exact schema. Runtime transport resolves the
+request's frame count and width at that frontier; cold boundary declarations
+also retain per-unit sequence bounds. This represents patch pyramids whose frame
+rate and width change between stages without moving model equations into a backend.
+
+Muse processor assets retain a typed video timestamp policy. The released Spark
+asset requests hundredths of a second; the Glimmer default remains tenths.
+The Spark waveform policy declares mono 24 kHz PCM, right zero-padding to 1,920
+samples per token and explicit soft-audio framing text. Portable
+`pad_waveform_to_cadence` preserves samples and their valid count; it performs no
+spectral extraction or backend allocation. Host preparation pads attachments
+individually and emits explicit `InputExtent::AudioValidSamples` descriptors,
+distinct from feature-frame extents. These descriptors retain the reference
+attention mask's valid length without allocating a sample-sized native mask.
+Architecture admission requires floating mono PCM, a positive valid-sample
+extent, and padding confined to the final cadence frame. Audio host preparation
+and source-tower admission remain distinct contracts.
+
+`TopKGroupSelectorSpec` retains an explicit positive logit multiplier as well as
+independent projection, score and coefficient arithmetic. The multiplier acts
+on projected logits and ordinary bias before scoring; selection-only correction
+does not contribute to mixture coefficients. Native ordinary selection,
+caller-selected routes and routing interventions use the same projection path.
+These mechanisms do not register Spark as an executable model family.
+
+Grouped gated-product operators expose `forward_uncombined` and
+`combine_outputs` around architecture-owned per-expert transformations. The
+uncombined tensor keeps `[tokens, selected_slots, output_dimensions]` in exact
+route-slot order and contains no routing coefficients. Its tensor-parallel
+operation separates unweighted rank-local outputs from replicated down bias;
+reconstruction and one bias addition precede nonlinear normalization. MLX uses
+the same chunked projection and unit-observer driver for combined and
+uncombined operations. Separate accumulation preserves the declared reduction
+order and dtype boundaries.
+Resident and addressable parameter providers expose the same uncombined boundary.
+The addressable driver retains its selection validation, compact-bank acquisition,
+chunking and completion path while preserving the selected-slot axis in its output.
+Provider composition, bank dispatch, unit observation, type erasure and execution
+agreement retain that operation. Unsupported neural mechanisms return the typed
+`UncombinedGroupedOutputUnavailable` error without returning an accumulated tensor.
+Expert-exchange invocations declare coefficient-weighted token accumulation or
+unweighted per-selection return. Per-selection reverse exchange validates the
+same route tags and scatters to unique flattened token/slot rows, preserving
+duplicates without multiplying coefficients. TP partials and replicated bias
+retain that slot geometry until the caller reconstructs each expert. This is a
+neutral exchange contract; the registered families retain their selected
+coefficient-weighted exchange policy.
+Partitioned parameter providers select this policy through the same route
+preparation, agreement, transport and completion driver. Owner-local uncombined
+requests validate cardinality one independently of the source top-k cardinality,
+preserve the original coefficient metadata for unit evidence, and flatten their
+single-slot axis only for transport. Source-side reconstruction restores that axis
+before architecture-owned expert normalization.
+
+`eredu-checkpoint::nvfp4::NvFp4MatrixFormat` describes borrowed packed E2M1
+weights, block-16 E4M3 scale geometry and contiguous output-row partitions with
+independent F32 global scales. Its portable decoder expands only selected rows
+under an explicit output-byte limit. Two row partitions preserve a fused
+gate/up matrix's distinct scales. Input-quantizer scales are not weight
+dequantization factors. `LinearFormat::NvFp4` and `LinearFormatSpec::nvfp4` retain
+block and global scales as distinct physical companions. Parallel expansion
+partitions packed words and block scales while replicating the small global-scale
+tensor and retaining independent row origins. ModelOpt byte-packed values and
+E4M3 scales use byte-preserving views into canonical U32/U8 sources; MLX split
+banks stack their global scales along the component axis.
+
+The MLX NVFP4 fallback converts at most 128 output rows from a selected expert
+at once. Each tile completes its projection before conversion storage is released;
+inference never expands an entire expert bank. Explicit effective-parameter
+inspection can request a decoded parameter under its ordinary capture reservation.
+Global scales participate in parameter traversal, retained dependencies and
+conversion accounting. Dense-to-NVFP4 calibration/encoding is unavailable through
+the existing load-time quantizer. These contracts do not register Spark or establish
+full released-model inference parity.
+
+The released NVFP4 text comparison exercises the ordinary disk-streamed layered
+runtime with packed expert banks and bounded selected-expert conversion. Prefill
+and three cached decode steps, including all 248 decoder-layer outputs, match the
+pinned independent reference exactly on the local CPU. This is numerical evidence
+for that selected artifact and invocation sequence; it does not register Spark or
+establish multimodal, controlled, assistant or native distributed conformance.
+
+Pinned Muse equation fixtures live in `eredu-evaluation::muse` for reuse by
+neutral and native tests. Backend mechanisms have no production dependency on
+that evaluation module.
 
 Multimodal preprocessing starts with an architecture-owned processor plan.
 That neutral plan parses family model and processor metadata, selects released
@@ -5232,12 +5490,34 @@ distinct tokenizer proof.
 Backend composition consumes both proven contracts and does not restate
 family-specific compatibility rules.
 
-Gemma 4 and Muse-Glimmer own their external-assistant execution strategies.
+Core's drafting handoff proves the exact realized target before native assistant
+materialization. The MLX drafter retains that target's immutable native session
+identity beside its parameter owner. Each external generation request validates
+the identity before queue binding, lane preparation or model work; equal artifact
+bytes, dimensions, devices and world sizes do not confer session ownership.
+This applies to conditioned assistants and independent autoregressive drafts.
+External execution streams carry the actual target session's partition binding,
+including its communicator and preparation-agreement owner. Request validation,
+queue binding, sampling setup and cache preparation use the existing readiness
+boundaries before participants enter the next stage. The backend does not
+reconstruct architecture compatibility or initialize an assistant world.
+
+External target and drafter mutation scopes participate in that retained readiness
+agreement after acquisition and before executable access. A busy or retained
+owner contributes its original failure instead of leaving peers to enter model
+work. Sampler preparation and assistant acquisition finish while the acquired
+target scope remains unused. A preparation refusal settles and releases healthy
+unused scopes; it does not mark an unvisited executable as mutated. Failed or
+unresolved native completion still fences its owner and retains its resources.
+The same move-only drafter scope runs conditioned or independent execution once
+both owners are ready; no separate generation driver or communicator is created.
+
+Gemma 4 and Muse own their external-assistant execution strategies.
 Gemma shared-attention capture truncation, target-to-draft state assembly,
 proposal progression, and partial-verification replay live in
 `eredu-architectures::gemma4::speculative`; ordered DFlash capture assembly,
-sliding committed context, anchor-plus-mask proposal construction, and replay
-live in `eredu-architectures::muse_glimmer::speculative`. The MLX adapter binds
+sliding committed context, typed anchor-position proposal construction, and replay
+live in `eredu-architectures::muse::speculative`. The MLX adapter binds
 both strategies through one family-neutral mechanism implementation for arrays,
 streams, exact completions, target-cache checkpointing, and already materialized
 neutral assistants. `ExternalAssistantArchitecture` selects and constructs the
@@ -5247,13 +5527,126 @@ matches assistant families nor provides a second family-specific
 public path to assistant materialization, so an incompatible pairing cannot
 open assistant weight payloads.
 
+The external preparation retains separate source and selected neural construction
+configurations. Architecture normalization binds target-dependent geometry before
+opening the source; the family-blind materializer constructs both encoding views
+from those retained configurations. It does not derive geometry from a native
+target or reopen an artifact.
+Spark's construction retains released identity and per-weight formats separately;
+the same selected encoding drives exact source constraints and neural operators.
+Matrix companion prefixes are explicit for transition codebooks without a
+`.weight` suffix. Ordinary matrix and expert naming conventions retain their
+existing declarations. Norms, convolution taps and I64 mapping buffers are not
+converted into matrix encodings.
+The shared `ExternalAssistantTargetProfile::Muse` retains the normalized target's
+Glimmer or Spark identity. Ordered capture requests and values use the common
+Muse contract; each assistant proves its released target geometry and capture
+paths independently. Spark construction does not imply public session admission.
+
+Assistant discovery precedes ordinary target discovery. An authoritative Spark
+assistant marker is validated by its strict assistant schema, including DFlash2's
+`qwen3` configuration; an invalid declaration retains its assistant-specific error.
+The facade consumes `ExternalDraftTokenizerSource`: independent drafts reconstruct
+their own tokenizer, while Spark assistants borrow the proven target's tokenizer.
+The published assistant repositories contain no tokenizer assets. Borrowing uses
+the actual target vocabulary fingerprint and retains the architecture compatibility
+proof before materialization. Tokenizer ownership remains separate from the target
+family registry and from native execution.
+
+Target-owned assistant operations distinguish ordinary normalized embeddings and
+logits from raw token-table lookup and raw vocabulary projection. Muse performs
+vocabulary reduction or gathering through neutral distributed mechanisms. Raw
+projection skips the final norm and output transform so a trained assistant can
+rank complete global vocabulary scores before applying its own softcap.
+`CompositeArchitecture` separates raw contributions from finishing equations.
+Muse's complete operation composes these stages through the same interface:
+embedding normalization follows combination, final readout normalization precedes
+the local projection, and output scaling/capping follows combination. The raw
+variants preserve the table or projection values. Without a parallel context,
+a vocabulary-sharded module emits its local contribution; the existing parallel
+context combines vocabulary shards before finishing. The finisher reads no
+parameter table or projection. Static parameters retain their enclosing session's
+completion owner; Muse selects no row-addressable providers for these tables.
+
+Cold and bound capture preparation use one producer calculation from the
+architecture descriptor, retained component coordinates and selected transport
+precision. The prepared placement retains its session communication requirements.
+Resolution checks one exact broadcast per ordered slot, including tensor rank,
+input/output extent and dtype, and requires exact failure agreement. Slots publish
+sequentially, so their count does not enlarge the per-operation tensor count.
+Cold preflight resolves the complete selected decoder sequence envelope without
+opening sources or realizing communication.
+Session and tensor publication element bounds cover the larger of complete logits
+and the declared primary decoder boundary, plus any additional prediction capture.
+A vocabulary narrower than the decoder hidden state therefore does not truncate
+capture admission. Media-only tensor-reduction envelopes remain separate.
+
+Assistant body definitions retain exact K/V head count and head width alongside
+context positions and unit layout. Context append and proposal traversal validate
+every layer against `[1, kv_heads, retained_positions, head_width]` before beginning
+the parameter policy. Equal-sized tensors with another head layout cannot be
+substituted for committed context. The same ownership evidence covers the pinned
+DFlash and DSpark numerical fixtures with malformed-context rejection followed by
+valid resident/leased context eviction and full/partial proposals.
+
+DSpark TP construction partitions complete query/KV heads and feed-forward
+channels, preserves replicated context/norm/gate parameters, and reduces branch
+writes before post-normalization and residual combination. Complete assistant
+source placement retains exact recipes and original target invocation authority;
+selected native groups cannot widen cold communication limits. DFlash2 uses
+explicitly accounted per-participant replicas. These placements execute through
+the same controlled and uninterrupted proposal/verification driver. See
+[speculative decoding](speculative-decoding.md) for the application contract.
+
+Retained target discovery exposes its declared tensor group paired with its
+complete communication manifest. The MLX invocation adapter validates that
+manifest against the target session's communication owner and borrows the
+already realized group. Before lending it, the adapter checks the assistant's
+operation, dtype, input/output extent, tensor count/rank and exact-completion
+requirements against that group's retained admission. Backend capability does
+not enlarge the selected limits. This check precedes assistant unit acquisition.
+The adapter constructs no assistant communicator and accepts no caller-provided
+substitute group. It does not select assistant source placement, enlarge target
+communication requirements or grant public multi-rank speculative admission.
+
+The cases cover TP2, PP2, PP3, EP2 and combined TP2/PP2/EP2 with resident,
+host-layerwise and disk-streamed target policies. Pipeline cases execute declared
+media-to-decoder return routes and decoder continuations. Only pure-TP DSpark
+uses a sharded assistant body; the remaining cases hold explicitly reported
+complete assistant replicas on each participating rank. These neutral fixtures
+do not select public distributed assistant source placement or admit complete
+assistant communication requirements, asymmetric failure recovery or native
+released-checkpoint sessions.
+
+The tensor contract exposes stable final-axis top-k selection and strict
+final-axis scatter. Selection preserves score precision and breaks ties by
+ascending original index. Scatter checks bounds in the original I32/I64
+representation and rejects duplicate indices. MLX retains device validation in
+the completion scope and sanitizes invalid indices before native indexing; a
+deferred failure cannot publish a result. Spark neural score composition maps
+DSpark's signed offsets into the target vocabulary before shared sampling and
+verification. DFlash2 forms each conditional distribution from the actual sampled
+predecessor and global candidate IDs. The neural helpers neither draw tokens nor
+own a second proposal cursor.
+
 Before materialization, the compatible external preparation derives one
 neutral selection contract. Architecture-owned target profiles supply the
-stable target/geometry identity and maximum capture sequence; the admitted
-assistant checkpoint supplies artifact and physical-format identities. The
-facade supplies only its tokenizer proof, requested proposal capacity,
-processor identity, and already selected rank topology. Concrete backends must
-not synthesize family, artifact-format, or capture identities.
+stable target/geometry identity and context ceiling; the admitted assistant
+checkpoint supplies artifact and physical-format identities. The contract receives
+an explicit positive decoder capture bound. Execution-plan preparation takes
+that bound from the retained target partition's primary decoder boundary, or
+uses the architecture ceiling for an unpartitioned target. The effective capture
+extent is the smaller of the invocation bound and architecture ceiling; it also
+enters speculative state identity. Media route extents do not replace decoder
+invocation limits. The facade supplies its tokenizer proof, requested proposal
+capacity and processor identity. Concrete backends must not synthesize family,
+artifact-format, capture identities or invocation bounds.
+
+Prepared target capture placement retains the same selected decoder batch and
+sequence limits. Resolution rejects zero, unrepresentable or oversized dimensions
+before creating a transport bundle, while preserving producer ownership and
+complete hidden width. It cannot enlarge the retained invocation by substituting
+a model's longer context length.
 
 The selected capture schema fixes paths, order, ownership, observation seams,
 fixed dimensions, and upper bounds for request-sized sequence dimensions.
@@ -6005,6 +6398,15 @@ bank's input/output geometry and order within a block, and pipeline cuts occur
 only after a completed block. Ordered expert reduction sorts returned routes by
 global expert identity before scatter, preserving the selected accumulation
 precision across expert exchange.
+Native logical subgroups share a physical world wave even when an inactive stage
+uses F32 placeholders and an active cohort computes in F16/BF16. MLX transports
+these floating values through a common F32 encoding, which represents all three
+supported floating types exactly. Routed/direct sums restore each contribution's
+logical dtype before addition; fallback world sums transport distinct per-rank
+slots before logical reduction. Gather and variable exchange restore the original
+logical dtype on return. Integer control values retain their integer encoding.
+This transport encoding does not select model equations or change pipeline-wire
+contracts; intermediate transport buffers remain native mechanism storage.
 
 Ordinary KV and hybrid KV/fixed-state snapshots copy strided tails through
 contiguous views and copy every sealed paging block into an independent session
@@ -8188,8 +8590,9 @@ Muse component execution uses a single architecture-owned block driver for
 ordinary, provider-backed, tensor-parallel, and observed calls. Its hooks expose
 the actual gated attention channels and FFN units before their selected output
 projections, and both sides of the separate post-projection RMS normalizations.
-The postnorm acts on the complete reduced write; sparse expert contributions
-must be summed before that normalization. The same architecture-owned final
+The block postnorm acts on the complete reduced write; Glimmer's sparse expert
+contributions are summed before that normalization. Compressed experts additionally
+normalize each reconstructed expert output before the mixture. The same architecture-owned final
 readout handles tied and untied heads and retains output multiplication after
 the actual vocabulary projection. Backends continue to supply ordinary tensor,
 projection, sparse-unit, and collective mechanisms.
@@ -9108,7 +9511,12 @@ Core checks the canonical lifecycle before calling it. The neutral autoregressiv
 executor composes two `AutoregressiveMechanisms::memory_observation` results and
 its retained assistant seed. MLX reads native state metadata/capacity and residency;
 it never creates checkpoints, settles completions or submits tensors for this call.
-Embedded and feature-conditioned executors retain the unsupported default.
+Embedded executors supply installed prediction-layer observations. Conditioned
+Muse executors compose the target cache observation with the separate assistant
+parameter owner, projected-context backing and pending-capture seed. Core permits
+these observations only at canonical boundaries without retained proposals;
+missing mechanisms retain the unsupported default. Future native backing remains
+unknown rather than extrapolating current allocator capacity.
 
 Runtime owns physical-pool request composition (`loaded_generation_request`),
 `GenerationForecastOptions`, calibrated continuation phase accounting and the

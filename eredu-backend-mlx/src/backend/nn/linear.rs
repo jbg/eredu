@@ -216,6 +216,9 @@ pub struct PhysicalLinear {
     /// Per-group affine biases, when applicable.
     pub biases: PhysicalParam<Option<Array>>,
     #[param]
+    /// F32 multiplier for retained NVFP4 weights.
+    pub global_scale: PhysicalParam<Option<Array>>,
+    #[param]
     /// Optional additive output bias.
     pub bias: PhysicalParam<Option<Array>>,
     /// Number of logical values in each quantization group.
@@ -281,7 +284,7 @@ impl PhysicalLinear {
                 ],
                 Dtype::Uint32,
             ),
-            LinearFormat::MxFp4 => (
+            LinearFormat::MxFp4 | LinearFormat::NvFp4 => (
                 vec![
                     output_dimensions,
                     quantized_packed_dimension(input_dimensions, WeightQuantization::MXFP4_BITS),
@@ -350,7 +353,7 @@ impl PhysicalLinear {
                         output_dimensions,
                         input_dimensions / quantization.group_size(),
                     ],
-                    if quantization == WeightQuantization::MxFp4 {
+                    if matches!(quantization, WeightQuantization::MxFp4 | WeightQuantization::NvFp4) {
                         Dtype::Uint8
                     } else {
                         Dtype::Float32
@@ -372,6 +375,9 @@ impl PhysicalLinear {
             } else {
                 PhysicalParam::new(None)
             },
+            global_scale: if format == LinearFormat::NvFp4 {
+                PhysicalParam::<Option<Array>>::unloaded_some(&[], Dtype::Float32, stream)?
+            } else { PhysicalParam::new(None) },
             bias: if bias {
                 PhysicalParam::<Option<Array>>::unloaded_some(
                     &[output_dimensions],
@@ -444,6 +450,10 @@ impl PhysicalLinear {
                 endian,
             )?
             .linear(input, true, stream)?
+        } else if let Some(global) = self.global_scale.as_ref() {
+            super::nvfp4::linear(input, self.weight.as_ref(),
+                self.scales.as_ref().as_ref().ok_or_else(|| Exception::custom("NVFP4 block scales are absent"))?,
+                global, eredu_nn::LinearRowLayout::Contiguous, stream)?
         } else if let Some(scales) = self.scales.as_ref() {
             let sparse = if self.prefers_transposed_storage() {
                 self.biases

@@ -41,10 +41,33 @@ impl<A> ExternalAssistantExecutionMechanisms<A> for MlxExternalAssistantMechanis
 where
     A: ExternalAssistantArchitecture,
 {
+    fn coordinate_speculative_step(
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        context.coordinate_speculative_step(local)
+    }
+
+    fn agree_text_preparation(
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
+        context.agree_text_preparation(stage, status)
+    }
+
+    fn coordinate_decoding_control(
+        local: eredu_core::decoding::DecodingCoordination,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
+        context.coordinate_decoding_control(local)
+    }
+
     fn control_logits_estimate(logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         super::state_snapshot::estimate_array(logits)
     }
     type NeuralBackend = MlxNeuralBackend;
+    type ParameterPolicy = super::parameter_policy::MlxAssistantParameterPolicy<A::Unit<MlxNeuralBackend>>;
     type AttentionCache = ConcatKeyValueCache;
     type Target = dyn ErasedExternalPredictionExecutable;
     type Assistant = MlxExternalAssistant<A>;
@@ -60,23 +83,22 @@ where
 
     fn trim_parameter_conversions(
         target: &mut Self::Target,
-        _assistant: &mut Self::Assistant,
+        assistant: &mut Self::Assistant,
     ) -> Result<
         eredu_core::residency::ExecutionConversionRetentionTrimReport,
         eredu_core::residency::ParameterConversionTrimError,
     > {
-        // Auxiliary assistants have no registered retained-conversion owners.
         Ok(
             eredu_core::residency::ExecutionConversionRetentionTrimReport {
                 target: target.trim_parameter_conversions()?,
-                external_drafter: Some(Vec::new()),
+                external_drafter: Some(assistant.trim_parameter_conversions()?),
             },
         )
     }
 
     fn parameter_conversion_retention(
         target: &Self::Target,
-        _assistant: &Self::Assistant,
+        assistant: &Self::Assistant,
     ) -> Result<
         Option<eredu_core::residency::ExecutionConversionRetentionReport>,
         eredu_core::BackendFailure,
@@ -84,19 +106,54 @@ where
         Ok(Some(
             eredu_core::residency::ExecutionConversionRetentionReport {
                 target: target.parameter_conversion_retention()?,
-                external_drafter: Some(eredu_core::Observed::unsupported(
-                    "auxiliary assistant does not expose parameter conversion retention",
-                )),
+                external_drafter: Some(assistant.parameter_conversion_retention()?),
             },
         ))
+    }
+
+    fn target_memory_observation(
+        target: &Self::Target,
+        cache: &Self::NativeCache,
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeModelMemoryObservation>,
+        eredu_core::BackendFailure,
+    > {
+        target
+            .continuation_memory_observation(cache, additional)
+            .map(Some)
+    }
+
+    fn assistant_memory_observation(
+        assistant: &Self::Assistant,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
+        eredu_core::BackendFailure,
+    > {
+        assistant.parameter_memory_observation()
+    }
+
+    fn tensor_backing_bytes(
+        tensors: &[&Self::Tensor],
+    ) -> Result<Option<u64>, eredu_core::BackendFailure> {
+        super::memory_observation::tensor_backing(tensors)
     }
 
     fn config(assistant: &Self::Assistant) -> &A::Config {
         &assistant.config
     }
 
-    fn module(assistant: &mut Self::Assistant) -> &mut A::Module<Self::NeuralBackend> {
+    fn module(assistant: &mut Self::Assistant) -> &mut A::Execution<Self::NeuralBackend, Self::ParameterPolicy> {
         &mut assistant.module.inner
+    }
+
+    fn assistant_parallel_context<'a>(
+        context: Self::Context<'a>,
+        requirements: &eredu_runtime::CommunicationGroupRequirements,
+    ) -> Result<Option<&'a crate::backend::runtime::distributed::Group>, Self::Error> {
+        context
+            .assistant_parallel_context(requirements)
+            .map_err(Exception::from_source)
     }
 
     fn neural_error(error: eredu_nn::Error) -> Self::Error {

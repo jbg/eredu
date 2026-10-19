@@ -42,6 +42,19 @@ pub struct ComponentTransformParameter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComponentTensorTransformEquation {
+    /// Bias-optional linear projection of each logical token row. The effective
+    /// weight is `[output_width, input_width]`. Leading batch/sequence axes may
+    /// be flattened or restored without changing token order.
+    AffineProjection {
+        /// Effective projection matrix and its shared identity.
+        weight: ComponentTransformParameter,
+        /// Optional additive output vector.
+        bias: Option<ComponentTransformParameter>,
+        /// Channels consumed per logical token.
+        input_width: usize,
+        /// Channels produced per logical token.
+        output_width: usize,
+    },
     /// Apply one shared right-hand matrix to every consecutive input group.
     /// Input `[batch, sequence, groups * input_width]` is reshaped into groups;
     /// each group multiplies the same `[input_width, output_width]` parameter.

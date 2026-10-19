@@ -33,8 +33,8 @@ pub enum GgufMediaProjectorConfig {
     Gemma4(crate::gemma4::FamilyConfig),
     /// Inkling text plus its admitted vision/audio projector.
     Inkling(crate::inkling::ModelArgs),
-    /// Muse-Glimmer decoder plus its admitted vision projector.
-    MuseGlimmer(crate::muse_glimmer::DecoderConfig),
+    /// Shared Muse decoder plus its admitted vision and/or audio projector.
+    Muse(crate::muse::DecoderConfig),
     /// Qwen3-VL text plus its admitted DeepStack vision projector.
     Qwen3Vl(crate::qwen::vl::ModelArgs),
     /// Structurally admitted Qwen3-VL awaiting facade-resolved media token IDs.
@@ -55,6 +55,13 @@ pub struct GgufMediaProjectorPlan {
 }
 
 impl GgufMediaProjectorPlan {
+    pub(crate) fn replace_muse_execution_config(&mut self, config: crate::muse::DecoderConfig) {
+        match &mut self.model {
+            GgufMediaProjectorConfig::Muse(current) => *current = config,
+            _ => unreachable!("Muse media enrichment retains its admitted family"),
+        }
+    }
+
     pub(crate) fn attach_draft_adapter(&mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<(), String> {
         match &mut self.model {
             GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => *config = config.clone().with_draft_adapter(adapter),
@@ -237,17 +244,22 @@ pub(crate) fn resolve_media_projector(
             let checkpoint = crate::inkling::mmproj_gguf_plan(&args)?;
             (GgufMediaProjectorConfig::Inkling(args), checkpoint)
         }
-        GgufModelConfig::MuseGlimmer(args) => {
+        GgufModelConfig::Muse(args) => {
+            let audio = if projector_metadata.get("clip.has_audio_encoder")
+                .and_then(MetadataValue::as_bool) == Some(true) {
+                Some(crate::muse::AudioConfig::from_gguf_metadata(&projector_metadata, args.hidden_size)
+                    .map_err(|error| error.to_string())?)
+            } else { None };
             let formats = weight_formats(
                 projector,
-                crate::muse_glimmer::translate_projector_gguf_name,
+                |name| crate::muse::translate_projector_gguf_name(name, audio.as_ref()),
             )?;
             let args = args
                 .clone()
                 .with_gguf_projector_metadata(&projector_metadata, formats)
                 .map_err(|error| error.to_string())?;
-            let checkpoint = crate::muse_glimmer::projector_gguf_plan(&args)?;
-            (GgufMediaProjectorConfig::MuseGlimmer(args), checkpoint)
+            let checkpoint = crate::muse::projector_gguf_plan(&args)?;
+            (GgufMediaProjectorConfig::Muse(args), checkpoint)
         }
         GgufModelConfig::Qwen(text) => {
             let mut vision = crate::qwen::vl::vision_config_from_gguf_catalog(
@@ -327,8 +339,8 @@ fn canonical_projector_mapping(
         GgufMediaProjectorConfig::Inkling(_) => {
             projector.translated_outputs(crate::inkling::translate_mmproj_weight_name)
         }
-        GgufMediaProjectorConfig::MuseGlimmer(_) => {
-            projector.translated_outputs(crate::muse_glimmer::translate_projector_gguf_name)
+        GgufMediaProjectorConfig::Muse(args) => {
+            projector.translated_outputs(|name| crate::muse::translate_projector_gguf_name(name, args.audio_config.as_ref()))
         }
         GgufMediaProjectorConfig::Qwen3Vl(model) => {
             let deepstack = model.vision.deepstack_layers();
@@ -510,11 +522,11 @@ mod tests {
             ),
         ]);
         let args =
-            crate::muse_glimmer::DecoderConfig::from_gguf_catalog(&Catalog, &metadata).unwrap();
-        let checkpoint = crate::muse_glimmer::gguf_plan(&args).unwrap();
+            crate::muse::DecoderConfig::from_gguf_catalog(&Catalog, &metadata).unwrap();
+        let checkpoint = crate::muse::gguf_plan(&args).unwrap();
         GgufArchitecturePlan::new(
             GgufArchitecture::MuseGlimmer,
-            GgufModelConfig::MuseGlimmer(args),
+            GgufModelConfig::Muse(args),
             checkpoint,
             Vec::new(),
         )

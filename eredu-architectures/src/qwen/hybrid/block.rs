@@ -207,6 +207,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     groups: None,
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,
@@ -356,6 +357,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     groups: None,
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,
@@ -704,6 +706,7 @@ fn new_attention<B: NeuralBackend>(
     let norm = |field: &str| {
         B::normalization(
             NormalizationConstructionSpec {
+                reduction: eredu_nn::NormalizationReduction::Native,
                 groups: None,
                 dimensions: config.head_dim,
                 epsilon: config.rms_norm_eps,

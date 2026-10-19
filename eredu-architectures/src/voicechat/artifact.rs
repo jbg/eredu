@@ -29,7 +29,7 @@ use eredu_checkpoint::{
     },
     validation::{resolve_gguf_plan, resolve_safetensors_plan},
 };
-use eredu_core::{artifact::ArtifactError, GgufCompanionRole};
+use eredu_core::{artifact::ArtifactError, ArtifactCompanionRole};
 
 /// A rejected source graph. No native resources are allocated during admission.
 #[derive(Debug, thiserror::Error)]
@@ -376,7 +376,7 @@ impl VoiceChatArtifactPlan {
             let id = if index == 0 {
                 PhysicalArtifactId::Primary
             } else {
-                PhysicalArtifactId::Companion(GgufCompanionRole::Named(format!(
+                PhysicalArtifactId::Companion(ArtifactCompanionRole::Named(format!(
                     "voicechat/component/{index}"
                 )))
             };
@@ -395,7 +395,7 @@ impl VoiceChatArtifactPlan {
                 config,
                 &required,
                 source,
-                PhysicalArtifactId::Companion(GgufCompanionRole::Named(
+                PhysicalArtifactId::Companion(ArtifactCompanionRole::Named(
                     "voicechat/companion".into(),
                 )),
                 true,

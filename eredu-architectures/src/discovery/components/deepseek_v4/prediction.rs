@@ -317,6 +317,7 @@ pub(in crate::discovery) fn declare(g: &mut Builder, c: &V4Args, target_output: 
                 effective_output: format!("{fusion_output}.effective"),
             },
             readout: ComponentReadoutEquation {
+                residual_cycles: vec![],
                 block_transforms: vec![],
                 score_writes: vec![],
                 stream_residual: Some(ComponentStreamResidual {

@@ -4,6 +4,8 @@
 //! patch/audio feature policy live here. A concrete backend executes the
 //! declared pixel or signal transforms and constructs its native tensors.
 
+pub(crate) mod muse_media_sources;
+
 use std::collections::{BTreeMap, HashMap};
 
 use eredu_core::VideoSampling;
@@ -559,6 +561,7 @@ pub struct ArtifactArchitecturePlan {
     processor: Option<NormalizedProcessorPlan>,
     prediction_extension: Option<crate::configuration::PredictionExtensionPlan>,
     draft_adapter: Option<std::sync::Arc<crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter>>,
+    media_companions: Vec<std::sync::Arc<crate::muse::media_companion::Bf16MediaCompanion>>,
 }
 
 impl ArtifactArchitecturePlan {
@@ -614,6 +617,7 @@ impl ArtifactArchitecturePlan {
             processor: None,
             prediction_extension: None,
             draft_adapter: None,
+            media_companions: Vec::new(),
         }
     }
 
@@ -628,6 +632,7 @@ impl ArtifactArchitecturePlan {
             processor: None,
             prediction_extension: None,
             draft_adapter: None,
+            media_companions: Vec::new(),
         }
     }
 
@@ -677,6 +682,7 @@ impl ArtifactArchitecturePlan {
                 processor: self.processor.clone(),
                 prediction_extension: Some(extension.clone()),
                 draft_adapter: self.draft_adapter.clone(),
+                media_companions: self.media_companions.clone(),
             },
             extension,
         )))
@@ -701,10 +707,14 @@ impl ArtifactArchitecturePlan {
     pub(crate) fn admit_safetensors_catalog(
         mut self,
         tensors: &eredu_core::checkpoint::TensorCatalog,
+        source: &serde_json::Value,
     ) -> Result<Self, eredu_core::artifact::ArtifactError> {
         self.validation = Default::default();
         match &mut self.family {
-            ArtifactFamilyPlan::Safetensors(plan) => plan.admit_catalog(tensors)?,
+            ArtifactFamilyPlan::Safetensors(plan) => {
+                plan.resolve_muse_catalog(tensors, source)?;
+                plan.admit_catalog(tensors)?;
+            },
             ArtifactFamilyPlan::Gguf(_) => {
                 return Err(
                     eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(
@@ -748,7 +758,7 @@ impl ArtifactArchitecturePlan {
             ModelKind::Inkling => {
                 InklingProcessorPlan::from_hf_json(model)?.map(NormalizedProcessorPlan::Inkling)
             }
-            ModelKind::MuseGlimmer => muse
+            ModelKind::MuseGlimmer | ModelKind::MuseSpark => muse
                 .map(MuseProcessorPlan::from_hf_json)
                 .transpose()?
                 .map(NormalizedProcessorPlan::Muse),
@@ -759,6 +769,13 @@ impl ArtifactArchitecturePlan {
                 .map(NormalizedProcessorPlan::Qwen),
             _ => None,
         };
+        if let (
+            Some(NormalizedProcessorPlan::Muse(processor)),
+            crate::configuration::SafetensorsModelConfig::Muse(config),
+        ) = (&processor, architecture.model())
+        {
+            processor.validate_components(config)?;
+        }
         self.validation = Default::default();
         self.processor = processor;
         Ok(self)
@@ -800,7 +817,7 @@ impl ArtifactArchitecturePlan {
             GgufArchitecture::Inkling if projector.is_some() => Some(
                 NormalizedProcessorPlan::Inkling(InklingProcessorPlan::from_gguf_metadata()?),
             ),
-            GgufArchitecture::MuseGlimmer => projector
+            GgufArchitecture::MuseGlimmer | GgufArchitecture::MuseSpark => projector
                 .map(|projector| MuseProcessorPlan::from_gguf_metadata(&as_hash_map(projector)))
                 .transpose()?
                 .map(NormalizedProcessorPlan::Muse),
@@ -844,8 +861,8 @@ impl ArtifactArchitecturePlan {
                         config.clone(),
                     ),
                 ),
-                SafetensorsModelConfig::MuseGlimmer(config) => Some(
-                    crate::external_assistant::ExternalAssistantTargetProfile::MuseGlimmer(
+                SafetensorsModelConfig::Muse(config) => Some(
+                    crate::external_assistant::ExternalAssistantTargetProfile::Muse(
                         config.clone(),
                     ),
                 ),
@@ -857,8 +874,8 @@ impl ArtifactArchitecturePlan {
                         config.clone(),
                     ),
                 ),
-                GgufModelConfig::MuseGlimmer(config) => Some(
-                    crate::external_assistant::ExternalAssistantTargetProfile::MuseGlimmer(
+                GgufModelConfig::Muse(config) => Some(
+                    crate::external_assistant::ExternalAssistantTargetProfile::Muse(
                         config.clone(),
                     ),
                 ),
@@ -2166,8 +2183,28 @@ const fn default_muse_lanczos() -> u8 {
     1
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+enum MuseTimestampPolicy {
+    #[default]
+    #[serde(rename = "Time: {timestamp:.1f}s")]
+    Tenths,
+    #[serde(rename = "Time: {timestamp:.2f}s")]
+    Hundredths,
+}
+
+impl MuseTimestampPolicy {
+    fn render(self, seconds: f64) -> String {
+        match self {
+            Self::Tenths => format!("Time: {seconds:.1}s"),
+            Self::Hundredths => format!("Time: {seconds:.2}s"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct MuseVisualSource {
+    #[serde(default)]
+    frame_timestamp_format: MuseTimestampPolicy,
     #[serde(default = "default_muse_true")]
     do_resize: bool,
     #[serde(default = "default_muse_true")]
@@ -2204,6 +2241,31 @@ struct MuseVisualSource {
 struct MuseProcessorSource {
     image_processor: MuseVisualSource,
     video_processor: MuseVisualSource,
+    feature_extractor: Option<MuseWaveformSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MuseWaveformSource {
+    feature_extractor_type: String,
+    feature_size: usize,
+    sampling_rate: u32,
+    samples_per_token: usize,
+    padding_side: String,
+    padding_value: f32,
+    return_attention_mask: bool,
+}
+
+/// Raw mono waveform preparation declared by a selected Muse processor asset.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MuseWaveformPlan {
+    /// Audio input sampling rate, before neural patch reduction.
+    pub sample_rate: u32,
+    /// Complete waveform samples represented by one decoder audio position.
+    pub samples_per_token: usize,
+    /// Opening framing text to tokenize.
+    pub start_text: &'static str,
+    /// Closing framing text to tokenize.
+    pub end_text: &'static str,
 }
 
 /// Muse-Glimmer patch packing geometry.
@@ -2260,26 +2322,62 @@ pub struct MuseProcessorPlan {
     image: MuseVisualSource,
     video: MuseVisualSource,
     image_only: bool,
+    waveform: Option<MuseWaveformPlan>,
 }
 
 impl MuseProcessorPlan {
+    pub(crate) fn validate_components(
+        &self,
+        config: &crate::muse::DecoderConfig,
+    ) -> Result<(), ProcessorPlanError> {
+        if let Some(vision) = &config.vision_config {
+            for source in [&self.image, &self.video] {
+                if source.patch_size != vision.patch_size as usize
+                    || source.temporal_patch_size != vision.temporal_patch_size as usize
+                    || source.merge_size != vision.merge_size as usize
+                {
+                    return Err(invalid("Muse processor patch geometry differs from its selected vision tower"));
+                }
+            }
+        }
+        if let Some(audio) = &config.audio_config {
+            let waveform = self.waveform.ok_or_else(|| invalid("selected audio companion omits its waveform processor"))?;
+            if waveform.samples_per_token != audio.samples_per_token().map_err(|e| invalid(e.to_string()))? as usize {
+                return Err(invalid("Muse waveform processor cadence differs from its selected audio tower"));
+            }
+        }
+        Ok(())
+    }
+
     /// Parses the release's nested Hugging Face processor configuration.
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ProcessorPlanError> {
         let source: MuseProcessorSource = serde_json::from_slice(bytes)?;
         validate_muse(&source.image_processor, "image")?;
         validate_muse(&source.video_processor, "video")?;
+        let waveform = source.feature_extractor.map(|source| {
+            if source.feature_extractor_type != "MuseSparkFeatureExtractor" || source.feature_size != 1
+                || source.sampling_rate != 24000 || source.samples_per_token != 1920
+                || source.padding_side != "right" || source.padding_value != 0.0
+                || !source.return_attention_mask {
+                return Err(invalid("Muse waveform processor must declare mono 24 kHz, right zero padding and 1,920-sample cadence"));
+            }
+            Ok(MuseWaveformPlan {sample_rate:source.sampling_rate,samples_per_token:source.samples_per_token,
+                start_text:"<|soft_audio_start|>",end_text:"<|soft_audio_end|>"})
+        }).transpose()?;
         Ok(Self {
             image: source.image_processor,
             video: source.video_processor,
             image_only: false,
+            waveform,
         })
     }
 
-    /// Parses the official image-only projector policy from portable GGUF metadata.
+    /// Parses still-image and optional waveform policy from portable GGUF metadata.
     pub fn from_gguf_metadata(
         metadata: &HashMap<String, MetadataValue>,
     ) -> Result<Self, ProcessorPlanError> {
         let image = MuseVisualSource {
+            frame_timestamp_format: MuseTimestampPolicy::Tenths,
             do_resize: true,
             do_rescale: true,
             rescale_factor: default_muse_rescale(),
@@ -2305,12 +2403,45 @@ impl MuseProcessorPlan {
             resample: default_muse_lanczos(),
         };
         validate_muse(&image, "image")?;
+        let waveform = match metadata.get("clip.has_audio_encoder") {
+            Some(MetadataValue::Bool(true)) => {
+                let width = required_metadata_usize(metadata, "clip.audio.projection_dim", "Muse")?;
+                let audio = crate::muse::AudioConfig::from_gguf_metadata(
+                    metadata,
+                    i32::try_from(width)
+                        .map_err(|_| invalid("Muse audio projection exceeds i32"))?,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                let cadence = audio
+                    .samples_per_token()
+                    .map_err(|error| invalid(error.to_string()))?;
+                if cadence != 1920 {
+                    return Err(invalid(
+                        "Muse waveform projector requires 1,920 samples per token",
+                    ));
+                }
+                Some(MuseWaveformPlan {
+                    sample_rate: 24000,
+                    samples_per_token: 1920,
+                    start_text: "<|soft_audio_start|>",
+                    end_text: "<|soft_audio_end|>",
+                })
+            }
+            Some(MetadataValue::Bool(false)) | None => None,
+            _ => return Err(invalid("clip.has_audio_encoder must be a boolean")),
+        };
+
         Ok(Self {
             video: image.clone(),
             image,
             image_only: true,
+            waveform,
         })
     }
+
+    /// Returns the exact waveform policy when the selected asset includes it.
+    /// Weight-source coverage is checked separately during artifact preparation.
+    pub const fn waveform(&self) -> Option<MuseWaveformPlan> { self.waveform }
 
     /// Derives image framing, transform, and patch policy.
     pub fn image(&self, height: usize, width: usize) -> Result<MuseImagePlan, ProcessorPlanError> {
@@ -2372,7 +2503,7 @@ impl MuseProcessorPlan {
                     .unwrap_or(0);
                 MuseVideoGroupPlan {
                     source_indices: chunk.to_vec(),
-                    timestamp_text: format!("Time: {:.1}s", source_index as f64 / source_fps),
+                    timestamp_text: self.video.frame_timestamp_format.render(source_index as f64 / source_fps),
                     boundary_text: if group + 1 == group_count {
                         "<|vid_end|>"
                     } else {
@@ -2851,5 +2982,31 @@ mod tests {
         assert_eq!(video.groups[0].timestamp_text, "Time: 0.0s");
         assert_eq!(video.groups[0].boundary_text, "<|vid_frame_separator|>");
         assert_eq!(video.groups[1].boundary_text, "<|vid_end|>");
+    }
+
+    #[test]
+    fn muse_video_timestamp_policy_honors_the_selected_processor_asset() {
+        let source = br#"{"image_processor":{},"video_processor":{"frame_timestamp_format":"Time: {timestamp:.2f}s"}}"#;
+        let plan = MuseProcessorPlan::from_hf_json(source).unwrap();
+        let video = plan.video(4,800,1200,Some(3.0),VideoSampling::All).unwrap();
+        assert_eq!(video.groups[0].timestamp_text,"Time: 0.00s");
+        assert_eq!(video.groups[1].timestamp_text,"Time: 0.67s");
+        assert!(MuseProcessorPlan::from_hf_json(br#"{"image_processor":{},"video_processor":{"frame_timestamp_format":"Time: {timestamp}s"}}"#).is_err());
+    }
+
+    #[test]
+    fn muse_released_processor_retains_waveform_framing_and_sampling_policy() {
+        let source = include_bytes!("../../validation/fixtures/muse-spark/processor-config.json");
+        let plan = MuseProcessorPlan::from_hf_json(source).unwrap();
+        let waveform = plan.waveform().unwrap();
+        assert_eq!(waveform.sample_rate,24_000);
+        assert_eq!(waveform.samples_per_token,1920);
+        assert_eq!((waveform.start_text,waveform.end_text),("<|soft_audio_start|>","<|soft_audio_end|>"));
+        let video = plan.video(4,800,1200,Some(3.0),VideoSampling::All).unwrap();
+        assert_eq!(video.groups[1].timestamp_text,"Time: 0.67s");
+        let mut malformed: serde_json::Value = serde_json::from_slice(source).unwrap();
+        malformed["feature_extractor"]["samples_per_token"] = 1919.into();
+        assert!(MuseProcessorPlan::from_hf_json(&serde_json::to_vec(&malformed).unwrap()).is_err());
+        assert!(MuseProcessorPlan::from_hf_json(br#"{"image_processor":{},"video_processor":{}}"#).unwrap().waveform().is_none());
     }
 }

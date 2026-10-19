@@ -387,6 +387,41 @@ Ordinary active llguidance constraints remain unsupported for snapshots because
 their storage cost is unknown. These limitations do not prevent controlled
 speculative stepping or proposal observation.
 
+Muse Spark uses shared Muse construction and the ordinary controlled-session
+and speculative drivers. Resident, host-layerwise and disk-streamed providers
+cover decoder, media and assistant units. Selected TP/PP/EP placements retain
+stage-local KV/convolution geometry and the same transport/completion contracts.
+Encoders prepare admitted attachments once; bounded decoder prefixes reuse their
+immutable products. Text-only inputs need no optional tower. A missing media
+component produces a typed preparation error before host processing.
+
+DSpark and DFlash2 preserve their released capture layers, proposal blocks and
+mask identities. Tentative proposals remain separate from committed output.
+Verification includes the pending committed token, commits accepted prefixes and
+rolls back rejected suffixes through the shared transaction. Cancellation or
+failed preparation publishes neither candidate state nor output. Source and
+invocation admission retain the exact target selection and native group identity.
+Pure TP DSpark may shard its body; DFlash2 and other selected placements use
+explicitly accounted replicas.
+
+Snapshots preserve target KV/convolution state, retained media products, pending
+preparation, projected assistant context, pending captures, positions, RNG,
+termination state and consumed budgets. Restore and fork do not refund copy,
+observation or transport work. Controlled and uninterrupted sessions share
+request preparation, sampling, constraints and commitment.
+
+Conditioned forecasts combine separate parameter owners, retained source/loading
+profiles, compacted context and full trained proposal geometry. Settled continuation
+observes installed target/draft frontiers and backing without evaluating lazy
+tensors. Unknown native workspace and future allocator capacity retain the ordinary
+MLX backend's coverage; no stronger Spark-specific finite fit claim is made.
+
+Shared execution conformance owns lifecycle, failure, partition and budget checks.
+Family acceptance compares pinned released checkpoints with independent references
+and records concise results. Detailed diagnostic tensors and tests remain external.
+See [Spark support and validation](model-support.md#muse-spark-evidence-and-support-status)
+for completed released NVFP4/assistant acceptance and current resource/native gaps.
+
 For captures, call `prepare_speculative_capture(settings, plan)` and pass its
 admitted plan in `GenerationControlOptions::speculative_capture`. Each observation is one
 vocabulary row, including prefill; ordinary whole-prompt admission is rejected.
@@ -1316,7 +1351,10 @@ or canonical verification/commit with no retained proposals, optimistic branch o
 pending verification. It never polls or settles work to make a boundary eligible.
 Before prefill, after termination/cancellation, on failed sessions, and during an
 uncommitted transaction it returns `UnsupportedContinuation` without changing state.
-Feature-conditioned external assistants remain unsupported. Embedded forecasts
+Feature-conditioned external assistants require installed target and projected
+context frontiers plus current parameter-owner observations. Pending target
+captures remain separate from assistant-owned projected context; unavailable
+backing and future capacity preserve unknown upper bounds. Embedded forecasts
 require installed prediction state and retained-feature observations; missing
 workspace mechanisms preserve an unknown upper end. Instrumentation
 or custom sampler/semantic growth without a complete bound preserves known native

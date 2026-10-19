@@ -55,6 +55,7 @@ fn grouped_projection_uses_selected_routes_and_local_output_partition() {
 #[test]
 fn convolution_history_is_fixed_by_receptive_field_not_prompt_length() {
     let mut spec = CausalDepthwiseConvolutionSpec {
+        arithmetic: crate::ConvolutionArithmetic::Native,
         dilation: 1,
         channels: 32,
         kernel_size: 4,
@@ -202,6 +203,7 @@ fn quantized_projection_keeps_packed_format_and_companion_contract() {
 #[test]
 fn convolution_rejects_invalid_or_overflowing_receptive_fields() {
     let mut spec = CausalDepthwiseConvolutionSpec {
+        arithmetic: crate::ConvolutionArithmetic::Native,
         channels: 1,
         kernel_size: 4,
         dilation: 0,
@@ -222,6 +224,8 @@ fn convolution_rejects_invalid_or_overflowing_receptive_fields() {
     spec.kernel_size = 0;
     assert!(spec.history_len().is_err());
     let invocation = MechanismInvocation::Convolution {
+        arithmetic: crate::ConvolutionArithmetic::Native,
+        bias: false,
         batch: 1,
         tokens: 1,
         channels: 1,
@@ -288,6 +292,7 @@ fn rotary_geometry_preserves_prefix_and_outputs_float32_for_all_layouts() {
 #[test]
 fn projection_bias_representation_requires_a_present_floating_parameter() {
     let invocation = |bias, bias_element| MechanismInvocation::Projection {
+        arithmetic: eredu_nn::LinearArithmetic::Native,
         rows: 3,
         input: 5,
         output: 7,
@@ -385,6 +390,7 @@ fn layer_normalization_geometry_preserves_nominal_dtype_and_borrowed_affine_para
         (false, None, true, Some(TensorElementType::F32)),
     ] {
         let invocation = MechanismInvocation::LayerNormalization {
+            arithmetic: crate::LayerNormalizationArithmetic::Native,
             rows: 3,
             width: 7,
             element: TensorElementType::Bf16,
@@ -413,6 +419,7 @@ fn layer_normalization_geometry_preserves_nominal_dtype_and_borrowed_affine_para
 fn layer_normalization_geometry_rejects_bad_presence_types_and_extents() {
     let make = |rows, width, element, weight, weight_element, bias, bias_element| {
         MechanismInvocation::LayerNormalization {
+            arithmetic: crate::LayerNormalizationArithmetic::Native,
             rows,
             width,
             element,

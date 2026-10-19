@@ -140,6 +140,12 @@ pub struct RoutedComponentGroup {
     /// or shared branches. Its `.effective` companion is the consumed write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_output: Option<String>,
+    /// Transform applied separately to each complete expert output, after tensor
+    /// reduction and before route-coefficient multiplication and accumulation.
+    /// Joins `ComponentTensorTransform::id`; its input/output preserve token and
+    /// selected-route axes. Absent means the expert outputs are weighted directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_output_transform: Option<String>,
     /// Bank output after declared transforms, before combining with other writes.
     /// Join this boundary to `ComponentTensorTransform` for the exact equation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -422,6 +428,7 @@ mod tests {
             effective_activation: "layer.routing.units.effective".into(),
             write_input: None,
             write_output: None,
+            expert_output_transform: None,
             output: None,
             input: None,
             reads: vec![

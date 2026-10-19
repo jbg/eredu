@@ -11,6 +11,10 @@ use eredu_runtime::{
 
 use crate::media_plan::AdmittedCompositeInput;
 
+mod prefill;
+pub use prefill::DecoderPrefillRequest;
+pub(crate) use prefill::DecoderPrefillChunk;
+
 /// One request-bounded tensor collective in a composite pipeline wave.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CompositeTensorCollective {
@@ -39,8 +43,8 @@ pub enum ExternalPredictionCaptureRequest {
         /// Exact final decoder unit-output observation path.
         final_hidden_path: String,
     },
-    /// Ordered decoder-unit outputs consumed by a DFlash assistant.
-    MuseGlimmerDFlash {
+    /// Ordered Muse decoder-unit outputs consumed by a trained assistant.
+    Muse {
         /// Exact zero-based decoder layers, in assistant encoder order.
         target_layers: Box<[usize]>,
         /// Exact unit-output observation paths in the same order.
@@ -59,21 +63,76 @@ pub enum ExternalPredictionTargetCapture<T> {
         /// Shared K/V values keyed by their exact attention policy.
         shared_kv: Vec<(AttentionPolicy, T, T)>,
     },
-    /// Muse-Glimmer decoder outputs in the requested target-layer order.
-    MuseGlimmerDFlash {
+    /// Muse decoder outputs in the requested target-layer order.
+    Muse {
         /// Exact ordered target-layer activations.
         target_states: Vec<T>,
     },
 }
 
 /// Target-owned static operation needed by an external assistant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum ExternalPredictionTargetOperation<'a, T> {
     /// Applies the ordinary target token embedding to assistant proposal IDs.
     TokenEmbeddings(&'a T),
     /// Applies the ordinary target vocabulary projection to assistant states.
     ProjectLogits(&'a T),
+    /// Looks up the target token table without input normalization or scaling.
+    RawTokenEmbeddings(&'a T),
+    /// Applies the target vocabulary head without final normalization, scaling or capping.
+    /// Tensor-parallel vocabulary shards are gathered before returning.
+    RawVocabularyProjection(&'a T),
+}
+
+/// Semantic identity of a target-owned static equation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExternalPredictionTargetOperationKind {
+    /// Ordinary normalized token embeddings.
+    TokenEmbeddings,
+    /// Ordinary final-normalized and transformed readout.
+    ProjectLogits,
+    /// Raw token table lookup.
+    RawTokenEmbeddings,
+    /// Raw vocabulary matrix product.
+    RawVocabularyProjection,
+}
+impl ExternalPredictionTargetOperationKind {
+    /// Whether this equation consumes token IDs rather than decoder hidden states.
+    pub const fn is_lookup(self) -> bool {
+        matches!(self, Self::TokenEmbeddings | Self::RawTokenEmbeddings)
+    }
+}
+impl<T> ExternalPredictionTargetOperation<'_, T> {
+    /// Stable equation identity independent of native tensor representation.
+    pub const fn kind(&self) -> ExternalPredictionTargetOperationKind {
+        match self {
+            Self::TokenEmbeddings(_) => ExternalPredictionTargetOperationKind::TokenEmbeddings,
+            Self::ProjectLogits(_) => ExternalPredictionTargetOperationKind::ProjectLogits,
+            Self::RawTokenEmbeddings(_) => {
+                ExternalPredictionTargetOperationKind::RawTokenEmbeddings
+            }
+            Self::RawVocabularyProjection(_) => {
+                ExternalPredictionTargetOperationKind::RawVocabularyProjection
+            }
+        }
+    }
+    /// Request tensor whose side-effect-free geometry resolves the static plan.
+    pub fn input(&self) -> &T {
+        match self {
+            Self::TokenEmbeddings(v)
+            | Self::ProjectLogits(v)
+            | Self::RawTokenEmbeddings(v)
+            | Self::RawVocabularyProjection(v) => v,
+        }
+    }
+}
+
+impl<T> Copy for ExternalPredictionTargetOperation<'_, T> {}
+impl<T> Clone for ExternalPredictionTargetOperation<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl CompositeTensorCollective {
@@ -114,6 +173,7 @@ pub struct PreparedCompositeInput<'a, T, P> {
     admitted: &'a AdmittedCompositeInput<P>,
     refinement: Option<Option<&'a T>>,
     invocation: Option<eredu_core::decoding::AttentionInvocation>,
+    decoder_chunk: Option<(usize, usize, Option<&'a T>)>,
 }
 
 impl<T, P> Clone for PreparedCompositeInput<'_, T, P> {
@@ -141,6 +201,7 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
             admitted,
             refinement: None,
             invocation: None,
+            decoder_chunk: None,
         })
     }
 
@@ -169,6 +230,13 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
     /// Explicit invocation authority, when supplied by the generation driver.
     pub fn attention_invocation(&self) -> Option<eredu_core::decoding::AttentionInvocation> {
         self.invocation
+    }
+
+    pub(crate) fn decoder_chunk(&self) -> Option<DecoderPrefillChunk<'a, T>> {
+        self.decoder_chunk.map(|(start, end, assembled)| DecoderPrefillChunk {
+            range: start..end,
+            assembled,
+        })
     }
 
     /// Exact backend-native prepared tensor handles.
@@ -298,6 +366,56 @@ where
     }
 }
 
+/// Request-specific encoder geometry at an intra-group pipeline cut.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CompositeContinuationGeometry {
+    /// Every internal cut has the same frame count and width.
+    Uniform {
+        /// Prepared encoder frames.
+        sequence: i32,
+        /// Encoder activation width.
+        width: i32,
+    },
+    /// Shape after each source unit, including reductions between encoder stages.
+    AfterUnits(Vec<(i32, i32)>),
+}
+
+impl From<(i32, i32)> for CompositeContinuationGeometry {
+    fn from((sequence, width): (i32, i32)) -> Self {
+        Self::Uniform { sequence, width }
+    }
+}
+
+impl CompositeContinuationGeometry {
+    /// Resolves the exact shape after a positive exclusive source-unit frontier.
+    pub fn after_unit_end(&self, end: usize) -> Result<(i32, i32), String> {
+        if end == 0 {
+            return Err("encoder continuation has no completed source unit".into());
+        }
+        let shape = match self {
+            Self::Uniform { sequence, width } => (*sequence, *width),
+            Self::AfterUnits(shapes) => *shapes
+                .get(end - 1)
+                .ok_or("encoder continuation exceeds its source units")?,
+        };
+        if shape.0 <= 0 || shape.1 <= 0 {
+            return Err("encoder continuation geometry must be positive".into());
+        }
+        Ok(shape)
+    }
+
+    /// Checks complete unit coverage before beginning any native operation.
+    pub fn validate_units(&self, units: usize) -> Result<(), String> {
+        if units == 0 || matches!(self,Self::AfterUnits(shapes) if shapes.len() != units) {
+            return Err("encoder continuation geometry differs from its unit count".into());
+        }
+        for end in 1..=units {
+            self.after_unit_end(end)?;
+        }
+        Ok(())
+    }
+}
+
 /// Architecture-owned interpretation of admitted prepared input.
 pub trait CompositeArchitecture<B, S>: LayeredArchitecture<B, S> + Sized + 'static
 where
@@ -322,6 +440,12 @@ where
     /// Prepared requests implement partial invocations with retained continuations.
     fn supports_retained_prefill() -> bool {
         false
+    }
+
+    /// Completed immutable assembled decoder ingress retained by a prefill cursor.
+    fn prefill_decoder_continuation(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        let _ = forward;
+        None
     }
 
     /// Ordinary unobserved plain-text passes preserve state across prefix boundaries.
@@ -416,7 +540,10 @@ where
         _group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
     ) -> Result<i32, String> {
-        i32::try_from(input.admitted().decoder_positions())
+        let positions = input.decoder_chunk().map_or(
+            input.admitted().decoder_positions(), |chunk| chunk.range.len() as u64,
+        );
+        i32::try_from(positions)
             .map_err(|_| "prepared composite boundary sequence exceeds i32".to_owned())
     }
 
@@ -431,7 +558,7 @@ where
         &self,
         _group: usize,
         _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<(i32, i32)>, String> {
+    ) -> Result<Option<CompositeContinuationGeometry>, String> {
         Ok(None)
     }
 
@@ -597,10 +724,41 @@ where
         Ok(None)
     }
 
-    /// Applies one target-owned static operation without transferring ordinary target ownership.
+    /// Applies one complete target-owned static operation. Contributions are
+    /// combined before the architecture's finishing equations run.
     fn external_prediction_target_operation(
         &mut self,
+        operation: ExternalPredictionTargetOperation<'_, B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        match self.external_prediction_target_contribution(operation, parallel, context)? {
+            Some(value) => {
+                self.finish_external_prediction_target_operation(operation, value, context)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Computes raw lookup/projection values. With no parallel context a
+    /// vocabulary-sharded module emits only its local contribution; normalization
+    /// of embeddings and output transforms belong to the finishing stage.
+    /// An ordinary parallel context combines vocabulary shards before returning.
+    fn external_prediction_target_contribution(
+        &mut self,
         _operation: ExternalPredictionTargetOperation<'_, B::Tensor>,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Finishes a complete combined value. This does not look up or project
+    /// parameters, and must not receive an uncombined contribution.
+    fn finish_external_prediction_target_operation(
+        &self,
+        _operation: ExternalPredictionTargetOperation<'_, B::Tensor>,
+        _combined: B::Tensor,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
         Ok(None)
@@ -879,7 +1037,8 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        self.inner.begin_composite_forward_observed(input, state, context, observer)
+        self.inner
+            .begin_composite_forward_observed(input, state, context, observer)
     }
 
     fn begin_execution_group(
@@ -1108,7 +1267,8 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        self.inner.begin_composite_forward_parallel_observed(input, state, parallel, context, observer)
+        self.inner
+            .begin_composite_forward_parallel_observed(input, state, parallel, context, observer)
     }
 
     fn forward_unit_parallel(

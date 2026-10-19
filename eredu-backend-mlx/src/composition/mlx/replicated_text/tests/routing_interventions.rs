@@ -443,7 +443,7 @@ fn routing_intervention_loaded_discovery_admission_and_evidence_agree_for_qwen_f
             }
         }
         let admitted = InterventionPlan {
-            schema_version: 1,
+            schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
             operations,
         }
         .admit(&discovery, request, "loaded-routes")

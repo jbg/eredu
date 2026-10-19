@@ -23,6 +23,7 @@ impl TopKGroupSelector {
         .and_then(|spec| {
             spec.with_weight_policy(self.normalization_epsilon, self.coefficient_scale)
         })
+        .map(|spec| spec.with_order(self.order))
         .map_err(|error| Exception::custom(error.to_string()))
     }
 

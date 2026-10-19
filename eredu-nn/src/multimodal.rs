@@ -164,6 +164,7 @@ impl FlattenedPatchSpec {
             ));
         }
         let invocation = crate::mechanism_memory::MechanismInvocation::Projection {
+            arithmetic: eredu_nn::LinearArithmetic::Native,
             rows: patches,
             input: input as u64,
             output: self.output as u64,
@@ -662,6 +663,7 @@ mod tests {
             assert!(matches!(
                 invocation,
                 crate::mechanism_memory::MechanismInvocation::Projection {
+                    arithmetic: eredu_nn::LinearArithmetic::Native,
                     rows: 11,
                     input: 120,
                     output: 7,

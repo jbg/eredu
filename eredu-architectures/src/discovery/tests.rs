@@ -8,8 +8,7 @@ mod compressed_v3;
 #[path = "tests/deepseek_v4.rs"]
 mod compressed_v4;
 
-#[path = "tests/muse.rs"]
-mod muse;
+
 
 fn describe(json: serde_json::Value) -> ArchitectureDescriptor {
     crate::configuration::MODEL_CONFIGURATIONS

@@ -207,6 +207,12 @@ impl RecipeCatalog for PreparedRowSource {
 
 // A retained restricted source with no cache of transient selected recipes.
 impl CheckpointSource for PreparedRowSource {
+    fn has_direct_encoded_leases(&self) -> bool {
+        self.source.has_direct_encoded_leases()
+    }
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        self.source.retained_payload_bytes_upper_bound()
+    }
     fn source_keys(&self) -> Vec<String> {
         self.source.source_keys()
     }

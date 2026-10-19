@@ -414,6 +414,16 @@ impl CommunicationGroupRequirements {
     pub fn operations(&self) -> &[CommunicationOperationRequirement] {
         &self.operations
     }
+
+    /// Checks an additional invocation against this group's retained admission.
+    /// Backend support alone cannot enlarge a selected group's payload bounds.
+    /// Membership and session authority remain the caller's responsibility.
+    pub fn validate_requirement(
+        &self,
+        requirement: &CommunicationOperationRequirement,
+    ) -> Result<(), CommunicationCapabilityError> {
+        validate_operation_requirement(&self.operations, requirement)
+    }
 }
 
 /// Ordered membership and exact requirements for one opaque group.
@@ -2068,37 +2078,43 @@ impl CommunicationCapabilities {
         &self,
         requirement: &CommunicationOperationRequirement,
     ) -> Result<(), CommunicationCapabilityError> {
-        let capability = self
-            .operations
-            .iter()
-            .find(|capability| capability.operation() == requirement.operation())
-            .ok_or(CommunicationCapabilityError::MissingOperation {
+        validate_operation_requirement(&self.operations, requirement)
+    }
+}
+
+fn validate_operation_requirement(
+    operations: &[CommunicationOperationRequirement],
+    requirement: &CommunicationOperationRequirement,
+) -> Result<(), CommunicationCapabilityError> {
+    let capability = operations
+        .iter()
+        .find(|capability| capability.operation() == requirement.operation())
+        .ok_or(CommunicationCapabilityError::MissingOperation {
+            operation: requirement.operation(),
+        })?;
+    for dtype in requirement.dtypes() {
+        if !capability.dtypes().contains(dtype) {
+            return Err(CommunicationCapabilityError::UnsupportedDtype {
                 operation: requirement.operation(),
-            })?;
-        for dtype in requirement.dtypes() {
-            if !capability.dtypes().contains(dtype) {
-                return Err(CommunicationCapabilityError::UnsupportedDtype {
-                    operation: requirement.operation(),
-                    dtype: dtype.clone(),
-                });
-            }
+                dtype: dtype.clone(),
+            });
         }
-        match (capability.limits(), requirement.limits()) {
-            (Some(available), Some(required)) if available.covers(required) => {}
-            (None, None) => {}
-            _ => {
-                return Err(CommunicationCapabilityError::InsufficientLimits {
-                    operation: requirement.operation(),
-                });
-            }
-        }
-        if requirement.exact_completion() && !capability.exact_completion() {
-            return Err(CommunicationCapabilityError::MissingExactCompletion {
+    }
+    match (capability.limits(), requirement.limits()) {
+        (Some(available), Some(required)) if available.covers(required) => {}
+        (None, None) => {}
+        _ => {
+            return Err(CommunicationCapabilityError::InsufficientLimits {
                 operation: requirement.operation(),
             });
         }
-        Ok(())
     }
+    if requirement.exact_completion() && !capability.exact_completion() {
+        return Err(CommunicationCapabilityError::MissingExactCompletion {
+            operation: requirement.operation(),
+        });
+    }
+    Ok(())
 }
 
 fn unique_axis_groups(
@@ -2531,6 +2547,67 @@ mod tests {
 
     fn group_requirements(operation: CommunicationOperation) -> CommunicationGroupRequirements {
         CommunicationGroupRequirements::new([requirement(operation)]).unwrap()
+    }
+
+    #[test]
+    fn retained_group_rejects_invocations_outside_selected_communication_bounds() {
+        let operation = CommunicationOperation::AllReduceSum;
+        let group = group_requirements(operation);
+        let request = |dtype, tensors, rank, input, output, exact| {
+            CommunicationOperationRequirement::tensors(
+                operation,
+                [dtype],
+                CommunicationTensorLimits::new(tensors, rank, input, None)
+                    .unwrap()
+                    .with_output_tensor_elements(output)
+                    .unwrap(),
+                exact,
+            )
+            .unwrap()
+        };
+        // An admitted target block of 32x128 also admits a shorter assistant
+        // block, but never a larger result, tensor batch or logical rank.
+        group
+            .validate_requirement(&request(TensorDtype::F32, 1, 3, 896, 896, true))
+            .unwrap();
+        for (tensors, rank, input, output) in [
+            (3, 3, 4096, 4096),
+            (2, 4, 4096, 4096),
+            (2, 3, 4097, 4096),
+            (2, 3, 4096, 4097),
+        ] {
+            assert_eq!(
+                group.validate_requirement(&request(
+                    TensorDtype::F32,
+                    tensors,
+                    rank,
+                    input,
+                    output,
+                    true,
+                )),
+                Err(CommunicationCapabilityError::InsufficientLimits { operation })
+            );
+        }
+        assert_eq!(
+            group.validate_requirement(&request(TensorDtype::F16, 1, 3, 896, 896, true)),
+            Err(CommunicationCapabilityError::UnsupportedDtype {
+                operation,
+                dtype: TensorDtype::F16
+            })
+        );
+        assert_eq!(
+            group.validate_requirement(&CommunicationOperationRequirement::barrier(true)),
+            Err(CommunicationCapabilityError::MissingOperation {
+                operation: CommunicationOperation::Barrier
+            })
+        );
+        let inexact =
+            CommunicationGroupRequirements::new([request(TensorDtype::F32, 2, 3, 4096, 4096, false)])
+                .unwrap();
+        assert_eq!(
+            inexact.validate_requirement(&request(TensorDtype::F32, 1, 3, 896, 896, true)),
+            Err(CommunicationCapabilityError::MissingExactCompletion { operation })
+        );
     }
 
     fn route_requirement() -> CommunicationOperationRequirement {

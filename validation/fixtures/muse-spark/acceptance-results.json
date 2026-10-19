@@ -1,0 +1,643 @@
+{
+  "schema_version": 1,
+  "scope": "Recorded family acceptance, distinct from complete layout/native validation. Detailed tensors and run artifacts remain outside tracked source.",
+  "records": [
+    {
+      "source_report_sha256": "d02359ee75ce8faa17f40ec95b5b861078a1375454e4e0aed86d2a9b7ccd80f0",
+      "case": "nvfp4-public-plan-native-comparison",
+      "repository": "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
+      "revision": "4239e4db19376904f2e82c167e78f70abb5455fe",
+      "payload_proof_sha256": "599760e541b871619be2699eabd9e5ffbafb726df7aaa27bb48b9b15becc7f3b",
+      "reference_evidence_sha256": "e79e8f6092cda25380dda6ef0cddb48d02377ff48d688f4154608431e214b0a8",
+      "atol": 0.0,
+      "rtol": 0.0,
+      "comparison_scope": "public execution-plan target and ordinary text prefill/cached decode; final vocabulary row of each invocation",
+      "validation_limits": [
+        "Teacher-forced text token IDs through the core public execution-plan target/session API; final vocabulary row only for each invocation",
+        "No tokenizer/chat, host-media preparation, sampling/termination, facade controlled generation, assistant proposal/verification/commit or distributed released-payload execution is exercised",
+        "The selected device KV state exposes no paged cache-residency report; reference cache frontiers are checked separately from optional observed telemetry",
+        "No released BF16 full-checkpoint or NVFP4 whole-model resident comparison is established by this bounded CPU run"
+      ],
+      "elapsed_seconds": 2632.137725542,
+      "steps": [
+        {
+          "input_ids": [
+            200000,
+            1234,
+            5678
+          ],
+          "native_shape": [
+            1,
+            202048
+          ],
+          "compared_reference_row": 2,
+          "reference_cache_after": 3,
+          "observed_cache_tokens": null,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "file": "step-0-last-row.f32",
+          "sha256": "eacc7018c3a260f657c5fd2414c671e9b0e849b9b52c6de8549c261642cceba9",
+          "reference_last_row_sha256": "eacc7018c3a260f657c5fd2414c671e9b0e849b9b52c6de8549c261642cceba9",
+          "elapsed_seconds": 1015.724569958
+        },
+        {
+          "input_ids": [
+            20
+          ],
+          "native_shape": [
+            1,
+            202048
+          ],
+          "compared_reference_row": 0,
+          "reference_cache_after": 4,
+          "observed_cache_tokens": null,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "file": "step-1-last-row.f32",
+          "sha256": "d5d93ec56df912f70dc32936e96bfa5a32ff96251233c7048aaa74a253745717",
+          "reference_last_row_sha256": "d5d93ec56df912f70dc32936e96bfa5a32ff96251233c7048aaa74a253745717",
+          "elapsed_seconds": 497.704341042
+        },
+        {
+          "input_ids": [
+            21
+          ],
+          "native_shape": [
+            1,
+            202048
+          ],
+          "compared_reference_row": 0,
+          "reference_cache_after": 5,
+          "observed_cache_tokens": null,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "file": "step-2-last-row.f32",
+          "sha256": "6486fa392bef943009bcdbd7c895b897ee31c738ee8517b1d7271e70e93d1513",
+          "reference_last_row_sha256": "6486fa392bef943009bcdbd7c895b897ee31c738ee8517b1d7271e70e93d1513",
+          "elapsed_seconds": 492.719815209
+        },
+        {
+          "input_ids": [
+            22
+          ],
+          "native_shape": [
+            1,
+            202048
+          ],
+          "compared_reference_row": 0,
+          "reference_cache_after": 6,
+          "observed_cache_tokens": null,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "file": "step-3-last-row.f32",
+          "sha256": "f74a6390be56acdbbd335cbcd0c26d43f0a915c36011e40dcb71daf89ac1e443",
+          "reference_last_row_sha256": "f74a6390be56acdbbd335cbcd0c26d43f0a915c36011e40dcb71daf89ac1e443",
+          "elapsed_seconds": 486.943864166
+        }
+      ]
+    },
+    {
+      "source_report_sha256": "013b14d8c05e99529ce3be82275d66be398026c0d48cdcc35ec82ea860e5cd27",
+      "case": "nvfp4-multimodal-native-comparison",
+      "repository": "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
+      "revision": "4239e4db19376904f2e82c167e78f70abb5455fe",
+      "payload_proof_sha256": "599760e541b871619be2699eabd9e5ffbafb726df7aaa27bb48b9b15becc7f3b",
+      "reference_evidence_sha256": "e8827d5e5dd0f70b5dda603c3267dc7c8702719f5626d139e6793951e9e19d11",
+      "atol": 0.0,
+      "rtol": 0.0,
+      "elapsed_seconds": 1109.53918425,
+      "steps": [
+        {
+          "input_ids": [
+            200000,
+            1234,
+            200092,
+            200092,
+            5678,
+            200038,
+            200038,
+            21,
+            200091,
+            200091
+          ],
+          "shape": [
+            1,
+            10,
+            202048
+          ],
+          "cache_after": 10,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "top1": [
+            [
+              15,
+              702,
+              198,
+              198,
+              131,
+              198,
+              198,
+              414,
+              198,
+              368
+            ]
+          ],
+          "top1_matches": true,
+          "file": "step-0.f32",
+          "sha256": "def2da9a899d963ce3ceeb682392854d17183b7a4d9096c59107ca3205fb6107"
+        },
+        {
+          "input_ids": [
+            20
+          ],
+          "shape": [
+            1,
+            1,
+            202048
+          ],
+          "cache_after": 11,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "top1": [
+            [
+              1234
+            ]
+          ],
+          "top1_matches": true,
+          "file": "step-1.f32",
+          "sha256": "6a29c1be8c0d99adaf5b9ddb09a1ab142b8bcd0181e8ab3feb755d3511ad9fdf"
+        },
+        {
+          "input_ids": [
+            21
+          ],
+          "shape": [
+            1,
+            1,
+            202048
+          ],
+          "cache_after": 12,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "top1": [
+            [
+              1492
+            ]
+          ],
+          "top1_matches": true,
+          "file": "step-2.f32",
+          "sha256": "13d498c33fbcf8ce8b00fda59ee4b083274dfed5fee7778ea9ddd69da586d870"
+        },
+        {
+          "input_ids": [
+            22
+          ],
+          "shape": [
+            1,
+            1,
+            202048
+          ],
+          "cache_after": 13,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "outside_tolerance": 0,
+          "top1": [
+            [
+              23
+            ]
+          ],
+          "top1_matches": true,
+          "file": "step-3.f32",
+          "sha256": "87d0c2ddb24d1c5688dd47990f4fa8d44433a4ed196fa1b01d75a56554aa5e0a"
+        }
+      ]
+    },
+    {
+      "source_report_sha256": "1ceb2008e79673e65075dd1fd33070214f4dba42c18e902a22dbc8baf4daf147",
+      "case": "dspark-facade-comparison",
+      "reference_evidence_sha256": "e79e8f6092cda25380dda6ef0cddb48d02377ff48d688f4154608431e214b0a8",
+      "comparison_verified": true,
+      "validation_limits": [
+        "One literal-text prefix, four greedy output IDs and one-token proposal capacity; the independent reference establishes the first ordinary prefill token, with complete ordinary continuation as the native comparison baseline",
+        "No controlled snapshots/fork, cancellation, multimodal requests, optimistic lookahead or multi-rank assistant execution is exercised by this run"
+      ],
+      "elapsed_seconds": 2210.719219083
+    },
+    {
+      "source_report_sha256": "7881707c77057f66899657b27282f060cdfa055769757147e5bc5a250ec891d5",
+      "case": "dflash2-facade-comparison",
+      "reference_evidence_sha256": "e79e8f6092cda25380dda6ef0cddb48d02377ff48d688f4154608431e214b0a8",
+      "comparison_verified": true,
+      "validation_limits": [
+        "One literal-text prefix, four greedy output IDs and one-token proposal capacity; the independent reference establishes the first ordinary prefill token, with complete ordinary continuation as the native comparison baseline.",
+        "No controlled snapshots/fork, cancellation, multimodal requests, optimistic lookahead or multi-rank assistant execution is exercised by this run."
+      ],
+      "elapsed_seconds": 1953.645780166
+    },
+    {
+      "source_report_sha256": "a90b76a74b4bcebe562afc24ccc7540b88f8f72957fabdd1843a3b990c0bf5c8",
+      "case": "nvfp4-tp2-facade-baseline-evidence",
+      "validation_limits": [
+        "The command selects a controlled assistant comparison, but this record covers only its completed ordinary baseline.",
+        "Full score rows, assisted execution and controlled lifecycle require separate evidence."
+      ]
+    },
+    {
+      "source_report_sha256": "5672cd00e53ce27334766efbfbefafaa254bd9d3b5dce823a985415b7e2784e6",
+      "case": "dspark-tp2-controlled-facade-evidence",
+      "target_revision": "4239e4db19376904f2e82c167e78f70abb5455fe",
+      "assistant_revision": "6f7aed1cac8d8b1c02a902988876172b39e49fc0",
+      "comparison_verified": true,
+      "results": [
+        {
+          "global_rank": 0,
+          "load_seconds": 146.561541167,
+          "elapsed_seconds": 1916.054705,
+          "assisted_ids": [
+            131,
+            50133,
+            220,
+            43810
+          ],
+          "speculation": {
+            "draft_tokens": 2,
+            "accepted_tokens": 1,
+            "rounds": 2,
+            "accept_lens": [
+              0,
+              1
+            ],
+            "target_tokens": 8
+          },
+          "snapshot_round_trip": {
+            "prefix": [
+              131
+            ],
+            "saved_usage": {
+              "snapshots": 1,
+              "branches": 0,
+              "retained_bytes": 17787376,
+              "cumulative_copy_bytes": 17787376
+            },
+            "released_usage": {
+              "snapshots": 0,
+              "branches": 0,
+              "retained_bytes": 0,
+              "cumulative_copy_bytes": 59108584
+            },
+            "epoch": 3,
+            "scope": "snapshot restore and unadvanced child exchange round trip; subsequent generation checks continuation against the ordinary baseline"
+          },
+          "continuation_horizons": [
+            0,
+            3
+          ]
+        },
+        {
+          "global_rank": 1,
+          "load_seconds": 146.561291125,
+          "elapsed_seconds": 1916.0135205,
+          "assisted_ids": [
+            131,
+            50133,
+            220,
+            43810
+          ],
+          "speculation": {
+            "draft_tokens": 2,
+            "accepted_tokens": 1,
+            "rounds": 2,
+            "accept_lens": [
+              0,
+              1
+            ],
+            "target_tokens": 8
+          },
+          "snapshot_round_trip": {
+            "prefix": [
+              131
+            ],
+            "saved_usage": {
+              "snapshots": 1,
+              "branches": 0,
+              "retained_bytes": 17787376,
+              "cumulative_copy_bytes": 17787376
+            },
+            "released_usage": {
+              "snapshots": 0,
+              "branches": 0,
+              "retained_bytes": 0,
+              "cumulative_copy_bytes": 59108584
+            },
+            "epoch": 3,
+            "scope": "snapshot restore and unadvanced child exchange round trip; subsequent generation checks continuation against the ordinary baseline"
+          },
+          "continuation_horizons": [
+            0,
+            3
+          ]
+        }
+      ],
+      "validation_limits": [
+        "Four greedy IDs from one literal prefix; no full-distribution independent-reference comparison on TP2",
+        "Snapshot/fork exchange is unadvanced and occurs before the first proposal; projected context/KV is empty at that saved boundary",
+        "Forecasts preserve unknown future capacity and unknown native scratch; no finite total-memory fit is asserted",
+        "No media, cancellation, paged state, native Metal, PP or EP coupled assistant session is exercised",
+        "Larger32/32GiB target-cache settings terminate under current-machine memory pressure; that separate failure remains recorded",
+        "Target-token statistics count computed positions including rejected verification/replay, not the final retained KV frontier"
+      ],
+      "cache_policy": {
+        "ordinary_target_gib_per_rank": {
+          "device": 32,
+          "host": 32
+        },
+        "assisted_target_gib_per_rank": {
+          "device": 20,
+          "host": 14
+        },
+        "assistant_gib_per_rank": {
+          "device": 8,
+          "host": 8
+        },
+        "unused_native_allocator_cache_bytes": 0,
+        "baseline_comparison": "only managed device/host cache budgets differ; all other target plan fields, artifact proofs, tokenizer identity, inputs and settings match"
+      },
+      "semantic_text": "Assisted TextDelta stream equals independent full decoding of published BPE byte strings on both ranks, including replacement of an incomplete UTF-8 prefix"
+    },
+    {
+      "source_report_sha256": "ec5086e8762bd192592443851d1697a9c960cfbffda1b93b2adb0622d9095a67",
+      "case": "dflash2-tp2-controlled-facade-evidence",
+      "target_revision": "4239e4db19376904f2e82c167e78f70abb5455fe",
+      "assistant_revision": "46c90f412549c472941a68382d91a99e5e6372a0",
+      "comparison_verified": true,
+      "results": [
+        {
+          "global_rank": 0,
+          "load_seconds": 145.973506833,
+          "elapsed_seconds": 3327.202153541,
+          "assisted_ids": [
+            131,
+            50133,
+            220,
+            43810
+          ],
+          "speculation": {
+            "draft_tokens": 3,
+            "accepted_tokens": 0,
+            "rounds": 3,
+            "accept_lens": [
+              0,
+              0,
+              0
+            ],
+            "target_tokens": 12
+          },
+          "snapshot_round_trips": [
+            {
+              "prefix": [
+                131
+              ],
+              "saved_usage": {
+                "snapshots": 1,
+                "branches": 0,
+                "retained_bytes": 17787376,
+                "cumulative_copy_bytes": 17787376
+              },
+              "released_usage": {
+                "snapshots": 0,
+                "branches": 0,
+                "retained_bytes": 0,
+                "cumulative_copy_bytes": 59108584
+              },
+              "epoch": 3,
+              "scope": "snapshot restore and unadvanced child exchange round trip; subsequent generation checks continuation against the ordinary baseline"
+            },
+            {
+              "prefix": [
+                131,
+                50133
+              ],
+              "saved_usage": {
+                "snapshots": 1,
+                "branches": 0,
+                "retained_bytes": 17854222,
+                "cumulative_copy_bytes": 76962806
+              },
+              "released_usage": {
+                "snapshots": 0,
+                "branches": 0,
+                "retained_bytes": 0,
+                "cumulative_copy_bytes": 118999172
+              },
+              "epoch": 6,
+              "scope": "snapshot restore and unadvanced child exchange round trip; subsequent generation checks continuation against the ordinary baseline"
+            }
+          ],
+          "continuation_observations": [
+            {
+              "prefix": [
+                131
+              ],
+              "epoch": 3,
+              "horizons": [
+                {
+                  "additional_tokens": 0,
+                  "fit": "insufficient_information",
+                  "current_positions": 3,
+                  "draft_current_upper_bytes": 64,
+                  "draft_peak_upper_bytes": 64,
+                  "seed_upper_bytes": 245760
+                },
+                {
+                  "additional_tokens": 3,
+                  "fit": "insufficient_information",
+                  "current_positions": 3,
+                  "draft_current_upper_bytes": 64,
+                  "draft_peak_upper_bytes": null,
+                  "seed_upper_bytes": 245760
+                }
+              ]
+            },
+            {
+              "prefix": [
+                131,
+                50133
+              ],
+              "epoch": 6,
+              "horizons": [
+                {
+                  "additional_tokens": 0,
+                  "fit": "insufficient_information",
+                  "current_positions": 4,
+                  "draft_current_upper_bytes": 111936,
+                  "draft_peak_upper_bytes": 111936,
+                  "seed_upper_bytes": 81920
+                },
+                {
+                  "additional_tokens": 3,
+                  "fit": "insufficient_information",
+                  "current_positions": 4,
+                  "draft_current_upper_bytes": 111936,
+                  "draft_peak_upper_bytes": null,
+                  "seed_upper_bytes": 81920
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "global_rank": 1,
+          "load_seconds": 145.97300975,
+          "elapsed_seconds": 3327.206545375,
+          "assisted_ids": [
+            131,
+            50133,
+            220,
+            43810
+          ],
+          "speculation": {
+            "draft_tokens": 3,
+            "accepted_tokens": 0,
+            "rounds": 3,
+            "accept_lens": [
+              0,
+              0,
+              0
+            ],
+            "target_tokens": 12
+          },
+          "snapshot_round_trips": [
+            {
+              "prefix": [
+                131
+              ],
+              "saved_usage": {
+                "snapshots": 1,
+                "branches": 0,
+                "retained_bytes": 17787376,
+                "cumulative_copy_bytes": 17787376
+              },
+              "released_usage": {
+                "snapshots": 0,
+                "branches": 0,
+                "retained_bytes": 0,
+                "cumulative_copy_bytes": 59108584
+              },
+              "epoch": 3,
+              "scope": "snapshot restore and unadvanced child exchange round trip; subsequent generation checks continuation against the ordinary baseline"
+            },
+            {
+              "prefix": [
+                131,
+                50133
+              ],
+              "saved_usage": {
+                "snapshots": 1,
+                "branches": 0,
+                "retained_bytes": 17854222,
+                "cumulative_copy_bytes": 76962806
+              },
+              "released_usage": {
+                "snapshots": 0,
+                "branches": 0,
+                "retained_bytes": 0,
+                "cumulative_copy_bytes": 118999172
+              },
+              "epoch": 6,
+              "scope": "snapshot restore and unadvanced child exchange round trip; subsequent generation checks continuation against the ordinary baseline"
+            }
+          ],
+          "continuation_observations": [
+            {
+              "prefix": [
+                131
+              ],
+              "epoch": 3,
+              "horizons": [
+                {
+                  "additional_tokens": 0,
+                  "fit": "insufficient_information",
+                  "current_positions": 3,
+                  "draft_current_upper_bytes": 64,
+                  "draft_peak_upper_bytes": 64,
+                  "seed_upper_bytes": 245760
+                },
+                {
+                  "additional_tokens": 3,
+                  "fit": "insufficient_information",
+                  "current_positions": 3,
+                  "draft_current_upper_bytes": 64,
+                  "draft_peak_upper_bytes": null,
+                  "seed_upper_bytes": 245760
+                }
+              ]
+            },
+            {
+              "prefix": [
+                131,
+                50133
+              ],
+              "epoch": 6,
+              "horizons": [
+                {
+                  "additional_tokens": 0,
+                  "fit": "insufficient_information",
+                  "current_positions": 4,
+                  "draft_current_upper_bytes": 111936,
+                  "draft_peak_upper_bytes": 111936,
+                  "seed_upper_bytes": 81920
+                },
+                {
+                  "additional_tokens": 3,
+                  "fit": "insufficient_information",
+                  "current_positions": 4,
+                  "draft_current_upper_bytes": 111936,
+                  "draft_peak_upper_bytes": null,
+                  "seed_upper_bytes": 81920
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "validation_limits": [
+        "One literal prefix, four greedy IDs and one-token proposal capacity; no independent full-score TP2 comparison",
+        "Forks exchange unadvanced child state; continuation after both restorations matches the ordinary baseline",
+        "Initial projected context is empty; the second boundary retains populated projected context/KV and pending target captures",
+        "Future allocator capacity and native operator scratch remain unknown; no finite total-memory fit is asserted",
+        "No media, cancellation, paged state, native Metal or coupled PP/EP assistant session is exercised",
+        "Target-token statistics count computed positions including rejected verification and replay, not the final retained KV frontier"
+      ],
+      "cache_policy": {
+        "ordinary_target_gib_per_rank": {
+          "device": 32,
+          "host": 32
+        },
+        "assisted_target_gib_per_rank": {
+          "device": 20,
+          "host": 14
+        },
+        "assistant_gib_per_rank": {
+          "device": 8,
+          "host": 8
+        },
+        "unused_native_allocator_cache_bytes": 0,
+        "baseline_comparison": "only managed device/host cache budgets differ; all other target plan fields, artifact proofs, tokenizer identity, inputs and settings match"
+      },
+      "semantic_text": "Assisted TextDelta streams equal independent decoding of the published BPE token bytes on both ranks, including replacement of an incomplete UTF-8 prefix"
+    }
+  ],
+  "pending_validation": [
+    "Complete official BF16 payload/reference execution: 1,644,333,393,864 bytes exceeds available local storage.",
+    "Native Metal and released distributed media.",
+    "Released coupled native PP/EP assistant sessions.",
+    "Whole-model reference execution for community layouts; catalog admission alone does not establish numerical parity."
+  ]
+}

@@ -57,7 +57,7 @@ pub(super) fn discovery() -> CaptureDiscovery {
 }
 pub(super) fn interventions() -> InterventionDiscovery {
     InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: "host-source".into(),
         session_identity: Some("host-session".into()),
         points: vec![InterventionPoint {
@@ -107,7 +107,7 @@ pub(super) fn plans(mode: u8) -> (AdmittedCapturePlan, AdmittedInterventionPlan)
     )
     .unwrap();
     let intervention = InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations: if mode & 2 == 0 {
             vec![]
         } else {

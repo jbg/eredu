@@ -85,7 +85,7 @@ impl InterventionEstimator for Facts {
 }
 pub(super) fn discovery(plan: &AdmittedInterventionPlan) -> InterventionDiscovery {
     InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: plan.artifact_identity().into(),
         session_identity: Some("backend-session".into()),
         points: plan.points().to_vec(),
@@ -118,6 +118,7 @@ fn routed(evidence: bool) -> (AdmittedCapturePlan, AdmittedInterventionPlan) {
             expert_count: 4,
             top_k: 2,
             scoring: RoutingScoring::Softmax,
+            selection_order: eredu_core::intervention::RoutingSelectionOrder::Partition,
             normalize_selected: true,
             normalization_epsilon: 0.,
             coefficient_scale: 1.,
@@ -128,13 +129,13 @@ fn routed(evidence: bool) -> (AdmittedCapturePlan, AdmittedInterventionPlan) {
         }),
     };
     let catalog = InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: "source".into(),
         session_identity: Some("backend-session".into()),
         points: vec![point],
     };
     let plan = InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations: vec![InterventionOperation {
             id: "routes".into(),
             target: "router".into(),
@@ -226,6 +227,9 @@ fn original_estimates_are_used_at_admission_and_reserved_before_routing() {
         {
             session.begin_step(phase, prediction).unwrap();
             let control = session.routing_control("router", rows).unwrap().unwrap();
+            let actual = eredu_nn::TopKGroupSelectionSpec::new(4, 2, eredu_nn::GroupScoring::Softmax, true)
+                .unwrap().with_order(eredu_nn::GroupSelectionOrder::Partition);
+            control.validate(actual, false, rows).expect("portable admission preserves the realized coefficient reduction order");
             assert!(control.capture_original);
             let ids = Value {
                 shape: vec![rows, 2],

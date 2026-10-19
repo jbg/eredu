@@ -1368,6 +1368,7 @@ fn quantization_fingerprint(value: Option<WeightQuantization>) -> String {
             value.group_size, value.bits, value.mode
         ),
         Some(WeightQuantization::MxFp4) => "mxfp4:group=32:bits=4".into(),
+        Some(WeightQuantization::NvFp4) => "nvfp4:group=16:bits=4".into(),
         Some(WeightQuantization::GgufIQuant { .. }) => "unsupported_gguf".into(),
     }
 }

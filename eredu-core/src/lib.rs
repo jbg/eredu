@@ -79,7 +79,7 @@ pub use admission::{
 pub use artifact::{
     gguf_u32_metadata_values, inspect_artifact, plan_model_preparation, resolve_gguf_companions,
     validate_preparation_policy, ArtifactFormat, ArtifactInspection, GgufCompanionEncoding,
-    GgufCompanionRequirement, GgufCompanionRole, LoadingProtocol, MaterializationRoute,
+    GgufCompanionRequirement, ArtifactCompanionRole, LoadingProtocol, MaterializationRoute,
     ModelArtifact, ModelConfiguration, ModelConfigurationResolver, ModelPreparationPlan,
     PreparationPolicy, QuantizationRequest, ResidencyRequest, ResolvedModelConfiguration,
     ValidatedGguf, ValidatedGgufCompanion,
@@ -128,7 +128,7 @@ pub use capability::{
     StateMemoryLayout, StaticMemoryReport,
 };
 pub use execution::{
-    BackendId, DevicePlan, DraftAdapterSource, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
+    BackendId, DevicePlan, MediaCompanionSources, DraftAdapterSource, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
     ExpertCachePlan, ResidencyPlan, WeightTransformationPlan, DEFAULT_MAX_CACHED_SHARDS,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };

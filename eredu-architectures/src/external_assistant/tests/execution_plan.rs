@@ -4,6 +4,11 @@ use eredu_core::{
     ExecutionPlan, ExternalDraftArtifact, SpeculativeExecutionTopology, WeightTransformationPlan,
 };
 
+use eredu_runtime::{
+    CommunicationCompletionPolicy, NormalizedLoadRequest, ParallelLoadRequest,
+    PipelineActivationDtype, PipelineWireContract,
+};
+
 fn target_inspection(
     vocabulary: usize,
 ) -> (
@@ -28,9 +33,21 @@ fn target_inspection(
     (root, inspection)
 }
 
+fn target_selection(
+    target: &ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+) -> crate::SelectedPreparation {
+    crate::select_preparation(
+        target,
+        &NormalizedLoadRequest::default(),
+        &crate::preparation_selection::tests::BoundedIndependentAdapter::default(),
+    )
+    .unwrap()
+}
+
 fn execution_plan(placement: DraftPlacementPlan, capacity: usize) -> ExecutionPlan {
     ExecutionPlan::fully_resident(DevicePlan::new("foreign", "device:0").unwrap()).with_drafting(
         DraftingPlan::External {
+            residency: eredu_core::ResidencyPlan::FullyResident,
             model: "retained-assistant".into(),
             placement,
             max_draft_tokens: capacity,
@@ -104,13 +121,31 @@ fn execution_plan_retains_exact_source_capture_tokenizer_capacity_and_placement(
         ),
     ] {
         let mut selected = prepare_execution_plan_assistant(
-            &execution_plan(placement, 2),
+            &execution_plan(placement, 2)
+                .with_parameter_conversion_retention(Some(
+                    eredu_core::residency::ParameterConversionRetentionPolicy::Disabled,
+                ))
+                .with_residency(eredu_core::ResidencyPlan::LayerwiseHost {
+                    device_layer_window: 1,
+                    device_budget_bytes: Some(4096),
+                    host_budget_bytes: Some(16384),
+                }),
             &target,
+            &target_selection(&target),
             artifact(root.path()),
             direct_lowering,
             &capabilities(),
         )
         .unwrap();
+        assert!(selected
+            .preparation
+            .target_selection()
+            .admission_token()
+            .same_admission(&target.admission_token()));
+        assert!(
+            selected.preparation.residency().is_fully_resident(),
+            "target residency must not become the assistant's policy"
+        );
         let requirements = selected.preparation.selected().requirements().clone();
         assert_eq!(
             requirements.strategy().class(),
@@ -122,6 +157,11 @@ fn execution_plan_retains_exact_source_capture_tokenizer_capacity_and_placement(
             expected
         );
         let proof = selected.tokenizer_compatibility;
+        let source_placement = selected.preparation.source_placement();
+        assert_eq!(
+            source_placement,
+            ExternalAssistantSourcePlacement::Replicated(replicated_topology())
+        );
         // Replacing the outer transport label cannot re-pair the opaque source
         // and contract with another tokenizer authority during materialization.
         selected.tokenizer_compatibility =
@@ -131,6 +171,12 @@ fn execution_plan_retains_exact_source_capture_tokenizer_capacity_and_placement(
             .materialize(InspectPreparation)
             .unwrap();
         assert_eq!(materialized.selected().requirements(), &requirements);
+        assert!(materialized
+            .target_selection()
+            .admission_token()
+            .same_admission(&target.admission_token()));
+        assert_eq!(materialized.source_placement(), source_placement);
+        assert!(materialized.residency().is_fully_resident());
         assert_eq!(materialized.tokenizer_compatibility(), proof);
         assert_eq!(materialized.selected().placement().topology(), expected);
         assert_eq!(
@@ -140,11 +186,12 @@ fn execution_plan_retains_exact_source_capture_tokenizer_capacity_and_placement(
             },
         );
         let inspected = materialized.visit(TakeInspection);
-        assert_eq!(inspected.model_type, "gemma4_assistant");
         assert_eq!(
-            inspected.tokenizer_model_kind,
-            crate::configuration::ModelKind::Gemma4
+            inspected.conversion_retention,
+            Some(eredu_core::residency::ParameterConversionRetentionPolicy::Disabled)
         );
+        assert_eq!(inspected.model_type, "gemma4_assistant");
+        assert_eq!(inspected.tokenizer_model_type, "gemma4");
     }
 }
 
@@ -173,6 +220,7 @@ fn execution_plan_rejects_every_missing_required_mechanism_before_source_prepara
         let result = prepare_execution_plan_assistant(
             &execution_plan(placement, 2),
             &target,
+            &target_selection(&target),
             retained.clone(),
             direct_lowering,
             &limited,
@@ -186,6 +234,7 @@ fn execution_plan_rejects_every_missing_required_mechanism_before_source_prepara
     let result = prepare_execution_plan_assistant(
         &execution_plan(DraftPlacementPlan::Target, 2),
         &target,
+        &target_selection(&target),
         retained,
         direct_lowering,
         &capabilities(),
@@ -214,6 +263,7 @@ fn execution_plan_validates_policy_lowering_compatibility_and_capacity_before_so
         prepare_execution_plan_assistant(
             &invalid,
             &target,
+            &target_selection(&target),
             retained.clone(),
             |_, _| panic!("invalid policy reached lowering"),
             &capabilities()
@@ -224,6 +274,7 @@ fn execution_plan_validates_policy_lowering_compatibility_and_capacity_before_so
         prepare_execution_plan_assistant(
             &execution_plan(DraftPlacementPlan::Target, 2),
             &target,
+            &target_selection(&target),
             retained.clone(),
             |_, _| None,
             &capabilities()
@@ -234,10 +285,10 @@ fn execution_plan_validates_policy_lowering_compatibility_and_capacity_before_so
         })
     ));
     assert!(matches!(prepare_execution_plan_assistant(
-        &execution_plan(DraftPlacementPlan::Target, 2), &incompatible, retained.clone(), direct_lowering, &capabilities()
+        &execution_plan(DraftPlacementPlan::Target, 2), &incompatible, &target_selection(&incompatible), retained.clone(), direct_lowering, &capabilities()
     ), Err(AutomaticPlanningError::Invalid(ref message)) if message.contains("incompatible")));
     assert!(matches!(prepare_execution_plan_assistant(
-        &execution_plan(DraftPlacementPlan::Target, 4), &target, retained, direct_lowering, &capabilities()
+        &execution_plan(DraftPlacementPlan::Target, 4), &target, &target_selection(&target), retained, direct_lowering, &capabilities()
     ), Err(AutomaticPlanningError::Invalid(ref message)) if message.contains("exceeds architecture capacity 3")));
 }
 
@@ -255,6 +306,7 @@ fn execution_plan_forwards_the_neutral_weight_transformation() {
     prepare_execution_plan_assistant(
         &plan,
         &target,
+        &target_selection(&target),
         artifact(root.path()),
         |descriptor, transforms| {
             if transforms
@@ -315,7 +367,7 @@ fn execution_plan_reader_bound_governs_the_exact_prepared_source() {
             self,
             prepared: PreparedExternalAssistantSource<A>,
         ) -> Result<(), Infallible> {
-            let (source, _, _, _, _, _) = prepared.into_parts();
+            let (source, _, _, _, _, _, _) = prepared.into_parts();
             let acquire = |key: &String| {
                 source.acquire_lease(TensorReadRequest {
                     key: key.clone(),
@@ -345,6 +397,7 @@ fn execution_plan_reader_bound_governs_the_exact_prepared_source() {
     prepare_execution_plan_assistant(
         &plan,
         &target,
+        &target_selection(&target),
         artifact(root.path()),
         direct_lowering,
         &capabilities(),
@@ -353,4 +406,123 @@ fn execution_plan_reader_bound_governs_the_exact_prepared_source() {
     .preparation
     .materialize(CheckReaderBound(keys))
     .unwrap();
+}
+
+#[test]
+fn execution_plan_rejects_substituted_target_admission_and_topology_before_lowering() {
+    let assistant = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
+    let (target_root, target) = target_inspection(32);
+    let selected = target_selection(&target);
+    // Even identical headers at the same path are a different admission authority.
+    let reinspected = crate::configuration::inspect_artifact(target_root.path()).unwrap();
+    let retained = artifact(assistant.path());
+    std::fs::remove_file(assistant.path().join("model.safetensors")).unwrap();
+    for (inspection, plan, expected) in [
+        (
+            &reinspected,
+            execution_plan(DraftPlacementPlan::Target, 2),
+            "different artifact admission",
+        ),
+        (
+            &target,
+            execution_plan(DraftPlacementPlan::Target, 2)
+                .with_topology(ParallelTopology::new(2, 1, 1, 1).unwrap()),
+            "plan topology differs",
+        ),
+    ] {
+        let result = prepare_execution_plan_assistant(
+            &plan,
+            inspection,
+            &selected,
+            retained.clone(),
+            |_, _| panic!("substituted target reached assistant lowering"),
+            &capabilities(),
+        );
+        assert!(
+            matches!(result, Err(AutomaticPlanningError::Invalid(message))
+            if message.contains(expected))
+        );
+    }
+}
+
+#[test]
+fn execution_plan_draft_ownership_uses_the_selected_nonzero_spark_rank() {
+    use crate::preparation_selection::tests::{inspected_config, BoundedIndependentAdapter};
+    use eredu_core::{CompletionCancellationMode, ParallelRankTopology};
+    let mut config: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../validation/fixtures/muse-spark/bf16-config.json"
+    ))
+    .unwrap();
+    config.as_object_mut().unwrap().remove("vision_config");
+    config.as_object_mut().unwrap().remove("audio_config");
+    config["image_token_id"] = 3.into();
+    config["audio_token_id"] = 4.into();
+    config["video_token_id"] = 5.into();
+    for (key, value) in [
+        ("hidden_size", 16),
+        ("intermediate_size", 24),
+        ("num_hidden_layers", 2),
+        ("num_attention_heads", 4),
+        ("num_key_value_heads", 2),
+        ("head_dim", 4),
+        ("vocab_size", 32),
+        ("max_position_embeddings", 32),
+        ("sliding_window", 8),
+        ("num_local_experts", 4),
+        ("num_experts_per_tok", 2),
+        ("moe_hidden_size", 8),
+        ("moe_intermediate_size", 8),
+    ] {
+        config["text_config"][key] = value.into();
+    }
+    config["text_config"]["layer_types"] =
+        serde_json::json!(["sliding_attention", "full_attention"]);
+    config["text_config"]["layer_rope_theta"] = serde_json::json!([500000., 0.]);
+    config["text_config"]["mlp_layer_types"] = serde_json::json!(["sparse", "sparse"]);
+    let (root, target) = inspected_config(config);
+    std::fs::remove_file(root.path().join("model.safetensors")).unwrap();
+    for axes in [(2, 1, 1), (1, 2, 1), (2, 2, 2)] {
+        let topology = ParallelTopology::new(axes.0, axes.1, axes.2, 1).unwrap();
+        let rank = ParallelRankTopology::new(topology, topology.world_size() - 1).unwrap();
+        let request = NormalizedLoadRequest::default()
+            .with_parallel_execution(
+                ParallelLoadRequest::new(
+                    rank,
+                    PipelineWireContract::new(PipelineActivationDtype::Float32),
+                    1,
+                    32,
+                    CommunicationCompletionPolicy::new(
+                        std::time::Duration::from_secs(1),
+                        CompletionCancellationMode::QuarantineUntilComplete,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let selected =
+            crate::select_preparation(&target, &request, &BoundedIndependentAdapter::default())
+                .unwrap();
+        let plan = execution_plan(DraftPlacementPlan::Target, 2).with_topology(topology);
+        assert_eq!(
+            crate::external_draft::external_draft_target_rank(&plan, &target, &selected).unwrap(),
+            rank
+        );
+        // Equal world sizes with different Cartesian axes cannot exchange authority.
+        let wrong =
+            plan.with_topology(ParallelTopology::new(1, 1, topology.world_size(), 1).unwrap());
+        assert!(
+            matches!(crate::external_draft::external_draft_target_rank(&wrong, &target, &selected),
+            Err(AutomaticPlanningError::Invalid(message)) if message.contains("plan topology differs"))
+        );
+    }
+    // The retained local selection also resolves without reopening the source.
+    let selected = target_selection(&target);
+    let plan = execution_plan(DraftPlacementPlan::Target, 2);
+    assert_eq!(
+        crate::external_draft::external_draft_target_rank(&plan, &target, &selected)
+            .unwrap()
+            .global_rank(),
+        0
+    );
 }

@@ -255,6 +255,7 @@ impl VisionConfig {
                          output|
          -> Result<(), Error> {
             let invocation = MechanismInvocation::Projection {
+                arithmetic: eredu_nn::LinearArithmetic::Native,
                 rows,
                 input,
                 output,
@@ -284,6 +285,7 @@ impl VisionConfig {
                           width|
          -> Result<(), Error> {
             let invocation = MechanismInvocation::LayerNormalization {
+                arithmetic: eredu_nn::LayerNormalizationArithmetic::Native,
                 rows,
                 width,
                 element,
@@ -499,6 +501,7 @@ mod tests {
         assert!(matches!(
             memory.invocations[0].invocation,
             MechanismInvocation::Projection {
+                arithmetic: eredu_nn::LinearArithmetic::Native,
                 rows: 196,
                 input: 24,
                 output: 16,
@@ -567,6 +570,7 @@ mod tests {
                     weight_element,
                     bias,
                     bias_element,
+                    ..
                 } = &group.invocation
                 else {
                     return None;

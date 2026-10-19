@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use serde::{de::MapAccess, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::MapAccess};
 
 use crate::{
     recipe::RecipeCatalog,
@@ -169,9 +169,12 @@ impl SafetensorsShards {
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
         let shards = Self::discover_catalog(path)?;
-        for payload in shards.payload_paths() {
-            shards
-                .admission(payload)
+        shards.validate_headers(path)
+    }
+
+    fn validate_headers(self, path: &Path) -> Result<Self, SafetensorsShardError> {
+        for payload in self.payload_paths() {
+            self.admission(payload)
                 .header(payload)
                 .map_err(|error| match error {
                     StoreError::ContradictoryIndexMapping { .. }
@@ -184,7 +187,7 @@ impl SafetensorsShards {
                     other => malformed_shard(payload, other.to_string()),
                 })?;
         }
-        Ok(shards)
+        Ok(self)
     }
 
     /// Builds an admitted tensor-to-shard catalog without reading payload headers.
@@ -194,7 +197,7 @@ impl SafetensorsShards {
     pub(crate) fn discover_catalog(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
         if path.is_dir() {
-            return Self::discover_directory(path);
+            return Self::discover_directory(path, None);
         }
         let payload = canonicalize(path)?;
         Self {
@@ -207,7 +210,10 @@ impl SafetensorsShards {
         .admit()
     }
 
-    fn discover_directory(root: &Path) -> Result<Self, SafetensorsShardError> {
+    fn discover_directory(
+        root: &Path,
+        selection: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<Self, SafetensorsShardError> {
         let access_roots = checkpoint_access_roots(root)?;
         let index_path = root.join("model.safetensors.index.json");
         if !index_path.exists() {
@@ -236,21 +242,71 @@ impl SafetensorsShards {
             });
         }
 
-        let mut payload_paths = BTreeSet::new();
-        let mut logical_payload_paths = BTreeMap::new();
-        let mut tensor_locations = BTreeMap::new();
-        for (tensor, relative) in index.weight_map.0 {
+        // Validate the complete index syntax even when only some members are
+        // selected. Omitted members grant no file-opening authority.
+        for (tensor, relative) in &index.weight_map.0 {
             if tensor.is_empty() {
                 return Err(SafetensorsShardError::MalformedIndex {
                     path: index_path.clone(),
                     message: "tensor names must not be empty".into(),
                 });
             }
+            validate_relative_shard_path(Path::new(relative))?;
+        }
+        let selected = selection.map(|predicate| {
+            index
+                .weight_map
+                .0
+                .iter()
+                .filter(|(tensor, _)| predicate(tensor))
+                .map(|(_, relative)| relative.clone())
+                .collect::<BTreeSet<_>>()
+        });
+        if selected.as_ref().is_some_and(BTreeSet::is_empty) {
+            return Err(SafetensorsShardError::EmptyTensorSelection);
+        }
+        let mut logical_payload_paths = selected
+            .as_ref()
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|relative| {
+                        Ok((
+                            relative.clone(),
+                            admit_payload(&root.join(relative), &access_roots)?,
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, SafetensorsShardError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let selected_payloads = selected.as_ref().map(|_| {
+            logical_payload_paths
+                .values()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        });
+
+        let mut payload_paths = selected_payloads.clone().unwrap_or_default();
+        let mut tensor_locations = BTreeMap::new();
+        for (tensor, relative) in index.weight_map.0 {
             let payload = if let Some(payload) = logical_payload_paths.get(&relative) {
                 PathBuf::clone(payload)
+            } else if let Some(payloads) = &selected_payloads {
+                // Preserve aliases of a retained physical blob. Canonicalizing
+                // an omitted member neither opens it nor requires it to exist.
+                let Some(payload) = root
+                    .join(&relative)
+                    .canonicalize()
+                    .ok()
+                    .filter(|path| payloads.contains(path))
+                else {
+                    continue;
+                };
+                logical_payload_paths.insert(relative, payload.clone());
+                payload
             } else {
-                let member = validate_relative_shard_path(Path::new(&relative))?;
-                let payload = admit_payload(&root.join(member), &access_roots)?;
+                let payload = admit_payload(&root.join(&relative), &access_roots)?;
                 payload_paths.insert(payload.clone());
                 logical_payload_paths.insert(relative, payload.clone());
                 payload
@@ -348,6 +404,33 @@ impl SafetensorsMetadataCatalog {
         Self::from_admitted(SafetensorsShards::discover(path)?)
     }
 
+    /// Admits complete physical members touched by matching tensor names.
+    ///
+    /// An indexed directory may omit unrelated members. Every retained member's
+    /// full header must still exactly match its original index assignments,
+    /// including nonmatching tensors sharing that member. The returned catalog
+    /// includes those tensors: consumers must declare restricted logical views
+    /// separately. This is component-source admission, not a complete checkpoint
+    /// proof. Ordinary [`Self::discover`] requires every indexed member.
+    pub fn discover_members_matching(
+        path: impl AsRef<Path>,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Result<Self, SafetensorsShardError> {
+        let path = path.as_ref();
+        let shards = if path.is_dir() {
+            SafetensorsShards::discover_directory(path, Some(&predicate))?.validate_headers(path)?
+        } else {
+            SafetensorsShards::discover(path)?
+        };
+        let catalog = Self::from_admitted(shards)?;
+        if catalog.shards.tensor_locations().is_none()
+            && !catalog.tensors.keys().any(|name| predicate(name))
+        {
+            return Err(SafetensorsShardError::EmptyTensorSelection);
+        }
+        Ok(catalog)
+    }
+
     /// Builds a catalog using the retained shard admissions without rereading headers.
     pub fn from_admitted(shards: SafetensorsShards) -> Result<Self, SafetensorsShardError> {
         let mut tensors = BTreeMap::new();
@@ -434,6 +517,9 @@ impl RecipeCatalog for SafetensorsMetadataCatalog {
 /// Failure to discover and admit a SafeTensors checkpoint shard set.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum SafetensorsShardError {
+    /// No tensor belongs to the explicitly selected component source.
+    #[error("SafeTensors component selection matches no tensors")]
+    EmptyTensorSelection,
     /// A checkpoint path or referenced payload does not exist.
     #[error("SafeTensors checkpoint shard does not exist: {path}", path = .path.display())]
     MissingShard {
@@ -588,6 +674,17 @@ fn validate_relative_shard_path(path: &Path) -> Result<&Path, SafetensorsShardEr
     Ok(path)
 }
 
+/// Resolves a relative checkpoint asset using the payload access-root policy.
+/// Hugging Face snapshot assets may refer to repository or shared cache blobs.
+/// This checks paths only and reads no asset contents.
+pub fn checkpoint_member_path(
+    root: &Path,
+    member: &Path,
+) -> Result<PathBuf, SafetensorsShardError> {
+    validate_relative_shard_path(member)?;
+    admit_payload(&root.join(member), &checkpoint_access_roots(root)?)
+}
+
 fn admit_payload(path: &Path, access_roots: &[PathBuf]) -> Result<PathBuf, SafetensorsShardError> {
     let canonical = canonicalize(path)?;
     if !access_roots.iter().any(|root| canonical.starts_with(root)) {
@@ -652,7 +749,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
+    use safetensors::{Dtype, tensor::TensorView, tensor::serialize_to_file};
 
     use crate::store::{SafetensorsWeightStore, WeightStore};
 
@@ -669,6 +766,105 @@ mod tests {
         .unwrap();
     }
 
+    fn write_component_member(path: &Path) {
+        serialize_to_file(
+            [
+                (
+                    "vision.weight",
+                    TensorView::new(Dtype::U8, vec![1], &[7]).unwrap(),
+                ),
+                (
+                    "decoder.shared",
+                    TensorView::new(Dtype::U8, vec![1], &[9]).unwrap(),
+                ),
+            ],
+            None,
+            path,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn component_member_selection_retains_complete_headers_without_unrelated_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        write_component_member(&root.path().join("mixed.safetensors"));
+        write_index(
+            root.path(),
+            r#"{"weight_map":{"vision.weight":"mixed.safetensors","decoder.shared":"mixed.safetensors","audio.weight":"absent.safetensors"}}"#,
+        );
+        let catalog = SafetensorsMetadataCatalog::discover_members_matching(root.path(), |key| {
+            key.starts_with("vision.")
+        })
+        .unwrap();
+        assert_eq!(catalog.shards().payload_paths().len(), 1);
+        assert_eq!(
+            catalog
+                .tensors()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["decoder.shared", "vision.weight"]
+        );
+        assert!(matches!(
+            SafetensorsShards::discover(root.path()),
+            Err(SafetensorsShardError::MissingShard { .. })
+        ));
+        std::fs::remove_file(root.path().join("model.safetensors.index.json")).unwrap();
+        let store = SafetensorsWeightStore::open_admitted(catalog.admitted_shards(), 1).unwrap();
+        assert_eq!(
+            WeightStore::keys(&store),
+            ["decoder.shared", "vision.weight"]
+        );
+    }
+
+    #[test]
+    fn component_member_selection_rejects_unindexed_corresident_tensors_and_missing_roles() {
+        let root = tempfile::tempdir().unwrap();
+        write_component_member(&root.path().join("mixed.safetensors"));
+        write_index(
+            root.path(),
+            r#"{"weight_map":{"vision.weight":"mixed.safetensors","audio.weight":"absent.safetensors"}}"#,
+        );
+        assert!(matches!(
+            SafetensorsMetadataCatalog::discover_members_matching(root.path(), |key| key
+                .starts_with("vision.")),
+            Err(SafetensorsShardError::MalformedIndex { .. })
+        ));
+        assert!(matches!(
+            SafetensorsMetadataCatalog::discover_members_matching(root.path(), |key| key
+                .starts_with("audio.")),
+            Err(SafetensorsShardError::MissingShard { .. })
+        ));
+        assert!(matches!(
+            SafetensorsMetadataCatalog::discover_members_matching(root.path(), |key| key
+                .starts_with("unknown.")),
+            Err(SafetensorsShardError::EmptyTensorSelection)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn component_member_selection_preserves_canonical_payload_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        write_component_member(&root.path().join("mixed.safetensors"));
+        std::os::unix::fs::symlink("mixed.safetensors", root.path().join("alias.safetensors"))
+            .unwrap();
+        write_index(
+            root.path(),
+            r#"{"weight_map":{"vision.weight":"mixed.safetensors","decoder.shared":"alias.safetensors","audio.weight":"absent.safetensors"}}"#,
+        );
+        let catalog = SafetensorsMetadataCatalog::discover_members_matching(root.path(), |key| {
+            key.starts_with("vision.")
+        })
+        .unwrap();
+        assert_eq!(catalog.shards().payload_paths().len(), 1);
+        assert_eq!(catalog.tensors().len(), 2);
+        assert_eq!(
+            catalog.shards().tensor_locations().unwrap()["vision.weight"],
+            catalog.shards().tensor_locations().unwrap()["decoder.shared"]
+        );
+    }
+
     fn write_header_and_sparse_payload(path: &Path, header: serde_json::Value, payload_len: u64) {
         let mut header = serde_json::to_vec(&header).unwrap();
         header.resize(header.len().next_multiple_of(8), b' ');
@@ -681,14 +877,18 @@ mod tests {
 
     #[test]
     fn header_admission_rejects_duplicate_tensor_fields() {
-        assert!(parse_header(
-            br#"{"weight":{"dtype":"U8","dtype":"I8","shape":[1],"data_offsets":[0,1]}}"#
-        )
-        .is_err());
-        assert!(parse_header(
-            br#"{"weight":{"dtype":"U8","shape":[1],"shape":[1],"data_offsets":[0,1]}}"#
-        )
-        .is_err());
+        assert!(
+            parse_header(
+                br#"{"weight":{"dtype":"U8","dtype":"I8","shape":[1],"data_offsets":[0,1]}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_header(
+                br#"{"weight":{"dtype":"U8","shape":[1],"shape":[1],"data_offsets":[0,1]}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

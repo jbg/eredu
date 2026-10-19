@@ -262,12 +262,31 @@ impl ParameterMemberSpec {
     }
 }
 
+/// Assignment of a group's logical partition units to tensor ranks.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum PartitionUnitAssignment {
+    /// Every tensor rank receives a distinct nonempty range.
+    #[default]
+    Distinct,
+    /// Every tensor rank receives the same nonzero count of logical units.
+    Even,
+    /// When ranks outnumber units, adjacent ranks repeat one whole unit.
+    /// The rank count must be an integral multiple of the semantic unit count.
+    /// Physical encoding may coarsen the partition domain, but cannot split
+    /// these semantic units to satisfy repetition.
+    Repeat {
+        /// Original architecture units before physical encoding expansion.
+        semantic_units: usize,
+    },
+}
+
 /// Atomic logical parameter and all of its physical checkpoint companions.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ParameterGroupSpec {
     logical_name: String,
     role: ParameterRole,
     partition_units: Option<usize>,
+    partition_unit_assignment: PartitionUnitAssignment,
     members: Vec<ParameterMemberSpec>,
 }
 
@@ -390,8 +409,79 @@ impl ParameterGroupSpec {
             logical_name,
             role,
             partition_units,
+            partition_unit_assignment: PartitionUnitAssignment::Distinct,
             members,
         })
+    }
+
+    /// Declares whether whole logical units may repeat across adjacent ranks.
+    pub fn with_partition_unit_assignment(
+        mut self,
+        assignment: PartitionUnitAssignment,
+    ) -> Result<Self, ParallelPlanError> {
+        if assignment == PartitionUnitAssignment::Even && self.partition_units.is_none() {
+            return Err(ParallelPlanError::InvalidGroup(
+                "even assignment requires a logical partition domain".into(),
+            ));
+        }
+        if let PartitionUnitAssignment::Repeat { semantic_units } = assignment {
+            if semantic_units == 0
+                || !self
+                    .partition_units
+                    .is_some_and(|physical_units| semantic_units.is_multiple_of(physical_units))
+            {
+                return Err(ParallelPlanError::InvalidGroup(
+                    "repeated assignment requires whole semantic units over its physical domain"
+                        .into(),
+                ));
+            }
+        }
+        self.partition_unit_assignment = assignment;
+        Ok(self)
+    }
+
+    /// Architecture-declared assignment, preserved through physical expansion.
+    pub const fn partition_unit_assignment(&self) -> PartitionUnitAssignment {
+        self.partition_unit_assignment
+    }
+
+    pub(crate) fn partition_coordinates(
+        &self,
+        rank: usize,
+        parts: usize,
+    ) -> Result<(usize, usize), ParallelPlanError> {
+        if parts == 0 || rank >= parts {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "invalid tensor-parallel coordinate {rank}/{parts}"
+            )));
+        }
+        let (rank, parts) = if let PartitionUnitAssignment::Repeat { semantic_units } =
+            self.partition_unit_assignment
+        {
+            if parts > semantic_units {
+                if !parts.is_multiple_of(semantic_units) {
+                    return Err(ParallelPlanError::InvalidGroup(format!(
+                        "cannot repeat {semantic_units} logical units across {parts} tensor ranks"
+                    )));
+                }
+                (rank / (parts / semantic_units), semantic_units)
+            } else {
+                (rank, parts)
+            }
+        } else {
+            (rank, parts)
+        };
+        if self.partition_unit_assignment != PartitionUnitAssignment::Distinct
+            && !self
+                .partition_units
+                .is_some_and(|units| units.is_multiple_of(parts))
+        {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "logical units in {:?} do not form equal whole-unit ranges for {parts} tensor partitions",
+                self.logical_name,
+            )));
+        }
+        Ok((rank, parts))
     }
 
     /// Returns the stable logical name.
@@ -766,6 +856,7 @@ pub fn partition_parameter_group_chunks(
     units: usize,
     mut width: impl FnMut(&ParameterMemberSpec) -> Result<usize, ParallelPlanError>,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let assignment = group.partition_unit_assignment;
     let mut members = Vec::with_capacity(group.members.len());
     for member in group.members {
         let sharding = match member.sharding() {
@@ -789,7 +880,8 @@ pub fn partition_parameter_group_chunks(
         };
         members.push(member.with_sharding(sharding));
     }
-    ParameterGroupSpec::partitioned(group.logical_name, group.role, units, members)
+    ParameterGroupSpec::partitioned(group.logical_name, group.role, units, members)?
+        .with_partition_unit_assignment(assignment)
 }
 
 /// Maps a logical chunk interval to exact physical coordinates without padding.
@@ -838,7 +930,7 @@ pub fn expand_linear_format_parameter_groups(
                     None => vec![source.clone()],
                 });
             }
-            match group.partition_units() {
+            let expanded = match group.partition_units() {
                 Some(units) => partitioned_group_with_preferred_units(
                     group.logical_name(),
                     group.role(),
@@ -846,7 +938,8 @@ pub fn expand_linear_format_parameter_groups(
                     members,
                 ),
                 None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
-            }
+            }?;
+            expanded.with_partition_unit_assignment(group.partition_unit_assignment())
         })
         .collect()
 }
@@ -1154,7 +1247,7 @@ fn expand_linear_format_member(
             };
             Ok(vec![ParameterMemberSpec::new(name, packed, sharding)])
         }
-        LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
+        LinearFormat::Affine(_) | LinearFormat::MxFp4 | LinearFormat::NvFp4 => {
             let quantization = format.weight_quantization().expect("packed format");
             let Some(scale) = declaration.scale() else {
                 return Err(ParallelPlanError::InvalidGroup(format!(
@@ -1188,7 +1281,7 @@ fn expand_linear_format_member(
                 name,
                 packed,
                 remap_linear_segments(source.sharding(), column_axis, 32 / bits, name)?,
-            )];
+            ).with_linear_row_layout(declaration.row_layout())];
             let companion_sharding =
                 remap_linear_segments(source.sharding(), column_axis, group, name)?;
             members.push(
@@ -1204,6 +1297,16 @@ fn expand_linear_format_member(
                     ParameterMemberSpec::new(bias.id.as_str(), companion, companion_sharding)
                         .with_linear_companion(eredu_nn::LinearCompanionRole::AffineBias, name),
                 );
+            }
+            if let Some(global) = declaration.global_scale() {
+                let mut global_shape = shape[..row_axis].to_vec();
+                let parts = declaration.row_layout().partitions();
+                declaration.row_layout().rows_per_partition(shape[row_axis])
+                    .map_err(|error| invalid(error.to_string()))?;
+                if parts > 1 { global_shape.push(parts); }
+                members.push(ParameterMemberSpec::new(
+                    global.id.as_str(), global_shape, MemberSharding::Replicated,
+                ).with_linear_companion(eredu_nn::LinearCompanionRole::GlobalScale, name));
             }
             Ok(members)
         }
@@ -1533,6 +1636,33 @@ mod tests {
                 .unwrap(),
             0..usize::MAX,
         );
+    }
+
+    #[test]
+    fn nvfp4_fused_rows_and_column_shards_keep_both_global_scales_replicated() {
+        let declaration = LinearFormatSpec::nvfp4(
+            eredu_nn::ParameterSpec::trainable("blocks").unwrap(),
+            eredu_nn::ParameterSpec::trainable("globals").unwrap(),
+        ).unwrap().with_row_layout(eredu_nn::LinearRowLayout::equal_partitions(2).unwrap()).unwrap();
+        for (sharding, expected_weight, expected_blocks) in [
+            (MemberSharding::PartitionedSegments { axis: 1, segments: vec![0..64, 64..128] },
+                MemberSharding::PartitionedSegments { axis: 1, segments: vec![0..64, 64..128] },
+                MemberSharding::PartitionedSegments { axis: 1, segments: vec![0..64, 64..128] }),
+            (MemberSharding::PartitionedChunks { axis: 2, chunk_size: 16 },
+                MemberSharding::PartitionedChunks { axis: 2, chunk_size: 2 },
+                MemberSharding::PartitionedChunks { axis: 2, chunk_size: 1 }),
+        ] {
+            let group = ParameterGroupSpec::partitioned("experts", ParameterRole::ExpertIntermediate, 2,
+                [ParameterMemberSpec::new("matrix", [3, 128, 32], sharding)]).unwrap();
+            let groups = expand_linear_format_parameter_groups(vec![group], |_| Ok(Some(declaration.clone()))).unwrap();
+            let members = groups[0].members();
+            assert_eq!(members[0].global_shape(), [3, 128, 4]);
+            assert_eq!(members[0].sharding(), &expected_weight);
+            assert_eq!(members[1].global_shape(), [3, 128, 2]);
+            assert_eq!(members[1].sharding(), &expected_blocks);
+            assert_eq!(members[2].global_shape(), [3, 2]);
+            assert_eq!(members[2].sharding(), &MemberSharding::Replicated);
+        }
     }
 
     #[test]

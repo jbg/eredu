@@ -8,6 +8,87 @@ use eredu_nn::multimodal::{
 };
 use safemlx::{Device, DeviceType};
 
+#[test]
+fn strict_score_selection_and_scatter_preserve_rank_ties_and_i64_validation() {
+    use crate::backend::nn::tensor::TokenValidationScope;
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let scores = MlxTensor::from_f32_slice(
+        &[3., 5., 5., -2., 5., -1., -1., -3., 4., 4.],
+        &[2, 5],
+        stream,
+    )
+    .unwrap();
+    let (values, ids) = scores.ranked_topk(3, stream).unwrap();
+    assert_eq!(ids.to_i32_vec(stream).unwrap(), [1, 2, 4, 3, 4, 0]);
+    assert_eq!(
+        values.to_f32_vec(stream).unwrap(),
+        [5., 5., 5., 4., 4., -1.]
+    );
+    let base = MlxTensor::full_f32(f32::NEG_INFINITY, &[2, 5], stream).unwrap();
+    let scattered = base
+        .scatter_last_axis(&ids, &values, stream)
+        .unwrap()
+        .to_f32_vec(stream)
+        .unwrap();
+    assert_eq!(
+        scattered,
+        [
+            f32::NEG_INFINITY,
+            5.,
+            5.,
+            f32::NEG_INFINITY,
+            5.,
+            -1.,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            4.,
+            4.
+        ]
+    );
+    for invalid in [vec![0_i64, 0], vec![0, 1_i64 << 40], vec![0, -1_i64 << 40]] {
+        let indices = MlxTensor::from_array(Array::from_slice(&invalid, &[1, 2]));
+        let base = MlxTensor::full_f32(0., &[1, 5], stream).unwrap();
+        let values = MlxTensor::from_f32_slice(&[2., 7.], &[1, 2], stream).unwrap();
+        let scope = TokenValidationScope::begin().unwrap();
+        let output = base.scatter_last_axis(&indices, &values, stream).unwrap();
+        let validation = scope.finish();
+        safemlx::transforms::eval(
+            validation
+                .arrays()
+                .chain(std::iter::once(output.as_array())),
+        )
+        .unwrap();
+        assert!(validation.validate_completed().is_err());
+    }
+}
+
+#[test]
+fn i64_parameter_binding_preserves_offsets_beyond_floating_and_i32_precision() {
+    use eredu_nn::{Parameter, ParameterSpec, Tensor, TensorElementType};
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let mut value = Parameter::<MlxTensor>::unloaded_i64(
+        ParameterSpec::trainable("offsets").unwrap(),
+        &[2],
+        stream,
+    )
+    .unwrap();
+    assert_eq!(value.as_ref().element_type(), Some(TensorElementType::I64));
+    let expected = [(1_i64 << 40) + 3, -(1_i64 << 40) + 5];
+    value.replace(MlxTensor::from_array(Array::from_slice(&expected, &[2])));
+    let selected = value
+        .as_ref()
+        .take_axis(
+            &MlxTensor::from_array(Array::from_slice(&[1_i32, 0], &[2])),
+            0,
+            stream,
+        )
+        .unwrap();
+    let selected = selected.as_array().evaluated().unwrap();
+    assert_eq!(selected.as_slice::<i64>(), &[expected[1], expected[0]]);
+}
+
 fn close(actual: &Array, expected: &[f32]) {
     let actual = actual.evaluated().unwrap();
     assert_eq!(actual.as_slice::<f32>().len(), expected.len());

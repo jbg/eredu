@@ -196,11 +196,17 @@ where
     S: MlxStateMechanisms + 'static,
 {
     #[cfg(test)]
-    fn backing_arrays(&self) -> Vec<&Array> { MlxStateMechanisms::retained_arrays(self) }
+    fn backing_arrays(&self) -> Vec<&Array> {
+        MlxStateMechanisms::retained_arrays(self)
+    }
     fn checkpoint_view(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception> {
-        super::super::speculative::state_snapshot::settle(MlxStateMechanisms::retained_arrays(self))?;
+        super::super::speculative::state_snapshot::settle(MlxStateMechanisms::retained_arrays(
+            self,
+        ))?;
         let view = self.deep_checkpoint()?;
-        super::super::speculative::state_snapshot::settle(MlxStateMechanisms::retained_arrays(&view))?;
+        super::super::speculative::state_snapshot::settle(MlxStateMechanisms::retained_arrays(
+            &view,
+        ))?;
         Ok(Box::new(view))
     }
     fn control_growth(&self, additional: u64) -> Option<u64> {
@@ -259,13 +265,18 @@ pub(crate) struct MlxPredictionTargetState(Option<Box<dyn ErasedPredictionTarget
 impl MlxPredictionTargetState {
     #[cfg(test)]
     pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
-        self.0.as_ref().map_or_else(Vec::new, |state| state.backing_arrays())
+        self.0
+            .as_ref()
+            .map_or_else(Vec::new, |state| state.backing_arrays())
     }
     /// Shares published immutable roots and isolates overwrite-capable state.
     /// Both paths settle native work before exposing the checkpoint.
     pub(crate) fn checkpoint_view(&self) -> Result<Self, Exception> {
-        self.0.as_ref().ok_or_else(|| Exception::custom("prediction target state is active"))?
-            .checkpoint_view().map(|state| Self(Some(state)))
+        self.0
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prediction target state is active"))?
+            .checkpoint_view()
+            .map(|state| Self(Some(state)))
     }
 
     pub(crate) fn control_growth(&self, additional: u64) -> Option<u64> {
@@ -330,8 +341,14 @@ impl MlxPredictionTargetState {
         current.restore_box(checkpoint.as_ref(), stream)
     }
 
-    pub(crate) fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception> {
-        self.0.as_mut().ok_or_else(|| Exception::custom("target state is active"))?
+    pub(crate) fn retain_causal_prefix(
+        &mut self,
+        length: i32,
+        stream: &Stream,
+    ) -> Result<bool, Exception> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| Exception::custom("target state is active"))?
             .retain_causal_prefix(length, stream)
     }
     pub(crate) fn generation(&self) -> Result<u64, Error> {
@@ -342,6 +359,10 @@ impl MlxPredictionTargetState {
             .map_err(|_| Error::ArchitectureModel("target capture generation is negative".into()))
     }
 }
+
+mod capture;
+pub(super) use capture::ExternalTargetBinding;
+pub(super) use capture::collect as collect_external_capture;
 
 pub(super) struct ExactPredictionCaptureObserver {
     paths: Vec<String>,
@@ -394,45 +415,6 @@ impl eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>
             }
         }
         Ok(())
-    }
-}
-
-pub(super) struct CompositePredictionTargetOperation<'a> {
-    pub(super) operation: ExternalPredictionTargetOperation<'a, MlxTensor>,
-}
-
-impl<A>
-    eredu_runtime::PredictionTargetOperation<
-        PreparedCompositeArchitecture<A>,
-        MlxNeuralBackend,
-        MlxHybridState,
-    > for CompositePredictionTargetOperation<'_>
-where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
-    A::InputPartPlan: 'static,
-{
-    type Output = MlxTensor;
-
-    fn apply(
-        self,
-        architecture: &mut PreparedCompositeArchitecture<A>,
-        _state: &mut MlxHybridState,
-        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
-        context: &Stream,
-    ) -> Result<Self::Output, eredu_nn::Error> {
-        if parallel.is_some() {
-            return Err(eredu_nn::Error::backend(
-                "external assistant target operations are unavailable under tensor parallelism",
-            ));
-        }
-        architecture
-            .inner_mut()
-            .external_prediction_target_operation(self.operation, context)?
-            .ok_or_else(|| {
-                eredu_nn::Error::backend(
-                    "architecture does not implement the selected external target operation",
-                )
-            })
     }
 }
 
@@ -872,6 +854,22 @@ where
 }
 
 pub(crate) trait ErasedExternalPredictionExecutable: 'static {
+    /// Observes the installed lane and its parameter owners without evaluating work.
+    fn continuation_memory_observation(
+        &self,
+        state: &MlxPredictionTargetState,
+        additional: u64,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeModelMemoryObservation,
+        eredu_core::BackendFailure,
+    >;
+
+    /// Retains architecture-owned capture and static-source discovery without artifact access.
+    fn bind_target_discovery(
+        &mut self,
+        discovery: std::sync::Arc<eredu_architectures::prepared_sources::PreparedModelDiscovery>,
+    );
+
     /// Releases optional conversions; caller must establish a settled boundary.
     fn trim_parameter_conversions(
         &mut self,
@@ -1086,7 +1084,11 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     }
     /// Atomically exchanges an already settled causal prefix with canonical state.
     /// The slot receives the previous state; parameters and source leases are unchanged.
-    fn exchange_autoregressive_cache(&mut self, cache: &mut MlxPredictionTargetState, stream: &Stream) -> Result<(), Error>;
+    fn exchange_autoregressive_cache(
+        &mut self,
+        cache: &mut MlxPredictionTargetState,
+        stream: &Stream,
+    ) -> Result<(), Error>;
     /// Encodes complete prepared media/text context into a transaction-owned
     /// causal cache. Returns its full decoder position count with sequence logits.
     fn prepared_context_forward(
@@ -1096,7 +1098,9 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         _stream: &Stream,
         _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<(Array, usize), Error> {
-        Err(Error::Speculative("prepared causal context is unavailable".into()))
+        Err(Error::Speculative(
+            "prepared causal context is unavailable".into(),
+        ))
     }
     fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
         eredu_core::execution_control::ControlSupport::Unsupported {

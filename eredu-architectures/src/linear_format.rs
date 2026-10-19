@@ -4,6 +4,70 @@ use eredu_checkpoint::LinearFormat;
 use eredu_nn::{Error, GroupedProjectionSpec, LinearFormatSpec, ParameterSpec};
 use eredu_runtime::{ParallelPlanError, ParameterMemberSpec};
 
+/// Packed formats do not establish activation precision from integer storage.
+/// Retain the portable floating fallback envelope until a compute contract
+/// narrows it. Dense and affine formats obtain precision from their sources.
+pub(crate) fn encoded_floating_compute_precisions(
+    format: LinearFormat,
+) -> &'static [eredu_checkpoint::recipe::RecipeDtype] {
+    use eredu_checkpoint::recipe::RecipeDtype;
+    match format {
+        LinearFormat::Dense | LinearFormat::Affine(_) => &[],
+        _ => &[RecipeDtype::F16, RecipeDtype::BF16],
+    }
+}
+
+/// Floating types that can reach selected projections, including FP32 equation
+/// promotion. Packed integer weights are not activation precisions; their
+/// admitted companions and conversion-input metadata supply the compute types.
+pub(crate) fn floating_compute_precisions(
+    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
+) -> Vec<eredu_core::checkpoint::TensorDtype> {
+    use eredu_checkpoint::recipe::RecipeDtype;
+    use eredu_core::checkpoint::TensorDtype;
+    let mut precisions = Vec::new();
+    let mut include = |dtype: RecipeDtype| {
+        let dtype = match dtype {
+            RecipeDtype::F16 => TensorDtype::F16,
+            RecipeDtype::BF16 => TensorDtype::Bf16,
+            RecipeDtype::F32 => TensorDtype::F32,
+            _ => return,
+        };
+        if !precisions.contains(&dtype) {
+            precisions.push(dtype);
+        }
+    };
+    for task in tasks {
+        for dtype in encoded_floating_compute_precisions(task.executable()) {
+            include(dtype.clone());
+        }
+        if let Some(dtype) = task.source_encoding().scalar_dtype().map(Into::into) {
+            include(dtype);
+        }
+        if let Some(metadata) = task.derived_output() {
+            include(metadata.dtype.clone());
+        }
+        for companion in task.output_companions() {
+            if let Some(dtype) = companion
+                .catalog_source()
+                .and_then(|source| source.source_encoding().scalar_dtype())
+                .map(Into::into)
+            {
+                include(dtype);
+            }
+            if let Some(metadata) = companion.derived_output() {
+                include(metadata.dtype.clone());
+            }
+        }
+    }
+    include(RecipeDtype::F32);
+    // Stable canonical order independent of physical tensor enumeration.
+    [TensorDtype::F16, TensorDtype::Bf16, TensorDtype::F32]
+        .into_iter()
+        .filter(|dtype| precisions.contains(dtype))
+        .collect()
+}
+
 fn expert_parameter(name: &str) -> Result<ParameterSpec, Error> {
     ParameterSpec::trainable(name).map_err(Error::backend)
 }
@@ -28,35 +92,50 @@ pub(crate) fn standard_linear_format(
     weight_name: &str,
     format: LinearFormat,
 ) -> Result<LinearFormatSpec, Error> {
+    if matches!(
+        format,
+        LinearFormat::Dense | LinearFormat::GgufIQuant { .. }
+    ) {
+        return LinearFormatSpec::unscaled(format);
+    }
     let prefix = weight_name.strip_suffix(".weight").ok_or_else(|| {
         Error::backend(format!(
             "encoded ordinary linear parameter {weight_name:?} must end in .weight"
         ))
-    });
+    })?;
+    matrix_linear_format(weight_name, prefix, format)
+}
+
+/// Declares a matrix whose companion prefix is explicit, including named codebooks.
+/// Parameter identities and companion ownership remain architecture-declared.
+pub(crate) fn matrix_linear_format(
+    weight_name: &str,
+    prefix: &str,
+    format: LinearFormat,
+) -> Result<LinearFormatSpec, Error> {
     match format {
         LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => LinearFormatSpec::unscaled(format),
-        LinearFormat::E4M3BlockFp8(_) => {
-            let prefix = prefix?;
-            LinearFormatSpec::scaled(
-                format,
-                companion(weight_name, format!("{prefix}.weight_scale_inv"), "scale")?,
-            )
-        }
-        LinearFormat::MxFp4 => {
-            let prefix = prefix?;
-            LinearFormatSpec::scaled(
-                format,
-                companion(weight_name, format!("{prefix}.scales"), "scale")?,
-            )
-        }
-        LinearFormat::Affine(_) => {
-            let prefix = prefix?;
-            LinearFormatSpec::affine(
-                format,
-                companion(weight_name, format!("{prefix}.scales"), "scale")?,
-                companion(weight_name, format!("{prefix}.biases"), "affine-bias")?,
-            )
-        }
+        LinearFormat::E4M3BlockFp8(_) => LinearFormatSpec::scaled(
+            format,
+            companion(weight_name, format!("{prefix}.weight_scale_inv"), "scale")?,
+        ),
+        LinearFormat::MxFp4 => LinearFormatSpec::scaled(
+            format,
+            companion(weight_name, format!("{prefix}.scales"), "scale")?,
+        ),
+        LinearFormat::NvFp4 => LinearFormatSpec::nvfp4(
+            companion(weight_name, format!("{prefix}.scales"), "scale")?,
+            companion(
+                weight_name,
+                format!("{prefix}.global_scale"),
+                "global-scale",
+            )?,
+        ),
+        LinearFormat::Affine(_) => LinearFormatSpec::affine(
+            format,
+            companion(weight_name, format!("{prefix}.scales"), "scale")?,
+            companion(weight_name, format!("{prefix}.biases"), "affine-bias")?,
+        ),
     }
 }
 
@@ -70,13 +149,23 @@ pub(crate) fn standard_expert_format(
             format,
             companion(weight_name, format!("{weight_name}_scales"), "scale")?,
         ),
+        LinearFormat::NvFp4 => LinearFormatSpec::nvfp4(
+            companion(weight_name, format!("{weight_name}_scales"), "scale")?,
+            companion(
+                weight_name,
+                format!("{weight_name}_global_scale"),
+                "global-scale",
+            )?,
+        ),
         LinearFormat::Affine(_) => LinearFormatSpec::affine(
             format,
             companion(weight_name, format!("{weight_name}_scales"), "scale")?,
             companion(weight_name, format!("{weight_name}_biases"), "affine-bias")?,
         ),
     }?;
-    if matches!(format, LinearFormat::E4M3BlockFp8(_)) && weight_name.ends_with(".gate_up_proj") {
+    if matches!(format, LinearFormat::E4M3BlockFp8(_) | LinearFormat::NvFp4)
+        && weight_name.ends_with(".gate_up_proj")
+    {
         declaration.with_row_layout(eredu_nn::LinearRowLayout::equal_partitions(2)?)
     } else {
         Ok(declaration)

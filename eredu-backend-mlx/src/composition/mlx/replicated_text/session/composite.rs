@@ -150,6 +150,7 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedComposite<
     effective_model_type: String,
     pub(super) prediction: P,
     pub(super) embedded_prediction_observers: MlxEmbeddedPredictionObservers,
+    external_target: super::super::prediction::ExternalTargetBinding,
     prepared_parameters: Vec<eredu_runtime::parameter_operations::PreparedParameterSlot>,
     parameter_tasks: Vec<eredu_runtime::ReplicatedTextMaterializationTask>,
     prepared_bank_parameters: Vec<eredu_runtime::parameter_operations::PreparedBankParameter>,
@@ -592,6 +593,7 @@ where
             effective_model_type: self.effective_model_type,
             prediction,
             embedded_prediction_observers: self.embedded_prediction_observers,
+            external_target: self.external_target,
             #[cfg(test)]
             selected_residency: self.selected_residency,
             partition_sampling_group: self.partition_sampling_group,
@@ -638,6 +640,7 @@ where
             effective_model_type,
             prediction: NoSelectedPrediction,
             embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
+            external_target: Default::default(),
             #[cfg(test)]
             selected_residency,
             partition_sampling_group,
@@ -1401,26 +1404,7 @@ where
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
-        use crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport;
-        let report = self.session.execution_strategy().parameter_bank_report()?;
-        let report = if report.is_some() || self.parameter_banks.is_empty() {
-            report
-        } else {
-            Some(ParameterBanksResidencyReport::new(
-                self.parameter_banks
-                    .iter()
-                    .map(|(id, bank)| bank.report().map(|report| (*id, report)))
-                    .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
-            ))
-        };
-        match &self.partition_row_pool {
-            Some((pool, requirements)) => Ok(Some(
-                report
-                    .unwrap_or_else(|| ParameterBanksResidencyReport::new(Default::default()))
-                    .with_rows(pool.row_report(*requirements)?),
-            )),
-            None => Ok(report),
-        }
+        self.parameter_bank_memory_report()
     }
 
     fn prompt_cache_model_identity(&self) -> Option<&PromptCacheModelIdentity> {
@@ -1734,6 +1718,52 @@ where
     }
 }
 
+impl<A, D, P> CompletedComposite<A, D, P>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxHybridState,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+    P: 'static,
+{
+    fn parameter_bank_memory_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
+        Error,
+    > {
+        use crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport;
+        let report = self.session.execution_strategy().parameter_bank_report()?;
+        let report = if report.is_some() || self.parameter_banks.is_empty() {
+            report
+        } else {
+            Some(ParameterBanksResidencyReport::new(
+                self.parameter_banks
+                    .iter()
+                    .map(|(id, bank)| bank.report().map(|report| (*id, report)))
+                    .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
+            ))
+        };
+        match &self.partition_row_pool {
+            Some((pool, requirements)) => Ok(Some(
+                report
+                    .unwrap_or_else(|| ParameterBanksResidencyReport::new(Default::default()))
+                    .with_rows(pool.row_report(*requirements)?),
+            )),
+            None => Ok(report),
+        }
+    }
+
+}
+
 impl<A, D, P> ErasedExternalPredictionExecutable for CompletedComposite<A, D, P>
 where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
@@ -1750,6 +1780,37 @@ where
         + 'static,
     P: 'static,
 {
+    fn continuation_memory_observation(
+        &self,
+        state: &MlxPredictionTargetState,
+        additional: u64,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeModelMemoryObservation,
+        eredu_core::BackendFailure,
+    > {
+        crate::composition::mlx::speculative::memory_observation::model(
+            state,
+            additional,
+            Some(
+                self.session
+                    .report()
+                    .map_err(eredu_core::BackendFailure::from_error)?
+                    .execution_report()
+                    .residency
+                    .clone(),
+            ),
+            self.parameter_bank_memory_report()
+                .map_err(eredu_core::BackendFailure::from_error)?,
+        )
+    }
+
+    fn bind_target_discovery(
+        &mut self,
+        discovery: std::sync::Arc<eredu_architectures::prepared_sources::PreparedModelDiscovery>,
+    ) {
+        self.external_target.bind(discovery);
+    }
+
     /// Releases optional conversions; caller must establish a settled boundary.
     fn trim_parameter_conversions(
         &mut self,
@@ -1787,42 +1848,43 @@ where
         cache: &mut MlxPredictionTargetState,
     ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
         let paths = A::external_prediction_capture_paths(request)
-            .map_err(|error| Error::Other(Box::new(error)))?
-            .ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "assistant capture request differs from the neutral target architecture".into(),
-                )
-            })?;
-        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
-        let (prepared, admitted, _) = self.prepare(input)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+            .map_err(|error| Error::Other(Box::new(error)))
+            .and_then(|paths| {
+                paths.ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "assistant capture request differs from the neutral target architecture"
+                            .into(),
+                    )
+                })
+            });
+        let input = self.prepare(input);
+        let prepared = self.external_target.prepare(paths, input);
         let request = request.clone();
-        let captured = observer.values.clone();
         let stream = self.stream.clone();
         self.with_native_prediction_target_state(cache, |session| {
-            session
-                .prefill_input_with_capture(paired, &stream, &mut observer, |forward| {
-                    let values = captured
-                        .borrow()
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            value.ok_or_else(|| {
-                                eredu_nn::Error::backend(format!(
-                                    "external-assistant target did not reach capture path {index}"
-                                ))
+            prepared.with_input(|input, bundle, rank, observer| {
+                let values = observer.values.clone();
+                session
+                    .prefill_input_with_capture(
+                        input,
+                        &stream,
+                        observer,
+                        bundle,
+                        |_forward| {
+                            super::super::prediction::collect_external_capture(
+                                &values, bundle, rank, &stream,
+                            )
+                        },
+                        |forward, values| {
+                            A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
+                                eredu_nn::Error::backend(
+                                    "architecture did not produce its selected assistant capture",
+                                )
                             })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "architecture did not produce its selected assistant capture",
-                        )
-                    })
-                })
-                .map_err(|error| Error::Other(Box::new(error)))
+                        },
+                    )
+                    .map_err(|error| Error::Other(Box::new(error)))
+            })
         })
     }
 
@@ -1832,43 +1894,44 @@ where
         request: &ExternalPredictionCaptureRequest,
         cache: &mut MlxPredictionTargetState,
     ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
-        let (prepared, admitted, _) = self.text_input(tokens.as_array())?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
         let paths = A::external_prediction_capture_paths(request)
-            .map_err(|error| Error::Other(Box::new(error)))?
-            .ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "assistant capture request differs from the neutral target architecture".into(),
-                )
-            })?;
-        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
+            .map_err(|error| Error::Other(Box::new(error)))
+            .and_then(|paths| {
+                paths.ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "assistant capture request differs from the neutral target architecture"
+                            .into(),
+                    )
+                })
+            });
+        let input = self.text_input(tokens.as_array());
+        let prepared = self.external_target.prepare(paths, input);
         let request = request.clone();
-        let captured = observer.values.clone();
         let stream = self.stream.clone();
         self.with_native_prediction_target_state(cache, |session| {
-            session
-                .decode_input_with_capture(paired, &stream, &mut observer, |forward| {
-                    let values = captured
-                        .borrow()
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            value.ok_or_else(|| {
-                                eredu_nn::Error::backend(format!(
-                                    "external-assistant target did not reach capture path {index}"
-                                ))
+            prepared.with_input(|input, bundle, rank, observer| {
+                let values = observer.values.clone();
+                session
+                    .decode_input_with_capture(
+                        input,
+                        &stream,
+                        observer,
+                        bundle,
+                        |_forward| {
+                            super::super::prediction::collect_external_capture(
+                                &values, bundle, rank, &stream,
+                            )
+                        },
+                        |forward, values| {
+                            A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
+                                eredu_nn::Error::backend(
+                                    "architecture did not produce its selected assistant capture",
+                                )
                             })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "architecture did not produce its selected assistant capture",
-                        )
-                    })
-                })
-                .map_err(|error| Error::Other(Box::new(error)))
+                        },
+                    )
+                    .map_err(|error| Error::Other(Box::new(error)))
+            })
         })
     }
 
@@ -1876,11 +1939,9 @@ where
         &mut self,
         operation: ExternalPredictionTargetOperation<'_, MlxTensor>,
     ) -> Result<MlxTensor, Error> {
+        let operation = self.external_target.operation(operation);
         self.session
-            .apply_prediction_target_operation(
-                CompositePredictionTargetOperation { operation },
-                &self.stream,
-            )
+            .apply_prediction_target_operation(operation, &self.stream)
             .map_err(|error| Error::Other(Box::new(error)))
     }
 }

@@ -179,6 +179,7 @@ pub struct NormalizedLoadRequest {
     drafting: DraftingLoadRequest,
     prediction_source: Option<std::path::PathBuf>,
     draft_adapter: Option<eredu_core::DraftAdapterSource>,
+    media_companions: eredu_core::MediaCompanionSources,
     media_execution: crate::MediaLoadRequest,
     bounded_execution: Option<crate::BoundedExecutionPolicy>,
 }
@@ -391,6 +392,16 @@ impl NormalizedLoadRequest {
     /// Optional draft-only adapter source, distinct from prediction heads.
     pub fn draft_adapter(&self) -> Option<&eredu_core::DraftAdapterSource> {
         self.draft_adapter.as_ref()
+    }
+
+    /// Selects independent media artifacts before architecture and processor admission.
+    pub fn with_media_companions(mut self, sources: eredu_core::MediaCompanionSources) -> Self {
+        self.media_companions = sources;
+        self
+    }
+    /// Exact explicit source selection retained through cold preparation.
+    pub fn media_companions(&self) -> &eredu_core::MediaCompanionSources {
+        &self.media_companions
     }
 
     /// Architecture preparation validates its format and compatibility with the target.

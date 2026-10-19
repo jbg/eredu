@@ -1212,6 +1212,8 @@ impl ReplicatedTextContractError {
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
+    state_partition_plan: Option<crate::ArchitectureStatePartitionPlan>,
+    prefill_input_retention: crate::memory_forecast::PrefillInputRetention,
     execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
     chunked_prefill: bool,
     block_refinement: Option<crate::generation::refinement::architecture::BlockRefinementGeometry>,
@@ -1238,6 +1240,7 @@ pub struct ReplicatedTextRequirements {
     derived_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     derived_recipe_outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
     shared_source_keys: BTreeSet<String>,
+    nonparameter_sources: BTreeSet<String>,
     grouped_operations: Vec<GroupedOperationRequirement>,
 }
 
@@ -1295,6 +1298,34 @@ impl ReplicatedTextRequirements {
     /// Ordered reusable module topology, independent of allocation or forecast policy.
     pub fn execution_topology(&self) -> Option<&crate::execution_topology::TextExecutionTopology> {
         self.execution_topology.as_ref()
+    }
+
+    /// Retains explicit state placement for decoder and non-decoder groups.
+    pub fn with_state_partition_plan(
+        mut self,
+        plan: crate::ArchitectureStatePartitionPlan,
+    ) -> Self {
+        self.state_partition_plan = Some(plan);
+        self
+    }
+
+    /// Exact state placement, when the architecture declares non-default owners.
+    pub fn state_partition_plan(&self) -> Option<&crate::ArchitectureStatePartitionPlan> {
+        self.state_partition_plan.as_ref()
+    }
+
+    /// Declares input ownership across consecutive decoder prefix invocations.
+    pub const fn with_prefill_input_retention(
+        mut self,
+        retention: crate::memory_forecast::PrefillInputRetention,
+    ) -> Self {
+        self.prefill_input_retention = retention;
+        self
+    }
+
+    /// Input roots retained by the architecture's prefill request.
+    pub const fn prefill_input_retention(&self) -> crate::memory_forecast::PrefillInputRetention {
+        self.prefill_input_retention
     }
 
     /// Declares parity of consecutive causal prefix passes with full prefill.
@@ -1401,6 +1432,8 @@ impl ReplicatedTextRequirements {
         }
         Ok(Self {
             execution_topology: None,
+            state_partition_plan: None,
+            prefill_input_retention: crate::memory_forecast::PrefillInputRetention::TokenIds,
             chunked_prefill: false,
             block_refinement: None,
             floating_state_source: None,
@@ -1418,6 +1451,7 @@ impl ReplicatedTextRequirements {
             derived_recipes: BTreeMap::new(),
             derived_recipe_outputs: BTreeMap::new(),
             shared_source_keys: BTreeSet::new(),
+            nonparameter_sources: BTreeSet::new(),
             grouped_operations: Vec::new(),
         })
     }
@@ -1465,6 +1499,19 @@ impl ReplicatedTextRequirements {
         recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
     ) -> Result<Self, ReplicatedTextContractError> {
+        if parameters
+            .iter()
+            .flat_map(|p| p.sources())
+            .any(|key| self.nonparameter_sources.contains(key))
+            || recipes
+                .values()
+                .flat_map(|r| r.source_keys())
+                .any(|key| self.nonparameter_sources.contains(key))
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "auxiliary parameters consume a declared nonparameter source",
+            ));
+        }
         let primary = self
             .parameters
             .iter()
@@ -1525,6 +1572,15 @@ impl ReplicatedTextRequirements {
         outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
         shared_source_keys: BTreeSet<String>,
     ) -> Result<(), ReplicatedTextContractError> {
+        if recipes
+            .values()
+            .flat_map(|r| r.source_keys())
+            .any(|key| self.nonparameter_sources.contains(key))
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "derived parameters consume a declared nonparameter source",
+            ));
+        }
         if recipes.keys().ne(outputs.keys()) {
             return Err(ReplicatedTextContractError::invalid(
                 "derived recipe targets and inferred outputs differ",
@@ -1662,6 +1718,36 @@ impl ReplicatedTextRequirements {
     /// Returns physical sources explicitly declared as shared by the architecture.
     pub fn shared_source_keys(&self) -> &BTreeSet<String> {
         &self.shared_source_keys
+    }
+
+    /// Admits schema-validated metadata or calibration values which supply no
+    /// neural parameter or recipe. Strict binding still checks every other key.
+    pub fn with_nonparameter_sources(
+        mut self,
+        sources: BTreeSet<String>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let referenced = self
+            .parameters
+            .iter()
+            .chain(&self.auxiliary_parameters)
+            .flat_map(|p| p.sources().iter().map(String::as_str))
+            .chain(self.derived_recipes.values().flat_map(|r| r.source_keys()))
+            .collect::<BTreeSet<_>>();
+        if sources
+            .iter()
+            .any(|key| key.trim().is_empty() || referenced.contains(key.as_str()))
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "nonparameter sources must be named and disjoint from parameter inputs",
+            ));
+        }
+        self.nonparameter_sources = sources;
+        Ok(self)
+    }
+
+    /// Exact admitted source-only values, without learned or recipe inputs.
+    pub fn nonparameter_sources(&self) -> &BTreeSet<String> {
+        &self.nonparameter_sources
     }
     /// Returns exact grouped operations required before construction.
     pub fn grouped_operations(&self) -> &[GroupedOperationRequirement] {
@@ -2463,6 +2549,10 @@ impl ReplicatedTextMaterializationTask {
                 LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => {
                     vec![eredu_nn::LinearCompanionRole::Scale]
                 }
+                LinearFormat::NvFp4 => vec![
+                    eredu_nn::LinearCompanionRole::Scale,
+                    eredu_nn::LinearCompanionRole::GlobalScale,
+                ],
                 LinearFormat::Affine(_) => vec![
                     eredu_nn::LinearCompanionRole::Scale,
                     eredu_nn::LinearCompanionRole::AffineBias,
@@ -3289,6 +3379,7 @@ fn parameter_groups_have_same_members(
     left.logical_name() == right.logical_name()
         && left.role() == right.role()
         && left.partition_units() == right.partition_units()
+        && left.partition_unit_assignment() == right.partition_unit_assignment()
         && left.members().len() == right.members().len()
         && left.members().iter().all(|left_member| {
             right.members().iter().any(|right_member| {
@@ -3553,7 +3644,7 @@ impl SelectedStateRealization {
         let bindings = self
             .append_streams
             .iter()
-            .filter(|binding| range.contains(&binding.layer))
+            .filter(|binding| partition.owns_global_layer(binding.layer))
             .cloned()
             .map(|mut binding| {
                 let global_policy = self
@@ -3619,9 +3710,8 @@ impl SelectedStateRealization {
         partition: &crate::PartitionState,
     ) -> Result<Self, ReplicatedTextContractError> {
         let range = partition.global_layers();
-        let expected = self
-            .layout
-            .slice(range.clone())
+        let expected = partition
+            .selected_layout(&self.layout)
             .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
         if &expected != partition.layout() {
             return Err(ReplicatedTextContractError::invalid(
@@ -3631,7 +3721,7 @@ impl SelectedStateRealization {
         let components = self
             .components
             .iter()
-            .filter(|component| range.contains(&component.layer))
+            .filter(|component| partition.owns_global_layer(component.layer))
             .cloned()
             .map(|mut component| {
                 component.layer -= range.start;
@@ -3678,9 +3768,8 @@ impl SelectedStateRealization {
         partition: &crate::PartitionState,
     ) -> Result<Self, ReplicatedTextContractError> {
         let range = partition.global_layers();
-        let global = self
-            .layout
-            .slice(range.clone())
+        let global = partition
+            .selected_layout(&self.layout)
             .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
         if global.len() != partition.layout().len() {
             return Err(ReplicatedTextContractError::invalid(
@@ -3705,7 +3794,9 @@ impl SelectedStateRealization {
             let selected_components = self
                 .components
                 .iter()
-                .filter(|component| component.layer == global_layer)
+                .filter(|component| {
+                    component.layer == global_layer && partition.owns_global_layer(global_layer)
+                })
                 .collect::<Vec<_>>();
             if selected_components.len() != local_components.len() {
                 return Err(ReplicatedTextContractError::invalid(
@@ -4369,6 +4460,43 @@ mod tests {
         )
         .unwrap()
         .with_floating_state_source(TensorDtype::F16)
+    }
+
+    #[test]
+    fn nonparameter_admission_cannot_hide_learned_or_recipe_inputs() {
+        use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype, RecipeMetadata};
+        use eredu_checkpoint::store::TensorSelection;
+
+        assert!(requirements()
+            .with_nonparameter_sources(BTreeSet::from(["blk.0.ffn.weight".into()]))
+            .is_err());
+        assert!(requirements()
+            .with_nonparameter_sources(BTreeSet::from([" ".into()]))
+            .is_err());
+
+        let calibration = BTreeSet::from(["calibration.input_scale".into()]);
+        let recipes = BTreeMap::from([(
+            "model.layers.0.mlp.weight".into(),
+            DerivedWeightRecipe::source("calibration.input_scale", TensorSelection::Full),
+        )]);
+        let outputs = BTreeMap::from([(
+            "model.layers.0.mlp.weight".into(),
+            RecipeMetadata {
+                shape: vec![64, 64],
+                dtype: RecipeDtype::F16,
+                byte_len: 64 * 64 * 2,
+            },
+        )]);
+        let source_only = requirements()
+            .with_nonparameter_sources(calibration.clone())
+            .unwrap();
+        assert!(source_only
+            .with_derived_recipes(recipes.clone(), outputs.clone())
+            .is_err());
+        let learned = requirements()
+            .with_derived_recipes(recipes, outputs)
+            .unwrap();
+        assert!(learned.with_nonparameter_sources(calibration).is_err());
     }
 
     #[test]

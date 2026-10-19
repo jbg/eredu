@@ -298,7 +298,7 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
         );
         let model = eredu_core::PreparedModel::new(
             model
-                .with_capture_discovery(discovery_probe.clone())
+                .with_target_discovery(discovery_probe.clone())
                 .unwrap(),
             capabilities,
         );
@@ -675,7 +675,7 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
             vec![]
         };
         let plan = InterventionPlan {
-            schema_version: 1,
+            schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
             operations,
         }
         .admit(&discovery, request, "native-test-session")
@@ -731,7 +731,7 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
     for (fail_dtype, prompt_mismatch) in [(false, false), (true, false), (false, true)] {
         runtime.parts_mut().1.reset().unwrap();
         let plan = InterventionPlan {
-            schema_version: 1,
+            schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
             operations: vec![InterventionOperation {
                 id: "lifecycle".into(),
                 target: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),

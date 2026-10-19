@@ -15,6 +15,7 @@ pub(super) struct EffectiveLayout {
     pub(super) row_layout: eredu_nn::LinearRowLayout,
     scale: Option<String>,
     affine_bias: Option<String>,
+    global_scale: Option<String>,
     pub(super) bank_loan: CaptureUsage,
 }
 impl EffectiveLayout {
@@ -25,6 +26,7 @@ impl EffectiveLayout {
             row_layout: eredu_nn::LinearRowLayout::Contiguous,
             scale: None,
             affine_bias: None,
+            global_scale: None,
             bank_loan: CaptureUsage::default(),
         }
     }
@@ -32,6 +34,7 @@ impl EffectiveLayout {
         match role {
             LinearCompanionRole::Scale => self.scale = Some(id),
             LinearCompanionRole::AffineBias => self.affine_bias = Some(id),
+            LinearCompanionRole::GlobalScale => self.global_scale = Some(id),
         }
     }
     pub(super) fn input_transform(&self, actual_dtype: Dtype) -> ProjectionInputTransform {
@@ -61,6 +64,11 @@ impl EffectiveLayout {
                 actual_dtype == Dtype::Uint32
                     && self.scale.is_some()
                     && self.packed_geometry(actual_shape, 4, 32)
+            }
+            LinearFormat::NvFp4 => {
+                actual_dtype == Dtype::Uint32 && self.scale.is_some() && self.global_scale.is_some()
+                    && self.packed_geometry(actual_shape, 4, 16)
+                    && self.row_layout.rows_per_partition(self.shape[self.shape.len()-2] as usize).is_ok()
             }
             LinearFormat::E4M3BlockFp8(_) => {
                 self.matrix_geometry()
@@ -117,10 +125,11 @@ impl EffectiveLayout {
     pub(super) fn extend_dependencies(&self, ids: &mut BTreeSet<String>) {
         ids.extend(self.scale.iter().cloned());
         ids.extend(self.affine_bias.iter().cloned());
+        ids.extend(self.global_scale.iter().cloned());
     }
     pub(super) fn selection_metadata_bytes(&self, id: &str) -> Result<u64, ParameterError> {
         let mut bytes = id.len() as u64;
-        for companion in [&self.scale, &self.affine_bias].into_iter().flatten() {
+        for companion in [&self.scale, &self.affine_bias, &self.global_scale].into_iter().flatten() {
             bytes = add(bytes, companion.len() as u64)?;
         }
         Ok(add(1024, mul(bytes, 8)?)?)
@@ -128,7 +137,7 @@ impl EffectiveLayout {
     pub(super) fn host_conversion_bytes(&self) -> Result<u64, ParameterError> {
         // The native GGUF decoder has an explicit host implementation. Account
         // for packed reads, temporary decoded vectors and native re-upload.
-        if matches!(self.format, LinearFormat::GgufIQuant { .. }) {
+        if matches!(self.format, LinearFormat::GgufIQuant { .. } | LinearFormat::NvFp4) {
             Ok(add(
                 mul(elements(&self.shape)?, 32)?,
                 self.bank_loan.host_bytes,
@@ -218,6 +227,11 @@ impl EffectiveLayout {
                 4,
                 safemlx::ops::QuantizationMode::MxFp4,
                 stream,
+            )?,
+            LinearFormat::NvFp4 => crate::backend::nn::nvfp4::dequantize(
+                weight, scale()?, get(self.global_scale.as_deref()
+                    .ok_or_else(|| Error::ArchitectureModel("NVFP4 global scale is absent".into()))?)?,
+                self.row_layout, stream,
             )?,
             LinearFormat::E4M3BlockFp8(_) => crate::backend::nn::fp8::dequantize_with_row_layout(
                 weight,

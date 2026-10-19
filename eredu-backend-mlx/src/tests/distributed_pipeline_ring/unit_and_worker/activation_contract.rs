@@ -41,6 +41,7 @@ enum FixtureFamily {
     Gemma,
     MuseGlimmer,
     MuseGlimmerMoe,
+    MuseSpark,
     MuseGlimmerGguf(bool),
     Qwen4Exp,
     Qwen2,
@@ -105,6 +106,7 @@ impl FixtureFamily {
             Self::Gemma => "gemma",
             Self::MuseGlimmer => "muse-glimmer",
             Self::MuseGlimmerMoe => "muse-glimmer-moe",
+            Self::MuseSpark => "muse-spark",
             Self::MuseGlimmerGguf(false) => "muse-glimmer-gguf",
             Self::MuseGlimmerGguf(true) => "muse-glimmer-moe-gguf",
             Self::Qwen4Exp => "qwen4-exp",
@@ -158,6 +160,7 @@ impl FixtureFamily {
             Self::Gemma,
             Self::MuseGlimmer,
             Self::MuseGlimmerMoe,
+            Self::MuseSpark,
             Self::MuseGlimmerGguf(false),
             Self::MuseGlimmerGguf(true),
             Self::Qwen4Exp,
@@ -236,6 +239,7 @@ impl FixtureFamily {
             | Self::Qwen3VlMoe
             | Self::MuseGlimmer
             | Self::MuseGlimmerMoe
+            | Self::MuseSpark
             | Self::MuseGlimmerGguf(_) => 2,
             Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
             Self::Inkling
@@ -310,6 +314,7 @@ impl FixtureFamily {
             Self::MuseGlimmer | Self::MuseGlimmerMoe | Self::MuseGlimmerGguf(_) => {
                 "muse_glimmer_text"
             }
+            Self::MuseSpark => "muse_spark_text",
             Self::Qwen4Exp => "qwen4_exp_text",
             Self::Qwen2 | Self::Qwen2Gguf => "qwen2",
             Self::Qwen3 | Self::Qwen3Gguf => "qwen3",
@@ -344,6 +349,7 @@ impl FixtureFamily {
                 | Self::Gemma
                 | Self::MuseGlimmer
                 | Self::MuseGlimmerMoe
+                | Self::MuseSpark
                 | Self::MuseGlimmerGguf(_)
                 | Self::Qwen2
                 | Self::Qwen2Gguf

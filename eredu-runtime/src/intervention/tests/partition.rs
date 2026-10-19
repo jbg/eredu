@@ -57,7 +57,7 @@ fn admitted_at(
         });
     }
     InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations: vec![InterventionOperation {
             id: "edit".into(),
             target: point.path.clone(),
@@ -72,7 +72,7 @@ fn admitted_at(
     }
     .admit(
         &InterventionDiscovery {
-            schema_version: 1,
+            schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
             artifact_identity: "source".into(),
             session_identity: Some("native-session".into()),
             points: vec![point],

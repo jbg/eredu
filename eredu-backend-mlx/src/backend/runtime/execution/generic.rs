@@ -126,6 +126,7 @@ pub struct MlxLayerwisePolicy<U: 'static, P = ()> {
     unit_ids: Vec<OffloadUnitId>,
     layout: ExecutionUnitLayout,
     window_depth: usize,
+    pinned_units: BTreeSet<OffloadUnitId>,
     populator: P,
     _static_leases: OrdinaryRetirement<Vec<ResidentUnitLease>>,
     pending: VecDeque<MlxUnitLease<U>>,
@@ -285,12 +286,14 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
                 "generic MLX layerwise policy window depth must be nonzero".into(),
             ));
         }
+        let pinned_units = residency.pinned_unit_ids(&unit_ids)?;
         Ok(Self {
             residency,
             store,
             unit_ids,
             layout: layout.clone(),
             window_depth,
+            pinned_units,
             populator,
             _static_leases: OrdinaryRetirement::new(static_leases),
             pending: VecDeque::new(),
@@ -347,7 +350,9 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         })?;
         let end = current.saturating_add(self.window_depth).min(range.end);
         for (index, id) in self.unit_ids.iter().enumerate() {
-            if !range.contains(&index) || index < current || index >= end {
+            if !self.pinned_units.contains(id)
+                && (!range.contains(&index) || index < current || index >= end)
+            {
                 self.residency.evict(id, MemoryTier::Device)?;
             }
         }
@@ -527,20 +532,6 @@ fn populate_selected_parameterized<M: Parameterized<MlxTensor>>(
         .map_err(Error::from)
 }
 
-fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error> {
-    let mut largest = 0u64;
-    for start in 0..layer_bytes.len() {
-        let mut current = 0u64;
-        for bytes in layer_bytes.iter().skip(start).take(depth) {
-            current = current
-                .checked_add(*bytes)
-                .ok_or_else(|| Error::Parallel("generic device window bytes overflowed".into()))?;
-        }
-        largest = largest.max(current);
-    }
-    Ok(largest)
-}
-
 /// Derives the canonical flat unit layout from a neutral architecture.
 pub fn architecture_execution_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>
 where
@@ -566,10 +557,10 @@ mod preparation;
 pub use preparation::{
     prepare_layerwise_policy, prepare_layerwise_policy_from_addressed_bindings,
     prepare_layerwise_policy_from_bindings, prepare_layerwise_policy_with_bindings,
-    prepare_layerwise_policy_with_supplementary_bindings,
+    prepare_layerwise_policy_with_supplementary_bindings, prepare_parameter_unit_policy,
 };
 
 mod bounded;
 
 mod selected;
-pub(crate) use selected::MlxSelectedLayerwisePolicy;
+pub(crate) use selected::{MlxSelectedLayerwisePolicy, MlxSelectedUnitLease};

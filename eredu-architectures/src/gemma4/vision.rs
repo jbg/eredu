@@ -426,6 +426,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     groups: None,
                     dimensions: config.head_dim,
                     epsilon: config.rms_norm_eps,
@@ -622,6 +623,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     groups: None,
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,

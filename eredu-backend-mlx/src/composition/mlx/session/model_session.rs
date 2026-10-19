@@ -720,6 +720,11 @@ impl MlxModelSession {
         Ok(session)
     }
 
+    /// Stable identity of this native session, independent of tensor geometry.
+    pub(in crate::composition::mlx) fn native_session_identity(&self) -> &str {
+        &self.intervention_session_identity
+    }
+
     pub(super) fn block_refinement_geometry(
         &self,
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
@@ -769,8 +774,38 @@ impl MlxModelSession {
         &mut self,
         operation: impl FnOnce(&mut Executable) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut guard = self.begin_operation()?;
-        let result = operation(guard.model());
+        self.with_prepared_model_operation(|local| local, |model, ()| operation(model))
+    }
+
+    /// Agrees acquisition before a caller can enter distributed model work.
+    /// Rejected, unused scopes still prove completion before releasing authority.
+    pub(in crate::composition::mlx) fn with_prepared_model_operation<T, Prepared>(
+        &mut self,
+        prepare: impl FnOnce(Result<(), Error>) -> Result<Prepared, Error>,
+        operation: impl FnOnce(&mut Executable, Prepared) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let (guard, local) = match self.begin_operation() {
+            Ok(guard) => (Some(guard), Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        let prepared = prepare(local);
+        let Some(mut guard) = guard else {
+            return prepared.and_then(|_| {
+                Err(Error::ArchitectureModel(
+                    "model operation preparation accepted absent submission authority".into(),
+                ))
+            });
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // No executable access has occurred. Finish the native scope as
+                // unused rather than treating a peer refusal as abandoned mutation.
+                let (error, owner, recovery) = guard.finish(Ok(error))?;
+                return Err(complete_model_operation(error, owner, recovery)?);
+            }
+        };
+        let result = operation(guard.model(), prepared);
         let (value, owner, recovery) = guard.finish(result)?;
         complete_model_operation(value, owner, recovery)
     }
@@ -1041,6 +1076,16 @@ impl MlxModelSession {
             .model
             .prompt_cache_model_identity()
             .map_err(Into::into)
+    }
+
+    /// Validates raw modalities using retained architecture component coverage.
+    #[cfg(any(feature = "image", feature = "audio"))]
+    pub(crate) fn admit_raw_media_request(
+        &self,
+        request: &eredu_core::TokenizedMultimodalRequest,
+    ) -> Result<(), eredu_core::CapabilityError> {
+        self.capability_estimate()?
+            .admit_raw_media_request(request, self.processor().is_some())
     }
 
     pub(in crate::composition::mlx) fn capability_estimate(

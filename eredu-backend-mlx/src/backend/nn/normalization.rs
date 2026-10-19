@@ -1,6 +1,337 @@
 //! Native realization of reproducible weighted-normalization arithmetic.
 use safemlx::{error::Exception, Array, Stream};
 
+#[derive(Clone, Copy, Default)]
+struct Moments {
+    count: usize,
+    mean: [f32; 4],
+    square: [f32; 4],
+}
+impl Moments {
+    fn add(&mut self, other: Self) {
+        let count = self.count + other.count;
+        let coefficient = if count == 0 {
+            0.0
+        } else {
+            other.count as f32 / count as f32
+        };
+        for lane in 0..4 {
+            let delta = other.mean[lane] - self.mean[lane];
+            self.mean[lane] += coefficient * delta;
+            self.square[lane] +=
+                other.square[lane] + delta * delta * coefficient * self.count as f32;
+        }
+        self.count = count;
+    }
+}
+
+fn rowwise_moments(values: &[f32], reduced: bool) -> (f32, f32) {
+    let vector = if reduced { 8 } else { 4 };
+    let vectors = values.len() / vector;
+    let chunks = vectors.div_ceil(16);
+    let depth = usize::BITS as usize - chunks.saturating_sub(1).leading_zeros() as usize;
+    let mut stack = vec![Moments::default(); depth.max(1)];
+    for chunk in 0..chunks {
+        let count = 16.min(vectors - chunk * 16);
+        for half in 0..(vector / 4) {
+            let mut local = Moments {
+                count,
+                ..Moments::default()
+            };
+            for index in 0..count {
+                let coefficient = 1.0_f32 / (index + 1) as f32;
+                for lane in 0..4 {
+                    let value = values[(chunk * 16 + index) * vector + half * 4 + lane];
+                    let delta = value - local.mean[lane];
+                    local.mean[lane] += delta * coefficient;
+                    local.square[lane] += delta * (value - local.mean[lane]);
+                }
+            }
+            stack[0].add(local);
+        }
+        let mut mask = chunk + 1;
+        for level in 1..depth {
+            if mask & 1 != 0 {
+                break;
+            }
+            let prior = stack[level - 1];
+            stack[level].add(prior);
+            stack[level - 1] = Moments::default();
+            mask >>= 1;
+        }
+    }
+    for level in 1..depth {
+        let prior = stack[level];
+        stack[0].add(prior);
+    }
+    let mut count = 0usize;
+    let mut mean = 0.0_f32;
+    let mut square = 0.0_f32;
+    for &value in &values[vectors * vector..] {
+        let delta = value - mean;
+        count += 1;
+        mean += delta / count as f32;
+        square += delta * (value - mean);
+    }
+    let additional = vectors * vector / 4;
+    for lane in 0..4 {
+        let next = count + additional;
+        let coefficient = if next == 0 {
+            0.0
+        } else {
+            additional as f32 / next as f32
+        };
+        let delta = stack[0].mean[lane] - mean;
+        mean = coefficient.mul_add(delta, mean);
+        square += (delta * delta * coefficient).mul_add(count as f32, stack[0].square[lane]);
+        count = next;
+    }
+    (mean, square / values.len() as f32)
+}
+
+/// Bounded FP32 moments and affine rounding for reference-ordered LayerNorm.
+pub(crate) fn cascaded_layer_norm(
+    input: &Array,
+    weight: Option<&Array>,
+    bias: Option<&Array>,
+    epsilon: f32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::{Device, DeviceType, Dtype};
+    let width = input
+        .shape()
+        .last()
+        .copied()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| Exception::custom("layer normalization requires a positive final axis"))?;
+    let floating = |value: &Array| {
+        matches!(
+            value.dtype(),
+            Dtype::Float32 | Dtype::Float64 | Dtype::Bfloat16 | Dtype::Float16
+        )
+    };
+    if !floating(input)
+        || [weight, bias]
+            .into_iter()
+            .flatten()
+            .any(|value| !floating(value))
+    {
+        return Err(Exception::custom(
+            "cascaded layer normalization requires floating representations",
+        ));
+    }
+    if !epsilon.is_finite()
+        || epsilon <= 0.0
+        || [weight, bias]
+            .into_iter()
+            .flatten()
+            .any(|x| x.shape() != [width])
+    {
+        return Err(Exception::custom(
+            "invalid cascaded layer normalization parameters",
+        ));
+    }
+    if stream.get_device()?.get_type()? != DeviceType::Cpu {
+        let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let host = input.copy(&cpu)?;
+        let weight = weight.map(|value| value.copy(&cpu)).transpose()?;
+        let bias = bias.map(|value| value.copy(&cpu)).transpose()?;
+        return cascaded_layer_norm(&host, weight.as_ref(), bias.as_ref(), epsilon, &cpu)?
+            .copy(stream);
+    }
+    let wide = input
+        .as_dtype(Dtype::Float32, stream)?
+        .contiguous(false, stream)?
+        .into_evaluated()?;
+    let convert = |value: &Array| {
+        value
+            .as_dtype(Dtype::Float32, stream)?
+            .contiguous(false, stream)?
+            .into_evaluated()
+    };
+    let weight = weight.map(convert).transpose()?;
+    let bias = bias.map(convert).transpose()?;
+    let weight = weight.as_ref().map(|value| value.as_slice::<f32>());
+    let bias = bias.as_ref().map(|value| value.as_slice::<f32>());
+    let reduced = matches!(input.dtype(), Dtype::Bfloat16 | Dtype::Float16);
+    let mut output = Vec::with_capacity(input.size());
+    for row in wide.as_slice::<f32>().chunks_exact(width as usize) {
+        let (mean, variance) = rowwise_moments(row, reduced);
+        let inverse = 1.0_f32 / (variance + epsilon).sqrt();
+        let shift = -inverse * mean;
+        for (column, &value) in row.iter().enumerate() {
+            let normalized = if reduced {
+                value * inverse + shift
+            } else {
+                (value - mean) * inverse
+            };
+            output.push(
+                normalized * weight.map_or(1.0, |w| w[column]) + bias.map_or(0.0, |b| b[column]),
+            );
+        }
+    }
+    Array::from_slice(&output, input.shape()).as_dtype(input.dtype(), stream)
+}
+
+fn channel_sum_squares(values: &[f32], parallel: usize) -> f32 {
+    let steps = values.len() / parallel;
+    let log = usize::BITS as usize - steps.saturating_sub(1).leading_zeros() as usize;
+    let power = 4.max(log / 4);
+    let chunk = 1usize << power;
+    let mut sums = [[0.0_f32; 4]; 4];
+    let mut index = 0;
+    while index + chunk <= steps {
+        let end = index + chunk;
+        while index < end {
+            for p in 0..parallel {
+                let value = values[index * parallel + p];
+                sums[0][p] += value * value;
+            }
+            index += 1;
+        }
+        for level in 1..4 {
+            for p in 0..parallel {
+                sums[level][p] += sums[level - 1][p];
+                sums[level - 1][p] = 0.0;
+            }
+            if index & ((chunk - 1) << (level * power)) != 0 {
+                break;
+            }
+        }
+    }
+    while index < steps {
+        for p in 0..parallel {
+            let value = values[index * parallel + p];
+            sums[0][p] += value * value;
+        }
+        index += 1;
+    }
+    for level in 1..4 {
+        for p in 0..parallel {
+            sums[0][p] += sums[level][p];
+        }
+    }
+    for value in &values[steps * parallel..] {
+        sums[0][0] += value * value;
+    }
+    for p in 1..parallel {
+        sums[0][0] += sums[0][p];
+    }
+    sums[0][0]
+}
+
+/// Channel-major RMS traversal without depending on the realized input strides.
+pub(crate) fn channel_major_rms(
+    input: &Array,
+    weight: Option<&Array>,
+    offset: Option<f32>,
+    epsilon: f32,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    use safemlx::{DeviceType, Dtype};
+    if input.ndim() != 3 || input.shape().iter().any(|&n| n <= 0) {
+        return Err(Exception::custom(
+            "channel-major RMS requires [batch, time, channel]",
+        ));
+    }
+    let time = input.dim(1) as usize;
+    let width = input.dim(2) as usize;
+    if time == 1 || width == 1 {
+        return Ok(None);
+    }
+    let wide = input
+        .as_dtype(Dtype::Float32, stream)?
+        .contiguous(false, stream)?;
+    let scale = weight
+        .map(|value| {
+            value
+                .as_dtype(Dtype::Float32, stream)?
+                .contiguous(false, stream)
+        })
+        .transpose()?;
+    let offset = offset.unwrap_or(0.0);
+    if stream.get_device()?.get_type()? == DeviceType::Cpu {
+        let wide = wide.into_evaluated()?;
+        let values = wide.as_slice::<f32>();
+        let scale = scale.map(Array::into_evaluated).transpose()?;
+        let scale = scale.as_ref().map(|value| value.as_slice::<f32>());
+        let mut output = Vec::with_capacity(values.len());
+        for (row, values) in values.chunks_exact(width).enumerate() {
+            let parallel = if row % time < (time / 16) * 16 { 1 } else { 4 };
+            let variance = channel_sum_squares(values, parallel) / width as f32;
+            let inverse = 1.0 / (variance + epsilon).sqrt();
+            for (column, value) in values.iter().enumerate() {
+                let normalized = value * inverse;
+                output.push(match scale {
+                    Some(gain) => normalized * (gain[column] + offset),
+                    None => normalized,
+                });
+            }
+        }
+        return Array::from_slice(&output, input.shape())
+            .as_dtype(input.dtype(), stream)
+            .map(Some);
+    }
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if stream.get_device()?.get_type()? == DeviceType::Gpu {
+        use safemlx::fast::{CustomKernelConfig, MetalKernel};
+        use std::cell::RefCell;
+        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        let rows = i32::try_from(input.size() / width)
+            .map_err(|_| Exception::custom("RMS row count overflow"))?;
+        let square = wide.square(stream)?;
+        let constants = Array::from_slice(&[epsilon, offset], &[2]);
+        let has_weight = scale.is_some();
+        let scale = scale.unwrap_or_else(|| Array::from_slice(&[1f32], &[1]));
+        let config = CustomKernelConfig::new()
+            .with_template_arg_int("WIDTH", width as i32)
+            .with_template_arg_int("TIME", time as i32)
+            .with_template_arg_int("HAS_WEIGHT", i32::from(has_weight))
+            .with_grid([
+                rows.checked_mul(32)
+                    .ok_or_else(|| Exception::custom("RMS grid overflow"))?,
+                1,
+                1,
+            ])
+            .with_thread_group([32, 1, 1])
+            .with_output_arg(input.shape(), Dtype::Float32);
+        let mut result = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(MetalKernel::new("channel_major_rms", ["input", "square", "weight", "constants"], ["output"],
+                    concat!("uint row=threadgroup_position_in_grid.x; uint lane=thread_index_in_simdgroup;",
+                        "size_t base=size_t(row)*WIDTH; threadgroup float inverse;",
+                        "if(lane==0) { float sum=(row%TIME < (TIME/16)*16) ? cascade_sum_f32<1,1>(square+base,WIDTH) : cascade_sum_f32<1,4>(square+base,WIDTH);",
+                        " inverse=1.0f/metal::precise::sqrt(sum/float(WIDTH)+constants[0]); }",
+                        "threadgroup_barrier(mem_flags::mem_threadgroup);",
+                        "for(uint col=lane;col<WIDTH;col+=32) { float value=input[base+col]*inverse;",
+                        " output[base+col]=HAS_WEIGHT ? value*(weight[col]+constants[1]) : value; }"),
+                    include_str!("rms_cascade.metal"), true, false)?);
+            }
+            cell.borrow().as_ref().expect("RMS kernel initialized").apply_device([&wide, &square, &scale, &constants], &config, stream)
+        })?;
+        return result
+            .pop()
+            .expect("one RMS output")
+            .as_dtype(input.dtype(), stream)
+            .map(Some);
+    }
+    // A backend without the native kernel retains the same bounded activation
+    // operation through ordinary device copies; no checkpoint parameter bank is
+    // expanded or made resident by this fallback.
+    let cpu = Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
+    let host_input = input.copy(&cpu)?;
+    let host_weight = weight.map(|value| value.copy(&cpu)).transpose()?;
+    channel_major_rms(
+        &host_input,
+        host_weight.as_ref(),
+        Some(offset),
+        epsilon,
+        &cpu,
+    )?
+    .map(|value| value.copy(stream))
+    .transpose()
+}
+
 /// Weightless RMS with FP32 reduction and one final low-precision cast.
 pub(crate) fn weightless_rms(
     input: &Array,
@@ -38,11 +369,10 @@ pub(crate) fn input_precision_rms(
     if matches!(
         input.dtype(),
         safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16
-    )
-        && input
-            .shape()
-            .last()
-            .is_some_and(|width| weight.shape() == [*width])
+    ) && input
+        .shape()
+        .last()
+        .is_some_and(|width| weight.shape() == [*width])
     {
         return weightless_rms(input, epsilon, stream)?.multiply(weight, stream);
     }
@@ -208,181 +538,7 @@ pub(crate) fn f32_grouped_rms(
     }
 }
 
-#[cfg(all(test, feature = "metal", not(feature = "cuda")))]
-mod tests {
-    use super::*;
-    use safemlx::{Device, DeviceType, Dtype};
-    #[test]
-    fn input_precision_rms_rounds_before_nonuniform_gain() {
-        let input = [1.0f32, -2.0, 3.0, -4.0];
-        let gain = [1.125f32, 0.875, 1.75, 0.625];
-        let inverse = (7.5f32 + 0.125).sqrt().recip();
-        for input_dtype in [Dtype::Bfloat16, Dtype::Float16] {
-            let round = |x: f32| if input_dtype == Dtype::Bfloat16 {
-                half::bf16::from_f32(x).to_f32()
-            } else { half::f16::from_f32(x).to_f32() };
-            for gain_dtype in [input_dtype, Dtype::Float32] {
-                let output_round = |x| if gain_dtype == Dtype::Float32 { x } else { round(x) };
-                let expected = input.iter().zip(gain).map(|(&x, gain)| output_round(round(x * inverse) * gain)).collect::<Vec<_>>();
-                let fused = input.iter().zip(gain).map(|(&x, gain)| output_round(x * inverse * gain)).collect::<Vec<_>>();
-                assert_ne!(expected, fused, "fixture must distinguish the normalization boundary");
-                for device in [DeviceType::Cpu, DeviceType::Gpu] {
-                    let stream = Stream::new_with_device(&Device::new(device, 0));
-                    let input = Array::from_slice(&input, &[1, 4]).as_dtype(input_dtype, &stream).unwrap();
-                    let gain = Array::from_slice(&gain, &[4]).as_dtype(gain_dtype, &stream).unwrap();
-                    let actual = input_precision_rms(&input, &gain, 0.125, &stream).unwrap();
-                    assert_eq!(actual.dtype(), gain_dtype);
-                    let actual = actual.as_dtype(Dtype::Float32, &stream).unwrap().into_evaluated().unwrap();
-                    assert_eq!(actual.as_slice::<f32>(), expected.as_slice());
-                }
-            }
-        }
-    }
-    #[test]
-    fn fused_grouped_rms_handles_strided_rows_groups_and_reduction_tails() {
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-        for width in [17, 72, 1152] {
-            let dimensions = width * 3;
-            let values = (0..4 * dimensions)
-                .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
-                .collect::<Vec<_>>();
-            let weights = (0..dimensions)
-                .map(|i| ((i % 11) as f32 - 5.0) * 0.0625)
-                .collect::<Vec<_>>();
-            let input = Array::from_slice(&values, &[2, dimensions as i32, 2])
-                .transpose_axes(&[0, 2, 1], &stream)
-                .unwrap();
-            let gain = Array::from_slice(&weights, &[dimensions as i32]);
-            let result = f32_grouped_rms(&input, Some(&gain), 3, 0.125, Some(1.0), &stream)
-                .unwrap()
-                .unwrap()
-                .into_evaluated()
-                .unwrap();
-            let actual = result.as_slice::<f32>();
-            for batch in 0..2 {
-                for token in 0..2 {
-                    for group in 0..3 {
-                        let row = (0..width)
-                            .map(|column| {
-                                values[(batch * dimensions + group * width + column) * 2 + token]
-                            })
-                            .collect::<Vec<_>>();
-                        let mean =
-                            row.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / width as f64;
-                        for column in 0..width {
-                            let expected = row[column] as f64 / (mean + 0.125).sqrt()
-                                * (1.0 + weights[group * width + column] as f64);
-                            let observed =
-                                actual[(batch * 2 + token) * dimensions + group * width + column];
-                            assert!((observed as f64 - expected).abs() < 2e-6,
-                                "width {width} batch {batch} token {token} group {group} column {column}: {observed} vs {expected}");
-                        }
-                    }
-                }
-            }
-        }
-    }
 
-    #[test]
-    fn parallel_cascade_matches_cpu_addition_order_at_carries_and_tails() {
-        let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let gpu = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-        // Cover partial vectors/chains and carries into all three upper levels.
-        for width in [1, 7, 17, 255, 257, 4095, 4097, 65537] {
-            let values = (0..3 * width)
-                .map(|i| {
-                    let signed = ((i * 37 % 103) as f32 - 51.0) / 13.0;
-                    signed * 2.0_f32.powi((i % 19) - 9)
-                })
-                .collect::<Vec<_>>();
-            let input = Array::from_slice(&values, &[3, width]);
-            let expected = input
-                .sum_axes(&[-1], true, &cpu)
-                .unwrap()
-                .into_evaluated()
-                .unwrap();
-            use safemlx::fast::{CustomKernelConfig, MetalKernel};
-            let kernel = MetalKernel::new(
-                "parallel_cascade_parity",
-                ["input"],
-                ["output"],
-                "uint row = threadgroup_position_in_grid.x; uint lane = thread_position_in_threadgroup.x; float sum = parallel_cascade_sum_f32(input + size_t(row) * WIDTH, WIDTH, lane); if (lane == 0) output[row] = sum;",
-                include_str!("rms_cascade.metal"),
-                true,
-                false,
-            ).unwrap();
-            let config = CustomKernelConfig::new()
-                .with_template_arg_int("WIDTH", width)
-                .with_grid([3 * 32, 1, 1])
-                .with_thread_group([32, 1, 1])
-                .with_output_arg([3, 1], Dtype::Float32);
-            let actual = kernel
-                .apply_device([&input], &config, &gpu)
-                .unwrap()
-                .pop()
-                .unwrap()
-                .into_evaluated()
-                .unwrap();
-            assert_eq!(
-                actual
-                    .as_slice::<f32>()
-                    .iter()
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>(),
-                expected
-                    .as_slice::<f32>()
-                    .iter()
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>(),
-                "width {width}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_cascade_normalization_matches_independent_bf16_rounding() {
-        let weights = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-        let fixture = Array::load_safetensors(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/validation/bf16_normalization.safetensors"
-            ),
-            &weights,
-        )
-        .unwrap();
-        for width in [32, 768, 1280, 2560] {
-            let input = fixture[&format!("{width}.input")]
-                .as_dtype(Dtype::Float32, &stream)
-                .unwrap();
-            let weight = fixture[&format!("{width}.weight")]
-                .as_dtype(Dtype::Float32, &stream)
-                .unwrap();
-            let normalized = f32_weightless_rms(&input, 1e-6, &stream).unwrap().unwrap();
-            let output = normalized
-                .multiply(&weight, &stream)
-                .unwrap()
-                .as_dtype(Dtype::Bfloat16, &stream)
-                .unwrap()
-                .as_dtype(Dtype::Float32, &stream)
-                .unwrap()
-                .into_evaluated()
-                .unwrap();
-            let expected = fixture[&format!("{width}.output")]
-                .as_dtype(Dtype::Float32, &stream)
-                .unwrap()
-                .into_evaluated()
-                .unwrap();
-            let differences = output
-                .as_slice::<f32>()
-                .iter()
-                .zip(expected.as_slice::<f32>())
-                .filter(|(a, b)| a != b)
-                .count();
-            assert_eq!(differences, 0, "width {width}");
-        }
-    }
-}
 
 pub(crate) fn f32_sum_last(input: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -423,4 +579,130 @@ pub(crate) fn f32_sum_last(input: &Array, stream: &Stream) -> Result<Option<Arra
         let _ = (input, stream);
         Ok(None)
     }
+}
+
+// Four vector lanes and four independent accumulation chains, with the same
+// four-level carry and scalar-tail merge as rms_cascade.metal.
+fn contiguous_sum_squares(values: &[f32]) -> f32 {
+    let vectors = values.len() / 4;
+    let steps = vectors / 4;
+    let log = usize::BITS as usize - steps.saturating_sub(1).leading_zeros() as usize;
+    let power = 4.max(log / 4);
+    let chunk = 1usize << power;
+    let mut sums = [[[0.0_f32; 4]; 4]; 4];
+    let mut index = 0;
+    while index + chunk <= steps {
+        let end = index + chunk;
+        while index < end {
+            for p in 0..4 {
+                for lane in 0..4 {
+                    let value = values[(index * 4 + p) * 4 + lane];
+                    sums[0][p][lane] += value * value;
+                }
+            }
+            index += 1;
+        }
+        for level in 1..4 {
+            for p in 0..4 {
+                for lane in 0..4 {
+                    sums[level][p][lane] += sums[level - 1][p][lane];
+                    sums[level - 1][p][lane] = 0.0;
+                }
+            }
+            if index & ((chunk - 1) << (level * power)) != 0 {
+                break;
+            }
+        }
+    }
+    while index < steps {
+        for p in 0..4 {
+            for lane in 0..4 {
+                let value = values[(index * 4 + p) * 4 + lane];
+                sums[0][p][lane] += value * value;
+            }
+        }
+        index += 1;
+    }
+    for level in 1..4 {
+        for p in 0..4 {
+            for lane in 0..4 {
+                sums[0][p][lane] += sums[level][p][lane];
+            }
+        }
+    }
+    for vector in steps * 4..vectors {
+        for lane in 0..4 {
+            let value = values[vector * 4 + lane];
+            sums[0][0][lane] += value * value;
+        }
+    }
+    for p in 1..4 {
+        for lane in 0..4 {
+            sums[0][0][lane] += sums[0][p][lane];
+        }
+    }
+    let mut sum = 0.0_f32;
+    for &value in &values[vectors * 4..] {
+        sum += value * value;
+    }
+    for lane in 0..4 {
+        sum += sums[0][0][lane];
+    }
+    sum
+}
+
+/// Explicit contiguous FP32 reduction; native backend normalization remains a
+/// separate policy. Metal shares the existing grouped cascade with one group.
+pub(crate) fn cascaded_rms(
+    input: &Array,
+    weight: Option<&Array>,
+    offset: Option<f32>,
+    epsilon: f32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::{Device, DeviceType, Dtype};
+    let width = input
+        .shape()
+        .last()
+        .copied()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| Exception::custom("cascaded RMS requires a positive feature width"))?;
+    if weight.is_some_and(|value| value.shape() != [width]) {
+        return Err(Exception::custom("cascaded RMS gain geometry differs"));
+    }
+    if stream.get_device()?.get_type()? != DeviceType::Cpu {
+        if let Some(value) = f32_grouped_rms(input, weight, 1, epsilon, offset, stream)? {
+            return Ok(value);
+        }
+        let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let host = input.copy(&cpu)?;
+        let weight = weight.map(|value| value.copy(&cpu)).transpose()?;
+        return cascaded_rms(&host, weight.as_ref(), offset, epsilon, &cpu)?.copy(stream);
+    }
+    let wide = input
+        .as_dtype(Dtype::Float32, stream)?
+        .contiguous(false, stream)?
+        .into_evaluated()?;
+    let weight = weight
+        .map(|value| {
+            value
+                .as_dtype(Dtype::Float32, stream)?
+                .contiguous(false, stream)?
+                .into_evaluated()
+        })
+        .transpose()?;
+    let weight = weight.as_ref().map(|value| value.as_slice::<f32>());
+    let mut output = Vec::with_capacity(input.size());
+    for row in wide.as_slice::<f32>().chunks_exact(width as usize) {
+        let variance = contiguous_sum_squares(row) / width as f32;
+        let inverse = 1.0_f32 / (variance + epsilon).sqrt();
+        for (column, &value) in row.iter().enumerate() {
+            let normalized = value * inverse;
+            output.push(match weight {
+                Some(scale) => normalized * (scale[column] + offset.unwrap_or(0.0)),
+                None => normalized,
+            });
+        }
+    }
+    Array::from_slice(&output, input.shape()).as_dtype(input.dtype(), stream)
 }

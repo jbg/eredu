@@ -886,6 +886,7 @@ fn mixed_precision_covers_parameter_casts_and_promoted_state_without_double_char
 fn generic_topology() -> crate::execution_topology::TextExecutionTopology {
     use crate::execution_topology::*;
     let projection = |name: &str, input, output| ProjectionTopology {
+        arithmetic: eredu_nn::LinearArithmetic::Native,
         input,
         output,
         format: eredu_checkpoint::LinearFormat::Dense,
@@ -1155,6 +1156,7 @@ fn generic_target_rejects_zero_kernels_and_inconsistent_projection_contracts() {
 fn generic_expert_mechanism_bounds_selected_routes_without_a_family_dispatch() {
     use crate::execution_topology::*;
     let projection = |name: &str, input, output| ProjectionTopology {
+        arithmetic: eredu_nn::LinearArithmetic::Native,
         input,
         output,
         parameter: name.into(),
@@ -1509,6 +1511,7 @@ fn recurrent_workspace_retains_known_output_and_unknown_scan_tail() {
         kernel: 4,
         projections: vec![
             ProjectionTopology {
+                arithmetic: eredu_nn::LinearArithmetic::Native,
                 input: 32,
                 output: 6144,
                 parameter: "qkv".into(),
@@ -1517,6 +1520,7 @@ fn recurrent_workspace_retains_known_output_and_unknown_scan_tail() {
             },
             ProjectionTopology {
                 input: 2048,
+                arithmetic: eredu_nn::LinearArithmetic::Native,
                 output: 32,
                 parameter: "out".into(),
                 format: eredu_checkpoint::LinearFormat::Dense,

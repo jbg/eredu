@@ -19,7 +19,7 @@ pub(super) fn gguf_composite(
         }
         C::Gemma4(c) => gemma(g, c),
         C::Inkling(c) => inkling(g, c),
-        C::MuseGlimmer(c) => muse(g, c),
+        C::Muse(c) => muse(g, c),
         C::Qwen35(c) | C::Qwen35Pending(c) => qwen_hybrid(g, c),
         C::Qwen3Vl(c) => {
             qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
@@ -687,7 +687,7 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
         SafetensorsModelConfig::DeepSeekV4(c) => deepseek_v4(g, c),
         SafetensorsModelConfig::DiffusionGemma(c) => diffusion_gemma(g, c),
         SafetensorsModelConfig::Gemma4(c) => gemma(g, c),
-        SafetensorsModelConfig::MuseGlimmer(c) => muse(g, c),
+        SafetensorsModelConfig::Muse(c) => muse(g, c),
         SafetensorsModelConfig::Inkling(c) => inkling(g, c),
         SafetensorsModelConfig::QwenVl(c) => {
             qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
@@ -716,7 +716,7 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::DeepSeekV4(c) => deepseek_v4(g, c),
         GgufModelConfig::DiffusionGemma(c) => diffusion_gemma(g, c),
         GgufModelConfig::Gemma4(c) => gemma(g, c),
-        GgufModelConfig::MuseGlimmer(c) => muse(g, c),
+        GgufModelConfig::Muse(c) => muse(g, c),
         GgufModelConfig::Inkling(c) => inkling(g, c),
         GgufModelConfig::Gemma2(_)
         | GgufModelConfig::Llama(_)
@@ -1569,10 +1569,10 @@ fn gemma(g: &mut Builder, c: &crate::gemma4::FamilyConfig) {
     super::components::gemma4::readout(g, text);
 }
 
-fn muse(g: &mut Builder, c: &crate::muse_glimmer::DecoderConfig) {
+fn muse(g: &mut Builder, c: &crate::muse::DecoderConfig) {
     components(
         g,
-        crate::muse_glimmer::component_graph(c).expect("admitted component geometry"),
+        crate::muse::component_graph(c).expect("admitted component geometry"),
         "model",
         c.hidden_size as usize,
         c.vocab_size as usize,
@@ -1599,10 +1599,19 @@ fn muse(g: &mut Builder, c: &crate::muse_glimmer::DecoderConfig) {
                     c.num_experts_per_tok,
                     0,
                     c.norm_topk_prob,
-                    RoutingScoreTransform::Softmax,
+                    match c.routed_feed_forward {
+                        crate::muse::RoutedFeedForwardEquation::DirectSoftmax => RoutingScoreTransform::Softmax,
+                        crate::muse::RoutedFeedForwardEquation::CompressedSigmoid { .. } => RoutingScoreTransform::Sigmoid,
+                    },
                 )
             }),
         );
+        if c.is_moe() {
+            match crate::muse::text::routing_selection_spec(c) {
+                Ok(spec) => g.routing_control(&format!("decoder.{i}.feed_forward"), &format!("model.layers.{i}.routing"), spec, 0, false),
+                Err(error) => g.partial(format!("Muse routing control declaration failed: {error}")),
+            }
+        }
         super::components::muse::unit(g, c, i);
     }
     super::components::muse::readout(g, c);

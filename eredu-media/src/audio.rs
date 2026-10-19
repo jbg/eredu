@@ -59,6 +59,48 @@ impl<'a> AudioWaveform<'a> {
     }
 }
 
+/// Mono PCM padded on the right to complete a caller-declared frame cadence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaddedWaveform {
+    /// Contiguous mono samples, including final zero padding.
+    pub samples: Vec<f32>,
+    /// Original samples before padding.
+    pub valid_samples: usize,
+}
+
+/// Preserves waveform values and pads only its final incomplete cadence frame.
+/// Resampling is a separate host operation; mismatched sample rates are rejected.
+pub fn pad_waveform_to_cadence(
+    waveform: AudioWaveform<'_>,
+    required_sample_rate: u32,
+    samples_per_frame: usize,
+) -> Result<PaddedWaveform, MediaError> {
+    if required_sample_rate == 0 || waveform.sample_rate() != required_sample_rate {
+        return Err(MediaError::invalid(format!(
+            "waveform processor requires {required_sample_rate} Hz PCM, got {} Hz",
+            waveform.sample_rate()
+        )));
+    }
+    if samples_per_frame == 0 {
+        return Err(MediaError::invalid("waveform cadence must be positive"));
+    }
+    let valid_samples = waveform.samples().len();
+    let padded = valid_samples
+        .div_ceil(samples_per_frame)
+        .checked_mul(samples_per_frame)
+        .ok_or_else(|| MediaError::invalid("waveform padding length overflowed"))?;
+    let mut samples = Vec::new();
+    samples.try_reserve_exact(padded).map_err(|error| {
+        MediaError::invalid(format!("waveform padding allocation failed: {error}"))
+    })?;
+    samples.extend_from_slice(waveform.samples());
+    samples.resize(padded, 0.0);
+    Ok(PaddedWaveform {
+        samples,
+        valid_samples,
+    })
+}
+
 /// Model-independent log-mel extraction parameters.
 #[derive(Debug, Clone)]
 pub struct LogMelConfig {

@@ -30,6 +30,7 @@ pub fn mixer_spec(
     let spec = GatedResidualSpec {
         geometry,
         normalization: NormalizationConstructionSpec {
+            reduction: eredu_nn::NormalizationReduction::Native,
             dimensions: width,
             groups: Some(geometry.streams()),
             epsilon: config.norm_epsilon,

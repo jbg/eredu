@@ -190,6 +190,9 @@ pub(crate) mod qwen4;
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PreparationSelectionError {
+    /// Explicit media-source geometry, processor or retained file admission failed.
+    #[error("media companion admission failed: {0}")]
+    MediaCompanion(#[from] std::sync::Arc<crate::muse::media_companion::MediaCompanionError>),
     /// Separately supplied draft parameters failed ancestry, geometry or file admission.
     #[error("draft adapter admission failed: {0}")]
     DraftAdapter(String),
@@ -478,6 +481,13 @@ where
             .map_err(PreparationSelectionError::DraftAdapter)
     }).transpose()?;
     let inspection = adapted_inspection.as_ref().unwrap_or(inspection);
+    let media_inspection = if request.media_companions().is_empty() { None } else {
+        let architecture = inspection.architecture_plan().clone()
+            .with_media_companions(request.media_companions())
+            .map_err(|e| PreparationSelectionError::MediaCompanion(std::sync::Arc::new(e)))?;
+        Some(inspection.clone().map_architecture_plan(|_| architecture))
+    };
+    let inspection = media_inspection.as_ref().unwrap_or(inspection);
     let validated = request.validate_model_preparation()?;
     if matches!(
         request.media_execution(),

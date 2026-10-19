@@ -1005,7 +1005,7 @@ where
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
-    ) -> Result<Option<(i32, i32)>, String> {
+    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
         if group != 0 {
             return Ok(None);
         }
@@ -1025,7 +1025,7 @@ where
                 i32::try_from(patches.len())
                     .ok()
                     .and_then(|count| maximum.checked_mul(count))
-                    .map(|extent| (extent, self.config.vision.as_ref().unwrap().hidden_size))
+                    .map(|extent| (extent, self.config.vision.as_ref().unwrap().hidden_size).into())
                     .ok_or_else(|| "batched image continuation extent exceeds i32".into())
             })
             .transpose()

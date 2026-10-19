@@ -59,8 +59,15 @@ fn promotion_cases(stream: &Stream) {
                 stream,
             )
         });
-        let actual =
-            MlxTensor::layer_norm(&input, weight.as_ref(), bias.as_ref(), 1e-6, stream).unwrap();
+        let actual = MlxTensor::layer_norm(
+            &input,
+            weight.as_ref(),
+            bias.as_ref(),
+            1e-6,
+            eredu_nn::LayerNormalizationArithmetic::Native,
+            stream,
+        )
+        .unwrap();
         let reference = safemlx::fast::layer_norm(
             input.as_array(),
             weight.as_ref().map(MlxTensor::as_array),

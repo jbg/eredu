@@ -211,7 +211,7 @@ pub(crate) fn materialize_model_plan(
         PreparedExecutionError::Backend(error) => error,
         error => Error::ArchitectureModel(error.to_string()),
     })
-    .and_then(|model| model.with_capture_discovery(capture_discovery))
+    .and_then(|model| model.with_target_discovery(capture_discovery))
 }
 
 struct MlxExecutableAssembler {

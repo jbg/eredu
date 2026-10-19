@@ -6,6 +6,7 @@ fn native_intervention_estimates_account_for_group_masks_and_host_lookup() {
         expert_count: 64,
         top_k: 2,
         scoring: RoutingScoring::Softmax,
+        selection_order: eredu_core::intervention::RoutingSelectionOrder::Ranked,
         normalize_selected: true,
         normalization_epsilon: 0.,
         coefficient_scale: 1.,
@@ -305,7 +306,7 @@ fn verify_prepaid_partition_activation(device: safemlx::DeviceType) {
             routing: None,
         };
         InterventionPlan {
-            schema_version: 1,
+            schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
             operations: vec![InterventionOperation {
                 id: "edit".into(),
                 target: point.path.clone(),
@@ -320,7 +321,7 @@ fn verify_prepaid_partition_activation(device: safemlx::DeviceType) {
         }
         .admit(
             &InterventionDiscovery {
-                schema_version: 1,
+                schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
                 artifact_identity: "fixture".into(),
                 session_identity: Some("native-fixture".into()),
                 points: vec![point],

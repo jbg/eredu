@@ -87,6 +87,9 @@ fn local_layout_groups<'a>(
     let mut layout = crate::LocalModelLayout::default();
     for owned in groups {
         let group = owned.group();
+        let (member_rank, member_parts) = group
+            .partition_coordinates(tensor_rank, tensor_parts)
+            .map_err(|error| error.to_string())?;
         // A routed expert bank is packed when at least one member carries the
         // leading expert dimension in addition to its matrix dimensions.  The
         // complete group shares that leading dimension, including rank-two
@@ -138,7 +141,7 @@ fn local_layout_groups<'a>(
         let logical_range = group
             .partition_units()
             .map(|units| {
-                eredu_core::balanced_contiguous_range(units, tensor_parts, tensor_rank, false)
+                eredu_core::balanced_contiguous_range(units, member_parts, member_rank, false)
             })
             .transpose()
             .map_err(|error| error.to_string())?;
@@ -151,7 +154,7 @@ fn local_layout_groups<'a>(
             }
             let (placement, local_shape) = if let Some(range) = &packed_expert_range {
                 let (tensor_placement, mut shape) =
-                    resolve_member(member, group.partition_units(), tensor_rank, tensor_parts)?;
+                    resolve_member(member, group.partition_units(), member_rank, member_parts)?;
                 shape[0] = range.len();
                 let placement = if tensor_parts == 1 {
                     crate::TensorPlacement::Range {
@@ -166,7 +169,7 @@ fn local_layout_groups<'a>(
                 };
                 (placement, shape)
             } else {
-                resolve_member(member, group.partition_units(), tensor_rank, tensor_parts)?
+                resolve_member(member, group.partition_units(), member_rank, member_parts)?
             };
             let mut tensor = crate::LocalTensorLayout::new(
                 group.logical_name(),
@@ -385,6 +388,123 @@ fn indexed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_logical_units_keep_complete_dense_and_nvfp4_companions() {
+        use crate::{
+            MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec,
+            ParameterMemberSpec, ParameterRole, PartitionUnitAssignment, TensorPlacement,
+        };
+        let distinct = ParameterGroupSpec::partitioned(
+            "kv",
+            ParameterRole::AttentionHeads,
+            2,
+            ["key.weight", "value.weight"].map(|name| {
+                ParameterMemberSpec::new(name, [32, 32], MemberSharding::Partitioned { axis: 0 })
+            }),
+        )
+        .unwrap();
+        let owned =
+            |group| OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("kv"), group);
+        assert!(local_layout_groups([&owned(distinct.clone())], 0, 4, 0, 1).is_err());
+        let uneven = ParameterGroupSpec::partitioned(
+            "query",
+            ParameterRole::AttentionHeads,
+            3,
+            [ParameterMemberSpec::new(
+                "query.weight",
+                [48, 32],
+                MemberSharding::Partitioned { axis: 0 },
+            )],
+        )
+        .unwrap();
+        assert!(local_layout_groups([&owned(uneven.clone())], 0, 2, 0, 1).is_ok());
+        let even = uneven
+            .with_partition_unit_assignment(PartitionUnitAssignment::Even)
+            .unwrap();
+        assert!(local_layout_groups([&owned(even)], 0, 2, 0, 1).is_err());
+        let repeated = distinct
+            .with_partition_unit_assignment(PartitionUnitAssignment::Repeat { semantic_units: 2 })
+            .unwrap();
+        assert!(local_layout_groups([&owned(repeated.clone())], 0, 3, 0, 1).is_err());
+        for packed in [false, true] {
+            let groups = if packed {
+                crate::expand_linear_format_parameter_groups(vec![repeated.clone()], |member| {
+                    Ok(Some(
+                        eredu_nn::LinearFormatSpec::nvfp4(
+                            eredu_nn::ParameterSpec::trainable(format!(
+                                "{}.blocks",
+                                member.target()
+                            ))
+                            .unwrap(),
+                            eredu_nn::ParameterSpec::trainable(format!(
+                                "{}.global",
+                                member.target()
+                            ))
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    ))
+                })
+                .unwrap()
+            } else {
+                vec![repeated.clone()]
+            };
+            let group = owned(groups.into_iter().next().unwrap());
+            for rank in 0..4 {
+                let layout = local_layout_groups([&group], rank, 4, 0, 1).unwrap();
+                for name in ["key.weight", "value.weight"] {
+                    let tensor = layout.tensor(name).unwrap();
+                    let (start, end) = if rank < 2 { (0, 16) } else { (16, 32) };
+                    assert_eq!(tensor.local_shape(), [16, if packed { 4 } else { 32 }]);
+                    assert_eq!(
+                        tensor.placement(),
+                        &TensorPlacement::Range {
+                            axis: 0,
+                            start,
+                            end
+                        }
+                    );
+                    assert_eq!(tensor.logical_range(), Some(&(rank / 2..rank / 2 + 1)));
+                    if packed {
+                        let blocks = layout.tensor(&format!("{name}.blocks")).unwrap();
+                        assert_eq!(blocks.local_shape(), [16, 2]);
+                        assert_eq!(blocks.placement(), tensor.placement());
+                        assert_eq!(
+                            layout
+                                .tensor(&format!("{name}.global"))
+                                .unwrap()
+                                .placement(),
+                            &TensorPlacement::Replicated
+                        );
+                    }
+                }
+            }
+        }
+        // Coarsening a two-head domain into one physical block must not silently
+        // turn head replication into replication of the complete projection.
+        let coarsened = crate::expand_linear_format_parameter_groups(vec![repeated], |member| {
+            Ok(Some(
+                eredu_nn::LinearFormatSpec::scaled(
+                    eredu_checkpoint::LinearFormat::E4M3BlockFp8(
+                        eredu_checkpoint::BlockFp8Format::new(
+                            32,
+                            32,
+                            eredu_checkpoint::BlockFp8ScaleEncoding::FloatingPoint,
+                        )
+                        .unwrap(),
+                    ),
+                    eredu_nn::ParameterSpec::trainable(format!("{}.scale", member.target()))
+                        .unwrap(),
+                )
+                .unwrap(),
+            ))
+        })
+        .unwrap();
+        let group = owned(coarsened.into_iter().next().unwrap());
+        assert!(local_layout_groups([&group], 0, 1, 0, 1).is_ok());
+        assert!(local_layout_groups([&group], 0, 4, 0, 1).is_err());
+    }
 
     #[test]
     fn physical_chunk_placement_covers_short_tail_and_matching_scales() {

@@ -53,6 +53,7 @@ pub fn recurrent_spec(
         input_beta: linear("in_proj_b", config.hidden_size, r.value_heads)?,
         input_decay: linear("in_proj_a", config.hidden_size, r.value_heads)?,
         convolution: CausalDepthwiseConvolutionSpec {
+            arithmetic: eredu_nn::ConvolutionArithmetic::Native,
             dilation: 1,
             channels: qkv,
             kernel_size: r.kernel,

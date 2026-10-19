@@ -242,6 +242,7 @@ mod tests {
     use crate::execution_topology::*;
     fn topology() -> TextExecutionTopology {
         let p = ProjectionTopology {
+            arithmetic: eredu_nn::LinearArithmetic::Native,
             input: 128,
             output: 128,
             format: eredu_checkpoint::LinearFormat::Dense,

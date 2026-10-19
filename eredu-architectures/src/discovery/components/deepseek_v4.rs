@@ -79,6 +79,7 @@ pub(in crate::discovery) fn readout(g: &mut Builder, c: &V4Args) {
         embedding_scale: ComponentScalar::new(1.0),
         tied_embeddings: false,
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             score_writes: vec![],
             stream_residual: Some(ComponentStreamResidual {
@@ -283,6 +284,7 @@ pub(in crate::discovery) fn unit(
         write_parameter_group: parameter_group,
         write_bias: None,
         activation_equation: ComponentActivation::Attention {
+            attended_head_normalization: None,
             query_heads: heads,
             key_value_heads: 1,
             head_width: dim,

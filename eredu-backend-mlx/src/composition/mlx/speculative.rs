@@ -33,6 +33,8 @@ use crate::{
 };
 
 mod assistant;
+pub(super) mod memory_observation;
+mod parameter_policy;
 pub(crate) mod autoregressive;
 mod completion;
 mod execution_streams;
@@ -52,6 +54,98 @@ pub(crate) use sampling::validate_control_capture;
 pub use sampling::MlxSpeculativeSampling;
 
 #[cfg(test)]
-mod completion_tests;
+mod test_fixture;
 #[cfg(test)]
-mod external_materialization_tests;
+mod completion_tests;
+
+/// Exercises invocation-group binding against a real selected target in native tests.
+#[cfg(test)]
+pub(crate) fn verify_retained_assistant_tensor_group(
+    session: &mut super::MlxModelSession,
+    stream: &Stream,
+    rank: eredu_core::ParallelRankTopology,
+) {
+    use eredu_architectures::external_assistant::{
+        ExternalAssistantExecutionMechanisms, MuseAssistantArchitecture,
+    };
+    use eredu_core::checkpoint::TensorDtype;
+    use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
+    use eredu_runtime::{
+        CommunicationGroupRequirements, CommunicationOperation, CommunicationOperationRequirement,
+        CommunicationTensorLimits,
+    };
+    let requirements = |elements| {
+        CommunicationGroupRequirements::new([CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllReduceSum,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 3, elements, None).unwrap(),
+            true,
+        )
+        .unwrap()])
+        .unwrap()
+    };
+    let binding = session.speculative_partition_binding();
+    let context =
+        SpeculativeExecutionStreams::single(stream).with_capture_binding(binding.as_ref());
+    let entered = std::cell::Cell::new(false);
+    let refused = session.with_prepared_model_operation(
+        |local| {
+            let local = local.and_then(|()| {
+                if rank.global_rank() == 1 {
+                    Err(Error::Speculative(
+                        "injected target ownership refusal".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            context.finish_preparation(
+                eredu_core::run_preparation::TextPreparationStage::Request,
+                local,
+                |error| Error::Exception(Exception::from_source(error)),
+            )
+        },
+        |_, ()| {
+            entered.set(true);
+            Ok(())
+        },
+    );
+    assert!(refused.is_err());
+    assert!(!entered.get(), "peer refusal precedes native model access");
+    session.ensure_no_submission_in_flight().unwrap();
+    let group =
+        <external::MlxExternalAssistantMechanisms as ExternalAssistantExecutionMechanisms<
+            MuseAssistantArchitecture,
+        >>::assistant_parallel_context(context, &requirements(16))
+        .unwrap();
+    if rank.tensor_parallel_size() == 1 {
+        assert!(group.is_none());
+    } else {
+        let rejected =
+            <external::MlxExternalAssistantMechanisms as ExternalAssistantExecutionMechanisms<
+                MuseAssistantArchitecture,
+            >>::assistant_parallel_context(context, &requirements(usize::MAX));
+        assert!(
+            rejected.is_err(),
+            "assistant bounds must not enlarge the retained target group"
+        );
+        let group = group.expect("target's retained tensor communicator");
+        assert_eq!(
+            MlxNeuralBackend::parallel_size(group),
+            rank.tensor_parallel_size()
+        );
+        assert_eq!(
+            MlxNeuralBackend::parallel_rank(group),
+            rank.tensor_parallel_rank()
+        );
+        let value = MlxTensor::from_array(Array::from_slice(
+            &[rank.tensor_parallel_rank() as f32 + 1.; 16],
+            &[1, 1, 16],
+        ));
+        let reduced = MlxNeuralBackend::sum_parallel(value, group, stream).unwrap();
+        let values = reduced.to_f32_vec(stream).unwrap();
+        let size = rank.tensor_parallel_size();
+        let expected = (size * (size + 1) / 2) as f32;
+        assert!(values.iter().all(|value| *value == expected));
+    }
+}

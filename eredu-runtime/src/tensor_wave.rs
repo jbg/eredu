@@ -21,6 +21,11 @@ pub enum RoutedTensorReduction {
     Status,
     /// Ordinary floating hidden output with shape `[batch, sequence, hidden_width]`.
     Hidden,
+    /// Exact axes with the selected activation representation from the pipeline.
+    Activation {
+        /// Invocation-relative axes.
+        shape: Vec<RoutedTensorDimension>,
+    },
     /// An exact architecture-declared shape and scalar representation.
     Tensor {
         /// Invocation-relative axes.
@@ -42,6 +47,20 @@ impl RoutedTensorReduction {
         if batch <= 0 || sequence <= 0 {
             return Err(invalid());
         }
+        let resolve_shape = |shape: &[RoutedTensorDimension]| {
+            shape
+                .iter()
+                .map(|axis| match axis {
+                    RoutedTensorDimension::Fixed(size) => Ok(*size),
+                    RoutedTensorDimension::Batch => Ok(batch),
+                    RoutedTensorDimension::Sequence => Ok(sequence),
+                    RoutedTensorDimension::Tokens(factor) => batch
+                        .checked_mul(sequence)
+                        .and_then(|rows| rows.checked_mul(*factor))
+                        .ok_or_else(invalid),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
         let (shape, dtype) = match self {
             Self::Status => (vec![1], Some(TensorElementType::I32)),
             Self::Hidden => (
@@ -52,21 +71,8 @@ impl RoutedTensorReduction {
                 ],
                 None,
             ),
-            Self::Tensor { shape, dtype } => (
-                shape
-                    .iter()
-                    .map(|axis| match axis {
-                        RoutedTensorDimension::Fixed(size) => Ok(*size),
-                        RoutedTensorDimension::Batch => Ok(batch),
-                        RoutedTensorDimension::Sequence => Ok(sequence),
-                        RoutedTensorDimension::Tokens(factor) => batch
-                            .checked_mul(sequence)
-                            .and_then(|rows| rows.checked_mul(*factor))
-                            .ok_or_else(invalid),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                Some(*dtype),
-            ),
+            Self::Tensor { shape, dtype } => (resolve_shape(shape)?, Some(*dtype)),
+            Self::Activation { shape } => (resolve_shape(shape)?, None),
         };
         if shape.is_empty() || shape.iter().any(|size| *size <= 0) {
             return Err(invalid());

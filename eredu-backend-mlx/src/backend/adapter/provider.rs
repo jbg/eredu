@@ -5,7 +5,7 @@ pub struct MlxBackend<'a> {
     stream: Stream,
     weights_stream: Stream,
     realized_device: Option<MlxDeviceIdentity>,
-    world: Option<&'a safemlx::distributed::Group>,
+    world: Option<std::borrow::Cow<'a, safemlx::distributed::Group>>,
 }
 
 impl MlxBackend<'static> {
@@ -22,12 +22,13 @@ impl MlxBackend<'static> {
         stream: &Stream,
         weights_stream: &Stream,
         realized_device: MlxDeviceIdentity,
+        world: Option<safemlx::distributed::Group>,
     ) -> Self {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
             realized_device: Some(realized_device),
-            world: None,
+            world: world.map(std::borrow::Cow::Owned),
         }
     }
 }
@@ -42,7 +43,7 @@ impl<'a> MlxBackend<'a> {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
             realized_device: None,
-            world: Some(world),
+            world: Some(std::borrow::Cow::Borrowed(world)),
         }
     }
     pub(crate) const fn stream(&self) -> &Stream {
@@ -54,7 +55,7 @@ impl<'a> MlxBackend<'a> {
     }
 
     pub(crate) fn validate_prepared_target(&self, target: &MlxPreparedTarget) -> Result<(), Error> {
-        target.validate(&self.stream, self.world)
+        target.validate(&self.stream, self.world.as_deref())
     }
 
     fn realize_selected_communication(
@@ -75,9 +76,9 @@ impl<'a> MlxBackend<'a> {
         })?;
         #[cfg(test)]
         crate::tests::support::path_instrumentation::communication_realization_attempt();
-        let world = self.world.ok_or_else(|| {
+        let world = self.world.as_deref().ok_or_else(|| {
             Error::Parallel(
-                "distributed model preparation requires native::distributed_backend".into(),
+                "distributed model preparation requires a bound native world".into(),
             )
         })?;
         rank.validate_execution_stream(&self.stream)?;

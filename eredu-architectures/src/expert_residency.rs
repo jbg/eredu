@@ -1017,6 +1017,23 @@ where
         movement,
     )?;
 
+    let output_rows = match invocation.combination {
+        ExpertRouteCombination::CoefficientWeightedSum => packing.source_tokens(),
+        ExpertRouteCombination::PerSelection => packing
+            .source_tokens()
+            .checked_mul(packing.routes_per_token())
+            .ok_or_else(|| {
+                RoutedMechanismExecutionError::InvalidPlan(
+                    "expert selection output row count overflowed".into(),
+                )
+            })?,
+        _ => {
+            return Err(RoutedMechanismExecutionError::InvalidPlan(
+                "unknown expert route combination".into(),
+            ))
+        }
+    };
+
     let packed_input = movement
         .gather_rows(input, packing.packed_token_indices())
         .map_err(RoutedMechanismExecutionError::from_error)?;
@@ -1126,7 +1143,7 @@ where
                 coefficients: &received_coefficients,
                 pass: invocation.pass,
                 access: invocation.pass.parameter_bank_access(),
-                combination: ExpertRouteCombination::CoefficientWeightedSum,
+                combination: invocation.combination,
             })
             .map_err(RoutedMechanismExecutionError::from_error)?;
         let (complete, reducible, post_reduce) = match output {
@@ -1205,7 +1222,15 @@ where
     // Transport preserves peer order. Sequential accumulation instead follows
     // the architecture-global expert order, independently for every token.
     let (returned, returned_bias, destinations) =
-        if invocation.reduction == eredu_nn::GroupReduction::SequentialGroupOrder {
+        if invocation.combination == ExpertRouteCombination::PerSelection {
+            // The verified inverse permutation restores each unique slot;
+            // no coefficient multiplication or expert summation occurs here.
+            (
+                returned,
+                returned_bias,
+                packing.packed_route_positions().to_vec(),
+            )
+        } else if invocation.reduction == eredu_nn::GroupReduction::SequentialGroupOrder {
             let mut order = (0..packed_rows).collect::<Vec<_>>();
             order.sort_by_key(|row| packing.packed_global_experts()[*row]);
             let returned = movement
@@ -1228,22 +1253,12 @@ where
             )
         };
     let output = movement
-        .scatter_add_rows(
-            returned,
-            &destinations,
-            packing.source_tokens(),
-            invocation.reduction,
-        )
+        .scatter_add_rows(returned, &destinations, output_rows, invocation.reduction)
         .map_err(RoutedMechanismExecutionError::from_error)?;
     let post_reduce = returned_bias
         .map(|bias| {
             movement
-                .scatter_add_rows(
-                    bias,
-                    &destinations,
-                    packing.source_tokens(),
-                    invocation.reduction,
-                )
+                .scatter_add_rows(bias, &destinations, output_rows, invocation.reduction)
                 .map_err(RoutedMechanismExecutionError::from_error)
         })
         .transpose()?;
@@ -2332,7 +2347,6 @@ mod tests {
                 || request.input.rows != request.owner_local_experts.len()
                 || request.coefficients.rows != request.input.rows
                 || request.selected_scores.rows != request.input.rows
-                || request.combination != ExpertRouteCombination::CoefficientWeightedSum
             {
                 return Err(FixtureError("provider request mismatch"));
             }
@@ -2348,7 +2362,11 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut output = request.input.clone();
             for row in 0..output.rows {
-                let coefficient = request.coefficients.values[row];
+                let coefficient = if request.combination == ExpertRouteCombination::PerSelection {
+                    1.0
+                } else {
+                    request.coefficients.values[row]
+                };
                 let expert_scale = (request.owner_local_experts[row] + 1) as f32;
                 for column in 0..output.columns {
                     output.values[row * output.columns + column] *= coefficient * expert_scale;
@@ -2394,7 +2412,11 @@ mod tests {
                 vec![0.0; request.input.rows * request.input.columns],
             );
             for row in 0..request.input.rows {
-                let coefficient = request.coefficients.values[row];
+                let coefficient = if request.combination == ExpertRouteCombination::PerSelection {
+                    1.0
+                } else {
+                    request.coefficients.values[row]
+                };
                 let expert_scale = (request.owner_local_experts[row] + 1) as f32;
                 let bias = coefficient * (request.global_experts[row] + 1) as f32;
                 for column in 0..request.input.columns {
@@ -2462,6 +2484,7 @@ mod tests {
             scores,
             coefficients,
             eredu_runtime::ExpertRouteInvocation {
+                combination: eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum,
                 reduction: eredu_nn::GroupReduction::Sum,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 unit: 7,
@@ -2671,6 +2694,7 @@ mod tests {
                 &scores,
                 &coefficients,
                 eredu_runtime::ExpertRouteInvocation {
+                    combination: eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum,
                     reduction: eredu_nn::GroupReduction::Sum,
                     bank: eredu_runtime::RoutedBankId::new(1),
                     unit: 7,
@@ -2741,6 +2765,7 @@ mod tests {
                 &NumericTensor::new(1, 3, vec![1.0; 3]),
                 &NumericTensor::new(1, 3, vec![1.0; 3]),
                 eredu_runtime::ExpertRouteInvocation {
+                    combination: eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum,
                     bank: eredu_runtime::RoutedBankId::new(1),
                     unit: 7,
                     output_dimensions: 1,
@@ -2758,20 +2783,15 @@ mod tests {
     }
 
     #[test]
-    fn tp2_ep2_reverse_exchange_preserves_bias_for_one_post_sum_addition() {
-        let (realization, packing, counts, input, scores, coefficients) =
-            numeric_exchange_fixture();
-        let mut rank_outputs = Vec::new();
-
-        for tensor_rank in 0..2 {
+    fn per_selection_exchange_restores_unweighted_duplicate_slots() {
+        let (realization, _, counts, input, scores, coefficients) = numeric_exchange_fixture();
+        let packing = ExpertRoutePackingPlan::new(&realization, 2, 2, &[3, 2, 3, 3]).unwrap();
+        for reduction in [
+            eredu_nn::GroupReduction::Sum,
+            eredu_nn::GroupReduction::SequentialGroupOrder,
+        ] {
             let mut movement = NumericMovement::default();
-            let mut forward = IdentityExchange::default();
-            let mut reverse = IdentityExchange::default();
-            let mut provider = TensorParallelNumericProvider {
-                tensor_rank,
-                calls: 0,
-            };
-            let output = execute_expert_route_exchange_tensor_parallel(
+            let output = execute_expert_route_exchange(
                 &realization,
                 &packing,
                 &counts,
@@ -2779,45 +2799,97 @@ mod tests {
                 &scores,
                 &coefficients,
                 eredu_runtime::ExpertRouteInvocation {
-                    reduction: eredu_nn::GroupReduction::Sum,
+                    combination: ExpertRouteCombination::PerSelection,
+                    reduction,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     unit: 7,
                     output_dimensions: 2,
-                    pass: ExpertPass::Decode,
+                    pass: ExpertPass::Prefill,
                 },
                 &mut movement,
-                &mut forward,
-                &mut reverse,
-                &mut provider,
+                &mut IdentityExchange::default(),
+                &mut IdentityExchange::default(),
+                &mut NumericProvider::default(),
             )
             .unwrap();
-            let RoutedExpertTensorParallelOutput::Partial(output) = output else {
-                panic!("TP expert exchange collapsed a rank-local partial");
-            };
-            let (reducible, post_reduce) = output.into_parts();
-            rank_outputs.push((reducible, post_reduce.unwrap()));
-            assert_eq!(provider.calls, 1);
-            assert_eq!((forward.calls, reverse.calls), (6, 3));
-            assert_eq!(movement.scatter_rows, 2);
+            assert_eq!(
+                output,
+                NumericTensor::new(4, 2, vec![20.0, 2.0, 10.0, 1.0, 40.0, 4.0, 40.0, 4.0])
+            );
         }
+    }
 
-        assert_eq!(rank_outputs[0].1, rank_outputs[1].1);
-        let mut completed = rank_outputs[0].0.clone();
-        for (index, value) in completed.values.iter_mut().enumerate() {
-            *value += rank_outputs[1].0.values[index] + rank_outputs[0].1.values[index];
-        }
-        assert_eq!(
-            completed,
-            NumericTensor::new(2, 2, vec![32.5, 5.5, 311.0, 41.0])
-        );
+    #[test]
+    fn tp2_ep2_reverse_exchange_preserves_bias_for_one_post_sum_addition() {
+        for combination in [
+            ExpertRouteCombination::CoefficientWeightedSum,
+            ExpertRouteCombination::PerSelection,
+        ] {
+            let (realization, packing, counts, input, scores, coefficients) =
+                numeric_exchange_fixture();
+            let mut rank_outputs = Vec::new();
 
-        let mut incorrectly_added_per_rank = rank_outputs[0].0.clone();
-        for (index, value) in incorrectly_added_per_rank.values.iter_mut().enumerate() {
-            *value += rank_outputs[1].0.values[index]
-                + rank_outputs[0].1.values[index]
-                + rank_outputs[1].1.values[index];
+            for tensor_rank in 0..2 {
+                let mut movement = NumericMovement::default();
+                let mut forward = IdentityExchange::default();
+                let mut reverse = IdentityExchange::default();
+                let mut provider = TensorParallelNumericProvider {
+                    tensor_rank,
+                    calls: 0,
+                };
+                let output = execute_expert_route_exchange_tensor_parallel(
+                    &realization,
+                    &packing,
+                    &counts,
+                    &input,
+                    &scores,
+                    &coefficients,
+                    eredu_runtime::ExpertRouteInvocation {
+                        combination,
+                        reduction: eredu_nn::GroupReduction::Sum,
+                        bank: eredu_runtime::RoutedBankId::new(0),
+                        unit: 7,
+                        output_dimensions: 2,
+                        pass: ExpertPass::Decode,
+                    },
+                    &mut movement,
+                    &mut forward,
+                    &mut reverse,
+                    &mut provider,
+                )
+                .unwrap();
+                let RoutedExpertTensorParallelOutput::Partial(output) = output else {
+                    panic!("TP expert exchange collapsed a rank-local partial");
+                };
+                let (reducible, post_reduce) = output.into_parts();
+                rank_outputs.push((reducible, post_reduce.unwrap()));
+                assert_eq!(provider.calls, 1);
+                assert_eq!((forward.calls, reverse.calls), (6, 3));
+                assert_eq!(movement.scatter_rows, 2);
+            }
+
+            assert_eq!(rank_outputs[0].1, rank_outputs[1].1);
+            let mut completed = rank_outputs[0].0.clone();
+            for (index, value) in completed.values.iter_mut().enumerate() {
+                *value += rank_outputs[1].0.values[index] + rank_outputs[0].1.values[index];
+            }
+            assert_eq!(
+                completed,
+                if combination == ExpertRouteCombination::PerSelection {
+                    NumericTensor::new(4, 2, vec![33.0, 6.0, 64.0, 10.0, 63.0, 9.0, 124.0, 16.0])
+                } else {
+                    NumericTensor::new(2, 2, vec![32.5, 5.5, 311.0, 41.0])
+                }
+            );
+
+            let mut incorrectly_added_per_rank = rank_outputs[0].0.clone();
+            for (index, value) in incorrectly_added_per_rank.values.iter_mut().enumerate() {
+                *value += rank_outputs[1].0.values[index]
+                    + rank_outputs[0].1.values[index]
+                    + rank_outputs[1].1.values[index];
+            }
+            assert_ne!(completed, incorrectly_added_per_rank);
         }
-        assert_ne!(completed, incorrectly_added_per_rank);
     }
 
     #[test]

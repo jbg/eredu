@@ -152,6 +152,7 @@ pub mod state;
 mod weight_residency;
 
 pub use automatic_support::{
+    execution_unit_parameter_window_bytes,
     placed_recipe_peak_bytes, placed_source_recipe, residency_telemetry,
     selected_parameter_resources, selected_parameter_resources_for_layout,
     selected_text_bounded_requirement, BoundedResidencySizingError, SelectedParameterResources,
@@ -300,7 +301,8 @@ pub use parallel::{
     partition_parameter_group_chunks, partitioned_module_parameter_group,
     partitioned_projection_group, projection_parameter_group, segmented_projection_group,
     LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding, ShardingPolicy,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionUnitAssignment,
+    ProjectionSharding, ShardingPolicy,
     TensorPlacement,
 };
 pub use parameter::{
@@ -412,6 +414,7 @@ pub use realtime_session::{
     RealtimeSessionTransactionError, ReleasedRealtimeSession,
 };
 pub use replicated_session::{
+    ForwardCaptureBundle, ForwardCaptureSlot,
     construct_replicated_text_session, construct_replicated_text_session_with_execution,
     construct_replicated_text_session_with_runtime, prepare_block_refinement_contract,
     prepare_default_partitioned_runtime, prepare_layered_text_contract,
@@ -420,7 +423,8 @@ pub use replicated_session::{
     prepare_replicated_text_contract_with_addressable_parameters, DirectReplicatedTextExecution,
     DistributedSessionCheckpoint, DistributedStateCheckpoint, PartitionedRuntimeConstructionError,
     PartitionedSessionFactoryInput, PartitionedSessionPreparationError, PartitionedUnitScope,
-    PredictionTargetOperation, PreparedPartitionedRuntimeComponents,
+    PredictionTargetOperation, PredictionTargetTransport, PredictionTensorAssembly,
+    PredictionTensorAssemblyPlan, PredictionTensorSource, PreparedPartitionedRuntimeComponents,
     PreparedPartitionedSessionRuntime, PreparedReplicatedTextContract,
     ReplicatedRuntimeExecutionStrategy, ReplicatedTextExecutionStrategy, ReplicatedTextRuntime,
     ReplicatedTextSession, ReplicatedTextSessionCheckpoint, ReplicatedTextSessionError,
@@ -474,6 +478,7 @@ pub use speculative_selection::{
 pub use state::{
     realize_architecture_state, ArchitectureStateFactory, ArchitectureStatePartitionError,
     ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ArchitectureStatePlacement,
+    StatePartitionPacking,
     ArchitectureStateRealizationError, DeviceState, LayerRuntimeState, ModelStateIdentity,
     ResettableRuntimeLayerState, ResettableRuntimeState, RuntimeLayerState, RuntimeState,
     RuntimeStateComponents, StateError, StateLayout, StateSegmentId, StateSegmentLifetime,
@@ -520,3 +525,6 @@ pub use append_stream::{
     AppendOnlyStream, AppendStreamAllowances, AppendStreamBinding, AppendStreamError,
     AppendStreamLimits, AppendStreamSpec, ResidentAppendStream, RuntimeAppendStreams,
 };
+
+mod unit_policy_view;
+pub use unit_policy_view::{ProjectedUnitLease, UnitPolicyView, UnitPolicyViewError, UnitProjection};

@@ -11,7 +11,7 @@ mod routed;
 pub use routed::*;
 
 /// Independent wire version for intervention declarations, plans, and outcomes.
-pub const INTERVENTION_SCHEMA_VERSION: u32 = 1;
+pub const INTERVENTION_SCHEMA_VERSION: u32 = 2;
 /// Hard bound on operations, including inactive operations and their diagnostics.
 pub const MAX_INTERVENTION_OPERATIONS: usize = 1024;
 /// Hard bound on compact JSON plan bytes, including replacement values.
@@ -120,6 +120,16 @@ pub enum RoutingScoring {
     SqrtSoftplus,
 }
 
+/// Order retained after ordinary top-k selection and during coefficient reduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingSelectionOrder {
+    /// Descending score order.
+    Ranked,
+    /// Unranked selected partition, preserving its reduction order.
+    Partition,
+}
+
 /// Exact global routed-expert namespace and architecture coefficient policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterventionRoutingPolicy {
@@ -129,6 +139,8 @@ pub struct InterventionRoutingPolicy {
     pub top_k: u32,
     /// Score transform used by the ordinary router.
     pub scoring: RoutingScoring,
+    /// Selected-slot order used by the realized coefficient equation.
+    pub selection_order: RoutingSelectionOrder,
     /// Whether gathered scores are normalized before scaling.
     pub normalize_selected: bool,
     /// Denominator epsilon used by the architecture.

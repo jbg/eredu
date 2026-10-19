@@ -115,7 +115,7 @@ fn bind(
     assert!(rank.is_none());
     let primary = sources.primary().clone();
     let projector = sources
-        .companion(&eredu_core::GgufCompanionRole::MediaProjector)
+        .companion(&eredu_core::ArtifactCompanionRole::MediaProjector)
         .cloned();
     assert_eq!(
         primary.source_diagnostics().unwrap().physical_reads,

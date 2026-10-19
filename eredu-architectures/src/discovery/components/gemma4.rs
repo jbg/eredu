@@ -243,6 +243,7 @@ pub(in crate::discovery) fn unit_at(g: &mut Builder, c: &ModelArgs, layer: usize
         shared_write_weight: format!("{ap}.o_proj.weight"),
         write_bias: c.attention_bias.then(|| format!("{ap}.o_proj.bias")),
         activation_equation: ComponentActivation::Attention {
+            attended_head_normalization: None,
             query_heads: heads,
             key_value_heads: kv,
             head_width: dim,
@@ -489,6 +490,7 @@ pub(in crate::discovery) fn readout_at(g: &mut Builder, c: &ModelArgs, root: &st
         token_embedding_normalization: None,
         tied_embeddings: c.tie_word_embeddings,
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             stream_residual: None,
             residual: "readout.residual".into(),
             normalized: "readout.normalized".into(),

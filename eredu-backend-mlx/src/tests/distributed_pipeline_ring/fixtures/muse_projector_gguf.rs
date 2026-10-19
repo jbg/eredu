@@ -1,12 +1,12 @@
 // Use the published projector geometry with a bounded prepared patch grid.
 // The small decoder isolates component experiments from fixture storage size.
 fn write_muse_projector_gguf_component_fixture(path: &Path, routed: bool) {
-    use eredu_architectures::muse_glimmer;
+    use eredu_architectures::muse;
     use eredu_checkpoint::schema::{GgufTypeConstraint, TensorOperation};
 
     write_muse_glimmer_gguf_component_fixture(path, routed);
     let primary = eredu_gguf::Checkpoint::open(path).unwrap();
-    let args = muse_glimmer::DecoderConfig::from_gguf_catalog(
+    let args = muse::DecoderConfig::from_gguf_catalog(
         &primary,
         &primary.metadata().clone().into_iter().collect(),
     )
@@ -57,7 +57,7 @@ fn write_muse_projector_gguf_component_fixture(path: &Path, routed: bool) {
     let args = args
         .with_gguf_projector_metadata(&metadata.clone().into_iter().collect(), Default::default())
         .unwrap();
-    let plan = muse_glimmer::projector_gguf_plan(&args).unwrap();
+    let plan = muse::projector_gguf_plan(&args).unwrap();
     let mut encodings = BTreeMap::new();
     let tensors = plan
         .common_tensors

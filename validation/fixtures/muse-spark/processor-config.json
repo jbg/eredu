@@ -1,0 +1,63 @@
+{
+  "feature_extractor": {
+    "feature_extractor_type": "MuseSparkFeatureExtractor",
+    "feature_size": 1,
+    "padding_side": "right",
+    "padding_value": 0.0,
+    "return_attention_mask": true,
+    "samples_per_token": 1920,
+    "sampling_rate": 24000
+  },
+  "image_processor": {
+    "do_convert_rgb": true,
+    "do_normalize": true,
+    "do_rescale": true,
+    "do_resize": true,
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_processor_type": "MuseGlimmerImageProcessor",
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "max_image_tokens": 4096,
+    "merge_size": 2,
+    "patch_size": 14,
+    "resample": 1,
+    "rescale_factor": 0.00392156862745098,
+    "temporal_patch_size": 2
+  },
+  "processor_class": "MuseSparkProcessor",
+  "video_processor": {
+    "do_convert_rgb": true,
+    "do_normalize": true,
+    "do_rescale": true,
+    "do_resize": true,
+    "do_sample_frames": true,
+    "fps": 2.0,
+    "frame_timestamp_format": "Time: {timestamp:.2f}s",
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "max_video_frame_tokens": 256,
+    "merge_size": 2,
+    "num_frames": 600,
+    "patch_size": 14,
+    "resample": 1,
+    "rescale_factor": 0.00392156862745098,
+    "return_metadata": true,
+    "temporal_patch_size": 2,
+    "video_processor_type": "MuseGlimmerVideoProcessor"
+  }
+}

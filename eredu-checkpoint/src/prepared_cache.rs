@@ -258,6 +258,12 @@ struct CachedSource {
     _pin: File,
 }
 impl CheckpointSource for CachedSource {
+    fn has_direct_encoded_leases(&self) -> bool {
+        self.store.has_direct_encoded_leases()
+    }
+    fn retained_payload_bytes_upper_bound(&self) -> Option<u64> {
+        self.store.retained_payload_bytes_upper_bound()
+    }
     fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
         CheckpointSource::recipe_cache(&self.store)
     }

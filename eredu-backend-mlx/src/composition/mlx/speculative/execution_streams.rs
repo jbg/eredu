@@ -105,6 +105,17 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         self.capture
     }
 
+    pub(in crate::composition::mlx) fn assistant_parallel_context(
+        self,
+        requirements: &eredu_runtime::CommunicationGroupRequirements,
+    ) -> Result<Option<&'a crate::backend::runtime::distributed::Group>, eredu_core::BackendFailure>
+    {
+        match self.capture {
+            Some(binding) => binding.assistant_parallel_context(requirements),
+            None => Ok(None),
+        }
+    }
+
     pub(in crate::composition::mlx) fn coordinate_speculative_step(
         self,
         local: Vec<eredu_core::SpeculativeScheduleState>,

@@ -428,6 +428,16 @@ pub enum CapabilityError {
         /// Unsupported-input detail.
         reason: String,
     },
+    /// The selected artifact omits a component required by this media request.
+    #[error("{architecture} {modality:?} input requires an independently selected {component} companion")]
+    MissingCompanion {
+        /// Effective architecture identity.
+        architecture: String,
+        /// Modality requiring the absent component.
+        modality: crate::InputModality,
+        /// Architecture-declared component needed to prepare this request.
+        component: &'static str,
+    },
     /// A runtime observation could not be obtained.
     #[error("capability observation failed: {0}")]
     Observation(String),

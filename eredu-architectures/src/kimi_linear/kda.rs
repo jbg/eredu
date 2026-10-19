@@ -80,6 +80,7 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
         let convolution = |name: &str| {
             CausalDepthwiseConvolution::new(
                 CausalDepthwiseConvolutionSpec {
+                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
                     dilation: 1,
                     channels: projection,
                     kernel_size: args.kda_config.short_conv_kernel_size,

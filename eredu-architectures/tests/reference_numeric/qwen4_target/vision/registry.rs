@@ -8,7 +8,7 @@ use eredu_architectures::{
 };
 use eredu_core::{
     artifact::{ArtifactSource, CompanionSelection},
-    GgufCompanionRole, InputModality,
+    ArtifactCompanionRole, InputModality,
 };
 use eredu_runtime::*;
 
@@ -206,12 +206,12 @@ fn gguf_ordinary_media_registry_selects_from_retained_headers_and_separates_sour
     let sources =
         eredu_architectures::prepared_sources::prepare_model_sources(admitted, selected).unwrap();
     let companion = sources
-        .companion(&GgufCompanionRole::MediaProjector)
+        .companion(&ArtifactCompanionRole::MediaProjector)
         .unwrap();
     assert_eq!(sources.companions().count(), 1);
     assert!(sources
         .resolutions()
-        .target_companion(&GgufCompanionRole::MediaProjector)
+        .target_companion(&ArtifactCompanionRole::MediaProjector)
         .is_some());
     assert!(sources
         .primary()

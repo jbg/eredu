@@ -40,6 +40,7 @@ fn stream(
 fn indexer(context: &NumericContext) -> QsaIndexer<NumericBackend> {
     let p = |id| ParameterSpec::trainable(id).unwrap();
     let n = |id| NormalizationConstructionSpec {
+        reduction: eredu_nn::NormalizationReduction::Native,
         dimensions: 2,
         epsilon: 1e-5,
         groups: None,

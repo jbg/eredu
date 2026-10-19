@@ -375,7 +375,7 @@ impl From<InklingInputPartPlan> for PreparedInputPartPlan {
 
 /// Muse-Glimmer admission and execution plan for one prepared input part.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MuseGlimmerInputPartPlan {
+pub enum MuseInputPartPlan {
     /// Ordinary text token IDs.
     TextTokens {
         /// Decoder positions occupied by the part.
@@ -386,17 +386,37 @@ pub enum MuseGlimmerInputPartPlan {
         /// Semantic modality consumed by the vision tower.
         modality: InputModality,
         /// Architecture-selected placeholder span and patch grid.
-        ingress: MuseGlimmerIngressPlan,
+        ingress: MuseVisionIngressPlan,
         /// Decoder and workspace accounting for tower execution.
+        shape: MediaShapePlan,
+    },
+    /// Mono waveform input with independently padded clip boundaries.
+    Audio {
+        /// Exact waveform-to-decoder geometry and placeholder identity.
+        ingress: MuseAudioIngressPlan,
+        /// Decoder and activation accounting for the audio pyramid.
         shape: MediaShapePlan,
     },
 }
 
-impl From<MuseGlimmerInputPartPlan> for PreparedInputPartPlan {
-    fn from(plan: MuseGlimmerInputPartPlan) -> Self {
+/// Raw waveform geometry admitted before native construction or execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuseAudioIngressPlan {
+    /// Unpadded PCM samples in this independent attachment.
+    pub valid_samples: u64,
+    /// Right-padded samples, exactly divisible by the tower cadence.
+    pub padded_samples: u64,
+    /// Placeholder token from the selected decoder configuration.
+    pub placeholder_token_id: u32,
+    /// Audio positions emitted by the complete convolutional pyramid.
+    pub placeholder_count: u64,
+}
+
+impl From<MuseInputPartPlan> for PreparedInputPartPlan {
+    fn from(plan: MuseInputPartPlan) -> Self {
         match plan {
-            MuseGlimmerInputPartPlan::TextTokens { positions } => Self::Text { positions },
-            MuseGlimmerInputPartPlan::Vision { shape, .. } => Self::Media { shape },
+            MuseInputPartPlan::TextTokens { positions } => Self::Text { positions },
+            MuseInputPartPlan::Vision { shape, .. } | MuseInputPartPlan::Audio {shape, ..} => Self::Media { shape },
         }
     }
 }
@@ -412,7 +432,7 @@ pub struct InklingIngressPlan {
 
 /// Architecture-owned Muse-Glimmer ingress policy for one prepared tensor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MuseGlimmerIngressPlan {
+pub struct MuseVisionIngressPlan {
     /// Placeholder token selected for the input modality.
     pub placeholder_token_id: u32,
     /// Decoder placeholder span after spatial merging.
@@ -518,11 +538,11 @@ impl CompositePartPlan for InklingInputPartPlan {
     }
 }
 
-impl CompositePartPlan for MuseGlimmerInputPartPlan {
+impl CompositePartPlan for MuseInputPartPlan {
     fn decoder_positions(&self) -> u64 {
         match self {
             Self::TextTokens { positions } => *positions,
-            Self::Vision { shape, .. } => shape.decoder_positions,
+            Self::Vision { shape, .. } | Self::Audio {shape, ..} => shape.decoder_positions,
         }
     }
 }
@@ -631,13 +651,13 @@ pub fn admit_inkling_input<Tensor>(
 }
 
 /// Admits a complete Muse-Glimmer request before composite graph execution.
-pub fn admit_muse_glimmer_input<Tensor>(
-    args: &crate::muse_glimmer::DecoderConfig,
+pub fn admit_muse_input<Tensor>(
+    args: &crate::muse::DecoderConfig,
     input: &PreparedModelInput<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<AdmittedCompositeInput<MuseGlimmerInputPartPlan>, CapabilityError> {
+) -> Result<AdmittedCompositeInput<MuseInputPartPlan>, CapabilityError> {
     admit_composite_input(input, inspector, |part| {
-        muse_glimmer_input_part(args, part, inspector)
+        muse_input_part(args, part, inspector)
     })
 }
 
@@ -1945,38 +1965,39 @@ pub fn inkling_input_part<Tensor>(
     }
 }
 
-/// Derives prepared Muse-Glimmer media geometry and artifact modality policy.
-fn muse_glimmer(
-    args: &crate::muse_glimmer::DecoderConfig,
+/// Derives prepared Muse vision geometry and artifact modality policy.
+fn muse_vision(
+    args: &crate::muse::DecoderConfig,
     input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
+    let vision = args.vision_config.as_ref().ok_or_else(|| {
+        CapabilityError::MissingCompanion {
+            architecture: args.identity.text_model_type().into(),
+            modality: input.modality(),
+            component: "vision encoder and projector",
+        }
+    })?;
     if input.modality() == InputModality::Audio
         || (input.modality() == InputModality::Video
-            && args.weight_convention == crate::muse_glimmer::WeightConvention::Gguf)
+            && vision.input_policy == crate::muse::VisionInputPolicy::Images)
     {
         return Err(unsupported(
-            &args.model_type,
+            args.identity.text_model_type(),
             format!(
                 "loaded Muse-Glimmer artifact does not support {}",
                 input.modality().as_str()
             ),
         ));
     }
-    let vision = args.vision_config.as_ref().ok_or_else(|| {
-        unsupported(
-            &args.model_type,
-            "loaded Muse-Glimmer artifact has no vision projector",
-        )
-    })?;
     let grid = input.patch_grid.as_ref().ok_or_else(|| {
         unsupported(
-            &args.model_type,
+            args.identity.text_model_type(),
             "Muse-Glimmer media requires patch_grid metadata",
         )
     })?;
     if grid.shape.len() != 2 || grid.shape[0] == 0 || grid.shape[1] != 3 {
         return Err(unsupported(
-            &args.model_type,
+            args.identity.text_model_type(),
             format!(
                 "Muse-Glimmer patch_grid must be [items, 3], got {:?}",
                 grid.shape
@@ -1986,7 +2007,7 @@ fn muse_glimmer(
     let expected_values = checked_mul(grid.shape[0], 3, "Muse patch-grid scalar count")?;
     if u64::try_from(grid.values.len()).ok() != Some(expected_values) {
         return Err(unsupported(
-            &args.model_type,
+            args.identity.text_model_type(),
             "Muse-Glimmer patch_grid has an incomplete row",
         ));
     }
@@ -1999,7 +2020,7 @@ fn muse_glimmer(
             || u64::try_from(entry[2]).unwrap_or_default() % merge != 0
         {
             return Err(unsupported(
-                &args.model_type,
+                args.identity.text_model_type(),
                 "Muse-Glimmer vision grids must be positive and merge-divisible",
             ));
         }
@@ -2027,7 +2048,7 @@ fn muse_glimmer(
     }
     if input.payload_shape.first().copied() != Some(patches) {
         return Err(unsupported(
-            &args.model_type,
+            args.identity.text_model_type(),
             format!(
                 "Muse-Glimmer payload has {} patches but metadata describes {patches}",
                 input.payload_shape.first().copied().unwrap_or_default()
@@ -2048,11 +2069,11 @@ fn muse_glimmer(
 
 /// Validates one prepared Muse-Glimmer part and derives the exact placeholder,
 /// ingress geometry, and capability-accounting plan consumed by a backend.
-pub fn muse_glimmer_input_part<Tensor>(
-    args: &crate::muse_glimmer::DecoderConfig,
+pub fn muse_input_part<Tensor>(
+    args: &crate::muse::DecoderConfig,
     input: &PreparedInputPart<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<MuseGlimmerInputPartPlan, CapabilityError> {
+) -> Result<MuseInputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
     let descriptor = &inspected.descriptor;
     let modality = descriptor.modality();
@@ -2060,17 +2081,17 @@ pub fn muse_glimmer_input_part<Tensor>(
     let shape = u64_shape(descriptor.payload())?;
     match (modality, payload) {
         (InputModality::Text, InputPayloadKind::TokenIds) => {
-            Ok(MuseGlimmerInputPartPlan::TextTokens {
+            Ok(MuseInputPartPlan::TextTokens {
                 positions: batch_one_sequence(
                     &shape,
                     2,
                     "Muse-Glimmer text token IDs",
-                    &args.model_type,
+                    args.identity.text_model_type(),
                 )?,
             })
         }
         (modality @ (InputModality::Image | InputModality::Video), InputPayloadKind::Tensor) => {
-            let shape = muse_glimmer(args, &inspected)?;
+            let shape = muse_vision(args, &inspected)?;
             let placeholder_token_id = if modality == InputModality::Image {
                 args.image_token_id
             } else {
@@ -2086,9 +2107,9 @@ pub fn muse_glimmer_input_part<Tensor>(
                 .iter()
                 .map(|entry| (entry[0], entry[1], entry[2]))
                 .collect();
-            Ok(MuseGlimmerInputPartPlan::Vision {
+            Ok(MuseInputPartPlan::Vision {
                 modality,
-                ingress: MuseGlimmerIngressPlan {
+                ingress: MuseVisionIngressPlan {
                     placeholder_token_id,
                     placeholder_count: shape.decoder_positions,
                     patch_grid,
@@ -2096,8 +2117,44 @@ pub fn muse_glimmer_input_part<Tensor>(
                 shape,
             })
         }
+        (InputModality::Audio, InputPayloadKind::Tensor)
+            if args.identity == crate::muse::MuseIdentity::Spark && args.audio_config.is_none() =>
+        {
+            Err(CapabilityError::MissingCompanion {
+                architecture: args.identity.text_model_type().into(),
+                modality: InputModality::Audio,
+                component: "waveform encoder and perception projection",
+            })
+        }
+        (InputModality::Audio, InputPayloadKind::Tensor) if args.audio_config.is_some() => {
+            let audio = args.audio_config.as_ref().expect("admitted audio geometry");
+            let samples = batch_one_sequence(&shape, 2, "Muse mono waveform", args.identity.text_model_type())?;
+            let cadence = nonzero_positive(audio.samples_per_token().map_err(|error| unsupported(args.identity.text_model_type(), error.to_string()))?, "Muse waveform cadence")?;
+            let valid = descriptor.extents().find_map(|extent| match extent {
+                InputExtent::AudioValidSamples(samples) => u64::try_from(samples).ok(), _ => None,
+            }).ok_or_else(|| unsupported(args.identity.text_model_type(), "Muse waveform requires valid-sample extent"))?;
+            if samples == 0 || samples % cadence != 0 || valid == 0 || valid > samples
+                || valid.div_ceil(cadence) != samples / cadence
+                || descriptor.extents().count() != 1 || !descriptor.metadata().is_empty()
+                || !matches!(descriptor.payload().dtype(), eredu_core::checkpoint::TensorDtype::F32 | eredu_core::checkpoint::TensorDtype::F16 | eredu_core::checkpoint::TensorDtype::Bf16)
+            {
+                return Err(unsupported(args.identity.text_model_type(), "Muse waveform must be floating mono PCM padded only to its final token cadence"));
+            }
+            let positions = samples / cadence;
+            let mut frames = samples;
+            let mut workspace = samples;
+            for (&patch, &width) in audio.patch_sizes.iter().zip(&audio.hidden_sizes) {
+                frames /= nonzero_positive(patch, "Muse audio patch")?;
+                workspace = workspace.max(checked_mul(checked_mul(frames, positive(width, "Muse audio width")?, "Muse audio frame scalars")?, 8, "Muse audio workspace")?);
+            }
+            Ok(MuseInputPartPlan::Audio {ingress:MuseAudioIngressPlan {
+                valid_samples:valid, padded_samples:samples,
+                placeholder_token_id:args.audio_token_id.expect("validated audio token identity"),
+                placeholder_count:positions,
+            }, shape:MediaShapePlan {decoder_positions:positions, execution_workspace_scalars:workspace, capture_media:None}})
+        }
         (modality, payload) => Err(unsupported(
-            &args.model_type,
+            args.identity.text_model_type(),
             format!(
                 "Muse-Glimmer does not support a {} {} payload",
                 modality.as_str(),
@@ -2336,9 +2393,9 @@ mod tests {
         InklingInputPartPlan
     );
     input_part_adapter!(
-        muse_glimmer_input_part,
-        crate::muse_glimmer::DecoderConfig,
-        MuseGlimmerInputPartPlan
+        muse_input_part,
+        crate::muse::DecoderConfig,
+        MuseInputPartPlan
     );
 
     fn text_only_input_part(
@@ -3039,8 +3096,8 @@ mod tests {
         }
     }
 
-    fn tiny_muse() -> crate::muse_glimmer::DecoderConfig {
-        crate::muse_glimmer::DecoderConfig::from_hf_value(&json!({
+    fn tiny_muse() -> crate::muse::DecoderConfig {
+        crate::muse::DecoderConfig::from_hf_value(&json!({
           "architectures":["MuseGlimmerForConditionalGeneration"],
           "model_type":"muse_glimmer",
           "image_token_id":22,"video_token_id":23,"out_hidden_size":32,"projector_hidden_size":16,
@@ -3068,7 +3125,7 @@ mod tests {
             values: vec![1, 2, 2],
         });
         let mut args = tiny_muse();
-        let plan = muse_glimmer(&args, &prepared).unwrap();
+        let plan = muse_vision(&args, &prepared).unwrap();
         assert_eq!(plan.decoder_positions, 1);
         let prepared_part = |media: MediaAdmissionInput| TestInputPart {
             modality: InputModality::Video,
@@ -3078,9 +3135,9 @@ mod tests {
             },
         };
         assert!(matches!(
-            muse_glimmer_input_part(&args, &prepared_part(prepared.clone())).unwrap(),
-            MuseGlimmerInputPartPlan::Vision {
-                ingress: MuseGlimmerIngressPlan {
+            muse_input_part(&args, &prepared_part(prepared.clone())).unwrap(),
+            MuseInputPartPlan::Vision {
+                ingress: MuseVisionIngressPlan {
                     placeholder_token_id: 23,
                     placeholder_count: 1,
                     patch_grid,
@@ -3089,9 +3146,11 @@ mod tests {
             } if patch_grid == vec![(1, 2, 2)]
         ));
 
-        args.weight_convention = crate::muse_glimmer::WeightConvention::Gguf;
+        args.weight_convention = crate::muse::WeightConvention::Gguf;
+        assert!(muse_input_part(&args, &prepared_part(prepared.clone())).is_ok());
+        args.vision_config.as_mut().unwrap().input_policy = crate::muse::VisionInputPolicy::Images;
         assert!(matches!(
-            muse_glimmer_input_part(&args, &prepared_part(prepared)),
+            muse_input_part(&args, &prepared_part(prepared)),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
     }
@@ -3113,9 +3172,27 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                muse_glimmer_input_part(&args, &input),
+                muse_input_part(&args, &input),
                 Err(CapabilityError::UnsupportedInput { .. })
             ));
         }
+    }
+
+    #[test]
+    fn muse_missing_towers_report_the_required_companion_before_media_execution() {
+        let mut args = crate::muse::DecoderConfig::from_hf_value(&serde_json::from_str(
+            include_str!("../../validation/fixtures/muse-spark/bf16-config.json")
+        ).unwrap()).unwrap();
+        args.vision_config = None;
+        args.audio_config = None;
+        for modality in [InputModality::Image, InputModality::Video, InputModality::Audio] {
+            let part = TestInputPart { modality, payload: TestPayload::Tensor {
+                shape: vec![1, 1920], media: Some(input(modality, &[1, 1920])),
+            }};
+            assert!(matches!(muse_input_part(&args, &part),
+                Err(CapabilityError::MissingCompanion { modality: missing, .. }) if missing == modality));
+        }
+        let text = TestInputPart { modality: InputModality::Text, payload: TestPayload::TokenIds(vec![1, 3]) };
+        assert!(matches!(muse_input_part(&args, &text), Ok(MuseInputPartPlan::TextTokens { positions: 3 })));
     }
 }

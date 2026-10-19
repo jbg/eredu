@@ -49,6 +49,43 @@ impl MlxModelSession {
     }
 }
 impl SpeculativePartitionBinding {
+    pub(in crate::composition::mlx) fn assistant_parallel_context(
+        &self,
+        requirements: &eredu_runtime::CommunicationGroupRequirements,
+    ) -> Result<Option<&crate::backend::runtime::distributed::Group>, eredu_core::BackendFailure>
+    {
+        let Some((id, manifest)) = self
+            .prepared()
+            .map_err(eredu_core::BackendFailure::from_error)?
+            .tensor_parallel_communication()
+        else {
+            return Ok(None);
+        };
+        self.transport
+            .validate_selected_manifest(manifest)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let selected = manifest
+            .groups()
+            .iter()
+            .find(|group| group.id() == id)
+            .ok_or_else(|| {
+                eredu_core::BackendFailure::from_error(CaptureError::Invalid(
+                    "retained target tensor communicator is absent from its manifest".into(),
+                ))
+            })?;
+        for requirement in requirements.operations() {
+            selected
+                .requirements()
+                .validate_requirement(requirement)
+                .map_err(eredu_core::BackendFailure::from_error)?;
+        }
+        self.transport.selected_group(id).map(Some).ok_or_else(|| {
+            eredu_core::BackendFailure::from_error(CaptureError::Invalid(
+                "retained target tensor communicator has no native binding".into(),
+            ))
+        })
+    }
+
     pub(in crate::composition::mlx) fn coordinate_decoding_control(
         &self, local: eredu_core::decoding::DecodingCoordination,
     ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {

@@ -27,6 +27,7 @@ fn load(
             adaptive_lookahead: false,
         },
         2 => DraftingPlan::External {
+            residency: eredu_core::ResidencyPlan::FullyResident,
             model: assistant.path().display().to_string(),
             placement: DraftPlacementPlan::Target,
             max_draft_tokens: 2,

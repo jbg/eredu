@@ -71,6 +71,18 @@ impl ArchitectureStatePartitionRule {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ArchitectureStatePartitionPlan {
     rules: Vec<ArchitectureStatePartitionRule>,
+    packing: StatePartitionPacking,
+}
+
+/// Treatment of gaps between state ranges owned by one pipeline coordinate.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum StatePartitionPacking {
+    /// Every selected range must form one contiguous state slice.
+    #[default]
+    Contiguous,
+    /// Preserve global layer ordinals using stateless slots for unowned gaps.
+    /// No attention cache, fixed buffer, or payload is allocated for those slots.
+    PreserveGlobalOrdinals,
 }
 
 impl ArchitectureStatePartitionPlan {
@@ -78,8 +90,18 @@ impl ArchitectureStatePartitionPlan {
     pub fn new(rules: impl IntoIterator<Item = ArchitectureStatePartitionRule>) -> Self {
         Self {
             rules: rules.into_iter().collect(),
+            packing: StatePartitionPacking::Contiguous,
         }
     }
+
+    /// Selects exact global-ordinal preservation for multi-component ownership.
+    pub fn with_packing(mut self, packing: StatePartitionPacking) -> Self {
+        self.packing = packing;
+        self
+    }
+
+    /// Returns the architecture-declared treatment of unowned state gaps.
+    pub const fn packing(&self) -> StatePartitionPacking { self.packing }
 
     /// Returns the declared state placement rules.
     pub fn rules(&self) -> &[ArchitectureStatePartitionRule] {
@@ -484,6 +506,17 @@ impl StateLayout {
                 .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
             segments,
         )
+    }
+
+    pub(crate) fn selected_slice(&self, layers: Range<usize>, selected: &[Range<usize>]) -> Result<Self, StateError> {
+        let sliced = self.slice(layers.clone())?;
+        let policies = sliced.layers.iter().enumerate().map(|(local, policy)| {
+            if selected.iter().any(|range| range.contains(&(layers.start + local))) {
+                policy.clone()
+            } else { LayerCachePolicy::NoState }
+        }).collect::<Vec<_>>();
+        Self::segmented(LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| StateError::InvalidResidency(error.to_string()))?, sliced.segments)
     }
 }
 

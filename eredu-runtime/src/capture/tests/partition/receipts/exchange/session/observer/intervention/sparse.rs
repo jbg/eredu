@@ -142,7 +142,7 @@ fn admission_at(
         }),
     };
     let discovery = InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: "artifact-exact".into(),
         session_identity: Some(format!("session-{rank}")),
         points: vec![point],
@@ -169,7 +169,7 @@ fn admission_at(
         ]
     };
     let plan = InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations: actions
             .into_iter()
             .enumerate()

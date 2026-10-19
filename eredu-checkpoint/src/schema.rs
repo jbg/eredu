@@ -299,6 +299,9 @@ pub fn matrix_for_linear_format(
 ) -> Result<Vec<SafetensorsTensorConstraint>, MatrixConstraintError> {
     let name = name.into();
     let aliases = aliases.into_iter().map(Into::into).collect::<Vec<String>>();
+    if format == LinearFormat::NvFp4 {
+        return matrix_for_nvfp4(name, aliases, shape, 1, NvFp4Storage::PackedWords);
+    }
     if format == LinearFormat::Dense {
         return Ok(vec![SafetensorsTensorConstraint::required(
             name,
@@ -433,6 +436,90 @@ pub fn matrix_for_linear_format(
     Ok(constraints)
 }
 
+/// Exact physical NVFP4 checkpoint layout; both retain packed E2M1 values.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NvFp4Storage {
+    /// MLX U32 words, U8 E4M3 block scales, and `.global_scale` companions.
+    PackedWords,
+    /// ModelOpt U8 pairs, F8E4M3 scales, and `_weight_scale_2` companions.
+    ModelOptBytes,
+}
+
+/// Builds packed NVFP4 constraints with explicit independent global-scale origins.
+pub fn matrix_for_nvfp4(
+    name: impl Into<String>,
+    aliases: impl IntoIterator<Item = impl Into<String>>,
+    shape: Vec<usize>,
+    row_partitions: usize,
+    storage: NvFp4Storage,
+) -> Result<Vec<SafetensorsTensorConstraint>, MatrixConstraintError> {
+    let name = name.into();
+    let aliases = aliases.into_iter().map(Into::into).collect::<Vec<String>>();
+    let invalid = |detail| MatrixConstraintError::Invalid { detail };
+    let row_axis = shape
+        .len()
+        .checked_sub(2)
+        .ok_or_else(|| MatrixConstraintError::Scalar { name: name.clone() })?;
+    let column_axis = row_axis + 1;
+    let (rows, columns) = (shape[row_axis], shape[column_axis]);
+    crate::nvfp4::NvFp4MatrixFormat::new(rows, columns, row_partitions)
+        .map_err(|error| invalid(error.to_string()))?;
+    let (values_per_scalar, dtype, scale_dtype, scale_suffix, global_suffix) = match storage {
+        NvFp4Storage::PackedWords => (
+            8,
+            StoredDtype::U32,
+            StoredDtype::U8,
+            ".scales",
+            ".global_scale",
+        ),
+        NvFp4Storage::ModelOptBytes => (
+            2,
+            StoredDtype::U8,
+            StoredDtype::F8E4M3,
+            "_weight_scale",
+            "_weight_scale_2",
+        ),
+    };
+    let prefix = |key: &str| key.strip_suffix(".weight").unwrap_or(key).to_owned();
+    let companion_name = |suffix: &str| format!("{}{suffix}", prefix(&name));
+    let companion_aliases = |suffix: &str| {
+        aliases
+            .iter()
+            .map(|alias| format!("{}{suffix}", prefix(alias)))
+            .collect::<Vec<_>>()
+    };
+    let mut packed = shape.clone();
+    packed[column_axis] = columns / values_per_scalar;
+    let mut scales = shape.clone();
+    scales[column_axis] = columns / 16;
+    let mut global = shape[..row_axis].to_vec();
+    if row_partitions > 1 {
+        global.push(row_partitions);
+    }
+    Ok(vec![
+        SafetensorsTensorConstraint::required(
+            name.clone(),
+            packed,
+            StoredDtypeConstraint::Exact(dtype),
+        )
+        .with_aliases(aliases.clone()),
+        SafetensorsTensorConstraint::required(
+            companion_name(scale_suffix),
+            scales,
+            StoredDtypeConstraint::Exact(scale_dtype),
+        )
+        .with_aliases(companion_aliases(scale_suffix))
+        .linear_companion(name.clone(), LinearCompanionKind::Scale),
+        SafetensorsTensorConstraint::required(
+            companion_name(global_suffix),
+            global,
+            StoredDtypeConstraint::Exact(StoredDtype::F32),
+        )
+        .with_aliases(companion_aliases(global_suffix))
+        .linear_companion(name, LinearCompanionKind::GlobalScale),
+    ])
+}
+
 /// Whether a physical tensor must be present in the selected layout.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum TensorRequirement {
@@ -459,6 +546,8 @@ pub enum LinearCompanionKind {
     Scale,
     /// Per-group affine zero-point/bias values.
     AffineBias,
+    /// F32 multiplier shared by a matrix or an independent output-row partition.
+    GlobalScale,
 }
 
 /// Exact primary relationship for a physical encoded-linear companion.

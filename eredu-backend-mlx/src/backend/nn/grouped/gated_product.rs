@@ -3,6 +3,13 @@ use super::*;
 const GROUPED_PROJECTION_CHUNK_THRESHOLD: i32 = 64;
 const GROUPED_PROJECTION_CHUNK_TOKENS: i32 = 32;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Combined,
+    Uncombined,
+    UncombinedPartial,
+}
+
 /// Packed gated-product bank with optional MLX affine, MXFP4, or block-FP8 projections.
 #[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
@@ -42,6 +49,9 @@ pub struct PackedGatedProductGroups {
     /// Gate/up quantization biases.
     pub gate_up_proj_biases: PhysicalParam<Option<Array>>,
     #[param]
+    /// Independent F32 global scales for NVFP4 gate and up rows.
+    pub gate_up_proj_global_scale: PhysicalParam<Option<Array>>,
+    #[param]
     /// Down weights shaped `[groups, hidden, intermediate]`.
     pub down_proj: PhysicalParam<Array>,
     #[param]
@@ -53,6 +63,9 @@ pub struct PackedGatedProductGroups {
     #[param]
     /// Down quantization biases.
     pub down_proj_biases: PhysicalParam<Option<Array>>,
+    #[param]
+    /// Per-expert F32 global scales for NVFP4 down rows.
+    pub down_proj_global_scale: PhysicalParam<Option<Array>>,
 }
 
 pub(super) type GroupProjectionParams = (
@@ -149,7 +162,7 @@ impl PackedGatedProductGroups {
                             out_features,
                             in_features / quantization.group_size(),
                         ],
-                        if quantization == WeightQuantization::MxFp4 {
+                        if matches!(quantization, WeightQuantization::MxFp4 | WeightQuantization::NvFp4) {
                             Dtype::Uint8
                         } else {
                             Dtype::Float16
@@ -201,7 +214,9 @@ impl PackedGatedProductGroups {
             gate_up_iquant,
             down_iquant,
             native_fp8: false,
-            gate_up_row_layout: eredu_nn::LinearRowLayout::Contiguous,
+            gate_up_row_layout: if gate_up_affine == Some(WeightQuantization::NvFp4) {
+                eredu_nn::LinearRowLayout::equal_partitions(2).map_err(|error| Exception::custom(error.to_string()))?
+            } else { eredu_nn::LinearRowLayout::Contiguous },
             gate_up_proj,
             gate_up_proj_bias: if projection_biases[0] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
@@ -214,6 +229,9 @@ impl PackedGatedProductGroups {
             },
             gate_up_proj_scales,
             gate_up_proj_biases,
+            gate_up_proj_global_scale: if gate_up_affine == Some(WeightQuantization::NvFp4) {
+                PhysicalParam::<Option<Array>>::unloaded_some(&[group_count, 2], Dtype::Float32, stream)?
+            } else { PhysicalParam::new(None) },
             down_proj,
             down_proj_bias: if projection_biases[1] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
@@ -226,6 +244,9 @@ impl PackedGatedProductGroups {
             },
             down_proj_scales,
             down_proj_biases,
+            down_proj_global_scale: if down_affine == Some(WeightQuantization::NvFp4) {
+                PhysicalParam::<Option<Array>>::unloaded_some(&[group_count], Dtype::Float32, stream)?
+            } else { PhysicalParam::new(None) },
         })
     }
 
@@ -296,6 +317,7 @@ impl PackedGatedProductGroups {
         top_k_weights: &Array,
         token_offset: usize,
         total_token_count: usize,
+        mode: OutputMode,
         observer: &mut Option<&mut dyn NativeGroupedUnitObserver>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
@@ -325,6 +347,10 @@ impl PackedGatedProductGroups {
                 &plan.sorted_group_ids,
                 stream,
             )?
+        } else if let Some(global) = self.gate_up_proj_global_scale.as_ref() {
+            super::super::nvfp4::grouped_linear(&hidden, self.gate_up_proj.as_ref(),
+                self.gate_up_proj_scales.as_ref().as_ref().ok_or_else(|| Exception::custom("NVFP4 gate/up block scales are absent"))?,
+                global, &plan.sorted_group_ids, self.gate_up_row_layout, stream)?
         } else if let Some(quantization) = self.gate_up_affine {
             packed_grouped_linear(
                 &hidden,
@@ -415,6 +441,10 @@ impl PackedGatedProductGroups {
                 &plan.sorted_group_ids,
                 stream,
             )?
+        } else if let Some(global) = self.down_proj_global_scale.as_ref() {
+            super::super::nvfp4::grouped_linear(&activated, self.down_proj.as_ref(),
+                self.down_proj_scales.as_ref().as_ref().ok_or_else(|| Exception::custom("NVFP4 down block scales are absent"))?,
+                global, &plan.sorted_group_ids, eredu_nn::LinearRowLayout::Contiguous, stream)?
         } else if let Some(quantization) = self.down_affine {
             packed_grouped_linear(
                 &activated,
@@ -438,17 +468,24 @@ impl PackedGatedProductGroups {
             )?
         };
         let output = match self.down_proj_bias.as_ref() {
-            Some(bias) => output.add(bias.take_axis(&plan.sorted_group_ids, 0, stream)?, stream)?,
-            None => output,
+            Some(bias) if mode != OutputMode::UncombinedPartial => {
+                output.add(bias.take_axis(&plan.sorted_group_ids, 0, stream)?, stream)?
+            }
+            _ => output,
         };
-        weighted_group_sum(
-            output,
-            top_k_weights,
-            &plan,
-            num_tokens,
-            self.reduction,
-            stream,
-        )
+        match mode {
+            OutputMode::Combined => weighted_group_sum(
+                output,
+                top_k_weights,
+                &plan,
+                num_tokens,
+                self.reduction,
+                stream,
+            ),
+            OutputMode::Uncombined | OutputMode::UncombinedPartial => {
+                restore_grouped_slots(output, &plan, num_tokens, top_k_index.dim(-1), stream)
+            }
+        }
     }
 
     /// Evaluates selected groups and reduces selection outputs back to source tokens.
@@ -469,6 +506,79 @@ impl PackedGatedProductGroups {
         top_k_index: &Array,
         top_k_weights: &Array,
         stream: &Stream,
+        observer: Option<&mut dyn NativeGroupedUnitObserver>,
+    ) -> Result<Array, Exception> {
+        self.forward_mode(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            stream,
+            OutputMode::Combined,
+            observer,
+        )
+    }
+
+    /// Retains complete expert outputs in original token/selection-slot order.
+    pub(crate) fn forward_uncombined(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+        observer: Option<&mut dyn NativeGroupedUnitObserver>,
+    ) -> Result<Array, Exception> {
+        self.forward_mode(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            stream,
+            OutputMode::Uncombined,
+            observer,
+        )
+    }
+
+    /// Accumulates already transformed, complete per-slot expert outputs.
+    pub(crate) fn combine_outputs(
+        &self,
+        outputs: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if outputs.ndim() != 3
+            || top_k_index.ndim() != 2
+            || top_k_index.shape() != top_k_weights.shape()
+            || outputs.dim(0) != top_k_index.dim(0)
+            || outputs.dim(1) != top_k_index.dim(1)
+            || outputs.dim(2) != self.hidden_dim
+        {
+            return Err(Exception::custom(
+                "uncombined grouped output geometry mismatch",
+            ));
+        }
+        let plan = topk_group_plan(top_k_index, stream)?;
+        let sorted = outputs.reshape(&[-1, self.hidden_dim], stream)?.take_axis(
+            &plan.selection_indices,
+            0,
+            stream,
+        )?;
+        weighted_group_sum(
+            sorted,
+            top_k_weights,
+            &plan,
+            outputs.dim(0),
+            self.reduction,
+            stream,
+        )
+    }
+
+    fn forward_mode(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+        mode: OutputMode,
         mut observer: Option<&mut dyn NativeGroupedUnitObserver>,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
@@ -479,6 +589,7 @@ impl PackedGatedProductGroups {
                 top_k_weights,
                 0,
                 num_tokens as usize,
+                mode,
                 &mut observer,
                 stream,
             );
@@ -493,12 +604,45 @@ impl PackedGatedProductGroups {
                 &top_k_weights.try_index_device((start..end, ..), stream)?,
                 start as usize,
                 num_tokens as usize,
+                mode,
                 &mut observer,
                 stream,
             )?);
             start = end;
         }
         concatenate_axis(&outputs, 0, stream)
+    }
+
+    /// Keeps replicated down bias separate from unweighted per-expert partials.
+    pub(crate) fn forward_uncombined_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        partitions: usize,
+        stream: &Stream,
+        observer: Option<&mut dyn NativeGroupedUnitObserver>,
+    ) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
+        if partitions == 0 {
+            return Err(Exception::custom(
+                "tensor-parallel partition count must be positive",
+            ));
+        }
+        let output = self.forward_mode(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            stream,
+            OutputMode::UncombinedPartial,
+            observer,
+        )?;
+        let bias = self
+            .down_proj_bias
+            .as_ref()
+            .as_ref()
+            .map(|bias| bias.take_axis(top_k_index, 0, stream))
+            .transpose()?;
+        Ok(TensorParallelGroupedOutput::new(output, bias))
     }
 
     /// Separates the rank-local projection contribution from replicated grouped

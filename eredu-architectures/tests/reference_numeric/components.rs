@@ -22,10 +22,9 @@ mod diffusion_gemma;
 mod gemma4_components;
 #[path = "components/gemma4_placement.rs"]
 mod gemma4_placement;
-#[path = "components/muse.rs"]
-mod muse;
-#[path = "components/muse_placement.rs"]
-mod muse_placement;
+
+
+
 #[path = "components/qwen_conditional.rs"]
 mod qwen_conditional;
 #[path = "components/qwen_prediction.rs"]

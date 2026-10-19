@@ -131,6 +131,7 @@ impl TransformerConfig {
     ) -> Result<B::Normalization, Error> {
         B::normalization(
             NormalizationConstructionSpec {
+                reduction: eredu_nn::NormalizationReduction::Native,
                 groups: Some(1),
                 dimensions: self.hidden_size(),
                 epsilon: self.rms_norm_epsilon(),

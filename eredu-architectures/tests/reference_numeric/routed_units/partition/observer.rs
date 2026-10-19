@@ -4,9 +4,7 @@ use eredu_core::{capture::*, *};
 use eredu_runtime::capture::{partition::*, CaptureSession};
 #[path = "observer/collector.rs"]
 mod collector;
-#[path = "observer/transport.rs"]
-mod transport;
-pub(super) use transport::{Transport, World};
+pub(super) use super::super::super::bounded_transport::{Transport, World};
 
 pub(super) fn run(
     executable: &mut NumericPartitionExecutable,

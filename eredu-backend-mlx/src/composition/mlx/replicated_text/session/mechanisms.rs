@@ -365,6 +365,9 @@ where
         let layout = prepared.layout.clone();
         let mut ignored_sources = self.ignored_checkpoint_sources.clone();
         ignored_sources.extend(
+            selected.requirements().nonparameter_sources().iter().cloned(),
+        );
+        ignored_sources.extend(
             selected
                 .requirements()
                 .parameters()

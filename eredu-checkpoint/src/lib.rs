@@ -16,6 +16,8 @@ pub mod composite;
 pub mod expert;
 /// Neutral block-FP8 metadata normalization.
 pub mod fp8;
+/// Neutral NVFP4 storage geometry and bounded selected-row decoding.
+pub mod nvfp4;
 pub mod gguf_store;
 /// Shard-layout-independent identity of exact GGUF metadata and encoded payloads.
 pub mod gguf_fingerprint;
@@ -202,6 +204,8 @@ pub enum WeightQuantization {
     Affine(AffineQuantization),
     /// Microscaling FP4 with E2M1 values and E8M0 scales.
     MxFp4,
+    /// NVIDIA E2M1 FP4 with block-16 E4M3 and F32 global scales.
+    NvFp4,
     /// Checkpoint-native GGML blocks.
     GgufIQuant {
         /// Native GGML tensor encoding.
@@ -272,6 +276,8 @@ pub enum LinearFormat {
     Affine(AffineQuantization),
     /// Microscaling FP4 with E2M1 values and E8M0 scales.
     MxFp4,
+    /// NVIDIA E2M1 FP4 with block-16 E4M3 and F32 global scales.
+    NvFp4,
     /// Checkpoint-native GGML blocks.
     GgufIQuant {
         /// Native GGML tensor encoding.
@@ -290,6 +296,7 @@ impl LinearFormat {
             Self::Dense => Ok(()),
             Self::Affine(config) => config.validate(),
             Self::MxFp4 => WeightQuantization::MxFp4.validate(),
+            Self::NvFp4 => WeightQuantization::NvFp4.validate(),
             Self::GgufIQuant { ggml_type, endian } => {
                 WeightQuantization::GgufIQuant { ggml_type, endian }.validate()
             }
@@ -304,6 +311,7 @@ impl LinearFormat {
             Self::Dense | Self::E4M3BlockFp8(_) => None,
             Self::Affine(config) => Some(WeightQuantization::Affine(config)),
             Self::MxFp4 => Some(WeightQuantization::MxFp4),
+            Self::NvFp4 => Some(WeightQuantization::NvFp4),
             Self::GgufIQuant { ggml_type, endian } => {
                 Some(WeightQuantization::GgufIQuant { ggml_type, endian })
             }
@@ -316,6 +324,7 @@ impl From<WeightQuantization> for LinearFormat {
         match value {
             WeightQuantization::Affine(config) => Self::Affine(config),
             WeightQuantization::MxFp4 => Self::MxFp4,
+            WeightQuantization::NvFp4 => Self::NvFp4,
             WeightQuantization::GgufIQuant { ggml_type, endian } => {
                 Self::GgufIQuant { ggml_type, endian }
             }
@@ -340,6 +349,7 @@ impl WeightQuantization {
         match self {
             Self::Affine(config) => config.group_size,
             Self::MxFp4 => Self::MXFP4_GROUP_SIZE,
+            Self::NvFp4 => 16,
             Self::GgufIQuant { ggml_type, .. } => {
                 ggml_type.block_and_bytes().expect("validated GGML type").0 as i32
             }
@@ -350,7 +360,7 @@ impl WeightQuantization {
     pub fn bits(self) -> i32 {
         match self {
             Self::Affine(config) => config.bits,
-            Self::MxFp4 => Self::MXFP4_BITS,
+            Self::MxFp4 | Self::NvFp4 => Self::MXFP4_BITS,
             Self::GgufIQuant { ggml_type, .. } => {
                 ggml_type.block_and_bytes().expect("validated GGML type").1 as i32
             }
@@ -374,7 +384,7 @@ impl WeightQuantization {
     pub fn validate(self) -> Result<(), Error> {
         match self {
             Self::Affine(config) => config.validate(),
-            Self::MxFp4 => Ok(()),
+            Self::MxFp4 | Self::NvFp4 => Ok(()),
             Self::GgufIQuant { ggml_type, .. } => ggml_type
                 .block_and_bytes()
                 .map(|_| ())
@@ -409,6 +419,7 @@ impl Serialize for WeightQuantization {
         let mode = match self {
             Self::Affine(_) => "affine",
             Self::MxFp4 => "mxfp4",
+            Self::NvFp4 => "nvfp4",
             Self::GgufIQuant { .. } => {
                 return Err(serde::ser::Error::custom(
                     "checkpoint-native GGML block metadata is not serializable",
@@ -440,6 +451,11 @@ impl<'de> Deserialize<'de> for WeightQuantization {
             {
                 Ok(Self::MxFp4)
             }
+            "nvfp4" if metadata.group_size == 16 && metadata.bits == 4 => Ok(Self::NvFp4),
+            "nvfp4" => Err(de::Error::custom(format!(
+                "NVFP4 requires group_size=16 and bits=4, got group_size={} bits={}",
+                metadata.group_size, metadata.bits
+            ))),
             "mxfp4" => Err(de::Error::custom(format!(
                 "MXFP4 requires group_size=32 and bits=4, got group_size={} bits={}",
                 metadata.group_size, metadata.bits

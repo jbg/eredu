@@ -26,6 +26,28 @@ fn checked(invocation: MechanismInvocation) -> Result<MechanismInvocation, Error
     Ok(invocation)
 }
 
+impl crate::NormalizationConstructionSpec {
+    /// Describes ordinary rank-three RMS normalization without native allocation.
+    pub fn memory_invocation(
+        &self,
+        batch: u64,
+        time: u64,
+        element: TensorElementType,
+        weight_element: Option<TensorElementType>,
+    ) -> Result<MechanismInvocation, Error> {
+        self.validate()?;
+        checked(MechanismInvocation::RmsNormalization {
+            batch,
+            time,
+            width: positive(self.dimensions)?,
+            element,
+            reduction: self.reduction,
+            weight: !matches!(self.scale, crate::NormalizationScale::Unit),
+            weight_element,
+        })
+    }
+}
+
 impl LinearSpec {
     /// Describes a selected projection without constructing a native operator.
     pub fn memory_invocation(
@@ -36,13 +58,14 @@ impl LinearSpec {
     ) -> Result<MechanismInvocation, Error> {
         self.format.validate_for_weight(&self.weight)?;
         checked(MechanismInvocation::Projection {
+            bias: self.bias.is_some(),
             rows,
             input: positive(self.input)?,
             output: positive(self.output)?,
             format: self.format.encoding(),
+            arithmetic: self.format.arithmetic(),
             element,
             weight_element,
-            bias: self.bias.is_some(),
             bias_element: None,
         })
     }
@@ -112,6 +135,8 @@ impl CausalDepthwiseConvolutionSpec {
     ) -> Result<MechanismInvocation, Error> {
         self.validate()?;
         checked(MechanismInvocation::Convolution {
+            arithmetic: self.arithmetic,
+            bias: self.bias.is_some(),
             batch,
             tokens,
             channels: positive(self.channels)?,
@@ -266,6 +291,47 @@ impl crate::multimodal::MultiAxisRotarySpec {
             position_shape: position_shape.to_vec(),
             position_element,
             spec: self.clone(),
+        })
+    }
+}
+
+impl crate::TopKGroupSelectionSpec {
+    /// Describes index selection after scoring, correction and optional group
+    /// masking, without including projection or mixture-coefficient work.
+    pub fn index_memory_invocation(
+        self,
+        rows: u64,
+        element: TensorElementType,
+    ) -> Result<MechanismInvocation, Error> {
+        checked(MechanismInvocation::GroupIndexSelection {
+            rows,
+            groups: positive(self.group_count())?,
+            selected: positive(self.top_k())?,
+            element,
+            order: self.order(),
+        })
+    }
+}
+
+impl crate::TopKGroupSelectorSpec {
+    /// Describes the dense FP32 projection after operand conversion. Input
+    /// transforms, casts, bias, logit scaling and selection remain separate.
+    pub fn float32_projection_memory_invocation(
+        &self,
+        rows: u64,
+    ) -> Result<MechanismInvocation, Error> {
+        self.validate()?;
+        if self.arithmetic().projection != crate::RoutingPrecision::Float32
+            || self.format().encoding() != LinearFormat::Dense
+        {
+            return Err(Error::backend(
+                "FP32 router projection requires a dense FP32 projection policy",
+            ));
+        }
+        checked(MechanismInvocation::Float32GroupProjection {
+            rows,
+            input: positive(self.input_dimensions())?,
+            groups: positive(self.selection().group_count())?,
         })
     }
 }

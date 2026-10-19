@@ -193,7 +193,7 @@ fn sampled_conformance(root: &Path, routed: bool) {
                 });
             }
             let intervention = InterventionPlan {
-                schema_version: 1,
+                schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
                 operations,
             }
             .admit(&intervention_discovery, request, "native-snapshot-root")

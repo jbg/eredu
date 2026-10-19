@@ -1,4 +1,4 @@
-//! Muse-Glimmer's behavior-probed ATEM channel and tool protocol.
+//! Muse's behavior-probed ATEM channel and tool protocol.
 
 use llguidance::api::TopLevelGrammar;
 use serde_json::{Map, Value};
@@ -23,15 +23,61 @@ const STOPS: &[&str] = &[EOT];
 pub(crate) struct AtemDialect;
 
 pub(crate) static ATEM_DIALECT: AtemDialect = AtemDialect;
-static ATEM_PARAMETERS: () = ();
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AtemEffort {
+    StrengthWords,
+    EffortBudget,
+}
+impl AtemEffort {
+    pub(crate) fn template_kwarg(self) -> &'static str {
+        match self {
+            Self::StrengthWords => "reasoning_strength",
+            Self::EffortBudget => "reasoning_effort",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtemPrefix {
+    PrefilledAssistant,
+    GeneratedAssistant,
+}
+struct AtemParameters {
+    effort: AtemEffort,
+    prefix: AtemPrefix,
+}
 
-pub(crate) fn parameters() -> DialectParameters {
-    DialectParameters::Custom(&ATEM_PARAMETERS)
+pub(crate) fn parameters(effort: AtemEffort, prefix: AtemPrefix) -> DialectParameters {
+    use AtemEffort::*;
+    use AtemPrefix::*;
+    static STRENGTH_PREFILLED: AtemParameters = AtemParameters {
+        effort: StrengthWords,
+        prefix: PrefilledAssistant,
+    };
+    static STRENGTH_GENERATED: AtemParameters = AtemParameters {
+        effort: StrengthWords,
+        prefix: GeneratedAssistant,
+    };
+    static BUDGET_PREFILLED: AtemParameters = AtemParameters {
+        effort: EffortBudget,
+        prefix: PrefilledAssistant,
+    };
+    static BUDGET_GENERATED: AtemParameters = AtemParameters {
+        effort: EffortBudget,
+        prefix: GeneratedAssistant,
+    };
+    DialectParameters::Custom(match (effort, prefix) {
+        (StrengthWords, PrefilledAssistant) => &STRENGTH_PREFILLED,
+        (StrengthWords, GeneratedAssistant) => &STRENGTH_GENERATED,
+        (EffortBudget, PrefilledAssistant) => &BUDGET_PREFILLED,
+        (EffortBudget, GeneratedAssistant) => &BUDGET_GENERATED,
+    })
 }
 
 impl AtemDialect {
-    fn validate_parameters(parameters: DialectParameters) -> Result<(), String> {
-        parameters.custom::<()>().map(|_| ())
+    fn validate_parameters(
+        parameters: DialectParameters,
+    ) -> Result<&'static AtemParameters, String> {
+        parameters.custom::<AtemParameters>()
     }
 
     fn grammar(
@@ -39,6 +85,7 @@ impl AtemDialect {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         token_ids: &[u32],
+        prefix: AtemPrefix,
     ) -> Result<String, String> {
         if token_ids.len() != STRUCTURAL_TOKENS.len() {
             return Err(format!(
@@ -61,17 +108,23 @@ impl AtemDialect {
             start
         );
 
-        let mut grammar = String::new();
+        let mut grammar = match prefix {
+            AtemPrefix::PrefilledAssistant => "start: atem_response\n".into(),
+            AtemPrefix::GeneratedAssistant => format!(
+                "start: {start} {} atem_response\n",
+                json_literal("assistant")
+            ),
+        };
         match tool_choice {
             ToolChoice::None => grammar.push_str(&format!(
-                "start: {reasoning} visible | direct_visible\n\
+                "atem_response: {reasoning} visible | direct_visible\n\
                  visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n\
                  direct_visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
                 json_literal("assistant to=user"),
                 json_literal(" to=user"),
             )),
             ToolChoice::Auto => grammar.push_str(&format!(
-                "start: {reasoning} (visible | tool_collection) | direct_visible | direct_tool_collection\n\
+                "atem_response: {reasoning} (visible | tool_collection) | direct_visible | direct_tool_collection\n\
                  visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n\
                  direct_visible: {} {message} ATEM_CHANNEL_TEXT* {eot}\n",
                 json_literal("assistant to=user"),
@@ -79,7 +132,7 @@ impl AtemDialect {
             )),
             ToolChoice::Required => {
                 grammar.push_str(&format!(
-                    "start: {reasoning} tool_collection | direct_tool_collection\n"
+                    "atem_response: {reasoning} tool_collection | direct_tool_collection\n"
                 ))
             }
         }
@@ -198,16 +251,19 @@ impl FormatDialect for AtemDialect {
         &self,
         parameters: DialectParameters,
     ) -> Result<GenerationPromptBehavior, String> {
-        Self::validate_parameters(parameters)?;
-        Ok(GenerationPromptBehavior::Always)
+        Ok(match Self::validate_parameters(parameters)?.effort {
+            AtemEffort::StrengthWords => GenerationPromptBehavior::Always,
+            AtemEffort::EffortBudget => GenerationPromptBehavior::HonorRequest,
+        })
     }
 
     fn reasoning_template_kwarg(
         &self,
         parameters: DialectParameters,
     ) -> Result<&'static str, String> {
-        Self::validate_parameters(parameters)?;
-        Ok("reasoning_strength")
+        Ok(Self::validate_parameters(parameters)?
+            .effort
+            .template_kwarg())
     }
 
     fn supports_tool_reasoning(&self, parameters: DialectParameters) -> Result<bool, String> {
@@ -223,13 +279,14 @@ impl FormatDialect for AtemDialect {
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
     ) -> Result<ConstraintConfiguration, String> {
-        Self::validate_parameters(parameters)?;
+        let parameters = Self::validate_parameters(parameters)?;
         Ok(ConstraintConfiguration {
             grammar: TopLevelGrammar::from_lark(Self::grammar(
                 tools,
                 tool_choice,
                 parallel_tool_calls,
                 resolved_structural_token_ids,
+                parameters.prefix,
             )?),
         })
     }
@@ -262,8 +319,14 @@ impl FormatDialect for AtemDialect {
         &self,
         parameters: DialectParameters,
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
-        Self::validate_parameters(parameters)?;
-        Ok(Box::new(AtemParser::default()))
+        let parameters = Self::validate_parameters(parameters)?;
+        Ok(Box::new(AtemParser {
+            state: match parameters.prefix {
+                AtemPrefix::PrefilledAssistant => AtemState::Header,
+                AtemPrefix::GeneratedAssistant => AtemState::AwaitStart,
+            },
+            ..Default::default()
+        }))
     }
 }
 

@@ -553,17 +553,17 @@ fn public_embedded_observers_are_installed_causally_and_transactionally() {
     assert_eq!(failed_trace.count(VERIFICATION_LOGITS), 0);
 }
 
-fn execute_public_gemma_external_scheduler(
+fn prepare_public_gemma_external_scheduler(
     target: &Path,
     assistant: &Path,
     target_device: DevicePlan,
     placement: DraftPlacementPlan,
-    configure: impl FnOnce(&mut crate::composition::mlx::speculative::MlxDrafter),
 ) -> (
-    Result<eredu_core::SpeculativeGenerationBatchOutput, String>,
-    usize,
+    ModelRuntime<MlxBackend<'static>>,
+    eredu_core::RealizedDrafting<crate::composition::mlx::speculative::MlxDrafter>,
 ) {
     let plan = ExecutionPlan::fully_resident(target_device).with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: assistant.display().to_string(),
         placement,
         max_draft_tokens: 2,
@@ -586,11 +586,27 @@ fn execute_public_gemma_external_scheduler(
     )
     .unwrap();
     let realization = eredu_core::realize_execution_plan_target(&factory, &plan, selected).unwrap();
-    let mut runtime = realization.into_runtime().unwrap();
+    let runtime = realization.into_runtime().unwrap();
 
-    let mut drafting =
+    let drafting =
         eredu_core::realize_execution_plan_drafting(&factory, &plan, &runtime, external_artifact)
             .unwrap();
+    (runtime, drafting)
+}
+
+fn execute_public_gemma_external_scheduler(
+    target: &Path,
+    assistant: &Path,
+    target_device: DevicePlan,
+    placement: DraftPlacementPlan,
+    configure: impl FnOnce(&mut crate::composition::mlx::speculative::MlxDrafter),
+) -> (
+    Result<eredu_core::SpeculativeGenerationBatchOutput, String>,
+    usize,
+) {
+    let (mut runtime, mut drafting) = prepare_public_gemma_external_scheduler(
+        target, assistant, target_device, placement,
+    );
     let mut draft = drafting
         .as_speculative_draft()
         .expect("the external plan must realize a reusable assistant");
@@ -699,6 +715,117 @@ fn run_public_gemma_external_scheduler(
             request.stats().target_tokens() > 2,
             "verification must evaluate more than the two-token prefill"
         );
+    }
+}
+
+#[test]
+fn external_drafter_rejects_another_target_session_before_preparing_lanes() {
+    let target = tempfile::tempdir().unwrap();
+    let assistant = tempfile::tempdir().unwrap();
+    write_gemma_fixture(target.path());
+    write_gemma_assistant_fixture(assistant.path());
+    for source in [assistant.path(), target.path()] {
+        let device = DevicePlan::new("mlx", "cpu:0").unwrap();
+        let (mut runtime, mut drafting) = prepare_public_gemma_external_scheduler(
+            target.path(),
+            source,
+            device.clone(),
+            DraftPlacementPlan::Target,
+        );
+        let factory = crate::composition::mlx::automatic::MlxBackendFactory::default();
+        let plan = ExecutionPlan::fully_resident(device);
+        let inspection =
+            eredu_architectures::configuration::inspect_artifact(target.path()).unwrap();
+        let selected =
+            eredu_core::select_execution_plan_target(&factory, &plan, inspection).unwrap();
+        let mut other = eredu_core::realize_execution_plan_target(&factory, &plan, selected)
+            .unwrap()
+            .into_runtime()
+            .unwrap();
+        // Same checkpoint bytes, backend, device, dimensions and world size. Only
+        // the native target session differs. No lane or sampler may be prepared.
+        crate::tests::support::path_instrumentation::reset();
+        let before = crate::tests::support::path_instrumentation::snapshot();
+        let wrong =
+            <MlxBackend<'static> as SpeculativeGenerationBackend>::with_speculative_execution(
+                &mut other,
+                SpeculativeGenerationBatchRequest::new(
+                    drafting.as_speculative_draft().unwrap(),
+                    Vec::<SpeculativeGenerationLane<'_, MlxBackend<'static>, AllowAllTokens>>::new(
+                    ),
+                    [0; 32],
+                ),
+                eredu_runtime::RunSpeculativeGeneration::default(),
+            );
+        let error = wrong
+            .err()
+            .expect("a materialized drafter cannot change target sessions");
+        assert!(
+            error.to_string().contains("different target session"),
+            "{error}"
+        );
+        assert_eq!(
+            crate::tests::support::path_instrumentation::snapshot(),
+            before
+        );
+
+        // Rejection does not consume or poison the assistant. Its real target can
+        // immediately run the ordinary shared speculative driver and publish text.
+        let sampling = eredu_core::resolve_generation_config(
+            None,
+            eredu_core::GenerationConfigOverrides {
+                max_new_tokens: Some(3),
+                temperature: Some(0.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tokens = [1u32, 2];
+        let fingerprint = eredu_core::cache::prompt_cache_token_fingerprint(&tokens);
+        let tokens = Array::from_slice(&tokens, &[1, 2]);
+        let parts = [text_input_part(&tokens)];
+        let prompt = MlxModelInput::from(crate::backend::runtime::media::input::ModelInput::new(
+            &parts,
+        ))
+        .with_semantic_content_fingerprint(fingerprint)
+        .unwrap();
+        let publications = Arc::new(AtomicUsize::new(0));
+        let delivered = publications.clone();
+        let lane = SpeculativeGenerationLane::new(
+            prompt,
+            TextGenerationConfig::new(sampling),
+            GenerationRequestConfig {
+                max_tokens: 3,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default()
+                        .with_proposal_capacity(std::num::NonZeroUsize::new(2).unwrap()),
+                ),
+                temperature: 0.0,
+                eos_token_ids: Vec::new(),
+            },
+            AllowAllTokens,
+            Box::<TokenOnlySemanticState>::default(),
+            GenerationCancellationToken::new(),
+            Box::new(move |_| {
+                delivered.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let output =
+            <MlxBackend<'static> as SpeculativeGenerationBackend>::with_speculative_execution(
+                &mut runtime,
+                SpeculativeGenerationBatchRequest::new(
+                    drafting.as_speculative_draft().unwrap(),
+                    vec![lane],
+                    [0; 32],
+                ),
+                eredu_runtime::RunSpeculativeGeneration::default(),
+            )
+            .unwrap();
+        let requests = output.into_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].token_ids().len(), 3);
+        assert!(requests[0].stats().draft_tokens() > 0);
+        assert!(publications.load(Ordering::Relaxed) > 0);
     }
 }
 
@@ -1088,7 +1215,7 @@ fn muse_external_assistant_capture_uses_neutral_target_in_exact_layer_order() {
     let initial_offset = cache.generation().unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [text_input_part(&tokens)];
-    let invalid = ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
+    let invalid = ExternalPredictionCaptureRequest::Muse {
         target_layers: vec![0, 1].into_boxed_slice(),
         target_paths: vec!["missing.0".into(), "missing.1".into()].into_boxed_slice(),
     };
@@ -1102,7 +1229,7 @@ fn muse_external_assistant_capture_uses_neutral_target_in_exact_layer_order() {
     assert!(error.to_string().contains("did not reach capture path"));
     assert_eq!(cache.generation().unwrap(), initial_offset);
 
-    let request = ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
+    let request = ExternalPredictionCaptureRequest::Muse {
         target_layers: vec![0, 1].into_boxed_slice(),
         target_paths: vec![
             "model.layers.0.output".into(),
@@ -1119,7 +1246,7 @@ fn muse_external_assistant_capture_uses_neutral_target_in_exact_layer_order() {
         .unwrap();
     assert_eq!(logits.as_array().shape(), [1, 2, 32]);
     assert_eq!(cache.generation().unwrap(), 2);
-    let ExternalPredictionTargetCapture::MuseGlimmerDFlash { target_states } = capture else {
+    let ExternalPredictionTargetCapture::Muse { target_states } = capture else {
         panic!("Muse-Glimmer target returned the wrong external-assistant capture")
     };
     assert_eq!(target_states.len(), 2);

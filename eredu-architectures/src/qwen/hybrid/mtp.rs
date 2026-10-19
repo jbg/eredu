@@ -99,6 +99,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionSha
         let norm = |name: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    reduction: eredu_nn::NormalizationReduction::Native,
                     groups: None,
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,

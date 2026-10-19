@@ -13,7 +13,7 @@ use eredu_checkpoint::{
 use eredu_core::{
     artifact::ArtifactError,
     checkpoint::{TensorCatalog, TensorDtype},
-    ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement, GgufCompanionRole,
+    ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement, ArtifactCompanionRole,
     LoadingProtocol, ModelConfiguration, ModelConfigurationResolver, ResolvedModelConfiguration,
     ValidatedGguf,
 };
@@ -67,7 +67,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
             let admitted = crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
                 .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
             if admitted.config().vision.is_none() { return Ok(Vec::new()); }
-            return GgufCompanionRequirement::new(GgufCompanionRole::MediaProjector, false,
+            return GgufCompanionRequirement::new(ArtifactCompanionRole::MediaProjector, false,
                 "mmproj", 1, GgufCompanionEncoding::DenseRequired).map(|requirement| vec![requirement]);
         }
         gguf_companion_requirements(GgufArchitecture::resolve(architecture)?)
@@ -84,7 +84,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
                 crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
             ],
-            ModelKind::MuseGlimmer => &[crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME],
+            ModelKind::MuseGlimmer | ModelKind::MuseSpark => &[crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME],
             _ => &[],
         }
     }
@@ -100,7 +100,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
     ) -> Result<Self::ArtifactPlan, ArtifactError> {
         let plan = match format {
             ArtifactFormat::SafeTensors => {
-                let resolved_plan = resolved_plan.admit_safetensors_catalog(tensors)?;
+                let resolved_plan = resolved_plan.admit_safetensors_catalog(tensors, configuration.json().ok_or_else(|| ArtifactError::InvalidArtifact("SafeTensors inspection omitted its source configuration".into()))?)?;
                 let kind = resolved_plan.model_kind();
                 let model = serde_json::to_vec(configuration.json().ok_or_else(|| {
                     ArtifactError::InvalidArtifact(
@@ -127,7 +127,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 } else {
                     (None, None)
                 };
-                let muse = if kind == ModelKind::MuseGlimmer {
+                let muse = if matches!(kind, ModelKind::MuseGlimmer | ModelKind::MuseSpark) {
                     sidecars
                         .get(crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME)
                         .cloned()
@@ -148,7 +148,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                     )
                 })?;
                 let projector = validated
-                    .companion(&GgufCompanionRole::MediaProjector)
+                    .companion(&ArtifactCompanionRole::MediaProjector)
                     .map(|companion| companion.checkpoint());
                 let media_projector = projector
                     .map(|projector| {
@@ -201,7 +201,7 @@ pub fn gguf_companion_requirements(
         GgufCompanionEncoding::DensePreferred
     };
     GgufCompanionRequirement::new(
-        GgufCompanionRole::MediaProjector,
+        ArtifactCompanionRole::MediaProjector,
         required,
         "mmproj",
         1,
@@ -237,6 +237,8 @@ pub enum ModelKind {
     Nanbeige,
     /// Meta Muse-Glimmer multimodal decoder.
     MuseGlimmer,
+    /// Meta Muse Spark Open multimodal decoder.
+    MuseSpark,
     /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
     Lfm2,
     /// Nemotron-H hybrid architecture.
@@ -284,7 +286,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::DiffusionGemma,
@@ -297,6 +299,7 @@ impl ModelKind {
         Self::Gemma2,
         Self::Nanbeige,
         Self::MuseGlimmer,
+        Self::MuseSpark,
         Self::Lfm2,
         Self::NemotronH,
         Self::NemotronLabsDiffusion,
@@ -326,6 +329,7 @@ impl ModelKind {
             Self::Gemma2 => "gemma2",
             Self::Nanbeige => "nanbeige",
             Self::MuseGlimmer => "muse_glimmer",
+            Self::MuseSpark => "muse_spark",
             Self::Lfm2 => "lfm2",
             Self::NemotronH => "nemotron_h",
             Self::NemotronLabsDiffusion => "nemotron_labs_diffusion",
@@ -379,6 +383,7 @@ impl ModelKind {
             "nanbeige" => Ok(Self::Nanbeige),
             "gemma2" => Ok(Self::Gemma2),
             "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
+            "muse_spark" | "muse_spark_text" => Ok(Self::MuseSpark),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
             "nemotron_labs_diffusion" | "nemotron_labs_diffusion_vlm" => Ok(Self::NemotronLabsDiffusion),
@@ -430,6 +435,8 @@ pub enum GgufArchitecture {
     Phi3,
     /// `muse-glimmer`.
     MuseGlimmer,
+    /// `muse-spark`.
+    MuseSpark,
     /// `lfm2`.
     Lfm2,
     /// `lfm2moe`.
@@ -479,6 +486,7 @@ impl GgufArchitecture {
             "nanbeige" => Ok(Self::Nanbeige),
             "gemma2" => Ok(Self::Gemma2),
             "muse-glimmer" => Ok(Self::MuseGlimmer),
+            "muse-spark" => Ok(Self::MuseSpark),
             "lfm2" => Ok(Self::Lfm2),
             "lfm2moe" => Ok(Self::Lfm2Moe),
             "nemotron_h" => Ok(Self::NemotronH),
@@ -513,6 +521,7 @@ impl GgufArchitecture {
             Self::Nanbeige => ModelKind::Nanbeige,
             Self::Gemma2 => ModelKind::Gemma2,
             Self::MuseGlimmer => ModelKind::MuseGlimmer,
+            Self::MuseSpark => ModelKind::MuseSpark,
             Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
             Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
             Self::VoiceChat => ModelKind::VoiceChat,
@@ -544,6 +553,7 @@ impl GgufArchitecture {
             Self::Phi3 => "phi3",
             Self::Nanbeige => "nanbeige",
             Self::MuseGlimmer => "muse-glimmer",
+            Self::MuseSpark => "muse-spark",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2moe",
             Self::NemotronH => "nemotron_h",
@@ -647,6 +657,8 @@ fn effective_model_type(
             | "qwen3_5"
             | "qwen3_5_moe"
             | "qwen4_exp"
+            | "muse_glimmer"
+            | "muse_spark"
     ) {
         let effective_model_type = metadata
             .text_config
@@ -683,6 +695,22 @@ pub struct ResolvedModelIdentity {
 /// Resolves compatible family aliases and nested wrappers without parsing
 /// family geometry.
 pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelIdentity, ArtifactError> {
+    // Assistant implementation model_types may overlap target families. The
+    // released DFlash2 draft declares qwen3 but requires target captures and
+    // draft-only convolution/selector state, so it is not a Qwen target.
+    if json
+        .get("architectures")
+        .and_then(Value::as_array)
+        .is_some_and(|architectures| {
+            architectures
+                .iter()
+                .any(|name| name.as_str() == Some("DFlash2DraftModel"))
+        })
+    {
+        return Err(ArtifactError::InvalidArtifact(
+            "DFlash2DraftModel is an external draft assistant, not a standalone target".into(),
+        ));
+    }
     // The released NeMo document has no top-level Hugging Face model_type.
     // Identify its data contract, never its inert Python _target_ strings.
     if json.get("model_type").is_none()
@@ -754,8 +782,8 @@ pub enum SafetensorsModelConfig {
     Gemma2(crate::gemma2::ModelArgs),
     /// Nanbeige physical blocks and logical loop policy.
     Nanbeige(crate::nanbeige::ModelArgs),
-    /// Muse-Glimmer family geometry.
-    MuseGlimmer(crate::muse_glimmer::DecoderConfig),
+    /// Shared Muse geometry with its explicit checkpoint identity.
+    Muse(crate::muse::DecoderConfig),
     /// LFM2 family geometry.
     Lfm2(crate::lfm2::ModelArgs),
     /// Nemotron-H family geometry.
@@ -817,8 +845,8 @@ pub enum GgufModelConfig {
     Gemma2(crate::gemma2::ModelArgs),
     /// Nanbeige physical blocks and repetition policy.
     Nanbeige(crate::nanbeige::ModelArgs),
-    /// Muse-Glimmer family geometry.
-    MuseGlimmer(crate::muse_glimmer::DecoderConfig),
+    /// Shared Muse geometry with its explicit checkpoint identity.
+    Muse(crate::muse::DecoderConfig),
     /// Nemotron-H family geometry.
     NemotronH(crate::nemotron_h::ModelArgs),
     /// Complete coupled realtime speech geometry.
@@ -849,7 +877,7 @@ impl SafetensorsModelConfig {
             | Self::Nanbeige(_)
             | Self::Moshi(_)
             | Self::VoiceChat(_) => false,
-            Self::MuseGlimmer(args) => args.num_experts > 0,
+            Self::Muse(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
@@ -875,7 +903,7 @@ impl GgufModelConfig {
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
             Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) | Self::VoiceChat(_) => false,
-            Self::MuseGlimmer(args) => args.num_experts > 0,
+            Self::Muse(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
             Self::QwenHybrid(args) => args.text.num_experts > 0,
@@ -894,6 +922,13 @@ pub struct GgufArchitecturePlan {
 }
 
 impl GgufArchitecturePlan {
+    pub(crate) fn replace_muse_execution_config(&mut self, config: crate::muse::DecoderConfig) {
+        match &mut self.model {
+            GgufModelConfig::Muse(current) => *current = config,
+            _ => unreachable!("Muse source enrichment retains its admitted family"),
+        }
+    }
+
     pub(crate) fn with_draft_adapter(mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<Self, String> {
         match &mut self.model {
             GgufModelConfig::NemotronLabsDiffusion(plan) => *plan = plan.clone().with_draft_adapter(adapter),
@@ -963,6 +998,13 @@ impl GgufArchitecturePlan {
 }
 
 impl SafetensorsArchitecturePlan {
+    pub(crate) fn replace_muse_execution_config(&mut self, config: crate::muse::DecoderConfig) {
+        match &mut self.model {
+            SafetensorsModelConfig::Muse(current) => *current = config,
+            _ => unreachable!("Muse source enrichment retains its admitted family"),
+        }
+    }
+
     pub(crate) fn with_draft_adapter(mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<Self, String> {
         match &mut self.model {
             SafetensorsModelConfig::NemotronLabsDiffusion(plan) => *plan = plan.clone().with_draft_adapter(adapter),
@@ -1171,6 +1213,17 @@ impl SafetensorsArchitecturePlan {
             },
             extension,
         )))
+    }
+
+    pub(crate) fn resolve_muse_catalog(&mut self, tensors: &TensorCatalog, source: &Value) -> Result<(), ArtifactError> {
+        if let SafetensorsModelConfig::Muse(config) = &self.model {
+            let config = crate::muse::resolve_safetensors_config(config, source, &PortableSafetensorsCatalog(tensors))
+                .map_err(ArtifactError::InvalidArchitecturePlan)?;
+            self.checkpoint = crate::muse::safetensors_plan(&config)
+                .map_err(ArtifactError::InvalidArchitecturePlan)?;
+            self.model = SafetensorsModelConfig::Muse(config);
+        }
+        Ok(())
     }
 
     pub(crate) fn admit_catalog(&mut self, tensors: &TensorCatalog) -> Result<(), ArtifactError> {
@@ -1528,11 +1581,11 @@ fn resolve_safetensors_architecture(
         ModelKind::Nanbeige => crate::nanbeige::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Nanbeige)
             .map_err(|error| invalid_configuration(kind, error)),
-        ModelKind::MuseGlimmer => serde_json::to_vec(json)
+        ModelKind::MuseGlimmer | ModelKind::MuseSpark => serde_json::to_vec(json)
             .map_err(ArtifactError::from)
             .and_then(|bytes| {
-                crate::muse_glimmer::DecoderConfig::from_hf_json(&bytes)
-                    .map(SafetensorsModelConfig::MuseGlimmer)
+                crate::muse::DecoderConfig::from_hf_json(&bytes)
+                    .map(SafetensorsModelConfig::Muse)
                     .map_err(|error| invalid_configuration(kind, error))
             }),
         ModelKind::Lfm2 => crate::lfm2::model_args_from_config_value(json)
@@ -1602,7 +1655,7 @@ fn resolve_safetensors_architecture(
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Nanbeige(args) => crate::nanbeige::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
-        SafetensorsModelConfig::MuseGlimmer(args) => crate::muse_glimmer::safetensors_plan(args)
+        SafetensorsModelConfig::Muse(args) => crate::muse::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Lfm2(args) => crate::lfm2::safetensors_plan(args, true)
             .map_err(|error| invalid_configuration(kind, error))?,
@@ -1740,6 +1793,8 @@ mod tests {
             storage: None,
         }
     }
+
+
 
     fn qwen_vl_config() -> Value {
         serde_json::json!({
@@ -2415,7 +2470,7 @@ mod tests {
     #[test]
     fn gguf_families_declare_companion_presence_and_encoding_policy() {
         let required_quantized = GgufCompanionRequirement::new(
-            GgufCompanionRole::MediaProjector,
+            ArtifactCompanionRole::MediaProjector,
             true,
             "mmproj",
             1,
@@ -2431,7 +2486,7 @@ mod tests {
             vec![required_quantized.clone()]
         );
         let optional_quantized = GgufCompanionRequirement::new(
-            GgufCompanionRole::MediaProjector,
+            ArtifactCompanionRole::MediaProjector,
             false,
             "mmproj",
             1,
@@ -2443,7 +2498,7 @@ mod tests {
             vec![optional_quantized]
         );
         let optional_dense = GgufCompanionRequirement::new(
-            GgufCompanionRole::MediaProjector,
+            ArtifactCompanionRole::MediaProjector,
             false,
             "mmproj",
             1,

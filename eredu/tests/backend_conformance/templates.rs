@@ -560,6 +560,7 @@ fn retained_text_selection_loads_the_inspected_policy_without_rediscovery() {
     .unwrap();
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mock", "gpu:0").unwrap())
         .with_drafting(DraftingPlan::External {
+            residency: eredu_core::ResidencyPlan::FullyResident,
             model: assistant.path().display().to_string(),
             placement: DraftPlacementPlan::Target,
             max_draft_tokens: 4,

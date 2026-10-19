@@ -2,12 +2,18 @@
 use super::*;
 mod embedded;
 mod shared_backbone;
+mod conditioned;
+pub use conditioned::{ConditionedAssistantMemoryPlan, ConditionedAssistantMemoryProfile,
+    ConditionedBlockConvolution, ConditionedPredictionBody, ConditionedPredictionScoring,
+    ConditionedPredictionTopology};
 pub use shared_backbone::SharedBackboneMemoryPlan;
 pub use embedded::{apply_embedded_parameter_conversion_credit, EmbeddedPredictionMemoryPlan};
 use eredu_core::{generation::SpeculativeSchedulerOptions, ObservationKind, SpeculativeDraft};
 
 /// Native/architecture facts about the selected speculative mechanism.
 pub struct SpeculativeMemoryProfile {
+    /// Separately parameterized target-conditioned context and fixed-block execution.
+    pub conditioned: Option<ConditionedAssistantMemoryProfile>,
     /// Complete retained ordinary refinement and native numerical workspace.
     pub refinement: Option<RefinementMemoryPlan>,
     /// Complete masked invocation geometry over the target's parameter catalog.
@@ -57,6 +63,9 @@ pub trait SpeculativeForecastBackend<D>: GenerationForecastBackend {
 /// never predictions of acceptance rate or adaptive lookahead behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeculativeMemoryPlan {
+    /// Conditioned invocation over the paired parameter-only draft request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditioned: Option<ConditionedAssistantMemoryPlan>,
     /// Fixed masked canvas and optional additive draft work; no second parameter owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_backbone: Option<SharedBackboneMemoryPlan>,
@@ -188,6 +197,11 @@ pub fn estimate_speculative_continuation_memory(
     plan: &SpeculativeMemoryPlan,
     continuation: &SpeculativeContinuationMemoryPlan,
 ) -> Result<GenerationMemoryEstimate, CapabilityError> {
+    if plan.conditioned.is_some() && continuation.draft.as_ref().is_none_or(|state|
+        state.current_positions != continuation.target.current_positions
+    ) {
+        return Err(CapabilityError::InvalidConfiguration { field: "conditioned assistant continuation", detail: "installed projected context and pending capture observations must cover the target frontier".into() });
+    }
     let mut continuation = continuation.clone();
     continuation.target = continuation.target.with_logical_state_bounds(target)?;
     let extra = speculative_continuation_positions(
@@ -200,7 +214,18 @@ pub fn estimate_speculative_continuation_memory(
     }
     match (&plan.draft, &plan.embedded, &mut continuation.draft, &mut continuation.embedded) {
         (Some(draft), None, Some(state), None) if state.additional_input_tokens == extra => {
-            *state = state.with_logical_state_bounds(draft)?;
+            if plan.conditioned.is_some() {
+                state.current_state.validate()?;
+                state.peak_state.validate()?;
+                if state.query_tokens == 0 {
+                    return Err(CapabilityError::InvalidConfiguration {
+                        field: "conditioned assistant continuation",
+                        detail: "conditioned invocation query geometry is empty".into(),
+                    });
+                }
+            } else {
+                *state = state.with_logical_state_bounds(draft)?;
+            }
         }
         (None, Some(prediction), None, Some(state)) if state.additional_input_tokens == extra => {
             prediction.validate_continuation(target, state)?;
@@ -306,6 +331,14 @@ fn estimate_speculative_inner(
         normalize(draft);
     }
     let plan = &normalized;
+    if let Some(conditioned) = &plan.conditioned {
+        conditioned.validate(plan.draft.as_ref(), plan.max_draft_tokens)?;
+        if plan.embedded.is_some() || plan.shared_backbone.is_some() {
+            return Err(CapabilityError::InvalidConfiguration {
+                field: "conditioned assistant memory", detail: "conditioned execution cannot share another prediction mechanism".into(),
+            });
+        }
+    }
     if let Some(shared) = &plan.shared_backbone { shared.validate(plan.max_draft_tokens)?; }
     if [plan.embedded.is_some(), plan.draft.is_some(), plan.shared_backbone.is_some()].into_iter().filter(|selected| *selected).count() > 1 {
         return Err(CapabilityError::InvalidConfiguration {
@@ -550,8 +583,55 @@ fn estimate_speculative_inner(
                     mul(mul(positions, 4)?, add(6, mul(3,lookahead)?)?)?,
                     "single-lane token/history copies through rollback, replay and optimistic advancement"))?;
             }
+            let conditioned_pool = plan.conditioned.as_ref()
+                .filter(|assistant| assistant.execution_domain == pool.domain);
             let execution_pool = t.is_some_and(|p| !p.executions.is_empty())
-                || d.is_some_and(|(_, p)| !p.executions.is_empty());
+                || d.is_some_and(|(_, p)| !p.executions.is_empty()) || conditioned_pool.is_some();
+            if let Some(assistant) = conditioned_pool {
+                if assistant.native_workspace.upper_bytes.is_none() {
+                    result.uncertainties.push(assistant.native_workspace.detail.clone());
+                }
+                let vocabulary = t.into_iter().flat_map(|p| &p.executions)
+                    .filter_map(|e| e.execution_topology.as_ref().map(|t| t.vocabulary_size)
+                        .or_else(|| e.workspace.as_ref().map(|w| w.vocabulary_size))).max();
+                let installed = continuation.and_then(|c| c.draft.as_ref());
+                let context_positions = if start {
+                    installed.map_or(positions, |state| state.current_positions)
+                } else { positions };
+                let (logical, workspace, features) = assistant.costs(context_positions, if prefill { positions } else { width }, vocabulary)?;
+                let state = match installed {
+                    Some(state) if start => state.current_state.maximum(&logical),
+                    Some(state) => state.peak_state.add(&logical)?,
+                    None => logical,
+                };
+                p.persistent_state = p.persistent_state.add(&state)?;
+                p.retained_input = p.retained_input.add(&features)?;
+                if !start {
+                    p.workspace = p.workspace.add(&interval(&workspace, add(1, lookahead)?,
+                        "conditioned full-block invocation and optimistic graph overlap")?)?;
+                    let copies = if prefill { 2 } else { add(5, mul(3, lookahead)?)? };
+                    p.staging = p.staging.add(&interval(&state, copies,
+                        "conditioned seed, context replacement, rollback and optimistic context copies")?)?
+                        .add(&interval(&features, copies, "conditioned target capture views/copies through commitment and rollback")?)?;
+                }
+            }
+            // Pending context belongs to the target state. A separate assistant
+            // pool's transfer envelope cannot pay for the source backing or its
+            // rollback copies. Shared pools already include these charges above.
+            if let Some(assistant) = plan.conditioned.as_ref().filter(|_| {
+                conditioned_pool.is_none() && t.is_some_and(|p| !p.executions.is_empty())
+            }) {
+                let capture_positions = if start {
+                    continuation.map_or(positions, |c| c.target.current_positions)
+                } else { positions };
+                let features = assistant.captured_features(capture_positions)?;
+                p.retained_input = p.retained_input.add(&features)?;
+                if !start {
+                    let copies = if prefill { 2 } else { add(5, mul(3, lookahead)?)? };
+                    p.staging = p.staging.add(&interval(&features, copies,
+                        "target-owned conditioned capture backing through commitment and rollback")?)?;
+                }
+            }
             if execution_pool {
                 if let Some(embedded) = &plan.embedded {
                     let native = continuation.and_then(|c| c.embedded.as_ref());
@@ -742,7 +822,15 @@ fn estimate_speculative_inner(
         } else {
             0
         };
-        let growth = add(growth_in(&target_domains), embedded_growth)?
+        // Conditioned context compacts at its declared window. Its native
+        // floating width may be narrower, so retain a labeled FP32 growth envelope.
+        let conditioned_growth = match plan.conditioned.as_ref()
+            .filter(|p| p.execution_domain == pool.domain && target.input.model_positions < p.topology.body.context_window) {
+            Some(p) => mul(4, add(p.topology.body.hidden,
+                mul(mul(2, p.topology.body.layers)?, p.topology.body.key_value_width)?)?)?,
+            None => 0,
+        };
+        let growth = add(add(growth_in(&target_domains), embedded_growth)?, conditioned_growth)?
             .checked_add(draft_estimate.as_ref().map_or(0, |r| growth_in(&r.domains)))
             .ok_or(CapabilityError::ArithmeticOverflow {
                 operation: "speculative state growth",
@@ -783,6 +871,9 @@ fn estimate_speculative_inner(
                 .iter()
                 .map(|reason| format!("embedded prediction: {reason}")),
         );
+    }
+    if plan.conditioned.is_some() {
+        result.assumptions.push("Target-conditioned assistant: separate immutable parameter owner, compact encoded context/KV, full trained proposal block, raw/scattered scores and captured full-prefix backing; logical tensors and state growth use a conservative FP32 envelope. Capture backing and rollback allowances cover target execution pools and the assistant transfer pool, once when shared. Native scratch and bounded loading coverage remain separately labeled; this is not a total-process bound.".into());
     }
     result.uncertainties.sort();
     result.uncertainties.dedup();

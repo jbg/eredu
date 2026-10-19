@@ -212,6 +212,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         let convolution = |field: &str, channels| {
             CausalDepthwiseConvolution::new(
                 CausalDepthwiseConvolutionSpec {
+                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
                     dilation: 1,
                     channels,
                     kernel_size: args.sconv_kernel_size,
@@ -1005,6 +1006,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         let convolution = |field: &str| {
             CausalDepthwiseConvolution::new(
                 CausalDepthwiseConvolutionSpec {
+                    arithmetic: eredu_nn::ConvolutionArithmetic::Native,
                     dilation: 1,
                     channels: args.hidden_size,
                     kernel_size: args.sconv_kernel_size,

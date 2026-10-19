@@ -198,7 +198,9 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
                     .is_some_and(|transform| transform.inverse_sqrt_dimensions()),
                 spec.coefficient_scale().is_some(),
             ))?
-            .with_arithmetic(spec.arithmetic()),
+            .with_order(selection.order())
+            .with_arithmetic(spec.arithmetic())
+            .with_logit_scale(spec.logit_scale()),
             spec.format().encoding().weight_quantization(),
             context,
         ))?;
@@ -295,6 +297,9 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
                 bind_linear_companion(gate_up.weight(), scale.clone()),
             ));
         }
+        if let Some(global) = gate_up.format().global_scale() {
+            topology.push(("gate_up_proj_global_scale", bind_linear_companion(gate_up.weight(), global.clone())));
+        }
         if let Some(bias) = gate_up.format().affine_bias() {
             topology.push((
                 "gate_up_proj_biases",
@@ -306,6 +311,9 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
                 "down_proj_scales",
                 bind_linear_companion(down.weight(), scale.clone()),
             ));
+        }
+        if let Some(global) = down.format().global_scale() {
+            topology.push(("down_proj_global_scale", bind_linear_companion(down.weight(), global.clone())));
         }
         if let Some(bias) = down.format().affine_bias() {
             topology.push((

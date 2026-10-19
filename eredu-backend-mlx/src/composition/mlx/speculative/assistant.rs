@@ -1,6 +1,8 @@
+use super::parameter_policy::MlxAssistantParameterPolicy;
 use super::*;
 use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use eredu_runtime::WeightBinding;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -35,8 +37,13 @@ pub(crate) fn speculative_mechanism_capabilities() -> SpeculativeMechanismCapabi
 }
 
 pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistantArchitecture> {
+    memory_topology: Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>,
+    parameter_memory_bounds: Option<eredu_runtime::memory_forecast::ParameterResidencyMemoryBounds>,
+    parameter_loading: eredu_runtime::memory_forecast::ParameterLoadingMemoryProfile,
     pub(crate) config: A::Config,
-    pub(crate) module: MlxModule<A::Module<MlxNeuralBackend>>,
+    pub(crate) module: MlxModule<
+        A::Execution<MlxNeuralBackend, MlxAssistantParameterPolicy<A::Unit<MlxNeuralBackend>>>,
+    >,
     pub(crate) observers: eredu_architectures::external_assistant::ExternalAssistantObservers<
         MlxTensor,
         Array,
@@ -47,6 +54,158 @@ pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistant
 pub(crate) struct MlxAssistantPreparationVisitor {
     pub(super) stream: Stream,
     pub(super) weights_stream: Stream,
+}
+
+impl<A: eredu_architectures::ExternalAssistantArchitecture> MlxExternalAssistant<A> {
+    pub(super) fn memory_profile(
+        &self,
+        host_execution: bool,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::ConditionedAssistantMemoryProfile>,
+        eredu_runtime::memory_forecast::GenerationForecastError,
+    > {
+        let Some(topology) = &self.memory_topology else {
+            return Ok(None);
+        };
+        let Some(parameters) = self.parameter_memory_observation()? else {
+            return Ok(None);
+        };
+        Ok(Some(eredu_runtime::memory_forecast::ConditionedAssistantMemoryProfile {
+            topology: topology.clone(), host_execution, residency,
+            parameter_bounds: self.parameter_memory_bounds.clone(),
+            parameter_loading: Some(self.parameter_loading.clone()),
+            parameters,
+            native_workspace: eredu_runtime::memory_estimation::MemoryBytes::unknown("MLX conditioned projection/dequantization and operator scratch is not yet projected"),
+        }))
+    }
+
+    pub(super) fn parameter_memory_observation(
+        &self,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
+        eredu_core::BackendFailure,
+    > {
+        let Some(policy) = self.parameter_policy() else {
+            return Ok(None);
+        };
+        let report = policy
+            .residency_report()
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let parameter_conversions = report.device_parameter_conversions().map(<[_]>::to_vec);
+        Ok(Some(
+            eredu_core::speculative::SpeculativeParameterMemoryObservation {
+                parameters: crate::composition::mlx::capability::static_memory_from_residency(
+                    Some(report),
+                    None,
+                )
+                .map_err(eredu_core::BackendFailure::from_error)?,
+                parameter_conversions,
+                available: crate::composition::mlx::capability::available_memory()
+                    .map_err(eredu_core::BackendFailure::from_error)?,
+                allocator_cache_limit: match crate::allocator_cache_policy() {
+                    Ok(policy) => eredu_core::Observed::exact(
+                        policy.limit_bytes,
+                        "MLX process allocator-cache policy",
+                    ),
+                    Err(error) => eredu_core::Observed::unavailable(error.to_string()),
+                },
+            },
+        ))
+    }
+
+    fn parameter_policy(
+        &self,
+    ) -> Option<
+        &crate::backend::runtime::execution::generic::MlxSelectedLayerwisePolicy<
+            A::Unit<MlxNeuralBackend>,
+            (),
+        >,
+    > {
+        A::parameter_policy::<MlxNeuralBackend, _>(&self.module.inner)
+            .and_then(|policy| policy.0.as_ref())
+    }
+
+    pub(super) fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        match self.parameter_policy() {
+            Some(policy) => Ok(policy
+                .residency_report()
+                .map_err(eredu_core::BackendFailure::from_error)?
+                .offload()
+                .parameter_conversion_retention()
+                .clone()),
+            None => Ok(eredu_core::Observed::unsupported(
+                "resident module construction has no conversion-retention ledger",
+            )),
+        }
+    }
+
+    pub(super) fn trim_parameter_conversions(
+        &self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.parameter_policy()
+            .ok_or(eredu_core::residency::ParameterConversionTrimError::Unsupported)?
+            .trim_parameter_conversions()
+    }
+}
+
+struct ObserveAssistantConversions;
+struct ObserveAssistantMemory {
+    host_execution: bool,
+    residency: eredu_runtime::LayerWeightResidency,
+}
+impl eredu_architectures::MaterializedExternalAssistantRefVisitor<MlxAssistantPreparationVisitor>
+    for ObserveAssistantMemory
+{
+    type Output = Result<
+        Option<eredu_runtime::memory_forecast::ConditionedAssistantMemoryProfile>,
+        eredu_runtime::memory_forecast::GenerationForecastError,
+    >;
+    fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
+        self,
+        assistant: &MlxExternalAssistant<A>,
+    ) -> Self::Output {
+        assistant.memory_profile(self.host_execution, self.residency)
+    }
+}
+
+impl eredu_architectures::MaterializedExternalAssistantRefVisitor<MlxAssistantPreparationVisitor>
+    for ObserveAssistantConversions
+{
+    type Output = Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    >;
+    fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
+        self,
+        assistant: &MlxExternalAssistant<A>,
+    ) -> Self::Output {
+        assistant.parameter_conversion_retention()
+    }
+}
+
+struct TrimAssistantConversions;
+impl eredu_architectures::MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor>
+    for TrimAssistantConversions
+{
+    type Output = Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    >;
+    fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
+        self,
+        assistant: &mut MlxExternalAssistant<A>,
+    ) -> Self::Output {
+        assistant.trim_parameter_conversions()
+    }
 }
 
 impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPreparationVisitor {
@@ -61,20 +220,42 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPr
     }
 }
 
-fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchitecture>(
+pub(super) struct PreparedAssistantParameters<A: eredu_architectures::ExternalAssistantArchitecture>
+{
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    config: A::Config,
+    module_config: A::ModuleConfig,
+    pub(super) module: MlxModule<A::Module<MlxNeuralBackend>>,
+    units: Vec<Vec<WeightBinding>>,
+    layout: Option<eredu_runtime::ExecutionUnitLayout>,
+    residency: eredu_runtime::LayerWeightResidency,
+    conversion_retention: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+}
+
+pub(super) fn prepare_external_assistant_parameters<
+    A: eredu_architectures::ExternalAssistantArchitecture,
+>(
     prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MlxExternalAssistant<A>, Error> {
+) -> Result<PreparedAssistantParameters<A>, Error> {
     use crate::backend::runtime::{
-        checkpoint::binding::{
-            build_mlx_exact_replicated_text_bindings, materialize_module_bindings,
-            populate_module_from_arrays_excluding,
-        },
+        checkpoint::binding::{build_mlx_exact_replicated_text_bindings, ModuleBindingError},
         execution::layerwise::quantize_exact_replicated_text_tasks,
     };
-    let (store, _checkpoint, _artifact_identity, source_config, config, tasks) =
-        prepared.into_parts();
+    let parameter_units = prepared.parameter_units().to_vec();
+    let parameter_layout = prepared.parameter_layout().cloned();
+    let residency = prepared.residency();
+    let conversion_retention = prepared.parameter_conversion_retention();
+    let layout = prepared.execution_unit_layout().cloned();
+    let (
+        store,
+        _checkpoint,
+        _artifact_identity,
+        source_module_config,
+        config,
+        module_config,
+        tasks,
+    ) = prepared.into_parts();
     let mut store = store;
     let transformed = tasks
         .iter()
@@ -87,9 +268,9 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         })
         .collect::<Vec<_>>();
     if !transformed.is_empty() {
-        let source = A::module::<MlxNeuralBackend>(source_config, stream)
+        let source = A::module::<MlxNeuralBackend>(source_module_config, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target = A::module::<MlxNeuralBackend>(config.clone(), stream)
+        let target = A::module::<MlxNeuralBackend>(module_config.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let mut groups = Vec::<(eredu_checkpoint::WeightQuantization, Vec<_>)>::new();
         for task in transformed {
@@ -113,7 +294,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
                 &target,
                 &[] as &[A::Module<MlxNeuralBackend>],
                 &[],
-                None,
+                parameter_layout.as_ref(),
                 format,
                 &grouped,
                 stream,
@@ -121,8 +302,8 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
             .0;
         }
     }
-    let mut module = MlxModule::new(
-        A::module::<MlxNeuralBackend>(config.clone(), stream)
+    let module = MlxModule::new(
+        A::module::<MlxNeuralBackend>(module_config.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
     );
     let task_refs = tasks.iter().collect::<Vec<_>>();
@@ -131,13 +312,186 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         store.as_ref(),
         &task_refs,
         &std::collections::BTreeSet::new(),
-        None,
+        parameter_layout.as_ref(),
     )?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
-    Ok(MlxExternalAssistant {
+    eredu_runtime::preflight_bindings::<MlxNeuralBackend>(store.as_ref(), &bindings)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+    // Validate the complete destination partition before any payload is read.
+    // Architecture-declared units include every packed companion; native code
+    // neither parses checkpoint names nor chooses an assistant's boundaries.
+    let mut units = vec![Vec::new(); parameter_units.len()];
+    let mut assigned = std::collections::BTreeSet::new();
+    for binding in bindings {
+        let name = binding.logical_target().unwrap_or_else(|| binding.name());
+        let index = parameter_units
+            .iter()
+            .position(|unit| unit.outputs().contains(name))
+            .ok_or_else(|| {
+                Error::ArchitectureModel(format!(
+                    "assistant binding {name:?} has no acquisition unit"
+                ))
+            })?;
+        if !assigned.insert(name.to_owned()) {
+            return Err(Error::ArchitectureModel(format!(
+                "assistant binding {name:?} has duplicate destinations"
+            )));
+        }
+        units[index].push(binding);
+    }
+    if parameter_units
+        .iter()
+        .any(|unit| !unit.outputs().is_subset(&assigned))
+    {
+        return Err(Error::ArchitectureModel(
+            "assistant acquisition units have missing destinations".into(),
+        ));
+    }
+    for (definition, bindings) in parameter_units.iter().zip(&units) {
+        let actual = crate::backend::runtime::checkpoint::binding::binding_bytes(bindings)?;
+        if actual != definition.parameter_bytes() {
+            return Err(Error::ArchitectureModel(
+                "assistant native parameter extent differs from the retained cold unit".into(),
+            ));
+        }
+    }
+    Ok(PreparedAssistantParameters {
+        store,
         config,
+        module_config,
         module,
+        units,
+        layout,
+        residency,
+        conversion_retention,
+    })
+}
+
+pub(super) fn bind_resident_assistant_parameters<
+    A: eredu_architectures::ExternalAssistantArchitecture,
+>(
+    prepared: &mut PreparedAssistantParameters<A>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(), Error> {
+    use crate::backend::runtime::checkpoint::binding::{
+        materialize_module_bindings, populate_module_from_arrays_excluding,
+    };
+    for bindings in &prepared.units {
+        let arrays =
+            materialize_module_bindings(prepared.store.as_ref(), bindings, weights_stream, stream)?;
+        populate_module_from_arrays_excluding(&mut prepared.module, &arrays, |name| {
+            !arrays.contains_key(name)
+        })?;
+    }
+    Ok(())
+}
+
+fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchitecture>(
+    prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxExternalAssistant<A>, Error> {
+    let mut prepared = prepare_external_assistant_parameters::<A>(prepared, stream)?;
+    let memory_topology = A::memory_topology(&prepared.module_config)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    // Query exact binding extents and the native host-buffer capacity mechanism
+    // before units are consumed. No artifact reopening or payload materialization.
+    let parameter_memory_bounds = if prepared.layout.is_some() {
+        use crate::backend::runtime::{
+            checkpoint::binding::binding_bytes,
+            residency::manager::host_capacity_upper_bound_for_bindings,
+        };
+        let capacities = prepared
+            .units
+            .iter()
+            .map(|bindings| {
+                Ok((
+                    binding_bytes(bindings)?,
+                    host_capacity_upper_bound_for_bindings(bindings)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Some(
+            eredu_runtime::memory_forecast::ParameterResidencyMemoryBounds::from_unit_capacities(
+                capacities,
+                prepared.residency,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let parameter_loading = crate::backend::runtime::residency::manager::parameter_loading_memory_profile(
+        prepared.store.as_ref(), &prepared.units, prepared.residency,
+    )?;
+    let policy = if let Some(layout) = prepared.layout.take() {
+        use crate::backend::runtime::execution::generic::MlxSelectedLayerwisePolicy;
+        let addresses = (0..layout.len())
+            .map(|ordinal| layout.address(ordinal).expect("validated assistant layout"))
+            .collect::<Vec<_>>();
+        let bindings = std::mem::take(&mut prepared.units);
+        let (policy, _) =
+            crate::backend::runtime::execution::generic::prepare_parameter_unit_policy::<
+                A::Unit<MlxNeuralBackend>,
+                _,
+                _,
+                _,
+            >(
+                prepared.store,
+                &mut Vec::<A::Unit<MlxNeuralBackend>>::new(),
+                (),
+                prepared.residency,
+                stream,
+                weights_stream,
+                |_| false,
+                layout.clone(),
+                Vec::new(),
+                bindings,
+                Vec::new(),
+            )?;
+        policy
+            .residency_manager()
+            .configure_parameter_conversion_retention(
+                prepared.conversion_retention,
+                eredu_core::residency::ParameterConversionRetentionEligibility::Eligible,
+            )?;
+        let policy = if prepared.residency.is_fully_resident() {
+            let units = (0..layout.len())
+                .map(|ordinal| {
+                    A::build_execution_unit::<MlxNeuralBackend>(
+                        &prepared.module_config,
+                        ordinal,
+                        stream,
+                    )
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            MlxSelectedLayerwisePolicy::resident(
+                policy.into_resident_units(units, stream)?,
+                &layout,
+                &addresses,
+            )?
+        } else {
+            MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)?
+        };
+        MlxAssistantParameterPolicy(Some(policy))
+    } else {
+        if !prepared.residency.is_fully_resident() {
+            return Err(Error::ArchitectureModel(
+                "resident module construction received a bounded assistant policy".into(),
+            ));
+        }
+        bind_resident_assistant_parameters(&mut prepared, stream, weights_stream)?;
+        MlxAssistantParameterPolicy(None)
+    };
+    let module = A::into_execution::<MlxNeuralBackend, _>(prepared.module.inner, |_| policy)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    Ok(MlxExternalAssistant {
+        memory_topology,
+        parameter_memory_bounds,
+        parameter_loading,
+        config: prepared.config,
+        module: MlxModule::new(module),
         observers: Default::default(),
     })
 }
@@ -151,6 +505,7 @@ pub struct MlxDrafter {
 struct DrafterPayload {
     execution: DrafterExecution,
     stream: Stream,
+    target_session: String,
 }
 
 enum DrafterExecution {
@@ -214,7 +569,7 @@ impl Retention for DrafterRetention {
     }
 }
 
-struct DrafterOperation<'a> {
+pub(in crate::composition::mlx) struct DrafterOperation<'a> {
     drafter: &'a mut MlxDrafter,
     retained: Rc<RefCell<Option<Rc<OrdinaryRetirement<DrafterPayload>>>>>,
     recovery: Recovery<DrafterRetention>,
@@ -222,6 +577,30 @@ struct DrafterOperation<'a> {
 }
 
 impl DrafterOperation<'_> {
+    pub(in crate::composition::mlx) fn visit<W, T>(mut self, visitor: W) -> Result<T, Error>
+    where
+        W: eredu_architectures::MaterializedExternalAssistantVisitor<
+            MlxAssistantPreparationVisitor,
+            Output = Result<T, Error>,
+        >,
+    {
+        let result = self.payload().execution.visit(visitor);
+        self.finish(result)
+    }
+
+    pub(in crate::composition::mlx) fn with_autoregressive<T>(
+        mut self,
+        run: impl FnOnce(&mut crate::backend::MlxModel) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let result = match &mut self.payload().execution {
+            DrafterExecution::Autoregressive { model, .. } => run(model),
+            _ => Err(Error::Speculative(
+                "draft requires target-feature execution".into(),
+            )),
+        };
+        self.finish(result)
+    }
+
     fn payload(&mut self) -> &mut DrafterPayload {
         Rc::get_mut(&mut self.drafter.payload).expect("healthy drafter owns its native payload")
     }
@@ -270,6 +649,42 @@ impl Drop for DrafterOperation<'_> {
 }
 
 impl MlxDrafter {
+    /// Preserves the target ownership established by core's drafting handoff.
+    /// Equal checkpoints, geometry or communicators do not identify a session.
+    pub(crate) fn validate_target(
+        &self,
+        target: &super::super::session::MlxModelSession,
+    ) -> Result<(), Error> {
+        if self.payload.target_session != target.native_session_identity() {
+            return Err(Error::Speculative(
+                "external drafter belongs to a different target session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Immutable conditioned resource projection over the actual selected parameter owner.
+    pub(crate) fn conditioned_memory_profile(
+        &self,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::ConditionedAssistantMemoryProfile>,
+        eredu_runtime::memory_forecast::GenerationForecastError,
+    > {
+        let DrafterExecution::Assistant(assistant) = &self.payload.execution else {
+            return Ok(None);
+        };
+        let host_execution = self
+            .stream()
+            .get_device()
+            .and_then(|d| d.get_type())
+            .map_err(eredu_core::BackendFailure::from_error)?
+            == safemlx::DeviceType::Cpu;
+        assistant.visit_ref(ObserveAssistantMemory {
+            host_execution,
+            residency: assistant.residency(),
+        })
+    }
+
     /// Immutable facts for independent drafting; observing this does not acquire
     /// mutation authority, synchronize work or allocate an execution state.
     pub(crate) fn autoregressive_memory_profile(
@@ -363,6 +778,7 @@ impl MlxDrafter {
     /// Materializes an architecture-inspected drafter with proven tokenizer compatibility.
     pub(crate) fn materialize(
         preparation: eredu_architectures::PreparedExternalDraft,
+        target: &super::super::session::MlxModelSession,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
@@ -398,6 +814,7 @@ impl MlxDrafter {
         let payload = Rc::new(OrdinaryRetirement::new(DrafterPayload {
             execution,
             stream: stream.clone(),
+            target_session: target.native_session_identity().to_owned(),
         }));
         retained.replace(Some(Rc::clone(&payload)));
         recovery.seal();
@@ -412,16 +829,28 @@ impl MlxDrafter {
         Ok(Self { payload, poisoned })
     }
 
-    pub(crate) fn visit<W, T>(&mut self, visitor: W) -> Result<T, Error>
-    where
-        W: eredu_architectures::MaterializedExternalAssistantVisitor<
-            MlxAssistantPreparationVisitor,
-            Output = Result<T, Error>,
-        >,
-    {
-        let mut operation = self.begin_operation()?;
-        let result = operation.payload().execution.visit(visitor);
-        operation.finish(result)
+    pub(in crate::composition::mlx) fn prepare_operation(
+        &mut self,
+        prepare: impl FnOnce(Result<(), Error>) -> Result<(), Error>,
+    ) -> Result<DrafterOperation<'_>, Error> {
+        let (operation, local) = match self.begin_operation() {
+            Ok(operation) => (Some(operation), Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        let prepared = prepare(local);
+        let Some(operation) = operation else {
+            return prepared.and_then(|()| {
+                Err(Error::Speculative(
+                    "drafter preparation accepted absent mutation authority".into(),
+                ))
+            });
+        };
+        if let Err(error) = prepared {
+            // No assistant state or parameter visitor has run. A peer refusal
+            // releases this unused scope only after native completion evidence.
+            return Err(operation.finish(Ok(error))?);
+        }
+        Ok(operation)
     }
 
     pub(crate) fn is_autoregressive(&self) -> bool {
@@ -430,20 +859,6 @@ impl MlxDrafter {
             DrafterExecution::Autoregressive { .. }
         )
     }
-    pub(crate) fn with_autoregressive<T>(
-        &mut self,
-        run: impl FnOnce(&mut crate::backend::MlxModel) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        let mut operation = self.begin_operation()?;
-        let result = match &mut operation.payload().execution {
-            DrafterExecution::Autoregressive { model, .. } => run(model),
-            _ => Err(Error::Speculative(
-                "draft requires target-feature execution".into(),
-            )),
-        };
-        operation.finish(result)
-    }
-
     /// Returns the portable proof established before this assistant was materialized.
     pub fn tokenizer_compatibility(&self) -> TokenizerCompatibilityProof {
         self.payload.execution.tokenizer_compatibility()
@@ -508,9 +923,9 @@ impl eredu_core::residency::ParameterConversionRetentionObserver for MlxDrafter 
             DrafterExecution::Autoregressive { model, .. } => {
                 model.parameter_conversion_retention()
             }
-            DrafterExecution::Assistant(_) => Ok(eredu_core::Observed::unsupported(
-                "auxiliary assistant does not expose parameter conversion retention",
-            )),
+            DrafterExecution::Assistant(assistant) => {
+                assistant.visit_ref(ObserveAssistantConversions)
+            }
         }
     }
 }
@@ -531,8 +946,7 @@ impl eredu_core::residency::ParameterConversionRetentionTrimmer for MlxDrafter {
             .map_err(eredu_core::BackendFailure::from_error)?;
         let result = match &mut operation.payload().execution {
             DrafterExecution::Autoregressive { model, .. } => model.trim_parameter_conversions(),
-            // These modules never register optional retained conversions.
-            DrafterExecution::Assistant(_) => Ok(Vec::new()),
+            DrafterExecution::Assistant(assistant) => assistant.visit(TrimAssistantConversions),
         };
         operation
             .finish(Ok(result))

@@ -184,19 +184,32 @@ fn logical_routed_values(
     Ok(Some(values))
 }
 
+/// Independent logical cohorts may carry different floating compute types in
+/// one native world wave. F32 losslessly carries F16/BF16 values; restore the
+/// logical dtype before local arithmetic rather than changing its precision.
+fn logical_wire_value(input: &Array, stream: &Stream) -> Result<Array> {
+    match input.dtype() {
+        Dtype::Float16 | Dtype::Bfloat16 => input.as_dtype(Dtype::Float32, stream),
+        _ => Ok(input.clone()),
+    }
+}
+
 fn logical_all_sum(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
-    if let Some(values) = logical_routed_values(input, group, stream)? {
+    let dtype = input.dtype();
+    let wire = logical_wire_value(input, stream)?;
+    if let Some(values) = logical_routed_values(&wire, group, stream)? {
         let mut values = values.into_iter();
-        let (_, mut reduced) = values
+        let (_, first) = values
             .next()
             .ok_or_else(|| Exception::custom("logical routes cannot be empty"))?;
+        let mut reduced = first.as_dtype(dtype, stream)?;
         for (_, value) in values {
-            reduced = reduced.add(value, stream)?;
+            reduced = reduced.add(value.as_dtype(dtype, stream)?, stream)?;
         }
         return Ok(reduced);
     }
-    if let Some(peer) = logical_direct_exchange(input, group, stream)? {
-        return input.add(peer, stream);
+    if let Some(peer) = logical_direct_exchange(&wire, group, stream)? {
+        return input.add(peer.as_dtype(dtype, stream)?, stream);
     }
     let logical = group.logical.as_ref().expect("logical group");
     if !logical.world_collective_wave {
@@ -204,30 +217,44 @@ fn logical_all_sum(input: &Array, group: &Group, stream: &Stream) -> Result<Arra
             "logical subgroup cannot use a world collective without a consensus-proven participation wave",
         ));
     }
-    let representative = logical.global_ranks[0];
-    let packed = pack_logical_value(input, representative, group.native.size(), stream)?;
-    ordered_world_sum(&packed, group, stream)?.try_index_device(
-        i32::try_from(representative)
-            .map_err(|_| Exception::custom("logical representative does not fit in i32"))?,
-        stream,
-    )
+    // Distinct slots transport values without cross-member arithmetic. Restore
+    // each contribution's logical precision before the selected subgroup sum.
+    let packed = pack_logical_value(&wire, group.native.rank(), group.native.size(), stream)?;
+    let gathered = ordered_world_sum(&packed, group, stream)?;
+    let mut reduced = None;
+    for rank in &logical.global_ranks {
+        let value = gathered
+            .try_index_device(
+                i32::try_from(*rank)
+                    .map_err(|_| Exception::custom("logical member rank does not fit in i32"))?,
+                stream,
+            )?
+            .as_dtype(dtype, stream)?;
+        reduced = Some(match reduced {
+            None => value,
+            Some(previous) => Array::add(&previous, value, stream)?,
+        });
+    }
+    reduced.ok_or_else(|| Exception::custom("logical group has no members"))
 }
 
 fn logical_all_gather_stacked(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
-    if let Some(mut values) = logical_routed_values(input, group, stream)? {
+    let wire = logical_wire_value(input, stream)?;
+    if let Some(mut values) = logical_routed_values(&wire, group, stream)? {
         values.sort_unstable_by_key(|(source_rank, _)| *source_rank);
         let values = values
             .into_iter()
             .map(|(_, value)| value)
             .collect::<Vec<_>>();
-        return stack_axis(&values, 0, stream);
+        return stack_axis(&values, 0, stream)?.as_dtype(input.dtype(), stream);
     }
-    if let Some(peer) = logical_direct_exchange(input, group, stream)? {
+    if let Some(peer) = logical_direct_exchange(&wire, group, stream)? {
         return if group.rank() == 0 {
-            stack_axis(&[input.clone(), peer], 0, stream)
+            stack_axis(&[wire, peer], 0, stream)
         } else {
-            stack_axis(&[peer, input.clone()], 0, stream)
-        };
+            stack_axis(&[peer, wire], 0, stream)
+        }?
+        .as_dtype(input.dtype(), stream);
     }
     let logical = group.logical.as_ref().expect("logical group");
     if !logical.world_collective_wave {
@@ -235,7 +262,7 @@ fn logical_all_gather_stacked(input: &Array, group: &Group, stream: &Stream) -> 
             "logical subgroup cannot use a world collective without a consensus-proven participation wave",
         ));
     }
-    let packed = pack_logical_value(input, group.native.rank(), group.native.size(), stream)?;
+    let packed = pack_logical_value(&wire, group.native.rank(), group.native.size(), stream)?;
     let gathered = ordered_world_sum(&packed, group, stream)?;
     let indices = logical
         .global_ranks
@@ -247,7 +274,9 @@ fn logical_all_gather_stacked(input: &Array, group: &Group, stream: &Stream) -> 
         .collect::<Result<Vec<_>>>()?;
     let length = i32::try_from(indices.len())
         .map_err(|_| Exception::custom("logical subgroup size does not fit in i32"))?;
-    gathered.take_axis(Array::from_slice(&indices, &[length]), 0, stream)
+    gathered
+        .take_axis(Array::from_slice(&indices, &[length]), 0, stream)?
+        .as_dtype(input.dtype(), stream)
 }
 
 fn all_sum_unchecked(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
@@ -543,13 +572,15 @@ fn logical_world_all_to_all_v(
             stream,
         )?
     };
+    let wire_input = logical_wire_value(&world_input, stream)?;
     let world_output = native::all_to_all_v(
-        &world_input,
+        &wire_input,
         &world_send,
         &world_recv,
         &group.native,
         group.communication_stream(stream.as_ref())?,
-    )?;
+    )?
+    .as_dtype(input.dtype(), stream)?;
     if canonical_order {
         Ok(world_output)
     } else {

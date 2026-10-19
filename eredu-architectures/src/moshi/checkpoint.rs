@@ -413,6 +413,7 @@ fn matrix_constraint(
         CheckpointLayout::MoshiSafetensors => match quantization {
             WeightQuantization::Affine(_) => StoredDtypeConstraint::Floating,
             WeightQuantization::MxFp4 => StoredDtypeConstraint::Exact(StoredDtype::U8),
+            WeightQuantization::NvFp4 => return Err("Moshi NVFP4 layout is not implemented".into()),
             WeightQuantization::GgufIQuant { .. } => unreachable!(),
         },
     };

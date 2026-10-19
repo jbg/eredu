@@ -69,6 +69,7 @@ fn discovery(routing: bool) -> InterventionDiscovery {
             expert_count: 4,
             top_k: 2,
             scoring: RoutingScoring::Softmax,
+            selection_order: crate::intervention::RoutingSelectionOrder::Ranked,
             normalize_selected: true,
             normalization_epsilon: 0.0,
             coefficient_scale: 1.5,
@@ -442,6 +443,41 @@ fn bounded_plans_reject_oversized_payloads_metadata_and_operations() {
     let mut op = zero();
     op.evidence = InterventionEvidence::Preview { max_elements: 4097 };
     assert!(admit(op).is_err());
+}
+
+#[test]
+fn routing_selection_order_is_required_and_bound_to_session_identity() {
+    let mut ranked = discovery(true);
+    let mut partition = ranked.clone();
+    partition.points[0]
+        .routing
+        .as_mut()
+        .unwrap()
+        .selection_order = RoutingSelectionOrder::Partition;
+    let op = operation(InterventionAction::ExcludeExperts {
+        expert_ids: vec![0],
+    });
+    let a = plan(vec![op.clone()])
+        .admit(&ranked, request(), "s")
+        .unwrap();
+    let b = plan(vec![op]).admit(&partition, request(), "s").unwrap();
+    assert_ne!(a.identity(), b.identity());
+    assert_ne!(a.intent_identity(), b.intent_identity());
+    let encoded = serde_json::to_value(&partition).unwrap();
+    assert_eq!(
+        encoded["points"][0]["routing"]["selection_order"],
+        "partition"
+    );
+    let decoded: InterventionDiscovery = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, partition);
+    let mut incomplete = encoded;
+    incomplete["points"][0]["routing"]
+        .as_object_mut()
+        .unwrap()
+        .remove("selection_order");
+    assert!(serde_json::from_value::<InterventionDiscovery>(incomplete).is_err());
+    ranked.schema_version = 1;
+    assert!(a.plan().clone().admit(&ranked, request(), "s").is_err());
 }
 
 #[test]

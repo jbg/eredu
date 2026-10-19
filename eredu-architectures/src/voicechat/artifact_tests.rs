@@ -193,7 +193,7 @@ fn missing_rnnt_requires_an_explicit_companion_and_preserves_primary_function_we
     assert_eq!(function.artifact, PhysicalArtifactId::Primary);
     assert_eq!(function.recipe.source_keys(), ["function_head.weight"]);
     let companion =
-        PhysicalArtifactId::Companion(GgufCompanionRole::Named("voicechat/companion".into()));
+        PhysicalArtifactId::Companion(ArtifactCompanionRole::Named("voicechat/companion".into()));
     assert_eq!(
         plan.parameters()["stt_model.rnnt_decoder.prediction.embed.weight"].artifact,
         companion

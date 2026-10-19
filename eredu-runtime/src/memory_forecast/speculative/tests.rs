@@ -62,6 +62,7 @@ fn request(domain: MemoryDomain) -> GenerationMemoryRequest {
 
 fn plan() -> SpeculativeMemoryPlan {
     SpeculativeMemoryPlan {
+        conditioned: None,
         shared_backbone: None,
         embedded: None,
         draft: Some(request(MemoryDomain::Unified)),
@@ -81,6 +82,205 @@ fn upper(estimate: &GenerationMemoryEstimate) -> u64 {
     estimate.domains[0].generation_peak.upper_bytes.unwrap()
 }
 
+fn conditioned() -> ConditionedAssistantMemoryPlan {
+    ConditionedAssistantMemoryPlan {
+        topology: ConditionedPredictionTopology {
+            body: ConditionedPredictionBody {
+                hidden: 4,
+                captures: 2,
+                layers: 2,
+                query_heads: 2,
+                head_width: 4,
+                key_value_width: 2,
+                intermediate: 8,
+                context_window: 3,
+                block_positions: 4,
+                convolution: None,
+            },
+            scoring: ConditionedPredictionScoring::MappedVocabulary {
+                vocabulary: 11,
+                rank: 3,
+            },
+        },
+        execution_domain: MemoryDomain::Unified,
+        native_workspace: MemoryBytes::exact(0),
+    }
+}
+
+#[test]
+fn conditioned_context_compacts_but_capture_views_and_full_blocks_keep_their_backing() {
+    let p = conditioned();
+    let (state, workspace, features) = p.costs(10, 1, None).unwrap();
+    // Three retained positions, each with a width-4 encoded row and two
+    // width-2 key/value pairs. Capture suffix views can keep ten width-8 rows.
+    assert_eq!(state.upper_bytes, Some(144));
+    assert_eq!(features.upper_bytes, Some(320));
+    assert_eq!(state.lower_bytes, 0);
+    // Four complete width-11 raw score rows exist independently of the number
+    // of candidates eventually sampled; they cannot disappear from the envelope.
+    assert!(workspace.upper_bytes.unwrap() >= 4 * 11 * 4);
+    let (long_state, _, long_features) = p.costs(100, 1, None).unwrap();
+    assert_eq!(long_state, state);
+    assert_eq!(long_features.upper_bytes, Some(3200));
+    let mut convolution = p.clone();
+    convolution.topology.body.convolution = Some(ConditionedBlockConvolution {
+        taps: 3,
+        group_size: 2,
+    });
+    let (conv_state, conv_work, _) = convolution.costs(10, 1, None).unwrap();
+    assert_eq!(
+        conv_state, state,
+        "block-local convolution must not create persistent carry"
+    );
+    assert!(conv_work.upper_bytes.unwrap() > workspace.upper_bytes.unwrap());
+    let mut malformed = p;
+    malformed.topology.body.hidden = u64::MAX;
+    assert!(malformed.costs(10, 1, None).is_err());
+}
+
+#[test]
+fn conditioned_forecast_aggregates_one_parameter_owner_and_one_allocator_per_pool() {
+    let target = request(MemoryDomain::Unified);
+    let mut p = plan();
+    p.max_draft_tokens = 2;
+    p.conditioned = Some(conditioned());
+    let draft = p.draft.as_mut().unwrap();
+    draft.domains[0].executions.clear();
+    draft.domains[0].resident_parameters = MemoryBytes::exact(3072);
+    draft.domains[0].already_resident_bytes = 3072;
+    draft.domains[0].backend_overhead = MemoryBytes::exact(32768);
+    let estimate = estimate_speculative_memory(&target, &p).unwrap();
+    assert!(estimate.domains[0]
+        .phases
+        .iter()
+        .filter(|p| p.phase != MemoryPhase::Loading)
+        .all(|p| p.parameters.lower_bytes == 7168
+            && p.parameters.upper_bytes == Some(7168)
+            && p.backend_overhead.upper_bytes == Some(65536)));
+    let prefill = estimate.domains[0]
+        .phases
+        .iter()
+        .find(|p| p.phase == MemoryPhase::Prefill)
+        .unwrap();
+    assert_eq!(
+        prefill.retained_input.upper_bytes,
+        Some(
+            2 * (68 + std::mem::size_of::<eredu_core::GenerationSequence>() as u64 + 32 * 4)
+                + 17 * 8 * 4
+        ),
+        "two declared host sequence/input allowances plus one shared capture backing envelope"
+    );
+    let mut short_target = target.clone();
+    short_target.input = InputTokenCount::text(1);
+    let mut short_plan = p.clone();
+    short_plan.draft.as_mut().unwrap().input = short_target.input;
+    assert_eq!(
+        estimate_speculative_memory(&short_target, &short_plan)
+            .unwrap()
+            .domains[0]
+            .state_growth_bytes_per_position,
+        80,
+        "32 target bytes plus the 48-byte conditioned FP32 context envelope before compaction"
+    );
+    p.conditioned.as_mut().unwrap().native_workspace =
+        MemoryBytes::unknown("fixture native scratch unavailable");
+    let unknown = estimate_speculative_memory(&target, &p).unwrap();
+    assert_eq!(unknown.fit, MemoryFit::InsufficientInformation);
+    assert!(unknown
+        .uncertainties
+        .iter()
+        .any(|s| s == "fixture native scratch unavailable"));
+    assert!(unknown.domains[0].generation_peak.upper_bytes.is_none());
+    p.draft = None;
+    assert!(estimate_speculative_memory(&target, &p).is_err());
+}
+
+#[test]
+fn conditioned_split_pools_retain_target_capture_backing_before_transfer_and_rollback() {
+    let source = MemoryDomain::Device("target".into());
+    let destination = MemoryDomain::Device("assistant".into());
+    let mut target = request(source.clone());
+    target.max_output_tokens = Some(2);
+    target.forecast_output_tokens = 2;
+    let mut host = target.domains[0].clone();
+    host.domain = MemoryDomain::Host;
+    host.executions.clear();
+    host.resident_parameters = MemoryBytes::exact(0);
+    host.already_resident_bytes = 0;
+    host.retained_input = MemoryBytes::exact(0);
+    host.backend_overhead = MemoryBytes::exact(0);
+    target.domains.push(host);
+    let mut draft = target.clone();
+    draft.domains.truncate(1);
+    draft.domains[0].domain = destination.clone();
+    draft.domains[0].executions.clear();
+    draft.domains[0].retained_input = MemoryBytes::exact(0);
+    let mut p = plan();
+    p.max_draft_tokens = 2;
+    p.draft = Some(draft);
+    let mut assistant = conditioned();
+    assistant.execution_domain = destination.clone();
+    p.conditioned = Some(assistant);
+    for lookahead in [false, true] {
+        p.scheduler = p.scheduler.with_lookahead(lookahead);
+        let estimate = estimate_speculative_memory(&target, &p).unwrap();
+        let target_pool = estimate
+            .domains
+            .iter()
+            .find(|d| d.domain == source)
+            .unwrap();
+        let prefill = target_pool
+            .phases
+            .iter()
+            .find(|p| p.phase == MemoryPhase::Prefill)
+            .unwrap();
+        // Seventeen target rows, two ordered width-four captures, FP32 envelope.
+        assert_eq!(
+            prefill.retained_input.upper_bytes,
+            Some(68 + 17 * 2 * 4 * 4)
+        );
+        assert!(prefill.staging.upper_bytes.unwrap() >= 2 * 17 * 2 * 4 * 4);
+        let verification = target_pool
+            .phases
+            .iter()
+            .find(|p| p.phase == MemoryPhase::SpeculativeVerification)
+            .unwrap();
+        // Two canonical outputs plus pending-token/proposal verification, with
+        // another three positions when an optimistic block may remain live.
+        let rows = if lookahead { 25 } else { 22 };
+        assert_eq!(
+            verification.retained_input.upper_bytes,
+            Some(68 + rows * 2 * 4 * 4)
+        );
+        assert!(verification.staging.upper_bytes.unwrap() >= 2 * rows * 2 * 4 * 4);
+        let draft_pool = estimate
+            .domains
+            .iter()
+            .find(|d| d.domain == destination)
+            .unwrap();
+        let transferred = draft_pool
+            .phases
+            .iter()
+            .find(|p| p.phase == MemoryPhase::Prefill)
+            .unwrap();
+        assert_eq!(transferred.retained_input.upper_bytes, Some(17 * 2 * 4 * 4));
+        let host_pool = estimate
+            .domains
+            .iter()
+            .find(|d| d.domain == MemoryDomain::Host)
+            .unwrap();
+        assert!(
+            host_pool
+                .phases
+                .iter()
+                .filter(|p| p.phase != MemoryPhase::Loading)
+                .all(|p| p.retained_input.upper_bytes
+                    == Some(std::mem::size_of::<eredu_core::GenerationSequence>() as u64 + 2 * 4)),
+            "a metadata-only host pool owns the common sequence, without target publications"
+        );
+    }
+}
+
 #[test]
 fn shortened_refinement_keeps_full_canvas_and_causal_prefix_separate() {
     let mut request = request(MemoryDomain::Unified);
@@ -93,8 +293,16 @@ fn shortened_refinement_keeps_full_canvas_and_causal_prefix_separate() {
     };
     let estimate = estimate_refinement_memory(&request, &plan).unwrap();
     let domain = &estimate.domains[0];
-    let refinement = domain.phases.iter().find(|p| p.phase == MemoryPhase::Refinement).unwrap();
-    let commit = domain.phases.iter().find(|p| p.phase == MemoryPhase::RefinementCommit).unwrap();
+    let refinement = domain
+        .phases
+        .iter()
+        .find(|p| p.phase == MemoryPhase::Refinement)
+        .unwrap();
+    let commit = domain
+        .phases
+        .iter()
+        .find(|p| p.phase == MemoryPhase::RefinementCommit)
+        .unwrap();
     assert_eq!(refinement.query_positions, 32);
     // The selected cache rounds eighteen positions to its eight-position quantum.
     assert_eq!(refinement.persistent_state.lower_bytes, 24 * 8 * 4);
@@ -102,22 +310,48 @@ fn shortened_refinement_keeps_full_canvas_and_causal_prefix_separate() {
     assert_eq!(commit.positions, 18);
     assert!(refinement.workspace.upper_bytes.unwrap() >= 32 * 128 * 64 + 32 * 64 + 32 * 8 * 4);
     assert!(domain.phases.iter().all(|p| p.phase != MemoryPhase::Decode));
-    assert!(domain.phases.iter().filter(|p| p.phase != MemoryPhase::Loading).all(|p| p.parameters.lower_bytes == 4096));
+    assert!(domain
+        .phases
+        .iter()
+        .filter(|p| p.phase != MemoryPhase::Loading)
+        .all(|p| p.parameters.lower_bytes == 4096));
     request.max_output_tokens = Some(2);
     let longer = estimate_refinement_memory(&request, &plan).unwrap();
-    assert_eq!(longer.domains[0].phases.iter().find(|p| p.phase == MemoryPhase::Refinement).unwrap().query_positions, 32);
+    assert_eq!(
+        longer.domains[0]
+            .phases
+            .iter()
+            .find(|p| p.phase == MemoryPhase::Refinement)
+            .unwrap()
+            .query_positions,
+        32
+    );
     assert!(upper(&longer) >= upper(&estimate));
     request.domains[0].loading_peak = MemoryBytes::exact(1 << 28);
     let source = SpeculativeMemoryPlan {
-        shared_backbone: None, embedded: None, draft: None,
+        conditioned: None,
+        shared_backbone: None,
+        embedded: None,
+        draft: None,
         auxiliary_bytes_per_position: MemoryBytes::exact(0),
         sampling_bytes_per_vocabulary_entry: MemoryBytes::exact(64),
-        max_draft_tokens: 0, scheduler: Default::default(), shared_allocator: true,
+        max_draft_tokens: 0,
+        scheduler: Default::default(),
+        shared_allocator: true,
     };
     let combined = estimate_source_generation_memory(&request, &source, Some(&plan)).unwrap();
     assert!(combined.domains[0].overall_peak.lower_bytes >= 1 << 28);
     assert!(combined.domains[0].generation_peak.upper_bytes.unwrap() < 1 << 28);
-    assert_eq!(combined.domains[0].phases.iter().find(|phase| phase.phase == MemoryPhase::Refinement).unwrap().parameters.lower_bytes, 4096);
+    assert_eq!(
+        combined.domains[0]
+            .phases
+            .iter()
+            .find(|phase| phase.phase == MemoryPhase::Refinement)
+            .unwrap()
+            .parameters
+            .lower_bytes,
+        4096
+    );
 }
 
 #[test]
@@ -131,40 +365,93 @@ fn queued_mode_forecasts_cover_all_handoffs_without_replaying_prefill_or_residen
     };
     let mut speculative = plan();
     speculative.draft = None;
-    speculative.shared_backbone = Some(SharedBackboneMemoryPlan { canvas_positions: 32, adapter: None });
-    let modes = [DecodingMode::Autoregressive, DecodingMode::Diffusion { policy: None }, DecodingMode::SelfSpeculation(SpeculationOptionsRequest { max_draft_tokens: std::num::NonZeroUsize::new(4).unwrap(), ..Default::default() }.try_into().unwrap())];
+    speculative.shared_backbone = Some(SharedBackboneMemoryPlan {
+        canvas_positions: 32,
+        adapter: None,
+    });
+    let modes = [
+        DecodingMode::Autoregressive,
+        DecodingMode::Diffusion { policy: None },
+        DecodingMode::SelfSpeculation(
+            SpeculationOptionsRequest {
+                max_draft_tokens: std::num::NonZeroUsize::new(4).unwrap(),
+                ..Default::default()
+            }
+            .try_into()
+            .unwrap(),
+        ),
+    ];
     let mut request = request(MemoryDomain::Unified);
     request.max_output_tokens = Some(2);
     request.forecast_output_tokens = 2;
     for active in modes {
         for pending in modes.into_iter().filter(|mode| *mode != active) {
-            let mut decoding = DecodingContinuationMemoryPlan { state: DecodingState { active, pending: Some(pending), acknowledgement: None, terminal: false }, settlement_input_tokens: 0, refinement: vec![], speculative: vec![] };
+            let mut decoding = DecodingContinuationMemoryPlan {
+                state: DecodingState {
+                    active,
+                    pending: Some(pending),
+                    acknowledgement: None,
+                    terminal: false,
+                },
+                settlement_input_tokens: 0,
+                refinement: vec![],
+                speculative: vec![],
+            };
             for mode in [active, pending] {
                 match mode {
-                    DecodingMode::Autoregressive => {},
+                    DecodingMode::Autoregressive => {}
                     DecodingMode::Diffusion { .. } => decoding.refinement.push(refinement.clone()),
-                    DecodingMode::SelfSpeculation(_) => decoding.speculative.push(speculative.clone()),
+                    DecodingMode::SelfSpeculation(_) => {
+                        decoding.speculative.push(speculative.clone())
+                    }
                 }
             }
             let inputs = decoding.input_horizon(2, 2).unwrap();
-            if !decoding.refinement.is_empty() { assert_eq!(inputs, 34); }
-            else { assert!(inputs >= 7); }
-            let native = ContinuationMemoryPlan { current_positions: 17, additional_input_tokens: inputs, query_tokens: 1, current_state: MemoryBytes::estimated(544, 1024, "installed capacity"), peak_state: MemoryBytes::estimated(544, 4096, "future capacity") };
-            let estimate = estimate_decoding_continuation_memory(&request, &native, &decoding).unwrap();
+            if !decoding.refinement.is_empty() {
+                assert_eq!(inputs, 34);
+            } else {
+                assert!(inputs >= 7);
+            }
+            let native = ContinuationMemoryPlan {
+                current_positions: 17,
+                additional_input_tokens: inputs,
+                query_tokens: 1,
+                current_state: MemoryBytes::estimated(544, 1024, "installed capacity"),
+                peak_state: MemoryBytes::estimated(544, 4096, "future capacity"),
+            };
+            let estimate =
+                estimate_decoding_continuation_memory(&request, &native, &decoding).unwrap();
             let phases = &estimate.domains[0].phases;
-            assert!(phases.iter().all(|p| !matches!(p.phase, MemoryPhase::Loading | MemoryPhase::Prefill)));
+            assert!(phases
+                .iter()
+                .all(|p| !matches!(p.phase, MemoryPhase::Loading | MemoryPhase::Prefill)));
             assert!(phases.iter().all(|p| p.parameters.lower_bytes == 4096));
             if !decoding.refinement.is_empty() {
-                let phase = phases.iter().find(|p| p.phase == MemoryPhase::Refinement).unwrap();
+                let phase = phases
+                    .iter()
+                    .find(|p| p.phase == MemoryPhase::Refinement)
+                    .unwrap();
                 assert_eq!(phase.query_positions, 32);
                 assert_eq!(phase.persistent_state.upper_bytes, Some(4096));
-                assert_eq!(phases.iter().find(|p| p.phase == MemoryPhase::RefinementCommit).unwrap().query_positions, 32);
+                assert_eq!(
+                    phases
+                        .iter()
+                        .find(|p| p.phase == MemoryPhase::RefinementCommit)
+                        .unwrap()
+                        .query_positions,
+                    32
+                );
             }
             if !decoding.speculative.is_empty() {
-                let draft = phases.iter().find(|p| p.phase == MemoryPhase::SpeculativeDraft).unwrap();
+                let draft = phases
+                    .iter()
+                    .find(|p| p.phase == MemoryPhase::SpeculativeDraft)
+                    .unwrap();
                 assert_eq!(draft.query_positions, 32);
                 assert!(draft.positions >= 17 + inputs + 32);
-                assert!(phases.iter().any(|p| p.phase == MemoryPhase::SpeculativeVerification));
+                assert!(phases
+                    .iter()
+                    .any(|p| p.phase == MemoryPhase::SpeculativeVerification));
             }
         }
     }
@@ -393,6 +680,41 @@ fn continuation_fixture(
 }
 
 #[test]
+fn conditioned_startup_geometry_cannot_substitute_for_installed_continuation_state() {
+    let (target, mut plan, installed) = continuation_fixture(2, false);
+    plan.conditioned = Some(conditioned());
+    plan.draft.as_mut().unwrap().domains[0].executions.clear();
+    assert!(matches!(
+        estimate_speculative_continuation_memory(&target, &plan, &installed),
+        Err(CapabilityError::InvalidConfiguration {
+            field: "conditioned assistant continuation",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn conditioned_continuation_keeps_installed_backing_and_unknown_future_capacity() {
+    let (target, mut plan, mut installed) = continuation_fixture(2, false);
+    plan.conditioned = Some(conditioned());
+    plan.draft.as_mut().unwrap().domains[0].executions.clear();
+    installed.draft.as_mut().unwrap().current_positions = 17;
+    let estimate = estimate_speculative_continuation_memory(&target, &plan, &installed).unwrap();
+    let phases = &estimate.domains[0].phases;
+    assert_eq!(phases[0].phase, MemoryPhase::ContinuationStart);
+    assert_eq!(phases[0].persistent_state.upper_bytes, Some(200_000));
+    // Seven possible new positions: native target and context bounds each grow
+    // by 700 bytes, plus 144 bytes for the three-position compact logical bank.
+    assert_eq!(phases[1].persistent_state.upper_bytes, Some(201_544));
+    assert!(phases.iter().all(|p| !matches!(p.phase, MemoryPhase::Loading | MemoryPhase::Prefill)));
+
+    installed.draft.as_mut().unwrap().peak_state = MemoryBytes::unknown("future native backing capacity");
+    let unknown = estimate_speculative_continuation_memory(&target, &plan, &installed).unwrap();
+    assert_eq!(unknown.domains[0].phases[0].persistent_state.upper_bytes, Some(200_000));
+    assert!(unknown.domains[0].generation_peak.upper_bytes.is_none());
+}
+
+#[test]
 fn continuation_uses_both_installed_frontiers_and_capacity_without_completed_phases() {
     let (target, plan, continuation) = continuation_fixture(7, false);
     let result = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
@@ -485,6 +807,7 @@ fn continuation_unattributed_sampling_and_capture_storage_covers_discrete_pools(
 fn use_generic_topology(request: &mut GenerationMemoryRequest) {
     use crate::execution_topology::*;
     let projection = |name: &str, input, output| ProjectionTopology {
+        arithmetic: eredu_nn::LinearArithmetic::Native,
         input,
         output,
         format: eredu_checkpoint::LinearFormat::Dense,
@@ -1193,41 +1516,95 @@ fn shared_masked_forecast_keeps_the_full_canvas_and_one_parameter_owner() {
     let request = request(MemoryDomain::Unified);
     let mut plan = plan();
     plan.draft = None;
-    plan.shared_backbone = Some(SharedBackboneMemoryPlan { canvas_positions: 32, adapter: None });
+    plan.shared_backbone = Some(SharedBackboneMemoryPlan {
+        canvas_positions: 32,
+        adapter: None,
+    });
     let full = estimate_speculative_memory(&request, &plan).unwrap();
-    let proposal = full.domains[0].phases.iter().find(|phase| phase.phase == MemoryPhase::SpeculativeDraft).unwrap();
+    let proposal = full.domains[0]
+        .phases
+        .iter()
+        .find(|phase| phase.phase == MemoryPhase::SpeculativeDraft)
+        .unwrap();
     assert_eq!(proposal.query_positions, 32);
     assert_eq!(proposal.parameters.lower_bytes, 4096);
-    let verification = full.domains[0].phases.iter().find(|phase| phase.phase == MemoryPhase::SpeculativeVerification).unwrap();
+    let verification = full.domains[0]
+        .phases
+        .iter()
+        .find(|phase| phase.phase == MemoryPhase::SpeculativeVerification)
+        .unwrap();
     assert_eq!(verification.query_positions, 5);
-    assert!(proposal.persistent_state.upper_bytes.unwrap() <= verification.persistent_state.upper_bytes.unwrap(), "masked block K/V does not enlarge canonical residency");
+    assert!(
+        proposal.persistent_state.upper_bytes.unwrap()
+            <= verification.persistent_state.upper_bytes.unwrap(),
+        "masked block K/V does not enlarge canonical residency"
+    );
     let workspace = proposal.workspace.upper_bytes.unwrap();
     plan.max_draft_tokens = 1;
     let shortened = estimate_speculative_memory(&request, &plan).unwrap();
-    let proposal = shortened.domains[0].phases.iter().find(|phase| phase.phase == MemoryPhase::SpeculativeDraft).unwrap();
+    let proposal = shortened.domains[0]
+        .phases
+        .iter()
+        .find(|phase| phase.phase == MemoryPhase::SpeculativeDraft)
+        .unwrap();
     assert_eq!(proposal.query_positions, 32);
     assert_eq!(proposal.workspace.upper_bytes, Some(workspace));
     let nz = |n| std::num::NonZeroU32::new(n).unwrap();
-    plan.shared_backbone.as_mut().unwrap().adapter = Some(crate::speculative::shared_backbone::SharedDraftAdapterGeometry { rank: nz(2), input: nz(32), output: nz(32), layers: nz(1) });
+    plan.shared_backbone.as_mut().unwrap().adapter = Some(
+        crate::speculative::shared_backbone::SharedDraftAdapterGeometry {
+            rank: nz(2),
+            input: nz(32),
+            output: nz(32),
+            layers: nz(1),
+        },
+    );
     let adapted = estimate_speculative_memory(&request, &plan).unwrap();
-    let adapted = adapted.domains[0].phases.iter().find(|phase| phase.phase == MemoryPhase::SpeculativeDraft).unwrap();
+    let adapted = adapted.domains[0]
+        .phases
+        .iter()
+        .find(|phase| phase.phase == MemoryPhase::SpeculativeDraft)
+        .unwrap();
     assert_eq!(adapted.parameters, proposal.parameters);
-    let graphs = 1 + u64::from(plan.scheduler.lookahead_blocks != 0 && plan.scheduler.max_optimistic_branches != 0);
-    assert_eq!(adapted.workspace.upper_bytes.unwrap() - workspace, 32 * (32 + 2 + 2*32) * 4 * graphs);
-    assert!(adapted.staging.upper_bytes.unwrap() > 32 * 128 * 128, "full canvas distributions remain charged with shortened proposal budgets");
+    let graphs = 1 + u64::from(
+        plan.scheduler.lookahead_blocks != 0 && plan.scheduler.max_optimistic_branches != 0,
+    );
+    assert_eq!(
+        adapted.workspace.upper_bytes.unwrap() - workspace,
+        32 * (32 + 2 + 2 * 32) * 4 * graphs
+    );
+    assert!(
+        adapted.staging.upper_bytes.unwrap() > 32 * 128 * 128,
+        "full canvas distributions remain charged with shortened proposal budgets"
+    );
 
     plan.max_draft_tokens = 0;
     let causal = estimate_speculative_memory(&request, &plan).unwrap();
-    assert!(!causal.domains[0].phases.iter().any(|phase| phase.phase == MemoryPhase::SpeculativeDraft));
-    let verification = causal.domains[0].phases.iter().find(|phase| phase.phase == MemoryPhase::SpeculativeVerification).unwrap();
+    assert!(!causal.domains[0]
+        .phases
+        .iter()
+        .any(|phase| phase.phase == MemoryPhase::SpeculativeDraft));
+    let verification = causal.domains[0]
+        .phases
+        .iter()
+        .find(|phase| phase.phase == MemoryPhase::SpeculativeVerification)
+        .unwrap();
     assert_eq!(verification.query_positions, 1);
     assert_eq!(verification.parameters.lower_bytes, 4096);
-    assert_eq!(speculative_continuation_positions(7, 0, plan.scheduler).unwrap(), 8);
+    assert_eq!(
+        speculative_continuation_positions(7, 0, plan.scheduler).unwrap(),
+        8
+    );
     let causal_peak = causal.domains[0].generation_peak.clone();
     plan.shared_backbone.as_mut().unwrap().adapter = None;
-    assert_eq!(estimate_speculative_memory(&request, &plan).unwrap().domains[0].generation_peak, causal_peak, "retained draft adapter has no causal invocation workspace");
+    assert_eq!(
+        estimate_speculative_memory(&request, &plan)
+            .unwrap()
+            .domains[0]
+            .generation_peak,
+        causal_peak,
+        "retained draft adapter has no causal invocation workspace"
+    );
 }
-
 
 #[test]
 fn queued_block_append_forecast_keeps_checkpoint_copies_with_zero_output() {
@@ -1236,25 +1613,43 @@ fn queued_block_append_forecast_keeps_checkpoint_copies_with_zero_output() {
     request.max_output_tokens = Some(0);
     request.forecast_output_tokens = 0;
     let decoding = DecodingContinuationMemoryPlan {
-        state: DecodingState { active: DecodingMode::Diffusion { policy: None },
-            pending: Some(DecodingMode::Autoregressive), acknowledgement: None, terminal: false },
-        settlement_input_tokens: 32, speculative: vec![],
+        state: DecodingState {
+            active: DecodingMode::Diffusion { policy: None },
+            pending: Some(DecodingMode::Autoregressive),
+            acknowledgement: None,
+            terminal: false,
+        },
+        settlement_input_tokens: 32,
+        speculative: vec![],
         refinement: vec![RefinementMemoryPlan {
             canvas_positions: std::num::NonZeroU32::new(32).unwrap(),
             vocabulary_size: std::num::NonZeroU32::new(128).unwrap(),
-            stability_history: 0, bytes_per_vocabulary_entry: MemoryBytes::estimated(0, 64, "numerical fixture"),
+            stability_history: 0,
+            bytes_per_vocabulary_entry: MemoryBytes::estimated(0, 64, "numerical fixture"),
         }],
     };
     assert_eq!(decoding.input_horizon(0, 0).unwrap(), 32);
-    let native = ContinuationMemoryPlan { current_positions: 17, additional_input_tokens: 32,
-        query_tokens: 1, current_state: MemoryBytes::estimated(544, 1024, "installed capacity"),
-        peak_state: MemoryBytes::estimated(544, 4096, "future capacity") };
+    let native = ContinuationMemoryPlan {
+        current_positions: 17,
+        additional_input_tokens: 32,
+        query_tokens: 1,
+        current_state: MemoryBytes::estimated(544, 1024, "installed capacity"),
+        peak_state: MemoryBytes::estimated(544, 4096, "future capacity"),
+    };
     let estimate = estimate_decoding_continuation_memory(&request, &native, &decoding).unwrap();
     let phases = &estimate.domains[0].phases;
-    let append = phases.iter().find(|p| p.phase == MemoryPhase::SpeculativeVerification).unwrap();
+    let append = phases
+        .iter()
+        .find(|p| p.phase == MemoryPhase::SpeculativeVerification)
+        .unwrap();
     assert_eq!(append.query_positions, 32);
     assert!(append.staging.upper_bytes.unwrap() >= 2 * 4096);
-    assert!(phases.iter().any(|p| p.phase == MemoryPhase::Refinement && p.query_positions == 32));
+    assert!(phases
+        .iter()
+        .any(|p| p.phase == MemoryPhase::Refinement && p.query_positions == 32));
     assert!(phases.iter().all(|p| p.parameters.lower_bytes == 4096));
-    assert!(phases.iter().all(|p| !matches!(p.phase, MemoryPhase::SpeculativeDraft | MemoryPhase::Loading | MemoryPhase::Prefill)));
+    assert!(phases.iter().all(|p| !matches!(
+        p.phase,
+        MemoryPhase::SpeculativeDraft | MemoryPhase::Loading | MemoryPhase::Prefill
+    )));
 }

@@ -35,6 +35,7 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 ParameterConversionRetentionPolicy::Bounded { max_bytes: 1024 },
             ))
             .with_drafting(DraftingPlan::External {
+                residency: eredu_core::ResidencyPlan::FullyResident,
                 model: path.display().to_string(),
                 placement: if lookahead {
                     DraftPlacementPlan::Device {

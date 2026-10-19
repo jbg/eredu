@@ -425,6 +425,9 @@ fn values(
                     let payload = match companion.role() {
                         eredu_nn::LinearCompanionRole::Scale => &scale,
                         eredu_nn::LinearCompanionRole::AffineBias => &bias,
+                        eredu_nn::LinearCompanionRole::GlobalScale => {
+                            return Err(Error::backend("affine transformation cannot produce a global scale"));
+                        }
                     };
                     let expected = context
                         .tensor_layout(companion.name())

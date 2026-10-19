@@ -252,6 +252,38 @@ where
     B: GroupedNeuralBackend,
 {
     type Error = RoutedTextExecutionError;
+    fn forward_compact_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => ParameterProvider::<B>::forward_compact_grouped_uncombined(
+                p, resident, request, context,
+            ),
+            _ => Err(eredu_nn::Error::backend_source(
+                eredu_nn::UncombinedGroupedOutputUnavailable,
+            )),
+        }
+    }
+
+    fn forward_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => {
+                ParameterProvider::<B>::forward_grouped_uncombined(p, resident, request, context)
+            }
+            _ => Err(eredu_nn::Error::backend_source(
+                eredu_nn::UncombinedGroupedOutputUnavailable,
+            )),
+        }
+    }
+
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
@@ -364,6 +396,38 @@ where
     Movement::Error: std::fmt::Display,
 {
     type Error = RoutedTextExecutionError;
+    fn forward_compact_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => ParameterProvider::<B>::forward_compact_grouped_uncombined(
+                p, resident, request, context,
+            ),
+            _ => Err(eredu_nn::Error::backend_source(
+                eredu_nn::UncombinedGroupedOutputUnavailable,
+            )),
+        }
+    }
+
+    fn forward_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => {
+                ParameterProvider::<B>::forward_grouped_uncombined(p, resident, request, context)
+            }
+            _ => Err(eredu_nn::Error::backend_source(
+                eredu_nn::UncombinedGroupedOutputUnavailable,
+            )),
+        }
+    }
+
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
@@ -717,6 +781,32 @@ impl<B> eredu_runtime::TensorParallelParameterProvider<B> for PlannedResidentBan
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
 {
+    fn forward_compact_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_compact_grouped_uncombined_tensor_parallel(p, resident, request, partitions, context),
+            _ => Err(eredu_nn::Error::backend_source(eredu_nn::UncombinedGroupedOutputUnavailable)),
+        }
+    }
+
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_grouped_uncombined_tensor_parallel(p, resident, request, partitions, context),
+            _ => Err(eredu_nn::Error::backend_source(eredu_nn::UncombinedGroupedOutputUnavailable)),
+        }
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
@@ -777,6 +867,32 @@ where
     Movement: IndexedMovement<B>,
     Movement::Error: std::fmt::Display,
 {
+    fn forward_compact_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_compact_grouped_uncombined_tensor_parallel(p, resident, request, partitions, context),
+            _ => Err(eredu_nn::Error::backend_source(eredu_nn::UncombinedGroupedOutputUnavailable)),
+        }
+    }
+
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        match self {
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_grouped_uncombined_tensor_parallel(p, resident, request, partitions, context),
+            _ => Err(eredu_nn::Error::backend_source(eredu_nn::UncombinedGroupedOutputUnavailable)),
+        }
+    }
+
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,

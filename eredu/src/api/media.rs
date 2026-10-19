@@ -17,6 +17,9 @@ pub enum MultimodalPreparationError {
     /// The attached tokenizer failed to encode a text segment.
     #[error(transparent)]
     Text(#[from] TextModelError),
+    /// The selected artifact or companions cannot admit the requested modality.
+    #[error(transparent)]
+    Capability(#[from] eredu_core::CapabilityError),
     /// The selected backend could not preprocess the request.
     #[error("selected backend failed multimodal preparation: {0}")]
     Backend(#[source] eredu_core::BackendFailure),
@@ -33,6 +36,9 @@ impl<B: MultimodalPreparationBackend> LoadedModel<B> {
             self.encode(text, false)
         })
         .map_err(|error| match error {
+            MultimodalPreparationFailure::Capability(error) => {
+                MultimodalPreparationError::Capability(error)
+            }
             MultimodalPreparationFailure::Backend(error) => {
                 MultimodalPreparationError::Backend(eredu_core::BackendFailure::from_error(error))
             }

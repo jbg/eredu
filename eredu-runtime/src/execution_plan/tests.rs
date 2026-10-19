@@ -137,6 +137,7 @@ fn drafting_intent_is_checked_without_native_placement() {
         5
     );
     let external = plan().with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: "assistant".into(),
         placement: DraftPlacementPlan::Device {
             device: DevicePlan::new("foreign", "queue:2").unwrap(),
@@ -150,6 +151,7 @@ fn drafting_intent_is_checked_without_native_placement() {
         crate::DraftingLoadRequest::ExternalTarget
     );
     let invalid = external.with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: "assistant".into(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 0,

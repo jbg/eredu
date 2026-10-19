@@ -166,16 +166,21 @@ source format, or adding a family branch to a backend. Keep logical invocations,
 shared checkpoint parameters, and mutable state distinct. Residency estimates
 must account for the actual materialization strategy, including any replicas.
 
-Add behavioral coverage for the applicable matrix above, using nonzero numerical
-fixtures and neutral backend contracts. Exercise pipeline cuts at architecture
-boundaries and compare partitioned and bounded execution with ordinary execution.
-Download a pinned official checkpoint outside the tracked source tree, validate
-its provenance, and run prefill plus multiple cached decode steps against an
-independent reference. Record reproducible commands, revisions, tolerances, and
-results in the family support documentation. Synthetic fixtures supplement this
-released-checkpoint validation; they do not replace it. If hardware prevents a
-particular native distributed run, keep its neutral conformance coverage and
-report that native validation gap explicitly.
+Verify supported checkpoint layouts through family-level acceptance against a pinned
+independent reference: compare prefill score rows and several cached decode steps,
+including generated token IDs. Quantized comparisons execute the same encoded
+artifact; BF16 differences are a separate measurement. Include representative
+media and assistant inputs where applicable. Keep checkpoint payloads and generated
+traces outside the tracked tree. Retain compact manifests, reference runners and
+reproducible commands, revisions, tolerances and measured results.
+
+Families use shared, model-independent execution conformance for bounded and
+partitioned execution, controlled/uninterrupted parity, cancellation, speculative
+commit/rollback, snapshots, restore/fork and budget preservation. Reuse compact
+fixtures and shared drivers instead of building a separate conformance matrix for
+each family. If resources prevent a released-checkpoint or native distributed run,
+report that exact validation gap; synthetic execution does not establish released
+checkpoint parity.
 
 Only architectural inapplicability justifies omitting an existing feature. Explain
 the concrete equation, state, or resource constraint in the support documentation
@@ -188,7 +193,7 @@ New inference functionality must also work through controlled sessions by defaul
 Keep request preparation, sampling, speculation, commitment, decoding, termination,
 metrics and bounded observation in shared drivers; controlled sessions supply
 explicit advancement and state ownership rather than a second inference engine.
-Add behavioral conformance coverage comparing controlled and uninterrupted runs.
+Use shared execution conformance to compare controlled and uninterrupted runs.
 
 An exception needs a concrete state, completion, attribution or resource-accounting
 reason, exposed through capabilities or a typed rejection and documented in
@@ -208,7 +213,7 @@ Prefer semantic enforcement that survives refactors:
   `eredu-ios` C-ABI example;
 - compiler type checking and visibility for ownership boundaries;
 - backend-neutral conformance tests for public behavior; and
-- focused tests for architecture/runtime contracts.
+- family-level acceptance against pinned independent references.
 
 Any additional native-backend unsafe-code exception must be explicit and
 crate-local, document the safety boundary here and in
@@ -242,53 +247,58 @@ cargo test -p eredu --no-default-features --test portable_facade
 cargo test -p eredu --no-default-features --test backend_conformance
 ```
 
-## Selective validation
+## Verification policy
 
-Test and check activity must resolve a specific, credible uncertainty about the
-change. Minimize both test maintenance and execution cost while retaining the
-evidence needed to establish correctness. The model-family integration and
-controlled-inference conformance requirements above still apply when introducing
-those capabilities; they do not require rerunning their full matrices for every
-refactor.
+Checked-in verification consists of family-level reference acceptance and a small
+shared execution-conformance layer. Keep this surface stable and inexpensive to
+maintain. Test count and passing-result volume are not measures of completeness.
 
-### Running tests and checks
+### Durable acceptance and conformance
 
-- Before each run, identify the affected behavior and concrete failure it could
-  reveal, or the observed failure it should confirm as fixed. Do not run tests
-  merely to accumulate passing results.
-- Use compiler checks for type, API, visibility, and feature-boundary changes.
-  Do not write or run behavioral tests solely to demonstrate properties already
-  enforced by types.
-- Choose the smallest existing test or check that can expose each distinct risk.
-  Prefer one informative test over several overlapping tests. Use numerical,
-  distributed, media, or lifecycle tests when they uniquely exercise affected
-  behavior.
-- Do not automatically run whole crate or workspace suites, every family, all
-  feature configurations, or a full format/topology/residency matrix. Broaden
-  validation only when the changed scope, an observed failure, or an unresolved
-  concern gives a concrete reason.
-- After an informative pass, move on. Repeat a passing test or rebuild a passing
-  configuration only after a relevant subsequent change or when investigating
-  an unresolved concern. Apply this restraint to builds and checks as well as
-  tests.
-- Resolve failures found and report material validation gaps. Completion requires
-  relevant evidence of correctness, not an exhaustive passing-test inventory.
+- Each supported checkpoint layout has a reproducible acceptance route against a
+  pinned independent reference, covering prefill scores and several cached decode
+  steps. Matching a few token IDs alone is insufficient numerical evidence.
+- Retain small source/provenance manifests, reference entry points and concise
+  results. Download payloads and generate detailed tensors, traces and diagnostics
+  outside the repository. Do not check in full tensor dumps, captured checkpoint
+  slices, historical experiment logs or copies of executed runners.
+- Shared conformance owns state and execution contracts such as cancellation,
+  rank-local failure agreement, rejected speculation, controlled advancement,
+  snapshot isolation and consumed budgets. Families supply compact fixtures to
+  existing drivers; do not duplicate these suites for each family or enumerate
+  full format/topology/residency cross-products.
+- Compiler types, visibility, manifests and feature-gated checks enforce API and
+  ownership boundaries. Do not add behavioral assertions for properties already
+  established by those mechanisms.
 
-### Writing tests
+### Temporary investigation
 
-- Reuse or adapt existing coverage first. Add a test only for a distinct behavioral
-  risk without adequate coverage, with an independent expected result or an
-  externally meaningful contract.
-- Do not mirror implementation helper calls, compute expected values using the
-  implementation under test, enumerate fields merely because they exist, or test
-  forwarding methods only for forwarding.
-- Avoid asserting the same invariant at every layer. Choose the layer where a
-  failure is most directly attributable; add coverage at another layer only for
-  a distinct integration risk.
-- Keep fixtures and assertions focused on the behavior at risk. Do not expand
-  combinatorial fixtures or introduce a new validation harness without a concrete
-  coverage need. Comparisons across formats or backends must allow legitimate
-  representation, precision, and provenance differences.
+- Unit tests, component-level numerical comparisons and other narrow diagnostic
+  tests are temporary investigation tools. Write and run them outside the tracked
+  tree, use inspection and source reasoning to explain discrepancies, then remove
+  the diagnostics once the issue is resolved.
+- Do not retain exceptional numerical regression tests, including counterexamples
+  for previously fixed rounding, routing, normalization or encoding bugs. Fix the
+  implementation and use family acceptance or shared conformance for durable
+  verification. A past bug does not create an exception to this policy.
+- Do not preserve implementation-mirroring tests, field/forwarding assertions,
+  family-specific copies of shared contracts, or numerical fixtures merely because
+  they already exist or once helped diagnose a failure.
+
+### Running verification
+
+- Before each run, identify the concrete uncertainty it resolves. Select the
+  smallest applicable compiler check, acceptance case or shared conformance case.
+- Do not automatically run entire crates, workspaces, all families or broad
+  feature and placement matrices. Broaden only when an observed failure or changed
+  scope gives a concrete reason.
+- After an informative pass, move on. Repeat only after a relevant subsequent
+  change or to investigate an unresolved concern. Do not run expensive acceptance
+  again for test deletion, documentation or other changes that cannot affect its
+  numerical result.
+- Report implementation completion separately from validation coverage. Resource
+  limits and missing access remain explicit; do not fabricate passing evidence or
+  silently weaken tolerances.
 
 ## Documentation
 

@@ -37,6 +37,7 @@ pub(super) fn readout<C: Config>(g: &mut Builder, c: &C) {
         embedding_scale: ComponentScalar::new(c.embedding_scale()),
         tied_embeddings: c.tie_word_embeddings(),
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             score_writes: vec![],
             stream_residual: None,
@@ -234,6 +235,7 @@ pub(super) fn decoder_unit<C: Config>(
             .attention_bias(AttentionProjection::Output)
             .then(|| format!("{attention_prefix}.{}.bias", fields.attention_output)),
         activation_equation: ComponentActivation::Attention {
+            attended_head_normalization: None,
             query_heads: heads,
             key_value_heads: kv,
             head_width: dim,
@@ -439,6 +441,7 @@ fn nemotron_unit_at(
         write_bias: bias.then(|| format!("{prefix}.{write}.bias")),
         activation_equation: if attention {
             ComponentActivation::Attention {
+                attended_head_normalization: None,
                 query_heads: heads,
                 key_value_heads: kv,
                 head_width: dim,
@@ -554,6 +557,7 @@ pub(super) fn nemotron_readout(g: &mut Builder, c: &crate::nemotron_h::ModelArgs
         embedding_scale: ComponentScalar::new(1.0),
         tied_embeddings: c.tie_word_embeddings,
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             score_writes: vec![],
             stream_residual: None,
@@ -710,6 +714,7 @@ pub(super) fn lfm2_unit(
             write_parameter_group: format!("parameters:{prefix}"),
             write_bias: None,
             activation_equation: ComponentActivation::Attention {
+                attended_head_normalization: None,
                 query_heads: heads,
                 key_value_heads: kv,
                 head_width: dim,
@@ -827,6 +832,7 @@ pub(super) fn lfm2_readout(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
         embedding_scale: ComponentScalar::new(1.0),
         tied_embeddings: c.tie_word_embeddings,
         equation: ComponentReadoutEquation {
+            residual_cycles: vec![],
             block_transforms: vec![],
             score_writes: vec![],
             stream_residual: None,

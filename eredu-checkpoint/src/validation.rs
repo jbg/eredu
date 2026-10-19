@@ -416,6 +416,24 @@ pub fn validate_gguf_plan(
     ))
 }
 
+/// Compares a frozen physical GGUF tensor catalog with an architecture schema.
+/// This metadata-only comparison grants no payload-opening or resolution authority.
+pub fn validate_gguf_tensor_catalog(
+    tensors: impl IntoIterator<Item = (String, Vec<usize>, GgufType)>,
+    plan: &GgufCheckpointPlan,
+) -> CheckpointValidation {
+    let mut catalog = BTreeMap::new();
+    let mut issues = Vec::new();
+    for (key, shape, encoding) in tensors {
+        if catalog.insert(key.clone(), PhysicalMetadata { shape, encoding }).is_some() {
+            issues.push(metadata_failure(&key, "duplicate physical GGUF tensor".into()));
+        }
+    }
+    issues.extend(validate_catalog(&catalog, &plan.identity, &plan.common_tensors,
+        &plan.layout_groups, &plan.catalog_policy));
+    CheckpointValidation::from_issues(issues)
+}
+
 /// Resolves and validates the one GGUF layout that loading may consume.
 pub fn resolve_gguf_plan(
     checkpoint: &GgufCheckpoint,

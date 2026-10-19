@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     if let Some(path) = &drafter_path {
         plan = plan.with_drafting(DraftingPlan::External {
+            residency: eredu_core::ResidencyPlan::FullyResident,
             model: path.clone(),
             placement: DraftPlacementPlan::Device {
                 device: local_device_plan(LocalDevice::Cpu)?,

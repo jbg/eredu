@@ -55,6 +55,7 @@ pub(super) fn profile(runtime: &ModelRuntime<MockBackend>) -> LoadedMemoryProfil
         input: 2,
         output: 2,
         format: eredu_checkpoint::LinearFormat::Dense,
+        arithmetic: eredu_nn::LinearArithmetic::Native,
         bias: false,
         parameter: name.into(),
     };
@@ -89,6 +90,7 @@ pub(super) fn profile(runtime: &ModelRuntime<MockBackend>) -> LoadedMemoryProfil
             input: 2,
             output: 2,
             format: eredu_checkpoint::LinearFormat::Dense,
+            arithmetic: eredu_nn::LinearArithmetic::Native,
             bias: false,
             parameter: "output.weight".into(),
         },

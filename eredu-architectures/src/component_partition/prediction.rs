@@ -198,13 +198,6 @@ impl ComponentPartitionLayouts {
                     }
                 }
                 projected.prediction_boundaries(descriptor, scope)?;
-                transforms::register(
-                    &mut projected.observations,
-                    descriptor,
-                    local,
-                    invocation,
-                    &owns,
-                )?;
                 register_routed_boundaries(
                     &mut projected.observations,
                     descriptor,
@@ -221,6 +214,14 @@ impl ComponentPartitionLayouts {
                         }
                         Ok(true)
                     },
+                )?;
+                residual::register(&mut projected.observations, descriptor, &scope.readout.residual_cycles, local, &owns)?;
+                transforms::register(
+                    &mut projected.observations,
+                    descriptor,
+                    local,
+                    invocation,
+                    &owns,
                 )?;
                 if let Some(streams) = &scope.readout.stream_residual {
                     streams::register(

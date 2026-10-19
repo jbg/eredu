@@ -18,6 +18,8 @@ pub enum QuantizationMode {
     Affine,
     /// Microscaling FP4 with one E8M0 scale for every 32 values.
     MxFp4,
+    /// E2M1 values with block-16 E4M3 scales and a separately retained global scale.
+    NvFp4,
 }
 
 impl QuantizationMode {
@@ -25,6 +27,7 @@ impl QuantizationMode {
         match self {
             Self::Affine => c"affine",
             Self::MxFp4 => c"mxfp4",
+            Self::NvFp4 => c"nvfp4",
         }
     }
 
@@ -35,6 +38,9 @@ impl QuantizationMode {
 
     /// Validates the group size and bit width required by this encoding.
     pub fn validate(self, group_size: i32, bits: i32) -> Result<()> {
+        if self == Self::NvFp4 && (group_size != 16 || bits != 4) {
+            return Err(crate::error::Exception::custom("NVFP4 requires group_size=16 and bits=4"));
+        }
         if self == Self::MxFp4 && (group_size != 32 || bits != 4) {
             return Err(crate::error::Exception::custom(format!(
                 "MXFP4 requires group_size=32 and bits=4, got group_size={group_size} bits={bits}"
@@ -126,6 +132,9 @@ pub fn quantize_with_mode(
     stream: impl AsRef<Stream>,
 ) -> Result<QuantizedArrays> {
     mode.validate(group_size, bits)?;
+    if mode == QuantizationMode::NvFp4 {
+        return Err(crate::error::Exception::custom("NVFP4 encoding requires a calibrated global scale and is unavailable through this quantizer"));
+    }
     let group_size = optional_int(Some(group_size), DEFAULT_GROUP_SIZE);
     let bits = optional_int(Some(bits), DEFAULT_BITS);
 

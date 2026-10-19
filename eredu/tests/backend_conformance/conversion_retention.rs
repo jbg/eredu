@@ -236,6 +236,7 @@ fn composed_reports_distinguish_independent_drafter_and_embedded_ownership() {
     write_loadable_assistant_artifact(assistant.path());
     let policy = ParameterConversionRetentionPolicy::Bounded { max_bytes: 32 };
     let external = plan(Some(policy)).with_drafting(DraftingPlan::External {
+        residency: eredu_core::ResidencyPlan::FullyResident,
         model: assistant.path().display().to_string(),
         placement: DraftPlacementPlan::Target,
         max_draft_tokens: 4,
@@ -461,6 +462,7 @@ fn planned_trim_preserves_independent_external_and_shared_embedded_scopes() {
     write_loadable_assistant_artifact(assistant.path());
     for drafting in [
         DraftingPlan::External {
+            residency: eredu_core::ResidencyPlan::FullyResident,
             model: assistant.path().display().to_string(),
             placement: DraftPlacementPlan::Target,
             max_draft_tokens: 4,

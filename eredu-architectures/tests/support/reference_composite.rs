@@ -467,9 +467,7 @@ where
 struct ReferenceEmbeddedMechanisms;
 struct ReferenceGenerationExecutorTypes;
 
-impl eredu_core::speculative::GenerationExecutorTypes
-    for ReferenceGenerationExecutorTypes
-{
+impl eredu_core::speculative::GenerationExecutorTypes for ReferenceGenerationExecutorTypes {
     type Input = ReferencePreparedInput;
     type Logits = u32;
     type Context<'a> = ();
@@ -733,14 +731,9 @@ where
         parallel: Option<&<ReferenceBackend as NeuralBackend>::ParallelContext>,
         context: &(),
     ) -> Result<Self::Output, Error> {
-        if parallel.is_some() {
-            return Err(Error::backend(
-                "reference external target operation unexpectedly used tensor parallelism",
-            ));
-        }
         architecture
             .inner_mut()
-            .external_prediction_target_operation(self.operation, context)?
+            .external_prediction_target_operation(self.operation, parallel, context)?
             .ok_or_else(|| Error::backend("external target operation was unavailable"))
     }
 }
@@ -849,8 +842,8 @@ where
         let request = request.clone();
         let identity = input.identity;
         self.with_lane(cache, |session| {
-            let capture = |forward: &A::ForwardContext| {
-                let values = captured
+            let collect = |_forward: &A::ForwardContext| {
+                captured
                     .borrow()
                     .iter()
                     .cloned()
@@ -860,14 +853,16 @@ where
                             Error::backend(format!("reference target missed capture path {index}"))
                         })
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            let capture = |forward: &A::ForwardContext, values| {
                 A::external_prediction_capture(&request, forward, values)?
                     .ok_or_else(|| Error::backend("target did not form selected capture"))
             };
             let result = if prefill {
-                session.prefill_input_with_capture(paired, &(), &mut observer, capture)
+                session.prefill_input_with_capture(Ok(paired), &(), &mut observer, None, collect, capture)
             } else {
-                session.decode_input_with_capture(paired, &(), &mut observer, capture)
+                session.decode_input_with_capture(Ok(paired), &(), &mut observer, None, collect, capture)
             }
             .map_err(|error| Error::backend(error.to_string()))?;
             let _ = identity;
@@ -1214,7 +1209,7 @@ fn construct_reference_composite_target(
 
 struct ReferenceMaterializedAssistant<A: eredu_architectures::ExternalAssistantArchitecture> {
     config: A::Config,
-    module: A::Module<ReferenceBackend>,
+    module: A::Execution<ReferenceBackend, eredu_runtime::ResidentUnitWindow<A::Unit<ReferenceBackend>>>,
     observers: eredu_architectures::external_assistant::ExternalAssistantObservers<
         ReferenceTensor,
         u32,
@@ -1233,7 +1228,8 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
         self,
         prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
-        let (store, checkpoint, _identity, _source_config, config, _tasks) = prepared.into_parts();
+        let (store, checkpoint, _identity, _source_config, config, module_config, _tasks) =
+            prepared.into_parts();
         if matches!(
             checkpoint,
             eredu_architectures::ExternalAssistantCheckpoint::Gguf { .. }
@@ -1242,7 +1238,7 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
                 "reference production proof requires its SafeTensors fixture",
             ));
         }
-        let mut module = A::module::<ReferenceBackend>(config.clone(), &())?;
+        let mut module = A::module::<ReferenceBackend>(module_config, &())?;
         struct Bindings(Vec<eredu_runtime::WeightBinding>);
         impl<'a> ParameterVisitor<'a, ReferenceTensor> for Bindings {
             fn visit(&mut self, metadata: ParameterMetadata, value: &'a ReferenceTensor) {
@@ -1273,6 +1269,7 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
         .map_err(|error| Error::backend(error.to_string()))?;
         eredu_runtime::bind_materialized_unit::<ReferenceBackend, _>(&mut module, materialized)
             .map_err(|error| Error::backend(error.to_string()))?;
+        let module = A::into_execution::<ReferenceBackend, _>(module, eredu_runtime::ResidentUnitWindow::new)?;
         Ok(ReferenceMaterializedAssistant {
             config,
             module,
@@ -1549,6 +1546,7 @@ where
     A: eredu_architectures::ExternalAssistantArchitecture,
 {
     type NeuralBackend = ReferenceBackend;
+    type ParameterPolicy = eredu_runtime::ResidentUnitWindow<A::Unit<ReferenceBackend>>;
     type AttentionCache = ReferenceCache;
     type Target = dyn ReferenceExternalTarget;
     type Assistant = ReferenceMaterializedAssistant<A>;
@@ -1566,7 +1564,7 @@ where
         &assistant.config
     }
 
-    fn module(assistant: &mut Self::Assistant) -> &mut A::Module<Self::NeuralBackend> {
+    fn module(assistant: &mut Self::Assistant) -> &mut A::Execution<Self::NeuralBackend, Self::ParameterPolicy> {
         &mut assistant.module
     }
 
@@ -1818,9 +1816,8 @@ fn reference_muse_assistant_artifact() -> tempfile::TempDir {
       "hidden_act":"silu","attention_dropout":0.0,
       "rope_parameters":{"rope_theta":500000.0}
     }"#;
-    let config =
-        eredu_architectures::muse_glimmer::DFlashConfig::from_hf_json(CONFIG.as_bytes()).unwrap();
-    let plan = eredu_architectures::muse_glimmer::dflash_safetensors_plan(&config).unwrap();
+    let config = eredu_architectures::muse::DFlashConfig::from_hf_json(CONFIG.as_bytes()).unwrap();
+    let plan = eredu_architectures::muse::dflash_safetensors_plan(&config).unwrap();
     let tensors = plan
         .common_tensors
         .iter()
@@ -1874,7 +1871,10 @@ fn run_reference_embedded_scheduler(
             max_tokens: 3,
             decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
                 eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
-                    std::num::NonZeroUsize::new(selected.requirements().strategy().proposal_capacity().get()).expect("positive proposal capacity"),
+                    std::num::NonZeroUsize::new(
+                        selected.requirements().strategy().proposal_capacity().get(),
+                    )
+                    .expect("positive proposal capacity"),
                 ),
             ),
             temperature: 0.0,
@@ -2418,6 +2418,8 @@ fn run_reference_external_production(
                 tokenizer,
                 fingerprint,
                 NonZeroUsize::new(2).unwrap(),
+                target.profile().maximum_capture_sequence_length()
+                    .map_err(|error| error.to_string())?,
             ),
         )
         .map_err(|error| error.to_string())?;

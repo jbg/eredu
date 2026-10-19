@@ -560,6 +560,19 @@ impl SelectedExecution {
         }
     }
 
+    /// Maximum decoder batch and sequence admitted by this retained partition.
+    /// Media route shapes have independent limits and do not replace these bounds.
+    pub fn partitioned_invocation_limits(&self) -> Option<(i32, i32)> {
+        let boundary = match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => selected.requirements().boundary(),
+            SelectedExecutionKind::PartitionedRouted(selected) => selected.requirements().boundary(),
+            SelectedExecutionKind::PartitionedComposite(selected) => selected.requirements().boundary(),
+            _ => return None,
+        };
+        let shape = boundary.primary().shape();
+        Some((shape[0], shape[1]))
+    }
+
     /// Exact selected processor policy for composite execution.
     pub fn processor(&self) -> Option<&eredu_runtime::SelectedProcessorExecution> {
         match self.kind.as_ref() {
@@ -1140,6 +1153,22 @@ impl SelectedExecution {
             SelectedExecutionKind::Replicated(_)
             | SelectedExecutionKind::Routed(_)
             | SelectedExecutionKind::Composite(_) => None,
+        }
+    }
+
+    /// Opaque tensor communicator declared by the retained rank's manifest.
+    pub fn partitioned_tensor_group(&self) -> Option<CollectiveGroupId> {
+        match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => {
+                selected.requirements().tensor_group()
+            }
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                selected.requirements().tensor_group()
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                selected.requirements().tensor_group()
+            }
+            _ => None,
         }
     }
 

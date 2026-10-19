@@ -747,7 +747,7 @@ where
         &self,
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
-    ) -> Result<Option<(i32, i32)>, String> {
+    ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
         let extents = input
             .admitted()
             .parts()
@@ -776,7 +776,7 @@ where
             1 => self.args.audio.as_ref().map(|config| config.hidden_size),
             _ => None,
         };
-        Ok(extent.zip(width))
+        Ok(extent.zip(width).map(Into::into))
     }
 
     fn prepared_group_continuation_batched(&self, _group: usize) -> bool {
@@ -975,13 +975,25 @@ where
     fn external_prediction_target_operation(
         &mut self,
         operation: ExternalPredictionTargetOperation<'_, B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
         match operation {
-            ExternalPredictionTargetOperation::TokenEmbeddings(tokens) => {
-                self.token_embeddings(tokens, context).map(Some)
-            }
-            ExternalPredictionTargetOperation::ProjectLogits(_) => Ok(None),
+            ExternalPredictionTargetOperation::TokenEmbeddings(tokens) => match parallel {
+                Some(parallel) => B::vocabulary_parallel_lookup(
+                    &mut self.static_modules.text.embeddings,
+                    tokens,
+                    eredu_nn::EmbeddingLookupPolicy::Strict,
+                    parallel,
+                    context,
+                )?
+                .multiply_scalar((self.args.text.hidden_size as f32).sqrt(), context)
+                .map(Some),
+                None => self.token_embeddings(tokens, context).map(Some),
+            },
+            ExternalPredictionTargetOperation::ProjectLogits(_)
+            | ExternalPredictionTargetOperation::RawTokenEmbeddings(_)
+            | ExternalPredictionTargetOperation::RawVocabularyProjection(_) => Ok(None),
         }
     }
 

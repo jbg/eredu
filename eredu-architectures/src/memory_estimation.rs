@@ -162,9 +162,9 @@ pub fn generation_memory_geometry(
         | (None, Some(GgufModelConfig::K2Horizon(args))) => crate::capability::k2_horizon(args)?,
         (Some(SafetensorsModelConfig::KimiLinear(args)), None)
         | (None, Some(GgufModelConfig::KimiLinear(args))) => crate::capability::kimi_linear(args)?,
-        (Some(SafetensorsModelConfig::MuseGlimmer(args)), None)
-        | (None, Some(GgufModelConfig::MuseGlimmer(args))) => {
-            crate::capability::muse_glimmer(args)?
+        (Some(SafetensorsModelConfig::Muse(args)), None)
+        | (None, Some(GgufModelConfig::Muse(args))) => {
+            crate::capability::muse(args)?
         }
         (Some(SafetensorsModelConfig::Lfm2(args)), None)
         | (None, Some(GgufModelConfig::Lfm2(args))) => crate::capability::lfm2(args)?,

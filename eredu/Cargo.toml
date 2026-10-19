@@ -61,6 +61,11 @@ path = "examples/gemma4_speculative_generate.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "speculative_reference"
+path = "examples/speculative_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
 name = "gguf_generate"
 path = "examples/gguf_generate.rs"
 required-features = ["mlx"]

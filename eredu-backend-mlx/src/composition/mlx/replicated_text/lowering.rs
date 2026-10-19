@@ -17,26 +17,33 @@ pub(crate) fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
                 | StoredDtype::F32
                 | StoredDtype::U8
                 | StoredDtype::I32
+                | StoredDtype::I64
                 | StoredDtype::F8E8M0,
             ),
             LinearFormat::Dense,
         ) => true,
         (
             SourceTensorEncoding::Safetensors(
-                StoredDtype::U8 | StoredDtype::I32 | StoredDtype::F8E8M0,
+                StoredDtype::U8 | StoredDtype::I32 | StoredDtype::I64 | StoredDtype::F8E8M0,
             ),
             LinearFormat::Dense,
         ) => true,
         (SourceTensorEncoding::Safetensors(StoredDtype::U32), LinearFormat::Affine(format)) => {
             format.validate().is_ok()
         }
-        (SourceTensorEncoding::Safetensors(StoredDtype::U32), LinearFormat::MxFp4) => true,
+        (
+            SourceTensorEncoding::Safetensors(StoredDtype::U32),
+            LinearFormat::MxFp4 | LinearFormat::NvFp4,
+        ) => true,
         (SourceTensorEncoding::Safetensors(StoredDtype::U8), LinearFormat::MxFp4) => true,
         (SourceTensorEncoding::Safetensors(StoredDtype::F4), LinearFormat::MxFp4) => true,
         (SourceTensorEncoding::RecipeOutput(StoredDtype::U32), LinearFormat::Affine(format)) => {
             format.validate().is_ok()
         }
-        (SourceTensorEncoding::RecipeOutput(StoredDtype::U32), LinearFormat::MxFp4) => true,
+        (
+            SourceTensorEncoding::RecipeOutput(StoredDtype::U32),
+            LinearFormat::MxFp4 | LinearFormat::NvFp4,
+        ) => true,
         (SourceTensorEncoding::RecipeOutput(StoredDtype::U8), LinearFormat::MxFp4) => true,
         (
             SourceTensorEncoding::RecipeOutput(StoredDtype::U8),
@@ -102,6 +109,7 @@ pub(crate) fn supports_transform(descriptor: &WeightLoweringDescriptor) -> bool 
             LinearFormat::Affine(format) => format.validate().is_ok(),
             LinearFormat::MxFp4 => true,
             LinearFormat::Dense
+            | LinearFormat::NvFp4
             | LinearFormat::GgufIQuant { .. }
             | LinearFormat::E4M3BlockFp8(_) => false,
         }

@@ -75,6 +75,8 @@ impl ArtifactArchitecturePlan {
     }
 }
 
+
+
 fn axes(width: usize) -> Vec<TensorAxis> {
     vec![
         TensorAxis {
@@ -121,6 +123,10 @@ pub(crate) fn routing_intervention_point(
             routed_units: None,
             routing: Some(InterventionRoutingPolicy {
                 expert_count: spec.group_count() as u32, top_k: spec.top_k() as u32, scoring,
+                selection_order: match spec.order() {
+                    eredu_nn::GroupSelectionOrder::Ranked => RoutingSelectionOrder::Ranked,
+                    eredu_nn::GroupSelectionOrder::Partition => RoutingSelectionOrder::Partition,
+                },
                 normalize_selected: spec.normalize_selected(), normalization_epsilon: spec.normalization_epsilon(),
                 coefficient_scale: spec.coefficient_scale(), groups: spec.selection_partitions() as u32,
                 selected_groups: spec.selected_groups() as u32, learned_coefficient_scale, shared_experts,

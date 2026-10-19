@@ -69,13 +69,58 @@ pub const GEMMA4: C = C::SIGMOID
     .union(C::MULTI_AXIS_ROTARY_EMBEDDINGS)
     .union(C::MASKED_OUTPUT_PROJECTION);
 
-/// Muse-Glimmer text and vision execution requirements.
-pub const MUSE_GLIMMER: C = C::SIGMOID
+/// Shared Muse text and media execution requirements.
+pub const MUSE: C = C::SIGMOID
     .union(C::RMS_NORM_WITHOUT_WEIGHT)
     .union(C::FROM_I32_SLICE)
     .union(C::FULL_F32)
     .union(C::TANH)
     .union(C::MULTI_AXIS_ROTARY_EMBEDDINGS);
+
+/// Additional mechanism used by the audio convolution's independent FP32 sums.
+pub const MUSE_AUDIO: C = C::ZEROS_LIKE
+    .union(C::CHANNEL_MAJOR_RMS)
+    .union(C::CAST_FLOAT);
+
+/// Exact media-dependent requirements of a selected Muse configuration.
+pub fn muse(config: &crate::muse::DecoderConfig) -> C {
+    let mut requirements = MUSE;
+    if matches!(config.attention_equation, crate::muse::AttentionEquation::NormalizedHeads | crate::muse::AttentionEquation::NormalizedHeadsScoreScaled)
+        || config.block_normalization == crate::muse::BlockNormalization::InputScaledFeedForward
+        || config.vocabulary_arithmetic() == crate::muse::VocabularyArithmetic::StageRounded
+        || config.vision_config.as_ref().is_some_and(|vision| {
+            matches!(
+                vision.perception_normalization,
+                crate::muse::PerceptionNormalization::Float32 { .. }
+            )
+        })
+    {
+        requirements = requirements.union(C::CASCADED_RMS).union(C::CAST_FLOAT);
+    }
+    if matches!(
+        config.residual_equation,
+        crate::muse::ResidualEquation::Learned { .. }
+    ) {
+        requirements = requirements.union(C::CAST_FLOAT).union(C::SQRT);
+    } else if config.residual_equation == crate::muse::ResidualEquation::StoredCoefficients
+        || config.vocabulary_arithmetic() == crate::muse::VocabularyArithmetic::Float32
+    {
+        requirements = requirements.union(C::CAST_FLOAT);
+    }
+    if config.audio_config.is_some() {
+        requirements = requirements.union(MUSE_AUDIO);
+    }
+    if config
+        .vision_config
+        .as_ref()
+        .is_some_and(|vision| vision.arithmetic == crate::muse::VisionArithmetic::Rounded)
+    {
+        requirements = requirements
+            .union(C::CASCADED_LAYER_NORM)
+            .union(C::CAST_FLOAT);
+    }
+    requirements
+}
 
 /// Validates one architecture requirement against a backend's declaration.
 pub fn require<B: NeuralBackend>(architecture: &'static str, requirements: C) -> Result<(), Error> {

@@ -38,7 +38,8 @@ pub use external_assistant::{
     ExternalAssistantPreparationVisitor, ExternalAssistantTargetProfile,
     ExternalAssistantTensorPlacement, ExternalAssistantTransfer, ExternalSpeculativeContract,
     ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
-    MaterializedExternalAssistantExecution, MaterializedExternalAssistantVisitor,
+    MaterializedExternalAssistantExecution, MaterializedExternalAssistantRefVisitor,
+    MaterializedExternalAssistantVisitor,
     PreparedCompatibleExternalAssistant, PreparedExternalAssistantExecution,
     PreparedExternalAssistantSource, SelectedExternalAssistantPreparation,
 };
@@ -145,7 +146,8 @@ pub mod shared_routed;
 
 /// Inkling multimodal routed decoder family.
 pub mod inkling;
-pub mod muse_glimmer;
+/// Shared Muse decoder, vision, checkpoint, preparation, and placement mechanisms.
+pub mod muse;
 
 /// DeepSeek V3/R1 and V4 compressed-attention decoder family.
 pub mod deepseek;

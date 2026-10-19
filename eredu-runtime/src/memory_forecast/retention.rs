@@ -301,6 +301,7 @@ mod tests {
             vocabulary_size: 4,
             layers: vec![],
             output: ProjectionTopology {
+                arithmetic: eredu_nn::LinearArithmetic::Native,
                 input: 4,
                 output: 4,
                 format: eredu_checkpoint::LinearFormat::Dense,

@@ -470,6 +470,25 @@ impl ResidencyManager {
         })
     }
 
+    /// Declared permanent owners among the selected execution-unit identities.
+    /// Compact ranges are resolved only for those identities, without expansion.
+    pub(crate) fn pinned_unit_ids(
+        &self,
+        ids: &[OffloadUnitId],
+    ) -> Result<BTreeSet<OffloadUnitId>, ResidencyError> {
+        let state = self.observation_lock()?;
+        let plan = state.control.ledger().plan();
+        Ok(ids
+            .iter()
+            .filter(|id| {
+                plan.unit(id).is_some_and(|unit| {
+                    unit.policy() == eredu_core::residency::ResidencyPolicy::Pinned
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
     /// Materializes all planned host and device units in identifier order.
     ///
     /// Disk units remain array-free. A failure never publishes a partial unit;
@@ -1209,6 +1228,8 @@ pub use transfer::{
     ManagerInner, ResidentArrays, ResidentHostBuffers, ResidentTransfer, ResidentTransferResources,
 };
 
+mod loading_memory;
+pub(crate) use loading_memory::parameter_loading_memory_profile;
 mod materialization;
 pub use materialization::host_capacity_upper_bound_for_bindings;
 use materialization::*;

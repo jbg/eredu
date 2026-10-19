@@ -440,7 +440,7 @@ fn plans_at(
         routing: None,
     };
     let discovery = InterventionDiscovery {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         artifact_identity: "artifact-exact".into(),
         session_identity: Some(format!("backend-session-{rank}")),
         points: vec![point],
@@ -484,7 +484,7 @@ fn plans_at(
         operations[0].slices[0].end = 1;
     }
     let intervention = InterventionPlan {
-        schema_version: 1,
+        schema_version: eredu_core::intervention::INTERVENTION_SCHEMA_VERSION,
         operations,
     };
     let intervention = match bounds {

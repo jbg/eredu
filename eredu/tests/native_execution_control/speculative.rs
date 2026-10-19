@@ -19,7 +19,7 @@ mod startup_forecast;
 #[path = "speculative/v4_components.rs"]
 mod v4_components;
 
-fn artifacts() -> (Fixture, Fixture) {
+pub(super) fn artifacts() -> (Fixture, Fixture) {
     let target = fixture(false);
     let draft = fixture(false);
     super::candidate_domain::install_vocabulary(&target.0);
@@ -134,19 +134,20 @@ fn k2_independent_draft_control_matches_uninterrupted_and_preserves_budgets() {
     }
 }
 
-fn speculative_control_artifacts(
+pub(super) fn speculative_control_artifacts(
     target: Fixture,
     draft: Fixture,
     experiment: bool,
     residency: eredu_core::ResidencyPlan,
     compare: bool,
     temperature: f32,
-) {
+) -> bool {
     let split = compare && matches!(residency, eredu_core::ResidencyPlan::FullyResident);
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
         .with_residency(residency)
         .with_drafting(DraftingPlan::External {
+            residency: eredu_core::ResidencyPlan::FullyResident,
             model: draft.0.display().to_string(),
             placement: if split {
                 DraftPlacementPlan::Device {
@@ -292,6 +293,7 @@ fn speculative_control_artifacts(
         std::fs::remove_file(target.0.join("model.safetensors")).unwrap();
         std::fs::remove_file(draft.0.join("model.safetensors")).unwrap();
     }
+    let mut accepted = false;
     let mut replays = Vec::new();
     let mut captures = Vec::new();
     let output = model
@@ -343,6 +345,11 @@ fn speculative_control_artifacts(
                     let mut tokens = Vec::new();
                     while let Some(step) = session.step()? {
                         assert_eq!(step.epoch, epoch);
+                        accepted |= step.verification.as_ref().is_some_and(|verification| {
+                            verification
+                                .dispositions
+                                .contains(&SpeculativeProposalDisposition::Accepted)
+                        });
                         tokens.extend(step.committed_token_ids);
                         captures.extend(step.captures);
                     }
@@ -446,7 +453,7 @@ fn speculative_control_artifacts(
     if replays[0].is_empty() {
         // This greedy fixture terminates at prefill, before any draft block.
         assert!(compare && temperature == 0.0 && output.token_ids().len() == 1);
-        return;
+        return accepted;
     }
     assert!(captures
         .iter()
@@ -476,4 +483,5 @@ fn speculative_control_artifacts(
         .windows(2)
         .all(|pair| pair[0].capture.cumulative_usage.captures
             < pair[1].capture.cumulative_usage.captures));
+    accepted
 }

@@ -98,6 +98,11 @@ pub(super) fn parameter_topology(
                         )
                     })?,
                 ),
+                "global_scale" => bind_linear_companion(
+                    &weight, format.global_scale().cloned().ok_or_else(|| {
+                        ComputeError::backend("backend operator exposed an undeclared global scale")
+                    })?,
+                ),
                 "e_score_correction_bias" => bias.clone().ok_or_else(|| {
                     ComputeError::backend(format!(
                         "backend operator exposed unexpected correction-bias parameter {local:?}"

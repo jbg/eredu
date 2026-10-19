@@ -1,10 +1,21 @@
 //! Architecture-owned inspection and preparation of external draft assistants.
 
+mod capture_placement;
+mod construction;
+use construction::NormalizedExternalAssistant;
+mod static_placement;
+mod target_operation;
+pub use static_placement::PreparedTargetStaticPlacement;
+pub(crate) use static_placement::TargetStaticDescription;
+pub use target_operation::PreparedExternalTargetOperation;
+pub use capture_placement::PreparedTargetCapturePlacement;
 mod execution_plan;
+mod parameters;
 pub use execution_plan::{
     prepare_execution_plan_assistant, MaterializedExternalAssistantExecution,
     PreparedExternalAssistantExecution,
 };
+pub use parameters::ExternalAssistantParameterUnit;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -30,7 +41,10 @@ use eredu_core::{
 use eredu_gguf::{Checkpoint, MetadataValue};
 use serde_json::Value;
 
-use crate::{gemma4, muse_glimmer};
+use crate::{gemma4, muse};
+use muse::assistant::integration::{
+    MuseAssistantConfig, MuseAssistantConstruction, MuseAssistantModule,
+};
 
 use eredu_runtime::{
     ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion, ReplicatedTextParameterOwner,
@@ -265,8 +279,8 @@ impl<T, L, E> ExternalAssistantObservers<T, L, E> {
 pub enum ExternalAssistantTargetProfile {
     /// Gemma text target configuration.
     Gemma4(gemma4::FamilyConfig),
-    /// Muse-Glimmer decoder target configuration.
-    MuseGlimmer(muse_glimmer::DecoderConfig),
+    /// Normalized Muse target configuration, retaining its distinct released identity.
+    Muse(muse::DecoderConfig),
 }
 
 impl ExternalAssistantTargetProfile {
@@ -278,9 +292,13 @@ impl ExternalAssistantTargetProfile {
                 config.model_type,
                 config.architecture_fingerprint()
             ),
-            Self::MuseGlimmer(config) => format!(
-                "muse-glimmer-target/profile={};geometry={}",
-                config.model_type,
+            Self::Muse(config) => format!(
+                "{}-target/profile={};geometry={}",
+                match config.identity {
+                    muse::MuseIdentity::Glimmer => "muse-glimmer",
+                    muse::MuseIdentity::Spark => "muse-spark",
+                },
+                config.identity.text_model_type(),
                 config.architecture_fingerprint()
             ),
         };
@@ -291,7 +309,7 @@ impl ExternalAssistantTargetProfile {
     pub fn maximum_capture_sequence_length(&self) -> Result<NonZeroUsize, ArtifactError> {
         let maximum = match self {
             Self::Gemma4(config) => config.text.max_position_embeddings,
-            Self::MuseGlimmer(config) => config.max_position_embeddings,
+            Self::Muse(config) => config.max_position_embeddings,
         };
         usize::try_from(maximum)
             .ok()
@@ -396,9 +414,63 @@ mod sealed {
 pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
     /// Exact normalized architecture configuration.
     type Config: Clone + std::fmt::Debug;
+    /// Complete neural construction geometry after target compatibility is proven.
+    type ModuleConfig: Clone + std::fmt::Debug;
+
+    /// Retained resource equations, absent when the assistant projection is unimplemented.
+    fn memory_topology(
+        _config: &Self::ModuleConfig,
+    ) -> Result<Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>, eredu_nn::Error> {
+        Ok(None)
+    }
+
+    /// Normalizes construction without opening payloads or binding native resources.
+    fn module_config(
+        config: &Self::Config,
+        target: Option<&ExternalAssistantTargetProfile>,
+    ) -> Result<Self::ModuleConfig, String>;
 
     /// Backend-neutral assistant module specialized to a neutral neural backend.
     type Module<B>: Clone + eredu_nn::Parameterized<B::Tensor>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+
+    /// One true independently constructed parameter unit.
+    type Unit<B>: eredu_nn::Parameterized<B::Tensor> + 'static
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+
+    /// Execution container specialized to the selected ordinary parameter policy.
+    /// It need not implement parameter traversal or cloning.
+    type Execution<B, P>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+
+    /// Canonical unit construction, or a separately constructed resident module.
+    fn execution_unit_layout(
+        config: &Self::ModuleConfig,
+    ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error>;
+
+    /// Constructs one unloaded unit from retained target-proven geometry.
+    fn build_execution_unit<B>(
+        config: &Self::ModuleConfig,
+        ordinal: usize,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Unit<B>, eredu_nn::Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+
+    /// Consumes the construction tree once. The supplied constructor may retain
+    /// its actual units or replace unloaded units with an exact-source policy.
+    fn into_execution<B, P>(
+        module: Self::Module<B>,
+        policy: impl FnOnce(Vec<Self::Unit<B>>) -> P,
+    ) -> Result<Self::Execution<B, P>, eredu_nn::Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+
+    /// Borrows the selected policy when the runtime owns independently acquired units.
+    fn parameter_policy<B, P>(execution: &Self::Execution<B, P>) -> Option<&P>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
 
@@ -417,14 +489,23 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
         M: ExternalAssistantExecutionMechanisms<Self> + 'static;
 
     /// Architecture identity whose tokenizer contract the assistant shares.
-    fn tokenizer_model_kind() -> crate::configuration::ModelKind;
+    fn tokenizer_model_type(config: &Self::Config) -> &'static str;
+
+    /// Tokenizer ownership declared by the trained architecture before native construction.
+    fn tokenizer_source(
+        config: &Self::Config,
+    ) -> crate::external_draft::ExternalDraftTokenizerSource {
+        crate::external_draft::ExternalDraftTokenizerSource::Artifact {
+            model_type: Self::tokenizer_model_type(config),
+        }
+    }
 
     /// Stable artifact identity carried by the normalized configuration.
     fn configuration_model_type(config: &Self::Config) -> &str;
 
     /// Builds the unloaded neutral assistant module.
     fn module<B>(
-        config: Self::Config,
+        config: Self::ModuleConfig,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
@@ -451,6 +532,13 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
 
     /// Returns the executable format selected for one primary matrix parameter.
     fn linear_format(config: &Self::Config, name: &str) -> LinearFormat;
+
+    /// Declares the independently acquired owner of one canonical primary parameter.
+    /// Quantization companions inherit this owner rather than creating another unit.
+    fn parameter_owner(
+        config: &Self::Config,
+        name: &str,
+    ) -> Result<ReplicatedTextParameterOwner, String>;
 
     /// Binds a typed assistant to the architecture-owned speculative lifecycle.
     fn executor<'a, M>(
@@ -520,13 +608,57 @@ pub enum ExternalAssistantTransfer {
 /// Family configuration, capture interpretation, proposal equations, state geometry, and
 /// executor choice remain owned by [`ExternalAssistantArchitecture`]. A backend supplies this
 /// contract once for every sealed architecture it can materialize.
+///
+/// Coordination defaults describe a local session. A distributed binding overrides
+/// all three agreement methods with the same retained session authority. Checkpoints
+/// copy model state, never that authority or its cumulative transport usage.
 pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>: 'static {
+    /// Resolves cancellation and completion across the retained target session.
+    fn coordinate_speculative_step(
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        _context: Self::Context<'_>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        Ok(local)
+    }
+
+    /// Agrees host preparation before any participant enters the next phase.
+    fn agree_text_preparation(
+        _stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure> {
+        use eredu_core::run_preparation::{TextPreparationOutcome as O, TextPreparationStatus as S};
+        Ok(match status {
+            S::Ready => O::Ready,
+            S::Cancelled => O::Cancelled,
+            S::Failed => O::Rejected { rank: 0 },
+        })
+    }
+
+    /// Agrees explicit commands without executing model work or restoring credits.
+    fn coordinate_decoding_control(
+        local: eredu_core::decoding::DecodingCoordination,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
+        Ok(local)
+    }
+
     /// Full score-row backing allowance for settled decoding handoffs.
-    fn control_logits_estimate(_logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> { None }
+    fn control_logits_estimate(
+        _logits: &Self::Logits,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        None
+    }
     /// Neutral neural backend used by the materialized assistant module.
     type NeuralBackend: eredu_nn::GroupedNeuralBackend<Tensor = Self::Tensor>
         + eredu_nn::DistributedNeuralBackend
         + Clone;
+    /// Selected complete parameter policy, independent of the target's residency.
+    type ParameterPolicy: eredu_runtime::LayerwisePolicy<
+        Self::NeuralBackend,
+        A::Unit<Self::NeuralBackend>,
+        Error: std::error::Error + Send + Sync + 'static,
+    >;
     /// Attention cache used by sequential assistant layers.
     type AttentionCache: eredu_nn::AttentionCache<Self::Tensor>;
     /// Materialized ordinary target.
@@ -576,6 +708,36 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
         Ok(None)
     }
 
+    /// Reads the installed target frontier, native capacity and parameter owners.
+    fn target_memory_observation(
+        _target: &Self::Target,
+        _cache: &Self::NativeCache,
+        _additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeModelMemoryObservation>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
+
+    /// Reads the current assistant parameter owner without acquiring any unit.
+    fn assistant_memory_observation(
+        _assistant: &Self::Assistant,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
+
+    /// Complete available backing upper allowance for one borrowed tensor survey.
+    /// Unknown or foreign backing stays unknown; observation never evaluates work.
+    fn tensor_backing_bytes(
+        _tensors: &[&Self::Tensor],
+    ) -> Result<Option<u64>, eredu_core::BackendFailure> {
+        Ok(None)
+    }
+
     /// Known bound for an isolated reusable target-cache checkpoint.
     fn control_cache_estimate(
         _cache: &Self::NativeCache,
@@ -615,7 +777,23 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     /// Borrows the exact normalized assistant configuration.
     fn config(assistant: &Self::Assistant) -> &A::Config;
     /// Borrows the neutral assistant module.
-    fn module(assistant: &mut Self::Assistant) -> &mut A::Module<Self::NeuralBackend>;
+    fn module(
+        assistant: &mut Self::Assistant,
+    ) -> &mut A::Execution<Self::NeuralBackend, Self::ParameterPolicy>;
+    /// Validates the required operations against the retained group admission,
+    /// then borrows its communicator from this invocation's target session.
+    /// A caller cannot substitute an independently constructed equal-sized group.
+    /// Replicated execution requires no tensor communicator.
+    fn assistant_parallel_context<'a>(
+        _context: Self::Context<'a>,
+        _requirements: &eredu_runtime::CommunicationGroupRequirements,
+    ) -> Result<
+        Option<&'a <Self::NeuralBackend as eredu_nn::NeuralBackend>::ParallelContext>,
+        Self::Error,
+    > {
+        Ok(None)
+    }
+
     /// Maps a portable neural error into the backend failure type.
     fn neural_error(error: eredu_nn::Error) -> Self::Error;
     /// Constructs a stable architecture lifecycle failure.
@@ -751,10 +929,58 @@ impl sealed::Sealed for Gemma4AssistantArchitecture {}
 
 impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     type Config = gemma4::AssistantConfig;
+    type ModuleConfig = gemma4::AssistantConfig;
+    fn module_config(
+        config: &Self::Config,
+        _target: Option<&ExternalAssistantTargetProfile>,
+    ) -> Result<Self::ModuleConfig, String> {
+        Ok(config.clone())
+    }
     type Module<B>
         = gemma4::Assistant<B>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+    type Unit<B>
+        = gemma4::DenseBlock<B>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+    type Execution<B, P>
+        = gemma4::Assistant<B>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+    fn execution_unit_layout(
+        _config: &Self::ModuleConfig,
+    ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn build_execution_unit<B>(
+        config: &Self::ModuleConfig,
+        ordinal: usize,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Unit<B>, eredu_nn::Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        if ordinal >= config.text_config.num_hidden_layers() {
+            return Err(eredu_nn::Error::backend("invalid assistant decoder unit"));
+        }
+        gemma4::DenseBlock::new_at(&config.text_config, ordinal, "model.layers", context)
+    }
+    fn into_execution<B, P>(
+        module: Self::Module<B>,
+        _policy: impl FnOnce(Vec<Self::Unit<B>>) -> P,
+    ) -> Result<Self::Execution<B, P>, eredu_nn::Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        Ok(module)
+    }
+    fn parameter_policy<B, P>(_execution: &Self::Execution<B, P>) -> Option<&P>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        None
+    }
     type Executor<'a, M>
         = gemma4::speculative::ExternalExecutor<
         'a,
@@ -763,8 +989,8 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     where
         M: ExternalAssistantExecutionMechanisms<Self> + 'static;
 
-    fn tokenizer_model_kind() -> crate::configuration::ModelKind {
-        crate::configuration::ModelKind::Gemma4
+    fn tokenizer_model_type(_config: &Self::Config) -> &'static str {
+        "gemma4"
     }
 
     fn configuration_model_type(config: &Self::Config) -> &str {
@@ -772,7 +998,7 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     }
 
     fn module<B>(
-        config: Self::Config,
+        config: Self::ModuleConfig,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
@@ -814,6 +1040,28 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
             .unwrap_or_else(|| config.text_config.linear_format_for(name))
     }
 
+    fn parameter_owner(
+        config: &Self::Config,
+        name: &str,
+    ) -> Result<ReplicatedTextParameterOwner, String> {
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            let (index, suffix) = rest
+                .split_once('.')
+                .ok_or("invalid assistant block parameter")?;
+            let unit = index.parse::<usize>().map_err(|e| e.to_string())?;
+            if unit >= config.text_config.num_hidden_layers() || suffix.is_empty() {
+                return Err(format!("assistant parameter {name:?} has no decoder block"));
+            }
+            return Ok(ReplicatedTextParameterOwner::ExecutionUnit {
+                group: "assistant.decoder".into(),
+                unit,
+            });
+        }
+        Ok(ReplicatedTextParameterOwner::StaticRole(
+            "external_assistant".into(),
+        ))
+    }
+
     fn executor<'a, M>(
         target: &'a mut M::Target,
         assistant: &'a mut M::Assistant,
@@ -843,45 +1091,123 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
 }
 
 #[derive(Debug, Clone, Copy)]
-/// Muse-Glimmer DFlash assistant architecture marker used by typed dispatch.
-pub struct MuseGlimmerAssistantArchitecture;
+/// Shared Muse assistant architecture marker preserving distinct checkpoint identities.
+pub struct MuseAssistantArchitecture;
 
-impl sealed::Sealed for MuseGlimmerAssistantArchitecture {}
+impl sealed::Sealed for MuseAssistantArchitecture {}
 
-impl ExternalAssistantArchitecture for MuseGlimmerAssistantArchitecture {
-    type Config = muse_glimmer::DFlashConfig;
+impl ExternalAssistantArchitecture for MuseAssistantArchitecture {
+    fn memory_topology(
+        config: &Self::ModuleConfig,
+    ) -> Result<Option<eredu_runtime::memory_forecast::ConditionedPredictionTopology>, eredu_nn::Error> {
+        config.execution_definition().memory_topology().map(Some)
+    }
+    type Config = MuseAssistantConfig;
+    type ModuleConfig = MuseAssistantConstruction;
+    fn module_config(
+        config: &Self::Config,
+        target: Option<&ExternalAssistantTargetProfile>,
+    ) -> Result<Self::ModuleConfig, String> {
+        config.construction(match target {
+            Some(ExternalAssistantTargetProfile::Muse(target)) => Some(target),
+            _ => None,
+        })
+    }
     type Module<B>
-        = muse_glimmer::DFlash<B>
+        = MuseAssistantModule<B>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+    type Unit<B>
+        = muse::assistant::execution::MuseAssistantUnit<B>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+    type Execution<B, P>
+        = MuseAssistantModule<B, P>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone;
+    fn execution_unit_layout(
+        config: &Self::ModuleConfig,
+    ) -> Result<Option<eredu_runtime::ExecutionUnitLayout>, eredu_nn::Error> {
+        Ok(Some(config.execution_definition().unit_layout().clone()))
+    }
+    fn build_execution_unit<B>(
+        config: &Self::ModuleConfig,
+        ordinal: usize,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Unit<B>, eredu_nn::Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        config
+            .execution_definition()
+            .build_unit::<B>(ordinal, context)
+    }
+    fn into_execution<B, P>(
+        module: Self::Module<B>,
+        policy: impl FnOnce(Vec<Self::Unit<B>>) -> P,
+    ) -> Result<Self::Execution<B, P>, eredu_nn::Error>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        let (definition, units) = module.into_parts();
+        Ok(MuseAssistantModule::new(
+            definition,
+            policy(
+                units
+                    .into_units()
+                    .map_err(eredu_nn::Error::backend_source)?,
+            ),
+        ))
+    }
+    fn parameter_policy<B, P>(execution: &Self::Execution<B, P>) -> Option<&P>
+    where
+        B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    {
+        Some(execution.policy())
+    }
     type Executor<'a, M>
-        = muse_glimmer::speculative::ExternalExecutor<
+        = muse::speculative::ExternalExecutor<
         'a,
-        muse_glimmer::speculative::ArchitectureExternalMechanisms<M>,
+        muse::speculative::ArchitectureExternalMechanisms<M>,
     >
     where
         M: ExternalAssistantExecutionMechanisms<Self> + 'static;
 
-    fn tokenizer_model_kind() -> crate::configuration::ModelKind {
-        crate::configuration::ModelKind::MuseGlimmer
+    fn tokenizer_model_type(config: &Self::Config) -> &'static str {
+        config.tokenizer_model_type()
+    }
+
+    fn tokenizer_source(
+        config: &Self::Config,
+    ) -> crate::external_draft::ExternalDraftTokenizerSource {
+        use crate::external_draft::ExternalDraftTokenizerSource;
+        match config {
+            MuseAssistantConfig::Spark(_) => ExternalDraftTokenizerSource::Target,
+            MuseAssistantConfig::Glimmer(_) => ExternalDraftTokenizerSource::Artifact {
+                model_type: config.tokenizer_model_type(),
+            },
+        }
     }
 
     fn configuration_model_type(config: &Self::Config) -> &str {
-        &config.model_type
+        config.model_type()
     }
 
     fn module<B>(
-        config: Self::Config,
+        config: Self::ModuleConfig,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Module<B>, eredu_nn::Error>
     where
         B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     {
-        muse_glimmer::DFlash::new(config, context)
+        config.module(context)
     }
 
     fn quantization(config: &Self::Config) -> Option<eredu_checkpoint::WeightQuantization> {
-        config.quantization
+        match config {
+            MuseAssistantConfig::Glimmer(c) => c.quantization,
+            MuseAssistantConfig::Spark(_) => None,
+        }
     }
 
     fn load_time_quantization(
@@ -903,17 +1229,18 @@ impl ExternalAssistantArchitecture for MuseGlimmerAssistantArchitecture {
     }
 
     fn materialization_plan(config: &Self::Config) -> Result<SafetensorsCheckpointPlan, String> {
-        muse_glimmer::dflash_safetensors_plan(config)
+        config.safetensors_plan()
     }
 
     fn linear_format(config: &Self::Config, name: &str) -> LinearFormat {
-        config
-            .quantized_weights
-            .get(name)
-            .copied()
-            .or(config.quantization)
-            .map(LinearFormat::from)
-            .unwrap_or(LinearFormat::Dense)
+        config.linear_format(name)
+    }
+
+    fn parameter_owner(
+        config: &Self::Config,
+        name: &str,
+    ) -> Result<ReplicatedTextParameterOwner, String> {
+        config.parameter_owner(name)
     }
 
     fn executor<'a, M>(
@@ -924,7 +1251,7 @@ impl ExternalAssistantArchitecture for MuseGlimmerAssistantArchitecture {
     where
         M: ExternalAssistantExecutionMechanisms<Self> + 'static,
     {
-        muse_glimmer::speculative::ExternalExecutor::new(target, assistant, capture)
+        muse::speculative::ExternalExecutor::new(target, assistant, capture)
     }
 
     fn visit_executor<'a, M, V>(
@@ -937,8 +1264,8 @@ impl ExternalAssistantArchitecture for MuseGlimmerAssistantArchitecture {
         M: ExternalAssistantExecutionMechanisms<Self> + 'static,
         V: ExternalAssistantExecutorVisitor<Self, M>,
     {
-        let mut executor = muse_glimmer::speculative::ExternalExecutor::<
-            muse_glimmer::speculative::ArchitectureExternalMechanisms<M>,
+        let mut executor = muse::speculative::ExternalExecutor::<
+            muse::speculative::ArchitectureExternalMechanisms<M>,
         >::new(target, assistant, capture);
         visitor.execute(&mut executor)
     }
@@ -968,12 +1295,94 @@ pub struct PreparedExternalAssistantSource<A: ExternalAssistantArchitecture> {
     checkpoint: ExternalAssistantCheckpoint,
     artifact_identity: DeferredArtifactIdentity,
     source: eredu_checkpoint::store::SharedCheckpointSource,
-    source_config: A::Config,
+    source_module_config: A::ModuleConfig,
+    module_config: A::ModuleConfig,
     config: A::Config,
     tasks: Vec<ReplicatedTextMaterializationTask>,
+    parameter_units: Vec<ExternalAssistantParameterUnit>,
+    residency: eredu_runtime::LayerWeightResidency,
+    execution_layout: Option<eredu_runtime::ExecutionUnitLayout>,
+    parameter_layout: Option<eredu_runtime::LocalModelLayout>,
+    conversion_retention: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
 }
 
 impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
+    /// Cold immutable-parameter payload for the selected policy. This excludes
+    /// conversion retention, loading, operator workspace, state and source caches.
+    pub fn parameter_residency_requirement(
+        &self,
+    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_runtime::BoundedResidencySizingError> {
+        let bytes = self.parameter_units.iter()
+            .map(|unit| unit.parameter_bytes()).collect::<Vec<_>>();
+        let (static_bytes, window_bytes, depth) = match &self.execution_layout {
+            Some(layout) => (
+                0,
+                eredu_runtime::execution_unit_parameter_window_bytes(layout, &bytes, self.residency)?,
+                self.residency.device_depth(layout.len()),
+            ),
+            None => {
+                let total = bytes.iter().try_fold(0u64, |total, bytes| total.checked_add(*bytes))
+                    .ok_or(eredu_runtime::BoundedResidencySizingError::ArithmeticOverflow("resident assistant parameter bytes"))?;
+                (total, 0, 0)
+            }
+        };
+        Ok(eredu_core::BoundedResidencyRequirement {
+            static_bytes,
+            window_bytes,
+            required_bytes: static_bytes.checked_add(window_bytes)
+                .ok_or(eredu_runtime::BoundedResidencySizingError::ArithmeticOverflow("assistant parameter requirement"))?,
+            depth,
+        })
+    }
+
+    /// Requested per-execution retention policy; absence selects the managed default.
+    pub const fn parameter_conversion_retention(
+        &self,
+    ) -> Option<eredu_core::residency::ParameterConversionRetentionPolicy> {
+        self.conversion_retention
+    }
+
+    /// Retains conversion policy without allocating caches or changing source admission.
+    pub fn with_parameter_conversion_retention(
+        mut self,
+        policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+    ) -> Self {
+        self.conversion_retention = policy;
+        self
+    }
+
+    /// Canonical execution addresses frozen together with exact source owners.
+    pub fn execution_unit_layout(&self) -> Option<&eredu_runtime::ExecutionUnitLayout> {
+        self.execution_layout.as_ref()
+    }
+
+    /// Complete assistant policy retained independently of target residency.
+    pub const fn residency(&self) -> eredu_runtime::LayerWeightResidency {
+        self.residency
+    }
+
+    /// Freezes an explicitly selected parameter policy before native construction.
+    pub fn with_residency(
+        mut self,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<Self, ArtifactError> {
+        if self.execution_layout.is_none() && !residency.is_fully_resident() {
+            return Err(ArtifactError::UnsupportedResidencyPolicy("selected assistant uses resident module construction; a bounded parameter-unit driver is not implemented".into()));
+        }
+        self.residency = residency;
+        Ok(self)
+    }
+
+    /// Exact rank-local parameter selections retained independently of the source catalog.
+    pub fn parameter_layout(&self) -> Option<&eredu_runtime::LocalModelLayout> {
+        self.parameter_layout.as_ref()
+    }
+
+    /// Complete disjoint physical acquisition units, validated before opening payloads.
+    pub fn parameter_units(&self) -> &[ExternalAssistantParameterUnit] {
+        &self.parameter_units
+    }
+
     /// Exact admitted checkpoint provenance paired with this source.
     pub const fn checkpoint(&self) -> &ExternalAssistantCheckpoint {
         &self.checkpoint
@@ -989,25 +1398,58 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
         &self.config
     }
 
-    /// Consumes the handoff into the exact source, source/target configs, and tasks.
+    /// Selected, target-bound neural geometry; no artifact needs reopening.
+    pub const fn module_config(&self) -> &A::ModuleConfig {
+        &self.module_config
+    }
+
+    /// Consumes the exact source, source/selected neural geometry, selected config and tasks.
     pub fn into_parts(
         self,
     ) -> (
         eredu_checkpoint::store::SharedCheckpointSource,
         ExternalAssistantCheckpoint,
         DeferredArtifactIdentity,
+        A::ModuleConfig,
         A::Config,
-        A::Config,
+        A::ModuleConfig,
         Vec<ReplicatedTextMaterializationTask>,
     ) {
         (
             self.source,
             self.checkpoint,
             self.artifact_identity,
-            self.source_config,
+            self.source_module_config,
             self.config,
+            self.module_config,
             self.tasks,
         )
+    }
+}
+
+impl PreparedExternalAssistantSource<MuseAssistantArchitecture> {
+    /// Selects local DSpark construction and binding from this exact already-open source.
+    /// This does not admit a distributed speculative session.
+    pub fn partition_tensor_parallel(
+        mut self,
+        rank: ParallelRankTopology,
+    ) -> Result<Self, ArtifactError> {
+        let (source, selected, layout) = construction::partition_muse_construction(
+            &self.source_module_config,
+            &self.module_config,
+            &self.tasks,
+            rank,
+        )?;
+        let units = parameters::local_parameter_units(&self.tasks, &layout, self.source.as_ref())
+            .map_err(invalid_assistant)?;
+        self.parameter_units =
+            parameters::canonical_unit_order(units, selected.execution_definition().unit_layout())
+                .map_err(invalid_assistant)?;
+        self.execution_layout = Some(selected.execution_definition().unit_layout().clone());
+        self.source_module_config = source;
+        self.module_config = selected;
+        self.parameter_layout = Some(layout);
+        Ok(self)
     }
 }
 
@@ -1016,15 +1458,19 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
     fn prepare_source(
         self,
         max_cached_sources: usize,
+        source_module_config: A::ModuleConfig,
+        module_config: A::ModuleConfig,
+        parameter_layout: Option<eredu_runtime::LocalModelLayout>,
     ) -> Result<PreparedExternalAssistantSource<A>, ArtifactError> {
         let Self {
             checkpoint,
             prepared_source,
-            source_config,
+            source_config: _,
             config,
             tasks,
             _architecture: _,
         } = self;
+        let execution_layout = A::execution_unit_layout(&module_config).map_err(invalid_assistant)?;
         let retained_checkpoint = checkpoint.clone();
         let artifact_identity = match &checkpoint {
             ExternalAssistantCheckpoint::SafeTensors { shards, .. } => {
@@ -1060,13 +1506,29 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
                 )
             })?,
         };
+        let parameter_units = match &parameter_layout {
+            Some(layout) => parameters::local_parameter_units(&tasks, layout, source.as_ref()),
+            None => parameters::parameter_units(&tasks),
+        }
+        .map_err(invalid_assistant)?;
+        let parameter_units = if let Some(layout) = &execution_layout {
+            parameters::canonical_unit_order(parameter_units, layout).map_err(invalid_assistant)?
+        } else {
+            parameter_units
+        };
         Ok(PreparedExternalAssistantSource {
             source,
             checkpoint: retained_checkpoint,
             artifact_identity,
-            source_config,
+            source_module_config,
+            module_config,
             config,
             tasks,
+            parameter_units,
+            residency: eredu_runtime::LayerWeightResidency::FullyResident,
+            execution_layout,
+            parameter_layout,
+            conversion_retention: None,
         })
     }
 
@@ -1104,7 +1566,7 @@ pub trait ExternalAssistantPreparationVisitor {
 
 enum DispatchedMaterializedExternalAssistant<V: ExternalAssistantPreparationVisitor> {
     Gemma4(V::Output<Gemma4AssistantArchitecture>),
-    MuseGlimmer(V::Output<MuseGlimmerAssistantArchitecture>),
+    Muse(V::Output<MuseAssistantArchitecture>),
 }
 
 /// Architecture-owned existential wrapper around one materialized assistant.
@@ -1124,7 +1586,28 @@ pub trait MaterializedExternalAssistantVisitor<V: ExternalAssistantPreparationVi
     fn visit<A: ExternalAssistantArchitecture>(self, assistant: &mut V::Output<A>) -> Self::Output;
 }
 
+/// Read-only operation on an architecture-dispatched materialized assistant.
+pub trait MaterializedExternalAssistantRefVisitor<V: ExternalAssistantPreparationVisitor> {
+    /// Result of the observation.
+    type Output;
+
+    /// Observes retained resources without obtaining mutation authority.
+    fn visit<A: ExternalAssistantArchitecture>(self, assistant: &V::Output<A>) -> Self::Output;
+}
+
 impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistant<V> {
+    /// Observes the retained typed assistant without changing execution state.
+    pub fn visit_ref<W: MaterializedExternalAssistantRefVisitor<V>>(&self, visitor: W) -> W::Output {
+        match &self.dispatched {
+            DispatchedMaterializedExternalAssistant::Gemma4(assistant) => {
+                visitor.visit::<Gemma4AssistantArchitecture>(assistant)
+            }
+            DispatchedMaterializedExternalAssistant::Muse(assistant) => {
+                visitor.visit::<MuseAssistantArchitecture>(assistant)
+            }
+        }
+    }
+
     /// Runs one generic backend visitor against the retained typed assistant.
     pub fn visit<W>(&mut self, visitor: W) -> W::Output
     where
@@ -1134,8 +1617,8 @@ impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistant<V> {
             DispatchedMaterializedExternalAssistant::Gemma4(assistant) => {
                 visitor.visit::<Gemma4AssistantArchitecture>(assistant)
             }
-            DispatchedMaterializedExternalAssistant::MuseGlimmer(assistant) => {
-                visitor.visit::<MuseGlimmerAssistantArchitecture>(assistant)
+            DispatchedMaterializedExternalAssistant::Muse(assistant) => {
+                visitor.visit::<MuseAssistantArchitecture>(assistant)
             }
         }
     }
@@ -1144,13 +1627,13 @@ impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistant<V> {
 #[derive(Debug, Clone)]
 enum DispatchedExternalAssistantPreparation {
     Gemma4(PreparedExternalAssistant<Gemma4AssistantArchitecture>),
-    MuseGlimmer(PreparedExternalAssistant<MuseGlimmerAssistantArchitecture>),
+    Muse(PreparedExternalAssistant<MuseAssistantArchitecture>),
 }
 
 #[derive(Clone)]
 enum DispatchedSelectedExternalAssistant {
     Gemma4(SelectedExternalAssistant<Gemma4AssistantArchitecture>),
-    MuseGlimmer(SelectedExternalAssistant<MuseGlimmerAssistantArchitecture>),
+    Muse(SelectedExternalAssistant<MuseAssistantArchitecture>),
 }
 
 /// Opaque architecture-dispatched external assistant preparation.
@@ -1173,10 +1656,13 @@ pub struct ExternalSpeculativeContractRequest {
     tokenizer_proof: TokenizerCompatibilityProof,
     tokenizer_fingerprint: [u8; 32],
     maximum_draft_tokens: NonZeroUsize,
+    maximum_capture_sequence_length: NonZeroUsize,
 }
 
 impl ExternalSpeculativeContractRequest {
     /// Creates exact construction-time inputs for architecture-owned external selection.
+    /// The capture sequence bound describes one decoder invocation, independently
+    /// of cumulative committed context and media-tower sequence geometry.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         topology: ParallelRankTopology,
@@ -1184,6 +1670,7 @@ impl ExternalSpeculativeContractRequest {
         tokenizer_proof: TokenizerCompatibilityProof,
         tokenizer_fingerprint: [u8; 32],
         maximum_draft_tokens: NonZeroUsize,
+        maximum_capture_sequence_length: NonZeroUsize,
     ) -> Self {
         Self {
             topology,
@@ -1191,6 +1678,7 @@ impl ExternalSpeculativeContractRequest {
             tokenizer_proof,
             tokenizer_fingerprint,
             maximum_draft_tokens,
+            maximum_capture_sequence_length,
         }
     }
 }
@@ -1255,14 +1743,21 @@ impl ExternalSpeculativeContract {
 
 /// Target/assistant compatibility proven before any assistant payload is opened.
 pub struct CompatibleExternalAssistantPreparation {
-    preparation: SelectedExternalAssistantPreparation,
+    preparation: DispatchedNormalizedExternalAssistant,
     target: ExternalAssistantTargetProfile,
     capture: crate::composite_execution::ExternalPredictionCaptureRequest,
+    placement: Option<ExternalAssistantSourcePlacement>,
+    target_selection: Option<construction::AssistantTargetSelection>,
+}
+
+enum DispatchedNormalizedExternalAssistant {
+    Gemma4(NormalizedExternalAssistant<Gemma4AssistantArchitecture>),
+    Muse(NormalizedExternalAssistant<MuseAssistantArchitecture>),
 }
 
 enum DispatchedPreparedExternalAssistant {
     Gemma4(PreparedExternalAssistantSource<Gemma4AssistantArchitecture>),
-    MuseGlimmer(PreparedExternalAssistantSource<MuseGlimmerAssistantArchitecture>),
+    Muse(PreparedExternalAssistantSource<MuseAssistantArchitecture>),
 }
 
 /// Compatibility-proven assistant whose exact neutral source is already open.
@@ -1272,6 +1767,17 @@ enum DispatchedPreparedExternalAssistant {
 pub struct PreparedCompatibleExternalAssistant {
     preparation: DispatchedPreparedExternalAssistant,
     capture: crate::composite_execution::ExternalPredictionCaptureRequest,
+    placement: Option<ExternalAssistantSourcePlacement>,
+}
+
+/// Immutable parameter placement selected against an ordinary target rank.
+/// It describes source construction, not admission of a speculative session.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExternalAssistantSourcePlacement {
+    /// Complete assistant parameters on each participating target rank.
+    Replicated(ParallelRankTopology),
+    /// Sharded body projections and complete replicated scoring parameters.
+    TensorParallel(ParallelRankTopology),
 }
 
 impl CompatibleExternalAssistantPreparation {
@@ -1281,6 +1787,8 @@ impl CompatibleExternalAssistantPreparation {
     }
 
     /// Derives exact architecture requirements before any assistant payload is opened.
+    /// Selected placement requires successful target invocation admission.
+    /// Profile-only singleton contracts describe requirements without a bound target.
     pub fn speculative_contract(
         &self,
         request: ExternalSpeculativeContractRequest,
@@ -1293,14 +1801,14 @@ impl CompatibleExternalAssistantPreparation {
         self,
         max_cached_sources: usize,
     ) -> Result<PreparedCompatibleExternalAssistant, ArtifactError> {
-        let preparation = match self.preparation.dispatched {
-            DispatchedSelectedExternalAssistant::Gemma4(selected) => {
+        let preparation = match self.preparation {
+            DispatchedNormalizedExternalAssistant::Gemma4(selected) => {
                 DispatchedPreparedExternalAssistant::Gemma4(
                     selected.prepare_source(max_cached_sources)?,
                 )
             }
-            DispatchedSelectedExternalAssistant::MuseGlimmer(selected) => {
-                DispatchedPreparedExternalAssistant::MuseGlimmer(
+            DispatchedNormalizedExternalAssistant::Muse(selected) => {
+                DispatchedPreparedExternalAssistant::Muse(
                     selected.prepare_source(max_cached_sources)?,
                 )
             }
@@ -1308,11 +1816,88 @@ impl CompatibleExternalAssistantPreparation {
         Ok(PreparedCompatibleExternalAssistant {
             preparation,
             capture: self.capture,
+            placement: self.placement,
         })
     }
 }
 
 impl PreparedCompatibleExternalAssistant {
+    /// Selected local source policy. Explicit unplaced preparation has no policy.
+    pub const fn source_placement(&self) -> Option<ExternalAssistantSourcePlacement> {
+        self.placement
+    }
+
+    /// Retains exact assistant TP selections without reopening or reselecting its source.
+    /// Complete public distributed assistant admission remains a separate contract.
+    pub fn partition_tensor_parallel(
+        mut self,
+        rank: ParallelRankTopology,
+    ) -> Result<Self, ArtifactError> {
+        if self.placement.is_some() {
+            return Err(invalid_assistant("assistant source placement is already selected"));
+        }
+        self.preparation = match self.preparation {
+            DispatchedPreparedExternalAssistant::Muse(source) => {
+                DispatchedPreparedExternalAssistant::Muse(source.partition_tensor_parallel(rank)?)
+            }
+            DispatchedPreparedExternalAssistant::Gemma4(_) => {
+                return Err(invalid_assistant(
+                    "tensor-parallel assistant source construction is implemented for Muse DSpark",
+                ))
+            }
+        };
+        self.placement = Some(ExternalAssistantSourcePlacement::TensorParallel(rank));
+        Ok(self)
+    }
+
+    /// Exact selected immutable device-parameter payload, excluding other resources.
+    pub fn parameter_residency_requirement(
+        &self,
+    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_runtime::BoundedResidencySizingError> {
+        match &self.preparation {
+            DispatchedPreparedExternalAssistant::Gemma4(source) => source.parameter_residency_requirement(),
+            DispatchedPreparedExternalAssistant::Muse(source) => source.parameter_residency_requirement(),
+        }
+    }
+
+    /// Applies the load plan's independent per-execution conversion allowance.
+    pub fn with_parameter_conversion_retention(
+        mut self,
+        policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+    ) -> Self {
+        self.preparation = match self.preparation {
+            DispatchedPreparedExternalAssistant::Gemma4(source) => {
+                DispatchedPreparedExternalAssistant::Gemma4(source.with_parameter_conversion_retention(policy))
+            }
+            DispatchedPreparedExternalAssistant::Muse(source) => {
+                DispatchedPreparedExternalAssistant::Muse(source.with_parameter_conversion_retention(policy))
+            }
+        };
+        self
+    }
+
+    /// Assistant parameter policy retained on the prepared source.
+    pub fn residency(&self) -> eredu_runtime::LayerWeightResidency {
+        match &self.preparation {
+            DispatchedPreparedExternalAssistant::Gemma4(source) => source.residency(),
+            DispatchedPreparedExternalAssistant::Muse(source) => source.residency(),
+        }
+    }
+    /// Retains one explicit assistant policy on the exact already-prepared source.
+    pub fn with_residency(
+        mut self,
+        residency: eredu_runtime::LayerWeightResidency,
+    ) -> Result<Self, ArtifactError> {
+        self.preparation = match self.preparation {
+            DispatchedPreparedExternalAssistant::Gemma4(source) => {
+                DispatchedPreparedExternalAssistant::Gemma4(source.with_residency(residency)?)
+            }
+            DispatchedPreparedExternalAssistant::Muse(source) => {
+                DispatchedPreparedExternalAssistant::Muse(source.with_residency(residency)?)
+            }
+        };
+        Ok(self)
+    }
     /// Exact architecture-owned target capture request.
     pub const fn capture(&self) -> &crate::composite_execution::ExternalPredictionCaptureRequest {
         &self.capture
@@ -1331,24 +1916,38 @@ impl PreparedCompatibleExternalAssistant {
                         dispatched: DispatchedMaterializedExternalAssistant::Gemma4(assistant),
                     })
             }
-            DispatchedPreparedExternalAssistant::MuseGlimmer(prepared) => visitor
-                .visit(prepared)
-                .map(|assistant| MaterializedExternalAssistant {
-                    dispatched: DispatchedMaterializedExternalAssistant::MuseGlimmer(assistant),
-                }),
+            DispatchedPreparedExternalAssistant::Muse(prepared) => {
+                visitor
+                    .visit(prepared)
+                    .map(|assistant| MaterializedExternalAssistant {
+                        dispatched: DispatchedMaterializedExternalAssistant::Muse(assistant),
+                    })
+            }
         }
     }
 }
 
 impl ExternalAssistantPreparation {
-    /// Architecture identity whose tokenizer contract the assistant shares.
-    pub fn tokenizer_model_kind(&self) -> crate::configuration::ModelKind {
+    /// Returns the exact tokenizer ownership declared by the selected assistant architecture.
+    pub fn tokenizer_source(&self) -> crate::external_draft::ExternalDraftTokenizerSource {
         match &self.dispatched {
-            DispatchedExternalAssistantPreparation::Gemma4(_) => {
-                Gemma4AssistantArchitecture::tokenizer_model_kind()
+            DispatchedExternalAssistantPreparation::Gemma4(p) => {
+                Gemma4AssistantArchitecture::tokenizer_source(&p.config)
             }
-            DispatchedExternalAssistantPreparation::MuseGlimmer(_) => {
-                MuseGlimmerAssistantArchitecture::tokenizer_model_kind()
+            DispatchedExternalAssistantPreparation::Muse(p) => {
+                MuseAssistantArchitecture::tokenizer_source(&p.config)
+            }
+        }
+    }
+
+    /// Architecture identity whose tokenizer contract the assistant shares.
+    pub fn tokenizer_model_type(&self) -> &'static str {
+        match &self.dispatched {
+            DispatchedExternalAssistantPreparation::Gemma4(p) => {
+                Gemma4AssistantArchitecture::tokenizer_model_type(&p.config)
+            }
+            DispatchedExternalAssistantPreparation::Muse(p) => {
+                MuseAssistantArchitecture::tokenizer_model_type(&p.config)
             }
         }
     }
@@ -1372,8 +1971,8 @@ impl ExternalAssistantPreparation {
                     &lowering,
                 )?)
             }
-            DispatchedExternalAssistantPreparation::MuseGlimmer(prepared) => {
-                DispatchedSelectedExternalAssistant::MuseGlimmer(select_external_materialization(
+            DispatchedExternalAssistantPreparation::Muse(prepared) => {
+                DispatchedSelectedExternalAssistant::Muse(select_external_materialization(
                     prepared,
                     quantization,
                     max_cached_sources,
@@ -1394,7 +1993,12 @@ impl SelectedExternalAssistantPreparation {
         fn prepared<A: ExternalAssistantArchitecture>(
             selected: SelectedExternalAssistant<A>,
         ) -> PreparedExternalAssistantSource<A> {
-            match selected.prepare_source(eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS) {
+            match NormalizedExternalAssistant::new(selected, None)
+                .map_err(invalid_assistant)
+                .and_then(|selected| {
+                    selected.prepare_source(eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS)
+                })
+            {
                 Ok(prepared) => prepared,
                 Err(error) => panic!("test source preparation failed: {error}"),
             }
@@ -1405,10 +2009,10 @@ impl SelectedExternalAssistantPreparation {
                 .map(|assistant| MaterializedExternalAssistant {
                     dispatched: DispatchedMaterializedExternalAssistant::Gemma4(assistant),
                 }),
-            DispatchedSelectedExternalAssistant::MuseGlimmer(selected) => visitor
+            DispatchedSelectedExternalAssistant::Muse(selected) => visitor
                 .visit(prepared(selected))
                 .map(|assistant| MaterializedExternalAssistant {
-                    dispatched: DispatchedMaterializedExternalAssistant::MuseGlimmer(assistant),
+                    dispatched: DispatchedMaterializedExternalAssistant::Muse(assistant),
                 }),
         }
     }
@@ -1426,18 +2030,29 @@ impl SelectedExternalAssistantPreparation {
                 crate::gemma4::model::external_assistant_capture_request(target, prepared.config())
             }
             (
-                DispatchedSelectedExternalAssistant::MuseGlimmer(prepared),
-                ExternalAssistantTargetProfile::MuseGlimmer(target),
-            ) => crate::muse_glimmer::model::external_assistant_capture_request(
-                target,
-                prepared.config(),
-            ),
+                DispatchedSelectedExternalAssistant::Muse(prepared),
+                ExternalAssistantTargetProfile::Muse(target),
+            ) => prepared.config().capture_request(target),
             _ => Err("external assistant family does not match the selected target".into()),
         }?;
+        let preparation = match self.dispatched {
+            DispatchedSelectedExternalAssistant::Gemma4(selected) => {
+                DispatchedNormalizedExternalAssistant::Gemma4(
+                    NormalizedExternalAssistant::new(selected, Some(target))?,
+                )
+            }
+            DispatchedSelectedExternalAssistant::Muse(selected) => {
+                DispatchedNormalizedExternalAssistant::Muse(
+                    NormalizedExternalAssistant::new(selected, Some(target))?,
+                )
+            }
+        };
         Ok(CompatibleExternalAssistantPreparation {
-            preparation: self,
+            preparation,
             target: target.clone(),
             capture,
+            placement: None,
+            target_selection: None,
         })
     }
 }
@@ -1709,6 +2324,9 @@ where
         .filter_map(|constraint| {
             constraint.linear_companion.as_ref().map(|companion| {
                 let role = match companion.kind {
+                    eredu_checkpoint::schema::LinearCompanionKind::GlobalScale => {
+                        eredu_nn::LinearCompanionRole::GlobalScale
+                    }
                     eredu_checkpoint::schema::LinearCompanionKind::Scale => {
                         eredu_nn::LinearCompanionRole::Scale
                     }
@@ -1736,7 +2354,8 @@ where
             Err(_) if constraint.requirement == TensorRequirement::Optional => continue,
             Err(error) => return Err(error.to_string()),
         };
-        let is_matrix = constraint.key.ends_with(".weight") && source.logical_shape.len() >= 2;
+        let is_matrix = source.logical_shape.len() == 2
+            || (constraint.key.ends_with(".weight") && source.logical_shape.len() > 2);
         let packed_output = companions.contains_key(&constraint.key);
         let executable = if quantization.is_some() && !packed_output {
             LinearFormat::Dense
@@ -1762,6 +2381,10 @@ where
                 constraint.key
             )
         })?;
+        let owner = A::parameter_owner(&target_config, &constraint.key)?;
+        let companion_owner = owner
+            .parameter_group_owner()
+            .map_err(|error| error.to_string())?;
         let mut task = ReplicatedTextMaterializationTask::from_exact_source(
             constraint.key.clone(),
             exact_physical_source(&store, &constraint.key)?,
@@ -1773,7 +2396,7 @@ where
             } else {
                 ReplicatedTextParameterRole::Other
             },
-            ReplicatedTextParameterOwner::StaticRole("external_assistant".into()),
+            owner,
             executable,
             kind,
             descriptor,
@@ -1788,7 +2411,7 @@ where
                     companion.key.clone(),
                     *role,
                     companion.shape.clone(),
-                    eredu_runtime::ParameterGroupOwner::static_role("external_assistant"),
+                    companion_owner.clone(),
                 )
                 .map_err(|error| error.to_string())?;
                 if store.source_metadata(&companion.key).is_ok() {
@@ -1849,19 +2472,33 @@ fn external_speculative_contract(
     compatible: &CompatibleExternalAssistantPreparation,
     request: ExternalSpeculativeContractRequest,
 ) -> Result<ExternalSpeculativeContract, ArtifactError> {
-    if request.topology.world_size() != 1 {
+    if let Some(placement) = compatible.placement {
+        let retained_rank = match placement {
+            ExternalAssistantSourcePlacement::Replicated(rank)
+            | ExternalAssistantSourcePlacement::TensorParallel(rank) => rank,
+        };
+        if retained_rank != request.topology {
+            return Err(invalid_assistant(
+                "external speculative topology differs from retained source placement",
+            ));
+        }
+    }
+    if let Some(selected) = &compatible.target_selection {
+        selected.validate_request(&request, &compatible.target)?;
+    } else if request.topology.world_size() != 1 {
         return Err(invalid_assistant(
-            "external speculative targets require replicated topology",
+            "partitioned external speculation requires retained target invocation admission",
         ));
     }
     request
         .tokenizer_proof
         .validate_target(request.tokenizer_fingerprint)
         .map_err(invalid_assistant)?;
-    // Public speculative lanes are batch-one. Sequence capture geometry uses the target's
-    // architecture-declared upper bound so construction never invents a narrower invocation.
+    // Public speculative lanes are batch-one. Capture cannot exceed either the
+    // architecture context or the selected decoder invocation.
     let batch = 1;
-    let sequence = compatible.target.maximum_capture_sequence_length()?.get();
+    let sequence = compatible.target.maximum_capture_sequence_length()?.get()
+        .min(request.maximum_capture_sequence_length.get());
     let target_identity = compatible.target.speculative_identity()?;
     let topology = external_topology_identity(request.topology)?;
     let owner = external_contract_identity(format!(
@@ -1881,18 +2518,18 @@ fn external_speculative_contract(
         mut state,
         grouped,
     ) = match (
-        &compatible.preparation.dispatched,
+        &compatible.preparation,
         &compatible.target,
         &compatible.capture,
     ) {
         (
-            DispatchedSelectedExternalAssistant::Gemma4(prepared),
+            DispatchedNormalizedExternalAssistant::Gemma4(prepared),
             ExternalAssistantTargetProfile::Gemma4(target),
             crate::composite_execution::ExternalPredictionCaptureRequest::Gemma4SharedAttention {
                 final_hidden_path,
             },
         ) => {
-            let assistant = prepared.config();
+            let assistant = prepared.selected.config();
             let proof = assistant
                 .prove_compatibility(&target.text)
                 .map_err(invalid_assistant)?;
@@ -1960,6 +2597,7 @@ fn external_speculative_contract(
                 assistant.backbone_hidden_size,
             ))?;
             let (artifact_identity, format_identity) = prepared
+                .selected
                 .checkpoint()
                 .speculative_identities(&assistant_identity)?;
             (
@@ -1978,21 +2616,21 @@ fn external_speculative_contract(
             )
         }
         (
-            DispatchedSelectedExternalAssistant::MuseGlimmer(prepared),
-            ExternalAssistantTargetProfile::MuseGlimmer(target),
-            crate::composite_execution::ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
+            DispatchedNormalizedExternalAssistant::Muse(prepared),
+            ExternalAssistantTargetProfile::Muse(target),
+            crate::composite_execution::ExternalPredictionCaptureRequest::Muse {
                 target_layers,
                 target_paths,
             },
         ) => {
-            let assistant = prepared.config();
-            let _compatibility = assistant
-                .prove_compatibility(target)
+            let assistant = prepared.selected.config();
+            assistant
+                .capture_request(target)
                 .map_err(invalid_assistant)?;
-            let capacity = NonZeroUsize::new(assistant.block_size.saturating_sub(1).min(15))
-                .ok_or_else(|| {
-                    invalid_assistant("Muse-Glimmer assistant proposal capacity is zero")
-                })?;
+            let family = assistant.strategy_name();
+            let capacity = NonZeroUsize::new(assistant.proposal_capacity()).ok_or_else(|| {
+                invalid_assistant("Muse-Glimmer assistant proposal capacity is zero")
+            })?;
             let hidden = external_positive(target.hidden_size, "Muse-Glimmer target hidden size")?;
             if target_layers.len() != target_paths.len() {
                 return Err(invalid_assistant(
@@ -2009,7 +2647,7 @@ fn external_speculative_contract(
                         vec![batch, sequence, hidden],
                         owner.clone(),
                         external_contract_identity(format!(
-                            "muse-glimmer.target_layers.{position}.layer.{layer}"
+                            "{family}.target_layers.{position}.layer.{layer}"
                         ))?,
                     )
                     .and_then(|entry| entry.with_bounded_dimension(1))
@@ -2017,12 +2655,12 @@ fn external_speculative_contract(
                 })
                 .collect::<Result<Vec<_>, ArtifactError>>()?;
             let capture = SpeculativeCaptureSchema::new(
-                    external_contract_identity(format!(
-                        "muse-glimmer-dflash/capture/batch={batch};sequence={sequence};layers={target_layers:?}"
-                    ))?,
-                    entries,
-                )
-                .map_err(invalid_assistant)?;
+                external_contract_identity(format!(
+                    "{family}/capture/batch={batch};sequence={sequence};layers={target_layers:?}"
+                ))?,
+                entries,
+            )
+            .map_err(invalid_assistant)?;
             let mut state = vec![
                 "target.verification_checkpoint".to_owned(),
                 "assistant.pending_target_context".to_owned(),
@@ -2031,30 +2669,55 @@ fn external_speculative_contract(
                 "assistant.proposal_cursor".to_owned(),
             ];
             for layer in
-                0..usize::try_from(assistant.num_hidden_layers).map_err(invalid_assistant)?
+                0..usize::try_from(assistant.num_hidden_layers()).map_err(invalid_assistant)?
             {
                 state.push(format!("assistant.projected_context.{layer}.keys"));
                 state.push(format!("assistant.projected_context.{layer}.values"));
             }
+            match assistant {
+                MuseAssistantConfig::Spark(c) => match c.released().identity() {
+                    muse::assistant::spark::SparkAssistantIdentity::DSpark => state.extend(
+                        [
+                            "assistant.proposal_hidden",
+                            "assistant.markov_logits",
+                            "assistant.target_columns",
+                            "assistant.confidence",
+                        ]
+                        .map(str::to_owned),
+                    ),
+                    muse::assistant::spark::SparkAssistantIdentity::DFlash2 => state.extend(
+                        [
+                            "assistant.proposal_hidden",
+                            "assistant.candidate_ids",
+                            "assistant.unary_logits",
+                        ]
+                        .map(str::to_owned),
+                    ),
+                },
+                MuseAssistantConfig::Glimmer(_) => {}
+            }
             let assistant_identity = external_contract_identity(format!(
-                "muse-glimmer-assistant/model={};block={};layers={};hidden={};targets={target_layers:?}",
-                assistant.model_type,
-                assistant.block_size,
-                assistant.num_hidden_layers,
-                assistant.hidden_size,
+                "{family}/model={};block={};layers={};hidden={};targets={target_layers:?}",
+                assistant.model_type(),
+                assistant.block_size(),
+                assistant.num_hidden_layers(),
+                assistant.hidden_size(),
             ))?;
             let (artifact_identity, format_identity) = prepared
+                .selected
                 .checkpoint()
                 .speculative_identities(&assistant_identity)?;
             (
-                "muse-glimmer-dflash",
+                family,
                 capacity,
                 assistant_identity,
                 artifact_identity,
                 format_identity,
                 format!(
                     "block={};sliding={};mask={};layers={target_layers:?}",
-                    assistant.block_size, assistant.sliding_window, assistant.mask_token_id
+                    assistant.block_size(),
+                    assistant.sliding_window(),
+                    assistant.mask_token_id()
                 ),
                 capture,
                 state,
@@ -2176,11 +2839,11 @@ pub fn prepare_external_assistant(
         }
         "muse_glimmer_assistant" => {
             let config = match inspection.format() {
-                ArtifactFormat::SafeTensors => muse_glimmer::DFlashConfig::from_hf_json(
+                ArtifactFormat::SafeTensors => muse::DFlashConfig::from_hf_json(
                     &serde_json::to_vec(config_json.expect("SafeTensors inspection has JSON"))?,
                 )
                 .map_err(invalid_assistant)?,
-                ArtifactFormat::Gguf => muse_glimmer::DFlashConfig::from_gguf_metadata(
+                ArtifactFormat::Gguf => muse::DFlashConfig::from_gguf_metadata(
                     metadata.as_ref().expect("GGUF inspection has metadata"),
                 )
                 .map_err(invalid_assistant)?,
@@ -2192,12 +2855,40 @@ pub fn prepare_external_assistant(
             };
             let checkpoint = prepared_checkpoint(
                 &inspection,
-                || muse_glimmer::dflash_safetensors_plan(&config),
-                || muse_glimmer::dflash_gguf_plan(&config),
-                muse_glimmer::translate_dflash_gguf_weight_name,
+                || muse::dflash_safetensors_plan(&config),
+                || muse::dflash_gguf_plan(&config),
+                muse::translate_dflash_gguf_weight_name,
             )?;
             Ok(ExternalAssistantPreparation {
-                dispatched: DispatchedExternalAssistantPreparation::MuseGlimmer(
+                dispatched: DispatchedExternalAssistantPreparation::Muse(
+                    PreparedExternalAssistant {
+                        checkpoint,
+                        config: MuseAssistantConfig::Glimmer(config),
+                        _architecture: PhantomData,
+                    },
+                ),
+            })
+        }
+        "muse_spark_assistant" => {
+            let released = muse::assistant::spark::SparkAssistantConfig::from_hf_value(
+                config_json.ok_or_else(|| {
+                    invalid_assistant(
+                        "Spark assistants require their released SafeTensors configuration",
+                    )
+                })?,
+            )
+            .map_err(invalid_assistant)?;
+            let config = MuseAssistantConfig::Spark(
+                muse::assistant::spark::SparkAssistantLoadConfig::new(released),
+            );
+            let checkpoint = prepared_checkpoint(
+                &inspection,
+                || config.safetensors_plan(),
+                || Err("no released Spark assistant GGUF format is declared".into()),
+                str::to_owned,
+            )?;
+            Ok(ExternalAssistantPreparation {
+                dispatched: DispatchedExternalAssistantPreparation::Muse(
                     PreparedExternalAssistant {
                         checkpoint,
                         config,
@@ -2292,16 +2983,22 @@ impl ModelConfigurationResolver for AssistantConfigurations {
             .ok_or_else(|| {
                 ArtifactError::InvalidArtifact("assistant config is missing model_type".into())
             })?;
-        let family = match model_type {
-            "gemma4_assistant" => {
-                gemma4::AssistantConfig::from_json(&bytes).map_err(invalid_assistant)?;
-                "gemma4_assistant"
+        let family = if muse::assistant::spark::SparkAssistantConfig::declared_by(json) {
+            muse::assistant::spark::SparkAssistantConfig::from_hf_value(json)
+                .map_err(invalid_assistant)?;
+            "muse_spark_assistant"
+        } else {
+            match model_type {
+                "gemma4_assistant" => {
+                    gemma4::AssistantConfig::from_json(&bytes).map_err(invalid_assistant)?;
+                    "gemma4_assistant"
+                }
+                "muse_glimmer_assistant" => {
+                    muse::DFlashConfig::from_hf_json(&bytes).map_err(invalid_assistant)?;
+                    "muse_glimmer_assistant"
+                }
+                other => return Err(ArtifactError::UnsupportedModelType(other.into())),
             }
-            "muse_glimmer_assistant" => {
-                muse_glimmer::DFlashConfig::from_hf_json(&bytes).map_err(invalid_assistant)?;
-                "muse_glimmer_assistant"
-            }
-            other => return Err(ArtifactError::UnsupportedModelType(other.into())),
         };
         Ok(ResolvedModelConfiguration::new(
             ModelConfiguration::new(
@@ -2328,8 +3025,7 @@ impl ModelConfigurationResolver for AssistantConfigurations {
                 "gemma4_assistant"
             }
             "dflash" => {
-                muse_glimmer::DFlashConfig::from_gguf_metadata(&metadata)
-                    .map_err(invalid_assistant)?;
+                muse::DFlashConfig::from_gguf_metadata(&metadata).map_err(invalid_assistant)?;
                 "muse_glimmer_assistant"
             }
             other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
@@ -2352,6 +3048,7 @@ impl ModelConfigurationResolver for AssistantConfigurations {
 #[cfg(test)]
 mod tests {
     mod execution_plan;
+
 
     use super::*;
     use eredu_checkpoint::{schema::StoredDtypeConstraint, SourceTensorEncoding, StoredDtype};
@@ -2382,7 +3079,10 @@ mod tests {
                         && match (descriptor.source(), descriptor.executable()) {
                             (
                                 SourceTensorEncoding::Safetensors(
-                                    StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32,
+                                    StoredDtype::F16
+                                    | StoredDtype::BF16
+                                    | StoredDtype::F32
+                                    | StoredDtype::I64,
                                 ),
                                 LinearFormat::Dense,
                             ) => true,
@@ -2482,7 +3182,14 @@ mod tests {
         let mut offset = 0_u64;
         let mut header = serde_json::Map::new();
         for tensor in &plan.common_tensors {
-            assert_eq!(tensor.dtype, StoredDtypeConstraint::Floating);
+            let (dtype, width) = match tensor.dtype {
+                StoredDtypeConstraint::Floating => ("F32", 4),
+                StoredDtypeConstraint::Exact(StoredDtype::BF16) => ("BF16", 2),
+                StoredDtypeConstraint::Exact(StoredDtype::F16) => ("F16", 2),
+                StoredDtypeConstraint::Exact(StoredDtype::F32) => ("F32", 4),
+                StoredDtypeConstraint::Exact(StoredDtype::I64) => ("I64", 8),
+                _ => panic!("unexpected sparse fixture dtype"),
+            };
             let elements = tensor
                 .shape
                 .iter()
@@ -2491,12 +3198,12 @@ mod tests {
                 })
                 .unwrap();
             let end = offset
-                .checked_add(elements.checked_mul(4).unwrap())
+                .checked_add(elements.checked_mul(width).unwrap())
                 .unwrap();
             header.insert(
                 tensor.key.clone(),
                 serde_json::json!({
-                    "dtype": "F32",
+                    "dtype": dtype,
                     "shape": tensor.shape,
                     "data_offsets": [offset, end],
                 }),
@@ -2540,6 +3247,7 @@ mod tests {
             proof,
             fingerprint,
             NonZeroUsize::new(capacity).unwrap(),
+            NonZeroUsize::new(usize::MAX).unwrap(),
         )
     }
 
@@ -2588,17 +3296,17 @@ mod tests {
                 "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}
             }
         });
-        let mut target = muse_glimmer::DecoderConfig::from_hf_value(&target).unwrap();
+        let mut target = muse::DecoderConfig::from_hf_value(&target).unwrap();
         target.hidden_size = 6656;
         target.num_hidden_layers = 50;
         target.vocab_size = 201819;
         target.max_position_embeddings = 131072;
-        ExternalAssistantTargetProfile::MuseGlimmer(target)
+        ExternalAssistantTargetProfile::Muse(target)
     }
 
     fn prepared_muse_without_payload_open() -> (ExternalAssistantPreparation, tempfile::TempDir) {
-        let config = muse_glimmer::DFlashConfig::from_hf_json(MUSE_ASSISTANT.as_bytes()).unwrap();
-        let plan = muse_glimmer::dflash_safetensors_plan(&config).unwrap();
+        let config = muse::DFlashConfig::from_hf_json(MUSE_ASSISTANT.as_bytes()).unwrap();
+        let plan = muse::dflash_safetensors_plan(&config).unwrap();
         let artifact = sparse_safetensors_artifact(MUSE_ASSISTANT, &plan);
         let preparation = prepare_external_assistant(artifact.path()).unwrap();
         (preparation, artifact)
@@ -2675,8 +3383,9 @@ mod tests {
     struct InspectedPreparation {
         checkpoint: ExternalAssistantCheckpoint,
         artifact_identity: ArtifactIdentity,
-        tokenizer_model_kind: crate::configuration::ModelKind,
+        tokenizer_model_type: &'static str,
         model_type: String,
+        conversion_retention: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
     }
 
     struct InspectPreparation;
@@ -2695,8 +3404,9 @@ mod tests {
             Ok(InspectedPreparation {
                 checkpoint,
                 artifact_identity,
-                tokenizer_model_kind: A::tokenizer_model_kind(),
+                tokenizer_model_type: A::tokenizer_model_type(prepared.config()),
                 model_type,
+                conversion_retention: prepared.parameter_conversion_retention(),
             })
         }
     }
@@ -2713,8 +3423,9 @@ mod tests {
             InspectedPreparation {
                 checkpoint: assistant.checkpoint.clone(),
                 artifact_identity: assistant.artifact_identity,
-                tokenizer_model_kind: assistant.tokenizer_model_kind,
+                tokenizer_model_type: assistant.tokenizer_model_type,
                 model_type: assistant.model_type.clone(),
+                conversion_retention: assistant.conversion_retention,
             }
         }
     }
@@ -2914,7 +3625,7 @@ mod tests {
     }
 
     #[test]
-    fn external_contract_rejects_partitioned_topology_before_payload_materialization() {
+    fn profile_only_external_contract_requires_retained_target_for_partitioned_topology() {
         let artifact = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
         let target = compatible_gemma_target();
         let compatible =
@@ -2931,19 +3642,19 @@ mod tests {
             tokenizer,
             fingerprint,
             NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(32).unwrap(),
         );
-        let payload_opens = Arc::new(AtomicUsize::new(0));
+        std::fs::remove_file(artifact.path().join("model.safetensors")).unwrap();
 
         match compatible.speculative_contract(request) {
             Ok(_) => panic!("partitioned external target unexpectedly produced a contract"),
             Err(error) => assert!(
                 error
                     .to_string()
-                    .contains("external speculative targets require replicated topology"),
+                    .contains("requires retained target invocation admission"),
                 "{error}"
             ),
         }
-        assert_eq!(payload_opens.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2958,6 +3669,16 @@ mod tests {
         let contract = compatible
             .speculative_contract(contract_request(8, fingerprint, tokenizer))
             .unwrap();
+
+        // A selected decoder invocation can be much smaller than its model context.
+        let mut bounded_request = contract_request(8, fingerprint, tokenizer);
+        bounded_request.maximum_capture_sequence_length = NonZeroUsize::new(32).unwrap();
+        let bounded = compatible.speculative_contract(bounded_request).unwrap();
+        assert!(bounded.target_capture().entries().iter()
+            .all(|entry| entry.shape() == [1, 32, 6656]));
+        assert!(bounded.target_capture().instantiate(vec![vec![1, 32, 6656]; 5]).is_ok());
+        assert!(bounded.target_capture().instantiate(vec![vec![1, 33, 6656]; 5]).is_err());
+        assert_ne!(bounded.target_capture(), contract.target_capture());
 
         assert_eq!(
             contract
@@ -3022,8 +3743,8 @@ mod tests {
                 "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}
             }
         });
-        let target = ExternalAssistantTargetProfile::MuseGlimmer(
-            crate::muse_glimmer::DecoderConfig::from_hf_value(&target).unwrap(),
+        let target = ExternalAssistantTargetProfile::Muse(
+            crate::muse::DecoderConfig::from_hf_value(&target).unwrap(),
         );
         let payload_opens = Arc::new(AtomicUsize::new(0));
         match select_direct_for_test(preparation).prove_target_compatibility(&target) {
