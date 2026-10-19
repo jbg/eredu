@@ -558,6 +558,7 @@ impl ComponentPartitionLayout {
             if crate::speculative_execution::speculative_capture_scope(descriptor, &node.id)?
                 != eredu_core::speculative::SpeculativeCaptureScope::Target { continue; }
             let points = descriptor.observations.points.iter().filter(|point| point.node_id == node.id
+                && node.observation_paths.contains(&point.path)
                 && point.axes.as_ref().is_some_and(|axes| axes.iter().any(|axis| axis.name == "hidden")))
                 .collect::<Vec<_>>();
             if points.is_empty() { continue; }
@@ -1113,14 +1114,22 @@ fn node_invocation_owner<'a>(
             .iter()
             .find(|group| &group.id == group_id)
             .ok_or_else(invalid)?;
+        // A declared logical group owns its invocation even when another
+        // invocation (for example lexical injection) nests in its namespace.
+        let named_group = parameters.groups().iter().any(|owned| {
+            owned.logical_name() == group.canonical_prefix
+        });
         let mut matched = false;
         for owned in parameters.groups().iter().filter(|owned| {
-            owned.members().iter().any(|member| {
-                member
-                    .target()
-                    .strip_prefix(&group.canonical_prefix)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-            })
+            if named_group {
+                owned.logical_name() == group.canonical_prefix
+            } else {
+                owned.members().iter().any(|member| {
+                    member.target() == group.canonical_prefix
+                        || member.target().strip_prefix(&group.canonical_prefix)
+                            .is_some_and(|suffix| suffix.starts_with('.'))
+                })
+            }
         }) {
             matched = true;
             if !matches!(

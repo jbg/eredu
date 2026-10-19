@@ -1050,6 +1050,9 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let group_continuation_geometry = (0..self.units.len())
             .map(|group| {
+                if !group_activity[group] {
+                    return Ok(None);
+                }
                 self.architecture
                     .inner()
                     .prepared_group_continuation_geometry(group, input)
