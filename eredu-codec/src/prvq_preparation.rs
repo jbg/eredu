@@ -1,14 +1,14 @@
 //! Cold exact binding plans for independently leased PRVQ codebook units.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{RecipeDtype, RecipeError},
+    store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
+    PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use crate::{prvq::Geometry, prvq_layered::quantizer_parameter_description};
@@ -16,6 +16,9 @@ use crate::{prvq::Geometry, prvq_layered::quantizer_parameter_description};
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum QuantizerPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// A retained communicator lacks required membership, completion or operations.
     #[error(transparent)]
     Coordination(#[from] eredu_runtime::replicated_execution::CollectiveCoordinationError),
@@ -58,10 +61,7 @@ pub enum QuantizerPreparationError {
 pub struct PreparedQuantizerBindings {
     geometry: Geometry,
     prefix: String,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
-    local_layout: Option<LocalModelLayout>,
+    prepared: PreparedComponent,
 }
 
 impl PreparedQuantizerBindings {
@@ -75,25 +75,11 @@ impl PreparedQuantizerBindings {
         parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, QuantizerPreparationError> {
         let description = quantizer_parameter_description(geometry, prefix)?;
-        let layout = description.unit_layout().clone();
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(QuantizerPreparationError::Geometry(
-                    "unexpected static quantizer owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
+        let prepared = PreparedComponent::prepare(
+            "prvq/codebooks/leased-units",
+            description,
+            source.clone(),
+            |member| {
                 let name = member.target();
                 let mut recipe = parameters
                     .get(name)
@@ -112,49 +98,13 @@ impl PreparedQuantizerBindings {
                 if recipe.infer(source.as_ref())?.dtype != RecipeDtype::F32 {
                     return Err(QuantizerPreparationError::Geometry(name.into()));
                 }
-                unit_recipes[ordinal].insert(name.into(), recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "prvq/codebooks/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !targets.contains(&target) {
-                            return Err(QuantizerPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(QuantizerPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, QuantizerPreparationError>>()?;
+                Ok::<_, QuantizerPreparationError>(recipe)
+            },
+        )?;
         Ok(Self {
             geometry,
             prefix: prefix.into(),
-            layout,
-            source,
-            units,
-            local_layout: None,
+            prepared,
         })
     }
 
@@ -175,7 +125,7 @@ impl PreparedQuantizerBindings {
         let description = quantizer_parameter_description(self.geometry, &self.prefix)?;
         let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
             .map_err(QuantizerPreparationError::Parallel)?;
-        if let Some(selected) = self.local_layout.as_ref() {
+        if let Some(selected) = self.prepared.local_layout() {
             if selected != &layout {
                 return Err(QuantizerPreparationError::Parallel(
                     "retained PRVQ placement differs from the tensor topology".into(),
@@ -191,24 +141,14 @@ impl PreparedQuantizerBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, QuantizerPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(QuantizerPreparationError::Parallel(
-                "PRVQ bindings already have a tensor partition".into(),
-            ));
-        }
         crate::prvq_layered::quantizer_local_dimensions(self.geometry, &self.prefix, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
 
     /// Exact retained tensor placement, when selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
 
     /// Validated neural quantizer geometry.
@@ -222,12 +162,12 @@ impl PreparedQuantizerBindings {
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
 
     /// Restricted retained source used by these exact bindings.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
@@ -241,14 +181,11 @@ impl PreparedQuantizerBindings {
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (
-            self.geometry,
-            self.prefix,
-            self.local_layout,
-            self.layout,
-            self.source,
-            self.units,
-        )
+        let (local, layout, source, units) = self
+            .prepared
+            .into_unit_parts()
+            .expect("component declares only independently leased units");
+        (self.geometry, self.prefix, local, layout, source, units)
     }
 }
 

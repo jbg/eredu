@@ -96,6 +96,9 @@ pub struct AudioTokenizerConfig {
 /// Errors returned by codec construction and tokenization operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Shared component declaration or invocation failure.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// A completed streaming layer requires reset before accepting more input.
     #[error("streaming codec layer has finished; reset before submitting input")]
     StreamFinished,

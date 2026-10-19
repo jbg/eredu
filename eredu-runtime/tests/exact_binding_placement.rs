@@ -307,3 +307,224 @@ fn exact_binding_does_not_reshard_selected_local_transform_output() {
     );
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
 }
+
+mod component_preparation {
+    use eredu_checkpoint::{
+        recipe::DerivedWeightRecipe,
+        store::{MemoryWeightStore, SharedCheckpointSource, TensorSelection},
+    };
+    use eredu_runtime::{
+        ArchitectureParameterDescription, ComponentPreparationError, ExecutionGraph,
+        ExecutionGroupSpec, ExecutionUnitLayout, MemberSharding, OwnedParameterGroupSpec,
+        ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        PreparedComponent,
+    };
+    use std::sync::Arc;
+
+    fn description(selected: &[usize]) -> ArchitectureParameterDescription {
+        let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
+        let layout = ExecutionUnitLayout::new(&graph, [3]).unwrap();
+        let groups = selected
+            .iter()
+            .map(|index| {
+                ParameterGroupSpec::partitioned(
+                    format!("parameter.{index}"),
+                    ParameterRole::ColumnProjection,
+                    4,
+                    [ParameterMemberSpec::new(
+                        format!("weight.{index}"),
+                        vec![4, 2],
+                        MemberSharding::Partitioned { axis: 0 },
+                    )],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let owned = selected
+            .iter()
+            .zip(&groups)
+            .map(|(index, group)| {
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit(
+                        layout.group_id(0).unwrap().clone(),
+                        *index,
+                    ),
+                    group.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ArchitectureParameterDescription::new(&graph, &layout, groups, owned).unwrap()
+    }
+
+    fn prepared() -> PreparedComponent {
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors((0..4).map(|index| {
+                (
+                    format!("physical.{index}"),
+                    safetensors::Dtype::F32,
+                    vec![4, 2],
+                    vec![0; 32],
+                )
+            }))
+            .unwrap(),
+        );
+        PreparedComponent::prepare(
+            "shared-contract",
+            description(&[0, 1, 2]),
+            source,
+            |member| {
+                let index = member.target().strip_prefix("weight.").unwrap();
+                Ok::<_, ComponentPreparationError>(DerivedWeightRecipe::source(
+                    format!("physical.{index}"),
+                    TensorSelection::Full,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sparse_component_selection_retains_global_address_and_only_owned_sources() {
+        let prepared = prepared();
+        let address = prepared.description().unit_layout().address(2).unwrap();
+        let selected = prepared.select_units([address]).unwrap();
+        assert_eq!(selected.source().source_keys(), ["physical.2"]);
+        let (_, layout, source, units) = selected.into_unit_parts().unwrap();
+        assert_eq!(layout.address(0), Some(address));
+        assert_eq!(layout.ordinal(0, 2), Some(0));
+        assert!(layout.ordinal(0, 0).is_none());
+        assert_eq!(
+            units[0][0]
+                .source_recipe()
+                .infer(source.as_ref())
+                .unwrap()
+                .shape(),
+            [4, 2]
+        );
+    }
+
+    #[test]
+    fn component_projection_preserves_placement_without_transforming_twice() {
+        let prepared = prepared();
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        let layout =
+            eredu_runtime::derive_partitioned_local_layout(prepared.description(), topology)
+                .unwrap();
+        let prepared = prepared.select(&layout).unwrap();
+        let before = prepared.unit_bindings()[2][0].source_recipe();
+        let projected = prepared.project("projected", description(&[2])).unwrap();
+        assert_eq!(projected.source().source_keys(), ["physical.2"]);
+        assert_eq!(projected.local_layout().unwrap().len(), 1);
+        let retained = projected.local_layout().unwrap().clone();
+        let projected = projected.select(&retained).unwrap();
+        let after = projected.unit_bindings()[2][0].source_recipe();
+        assert_eq!(before, after);
+        assert_eq!(
+            after.infer(projected.source().as_ref()).unwrap().shape(),
+            [2, 2]
+        );
+        assert!(projected.select(&layout).is_err());
+    }
+
+    #[test]
+    fn component_projection_rejects_unretained_storage() {
+        let prepared = prepared().project("subset", description(&[2])).unwrap();
+        assert!(matches!(prepared.project("invalid", description(&[0])),
+            Err(ComponentPreparationError::InvalidProjection { target, .. }) if target == "weight.0"));
+    }
+    #[test]
+    fn shared_component_storage_keeps_aliases_coherent_through_placement_and_precision() {
+        use eredu_checkpoint::recipe::RecipeDtype;
+        use eredu_runtime::{ComponentRecipe, RecipeBindingError, WeightBindingPlan};
+        let graph =
+            ExecutionGraph::new(vec![ExecutionGroupSpec::root("shared")], "shared").unwrap();
+        let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+        let parameters = ParameterGroupSpec::partitioned(
+            "shared",
+            ParameterRole::ColumnProjection,
+            4,
+            ["owner", "consumer"].map(|name| {
+                ParameterMemberSpec::new(name, vec![4, 2], MemberSharding::Partitioned { axis: 0 })
+            }),
+        )
+        .unwrap();
+        let description = ArchitectureParameterDescription::new(
+            &graph,
+            &units,
+            [parameters.clone()],
+            [OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(units.group_id(0).unwrap().clone(), 0),
+                parameters,
+            )],
+        )
+        .unwrap();
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "physical".into(),
+                safetensors::Dtype::F32,
+                vec![4, 2],
+                vec![0; 32],
+            )])
+            .unwrap(),
+        );
+        let prepared = PreparedComponent::prepare("shared", description, source, |member| {
+            Ok::<_, ComponentPreparationError>(if member.target() == "owner" {
+                ComponentRecipe::Physical(DerivedWeightRecipe::source(
+                    "physical",
+                    TensorSelection::Full,
+                ))
+            } else {
+                ComponentRecipe::Alias("owner".into())
+            })
+        })
+        .unwrap();
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            0,
+        )
+        .unwrap();
+        let layout =
+            eredu_runtime::derive_partitioned_local_layout(prepared.description(), topology)
+                .unwrap();
+        let prepared = prepared
+            .select(&layout)
+            .unwrap()
+            .transform_units(|source, units| {
+                for binding in units
+                    .iter_mut()
+                    .flatten()
+                    .filter(|binding| !binding.is_alias())
+                {
+                    let recipe = DerivedWeightRecipe::Cast {
+                        input: Box::new(binding.source_recipe()),
+                        dtype: RecipeDtype::F16,
+                    };
+                    let bytes = recipe
+                        .infer(source.as_ref())
+                        .map_err(ComponentPreparationError::from)?
+                        .byte_len();
+                    *binding = binding
+                        .clone()
+                        .with_source_recipe(recipe, bytes)
+                        .map_err(RecipeBindingError::from)?;
+                }
+                Ok::<_, ComponentPreparationError>(())
+            })
+            .unwrap();
+        let plan = WeightBindingPlan::new(&prepared.unit_bindings()[0]).unwrap();
+        assert_eq!(plan.owners().count(), 1);
+        assert_eq!(plan.aliases().count(), 1);
+        for (alias, owner) in plan.aliases() {
+            assert_eq!(alias.expected_bytes(), 8);
+            assert_eq!(owner.expected_bytes(), 8);
+        }
+        assert_eq!(prepared.source().source_keys(), ["physical"]);
+        let description = prepared.description().clone();
+        let projected = prepared.project("retained", description);
+        assert!(projected.is_ok());
+    }
+}

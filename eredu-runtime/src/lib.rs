@@ -21,6 +21,16 @@ pub mod capture;
 pub mod communication;
 /// Typed multimodal component graphs and residency accounting.
 pub mod component;
+/// Validated declarations and typed component execution adapters.
+pub mod component_execution;
+pub use component_execution::{
+    ComponentAdapter, ComponentDefinition, ComponentDefinitionError, ComponentKernel,
+    ComponentUnit, EmptyParameterModule, ParallelComponentKernel, ParameterStorageId, StateSlotId,
+    StatelessComponentState,
+};
+/// Exact cold component preparation and consuming placement.
+pub mod prepared_component;
+pub use prepared_component::{ComponentPreparationError, ComponentRecipe, PreparedComponent};
 mod component_pipeline;
 /// Mechanism-only selection contracts for composite model input.
 pub mod composite;

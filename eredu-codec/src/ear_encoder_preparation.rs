@@ -1,14 +1,14 @@
 //! Cold exact binding plans for independently leased EAR neural encoder units.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{RecipeDtype, RecipeError},
+    store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
+    PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use crate::{ear_encoder::EncoderConfig, ear_encoder_layered::encoder_parameter_description};
@@ -16,6 +16,9 @@ use crate::{ear_encoder::EncoderConfig, ear_encoder_layered::encoder_parameter_d
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum EncoderPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// Encoder geometry cannot be constructed.
     #[error(transparent)]
     Encoder(#[from] crate::Error),
@@ -51,10 +54,7 @@ pub enum EncoderPreparationError {
 pub struct PreparedEncoderBindings {
     config: EncoderConfig,
     prefix: String,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
-    local_layout: Option<LocalModelLayout>,
+    prepared: PreparedComponent,
 }
 
 impl PreparedEncoderBindings {
@@ -68,25 +68,11 @@ impl PreparedEncoderBindings {
         parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, EncoderPreparationError> {
         let description = encoder_parameter_description(&config, prefix)?;
-        let layout = description.unit_layout().clone();
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(EncoderPreparationError::Geometry(
-                    "unexpected static encoder owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
+        let prepared = PreparedComponent::prepare(
+            "ear/encoder/leased-units",
+            description,
+            source.clone(),
+            |member| {
                 let name = member.target();
                 let mut recipe = parameters
                     .get(name)
@@ -105,49 +91,13 @@ impl PreparedEncoderBindings {
                 if recipe.infer(source.as_ref())?.dtype != RecipeDtype::F32 {
                     return Err(EncoderPreparationError::Geometry(name.into()));
                 }
-                unit_recipes[ordinal].insert(name.into(), recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "ear/encoder/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !targets.contains(&target) {
-                            return Err(EncoderPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(EncoderPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, EncoderPreparationError>>()?;
+                Ok::<_, EncoderPreparationError>(recipe)
+            },
+        )?;
         Ok(Self {
             config,
             prefix: prefix.into(),
-            layout,
-            source,
-            units,
-            local_layout: None,
+            prepared,
         })
     }
 
@@ -168,7 +118,7 @@ impl PreparedEncoderBindings {
         let description = encoder_parameter_description(&self.config, &self.prefix)?;
         let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
             .map_err(EncoderPreparationError::Parallel)?;
-        if let Some(selected) = self.local_layout.as_ref() {
+        if let Some(selected) = self.prepared.local_layout() {
             if selected != &layout {
                 return Err(EncoderPreparationError::Parallel(
                     "retained EAR encoder placement differs from the tensor topology".into(),
@@ -184,18 +134,8 @@ impl PreparedEncoderBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, EncoderPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(EncoderPreparationError::Parallel(
-                "EAR encoder bindings already have a tensor partition".into(),
-            ));
-        }
         crate::ear_encoder_layered::encoder_local_dimensions(&self.config, &self.prefix, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
 
@@ -210,52 +150,25 @@ impl PreparedEncoderBindings {
         crate::ear_encoder_partition::validate_encoder_partition(
             &self.config,
             &self.prefix,
-            self.local_layout.as_ref(),
+            self.prepared.local_layout(),
             partition,
         )?;
-        let selected = partition
-            .units()
-            .map(|address| {
-                self.layout
-                    .ordinal(address.group(), address.index())
-                    .map(|ordinal| (ordinal, address))
-                    .ok_or_else(|| {
-                        EncoderPreparationError::Geometry("partition unit outside encoder".into())
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let units = self
-            .units
+        let prepared = self.prepared.select_units(partition.units())?;
+        let (local_layout, layout, source, bindings) = prepared.into_unit_parts()?;
+        let units = bindings
             .into_iter()
             .enumerate()
-            .filter_map(|(ordinal, bindings)| {
-                selected
-                    .get(&ordinal)
-                    .copied()
-                    .map(|address| (address, bindings))
-            })
-            .collect::<Vec<_>>();
-        let inputs = units
-            .iter()
-            .flat_map(|(_, bindings)| bindings)
-            .flat_map(|binding| {
-                binding
-                    .source_recipe()
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
+            .map(|(ordinal, bindings)| {
+                (
+                    layout.address(ordinal).expect("selected unit address"),
+                    bindings,
+                )
             })
             .collect();
-        let source = Arc::new(RestrictedCheckpointSource::including(
-            self.source,
-            "ear/encoder/partition-units",
-            inputs,
-        )?);
         Ok(PreparedEncoderPartitionBindings {
             config: self.config,
             prefix: self.prefix,
-            local_layout: self.local_layout,
+            local_layout,
             source,
             units,
         })
@@ -263,7 +176,7 @@ impl PreparedEncoderBindings {
 
     /// Exact retained tensor placement, when selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
 
     /// Validated neural encoder geometry.
@@ -277,12 +190,12 @@ impl PreparedEncoderBindings {
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
 
     /// Restricted retained source used by these exact bindings.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
@@ -296,14 +209,11 @@ impl PreparedEncoderBindings {
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (
-            self.config,
-            self.prefix,
-            self.local_layout,
-            self.layout,
-            self.source,
-            self.units,
-        )
+        let (local, layout, source, units) = self
+            .prepared
+            .into_unit_parts()
+            .expect("component declares only independently leased units");
+        (self.config, self.prefix, local, layout, source, units)
     }
 }
 

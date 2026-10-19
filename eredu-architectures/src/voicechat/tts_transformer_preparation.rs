@@ -1,14 +1,14 @@
 //! Cold exact binding plans for independently leased TTS transformer units.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{RecipeDtype, RecipeError},
+    store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
+    PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use super::{
@@ -32,6 +32,9 @@ pub enum TtsTransformerKind {
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum TtsTransformerPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// Invalid floating execution profile or attempted precision reselection.
     #[error("invalid speech precision: {0}")]
     Precision(&'static str),
@@ -69,10 +72,7 @@ pub enum TtsTransformerPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedTtsTransformerBindings {
     config: TransformerConfig,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
-    local_layout: Option<LocalModelLayout>,
+    prepared: PreparedComponent,
 }
 
 impl PreparedTtsTransformerBindings {
@@ -89,7 +89,11 @@ impl PreparedTtsTransformerBindings {
         precision
             .validate()
             .map_err(TtsTransformerPreparationError::Precision)?;
-        precision.bindings(&self.source, &mut self.units)?;
+        self.prepared = self.prepared.transform_units(|source, units| {
+            precision
+                .bindings(source, units)
+                .map_err(TtsTransformerPreparationError::from)
+        })?;
         self.config = self.config.with_precision(precision);
         Ok(self)
     }
@@ -131,25 +135,11 @@ impl PreparedTtsTransformerBindings {
                 .collect(),
         );
         let description = tts_transformer_parameter_description(&config)?;
-        let layout = description.unit_layout().clone();
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(TtsTransformerPreparationError::Geometry(
-                    "unexpected static transformer owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
+        let prepared = PreparedComponent::prepare(
+            "voicechat/tts_transformer/leased-units",
+            description,
+            source.clone(),
+            |member| {
                 let name = member.target();
                 let parameter = parameters
                     .get(name)
@@ -170,49 +160,10 @@ impl PreparedTtsTransformerBindings {
                 {
                     return Err(TtsTransformerPreparationError::Geometry(name.into()));
                 }
-                unit_recipes[ordinal].insert(name.into(), parameter.recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "voicechat/tts_transformer/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let canonical_targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !canonical_targets.contains(&target) {
-                            return Err(TtsTransformerPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(TtsTransformerPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, TtsTransformerPreparationError>>()?;
-        Ok(Self {
-            config,
-            layout,
-            source,
-            units,
-            local_layout: None,
-        })
+                Ok::<_, TtsTransformerPreparationError>(parameter.recipe)
+            },
+        )?;
+        Ok(Self { config, prepared })
     }
 
     /// Selects complete-stack tensor placement using the shared physical planner.
@@ -238,23 +189,13 @@ impl PreparedTtsTransformerBindings {
 
     /// Applies an already selected rank-local layout to the exact retained recipes.
     /// Shape validation precedes recipe lowering and source authority is preserved.
-    /// This consumes global bindings and rejects a second partition selection.
+    /// Reusing the same retained selection preserves its transformed recipes.
     pub fn into_parallel(
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, TtsTransformerPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(TtsTransformerPreparationError::Parallel(
-                "transformer bindings already have a selected tensor partition".into(),
-            ));
-        }
         super::tts_transformer_layered::transformer_local_configs(&self.config, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
 
@@ -270,53 +211,24 @@ impl PreparedTtsTransformerBindings {
     ) -> Result<PreparedTtsTransformerPartitionBindings, TtsTransformerPreparationError> {
         super::tts_transformer_layered::validate_transformer_partition(
             &self.config,
-            self.local_layout.as_ref(),
+            self.prepared.local_layout(),
             partition,
         )?;
-        let selected = partition
-            .units()
-            .map(|address| {
-                self.layout
-                    .ordinal(address.group(), address.index())
-                    .map(|ordinal| (ordinal, address))
-                    .ok_or_else(|| {
-                        TtsTransformerPreparationError::Geometry(
-                            "partition unit outside transformer".into(),
-                        )
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let units = self
-            .units
+        let prepared = self.prepared.select_units(partition.units())?;
+        let (local_layout, layout, source, bindings) = prepared.into_unit_parts()?;
+        let units = bindings
             .into_iter()
             .enumerate()
-            .filter_map(|(ordinal, bindings)| {
-                selected
-                    .get(&ordinal)
-                    .copied()
-                    .map(|address| (address, bindings))
-            })
-            .collect::<Vec<_>>();
-        let inputs = units
-            .iter()
-            .flat_map(|(_, bindings)| bindings)
-            .flat_map(|binding| {
-                binding
-                    .source_recipe()
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
+            .map(|(ordinal, bindings)| {
+                (
+                    layout.address(ordinal).expect("selected unit address"),
+                    bindings,
+                )
             })
             .collect();
-        let source = Arc::new(RestrictedCheckpointSource::including(
-            self.source,
-            "voicechat/tts_transformer/partition-units",
-            inputs,
-        )?);
         Ok(PreparedTtsTransformerPartitionBindings {
             config: self.config,
-            local_layout: self.local_layout,
+            local_layout,
             source,
             units,
             state_layout: partition.state().map(|state| state.layout().clone()),
@@ -330,12 +242,12 @@ impl PreparedTtsTransformerBindings {
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
 
     /// Restricted retained source used by these exact bindings.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
@@ -347,7 +259,11 @@ impl PreparedTtsTransformerBindings {
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (self.config, self.layout, self.source, self.units)
+        let (_, layout, source, units) = self
+            .prepared
+            .into_unit_parts()
+            .expect("component declares only independently leased units");
+        (self.config, layout, source, units)
     }
 }
 

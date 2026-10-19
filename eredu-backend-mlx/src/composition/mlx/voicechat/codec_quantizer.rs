@@ -2,10 +2,7 @@
 
 use eredu_codec::{
     prvq::{Codebook, DistanceMetric, Geometry, Quantized},
-    prvq_layered::{
-        LayerwiseQuantizer, QuantizerArchitecture, QuantizerExecution, QuantizerInput,
-        QuantizerRuntimeState,
-    },
+    prvq_layered::{LayerwiseQuantizer, QuantizerExecution, QuantizerInput, QuantizerKernel},
     prvq_preparation::{validate_parallel_communication, PreparedQuantizerBindings},
     Error,
 };
@@ -246,17 +243,18 @@ fn materialize(
         || {
             let (geometry, prefix, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
-                Some(local) => QuantizerArchitecture::<MlxNeuralBackend>::new_parallel(
-                    geometry, &prefix, local,
-                ),
-                None => QuantizerArchitecture::<MlxNeuralBackend>::new(geometry, &prefix),
+                Some(local) => {
+                    QuantizerKernel::<MlxNeuralBackend>::new_parallel(geometry, &prefix, local)
+                }
+                None => QuantizerKernel::<MlxNeuralBackend>::new(geometry, &prefix),
             }
+            .and_then(QuantizerKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<QuantizerRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -271,7 +269,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<QuantizerRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseQuantizer::new(architecture, policy))

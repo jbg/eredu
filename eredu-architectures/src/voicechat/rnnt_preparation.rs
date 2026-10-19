@@ -1,14 +1,14 @@
 //! Exact cold recipes for independently leased RNNT prediction and joint units.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{DerivedWeightRecipe, RecipeDtype, RecipeError},
+    store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
+    PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use super::{
@@ -22,6 +22,9 @@ use super::{
 /// Invalid RNNT geometry, retained source authority, or execution recipe.
 #[derive(Debug, thiserror::Error)]
 pub enum RnntPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// Architecture geometry cannot be constructed.
     #[error(transparent)]
     Rnnt(#[from] RnntError),
@@ -63,10 +66,7 @@ pub enum RnntPreparationError {
 /// state and can be materialized independently through shared residency providers.
 pub struct PreparedRnntBindings {
     dimensions: RnntDimensions,
-    local_layout: Option<LocalModelLayout>,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
+    pub(super) prepared: PreparedComponent,
 }
 impl PreparedRnntBindings {
     /// Projects the admitted component without resolving or reopening artifacts.
@@ -120,25 +120,11 @@ impl PreparedRnntBindings {
         parameters: &BTreeMap<String, DerivedWeightRecipe>,
     ) -> Result<Self, RnntPreparationError> {
         let description = rnnt_parameter_description(dimensions)?;
-        let layout = description.unit_layout().clone();
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(RnntPreparationError::Geometry(
-                    "unexpected static RNNT owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
+        let prepared = PreparedComponent::prepare(
+            "voicechat/rnnt/leased-units",
+            description,
+            source.clone(),
+            |member| {
                 let name = member.target();
                 let mut recipe = parameters
                     .get(name)
@@ -157,48 +143,12 @@ impl PreparedRnntBindings {
                 if recipe.infer(source.as_ref())?.dtype != RecipeDtype::F32 {
                     return Err(RnntPreparationError::Geometry(name.into()));
                 }
-                unit_recipes[ordinal].insert(name.into(), recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "voicechat/rnnt/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !targets.contains(&target) {
-                            return Err(RnntPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(RnntPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, RnntPreparationError>>()?;
+                Ok::<_, RnntPreparationError>(recipe)
+            },
+        )?;
         Ok(Self {
             dimensions,
-            local_layout: None,
-            layout,
-            source,
-            units,
+            prepared,
         })
     }
 
@@ -219,7 +169,7 @@ impl PreparedRnntBindings {
         let description = rnnt_parameter_description(self.dimensions)?;
         let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
             .map_err(RnntPreparationError::Parallel)?;
-        if let Some(selected) = self.local_layout.as_ref() {
+        if let Some(selected) = self.prepared.local_layout() {
             if selected != &layout {
                 return Err(RnntPreparationError::Parallel(
                     "retained RNNT placement differs from the tensor topology".into(),
@@ -235,24 +185,14 @@ impl PreparedRnntBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, RnntPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(RnntPreparationError::Parallel(
-                "RNNT bindings already have a tensor partition".into(),
-            ));
-        }
         super::rnnt_layered::rnnt_local_dimensions(self.dimensions, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
 
     /// Exact retained vocabulary placement, if tensor parallelism was selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
 
     /// Exact prediction and joint geometry retained during preparation.
@@ -261,11 +201,11 @@ impl PreparedRnntBindings {
     }
     /// Canonical unit bindings for selected-task resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
     /// Restricted retained source used by every execution recipe.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
     /// Transfers source authority and architecture-ordered unit bindings.
     pub fn into_parts(
@@ -277,13 +217,11 @@ impl PreparedRnntBindings {
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (
-            self.dimensions,
-            self.local_layout,
-            self.layout,
-            self.source,
-            self.units,
-        )
+        let (local, layout, source, units) = self
+            .prepared
+            .into_unit_parts()
+            .expect("component declares only independently leased units");
+        (self.dimensions, local, layout, source, units)
     }
 }
 

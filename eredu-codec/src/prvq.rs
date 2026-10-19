@@ -277,9 +277,12 @@ impl<T: Tensor> Codebook<T> {
 /// Resident fixed codebooks using the same selected-depth layered traversal.
 pub struct ResidualQuantizer<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        crate::prvq_layered::QuantizerArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            crate::prvq_layered::QuantizerKernel<B>,
+        >,
         B,
-        crate::prvq_layered::QuantizerRuntimeState,
+        eredu_runtime::StatelessComponentState,
     >,
 }
 impl<B: NeuralBackend> std::fmt::Debug for ResidualQuantizer<B> {
@@ -349,7 +352,8 @@ impl<B: NeuralBackend> ResidualQuantizer<B> {
                 "residual codebooks do not match configured order, namespace and geometry",
             ));
         }
-        let architecture = crate::prvq_layered::QuantizerArchitecture::new(geometry, &prefix)?;
+        let architecture =
+            crate::prvq_layered::QuantizerKernel::new(geometry, &prefix)?.into_component()?;
         let runtime = eredu_runtime::ResidentRuntime::from_units(
             architecture,
             codebooks.into_iter().map(|book| vec![book]).collect(),
@@ -362,7 +366,7 @@ impl<B: NeuralBackend> ResidualQuantizer<B> {
     }
     /// Exact selected codebook geometry.
     pub fn geometry(&self) -> Geometry {
-        self.runtime.architecture().geometry()
+        self.runtime.architecture().kernel().geometry()
     }
     /// Independently leased depth modules in residual order.
     pub fn codebooks(&self) -> impl ExactSizeIterator<Item = &Codebook<B::Tensor>> {
@@ -427,7 +431,7 @@ impl<B: NeuralBackend> crate::prvq_layered::QuantizerExecution<B> for ResidualQu
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         use eredu_runtime::LayeredInvocation;
-        let mut state = crate::prvq_layered::QuantizerRuntimeState::new()?;
+        let mut state = eredu_runtime::StatelessComponentState::new()?;
         self.runtime.invoke(
             crate::prvq_layered::QuantizerInput::Decode { codes, range },
             &mut state,
@@ -442,7 +446,7 @@ impl<B: NeuralBackend> crate::prvq_layered::QuantizerExecution<B> for ResidualQu
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Quantized<B::Tensor>, Error> {
         use eredu_runtime::LayeredInvocation;
-        let mut state = crate::prvq_layered::QuantizerRuntimeState::new()?;
+        let mut state = eredu_runtime::StatelessComponentState::new()?;
         self.runtime
             .invoke_with_context(
                 crate::prvq_layered::QuantizerInput::Quantize {

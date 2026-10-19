@@ -3,15 +3,13 @@
 use eredu_architectures::voicechat::{
     tts_mog::TtsError,
     tts_rvq::{RefinementState, RvqDimensions},
-    tts_rvq_layered::{
-        LayerwiseRvq, RvqArchitecture, RvqExecution, RvqForward, RvqInput, RvqRuntimeState, RvqUnit,
-    },
+    tts_rvq_layered::{LayerwiseRvq, RvqExecution, RvqForward, RvqInput, RvqKernel, RvqUnit},
     tts_rvq_preparation::{validate_parallel_communication, PreparedRvqBindings},
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
     DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport,
+    ResidencyReport, StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
@@ -210,15 +208,17 @@ fn materialize(
         || {
             let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
-                Some(local) => RvqArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local),
-                None => RvqArchitecture::<MlxNeuralBackend>::new(dimensions),
+                Some(local) => RvqKernel::<MlxNeuralBackend>::new_parallel(dimensions, local)
+                    .and_then(RvqKernel::into_component),
+                None => RvqKernel::<MlxNeuralBackend>::new(dimensions)
+                    .and_then(RvqKernel::into_component),
             }
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<RvqRuntimeState>,
+                std::marker::PhantomData::<StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -233,7 +233,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<RvqRuntimeState>,
+                        std::marker::PhantomData::<StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseRvq::new(architecture, policy))

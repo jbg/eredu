@@ -680,6 +680,43 @@ consumes `InputExecution`, whose associated perception cache may be ordinary or
 stage-local. PCM carry, paired input state, execution output and the enclosing
 transaction retain that exact cache type through completion and publication.
 
+`eredu-runtime::ComponentDefinition` retains canonical parameter ownership and its
+execution graph with logical unit paths, state references, group transport and
+primary/prediction identities. Construction validates addresses, paths, state
+ranges, partition rules and optional group semantics without native allocation.
+`ParameterStorageId` and `StateSlotId` distinguish physical parameter ownership
+from invocation addresses and mutable state. `ComponentAdapter` implements the
+ordinary architecture and layered contracts for independently leased components;
+its typed `ComponentKernel` supplies equations, operation activity, request roots
+and family cache identity. Parallel adaptation requires the separate
+`ParallelComponentKernel` bound. The adapter rejects pinned parameter declarations;
+it does not infer missing capabilities from equation defaults.
+
+VoiceChat RVQ and codec PRVQ use this adapter with `RvqKernel` and
+`QuantizerKernel`. Both use runtime-owned empty pinned modules and stateless
+traversal metadata. RVQ retains bank-only sum and refinement operations and the
+bank-to-projection embedding operation. PRVQ retains selected depth ranges and
+ordered residual subtraction. Their collective-bearing equations retain explicit
+rank agreement and transient input/candidate roots through ordinary completion.
+
+`PreparedComponent` validates family-resolved recipes against canonical global
+shapes, groups bindings by parameter-storage owner, and restricts checkpoint
+source authority to the recipes' physical inputs. Consuming placement selection
+retains the exact local layout; identical reselection validates it without
+transforming recipes again, and incompatible selection fails. Recipe policy
+transforms preserve targets, shapes and source authority. Identity-based
+projections retain transformed bindings and project local placement; sparse unit
+selection preserves global invocation addresses while compacting local ordinals
+and narrowing source access. Families own source admission, naming, aliases,
+precision policy, special recipes and additional geometry constraints.
+
+RVQ, PRVQ, RNNT, RNNT projection, perception, conditioning, MoG, the TTS transformer
+and EAR encoder/decoder preparation use this shared container. Function-head
+preparation retains its primary parameter accounting alongside the same container.
+RNNT projection selects declared canonical targets and ownership. EAR, perception and TTS
+transformer stage preparation use shared global-address selection while retaining
+their family state and boundary geometry.
+
 `PreparedPerceptionBindings` validates symbolic parameter geometry against the
 admitted recipes without reading payloads or allocating native resources. It
 retains only the physical inputs for subsampling, Conformer blocks and projection,
@@ -1494,8 +1531,8 @@ the existing session RNG. These components accept supplied TTS backbone hidden
 states. The coupled execution graph orders their invocations and retains
 component resources through completion.
 
-`RvqArchitecture` separates the canonical stacked feedback bank from its single
-latent-to-hidden projection. Ordered depth sums and residual quantization lease
+`RvqKernel` declares separate resources for the canonical stacked feedback bank
+and its single latent-to-hidden projection. Ordered depth sums and residual quantization lease
 only the bank; embedded feedback also executes the projection. `RvqExecution`
 shares those operations and the refinement schedule across resident and bounded
 providers. Prompt ingress and each refinement iteration use the same projection

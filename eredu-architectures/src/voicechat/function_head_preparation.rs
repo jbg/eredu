@@ -1,14 +1,14 @@
 //! Cold exact binding plans for independently leased function head units.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{RecipeDtype, RecipeError},
+    store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
+    PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use super::{
@@ -22,6 +22,9 @@ use super::{
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum FunctionHeadPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// Function head geometry cannot be constructed.
     #[error(transparent)]
     FunctionHead(#[from] ChannelError),
@@ -63,11 +66,8 @@ pub enum FunctionHeadPreparationError {
 pub struct PreparedFunctionHeadBindings {
     dimensions: FunctionHeadDimensions,
     format: eredu_nn::LinearFormatSpec,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
+    prepared: PreparedComponent,
     parameter: ParameterAdmission,
-    local_layout: Option<LocalModelLayout>,
 }
 
 impl PreparedFunctionHeadBindings {
@@ -109,26 +109,12 @@ impl PreparedFunctionHeadBindings {
         let format = crate::linear_format::standard_linear_format(weight, primary.linear_format)
             .map_err(ChannelError::from)?;
         let description = function_head_parameter_description(dimensions, &format)?;
-        let layout = description.unit_layout().clone();
         let mut selected_parameter = None;
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(FunctionHeadPreparationError::Geometry(
-                    "unexpected static function head owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
+        let prepared = PreparedComponent::prepare(
+            "voicechat/function_head/leased-units",
+            description,
+            source.clone(),
+            |member| {
                 let name = member.target();
                 let parameter = parameters
                     .get(name)
@@ -169,50 +155,14 @@ impl PreparedFunctionHeadBindings {
                 {
                     return Err(FunctionHeadPreparationError::Geometry(name.into()));
                 }
-                unit_recipes[ordinal].insert(name.into(), parameter.recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "voicechat/function_head/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !targets.contains(&target) {
-                            return Err(FunctionHeadPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(FunctionHeadPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, FunctionHeadPreparationError>>()?;
+                Ok::<_, FunctionHeadPreparationError>(parameter.recipe)
+            },
+        )?;
         Ok(Self {
             dimensions,
             format,
-            layout,
-            source,
-            units,
+            prepared,
             parameter: selected_parameter.expect("one declared function head parameter"),
-            local_layout: None,
         })
     }
 
@@ -234,7 +184,7 @@ impl PreparedFunctionHeadBindings {
         let description = function_head_parameter_description(self.dimensions, &format)?;
         let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
             .map_err(FunctionHeadPreparationError::Parallel)?;
-        if let Some(selected) = self.local_layout.as_ref() {
+        if let Some(selected) = self.prepared.local_layout() {
             if selected != &layout {
                 return Err(FunctionHeadPreparationError::Parallel(
                     "retained function-head placement differs from the tensor topology".into(),
@@ -251,44 +201,37 @@ impl PreparedFunctionHeadBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, FunctionHeadPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(FunctionHeadPreparationError::Parallel(
-                "function-head bindings already have a tensor partition".into(),
-            ));
-        }
         let format = self.format.clone();
         super::function_head_layered::function_head_parallel_range(
             self.dimensions,
             &format,
             layout,
         )?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.parameter.recipe = self.units[0]
+        self.prepared = self.prepared.select(layout)?;
+        self.parameter.recipe = self.prepared.unit_bindings()[0]
             .iter()
             .find(|b| b.name() == "stt_model.function_head.weight")
             .expect("validated primary function weight")
             .source_recipe();
-        self.parameter.output = self.parameter.recipe.infer(self.source.as_ref())?;
+        self.parameter.output = self
+            .parameter
+            .recipe
+            .infer(self.prepared.source().as_ref())?;
         self.parameter.materialization_peak_bytes = self
             .parameter
             .recipe
-            .peak_materialization_bytes(self.source.as_ref())?
+            .peak_materialization_bytes(self.prepared.source().as_ref())?
             .checked_add(self.parameter.conversion_workspace_bytes)
             .and_then(|bytes| bytes.checked_add(self.parameter.stored_bytes))
             .ok_or(RecipeError::ArithmeticOverflow(
                 "function head execution peak bytes",
             ))?;
-        self.local_layout = Some(layout.clone());
         Ok(self)
     }
 
     /// Exact physical tensor placement retained by this preparation.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
 
     /// Exact execution recipe and conservative physical storage, converter
@@ -304,12 +247,12 @@ impl PreparedFunctionHeadBindings {
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
 
     /// Restricted retained source used by these exact bindings.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
@@ -323,14 +266,11 @@ impl PreparedFunctionHeadBindings {
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (
-            self.dimensions,
-            self.format,
-            self.local_layout,
-            self.layout,
-            self.source,
-            self.units,
-        )
+        let (local, layout, source, units) = self
+            .prepared
+            .into_unit_parts()
+            .expect("function head declares only independently leased units");
+        (self.dimensions, self.format, local, layout, source, units)
     }
 }
 

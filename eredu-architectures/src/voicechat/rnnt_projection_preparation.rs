@@ -6,84 +6,33 @@ use super::{
         rnnt_projection_local_dimensions, rnnt_projection_parameter_description,
     },
 };
-use eredu_checkpoint::store::{RestrictedCheckpointSource, SharedCheckpointSource};
-use eredu_runtime::{place_weight_bindings, ExecutionUnitLayout, LocalModelLayout, WeightBinding};
-use std::{collections::BTreeSet, sync::Arc};
+use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_runtime::{ExecutionUnitLayout, LocalModelLayout, PreparedComponent, WeightBinding};
 
 /// Exact four-unit source authority, including vocabulary placement when selected.
 /// Recurrent recipes and replica declarations are excluded from this owner.
 pub struct PreparedRnntProjectionBindings {
     dimensions: RnntDimensions,
-    local_layout: Option<LocalModelLayout>,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
+    prepared: PreparedComponent,
 }
 impl PreparedRnntProjectionBindings {
     /// Projects existing retained RNNT recipes without reading parameter payloads.
     /// Existing tensor selection is retained exactly; recipes are never sliced twice.
     pub fn from_rnnt(bindings: PreparedRnntBindings) -> Result<Self, RnntPreparationError> {
-        let (dimensions, full_local, full_layout, source, full_units) = bindings.into_parts();
+        let dimensions = bindings.dimensions();
         let description = rnnt_projection_parameter_description(dimensions)?;
-        let mut units = Vec::new();
-        for (ordinal, bindings) in full_units.into_iter().enumerate() {
-            if [0, 2, 3, 4]
-                .into_iter()
-                .any(|group| full_layout.ordinal(group, 0) == Some(ordinal))
-            {
-                units.push(bindings);
-            }
+        let prepared = bindings
+            .prepared
+            .project("voicechat/rnnt/projection-units", description)?;
+        if let Some(layout) = prepared.local_layout() {
+            rnnt_projection_local_dimensions(dimensions, layout)?;
         }
-        if units.len() != 4 {
-            return Err(RnntPreparationError::Geometry(
-                "RNNT projection units are incomplete".into(),
-            ));
-        }
-        let local_layout = full_local
-            .map(|full| {
-                let mut selected = LocalModelLayout::default();
-                for member in description
-                    .groups()
-                    .iter()
-                    .flat_map(|group| group.members())
-                {
-                    let tensor = full.tensor(member.target()).ok_or_else(|| {
-                        RnntPreparationError::Parallel(format!(
-                            "RNNT projection placement omits {}",
-                            member.target()
-                        ))
-                    })?;
-                    selected.insert(member.target().to_owned(), tensor.clone());
-                }
-                rnnt_projection_local_dimensions(dimensions, &selected)?;
-                Ok::<_, RnntPreparationError>(selected)
-            })
-            .transpose()?;
-        let inputs = units
-            .iter()
-            .flatten()
-            .flat_map(|binding| {
-                binding
-                    .source_recipe()
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<BTreeSet<_>>();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "voicechat/rnnt/projection-units",
-            inputs,
-        )?);
         Ok(Self {
             dimensions,
-            local_layout,
-            layout: description.unit_layout().clone(),
-            source,
-            units,
+            prepared,
         })
     }
+
     /// Selects vocabulary shards and exact encoder/prediction replicas for one cohort.
     pub fn select_parallel(
         self,
@@ -102,7 +51,7 @@ impl PreparedRnntProjectionBindings {
             topology,
         )
         .map_err(RnntPreparationError::Parallel)?;
-        if let Some(selected) = self.local_layout.as_ref() {
+        if let Some(selected) = self.prepared.local_layout() {
             if selected != &layout {
                 return Err(RnntPreparationError::Parallel(
                     "retained RNNT projection placement differs from the tensor topology".into(),
@@ -117,18 +66,8 @@ impl PreparedRnntProjectionBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, RnntPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(RnntPreparationError::Parallel(
-                "RNNT projection bindings already have a tensor partition".into(),
-            ));
-        }
         rnnt_projection_local_dimensions(self.dimensions, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
     /// Global geometry used by projection equations and the shared greedy driver.
@@ -137,15 +76,15 @@ impl PreparedRnntProjectionBindings {
     }
     /// Exact optional vocabulary placement with no recurrent replica declarations.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
     /// Architecture-ordered embedding, encoder, prediction and output bindings.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
     /// Retained source restricted to the selected nonrecurrent parameters.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
     /// Transfers compact layout and exactly the authority needed by its four units.
     pub fn into_parts(
@@ -157,13 +96,11 @@ impl PreparedRnntProjectionBindings {
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (
-            self.dimensions,
-            self.local_layout,
-            self.layout,
-            self.source,
-            self.units,
-        )
+        let (local, layout, source, units) = self
+            .prepared
+            .into_unit_parts()
+            .expect("RNNT projection declares only independently leased units");
+        (self.dimensions, local, layout, source, units)
     }
 }
 

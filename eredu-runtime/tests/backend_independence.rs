@@ -9955,3 +9955,6 @@ fn completed_text_prefill_settles_state_and_rolls_back_before_publication() {
 
 #[path = "backend_independence/prefill.rs"]
 mod prefill_agreement_tests;
+
+#[path = "backend_independence/component_adapter.rs"]
+mod component_adapter;

@@ -17,6 +17,9 @@ use eredu_nn::{
 /// Invalid geometry, draw payload or neural execution.
 #[derive(Debug, thiserror::Error)]
 pub enum TtsError {
+    /// Shared component declaration or invocation is invalid.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// Portable execution graph is invalid.
     #[error(transparent)]
     Graph(#[from] eredu_runtime::ExecutionGraphError),
