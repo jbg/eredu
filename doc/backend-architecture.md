@@ -714,10 +714,14 @@ geometry. The adapter supplies ordinary, observed, parallel, provider-aware and
 pipeline driver contracts, including exact local state and pinned-role selection.
 Low-level decoder operations remain available through the typed kernel.
 
-Pipeline-local shared decoder readout uses the typed `PartitionStaticModules`
-readout for final normalization, tied or untied vocabulary projection and
-component instrumentation. The enclosing decoder applies its configured logit
-softcap after that readout, preserving the same observation and subgroup semantics.
+Complete and pipeline-local decoder readout borrow their actual tied embedding
+or untied head through the same vocabulary projection and component instrumentation.
+The typed static modules retain final normalization and the decoder applies its
+configured logit softcap after projection. Serial equations and resource traversal
+require only `NeuralBackend` and ordinary configuration; vocabulary collectives
+and partition construction require their distributed and selected-geometry
+capabilities separately. Observation timing and vocabulary subgroups follow the
+selected projection.
 
 `eredu-runtime::ComponentDefinition` retains canonical parameter ownership and its
 execution graph with logical unit paths, state references, group transport and

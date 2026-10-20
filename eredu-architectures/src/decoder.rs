@@ -4101,6 +4101,63 @@ impl StaticModuleSpec {
     }
 }
 
+// Borrow the actual tied or untied owner for every decoder readout. Instrumentation
+// and vocabulary collectives share this projection without changing normalization.
+struct DecoderOutput<'a, B: NeuralBackend> {
+    embedding: Option<&'a mut B::Embedding>,
+    head: Option<&'a mut B::Linear>,
+}
+impl<B: NeuralBackend> DecoderOutput<'_, B> {
+    fn project(
+        self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let logits = match self.head {
+            Some(head) => {
+                instrumentation.project::<B>("projection_input", head, hidden, None, context)
+            }
+            None => instrumentation.project_embedding(
+                "projection_input",
+                self.embedding
+                    .ok_or_else(|| Error::backend("tied decoder output has no embedding"))?,
+                hidden,
+                context,
+            ),
+        }?;
+        instrumentation.apply("linear", logits)
+    }
+}
+impl<B: eredu_nn::DistributedNeuralBackend> DecoderOutput<'_, B> {
+    fn project_parallel(
+        self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let logits = match self.head {
+            Some(head) => instrumentation.project_vocabulary::<B>(
+                "projection_input",
+                head,
+                hidden,
+                parallel,
+                context,
+            ),
+            None => instrumentation.project_vocabulary_embedding::<B>(
+                "projection_input",
+                self.embedding
+                    .ok_or_else(|| Error::backend("tied decoder output has no embedding"))?,
+                hidden,
+                parallel,
+                context,
+            ),
+        }?;
+        instrumentation.apply("linear", logits)
+    }
+}
+
 impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
     /// Projects normalized hidden values through the existing tensor-parallel head.
     pub fn project_normalized_parallel(
@@ -4139,26 +4196,14 @@ impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let Some(parallel) = parallel else {
-            return self.project_normalized_instrumented(hidden, context, instrumentation);
+        let output = DecoderOutput::<B> {
+            embedding: Some(&mut self.embeddings),
+            head: self.lm_head.as_mut(),
         };
-        let logits = match &mut self.lm_head {
-            Some(head) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                hidden,
-                parallel,
-                context,
-            ),
-            None => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                &mut self.embeddings,
-                hidden,
-                parallel,
-                context,
-            ),
-        }?;
-        instrumentation.apply("linear", logits)
+        match parallel {
+            Some(parallel) => output.project_parallel(hidden, parallel, context, instrumentation),
+            None => output.project(hidden, context, instrumentation),
+        }
     }
 
     pub(crate) fn finish_parallel_instrumented(
@@ -4205,19 +4250,11 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let logits = match &mut self.lm_head {
-            Some(head) => {
-                instrumentation.project::<B>("projection_input", head, hidden, None, context)
-            }
-            None => instrumentation.project_embedding(
-                "projection_input",
-                &mut self.embeddings,
-                hidden,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
-        Ok(logits)
+        DecoderOutput::<B> {
+            embedding: Some(&mut self.embeddings),
+            head: self.lm_head.as_mut(),
+        }
+        .project(hidden, context, instrumentation)
     }
 
     /// Embeds token IDs and applies the architecture's residual expansion.
@@ -4924,12 +4961,10 @@ impl<B: NeuralBackend> Clone for PartitionStaticModules<B> {
     }
 }
 
-impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
-    /// Shared readout for an output-owning pipeline partition.
-    pub(crate) fn finish_instrumented(
+impl<B: NeuralBackend> PartitionStaticModules<B> {
+    fn normalize_readout(
         &mut self,
         hidden: &B::Tensor,
-        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
@@ -4937,38 +4972,43 @@ impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
             .norm
             .as_mut()
             .ok_or_else(|| Error::backend("decoder partition does not own final normalization"))?;
-        let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
-        let logits = match (parallel, self.lm_head.as_mut()) {
-            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, Some(head)) => {
-                instrumentation.project::<B>("projection_input", head, &hidden, None, context)
-            }
-            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                self.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, None) => instrumentation.project_embedding(
-                "projection_input",
-                self.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
-        Ok(logits)
+        instrumentation.normalize_readout(hidden, norm, context)
+    }
+
+    fn finish_serial_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.normalize_readout(hidden, context, instrumentation)?;
+        DecoderOutput::<B> {
+            embedding: self.embeddings.as_mut(),
+            head: self.lm_head.as_mut(),
+        }
+        .project(&hidden, context, instrumentation)
+    }
+
+    /// Shared readout for an output-owning pipeline partition.
+    pub(crate) fn finish_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        let Some(parallel) = parallel else {
+            return self.finish_serial_instrumented(hidden, context, instrumentation);
+        };
+        let hidden = self.normalize_readout(hidden, context, instrumentation)?;
+        DecoderOutput::<B> {
+            embedding: self.embeddings.as_mut(),
+            head: self.lm_head.as_mut(),
+        }
+        .project_parallel(&hidden, parallel, context, instrumentation)
     }
 }
 
@@ -5196,6 +5236,25 @@ where
             definition, kernel, partition,
         )
         .map_err(Error::from)
+    }
+}
+
+impl<B, C, P> DecoderKernel<B, C, P>
+where
+    B: NeuralBackend,
+    C: Config,
+    P: BlockFactory<B, C>,
+{
+    fn finish_local_serial_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let logits =
+            self.static_modules
+                .finish_serial_instrumented(hidden, context, instrumentation)?;
+        softcap_logits(logits, self.args.output_softcap(), context)
     }
 
     /// Returns normalized architecture configuration.
@@ -5434,7 +5493,7 @@ fn dense_local_block_config<C: PartitionedConfig>(
 impl<B, C, P> DecoderKernel<B, C, P>
 where
     B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    C: Config,
     P: BlockFactory<B, C>,
 {
     pub(crate) fn finish_local(
@@ -5467,8 +5526,8 @@ where
 
 impl<B, C, P> eredu_runtime::ComponentKernel<B> for DecoderKernel<B, C, P>
 where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: NeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;
@@ -5511,8 +5570,8 @@ where
 }
 impl<B, C, P> eredu_runtime::ComponentPinnedResources<B> for DecoderKernel<B, C, P>
 where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: NeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
 {
     type Modules = PartitionStaticModules<B>;
@@ -5555,8 +5614,8 @@ where
 }
 impl<B, C, P, S> eredu_runtime::ComponentEquations<B, S> for DecoderKernel<B, C, P>
 where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: NeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -5661,7 +5720,11 @@ where
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_local(hidden, None, context)
+        self.finish_local_serial_instrumented(
+            hidden,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
     fn finish_observed<O>(
         &mut self,
@@ -5675,9 +5738,8 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.finish_local_instrumented(
+        self.finish_local_serial_instrumented(
             hidden,
-            None,
             context,
             &mut ComponentInstrumentation::new("readout", &mut observer),
         )
@@ -5686,7 +5748,7 @@ where
 impl<B, C, P, S> eredu_runtime::ParallelComponentKernel<B, S> for DecoderKernel<B, C, P>
 where
     B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
@@ -5816,8 +5878,8 @@ where
 }
 impl<B, C, P, S> eredu_runtime::RoutedComponentKernel<B, S> for DecoderKernel<B, C, P>
 where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: GroupedNeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: RoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
@@ -5902,7 +5964,7 @@ where
 impl<B, C, P, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for DecoderKernel<B, C, P>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: TensorParallelRoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
@@ -5983,7 +6045,7 @@ where
 impl<B, C, P, S> eredu_runtime::PartitionComponentKernel<B, S> for DecoderKernel<B, C, P>
 where
     B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    C: Config,
     P: BlockFactory<B, C>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
@@ -6102,8 +6164,8 @@ where
 }
 impl<B, C, P> eredu_runtime::TextComponentKernel<B> for DecoderKernel<B, C, P>
 where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: NeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
 {
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
@@ -6572,28 +6634,12 @@ where
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let hidden = instrumentation.normalize_readout(
+        let logits = self.static_modules.finish_parallel_instrumented(
             hidden,
-            &mut self.static_modules.boundary.norm,
+            parallel,
             context,
+            instrumentation,
         )?;
-        let logits = match &mut self.static_modules.lm_head {
-            Some(head) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                &hidden,
-                parallel,
-                context,
-            ),
-            None => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                &mut self.static_modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
         softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
