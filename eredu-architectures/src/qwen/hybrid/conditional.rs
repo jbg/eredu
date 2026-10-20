@@ -15,7 +15,7 @@ use eredu_runtime::{
     RuntimeStateComponents, StateLayout,
 };
 
-use crate::decoder::{DecoderStaticResources, StaticModules};
+use crate::decoder::{DecoderStaticResources, PartitionStaticModules};
 use crate::qwen::ingress::{prepare_input, prepared_semantic_tokens, ProjectedTokenPolicy};
 use crate::qwen::vision::{VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic};
 use crate::qwen::vl::InputPart;
@@ -30,8 +30,14 @@ use super::{Block, ConditionalLocalGeometry, ForwardMode, ParsedHybridConfig, Pr
 pub const VISION_EXECUTION_GROUP: &str = "vision";
 
 enum PreparedPart<T> {
-    Text { tokens: T, embeddings: T },
-    Media { tokens: T },
+    Text {
+        tokens: T,
+        embeddings: T,
+        ready: bool,
+    },
+    Media {
+        tokens: T,
+    },
 }
 
 /// Pinned hybrid text and shared-vision modules.
@@ -39,7 +45,7 @@ enum PreparedPart<T> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct ConditionalStaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Hybrid token embedding, final normalization, and vocabulary head.
-    pub text: crate::decoder::StaticModules<B>,
+    pub text: PartitionStaticModules<B>,
     /// Shared Qwen patch, position, and merger modules.
     pub vision: VisionStatic<B>,
     /// Canonical fusion and normalization shared by all prediction depths.
@@ -542,10 +548,12 @@ where
         let vision_sequence = *group_sequences.first().ok_or_else(|| {
             Error::backend("conditional Qwen boundary has no vision sequence geometry")
         })?;
-        // Active media carries compact DeepStack features at the projected-media
-        // extent. Text-only execution initializes the same roles from the full
-        // decoder embedding, and the inactive vision group has zero extent.
-        let deepstack_sequence = if vision_sequence > 0 {
+        // Vision edges carry compact media features. Decoder continuations
+        // carry contributions expanded to the declared decoder extent; receiving
+        // owners do not need the original visual mask or input embeddings.
+        let deepstack_sequence = if decoder_continuation {
+            source_sequence
+        } else if vision_sequence > 0 {
             vision_sequence
         } else {
             source_sequence
@@ -771,6 +779,23 @@ pub struct ConditionalPipelineBoundarySchema {
 }
 
 impl ConditionalPipelineBoundarySchema {
+    /// Declares the target/DeepStack boundary without constructing native resources.
+    pub fn for_config(parsed: &ParsedHybridConfig) -> Result<Self, Error> {
+        let vision = parsed
+            .vision
+            .as_ref()
+            .ok_or_else(|| Error::backend("conditional Qwen requires vision config"))?;
+        vision
+            .validate_for(VisionMode::WindowScheduled)
+            .map_err(Error::backend)?;
+        let schema = Self {
+            hidden_size: parsed.text.hidden_size,
+            deepstack_count: vision.deepstack_layer_count(),
+        };
+        eredu_runtime::ArchitectureBoundary::wire_schema(&schema).map_err(Error::backend_source)?;
+        Ok(schema)
+    }
+
     /// Returns the expected number of transported DeepStack tensors.
     pub const fn deepstack_count(self) -> usize {
         self.deepstack_count
@@ -892,6 +917,8 @@ pub struct ConditionalLayeredModel<B: GroupedNeuralBackend + eredu_nn::Distribut
     static_modules: ConditionalStaticModules<B>,
     target_layers: usize,
     prediction_steps: usize,
+    owned_units: Option<std::collections::BTreeSet<(usize, usize)>>,
+    owns_input: bool,
     parallel_geometry: Option<std::sync::Arc<ConditionalLocalGeometry>>,
     partition_state_layout: Option<StateLayout>,
     partition_state_offset: usize,
@@ -965,13 +992,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         if let Some(shared) = &self.static_modules.prediction {
             visitor.visit("mtp", shared)?;
         }
-        visitor.visit("vision", &self.static_modules.vision)?;
-        visitor.visit("embedding", &self.static_modules.text.embeddings)?;
-        visitor.visit("norm", &self.static_modules.text.boundary.norm)?;
-        if let Some(head) = &self.static_modules.text.lm_head {
-            visitor.visit("output", head)?;
+        if self.static_modules.vision.has_parameters() {
+            visitor.visit("vision", &self.static_modules.vision)?;
         }
-        Ok(())
+        self.static_modules.text.decoder_resources().visit(visitor)
     }
 
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
@@ -981,13 +1005,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         if let Some(shared) = &mut self.static_modules.prediction {
             visitor.visit_mut("mtp", shared)?;
         }
-        visitor.visit_mut("vision", &mut self.static_modules.vision)?;
-        visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.text.boundary.norm)?;
-        if let Some(head) = &mut self.static_modules.text.lm_head {
-            visitor.visit_mut("output", head)?;
+        if self.static_modules.vision.has_parameters() {
+            visitor.visit_mut("vision", &mut self.static_modules.vision)?;
         }
-        Ok(())
+        self.static_modules
+            .text
+            .decoder_resources_mut()
+            .visit(visitor)
     }
 }
 
@@ -1180,15 +1204,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
 
     /// Returns the family-owned activation schema transported between stages.
     pub fn pipeline_boundary_schema(&self) -> ConditionalPipelineBoundarySchema {
-        ConditionalPipelineBoundarySchema {
-            hidden_size: self.parsed.text.hidden_size,
-            deepstack_count: self
-                .parsed
-                .vision
-                .as_ref()
-                .expect("validated vision")
-                .deepstack_layer_count(),
-        }
+        ConditionalPipelineBoundarySchema::for_config(&self.parsed)
+            .expect("validated conditional definition")
     }
 
     /// Builds the exact configured vision/text/MTP graph.
@@ -1196,40 +1213,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         parsed: ParsedHybridConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "Qwen hybrid conditional",
-            crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
-        )?;
-        let vision = parsed
-            .vision
-            .clone()
-            .ok_or_else(|| Error::backend("conditional Qwen3.5 requires vision config"))?;
-        vision
-            .validate_for(VisionMode::WindowScheduled)
-            .map_err(Error::backend)?;
         let definition = super::conditional_component_definition(&parsed, None)?;
-        let target_layers = definition.unit_count(1)?;
-        let prediction_steps = definition.prediction_groups().len();
-        let text =
-            StaticModules::from_spec(super::model::static_module_spec(&parsed.text), context)?;
-        let prediction = (prediction_steps > 0)
-            .then(|| super::PredictionShared::new(&parsed.text, context))
-            .transpose()?;
-        Ok(Self {
-            parsed,
-            definition,
-            static_modules: ConditionalStaticModules {
-                text,
-                prediction,
-                vision: VisionStatic::new_with_root(vision, "model.visual", context)?,
-            },
-            target_layers,
-            prediction_steps,
-            parallel_geometry: None,
-            partition_state_layout: None,
-            partition_state_offset: 0,
-            expert_realization: None,
-        })
+        Self::materialize(parsed, definition, None, None, context)
     }
 
     /// Applies the architecture-owned tensor-parallel token embedding boundary.
@@ -1265,58 +1250,185 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         geometry: ConditionalLocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = super::conditional_component_definition(&parsed, Some(&geometry))?;
+        Self::materialize(parsed, definition, Some(geometry), None, context)
+    }
+
+    /// Materializes exactly the pinned roots and unit factories owned by an authoritative partition.
+    pub fn from_partition(
+        parsed: ParsedHybridConfig,
+        geometry: ConditionalLocalGeometry,
+        partition: &eredu_runtime::ArchitecturePartition<
+            super::ConditionalPartitionLocalGeometry,
+            ConditionalPipelineBoundarySchema,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let definition = super::conditional_component_definition(&parsed, Some(&geometry))?;
+        super::ConditionalPartitionLocalFoundation::from_partition(&parsed, partition)
+            .map_err(Error::backend_source)?;
+        partition
+            .local_geometry()
+            .validate_complete_geometry(&parsed, &geometry)
+            .map_err(Error::backend_source)?;
+        if partition.graph() != definition.parameters().graph()
+            || partition.unit_layout() != definition.parameters().unit_layout()
+            || partition.parameter_bindings() != definition.parameters().select_owned(partition)
+        {
+            return Err(Error::backend(
+                "conditional Qwen partition parameter ownership differs from its definition",
+            ));
+        }
+        let expected = definition
+            .state_partition_plan()
+            .resolve_partition(
+                definition.state_layout(),
+                definition.parameters().unit_layout(),
+                |group| {
+                    partition
+                        .groups()
+                        .iter()
+                        .find(|owned| owned.group_index() == group)
+                        .map(|owned| owned.global_units())
+                },
+                partition.ownership().owns_output(),
+            )
+            .map_err(Error::backend_source)?;
+        if partition.state() != expected.as_ref() {
+            return Err(Error::backend(
+                "conditional Qwen partition state differs from its definition",
+            ));
+        }
+        Self::materialize(parsed, definition, Some(geometry), Some(partition), context)
+    }
+
+    fn materialize(
+        parsed: ParsedHybridConfig,
+        definition: eredu_runtime::ComponentDefinition,
+        geometry: Option<ConditionalLocalGeometry>,
+        partition: Option<
+            &eredu_runtime::ArchitecturePartition<
+                super::ConditionalPartitionLocalGeometry,
+                ConditionalPipelineBoundarySchema,
+            >,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid conditional",
             crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
         )?;
-        geometry.validate_for(&parsed).map_err(Error::backend)?;
-        let vision_config = parsed
-            .vision
-            .clone()
-            .ok_or_else(|| Error::backend("conditional Qwen3.5 requires vision config"))?;
-        vision_config
-            .validate_for(VisionMode::WindowScheduled)
-            .map_err(Error::backend)?;
-        let definition = super::conditional_component_definition(&parsed, Some(&geometry))?;
-        crate::operator_requirements::require::<B>(
-            "Qwen hybrid tensor parallelism",
-            eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
-        )?;
+        if geometry.is_some() {
+            crate::operator_requirements::require::<B>(
+                "Qwen hybrid tensor parallelism",
+                eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+            )?;
+        }
+        let stores = |role: &str| {
+            partition.is_none_or(|partition| {
+                partition
+                    .parameter_bindings()
+                    .iter()
+                    .any(|group| group.owner().accepts_static_role(role))
+            })
+        };
         let target_layers = definition.unit_count(1)?;
         let prediction_steps = definition.prediction_groups().len();
-        let text = StaticModules::from_parallel_spec(
-            super::model::static_module_spec(&parsed.text),
-            geometry.text().embedding_range().clone(),
-            geometry.text().output_range().cloned(),
-            context,
-        )?;
+        let (embedding, head, normalization) =
+            super::model::static_module_spec(&parsed.text).construction_specs()?;
+        let norm = stores("norm")
+            .then(|| {
+                crate::decoder::NormalizedBoundary::<B>::new(normalization, context)
+                    .map(|boundary| boundary.norm)
+            })
+            .transpose()?;
+        let embeddings = stores("embedding")
+            .then(|| match &geometry {
+                Some(geometry) => B::vocabulary_parallel_embedding(
+                    embedding,
+                    geometry.text().embedding_range().clone(),
+                    context,
+                ),
+                None => B::embedding(embedding, context),
+            })
+            .transpose()?;
+        let lm_head = if stores("output") {
+            head.map(|spec| match &geometry {
+                Some(geometry) => B::vocabulary_parallel_linear(
+                    spec,
+                    geometry.text().output_range().cloned().ok_or_else(|| {
+                        Error::backend("conditional Qwen output owner has no vocabulary range")
+                    })?,
+                    context,
+                ),
+                None => B::linear(spec, context),
+            })
+            .transpose()?
+        } else {
+            None
+        };
         let prediction = (prediction_steps > 0)
             .then(|| super::PredictionShared::new(&parsed.text, context))
             .transpose()?;
+        let vision = parsed
+            .vision
+            .as_ref()
+            .expect("validated conditional vision")
+            .clone();
+        let selection = match partition {
+            Some(partition) => crate::qwen::vision::VisionStaticSelection::from_parameter_bindings(
+                vision,
+                "model.visual",
+                eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP)
+                    .map_err(Error::backend)?,
+                "vision",
+                partition.parameter_bindings(),
+            ),
+            None => crate::qwen::vision::VisionStaticSelection::all(vision, "model.visual"),
+        }
+        .map_err(Error::backend_source)?;
+        let complete_widths;
+        let widths = match &geometry {
+            Some(geometry) => geometry.merger_widths(),
+            None => {
+                complete_widths = selection
+                    .unsharded_merger_intermediates()
+                    .map_err(Error::backend_source)?;
+                &complete_widths
+            }
+        };
+        let vision = VisionStatic::from_selection(selection, widths, context)?;
+        let selected_state = partition.and_then(|partition| partition.state());
         Ok(Self {
             parsed,
             definition,
             static_modules: ConditionalStaticModules {
-                text,
+                text: PartitionStaticModules {
+                    embeddings,
+                    norm,
+                    lm_head,
+                },
+                vision,
                 prediction,
-                vision: VisionStatic::new_parallel_with_root(
-                    vision_config,
-                    "model.visual",
-                    geometry.merger_widths(),
-                    context,
-                )?,
             },
             target_layers,
             prediction_steps,
-            parallel_geometry: Some(std::sync::Arc::new(geometry)),
-            partition_state_layout: None,
-            partition_state_offset: 0,
+            owned_units: partition.map(|partition| {
+                partition
+                    .units()
+                    .map(|unit| (unit.group(), unit.index()))
+                    .collect()
+            }),
+            owns_input: partition.is_none_or(|partition| partition.ownership().owns_input()),
+            parallel_geometry: geometry.map(std::sync::Arc::new),
+            partition_state_layout: selected_state.map(|state| state.layout().clone()),
+            partition_state_offset: selected_state.map_or(0, |state| state.global_layer_offset()),
             expert_realization: None,
         })
     }
 
-    /// Restricts execution state to the exact PP-owned target slice while
-    /// retaining the complete TP-local unit construction geometry.
+    /// Restricts a low-level state view independently of parameter ownership.
+    /// Retained parameter ownership is independent of this state view.
     pub fn with_partition_state_layout(
         mut self,
         global_offset: usize,
@@ -1388,6 +1500,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalUnit<B>, Error> {
         self.definition.unit(group, index)?;
+        if self
+            .owned_units
+            .as_ref()
+            .is_some_and(|owned| !owned.contains(&(group, index)))
+        {
+            return Err(Error::backend(
+                "conditional Qwen unit is not owned by the selected partition",
+            ));
+        }
         match group {
             0 => {
                 let vision = self.parsed.vision.as_ref().expect("validated vision");
@@ -1516,13 +1637,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
                 }
                 let (vision_initial, vision_state) = match pixels {
                     Some(pixels) => {
-                        let (hidden, state) = self.static_modules.vision.begin(
-                            VisionInput {
-                                pixels,
-                                grid: &grids,
-                            },
-                            context,
-                        )?;
+                        let (hidden, state) =
+                            self.prepare_vision_request(pixels, &grids, context)?;
                         (Some(hidden), Some(state))
                     }
                     None => (None, None),
@@ -1545,13 +1661,27 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
                     Ok(value) => (Some(value.token_ids), Some(value.embeddings), None),
                     Err(error) => (None, None, Some(error)),
                 };
-                let hidden = vision_initial
+                let hidden = match vision_initial
                     .as_ref()
                     .cloned()
                     .or_else(|| embedded.clone())
-                    .ok_or_else(|| {
-                        error.unwrap_or_else(|| Error::backend("empty conditional input"))
-                    })?;
+                {
+                    Some(hidden) => hidden,
+                    None if !self.owns_input => B::Tensor::full_f32(
+                        0.0,
+                        &[
+                            hidden_token_placeholder(&prepared).dim(0),
+                            sequence,
+                            self.parsed.text.hidden_size,
+                        ],
+                        context,
+                    )?,
+                    None => {
+                        return Err(
+                            error.unwrap_or_else(|| Error::backend("empty conditional input"))
+                        )
+                    }
+                };
                 let embedded = embedded.unwrap_or_else(|| hidden_embedding_placeholder(&prepared));
                 let deepstack = (0..self
                     .parsed
@@ -1588,16 +1718,51 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        let embedding = self
+            .static_modules
+            .text
+            .embeddings
+            .as_mut()
+            .ok_or_else(|| {
+                Error::backend("conditional Qwen does not own token embedding parameters")
+            })?;
         match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules.text.embeddings,
+                embedding,
                 tokens,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             ),
-            None => self.static_modules.text.embeddings.forward(tokens, context),
+            None => embedding.forward(tokens, context),
         }
+    }
+
+    fn prepare_vision_request(
+        &mut self,
+        pixels: &B::Tensor,
+        grids: &[(i32, i32, i32)],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
+        if self.static_modules.vision.owns_ingress() {
+            return self.static_modules.vision.begin(
+                VisionInput {
+                    pixels,
+                    grid: grids,
+                },
+                context,
+            );
+        }
+        let config = self.parsed.vision.as_ref().expect("validated vision");
+        eredu_nn::sequence_layout::validate_patch_grid(
+            grids,
+            config.spatial_merge_size,
+            Some(pixels.dim(0)),
+        )
+        .map_err(Error::backend)?;
+        let state = self.static_modules.vision.prepare_state(grids, context)?;
+        let hidden = B::Tensor::full_f32(0.0, &[pixels.dim(0), config.hidden_size], context)?;
+        Ok((hidden, state))
     }
 
     fn prepare_parts(
@@ -1615,7 +1780,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             .map(|part| match part {
                 InputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
-                    embeddings: self.lookup_tokens(tokens, parallel, context)?,
+                    embeddings: if self.owns_input {
+                        self.lookup_tokens(tokens, parallel, context)?
+                    } else {
+                        B::Tensor::full_f32(
+                            0.0,
+                            &[tokens.dim(0), tokens.dim(1), self.parsed.text.hidden_size],
+                            context,
+                        )?
+                    },
+                    ready: self.owns_input,
                 }),
                 InputPart::Projected { tokens, embeddings } => {
                     if embeddings.shape()
@@ -1628,6 +1802,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
                     Ok(PreparedPart::Text {
                         tokens: (*tokens).clone(),
                         embeddings: (*embeddings).clone(),
+                        ready: true,
                     })
                 }
                 InputPart::Image { tokens, grid } | InputPart::Video { tokens, grid } => {
@@ -1670,8 +1845,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         for part in parts {
             match part {
                 PreparedPart::Text {
-                    embeddings: value, ..
-                } => embeddings.push(value.clone()),
+                    embeddings: value,
+                    ready,
+                    ..
+                } => {
+                    if !ready {
+                        return Err(Error::backend(
+                            "conditional Qwen text embeddings await their input owner",
+                        ));
+                    }
+                    embeddings.push(value.clone());
+                }
                 PreparedPart::Media { tokens } => {
                     let length = tokens.dim(1);
                     embeddings.push(vision.expect("validated vision output").index(
@@ -1772,13 +1956,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         }
         let (vision_initial, vision) = match pixels {
             Some(pixels) => {
-                let (hidden, state) = self.static_modules.vision.begin(
-                    VisionInput {
-                        pixels,
-                        grid: &grids,
-                    },
-                    context,
-                )?;
+                let (hidden, state) = self.prepare_vision_request(pixels, &grids, context)?;
                 (Some(hidden), Some(state))
             }
             None => (None, None),
@@ -1822,7 +2000,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         values.extend(state.mask.iter().cloned());
         for part in &state.parts {
             match part {
-                PreparedPart::Text { tokens, embeddings } => {
+                PreparedPart::Text {
+                    tokens, embeddings, ..
+                } => {
                     values.extend([tokens.clone(), embeddings.clone()]);
                 }
                 PreparedPart::Media { tokens } => values.push(tokens.clone()),
@@ -1853,7 +2033,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         }
         for part in &mut state.parts {
             match part {
-                PreparedPart::Text { tokens, embeddings } => {
+                PreparedPart::Text {
+                    tokens,
+                    embeddings,
+                    ready,
+                } => {
+                    *ready = true;
                     *tokens = values.next().expect("validated tokens");
                     *embeddings = values.next().expect("validated embeddings");
                 }
@@ -2075,6 +2260,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         )
     }
 
+    fn deepstack_contribution(
+        hidden: &B::Tensor,
+        features: &B::Tensor,
+        visual_mask: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if features.shape() == hidden.shape() {
+            return Ok(features.clone());
+        }
+        let mask = visual_mask.ok_or_else(|| Error::backend("missing conditional visual mask"))?;
+        let source = features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
+        hidden
+            .zeros_like(context)?
+            .masked_scatter(mask, &source, context)
+    }
+
     /// Adds the exact prepared vision contribution at its target-layer boundary.
     /// The disabled path uses the same borrowed feature value as ordinary execution.
     fn add_deepstack(
@@ -2090,26 +2291,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             return Ok(output);
         };
         instrumentation.observe("deepstack.input", &output)?;
-        let output = if features.shape() == output.shape() {
-            if instrumentation.enabled() {
-                let contribution = instrumentation.apply("deepstack.output", features.clone())?;
-                output.add(&contribution, context)?
-            } else {
-                output.add(features, context)?
-            }
-        } else {
-            let source = features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
-            let contribution = output.zeros_like(context)?.masked_scatter(
-                forward
-                    .visual_mask
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("missing conditional visual mask"))?,
-                &source,
-                context,
-            )?;
-            let contribution = instrumentation.apply("deepstack.output", contribution)?;
-            output.add(&contribution, context)?
-        };
+        let contribution =
+            Self::deepstack_contribution(&output, features, forward.visual_mask.as_ref(), context)?;
+        let contribution = instrumentation.apply("deepstack.output", contribution)?;
+        let output = output.add(&contribution, context)?;
         instrumentation.apply("deepstack.residual", output)
     }
 
@@ -2463,6 +2648,14 @@ where
         _index: usize,
     ) -> Self::RetainedContextValues<'a> {
         let mut values = vec![&forward.tokens, &forward.embedded];
+        for part in &forward.parts {
+            match part {
+                PreparedPart::Text {
+                    tokens, embeddings, ..
+                } => values.extend([tokens, embeddings]),
+                PreparedPart::Media { tokens } => values.push(tokens),
+            }
+        }
         values.extend(forward.mask.iter());
         values.extend(forward.vision_initial.iter());
         values.extend(forward.vision_output.iter());
@@ -2760,7 +2953,18 @@ where
             Ok(LayeredPartitionOutput::Boundary {
                 hidden: hidden.clone(),
                 auxiliary: ConditionalPipelineBoundary {
-                    deepstack: forward.deepstack.clone(),
+                    deepstack: forward
+                        .deepstack
+                        .iter()
+                        .map(|features| {
+                            Self::deepstack_contribution(
+                                hidden,
+                                features,
+                                forward.visual_mask.as_ref(),
+                                context,
+                            )
+                        })
+                        .collect::<Result<_, _>>()?,
                 },
             })
         }

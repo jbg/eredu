@@ -299,6 +299,43 @@ impl ConditionalPartitionLocalGeometry {
         &self.static_roles
     }
 
+    pub(super) fn validate_complete_geometry(
+        &self,
+        parsed: &ParsedHybridConfig,
+        complete: &ConditionalLocalGeometry,
+    ) -> Result<(), ParallelPlanError> {
+        self.validate_for(parsed)?;
+        complete.validate_for(parsed)?;
+        if self.complete_state_layout != *complete.state_layout()
+            || self.embedding_range != *complete.text().embedding_range()
+            || self.output_range.as_ref() != complete.text().output_range()
+            || self.merger_widths != complete.merger_widths()
+            || self
+                .vision_units
+                .clone()
+                .into_iter()
+                .flatten()
+                .any(|index| self.vision_block(index) != complete.vision_block(index))
+        {
+            return Err(invalid(
+                "conditional Qwen selected geometry differs from complete local geometry",
+            ));
+        }
+        for index in self.target_units.clone() {
+            let selected = self.target(index).expect("validated target unit");
+            let global = complete
+                .text()
+                .target(index)
+                .expect("validated complete unit");
+            if super::parameters::unit_parameter_geometry(selected, 0, index)?
+                != super::parameters::unit_parameter_geometry(global, 0, index)?
+            {
+                return Err(invalid(format!("conditional Qwen selected unit {index} parameter geometry differs from complete local geometry")));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_for(&self, parsed: &ParsedHybridConfig) -> Result<(), ParallelPlanError> {
         require_prediction_free_conditional(parsed)?;
         let target_count = usize::try_from(parsed.text.num_hidden_layers)

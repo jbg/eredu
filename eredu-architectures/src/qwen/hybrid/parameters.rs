@@ -410,11 +410,23 @@ pub fn unit_parallel_parameter_groups(
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     config.validate().map_err(invalid)?;
+    let (groups, formats) = unit_parameter_geometry(config, group, index)?;
+    eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
+        Ok(formats.get(member.target()).cloned())
+    })
+}
+
+/// Logical matrices and formats from the actual rank-local construction specs.
+/// Encoding/placement expansion remains checkpoint-global; local geometry is not
+/// reinterpreted as a new global sharding plan.
+pub(super) fn unit_parameter_geometry(
+    config: &HybridConfig,
+    group: usize,
+    index: usize,
+) -> Result<(Vec<ParameterGroupSpec>, BTreeMap<String, LinearFormatSpec>), ParallelPlanError> {
     let mut declaration = Declaration::default();
     let groups = declaration.unit(config, group, index)?;
-    eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
-        Ok(declaration.formats.get(member.target()).cloned())
-    })
+    Ok((groups, declaration.formats))
 }
 
 /// Validates target and prediction invocation, storage, transport and state projections.

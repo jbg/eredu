@@ -8663,8 +8663,29 @@ retained vocabulary mechanism; media validation, masks, projected-input checks,
 DeepStack placeholders and request roots share the same preparation. Pipeline
 vision ingress consumes the same typed part preparation. Text state lookup uses
 the declaration's invocation mapping and rejects slots outside selected pipeline
-ownership. Consuming state selection validates the exact declared slice and global
-offset, accepts an identical retained selection, and rejects an incompatible one.
+ownership. Low-level state-view restriction validates the exact declared slice
+and global offset independently of retained parameters; identical selection is
+valid and an incompatible retained selection fails.
+
+Conditional target and external-prediction partition construction consume a cold
+`ArchitecturePartition` before native allocation. One materializer builds complete
+or selected resources from the retained definition and canonical bindings. Selected
+text roots contain only the physical embedding, normalization and output owners;
+tied output keeps its declared embedding replica. Vision retains only selected
+ingress and merger resources. Unit construction rejects unowned global addresses,
+and selected local geometry, state, boundary and parameter ownership are validated
+against the same definition.
+
+Receiving conditional ranks retain declared request placeholders and parameter-free
+vision continuation geometry without evaluating unowned token or patch parameters.
+Text products track whether input-owner computation or transported values make them
+available; assembly rejects an unresolved product. Completion roots retain every
+prepared part's token and embedding tensors as well as assembled and transported
+products. Vision edges carry compact DeepStack features. Decoder continuation
+boundaries carry contributions expanded to the complete decoder sequence,
+matching their wire schema and removing the
+receiver's need for the original visual mask. Expansion and target-unit addition
+use the same contribution equation and preserve observation attribution.
 Conditional Qwen retains its vision/text driver and media assembly.
 
 Complete and selected Nemotron-H target readout uses one `TargetReadout`

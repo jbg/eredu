@@ -243,6 +243,12 @@ impl VisionStaticSelection {
         })
     }
 
+    /// Complete-model merger widths from the same checked native construction geometry.
+    pub fn unsharded_merger_intermediates(&self) -> Result<Vec<i32>, ParallelPlanError> {
+        let (_, width, _) = super::specs::merger_geometry(&self.config, false).map_err(invalid)?;
+        Ok(vec![width; self.config.deepstack_layer_count() + 1])
+    }
+
     /// Resolves complete native resources from selected canonical parameter groups.
     /// Encoded companions and normalization/projection groups remain indivisible.
     pub fn from_parameter_bindings(

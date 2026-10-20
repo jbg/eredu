@@ -512,9 +512,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parameter_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let (_, width, _) = super::specs::merger_geometry(&config, false)?;
-        let intermediates = vec![width; config.deepstack_layer_count() + 1];
-        Self::new_parallel_with_root(config, parameter_root, &intermediates, context)
+        let selection =
+            super::VisionStaticSelection::all(config, parameter_root).map_err(Error::backend)?;
+        let intermediates = selection
+            .unsharded_merger_intermediates()
+            .map_err(Error::backend)?;
+        Self::from_selection(selection, &intermediates, context)
     }
 
     /// Builds pinned modules with rank-local merger intermediate widths.
@@ -592,6 +595,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             deepstack_mergers,
             config,
         })
+    }
+
+    /// Whether this rank owns the complete patch and position ingress equation.
+    pub fn owns_ingress(&self) -> bool {
+        self.patch.is_some() && self.position.is_some()
     }
 
     /// Whether this rank physically retains any pinned vision parameter.

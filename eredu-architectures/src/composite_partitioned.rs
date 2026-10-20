@@ -2482,12 +2482,6 @@ where
             } else {
                 None
             };
-            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_parallel(
-                args.clone(),
-                local,
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let geometry = match &realization {
                 Some(_) => crate::qwen::hybrid::routed_conditional_partition_local_geometry(
                     &args,
@@ -2507,17 +2501,36 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = geometry
-                .local_state_layout()
+            let definition =
+                crate::qwen::hybrid::conditional_component_definition(&args, Some(&local))
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let boundary = crate::qwen::hybrid::ConditionalPipelineBoundarySchema::for_config(
+                &args,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = ArchitecturePartition::from_description(
+                definition.parameters(),
+                group_ranges
+                    .iter()
+                    .map(|(group, units)| (group.as_str(), units.clone())),
+                ownership.clone(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
+                geometry.clone(),
+                boundary,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let mut architecture =
+                crate::qwen::hybrid::ConditionalLayeredModel::<B>::from_partition(
+                    args.clone(),
+                    local,
+                    &partition,
+                    context,
+                )
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
-                })
-                .and_then(|layout| {
-                    architecture
-                        .with_partition_state_layout(geometry.target_units().start, layout)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })
                 })?;
             if let Some(plan) = &realization {
                 architecture.install_expert_realization(plan.clone());
@@ -3375,12 +3388,6 @@ where
             } else {
                 None
             };
-            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_parallel(
-                args.clone(),
-                local,
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let geometry = match &realization {
                 Some(_) => crate::qwen::hybrid::routed_conditional_partition_local_geometry(
                     &args,
@@ -3400,17 +3407,36 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = geometry
-                .local_state_layout()
+            let definition =
+                crate::qwen::hybrid::conditional_component_definition(&args, Some(&local))
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let boundary = crate::qwen::hybrid::ConditionalPipelineBoundarySchema::for_config(
+                &args,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = ArchitecturePartition::from_description(
+                definition.parameters(),
+                group_ranges
+                    .iter()
+                    .map(|(group, units)| (group.as_str(), units.clone())),
+                ownership.clone(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
+                geometry.clone(),
+                boundary,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let mut architecture =
+                crate::qwen::hybrid::ConditionalLayeredModel::<B>::from_partition(
+                    args.clone(),
+                    local,
+                    &partition,
+                    context,
+                )
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
-                })
-                .and_then(|state| {
-                    architecture
-                        .with_partition_state_layout(geometry.target_units().start, state)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })
                 })?;
             if let Some(plan) = &realization {
                 architecture.install_expert_realization(plan.clone());
