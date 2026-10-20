@@ -739,6 +739,55 @@ pub fn packed_gated_product_logical_group(
     )
 }
 
+/// Declares logical matrices and biases for a packed ReLU-squared bank.
+/// Encoding companions are expanded before placement by
+/// `expand_linear_format_parameter_groups`.
+pub fn packed_relu2_logical_group(
+    logical_name: impl Into<String>,
+    spec: &eredu_nn::GroupedRelu2Spec,
+    preferred_units: usize,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    spec.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let groups = spec.group_count() as usize;
+    let hidden = spec.hidden_dimensions() as usize;
+    let intermediate = spec.intermediate_dimensions() as usize;
+    let mut members = Vec::new();
+    for (projection, output, input, axis) in [
+        (spec.up(), intermediate, hidden, 1),
+        (spec.down(), hidden, intermediate, 2),
+    ] {
+        members.push(
+            ParameterMemberSpec::new(
+                projection.weight().id.as_str(),
+                vec![groups, output, input],
+                MemberSharding::Partitioned { axis },
+            )
+            .with_parameter_metadata(&ParameterMetadata::from_spec(projection.weight(), true)),
+        );
+        if let Some(bias) = projection.bias() {
+            members.push(
+                ParameterMemberSpec::new(
+                    bias.id.as_str(),
+                    vec![groups, output],
+                    if axis == 1 {
+                        MemberSharding::Partitioned { axis: 1 }
+                    } else {
+                        MemberSharding::Replicated
+                    },
+                )
+                .with_parameter_metadata(&ParameterMetadata::from_spec(bias, true)),
+            );
+        }
+    }
+    ParameterGroupSpec::partitioned(
+        logical_name,
+        ParameterRole::ExpertIntermediate,
+        preferred_units,
+        members,
+    )
+}
+
 /// Describes one affine projection and all encoding companions.
 pub fn projection_parameter_group<T, M>(
     logical_name: impl Into<String>,

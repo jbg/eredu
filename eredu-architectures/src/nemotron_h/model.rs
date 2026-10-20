@@ -5,17 +5,15 @@ use eredu_nn::{
     NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    ParameterProvider, PartitionedLayeredArchitecture, RoutedLayeredArchitecture,
-    RuntimeStateComponents, StateLayout,
+    ArchitectureParameterDescription, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
+    LayeredPartitionInput, LayeredPartitionOutput, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
+    RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
 use super::{
-    state_layout, static_parallel_parameter_groups, unit_parallel_parameter_groups, Block,
-    EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator, PredictionUnit, RetainedValues,
-    TargetReadout,
+    state_layout, Block, EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator,
+    PredictionUnit, RetainedValues, TargetReadout,
 };
 use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
 
@@ -369,9 +367,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        super::parameter_description(&self.args).map_err(Error::backend)
     }
 
     fn static_parameter_recipes(
@@ -520,71 +518,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         self.groups.prediction_count()
     }
 
-    /// Describes target and patterned prediction parameters with explicit
-    /// canonical execution-unit ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = self.groups.execution_graph()?;
-        let counts = std::iter::once(self.target_units)
-            .chain(std::iter::repeat_n(
-                self.prediction_pattern,
-                self.prediction_steps,
-            ))
-            .collect::<Vec<_>>();
-        let layout = ExecutionUnitLayout::new(&graph, counts.clone()).map_err(Error::backend)?;
-        let static_groups =
-            static_parallel_parameter_groups(&self.static_modules).map_err(Error::backend)?;
-        let mut expected = static_groups.clone();
-        let mut owned = static_groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                OwnedParameterGroupSpec::new(
-                    if index == 0 {
-                        let mut roles = vec!["embedding", "mtp"];
-                        if self.args.tie_word_embeddings {
-                            roles.push("output");
-                        }
-                        ParameterGroupOwner::static_any_of(roles)
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
-                    group,
-                )
-            })
-            .collect::<Vec<_>>();
-        for (group_index, &count) in counts.iter().enumerate() {
-            let owner_group = layout
-                .group_id(group_index)
-                .expect("Nemotron-H layout group")
-                .clone();
-            for index in 0..count {
-                let unit = self.construct_unit(group_index, index, context)?;
-                let flat = if group_index == 0 {
-                    index
-                } else {
-                    self.target_units + (group_index - 1) * self.prediction_pattern + index
-                };
-                let groups = unit_parallel_parameter_groups(&unit, &self.args, flat)
-                    .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
-    }
     /// Borrows pinned static modules.
     pub const fn static_modules(&self) -> &StaticModules<B> {
         &self.static_modules

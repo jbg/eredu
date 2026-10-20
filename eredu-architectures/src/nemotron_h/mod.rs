@@ -9,7 +9,9 @@ pub mod mlp;
 pub mod model;
 pub mod mtp;
 pub mod parallel;
+mod parameters;
 mod partitioned;
+pub use parameters::parameter_description;
 
 pub use attention::{new_attention, new_attention_at};
 pub use block::{Block, Operator};

@@ -8576,6 +8576,18 @@ geometry independently of the state profile. These hooks do not grant prediction
 execution support; explicit family preparation and target contracts admit that
 operation. Captured roots remain in the ordinary forward-retention lifecycle.
 
+Nemotron-H declares canonical target and patterned prediction parameter topology
+from normalized configuration before native materialization. Mamba projections
+retain their five input and three convolution segments, per-head scalars and
+grouped normalization scale. Attention, dense and routed/shared expert declarations
+retain their semantic partition units. Prediction depths own group-relative units
+with flattened checkpoint paths, first-unit embedding/hidden norms and fusion,
+and last-unit normalization. Static embedding ownership includes the prediction
+role and tied output consumers. The shared runtime expands declared linear
+formats and packed ReLU-squared bank geometry into exact physical companions;
+family code retains checkpoint identities and format policy. Full metadata and
+selected/source preparation consume the same cold declaration.
+
 Nemotron-H derives expert ownership and rank-local ReLU-squared bank
 specifications from normalized `ModelArgs`, optional validated `LocalGeometry`
 and neutral rank topology. Target units and repeated prediction patterns retain

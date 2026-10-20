@@ -9858,15 +9858,8 @@ where
             "resident Nemotron-H requires a dense prediction-free target schedule".into(),
         ));
     }
-    let description_model =
-        crate::nemotron_h::LayeredModel::<B>::new(selected_args.clone(), context).map_err(
-            |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
-        )?;
-    let parameters = eredu_runtime::ArchitectureParameters::parameter_description(
-        &description_model,
-        context,
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let parameters = crate::nemotron_h::parameter_description(&selected_args)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -9907,17 +9900,10 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = source_args
         .map(|source_args| {
-            let source_model =
-                crate::nemotron_h::LayeredModel::<B>::new(source_args.clone(), context).map_err(
-                    |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
-                )?;
-            let source_parameters = eredu_runtime::ArchitectureParameters::parameter_description(
-                &source_model,
-                context,
-            )
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
+            let source_parameters = crate::nemotron_h::parameter_description(&source_args)
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -11744,15 +11730,8 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: FamilyRoutedPartitionVisitor<B, S, crate::nemotron_h::PartitionedLayeredModel<B>>,
 {
-    let description_model =
-        crate::nemotron_h::LayeredModel::<B>::new(selected_args.clone(), context).map_err(
-            |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
-        )?;
-    let parameters = eredu_runtime::ArchitectureParameters::parameter_description(
-        &description_model,
-        context,
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let parameters = crate::nemotron_h::parameter_description(&selected_args)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -11804,14 +11783,8 @@ where
         )
     }) {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
-        let source_description =
-            crate::nemotron_h::LayeredModel::<B>::new(source_args.clone(), context)
-                .map_err(|e| error(e.to_string()))?;
-        let source_parameters = eredu_runtime::ArchitectureParameters::parameter_description(
-            &source_description,
-            context,
-        )
-        .map_err(|e| error(e.to_string()))?;
+        let source_parameters = crate::nemotron_h::parameter_description(&source_args)
+            .map_err(|e| error(e.to_string()))?;
         validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
