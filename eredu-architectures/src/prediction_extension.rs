@@ -4959,8 +4959,8 @@ where
                 crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), source_context)
                     .and_then(|model| model.parameter_description(source_context))
             } else {
-                crate::qwen::hybrid::LayeredModel::<B>::new(args.text.clone(), source_context)
-                    .and_then(|model| model.parameter_description(source_context))
+                crate::qwen::hybrid::parameter_description(&args.text)
+                    .map_err(eredu_nn::Error::backend)
             }
             .map_err(|error| invalid(error.to_string()))?;
             let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)

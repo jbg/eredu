@@ -16,7 +16,6 @@ use eredu_runtime::{
     RuntimeStateComponents, StateLayout,
 };
 
-use crate::decoder::static_parallel_parameter_groups;
 use crate::qwen::ingress::{prepare_input, prepared_semantic_tokens, ProjectedTokenPolicy};
 use crate::qwen::vision::{
     block_parallel_parameter_groups, VisionBlock, VisionInput, VisionMode, VisionState,
@@ -28,10 +27,7 @@ use crate::{
     media_plan::QwenInputPartPlan,
 };
 
-use super::{
-    unit_parallel_parameter_groups, Block, ConditionalLocalGeometry, ForwardMode,
-    ParsedHybridConfig, PredictionUnit, Unit,
-};
+use super::{Block, ConditionalLocalGeometry, ForwardMode, ParsedHybridConfig, PredictionUnit};
 
 /// Stable execution-group identity for conditional Qwen vision ingress.
 pub const VISION_EXECUTION_GROUP: &str = "vision";
@@ -1242,132 +1238,52 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
         let graph = self.canonical_execution_graph()?;
-        let vision = self.parsed.vision.as_ref().expect("validated vision");
         let layout = self.unit_layout()?;
-        // A partition-local model contains already-local tensor shapes. Keep
-        // parameter authority checkpoint-global so selected TP segments are
-        // validated once instead of being applied again to local modules.
-        let global_static = self.parallel_geometry.is_some().then(|| {
-            Ok::<_, Error>((
-                super::LayeredModel::<B>::new(self.parsed.text.clone(), context)?
-                    .into_static_modules(),
-                VisionStatic::new_with_root(vision.clone(), "model.visual", context)?,
-            ))
-        });
-        let global_static = global_static.transpose()?;
-        let (text_modules, vision_modules) = global_static.as_ref().map_or(
-            (&self.static_modules.text, &self.static_modules.vision),
-            |(text, vision)| (text, vision),
+        let vision = self.parsed.vision.as_ref().expect("validated vision");
+        let text = super::parameter_description(&self.parsed.text).map_err(Error::backend)?;
+        let mut owned = text.groups().to_vec();
+        // Vision metadata retains checkpoint-global shapes on selected ranks.
+        let global_vision = self
+            .parallel_geometry
+            .is_some()
+            .then(|| VisionStatic::<B>::new_with_root(vision.clone(), "model.visual", context))
+            .transpose()?;
+        let vision_modules = global_vision
+            .as_ref()
+            .unwrap_or(&self.static_modules.vision);
+        owned.extend(
+            crate::qwen::vision::owned_static_parallel_parameter_groups::<B>(
+                vision_modules,
+                vision,
+                "model.visual",
+                eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP)
+                    .map_err(Error::backend)?,
+                "vision",
+            )
+            .map_err(Error::backend)?,
         );
-        let text_static = static_parallel_parameter_groups::<B>(
-            &text_modules.embeddings,
-            &text_modules.boundary.norm,
-            text_modules.lm_head.as_ref(),
-            "model",
-        )
-        .map_err(Error::backend)?;
-        let vision_static = crate::qwen::vision::owned_static_parallel_parameter_groups::<B>(
-            vision_modules,
-            vision,
-            "model.visual",
-            eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP).map_err(Error::backend)?,
-            "vision",
-        )
-        .map_err(Error::backend)?;
-        let mut expected = text_static
-            .iter()
-            .cloned()
-            .chain(vision_static.iter().map(|owned| owned.group().clone()))
-            .collect::<Vec<_>>();
-        let mut owned = text_static
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
+        let group_id = layout.group_id(0).expect("declared vision group");
+        for index in 0..vision.layer_count() {
+            let block = VisionBlock::<B>::new_with_root(vision, "model.visual", index, context)?;
+            let groups = block_parallel_parameter_groups(&block, vision, "model.visual", index)
+                .map_err(Error::backend)?;
+            owned.extend(groups.into_iter().map(|group| {
                 OwnedParameterGroupSpec::new(
-                    if index == 0 {
-                        let mut roles = vec!["embedding", "mtp"];
-                        if self.parsed.text.tie_word_embeddings {
-                            roles.push("output");
-                        }
-                        ParameterGroupOwner::static_any_of(roles)
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
+                    ParameterGroupOwner::execution_unit(group_id.clone(), index),
                     group,
                 )
-            })
-            .chain(vision_static)
-            .collect::<Vec<_>>();
-        if let Some(shared) = &self.static_modules.prediction {
-            let groups =
-                super::parallel::prediction_shared_parameter_groups(shared, self.prediction_steps)
-                    .map_err(Error::backend)?;
-            expected.extend(groups.iter().map(|group| group.group().clone()));
-            owned.extend(groups);
+            }));
         }
-        for group_index in 0..layout.group_count() {
-            let group_id = layout
-                .group_id(group_index)
-                .expect("conditional layout group")
-                .clone();
-            let count = layout
-                .group_range(group_index)
-                .expect("conditional layout range")
-                .len();
-            for index in 0..count {
-                let unit = if self.parallel_geometry.is_some() {
-                    match group_index {
-                        0 => ConditionalUnit::Vision(VisionBlock::new_with_root(
-                            vision,
-                            "model.visual",
-                            index,
-                            context,
-                        )?),
-                        1 => {
-                            ConditionalUnit::Target(Block::new(&self.parsed.text, index, context)?)
-                        }
-                        _ => ConditionalUnit::Prediction(PredictionUnit::new(
-                            &self.parsed.text,
-                            group_index - 2,
-                            context,
-                        )?),
-                    }
-                } else {
-                    self.construct_unit(group_index, index, context)?
-                };
-                let groups = match unit {
-                    ConditionalUnit::Vision(block) => {
-                        block_parallel_parameter_groups(&block, vision, "model.visual", index)
-                    }
-                    ConditionalUnit::Target(block) => unit_parallel_parameter_groups(
-                        &Unit::Target(block),
-                        &self.parsed.text,
-                        0,
-                        index,
-                    ),
-                    ConditionalUnit::Prediction(prediction) => unit_parallel_parameter_groups(
-                        &Unit::Prediction(prediction),
-                        &self.parsed.text,
-                        group_index - 1,
-                        index,
-                    ),
-                }
-                .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
+        ArchitectureParameterDescription::new(
+            &graph,
+            &layout,
+            owned
+                .iter()
+                .map(|group| group.group().clone())
+                .collect::<Vec<_>>(),
+            owned,
+        )
+        .map_err(Error::backend)
     }
 
     /// Builds the exact configured vision/text/MTP graph.

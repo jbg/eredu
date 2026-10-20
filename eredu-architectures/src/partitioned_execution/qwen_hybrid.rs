@@ -61,7 +61,8 @@ where
     }
     let selected_args = crate::replicated_text::selected_qwen_hybrid_args(args, selected.base())
         .map_err(architecture)?;
-    let parameters = parameter_description::<B>(&selected_args, context).map_err(architecture)?;
+    let parameters =
+        crate::qwen::hybrid::parameter_description(&selected_args).map_err(architecture)?;
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -105,7 +106,7 @@ where
     }) {
         let source_args = args.clone();
         let source_parameters =
-            parameter_description::<B>(&source_args, context).map_err(architecture)?;
+            crate::qwen::hybrid::parameter_description(&source_args).map_err(architecture)?;
         validate_transform_parameter_space(&source_parameters, &parameters)
             .map_err(architecture)?;
         let source_layout =
@@ -199,17 +200,6 @@ where
     })
 }
 
-fn parameter_description<B>(
-    args: &crate::qwen::hybrid::HybridConfig,
-    context: &<B::Tensor as eredu_nn::Tensor>::Context,
-) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_nn::Error>
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-{
-    let model = crate::qwen::hybrid::LayeredModel::<B>::new(args.clone(), context)?;
-    eredu_runtime::ArchitectureParameters::parameter_description(&model, context)
-}
-
 pub(super) fn prepare_routed<B, S, V>(
     args: &crate::qwen::hybrid::HybridConfig,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
@@ -233,7 +223,8 @@ where
     let selected_args =
         crate::replicated_text::selected_qwen_hybrid_args(args, selected.base().text())
             .map_err(architecture)?;
-    let parameters = parameter_description::<B>(&selected_args, context).map_err(architecture)?;
+    let parameters =
+        crate::qwen::hybrid::parameter_description(&selected_args).map_err(architecture)?;
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -271,7 +262,8 @@ where
                 | eredu_runtime::WeightLoweringKind::DerivedTransform
         )
     }) {
-        let source_parameters = parameter_description::<B>(args, context).map_err(architecture)?;
+        let source_parameters =
+            crate::qwen::hybrid::parameter_description(args).map_err(architecture)?;
         validate_transform_parameter_space(&source_parameters, &parameters)
             .map_err(architecture)?;
         let source_layout =

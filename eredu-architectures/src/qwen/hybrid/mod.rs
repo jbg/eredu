@@ -11,6 +11,7 @@ mod linear_attention;
 mod model;
 mod mtp;
 mod parallel;
+mod parameters;
 mod safetensors;
 pub(crate) mod topology;
 
@@ -59,9 +60,10 @@ pub use mtp::{
 pub(crate) use parallel::routed_conditional_partition_local_geometry;
 pub use parallel::{
     conditional_local_geometry, conditional_partition_local_geometry, local_block_config,
-    local_geometry, local_unit_config, unit_parallel_parameter_groups, ConditionalLocalGeometry,
+    local_geometry, local_unit_config, ConditionalLocalGeometry,
     ConditionalPartitionLocalFoundation, ConditionalPartitionLocalGeometry, LocalGeometry,
 };
+pub use parameters::{parameter_description, unit_parallel_parameter_groups};
 
 /// Derives the complete replicated target/MTP expert plan from normalized geometry.
 pub fn replicated_expert_realization_plan(

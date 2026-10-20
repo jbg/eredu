@@ -8,19 +8,19 @@ use eredu_nn::{
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
     LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, ModelStateIdentity,
-    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ParameterGroupOwner, ParameterProvider, PartitionedLayeredArchitecture, ResidentExpertProvider,
-    RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterProvider,
+    PartitionedLayeredArchitecture, ResidentExpertProvider, RoutedLayeredArchitecture,
+    RuntimeStateComponents, StateLayout,
 };
 
 use crate::{
-    decoder::{static_parallel_parameter_groups, StaticModuleSpec, StaticModules},
+    decoder::{StaticModuleSpec, StaticModules},
     hybrid_decoder::HybridDecoder,
 };
 
 use super::{
-    prompt_cache_architecture_fingerprint, state_layout, unit_parallel_parameter_groups, Block,
-    EmbeddedInput, ForwardMode, HybridConfig, LocalGeometry, PredictionUnit,
+    prompt_cache_architecture_fingerprint, state_layout, Block, EmbeddedInput, ForwardMode,
+    HybridConfig, LocalGeometry, PredictionUnit,
 };
 
 /// One target or configured prediction execution unit.
@@ -334,9 +334,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        if let Some(parameters) = &self.global_parameters {
+            return Ok(parameters.as_ref().clone());
+        }
+        super::parameter_description(&self.config).map_err(Error::backend)
     }
 
     fn static_parameter_recipes(
@@ -561,84 +564,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             .map(|group| self.decoder.group_unit_count(group))
             .collect::<Result<Vec<_>, _>>()?;
         ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)
-    }
-
-    /// Describes target and embedded-prediction parameters without deriving
-    /// ownership from checkpoint-name substrings.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        if let Some(parameters) = &self.global_parameters {
-            return Ok(parameters.as_ref().clone());
-        }
-        if self.parallel_geometry.is_some() {
-            return Self::new(self.config.clone(), context)?.parameter_description_impl(context);
-        }
-        let graph = self.decoder.execution_graph()?;
-        let layout = self.unit_layout()?;
-        let static_groups = static_parallel_parameter_groups::<B>(
-            &self.decoder.static_modules().embeddings,
-            &self.decoder.static_modules().boundary.norm,
-            self.decoder.static_modules().lm_head.as_ref(),
-            "model",
-        )
-        .map_err(Error::backend)?;
-        let mut expected = static_groups.clone();
-        let mut owned = static_groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                OwnedParameterGroupSpec::new(
-                    if index == 0 {
-                        let mut roles = vec!["embedding", "mtp"];
-                        if self.config.tie_word_embeddings {
-                            roles.push("output");
-                        }
-                        ParameterGroupOwner::static_any_of(roles)
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
-                    group,
-                )
-            })
-            .collect::<Vec<_>>();
-        if let Some(shared) = &self.decoder.extended_static_modules().extension {
-            let groups =
-                super::parallel::prediction_shared_parameter_groups(shared, self.prediction_steps)
-                    .map_err(Error::backend)?;
-            expected.extend(groups.iter().map(|group| group.group().clone()));
-            owned.extend(groups);
-        }
-        for group_index in 0..graph.groups().len() {
-            let group_id = layout
-                .group_id(group_index)
-                .expect("hybrid layout contains every graph group")
-                .clone();
-            let count = layout
-                .group_range(group_index)
-                .expect("hybrid layout contains every group range")
-                .len();
-            for index in 0..count {
-                let unit = self.construct_unit(group_index, index, context)?;
-                let groups =
-                    unit_parallel_parameter_groups(&unit, &self.config, group_index, index)
-                        .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
     }
 
     /// Returns the pinned shared prediction modules and base text modules.

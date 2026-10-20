@@ -8597,8 +8597,20 @@ configuration, optional validated local geometry and neutral rank topology.
 Replicated and partition planning use the same derivation for target and MTP bank
 identities. Conditional planning validates the vision policy and its text-local
 geometry without a backend model, then supplies the retained expert plan before
-rank-local executable construction. Native metadata discovery for Qwen hybrid
-parameters remains separate from expert ownership planning.
+rank-local executable construction.
+
+Qwen hybrid text parameter metadata is declared from normalized configuration
+and the same recurrent, attention, routed, dense and static construction specs
+used by its equations. Runtime encoding expansion supplies physical companions,
+row layouts and placement units. Target and MTP groups retain distinct execution
+owners; shared prediction fusion and norms declare their actual MTP consumers.
+Full, selected and prediction-extension text preparation consume this
+checkpoint-global declaration without constructing native modules. Conditional
+Qwen uses the same text parameter declaration alongside its vision metadata,
+preserving canonical group identities across the composite graph. Vision metadata
+still uses native module visitation. Low-level unit parameter descriptions accept
+configuration and validated group coordinates without requiring a materialized
+unit.
 
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden
