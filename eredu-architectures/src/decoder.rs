@@ -4962,33 +4962,6 @@ impl<B: NeuralBackend> Clone for PartitionStaticModules<B> {
 }
 
 impl<B: NeuralBackend> PartitionStaticModules<B> {
-    fn normalize_readout(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error> {
-        let norm = self
-            .norm
-            .as_mut()
-            .ok_or_else(|| Error::backend("decoder partition does not own final normalization"))?;
-        instrumentation.normalize_readout(hidden, norm, context)
-    }
-
-    fn finish_serial_instrumented(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error> {
-        let hidden = self.normalize_readout(hidden, context, instrumentation)?;
-        DecoderOutput::<B> {
-            embedding: self.embeddings.as_mut(),
-            head: self.lm_head.as_mut(),
-        }
-        .project(&hidden, context, instrumentation)
-    }
-
     /// Shared readout for an output-owning pipeline partition.
     pub(crate) fn finish_instrumented(
         &mut self,
@@ -5000,13 +4973,151 @@ impl<B: NeuralBackend> PartitionStaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let Some(parallel) = parallel else {
-            return self.finish_serial_instrumented(hidden, context, instrumentation);
-        };
-        let hidden = self.normalize_readout(hidden, context, instrumentation)?;
-        DecoderOutput::<B> {
-            embedding: self.embeddings.as_mut(),
+        self.decoder_resources_mut()
+            .finish_parallel(hidden, parallel, context, instrumentation)
+    }
+}
+
+/// Canonical pinned decoder roles borrowed from their physical module owners.
+pub struct DecoderResources<'a, B: NeuralBackend> {
+    /// Input or tied-output embedding, when physically retained.
+    pub embedding: Option<&'a B::Embedding>,
+    /// Final normalization, when physically retained.
+    pub norm: Option<&'a B::Normalization>,
+    /// Untied output head, when physically retained.
+    pub head: Option<&'a B::Linear>,
+}
+
+/// Mutable access to the same physical pinned decoder roles.
+pub struct DecoderResourcesMut<'a, B: NeuralBackend> {
+    /// Input or tied-output embedding, when physically retained.
+    pub embedding: Option<&'a mut B::Embedding>,
+    /// Final normalization, when physically retained.
+    pub norm: Option<&'a mut B::Normalization>,
+    /// Untied output head, when physically retained.
+    pub head: Option<&'a mut B::Linear>,
+}
+
+/// Typed access to complete or selected pinned resources without a second owner.
+pub trait DecoderStaticResources<B: NeuralBackend>:
+    eredu_nn::Parameterized<B::Tensor> + 'static
+{
+    /// Borrows the canonical roles actually allocated by this aggregate.
+    fn decoder_resources(&self) -> DecoderResources<'_, B>;
+    /// Mutably borrows those same roles for equations and parameter editing.
+    fn decoder_resources_mut(&mut self) -> DecoderResourcesMut<'_, B>;
+}
+impl<B: NeuralBackend> DecoderStaticResources<B> for StaticModules<B> {
+    fn decoder_resources(&self) -> DecoderResources<'_, B> {
+        DecoderResources {
+            embedding: Some(&self.embeddings),
+            norm: Some(&self.boundary.norm),
+            head: self.lm_head.as_ref(),
+        }
+    }
+    fn decoder_resources_mut(&mut self) -> DecoderResourcesMut<'_, B> {
+        DecoderResourcesMut {
+            embedding: Some(&mut self.embeddings),
+            norm: Some(&mut self.boundary.norm),
             head: self.lm_head.as_mut(),
+        }
+    }
+}
+impl<B: NeuralBackend> DecoderStaticResources<B> for PartitionStaticModules<B> {
+    fn decoder_resources(&self) -> DecoderResources<'_, B> {
+        DecoderResources {
+            embedding: self.embeddings.as_ref(),
+            norm: self.norm.as_ref(),
+            head: self.lm_head.as_ref(),
+        }
+    }
+    fn decoder_resources_mut(&mut self) -> DecoderResourcesMut<'_, B> {
+        DecoderResourcesMut {
+            embedding: self.embeddings.as_mut(),
+            norm: self.norm.as_mut(),
+            head: self.lm_head.as_mut(),
+        }
+    }
+}
+impl<B: NeuralBackend> DecoderResources<'_, B> {
+    fn visit<V: eredu_runtime::StaticParameterVisitor<B>>(
+        self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(embedding) = self.embedding {
+            visitor.visit("embedding", embedding)?;
+        }
+        if let Some(norm) = self.norm {
+            visitor.visit("norm", norm)?;
+        }
+        if let Some(head) = self.head {
+            visitor.visit("output", head)?;
+        }
+        Ok(())
+    }
+}
+impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
+    fn visit<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+        self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(embedding) = self.embedding {
+            visitor.visit_mut("embedding", embedding)?;
+        }
+        if let Some(norm) = self.norm {
+            visitor.visit_mut("norm", norm)?;
+        }
+        if let Some(head) = self.head {
+            visitor.visit_mut("output", head)?;
+        }
+        Ok(())
+    }
+    fn input_embedding(self) -> Result<&'a mut B::Embedding, Error> {
+        self.embedding
+            .ok_or_else(|| Error::backend("decoder does not own input embedding"))
+    }
+    fn normalize(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let norm = self
+            .norm
+            .as_deref_mut()
+            .ok_or_else(|| Error::backend("decoder does not own final normalization"))?;
+        instrumentation.normalize_readout(hidden, norm, context)
+    }
+    fn finish(
+        mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.normalize(hidden, context, instrumentation)?;
+        DecoderOutput::<B> {
+            embedding: self.embedding,
+            head: self.head,
+        }
+        .project(&hidden, context, instrumentation)
+    }
+    fn finish_parallel(
+        mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        let Some(parallel) = parallel else {
+            return self.finish(hidden, context, instrumentation);
+        };
+        let hidden = self.normalize(hidden, context, instrumentation)?;
+        DecoderOutput::<B> {
+            embedding: self.embedding,
+            head: self.head,
         }
         .project_parallel(&hidden, parallel, context, instrumentation)
     }
@@ -5085,11 +5196,16 @@ fn decoder_component_definition<C: Config>(
 }
 
 /// Typed decoder equations over exact admitted pipeline geometry.
-pub struct DecoderKernel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
+pub struct DecoderKernel<
+    B: NeuralBackend,
+    C: Config,
+    P = DenseBlockFactory,
+    M = PartitionStaticModules<B>,
+> {
     args: C,
-    static_modules: PartitionStaticModules<B>,
+    static_modules: M,
     geometry: PartitionLocalGeometry<C>,
-    block_factory: std::marker::PhantomData<fn() -> P>,
+    block_factory: std::marker::PhantomData<fn() -> (B, P)>,
 }
 
 fn partition_static_modules<B, C>(
@@ -5239,10 +5355,11 @@ where
     }
 }
 
-impl<B, C, P> DecoderKernel<B, C, P>
+impl<B, C, P, M> DecoderKernel<B, C, P, M>
 where
     B: NeuralBackend,
     C: Config,
+    M: DecoderStaticResources<B>,
     P: BlockFactory<B, C>,
 {
     fn finish_local_serial_instrumented(
@@ -5253,7 +5370,8 @@ where
     ) -> Result<B::Tensor, Error> {
         let logits =
             self.static_modules
-                .finish_serial_instrumented(hidden, context, instrumentation)?;
+                .decoder_resources_mut()
+                .finish(hidden, context, instrumentation)?;
         softcap_logits(logits, self.args.output_softcap(), context)
     }
 
@@ -5268,12 +5386,12 @@ where
     }
 
     /// Returns the physically allocated static modules.
-    pub const fn static_modules(&self) -> &PartitionStaticModules<B> {
+    pub const fn static_modules(&self) -> &M {
         &self.static_modules
     }
 
     /// Borrows only statics retained by the selected pipeline owner for binding.
-    pub(crate) fn partition_static_modules_mut(&mut self) -> &mut PartitionStaticModules<B> {
+    pub(crate) fn partition_static_modules_mut(&mut self) -> &mut M {
         &mut self.static_modules
     }
 
@@ -5490,11 +5608,12 @@ fn dense_local_block_config<C: PartitionedConfig>(
     Ok(local)
 }
 
-impl<B, C, P> DecoderKernel<B, C, P>
+impl<B, C, P, M> DecoderKernel<B, C, P, M>
 where
     B: eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
 {
     pub(crate) fn finish_local(
         &mut self,
@@ -5517,18 +5636,20 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let logits =
-            self.static_modules
-                .finish_instrumented(hidden, parallel, context, instrumentation)?;
+        let logits = self
+            .static_modules
+            .decoder_resources_mut()
+            .finish_parallel(hidden, parallel, context, instrumentation)?;
         softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
 
-impl<B, C, P> eredu_runtime::ComponentKernel<B> for DecoderKernel<B, C, P>
+impl<B, C, P, M> eredu_runtime::ComponentKernel<B> for DecoderKernel<B, C, P, M>
 where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;
     type Unit = TransformerBlock<B, P::FeedForward>;
@@ -5568,13 +5689,14 @@ where
         forward.mask.iter()
     }
 }
-impl<B, C, P> eredu_runtime::ComponentPinnedResources<B> for DecoderKernel<B, C, P>
+impl<B, C, P, M> eredu_runtime::ComponentPinnedResources<B> for DecoderKernel<B, C, P, M>
 where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
 {
-    type Modules = PartitionStaticModules<B>;
+    type Modules = M;
     fn pinned_modules(&self) -> &Self::Modules {
         &self.static_modules
     }
@@ -5585,38 +5707,21 @@ where
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
-        if let Some(embedding) = &self.static_modules.embeddings {
-            visitor.visit("embedding", embedding)?;
-        }
-        if let Some(norm) = &self.static_modules.norm {
-            visitor.visit("norm", norm)?;
-        }
-        if let Some(head) = &self.static_modules.lm_head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
+        self.static_modules.decoder_resources().visit(visitor)
     }
     fn visit_pinned_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
-        if let Some(embedding) = &mut self.static_modules.embeddings {
-            visitor.visit_mut("embedding", embedding)?;
-        }
-        if let Some(norm) = &mut self.static_modules.norm {
-            visitor.visit_mut("norm", norm)?;
-        }
-        if let Some(head) = &mut self.static_modules.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
+        self.static_modules.decoder_resources_mut().visit(visitor)
     }
 }
-impl<B, C, P, S> eredu_runtime::ComponentEquations<B, S> for DecoderKernel<B, C, P>
+impl<B, C, P, S, M> eredu_runtime::ComponentEquations<B, S> for DecoderKernel<B, C, P, M>
 where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -5631,9 +5736,8 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let hidden = self
             .static_modules
-            .embeddings
-            .as_mut()
-            .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?
+            .decoder_resources_mut()
+            .input_embedding()?
             .forward(input.tokens, context)?;
         let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
         begin_decoder_hidden::<B, S>(
@@ -5745,11 +5849,12 @@ where
         )
     }
 }
-impl<B, C, P, S> eredu_runtime::ParallelComponentKernel<B, S> for DecoderKernel<B, C, P>
+impl<B, C, P, S, M> eredu_runtime::ParallelComponentKernel<B, S> for DecoderKernel<B, C, P, M>
 where
     B: eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -5766,9 +5871,8 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let hidden = B::vocabulary_parallel_lookup(
             self.static_modules
-                .embeddings
-                .as_mut()
-                .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?,
+                .decoder_resources_mut()
+                .input_embedding()?,
             input.tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
@@ -5876,11 +5980,12 @@ where
         )
     }
 }
-impl<B, C, P, S> eredu_runtime::RoutedComponentKernel<B, S> for DecoderKernel<B, C, P>
+impl<B, C, P, S, M> eredu_runtime::RoutedComponentKernel<B, S> for DecoderKernel<B, C, P, M>
 where
     B: GroupedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
     P::FeedForward: RoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -5961,11 +6066,12 @@ where
         )
     }
 }
-impl<B, C, P, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for DecoderKernel<B, C, P>
+impl<B, C, P, S, M> eredu_runtime::ParallelRoutedComponentKernel<B, S> for DecoderKernel<B, C, P, M>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
     P::FeedForward: TensorParallelRoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -6042,11 +6148,12 @@ where
         )
     }
 }
-impl<B, C, P, S> eredu_runtime::PartitionComponentKernel<B, S> for DecoderKernel<B, C, P>
+impl<B, C, P, S, M> eredu_runtime::PartitionComponentKernel<B, S> for DecoderKernel<B, C, P, M>
 where
     B: eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -6076,9 +6183,10 @@ where
         let context = selected.native;
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                let embedding = self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("decoder partition does not own input embedding")
-                })?;
+                let embedding = self
+                    .static_modules
+                    .decoder_resources_mut()
+                    .input_embedding()?;
                 let hidden = match selected.parallel {
                     Some(parallel) => B::vocabulary_parallel_lookup(
                         embedding,
@@ -6162,21 +6270,23 @@ where
         })
     }
 }
-impl<B, C, P> eredu_runtime::TextComponentKernel<B> for DecoderKernel<B, C, P>
+impl<B, C, P, M> eredu_runtime::TextComponentKernel<B> for DecoderKernel<B, C, P, M>
 where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
 {
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
 }
-impl<B, C, P, S> eredu_runtime::PipelineComponentKernel<B, S> for DecoderKernel<B, C, P>
+impl<B, C, P, S, M> eredu_runtime::PipelineComponentKernel<B, S> for DecoderKernel<B, C, P, M>
 where
     B: eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -6599,9 +6709,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let logits = self
-            .static_modules
-            .finish_instrumented(hidden, context, instrumentation)?;
+        let logits =
+            self.static_modules
+                .decoder_resources_mut()
+                .finish(hidden, context, instrumentation)?;
         softcap_logits(logits, self.args.output_softcap(), context)
     }
 
@@ -6634,12 +6745,10 @@ where
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let logits = self.static_modules.finish_parallel_instrumented(
-            hidden,
-            parallel,
-            context,
-            instrumentation,
-        )?;
+        let logits = self
+            .static_modules
+            .decoder_resources_mut()
+            .finish_parallel(hidden, Some(parallel), context, instrumentation)?;
         softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
@@ -6680,24 +6789,14 @@ where
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
-        visitor.visit("embedding", &self.static_modules.embeddings)?;
-        visitor.visit("norm", &self.static_modules.boundary.norm)?;
-        if let Some(head) = &self.static_modules.lm_head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
+        self.static_modules.decoder_resources().visit(visitor)
     }
 
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
-        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.boundary.norm)?;
-        if let Some(head) = &mut self.static_modules.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
+        self.static_modules.decoder_resources_mut().visit(visitor)
     }
 }
 

@@ -713,6 +713,12 @@ The kernel owns attention, readout, routed-bank ordering and exceptional local
 geometry. The adapter supplies ordinary, observed, parallel, provider-aware and
 pipeline driver contracts, including exact local state and pinned-role selection.
 Low-level decoder operations remain available through the typed kernel.
+`DecoderStaticResources` borrows canonical embedding, normalization and output
+roles from either complete `StaticModules` or selected `PartitionStaticModules`.
+The kernel is generic over that physical aggregate. Parameter visitation, editing,
+input lookup and ordinary normalized readout use those same borrowed roles;
+resource views allocate no parameters and retain no second owner. Specialized
+residual boundaries retain their own expansion and collapse equations.
 
 Complete and pipeline-local decoder readout borrow their actual tied embedding
 or untied head through the same vocabulary projection and component instrumentation.
