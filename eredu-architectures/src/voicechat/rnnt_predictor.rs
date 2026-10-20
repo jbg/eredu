@@ -64,6 +64,37 @@ pub fn rnnt_predictor_parameter_description(
         &graph, &layout, specs, owned,
     )?)
 }
+/// Global recurrent operations, independently leased layers and carry identities.
+pub fn rnnt_predictor_component_definition(
+    dimensions: RnntDimensions,
+) -> Result<ComponentDefinition, RnntError> {
+    Ok(ComponentDefinition::new(
+        "voicechat.rnnt.predictor",
+        rnnt_predictor_parameter_description(dimensions)?,
+        (0..dimensions.predictor_layers)
+            .map(|index| ComponentUnit {
+                path: format!("stt_model.rnnt_decoder.prediction.dec_rnn.lstm.layer{index}"),
+                state: index..index + 1,
+            })
+            .collect(),
+        vec![ArchitectureGroupTransport {
+            placement: ArchitectureGroupPlacement::Pipeline,
+            kind: ArchitectureGroupKind::Recurrent,
+            first_owner_static_roles: vec![],
+            last_owner_static_roles: vec![],
+            merge_destination: ArchitectureMergeDestination::LastOwner,
+            parallel_subgroup: None,
+            request_optional: false,
+        }],
+        GROUP,
+        vec![],
+        rnnt_predictor_state_layout(dimensions)?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+            0,
+            0..dimensions.predictor_layers,
+        )]),
+    )?)
+}
 /// Two optional F32 vectors per globally indexed recurrent layer.
 pub fn rnnt_predictor_state_layout(dimensions: RnntDimensions) -> Result<StateLayout, RnntError> {
     dimensions.validate()?;
@@ -149,7 +180,7 @@ impl<T: Tensor> RnntPredictorRuntimeState<T> {
     /// Retains a parent for validation inside the shared invocation failure phase.
     /// No parameter or tensor is constructed and no rank-local parent is advanced.
     pub fn for_partition<B: NeuralBackend<Tensor = T>>(
-        architecture: &RnntPredictorArchitecture<B>,
+        architecture: &RnntPredictorKernel<B>,
         parent: Option<&RnntPredictionState<T>>,
     ) -> Result<Self, RnntError> {
         let range = architecture.range();
@@ -190,7 +221,7 @@ impl<T: Tensor> RnntPredictorRuntimeState<T> {
     }
     fn validate<B: NeuralBackend<Tensor = T>>(
         &self,
-        architecture: &RnntPredictorArchitecture<B>,
+        architecture: &RnntPredictorKernel<B>,
     ) -> Result<(), RnntError> {
         if self.dimensions != architecture.dimensions
             || self.range != architecture.range()
@@ -278,36 +309,41 @@ pub struct RnntPredictorForward<T> {
     candidate: LstmState<T>,
 }
 /// Model-family equations and exact state ownership for a predictor stage.
-pub struct RnntPredictorArchitecture<B: NeuralBackend> {
+pub struct RnntPredictorKernel<B: NeuralBackend> {
     pub(crate) dimensions: RnntDimensions,
     pub(crate) partition: Option<(Range<usize>, RnntPredictorPipelineCuts)>,
-    empty: eredu_runtime::EmptyParameterModule,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> RnntPredictorArchitecture<B> {
+impl<B: NeuralBackend> RnntPredictorKernel<B> {
     /// Declares a complete predictor without native allocations.
     pub fn new(dimensions: RnntDimensions) -> Result<Self, RnntError> {
         dimensions.validate()?;
         Ok(Self {
             dimensions,
             partition: None,
-            empty: eredu_runtime::EmptyParameterModule,
             backend: PhantomData,
         })
+    }
+    /// Couples the recurrent equations to their validated global declaration.
+    pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
+        Ok(ComponentAdapter::new(
+            rnnt_predictor_component_definition(self.dimensions)?,
+            self,
+        )?)
     }
     /// Retains exactly one contiguous predictor stage.
     pub fn new_partition<G>(
         dimensions: RnntDimensions,
         partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
         cuts: &RnntPredictorPipelineCuts,
-    ) -> Result<Self, RnntError> {
+    ) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
         let range = validate_rnnt_predictor_partition(dimensions, partition)?;
         if cuts.dimensions() != dimensions {
             return Err(invalid("RNNT predictor cuts belong to another geometry"));
         }
         let mut value = Self::new(dimensions)?;
         value.partition = Some((range, cuts.clone()));
-        Ok(value)
+        Ok(value.into_component()?.select_partition(partition)?)
     }
     /// Logical F32 tensor payload of the completed prediction: local hidden/cell
     /// pairs plus a separately retained readout on every non-final stage.
@@ -330,27 +366,8 @@ impl<B: NeuralBackend> RnntPredictorArchitecture<B> {
             .map(|p| p.0.clone())
             .unwrap_or(0..self.dimensions.predictor_layers)
     }
-    /// Stable recurrent graph, independent of parameter residency.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, RnntError> {
-        graph()
-    }
-    /// Constructs only the selected canonical recurrent layer.
-    pub fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RnntPredictorUnit<B>, RnntError> {
-        if group != 0 || !self.range().contains(&index) {
-            return Err(invalid("RNNT predictor unit exceeds selected stage"));
-        }
-        Ok(RnntPredictorUnit {
-            dimensions: self.dimensions,
-            index,
-            layer: build_predictor_layer::<B>(self.dimensions, index, context)?,
-        })
-    }
-    pub(crate) fn begin(
+
+    pub(crate) fn begin_input(
         &self,
         input: &B::Tensor,
         prototype: &B::Tensor,
@@ -401,11 +418,17 @@ pub(crate) fn validate_row<T: Tensor>(
     }
     Ok(())
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for RnntPredictorArchitecture<B> {
-    type DefinitionError = RnntError;
-    fn state_layout(&self) -> Result<StateLayout, RnntError> {
-        rnnt_predictor_state_layout(self.dimensions)
-    }
+
+impl<B: NeuralBackend> ComponentKernel<B> for RnntPredictorKernel<B> {
+    type State = RnntPredictorRuntimeState<B::Tensor>;
+    type Input<'a> = RnntPredictorInput<'a, B::Tensor>;
+    type Unit = RnntPredictorUnit<B>;
+    type ForwardContext = RnntPredictorForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = RnntError;
     fn state_identity(
         &self,
         state: &PartitionState,
@@ -430,89 +453,22 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for RnntPredictorArchitecture<B
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, RnntError> {
-        rnnt_predictor_parameter_description(self.dimensions)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, RnntPredictorRuntimeState<B::Tensor>>
-    for RnntPredictorArchitecture<B>
-{
-    type Input<'a> = RnntPredictorInput<'a, B::Tensor>;
-    type StaticModules = eredu_runtime::EmptyParameterModule;
-    type Unit = RnntPredictorUnit<B>;
-    type ForwardContext = RnntPredictorForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = RnntError;
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::Recurrent,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        GROUP
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
-            0,
-            0..self.dimensions.predictor_layers,
-        )])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, RnntError> {
-        graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, RnntError> {
-        if group != 0 {
-            return Err(invalid("unknown RNNT predictor group"));
-        }
-        Ok(self.dimensions.predictor_layers)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, RnntError> {
-        if group != 0 || index >= self.dimensions.predictor_layers {
-            return Err(invalid("unknown RNNT predictor unit"));
-        }
-        Ok(format!(
-            "stt_model.rnnt_decoder.prediction.dec_rnn.lstm.layer{index}"
-        ))
-    }
-    fn static_modules(&self) -> &eredu_runtime::EmptyParameterModule {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut eredu_runtime::EmptyParameterModule {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, RnntError> {
-        self.build_unit(group, index, context)
+        let index = address.index();
+        if !self.range().contains(&index) {
+            return Err(invalid("RNNT predictor unit exceeds selected stage"));
+        }
+        Ok(RnntPredictorUnit {
+            dimensions: self.dimensions,
+            index,
+            layer: build_predictor_layer::<B>(self.dimensions, index, context)?,
+        })
     }
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
@@ -521,34 +477,33 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntPredictorRuntimeState<B::Tenso
         if self.partition.is_some() {
             return Err(invalid("RNNT predictor stage requires pipeline ingress"));
         }
-        self.begin(input.input, input.input, input.step, state)
+        self.begin_input(input.input, input.input, input.step, state)
     }
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
-        group: usize,
+        _: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        _: &[&B::Tensor],
         _: &mut RnntPredictorRuntimeState<B::Tensor>,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(invalid("RNNT predictor requires one recurrent root"));
-        }
         Ok(initial.clone())
     }
-    fn forward_unit(
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        if group != 0
-            || index != forward.next_unit
+        let index = address.index();
+        if index != forward.next_unit
             || unit.index != index
             || unit.dimensions != self.dimensions
             || !self.range().contains(&index)
@@ -571,7 +526,7 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntPredictorRuntimeState<B::Tenso
         forward.next_unit += 1;
         Ok(output)
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
@@ -581,11 +536,10 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntPredictorRuntimeState<B::Tenso
         self.complete(hidden, state, forward)?;
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
+    fn retained_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
+        _: ExecutionUnitAddress,
     ) -> Self::RetainedContextValues<'a> {
         let mut roots = vec![&forward.prototype];
         for layer in &forward.candidate.layers {
@@ -594,23 +548,20 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntPredictorRuntimeState<B::Tenso
         roots.into_iter()
     }
 }
-impl<B: DistributedNeuralBackend>
-    ParallelLayeredArchitecture<B, RnntPredictorRuntimeState<B::Tensor>>
-    for RnntPredictorArchitecture<B>
-{
-    fn begin_forward_parallel<'a>(
+
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for RnntPredictorKernel<B> {
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
-        self.begin_forward(input, state, context)
+        ComponentKernel::begin(self, input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
@@ -618,9 +569,9 @@ impl<B: DistributedNeuralBackend>
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.forward_unit(group, index, unit, hidden, state, forward, context)
+        self.execute(address, unit, hidden, state, forward, context)
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
@@ -628,6 +579,6 @@ impl<B: DistributedNeuralBackend>
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
 }

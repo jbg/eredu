@@ -28,6 +28,10 @@ pub use component_execution::{
     ComponentUnit, EmptyParameterModule, ParallelComponentKernel, ParameterStorageId, StateSlotId,
     StatelessComponentState,
 };
+mod component_partition;
+pub use component_partition::{
+    ComponentPartitionContext, PartitionComponentKernel, PipelineComponentKernel,
+};
 /// Exact cold component preparation and consuming placement.
 pub mod prepared_component;
 pub use prepared_component::{ComponentPreparationError, ComponentRecipe, PreparedComponent};

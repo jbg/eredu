@@ -689,8 +689,13 @@ from invocation addresses and mutable state. `ComponentAdapter` implements the
 ordinary architecture and layered contracts for independently leased components;
 its typed `ComponentKernel` supplies equations, operation activity, request roots
 and family cache identity. Parallel adaptation requires the separate
-`ParallelComponentKernel` bound. The adapter rejects pinned parameter declarations;
-it does not infer missing capabilities from equation defaults.
+`ParallelComponentKernel` bound. Typed partition and pipeline adaptation require
+`PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
+selection validates canonical parameter ownership and the declared state projection,
+retains global invocation addresses, and maps declared state slots to local ordinals.
+Ingress checks the selected state geometry; egress checks output ownership. The
+adapter rejects pinned parameter declarations; it does not infer missing
+capabilities from equation defaults.
 
 VoiceChat RVQ, MoG, character conditioning, the function head, RNNT and codec PRVQ
 use this adapter with their typed kernels. They use runtime-owned empty pinned
@@ -887,8 +892,9 @@ weight materialization. Broadcast I32 values retain integer storage, including
 values outside the F32 exact range; native completion retains their dependencies.
 The enclosing session retains the final state-commit and host-publication boundary.
 
-The RNNT predictor has a separate layered pipeline declaration containing only
-its recurrent layers. The shared `Recurrent` group kind is mandatory even without
+The RNNT predictor declares only its recurrent layers through the shared component
+adapter. Its `RnntPredictorKernel` supplies the same LSTM equations for complete
+and selected pipeline execution, with independent local parent and candidate carry. The shared `Recurrent` group kind is mandatory even without
 text or modality ingress. Exact prepared views restrict each stage to its owned
 LSTM parameters; TP cohorts replicate these small recurrent layers explicitly.
 Typed boundaries carry the hidden row, zero-state prototype, global layer cut and

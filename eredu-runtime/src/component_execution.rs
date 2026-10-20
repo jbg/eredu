@@ -404,11 +404,19 @@ pub trait ParallelComponentKernel<B: NeuralBackend>: ComponentKernel<B> {
     ) -> Result<B::Tensor, Self::Error>;
 }
 
+#[derive(PartialEq, Eq)]
+struct ComponentSelection {
+    units: std::collections::BTreeSet<(usize, usize)>,
+    state: Option<PartitionState>,
+    owns_output: bool,
+}
+
 /// Shared driver-facing contracts over one declaration and typed family kernel.
 pub struct ComponentAdapter<D, K> {
     definition: D,
     kernel: K,
     empty: EmptyParameterModule,
+    selection: Option<ComponentSelection>,
 }
 impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
     /// Couples a validated declaration with its family equations.
@@ -429,7 +437,123 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
             definition,
             kernel,
             empty: EmptyParameterModule,
+            selection: None,
         })
+    }
+    /// Retains validated rank-local ownership without changing global invocation identities.
+    pub fn select_partition<G, A>(
+        mut self,
+        partition: &crate::ArchitecturePartition<G, A>,
+    ) -> Result<Self, ComponentDefinitionError> {
+        let definition = self.definition();
+        let invalid = |resource: &str| ComponentDefinitionError::Invalid {
+            component: definition.id.clone(),
+            resource: resource.into(),
+        };
+        if partition.graph() != definition.parameters.graph()
+            || partition.unit_layout() != definition.parameters.unit_layout()
+            || partition.parameter_bindings() != definition.parameters.select_owned(partition)
+        {
+            return Err(invalid("partition parameter ownership"));
+        }
+        let expected = definition
+            .state_partition
+            .resolve_partition(
+                &definition.state,
+                definition.parameters.unit_layout(),
+                |group| {
+                    partition
+                        .groups()
+                        .iter()
+                        .find(|owned| owned.group_index() == group)
+                        .map(|owned| owned.global_units())
+                },
+                partition.ownership().owns_output(),
+            )
+            .map_err(|source| ComponentDefinitionError::StatePartition {
+                component: definition.id.clone(),
+                source,
+            })?;
+        if partition.state() != expected.as_ref() {
+            return Err(invalid("partition state ownership"));
+        }
+        let mut units = std::collections::BTreeSet::new();
+        for group in partition.groups() {
+            for index in group.global_units() {
+                let unit = definition.unit(group.group_index(), index)?;
+                if !unit.state.is_empty()
+                    && expected.as_ref().is_none_or(|state| {
+                        unit.state
+                            .clone()
+                            .any(|slot| !state.owns_global_layer(slot))
+                    })
+                {
+                    return Err(invalid("partition unit state references"));
+                }
+                units.insert((group.group_index(), index));
+            }
+        }
+        let selected = ComponentSelection {
+            units,
+            state: expected,
+            owns_output: partition.ownership().owns_output(),
+        };
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|retained| retained != &selected)
+        {
+            return Err(invalid("incompatible retained partition"));
+        }
+        self.selection = Some(selected);
+        Ok(self)
+    }
+    pub(crate) fn validate_partition_state(
+        &self,
+        actual: Option<&StateLayout>,
+        expected: Option<&StateLayout>,
+        owns_output: Option<bool>,
+    ) -> Result<(), ComponentDefinitionError> {
+        let selected =
+            self.selection
+                .as_ref()
+                .ok_or_else(|| ComponentDefinitionError::Invalid {
+                    component: self.definition().id.clone(),
+                    resource: "missing retained partition".into(),
+                })?;
+        let declared = selected.state.as_ref().map(PartitionState::layout);
+        if actual != declared
+            || expected != declared
+            || owns_output.is_some_and(|owns| owns != selected.owns_output)
+        {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.definition().id.clone(),
+                resource: "partition state or output ownership".into(),
+            });
+        }
+        Ok(())
+    }
+    pub(crate) fn local_state_slots(&self, group: usize, index: usize) -> Range<usize> {
+        let slots = self
+            .definition()
+            .unit(group, index)
+            .expect("validated traversal address")
+            .state
+            .clone();
+        if slots.is_empty() {
+            return 0..0;
+        }
+        match self
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.state.as_ref())
+        {
+            Some(state) => {
+                (slots.start - state.global_layer_offset())
+                    ..(slots.end - state.global_layer_offset())
+            }
+            None => slots,
+        }
     }
     /// Borrows family semantic operations and selected geometry.
     pub fn kernel(&self) -> &K {
@@ -450,6 +574,17 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
     ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
         let definition = self.definition();
         definition.unit(group, index)?;
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !selection.units.contains(&(group, index)))
+        {
+            return Err(ComponentDefinitionError::Address {
+                component: definition.id.clone(),
+                group,
+                index,
+            });
+        }
         let layout = definition.parameters.unit_layout();
         Ok(layout
             .address(layout.ordinal(group, index).expect("validated unit"))
@@ -595,18 +730,10 @@ where
         self.kernel.executes_group(group, forward)
     }
     fn retained_state_ordinals(&self, group: usize, index: usize, _: usize) -> Range<usize> {
-        self.definition()
-            .unit(group, index)
-            .expect("validated traversal address")
-            .state
-            .clone()
+        self.local_state_slots(group, index)
     }
     fn state_ordinal(&self, group: usize, index: usize, _: usize) -> usize {
-        self.definition()
-            .unit(group, index)
-            .expect("validated traversal address")
-            .state
-            .start
+        self.local_state_slots(group, index).start
     }
     fn forward_unit(
         &mut self,
