@@ -638,6 +638,72 @@ where
     partitioned_group_with_preferred_units(logical_name, role, preferred_units, collector.members)
 }
 
+/// Declares logical matrices and biases for a packed gated-product bank.
+/// The caller selects semantic partition units and expands the exact encoding
+/// companions through `expand_linear_format_parameter_groups` before placement.
+pub fn packed_gated_product_logical_group(
+    logical_name: impl Into<String>,
+    spec: &eredu_nn::GroupedGatedProductSpec,
+    preferred_units: usize,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    spec.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = spec.layout() else {
+        return Err(ParallelPlanError::InvalidGroup(
+            "packed parameter geometry requires a packed gated-product layout".into(),
+        ));
+    };
+    let groups = spec.group_count() as usize;
+    let intermediate = spec.intermediate_dimensions() as usize;
+    let doubled = intermediate.checked_mul(2).ok_or_else(|| {
+        ParallelPlanError::InvalidGroup("gated-product width overflowed usize".into())
+    })?;
+    let mut members = Vec::new();
+    for (projection, output, input, weight_sharding, bias_sharding) in [
+        (
+            gate_up,
+            doubled,
+            spec.input_dimensions() as usize,
+            MemberSharding::PartitionedSegments {
+                axis: 1,
+                segments: vec![0..intermediate, intermediate..doubled],
+            },
+            MemberSharding::PartitionedSegments {
+                axis: 1,
+                segments: vec![0..intermediate, intermediate..doubled],
+            },
+        ),
+        (
+            down,
+            spec.output_dimensions() as usize,
+            intermediate,
+            MemberSharding::Partitioned { axis: 2 },
+            MemberSharding::Replicated,
+        ),
+    ] {
+        members.push(
+            ParameterMemberSpec::new(
+                projection.weight().id.as_str(),
+                vec![groups, output, input],
+                weight_sharding,
+            )
+            .with_parameter_metadata(&ParameterMetadata::from_spec(projection.weight(), true)),
+        );
+        if let Some(bias) = projection.bias() {
+            members.push(
+                ParameterMemberSpec::new(bias.id.as_str(), vec![groups, output], bias_sharding)
+                    .with_parameter_metadata(&ParameterMetadata::from_spec(bias, true)),
+            );
+        }
+    }
+    ParameterGroupSpec::partitioned(
+        logical_name,
+        ParameterRole::ExpertIntermediate,
+        preferred_units,
+        members,
+    )
+}
+
 /// Describes one affine projection and all encoding companions.
 pub fn projection_parameter_group<T, M>(
     logical_name: impl Into<String>,

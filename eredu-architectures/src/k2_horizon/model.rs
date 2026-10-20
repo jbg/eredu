@@ -467,12 +467,11 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
             output_norm: None,
         })
     }
-    fn parameter_groups(
-        block: &TransformerBlock<B>,
+    fn parameter_description(
         args: &ModelArgs,
-        layer: usize,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
-        super::parallel::block_parameter_groups(block, args, layer)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        super::parallel::parameter_description(args)
     }
 }
 
@@ -507,11 +506,10 @@ impl<B: eredu_nn::NeuralBackend> decoder::BlockFactory<B, ModelArgs> for DenseBl
     ) -> Result<decoder::TransformerBlock<B>, Error> {
         decoder::TransformerBlock::new(args, layer, context)
     }
-    fn parameter_groups(
-        block: &decoder::TransformerBlock<B>,
+    fn parameter_description(
         args: &ModelArgs,
-        layer: usize,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
-        decoder::layer_parallel_parameter_groups(block, args, layer)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        decoder::dense_parameter_description(args)
     }
 }

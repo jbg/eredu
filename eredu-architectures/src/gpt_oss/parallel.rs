@@ -10,6 +10,21 @@ use crate::decoder::{block_common_parallel_parameter_groups, static_parallel_par
 
 use super::{block::TransformerBlock, config::ModelArgs};
 
+/// Complete parameter topology derived from neutral router and expert specifications.
+pub fn parameter_description(
+    args: &ModelArgs,
+) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
+    crate::decoder::routed_parameter_description(args, |layer| {
+        let root = format!("{}.layers.{layer}.mlp", args.parameter_root);
+        Ok(crate::decoder::RoutedBlockParameters {
+            selector_name: format!("{root}.router"),
+            bank_name: format!("{root}.experts.intermediate"),
+            selector: super::moe::selector_spec(args, layer)?,
+            bank: super::moe::expert_bank_spec(args, layer)?,
+        })
+    })
+}
+
 fn expert_member_sharding(
     name: &str,
     shape: &[usize],

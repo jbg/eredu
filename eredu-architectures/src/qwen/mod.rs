@@ -123,12 +123,11 @@ where
         assemble_block(args, layer, Mlp::new(args, layer, context)?, context)
     }
 
-    fn parameter_groups(
-        block: &crate::decoder::TransformerBlock<B, Self::FeedForward>,
+    fn parameter_description(
         args: &ModelArgs,
-        layer: usize,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
-        parallel::layer_parallel_parameter_groups(block, args, layer)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        crate::decoder::dense_parameter_description(args)
     }
 }
 
@@ -233,12 +232,11 @@ where
         )
     }
 
-    fn parameter_groups(
-        block: &RoutedTransformerBlock<B>,
+    fn parameter_description(
         args: &ModelArgs,
-        layer: usize,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
-        parallel::routed_layer_parallel_parameter_groups(block, args, layer)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        parallel::parameter_description(args)
     }
 }
 

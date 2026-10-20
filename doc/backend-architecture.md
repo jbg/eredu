@@ -688,6 +688,17 @@ validates the selected state layout and derives causal visibility from the selec
 cache offset through one shared function, including supplied masks and explicit
 rotary embeddings.
 
+Shared decoder block factories declare complete canonical parameter topology from
+normalized configuration without a native context. Dense, routed Qwen, GPT-OSS and
+K2 use the same neutral decoder projection for graph, state-independent parameter
+ownership and ordinary attention geometry. Learned attention sinks retain their
+per-head placement. Families supply router and packed-expert construction specs;
+`eredu-runtime` derives their logical matrix/bias geometry, while family format
+recipes expand exact encoded companions. Routed declarations omit unused dense
+feed-forward geometry. Cold routed preparation consumes the factory declaration
+directly, without constructing a model for parameter discovery. Native module
+visitation remains available for low-level resource operations.
+
 Selected decoder execution uses `ComponentAdapter` with `DecoderKernel` and
 kernel-owned `PartitionStaticModules`. Its definition retains canonical parameters,
 global paths, state references and decoder transport before module construction.

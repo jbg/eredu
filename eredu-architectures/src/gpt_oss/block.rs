@@ -89,12 +89,11 @@ where
         })
     }
 
-    fn parameter_groups(
-        block: &crate::decoder::TransformerBlock<B, Self::FeedForward>,
+    fn parameter_description(
         args: &ModelArgs,
-        layer: usize,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
-        super::parallel::layer_parallel_parameter_groups(block, args, layer)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        super::parallel::parameter_description(args)
     }
 }
 

@@ -3363,6 +3363,112 @@ pub(crate) fn parameter_description(
     )
 }
 
+/// Neutral router and packed-bank declaration for one ordinary routed block.
+pub(crate) struct RoutedBlockParameters {
+    pub selector_name: String,
+    pub bank_name: String,
+    pub selector: eredu_nn::TopKGroupSelectorSpec,
+    pub bank: eredu_nn::GroupedGatedProductSpec,
+}
+
+/// Projects ordinary routed blocks into the common decoder topology.
+pub(crate) fn routed_parameter_description(
+    config: &impl Config,
+    block: impl Fn(usize) -> Result<RoutedBlockParameters, Error>,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    let invalid = |error: Error| ParallelPlanError::InvalidGroup(error.to_string());
+    config.validate_config().map_err(invalid)?;
+    let layers = usize::try_from(config.num_hidden_layers())
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let mut groups = Vec::with_capacity(layers);
+    let mut formats = std::collections::BTreeMap::new();
+    for layer in 0..layers {
+        let block = block(layer).map_err(invalid)?;
+        block.selector.validate().map_err(invalid)?;
+        block.bank.validate().map_err(invalid)?;
+        if block.selector.selection().group_count() != block.bank.group_count()
+            || block.selector.input_dimensions() != block.bank.input_dimensions()
+        {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "routed decoder unit {layer} has incompatible selector and bank geometry"
+            )));
+        }
+        let mut router = vec![eredu_runtime::ParameterMemberSpec::new(
+            block.selector.weight().id.as_str(),
+            vec![
+                block.bank.group_count() as usize,
+                block.selector.input_dimensions() as usize,
+            ],
+            MemberSharding::Replicated,
+        )];
+        if let Some(bias) = block.selector.bias() {
+            router.push(eredu_runtime::ParameterMemberSpec::new(
+                bias.id.as_str(),
+                vec![block.bank.group_count() as usize],
+                MemberSharding::Replicated,
+            ));
+        }
+        for parameter in [
+            block.selector.correction_bias(),
+            block.selector.coefficient_scale(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            router.push(eredu_runtime::ParameterMemberSpec::new(
+                parameter.id.as_str(),
+                vec![block.bank.group_count() as usize],
+                MemberSharding::Replicated,
+            ));
+        }
+        if let Some(transform) = block.selector.input_transform() {
+            router.push(eredu_runtime::ParameterMemberSpec::new(
+                transform.scale().id.as_str(),
+                vec![block.selector.input_dimensions() as usize],
+                MemberSharding::Replicated,
+            ));
+        }
+        formats.insert(
+            block.selector.weight().id.as_str().to_owned(),
+            block.selector.format().encoding(),
+        );
+        let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = block.bank.layout()
+        else {
+            return Err(ParallelPlanError::InvalidGroup(
+                "ordinary routed decoder topology requires packed expert projections".into(),
+            ));
+        };
+        for projection in [gate_up, down] {
+            formats.insert(
+                projection.weight().id.as_str().to_owned(),
+                projection.format().encoding(),
+            );
+        }
+        let units = eredu_runtime::aligned_partition_units(
+            &block.bank_name,
+            block.bank.intermediate_dimensions() as usize,
+            1,
+            crate::linear_format::input_partition_alignment(down.format().encoding()) as usize,
+        )?;
+        groups.push(vec![
+            ParameterGroupSpec::new(block.selector_name, ParameterRole::Replicated, router)?,
+            eredu_runtime::packed_gated_product_logical_group(block.bank_name, &block.bank, units)?,
+        ]);
+    }
+    parameter_description_with_formats(
+        config,
+        |_| true,
+        |layer| Ok(Some(groups[layer].clone())),
+        true,
+        |name| {
+            formats
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| config.linear_format(name))
+        },
+    )
+}
+
 /// Derives block and final-normalization topology for supplied-embedding execution,
 /// without declaring a vocabulary table or a language-model output head.
 pub fn embedded_parameter_description(
@@ -3377,6 +3483,22 @@ fn parameter_description_with_vocabulary(
     replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
     include_vocabulary: bool,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    parameter_description_with_formats(
+        config,
+        ordinary_value_projection,
+        replacement_groups,
+        include_vocabulary,
+        |name| config.linear_format(name),
+    )
+}
+
+pub(crate) fn parameter_description_with_formats(
+    config: &impl Config,
+    ordinary_value_projection: impl Fn(usize) -> bool,
+    replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
+    include_vocabulary: bool,
+    format: impl Fn(&str) -> LinearFormat,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     config
         .validate_config()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
@@ -3384,11 +3506,6 @@ fn parameter_description_with_vocabulary(
         .block_parameter_fields()
         .validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    if config.learned_attention_sinks() {
-        return Err(ParallelPlanError::InvalidGroup(
-            "static dense parameter description requires no attention sinks".into(),
-        ));
-    }
     let dimension = |name: &str, value: i32| {
         usize::try_from(value)
             .map_err(|_| ParallelPlanError::InvalidTensor(format!("decoder {name} exceeds usize")))
@@ -3571,88 +3688,96 @@ fn parameter_description_with_vocabulary(
             attention_members,
         )?;
 
-        let feed_forward_prefix = format!("{prefix}.{}", fields.feed_forward);
-        let feed_forward_units = crate::linear_format::input_partition_units(
-            &feed_forward_prefix,
-            intermediate,
-            1,
-            config.linear_format(&format!(
-                "{feed_forward_prefix}.{}.weight",
-                fields.feed_forward_output
-            )),
-        )?;
-        let mut feed_forward_members = Vec::new();
-        let inputs = match config.gated_projection_layout() {
-            GatedProjectionLayout::Split => vec![
-                (
-                    fields.feed_forward_gate,
+        let feed_forward_groups = match replacement_groups(layer)? {
+            Some(groups) => groups,
+            None => {
+                let feed_forward_prefix = format!("{prefix}.{}", fields.feed_forward);
+                let feed_forward_units = crate::linear_format::input_partition_units(
+                    &feed_forward_prefix,
                     intermediate,
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                (
-                    fields.feed_forward_up,
+                    1,
+                    format(&format!(
+                        "{feed_forward_prefix}.{}.weight",
+                        fields.feed_forward_output
+                    )),
+                )?;
+                let mut feed_forward_members = Vec::new();
+                let inputs = match config.gated_projection_layout() {
+                    GatedProjectionLayout::Split => vec![
+                        (
+                            fields.feed_forward_gate,
+                            intermediate,
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                        (
+                            fields.feed_forward_up,
+                            intermediate,
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                    ],
+                    GatedProjectionLayout::Fused { field } => {
+                        let width = intermediate.checked_mul(2).ok_or_else(|| {
+                            ParallelPlanError::InvalidTensor(
+                                "fused gate/up width overflowed usize".into(),
+                            )
+                        })?;
+                        vec![(
+                            field,
+                            width,
+                            MemberSharding::PartitionedSegments {
+                                axis: 0,
+                                segments: vec![0..intermediate, intermediate..width],
+                            },
+                        )]
+                    }
+                };
+                for (field, width, sharding) in inputs {
+                    feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                        format!("{feed_forward_prefix}.{field}.weight"),
+                        vec![width, hidden],
+                        sharding.clone(),
+                    ));
+                    if config.mlp_bias() {
+                        feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                            format!("{feed_forward_prefix}.{field}.bias"),
+                            vec![width],
+                            sharding,
+                        ));
+                    }
+                }
+                feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                    format!(
+                        "{feed_forward_prefix}.{}.weight",
+                        fields.feed_forward_output
+                    ),
+                    vec![hidden, intermediate],
+                    MemberSharding::Partitioned { axis: 1 },
+                ));
+                if config.mlp_bias() {
+                    feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                        format!("{feed_forward_prefix}.{}.bias", fields.feed_forward_output),
+                        vec![hidden],
+                        MemberSharding::Replicated,
+                    ));
+                }
+                let feed_forward = ParameterGroupSpec::partitioned(
+                    format!("{feed_forward_prefix}.projections"),
+                    ParameterRole::FeedForwardIntermediate,
+                    feed_forward_units,
+                    feed_forward_members,
+                )?;
+                let feed_forward = crate::linear_format::dense_ffn_partition_tail(
+                    feed_forward,
                     intermediate,
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-            ],
-            GatedProjectionLayout::Fused { field } => {
-                let width = intermediate.checked_mul(2).ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor("fused gate/up width overflowed usize".into())
-                })?;
-                vec![(
-                    field,
-                    width,
-                    MemberSharding::PartitionedSegments {
-                        axis: 0,
-                        segments: vec![0..intermediate, intermediate..width],
-                    },
-                )]
+                    format(&format!(
+                        "{feed_forward_prefix}.{}.weight",
+                        fields.feed_forward_output
+                    )),
+                    |name| format(name),
+                )?;
+                vec![feed_forward]
             }
         };
-        for (field, width, sharding) in inputs {
-            feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                format!("{feed_forward_prefix}.{field}.weight"),
-                vec![width, hidden],
-                sharding.clone(),
-            ));
-            if config.mlp_bias() {
-                feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                    format!("{feed_forward_prefix}.{field}.bias"),
-                    vec![width],
-                    sharding,
-                ));
-            }
-        }
-        feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-            format!(
-                "{feed_forward_prefix}.{}.weight",
-                fields.feed_forward_output
-            ),
-            vec![hidden, intermediate],
-            MemberSharding::Partitioned { axis: 1 },
-        ));
-        if config.mlp_bias() {
-            feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                format!("{feed_forward_prefix}.{}.bias", fields.feed_forward_output),
-                vec![hidden],
-                MemberSharding::Replicated,
-            ));
-        }
-        let feed_forward = ParameterGroupSpec::partitioned(
-            format!("{feed_forward_prefix}.projections"),
-            ParameterRole::FeedForwardIntermediate,
-            feed_forward_units,
-            feed_forward_members,
-        )?;
-        let feed_forward = crate::linear_format::dense_ffn_partition_tail(
-            feed_forward,
-            intermediate,
-            config.linear_format(&format!(
-                "{feed_forward_prefix}.{}.weight",
-                fields.feed_forward_output
-            )),
-            |name| config.linear_format(name),
-        )?;
         let input_norm = ParameterGroupSpec::new(
             format!("{prefix}.{}", fields.input_norm),
             ParameterRole::Replicated,
@@ -3672,14 +3797,7 @@ fn parameter_description_with_vocabulary(
             )],
         )?;
         let mut unit_groups = vec![attention];
-        for name in [
-            config.block_output_normalization(layer),
-            config.attention_output_normalization(layer),
-            config.feed_forward_output_normalization(layer),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Some(name) = config.block_output_normalization(layer) {
             unit_groups.push(ParameterGroupSpec::new(
                 name.trim_end_matches(".weight"),
                 ParameterRole::Replicated,
@@ -3687,6 +3805,19 @@ fn parameter_description_with_vocabulary(
                     &name,
                     vec![hidden],
                     MemberSharding::Replicated,
+                )],
+            )?);
+        }
+        if config.learned_attention_sinks() {
+            let name = format!("{attention_prefix}.{}", fields.attention_sinks);
+            unit_groups.push(ParameterGroupSpec::partitioned(
+                name.clone(),
+                ParameterRole::AttentionHeads,
+                query_heads,
+                [eredu_runtime::ParameterMemberSpec::new(
+                    name,
+                    vec![query_heads],
+                    MemberSharding::Partitioned { axis: 0 },
                 )],
             )?);
         }
@@ -3718,14 +3849,27 @@ fn parameter_description_with_vocabulary(
                 });
             }
         }
-        unit_groups.extend([input_norm, post_attention_norm]);
-        if let Some(groups) = replacement_groups(layer)? {
-            unit_groups.extend(groups);
-        } else {
-            unit_groups.push(feed_forward);
+        for name in [
+            config.attention_output_normalization(layer),
+            config.feed_forward_output_normalization(layer),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            unit_groups.push(ParameterGroupSpec::new(
+                name.trim_end_matches(".weight"),
+                ParameterRole::Replicated,
+                [eredu_runtime::ParameterMemberSpec::new(
+                    &name,
+                    vec![hidden],
+                    MemberSharding::Replicated,
+                )],
+            )?);
         }
+        unit_groups.extend([input_norm, post_attention_norm]);
+        unit_groups.extend(feed_forward_groups);
         for group in unit_groups {
-            let group = head_partition.apply(group, |name| config.linear_format(name))?;
+            let group = head_partition.apply(group, |name| format(name))?;
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(group_id.clone(), layer),
                 group,
@@ -3741,7 +3885,7 @@ fn parameter_description_with_vocabulary(
             |member| {
                 crate::linear_format::standard_parallel_linear_format(
                     member,
-                    config.linear_format(member.target()),
+                    format(member.target()),
                 )
             },
         )?
@@ -4568,12 +4712,10 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
         Self::build(local, layer, context)
     }
 
-    /// Declares the complete neutral parameter placement for one built block.
-    fn parameter_groups(
-        block: &TransformerBlock<B, Self::FeedForward>,
+    /// Declares canonical global parameter topology without native resources.
+    fn parameter_description(
         config: &C,
-        layer: usize,
-    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>;
+    ) -> Result<ArchitectureParameterDescription, ParallelPlanError>;
 }
 
 /// Feed-forward policy that can delegate routed experts to runtime residency.
@@ -4730,12 +4872,10 @@ impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
         TransformerBlock::new(config, layer, context)
     }
 
-    fn parameter_groups(
-        block: &TransformerBlock<B, Self::FeedForward>,
+    fn parameter_description(
         config: &C,
-        layer: usize,
-    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-        layer_parallel_parameter_groups(block, config, layer)
+    ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+        dense_parameter_description(config)
     }
 }
 
@@ -6445,61 +6585,6 @@ where
     }
 }
 
-impl<B, C, P> LayeredModel<B, C, P>
-where
-    B: NeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-{
-    /// Describes every shared-decoder parameter group with explicit static or
-    /// architecture-global unit ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph =
-            ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)?;
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
-        let layout = ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?;
-        let static_groups = static_parallel_parameter_groups::<B>(
-            &self.static_modules.embeddings,
-            &self.static_modules.boundary.norm,
-            self.static_modules.lm_head.as_ref(),
-            self.args.parameter_root(),
-        )
-        .map_err(Error::backend)?;
-        let mut expected = static_groups.clone();
-        let mut owned = Vec::new();
-        for (index, group) in static_groups.into_iter().enumerate() {
-            let role = match index {
-                0 => "embedding",
-                1 => "norm",
-                _ => "output",
-            };
-            let owner = if index == 0 && self.args.tie_word_embeddings() {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role(role)
-            };
-            owned.push(OwnedParameterGroupSpec::new(owner, group));
-        }
-        let group_id = layout.group_id(0).expect("decoder layout group").clone();
-        for index in 0..count {
-            let unit = self.construct_unit(index, context)?;
-            let groups = P::parameter_groups(&unit, &self.args, index).map_err(Error::backend)?;
-            expected.extend(groups.iter().cloned());
-            owned.extend(groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                    group,
-                )
-            }));
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
-    }
-}
-
 impl<B, C, P> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B, C, P>
 where
     B: NeuralBackend,
@@ -6527,9 +6612,9 @@ where
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        P::parameter_description(&self.args).map_err(Error::backend)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>

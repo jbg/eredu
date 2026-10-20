@@ -11322,25 +11322,8 @@ where
     P::FeedForward: crate::decoder::TensorParallelRoutedProjectionOperator<B>,
     V: RoutedPartitionedProductionVisitor<B, S>,
 {
-    let parameters = match selected_args.static_parameter_description() {
-        Some(description) => description.map_err(|error| {
-            DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-        })?,
-        None => {
-            let description_model =
-                crate::decoder::LayeredModel::<B, C, P>::new(selected_args.clone(), context)
-                    .map_err(|error| {
-                        DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-                    })?;
-            eredu_runtime::ArchitectureParameters::parameter_description(
-                &description_model,
-                context,
-            )
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?
-        }
-    };
+    let parameters = P::parameter_description(&selected_args)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -12446,13 +12429,6 @@ where
 }
 
 trait RoutedPartitionedConfig: crate::decoder::PartitionedConfig {
-    fn static_parameter_description(
-        &self,
-    ) -> Option<
-        Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>,
-    > {
-        None
-    }
     fn partition_expert_plans(
         &self,
         layout: &eredu_runtime::LocalModelLayout,
@@ -12544,13 +12520,6 @@ impl RoutedPartitionedConfig for crate::gpt_oss::ModelArgs {
 }
 
 impl RoutedPartitionedConfig for crate::k2_horizon::ModelArgs {
-    fn static_parameter_description(
-        &self,
-    ) -> Option<
-        Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>,
-    > {
-        Some(crate::k2_horizon::parameter_description(self))
-    }
     fn partition_expert_plans(
         &self,
         layout: &eredu_runtime::LocalModelLayout,

@@ -10,6 +10,24 @@ use crate::decoder::{block_common_parallel_parameter_groups, dense_mlp_parallel_
 
 use super::{FeedForward, ModelArgs, RoutedTransformerBlock, TransformerBlock};
 
+/// Complete parameter topology derived from neutral router and expert specifications.
+pub fn parameter_description(
+    args: &ModelArgs,
+) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
+    if !args.is_moe() {
+        return crate::decoder::dense_parameter_description(args);
+    }
+    crate::decoder::routed_parameter_description(args, |layer| {
+        let root = format!("{}.layers.{layer}.mlp", args.parameter_root);
+        Ok(crate::decoder::RoutedBlockParameters {
+            selector_name: format!("{root}.gate"),
+            bank_name: format!("{root}.experts.intermediate"),
+            selector: super::moe::selector_spec(args, layer)?,
+            bank: super::moe::expert_bank_spec(args, layer)?,
+        })
+    })
+}
+
 /// Derives rank-local Qwen construction geometry from a semantic placement plan.
 pub fn local_block_args(
     args: &ModelArgs,
