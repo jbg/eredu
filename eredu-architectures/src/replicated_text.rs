@@ -954,14 +954,22 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = "gemma2".to_owned();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::gemma2::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    crate::decoder::CompleteDecoderKernel::<B, crate::gemma2::ModelArgs>::new(
+                        args.clone(),
+                        context,
+                    )
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_gemma2_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::gemma2::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::gemma2::LayeredModel::<B>::new(args, context)
+            let architecture =
+                crate::decoder::CompleteDecoderKernel::<B, crate::gemma2::ModelArgs>::new(
+                    args, context,
+                )
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
@@ -984,14 +992,22 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::llama::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    crate::decoder::CompleteDecoderKernel::<B, crate::llama::ModelArgs>::new(
+                        args.clone(),
+                        context,
+                    )
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_llama_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::llama::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::llama::LayeredModel::<B>::new(args, context)
+            let architecture =
+                crate::decoder::CompleteDecoderKernel::<B, crate::llama::ModelArgs>::new(
+                    args, context,
+                )
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
@@ -1014,14 +1030,22 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = "nanbeige".to_owned();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::nanbeige::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    crate::decoder::CompleteDecoderKernel::<B, crate::nanbeige::ModelArgs>::new(
+                        args.clone(),
+                        context,
+                    )
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_nanbeige_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::nanbeige::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::nanbeige::LayeredModel::<B>::new(args, context)
+            let architecture =
+                crate::decoder::CompleteDecoderKernel::<B, crate::nanbeige::ModelArgs>::new(
+                    args, context,
+                )
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
@@ -1044,15 +1068,25 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::k2_horizon::DenseLayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    crate::decoder::CompleteDecoderKernel::<
+                        B,
+                        crate::k2_horizon::ModelArgs,
+                        crate::k2_horizon::DenseBlockFactory,
+                    >::new(args.clone(), context)
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_k2_horizon_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::k2_horizon::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::k2_horizon::DenseLayeredModel::<B>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture = crate::decoder::CompleteDecoderKernel::<
+                B,
+                crate::k2_horizon::ModelArgs,
+                crate::k2_horizon::DenseBlockFactory,
+            >::new(args, context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
@@ -1074,15 +1108,25 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::qwen::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    crate::decoder::CompleteDecoderKernel::<
+                        B,
+                        crate::qwen::ModelArgs,
+                        crate::qwen::QwenBlockFactory,
+                    >::new(args.clone(), context)
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_qwen_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::qwen::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::qwen::LayeredModel::<B>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture = crate::decoder::CompleteDecoderKernel::<
+                B,
+                crate::qwen::ModelArgs,
+                crate::qwen::QwenBlockFactory,
+            >::new(args, context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,

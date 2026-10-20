@@ -699,20 +699,28 @@ feed-forward geometry. Cold routed preparation consumes the factory declaration
 directly, without constructing a model for parameter discovery. Native module
 visitation remains available for low-level resource operations.
 
-Full decoder construction retains a validated `ComponentDefinition` before pinned
-modules are built. Replicated and rank-local construction retain the declaration
-with their selected state geometry. Parameter discovery, graph queries, logical
-unit paths and state partition rules project that retained definition; queries do
-not rebuild modules or independently reconstruct topology. Clones retain the same
-semantic definition with their typed parameter and geometry owners.
+Complete and selected decoder construction retain a validated `ComponentDefinition`
+before pinned native modules are materialized. Block factories declare canonical
+parameter topology without constructing native blocks. Graph, unit paths, state
+partition rules and parameter discovery project that retained definition.
 
-Selected decoder execution uses `ComponentAdapter` with `DecoderKernel` and
-kernel-owned `PartitionStaticModules`. Its definition retains canonical parameters,
-global paths, state references and decoder transport before module construction.
-The kernel owns attention, readout, routed-bank ordering and exceptional local
-geometry. The adapter supplies ordinary, observed, parallel, provider-aware and
-pipeline driver contracts, including exact local state and pinned-role selection.
-Low-level decoder operations remain available through the typed kernel.
+`LayeredModel` and `PartitionedLayeredModel` are `ComponentAdapter` specializations
+over the same `DecoderKernel`. `CompleteDecoderKernel::new` and `new_parallel`
+construct complete adapters; `DecoderKernel::from_partition` constructs exact
+selected ownership. `CompleteDecoderGeometry` and `PartitionLocalGeometry` supply
+the geometry used by the shared equations. Complete geometry preserves replicated
+state admission, explicit TP admission, chunked text prefill and final-position
+text projection. Selected geometry maps global invocations into sliced local
+caches. Routed banks retain global invocation indices independently of cache slots.
+The adapter supplies ordinary, observed, parallel, provider-aware and pipeline
+driver contracts, including exact local state and pinned-role selection.
+
+Low-level decoder operations borrow `kernel()` or `kernel_mut()`. Complete kernels
+expose `prepare_partition` and `prepare_partition_parallel` with explicit state
+geometry and caller-selected cache origin; the typed partition kernel capability
+also supplies observed ingress and boundary/final egress. Driver-facing partition
+calls require retained ownership selection. Cloning an adapter clones its typed
+resources and geometry and retains the validated definition and ownership.
 `DecoderStaticResources` borrows canonical embedding, normalization and output
 roles from either complete `StaticModules` or selected `PartitionStaticModules`.
 The kernel is generic over that physical aggregate. Parameter visitation, editing,
@@ -753,6 +761,9 @@ validates invocation ownership before passing a provider to either equation. Ker
 report component and sparse expert observation coverage explicitly. Pipeline bank
 order and collective requirements are typed kernel hooks over validated invocations.
 Text request construction uses the independent `TextComponentKernel` capability.
+`ComponentEquations` exposes final-position text readout explicitly; its default
+uses ordinary full-output readout and advertises no narrowing. Ordinary and observed
+readout keep their full result geometry.
 Parallel adaptation requires the separate
 `ParallelComponentKernel` bound. Typed partition and pipeline adaptation require
 `PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
@@ -5891,7 +5902,8 @@ Core separates logical policy from physical storage:
   authoritative fingerprint covering all construction, equation, state, and
   encoding policy; the shared decoder does not synthesize compatibility
   identities from a partial policy subset.
-- Shared-decoder construction and execution enter through `LayeredModel`,
+- Shared-decoder construction enters through `CompleteDecoderKernel` and
+  `DecoderKernel::from_partition`; execution uses `ComponentAdapter`,
   which validates and retains the authoritative architecture configuration.
   Unit construction, cache policy, and forward execution reuse those retained
   arguments rather than accepting an independent configuration.

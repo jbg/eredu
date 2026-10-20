@@ -190,7 +190,7 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     architecture: &super::RoutedLayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
-    let args = architecture.args();
+    let args = architecture.kernel().args();
     if !args.is_moe() {
         return Ok(None);
     }
@@ -209,6 +209,7 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     let mut unit_specs = BTreeMap::new();
     for layer in 0..layers {
         let local_args = architecture
+            .kernel()
             .parallel_geometry()
             .and_then(|geometry| geometry.block(layer))
             .unwrap_or(args);

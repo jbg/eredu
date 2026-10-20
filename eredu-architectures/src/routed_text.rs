@@ -767,15 +767,25 @@ where
     )?;
     let args = k2_horizon_args(inspection).ok_or("expected K2 Horizon configuration")?;
     let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
-        .then(|| crate::k2_horizon::LayeredModel::<B>::new(args.clone(), context))
+        .then(|| {
+            crate::decoder::CompleteDecoderKernel::<
+                B,
+                crate::k2_horizon::ModelArgs,
+                crate::k2_horizon::BlockFactory,
+            >::new(args.clone(), context)
+        })
         .transpose()
         .map_err(|error| error.to_string())?;
     let selected_args = crate::replicated_text::selected_k2_horizon_args(args, selected.text())?;
     let identity = crate::k2_horizon::prompt_cache_architecture_fingerprint(&selected_args);
     let capability =
         crate::capability::k2_horizon(&selected_args).map_err(|error| error.to_string())?;
-    let architecture = crate::k2_horizon::LayeredModel::<B>::new(selected_args, context)
-        .map_err(|error| error.to_string())?;
+    let architecture = crate::decoder::CompleteDecoderKernel::<
+        B,
+        crate::k2_horizon::ModelArgs,
+        crate::k2_horizon::BlockFactory,
+    >::new(selected_args, context)
+    .map_err(|error| error.to_string())?;
     prepare_routed_architecture_handoff::<B, S, _>(
         architecture,
         source_architecture,
@@ -837,15 +847,25 @@ where
         ));
     };
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::qwen::RoutedLayeredModel::<B>::new(args.clone(), context))
+        .then(|| {
+            crate::decoder::CompleteDecoderKernel::<
+                B,
+                crate::qwen::ModelArgs,
+                crate::qwen::RoutedQwenBlockFactory,
+            >::new(args.clone(), context)
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_qwen_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::qwen::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::qwen::RoutedLayeredModel::<B>::new(selected_args, context)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture = crate::decoder::CompleteDecoderKernel::<
+        B,
+        crate::qwen::ModelArgs,
+        crate::qwen::RoutedQwenBlockFactory,
+    >::new(selected_args, context)
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::qwen(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =

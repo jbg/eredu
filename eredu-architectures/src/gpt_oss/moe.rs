@@ -286,7 +286,7 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     architecture: &super::LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
-    let args = architecture.args();
+    let args = architecture.kernel().args();
     let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
@@ -305,6 +305,7 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in 0..layers {
         let width = architecture
+            .kernel()
             .parallel_geometry()
             .and_then(|geometry| geometry.block(layer))
             .map_or(args.intermediate_size, |local| local.intermediate_size);

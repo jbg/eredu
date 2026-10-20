@@ -454,6 +454,23 @@ pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKer
         self.finish(hidden, state, forward, context)
     }
 
+    /// Whether causal-text readout projects only the final hidden position.
+    fn projects_final_text_position() -> bool {
+        false
+    }
+
+    /// Readout for an unobserved text consumer that needs only the final position.
+    /// Other operations and observed readout retain the ordinary result geometry.
+    fn finish_text(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.finish(hidden, state, forward, context)
+    }
+
     /// Prepares a typed operation.
     fn begin<'a>(
         &mut self,
@@ -579,7 +596,7 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
     ) -> Result<B::Tensor, Self::Error>;
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ComponentSelection {
     units: std::collections::BTreeSet<(usize, usize)>,
     state: Option<PartitionState>,
@@ -587,6 +604,7 @@ struct ComponentSelection {
 }
 
 /// Shared driver-facing contracts over one declaration and typed family kernel.
+#[derive(Clone)]
 pub struct ComponentAdapter<D, K, R = EmptyParameterModule> {
     definition: D,
     kernel: K,
@@ -1160,6 +1178,18 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
         self.kernel.finish(hidden, state, forward, context)
+    }
+    fn projects_final_text_position() -> bool {
+        K::projects_final_text_position()
+    }
+    fn finish_text_forward(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &K::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, K::Error> {
+        self.kernel.finish_text(hidden, state, forward, context)
     }
     fn retained_context_values<'a>(
         &'a self,

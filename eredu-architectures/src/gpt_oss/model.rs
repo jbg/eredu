@@ -88,5 +88,5 @@ pub fn new_layered_model<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
     args: ModelArgs,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<LayeredModel<B>, Error> {
-    LayeredModel::new(args, context)
+    crate::decoder::CompleteDecoderKernel::<B, ModelArgs, GptOssBlockFactory>::new(args, context)
 }

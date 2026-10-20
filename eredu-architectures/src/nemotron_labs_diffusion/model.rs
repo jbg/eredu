@@ -126,7 +126,7 @@ impl<B: NeuralBackend> TextModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            base: LayeredModel::new(config, context)?,
+            base: decoder::CompleteDecoderKernel::new(config, context)?,
         })
     }
     /// Declares the same base with exact tensor-parallel local geometry.
@@ -139,7 +139,7 @@ impl<B: NeuralBackend> TextModel<B> {
         B: eredu_nn::DistributedNeuralBackend,
     {
         Ok(Self {
-            base: LayeredModel::new_parallel(config, geometry, context)?,
+            base: decoder::CompleteDecoderKernel::new_parallel(config, geometry, context)?,
         })
     }
     /// Declares optional low-rank modules before any residency or state is built.
@@ -164,15 +164,15 @@ impl<B: NeuralBackend> TextModel<B> {
     }
     /// Complete family geometry shared by all phases.
     pub fn config(&self) -> &FamilyConfig {
-        self.base.args()
+        self.base.kernel().args()
     }
     /// Borrowed pinned parameter modules, with a singular storage owner.
     pub fn static_modules(&self) -> &StaticModules<B> {
-        self.base.static_modules()
+        self.base.kernel().static_modules()
     }
     /// Mutable binding access to that same pinned parameter catalog.
     pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
-        self.base.static_modules_mut()
+        self.base.kernel_mut().static_modules_mut()
     }
     /// Starts a text invocation from already assembled media/text embeddings.
     /// Cache visibility and write authority are identical to token ingress.
@@ -222,7 +222,7 @@ impl<B: NeuralBackend> TextModel<B> {
             )?);
         }
         let layout = state.layout().clone();
-        let forward = self.base.begin_embedded_with_layout(
+        let forward = self.base.kernel_mut().begin_embedded_with_layout(
             hidden,
             supplied.as_ref(),
             state,
@@ -244,7 +244,7 @@ impl<B: NeuralBackend> TextModel<B> {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextLayer<B>, Error> {
-        let base = self.base.construct_unit(index, context)?;
+        let base = self.base.kernel().construct_unit(index, context)?;
         let draft_adapter = self
             .config()
             .draft_adapter()
@@ -289,7 +289,7 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for TextModel<B> {
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        super::checkpoint::module_source_recipes(self.base.static_modules(), source)
+        super::checkpoint::module_source_recipes(self.base.kernel().static_modules(), source)
     }
     fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
         &self,
@@ -354,10 +354,10 @@ where
         )
     }
     fn static_modules(&self) -> &Self::StaticModules {
-        self.base.static_modules()
+        self.base.kernel().static_modules()
     }
     fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        self.base.static_modules_mut()
+        self.base.kernel_mut().static_modules_mut()
     }
     fn build_unit(
         &self,
@@ -400,6 +400,7 @@ where
         // changes shared projections or any ordinary causal invocation.
         let hidden = self
             .base
+            .kernel_mut()
             .static_modules_mut()
             .embed(input.tokens, context)?;
         self.begin_embedded(hidden, input.mask, input.invocation, state, context)
@@ -495,7 +496,7 @@ where
         _: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.base.finish_hidden(hidden, context)
+        self.base.kernel_mut().finish_hidden(hidden, context)
     }
     fn finish_forward_observed<O>(
         &mut self,
@@ -509,11 +510,14 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.static_modules_mut().finish_instrumented(
-            hidden,
-            context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
-        )
+        self.base
+            .kernel_mut()
+            .static_modules_mut()
+            .finish_instrumented(
+                hidden,
+                context,
+                &mut ComponentInstrumentation::new("readout", &mut observer),
+            )
     }
     fn projects_final_text_position() -> bool {
         true
@@ -534,7 +538,7 @@ where
             ],
             context,
         )?;
-        self.base.finish_hidden(&last, context)
+        self.base.kernel_mut().finish_hidden(&last, context)
     }
     fn retained_context_values<'a>(
         &'a self,
@@ -626,7 +630,7 @@ where
                 "shared-backbone input requires nonempty batched token IDs",
             ));
         }
-        let hidden = self.base.static_modules_mut().embed_parallel(
+        let hidden = self.base.kernel_mut().static_modules_mut().embed_parallel(
             input.tokens,
             eredu_nn::EmbeddingLookupPolicy::Strict,
             parallel,
@@ -712,7 +716,9 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.base.finish_hidden_parallel(hidden, parallel, context)
+        self.base
+            .kernel_mut()
+            .finish_hidden_parallel(hidden, parallel, context)
     }
     fn finish_forward_parallel_observed<O>(
         &mut self,
@@ -727,12 +733,15 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.static_modules_mut().finish_parallel_instrumented(
-            hidden,
-            parallel,
-            context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
-        )
+        self.base
+            .kernel_mut()
+            .static_modules_mut()
+            .finish_parallel_instrumented(
+                hidden,
+                parallel,
+                context,
+                &mut ComponentInstrumentation::new("readout", &mut observer),
+            )
     }
 }
 
