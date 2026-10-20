@@ -699,6 +699,13 @@ feed-forward geometry. Cold routed preparation consumes the factory declaration
 directly, without constructing a model for parameter discovery. Native module
 visitation remains available for low-level resource operations.
 
+Full decoder construction retains a validated `ComponentDefinition` before pinned
+modules are built. Replicated and rank-local construction retain the declaration
+with their selected state geometry. Parameter discovery, graph queries, logical
+unit paths and state partition rules project that retained definition; queries do
+not rebuild modules or independently reconstruct topology. Clones retain the same
+semantic definition with their typed parameter and geometry owners.
+
 Selected decoder execution uses `ComponentAdapter` with `DecoderKernel` and
 kernel-owned `PartitionStaticModules`. Its definition retains canonical parameters,
 global paths, state references and decoder transport before module construction.

@@ -178,6 +178,43 @@ impl ComponentDefinition {
     pub fn state_layout(&self) -> &StateLayout {
         &self.state
     }
+    /// Canonical number of logical invocations in one validated group.
+    pub fn unit_count(&self, group: usize) -> Result<usize, ComponentDefinitionError> {
+        self.parameters
+            .unit_layout()
+            .group_range(group)
+            .map(|range| range.len())
+            .ok_or_else(|| ComponentDefinitionError::Address {
+                component: self.id.clone(),
+                group,
+                index: 0,
+            })
+    }
+    /// Transport declaration for one validated semantic group.
+    pub fn group_transport(
+        &self,
+        group: usize,
+    ) -> Result<&ArchitectureGroupTransport, ComponentDefinitionError> {
+        self.transport
+            .get(group)
+            .ok_or_else(|| ComponentDefinitionError::Address {
+                component: self.id.clone(),
+                group,
+                index: 0,
+            })
+    }
+    /// Stable identity of the primary semantic group.
+    pub fn primary_group(&self) -> &str {
+        &self.primary
+    }
+    /// Ordered prediction groups, independent of declaration ordinals.
+    pub fn prediction_groups(&self) -> &[String] {
+        &self.prediction
+    }
+    /// State ownership projected from the same retained declaration.
+    pub fn state_partition_plan(&self) -> &ArchitectureStatePartitionPlan {
+        &self.state_partition
+    }
     /// Resolves a logical invocation using the canonical address map.
     pub fn unit(
         &self,
@@ -1017,34 +1054,25 @@ where
         B::Tensor: 'a;
     type Error = K::Error;
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
-        self.definition().transport[group].clone()
+        self.definition()
+            .group_transport(group)
+            .expect("validated traversal group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        &self.definition().primary
+        self.definition().primary_group()
     }
     fn prediction_execution_groups(&self) -> Vec<String> {
-        self.definition().prediction.clone()
+        self.definition().prediction_groups().to_vec()
     }
     fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        self.definition().state_partition.clone()
+        self.definition().state_partition_plan().clone()
     }
     fn execution_graph(&self) -> Result<ExecutionGraph, K::Error> {
         Ok(self.definition().parameters.graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, K::Error> {
-        self.definition()
-            .parameters
-            .unit_layout()
-            .group_range(group)
-            .map(|range| range.len())
-            .ok_or_else(|| {
-                ComponentDefinitionError::Address {
-                    component: self.definition().id.clone(),
-                    group,
-                    index: 0,
-                }
-                .into()
-            })
+        self.definition().unit_count(group).map_err(Into::into)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, K::Error> {
         Ok(self.definition().unit(group, index)?.path.clone())

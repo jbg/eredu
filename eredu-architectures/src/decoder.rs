@@ -3388,6 +3388,8 @@ pub(crate) fn routed_parameter_description(
         block.bank.validate().map_err(invalid)?;
         if block.selector.selection().group_count() != block.bank.group_count()
             || block.selector.input_dimensions() != block.bank.input_dimensions()
+            || block.bank.input_dimensions() != config.hidden_size()
+            || block.bank.output_dimensions() != config.hidden_size()
         {
             return Err(ParallelPlanError::InvalidGroup(format!(
                 "routed decoder unit {layer} has incompatible selector and bank geometry"
@@ -4882,6 +4884,7 @@ impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
 /// Shared layered decoder lifecycle over architecture configuration and block policy.
 pub struct LayeredModel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
     args: C,
+    definition: eredu_runtime::ComponentDefinition,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry<C>>>,
     block_factory: std::marker::PhantomData<fn() -> P>,
@@ -4891,6 +4894,7 @@ impl<B: NeuralBackend, C: Config + Clone, P> Clone for LayeredModel<B, C, P> {
     fn clone(&self) -> Self {
         Self {
             args: self.args.clone(),
+            definition: self.definition.clone(),
             static_modules: self.static_modules.clone(),
             parallel_geometry: self.parallel_geometry.clone(),
             block_factory: std::marker::PhantomData,
@@ -6172,9 +6176,15 @@ where
             "shared decoder equations",
             operator_requirements(&args),
         )?;
+        let definition = decoder_component_definition(
+            &args,
+            P::parameter_description(&args).map_err(Error::backend)?,
+            state_layout(&args)?,
+        )?;
         let static_modules = StaticModules::new(&args, context)?;
         Ok(Self {
             args,
+            definition,
             static_modules,
             parallel_geometry: None,
             block_factory: std::marker::PhantomData,
@@ -6197,9 +6207,15 @@ where
             operator_requirements(&args),
         )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = decoder_component_definition(
+            &args,
+            P::parameter_description(&args).map_err(Error::backend)?,
+            geometry.state_layout().clone(),
+        )?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         Ok(Self {
             args,
+            definition,
             static_modules,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
             block_factory: std::marker::PhantomData,
@@ -6221,12 +6237,9 @@ where
         &mut self.static_modules
     }
 
-    /// Returns the replicated or rank-local mutable-state layout for this model.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| state_layout(&self.args), Ok)
+    /// Borrows the same validated declaration used by construction and discovery.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Returns planner-derived geometry when this is a rank-local realization.
@@ -6594,7 +6607,7 @@ where
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
+        Ok(self.definition.state_layout().clone())
     }
 
     fn state_identity(
@@ -6614,7 +6627,7 @@ where
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        P::parameter_description(&self.args).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -6664,47 +6677,34 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
 
-    fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::transport::decoder()
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        self.definition
+            .group_transport(group)
+            .expect("validated traversal group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        TEXT_DECODER_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(0, layout)
+        self.definition.state_partition_plan().clone()
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        eredu_runtime::ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend(format!(
-                "decoder execution group {group} is outside the text decoder"
-            )));
-        }
-        usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)
+        self.definition.unit_count(group).map_err(Into::into)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend(format!(
-                "decoder execution group {group} is outside the text decoder"
-            )));
-        }
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
-        if index >= count {
-            return Err(Error::backend(format!(
-                "decoder unit {index} is outside {count} decoder layers"
-            )));
-        }
-        Ok(format!("{}.layers.{index}", self.args.parameter_root()))
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
