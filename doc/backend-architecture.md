@@ -8588,6 +8588,15 @@ formats and packed ReLU-squared bank geometry into exact physical companions;
 family code retains checkpoint identities and format policy. Full metadata and
 selected/source preparation consume the same cold declaration.
 
+Full Nemotron-H construction retains a validated `ComponentDefinition` before
+allocating pinned modules. Complete and selected views use the same definition
+builder. Graphs, parameter ownership, primary/prediction groups, transport,
+invocation paths and state slots project from that definition. Target state
+follows pipeline unit ownership; appended prediction state belongs to the output
+owner. Rank-local construction retains its exact local state geometry in the
+definition while the explicit ordinary state-layout operation returns global
+geometry. Group assembly validates dependencies against the retained graph.
+
 Nemotron-H derives expert ownership and rank-local ReLU-squared bank
 specifications from normalized `ModelArgs`, optional validated `LocalGeometry`
 and neutral rank topology. Target units and repeated prediction patterns retain

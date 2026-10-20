@@ -465,3 +465,60 @@ pub fn parameter_description(
     )
     .map_err(invalid)
 }
+
+/// Validates parameter, invocation, transport and state views as one retained definition.
+pub(crate) fn component_definition(
+    parameters: ArchitectureParameterDescription,
+    state: eredu_runtime::StateLayout,
+) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+    let layout = parameters.unit_layout();
+    let target = layout.group_range(0).expect("declared target group").len();
+    let units = (0..layout.len())
+        .map(|ordinal| {
+            let address = layout.address(ordinal).expect("declared unit");
+            let path = if address.group() == 0 {
+                format!("model.layers.{}", address.index())
+            } else {
+                format!("model.mtp.layers.{}", ordinal - target)
+            };
+            eredu_runtime::ComponentUnit {
+                path,
+                state: ordinal..ordinal + 1,
+            }
+        })
+        .collect();
+    let groups = parameters.graph().groups().len();
+    let prediction = (1..groups)
+        .map(|group| {
+            layout
+                .group_id(group)
+                .expect("declared prediction group")
+                .as_str()
+                .to_owned()
+        })
+        .collect();
+    let transport = (0..groups)
+        .map(|group| {
+            if group == 0 {
+                return crate::transport::decoder();
+            }
+            let mut contract = crate::transport::prediction();
+            if group == 1 {
+                contract.first_owner_static_roles.push("mtp".into());
+            }
+            contract
+        })
+        .collect();
+    let partition = crate::transport::pipeline_with_output_state(0, target, &state);
+    eredu_runtime::ComponentDefinition::new(
+        "nemotron-h",
+        parameters,
+        units,
+        transport,
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        prediction,
+        state,
+        partition,
+    )
+    .map_err(eredu_nn::Error::from)
+}

@@ -40,36 +40,6 @@ pub struct NemotronKernel<B: eredu_nn::GroupedNeuralBackend + eredu_nn::Distribu
     boundary: TargetBoundarySchema,
 }
 
-fn component_definition(
-    parameters: ArchitectureParameterDescription,
-    state: StateLayout,
-) -> Result<eredu_runtime::ComponentDefinition, Error> {
-    let units = (0..parameters.unit_layout().len())
-        .map(|ordinal| {
-            let address = parameters
-                .unit_layout()
-                .address(ordinal)
-                .expect("declared unit");
-            eredu_runtime::ComponentUnit {
-                path: format!("model.layers.{}", address.index()),
-                state: address.index()..address.index() + 1,
-            }
-        })
-        .collect();
-    let partition = crate::transport::pipeline_state(0, &state);
-    eredu_runtime::ComponentDefinition::new(
-        "nemotron-h",
-        parameters,
-        units,
-        vec![crate::transport::decoder()],
-        crate::decoder::TARGET_EXECUTION_GROUP,
-        vec![],
-        state,
-        partition,
-    )
-    .map_err(Error::from)
-}
-
 fn partition_static_modules<B, A>(
     args: &ModelArgs,
     geometry: &PartitionLocalGeometry,
@@ -202,8 +172,10 @@ where
             ));
         }
         let geometry = partition.local_geometry().clone();
-        let definition =
-            component_definition(parameters.clone(), geometry.complete_state_layout().clone())?;
+        let definition = super::parameters::component_definition(
+            parameters.clone(),
+            geometry.complete_state_layout().clone(),
+        )?;
         let static_modules = partition_static_modules(&args, &geometry, partition, context)?;
         let kernel = Self {
             args,

@@ -15,7 +15,7 @@ use super::{
     state_layout, Block, EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator,
     PredictionUnit, RetainedValues, TargetReadout,
 };
-use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
+use crate::decoder::{StaticModuleSpec, StaticModules};
 
 /// One target or appended prediction physical unit.
 #[derive(Debug, Clone, Parameterized)]
@@ -335,7 +335,7 @@ impl<T> ForwardContext<T> {
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
     static_modules: StaticModules<B>,
-    groups: SequentialPredictionGroups,
+    definition: eredu_runtime::ComponentDefinition,
     target_units: usize,
     prediction_steps: usize,
     prediction_pattern: usize,
@@ -349,7 +349,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
+        Ok(self.definition.state_layout().clone())
     }
 
     fn state_identity(
@@ -369,7 +369,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parameter_description(&self.args).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
 
     fn static_parameter_recipes(
@@ -415,19 +415,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             crate::operator_requirements::NEMOTRON_H,
         )?;
         args.validate().map_err(Error::backend)?;
-        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;
-        let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
-        let groups = SequentialPredictionGroups::new_pattern(
-            "model.layers",
-            target_units,
-            "model.mtp.layers",
-            prediction_steps,
-            prediction_pattern,
+        let definition = super::parameters::component_definition(
+            super::parameter_description(&args).map_err(Error::backend)?,
+            state_layout(&args).map_err(Error::backend)?,
         )?;
+        let target_units = definition.unit_count(0)?;
+        let prediction_steps = definition.prediction_groups().len();
+        let prediction_pattern = if prediction_steps == 0 {
+            0
+        } else {
+            definition.unit_count(1)?
+        };
+        let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
         Ok(Self {
             args,
             static_modules,
-            groups,
+            definition,
             target_units,
             prediction_steps,
             prediction_pattern,
@@ -448,46 +451,33 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
-        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;
+        let definition = super::parameters::component_definition(
+            super::parameter_description(&args).map_err(Error::backend)?,
+            geometry.state_layout().clone(),
+        )?;
+        let target_units = definition.unit_count(0)?;
+        let prediction_steps = definition.prediction_groups().len();
+        let prediction_pattern = if prediction_steps == 0 {
+            0
+        } else {
+            definition.unit_count(1)?
+        };
         let static_modules = StaticModules::from_parallel_spec(
             Self::static_spec(&args),
             geometry.embedding_range().clone(),
             geometry.output_range().cloned(),
             context,
         )?;
-        let groups = SequentialPredictionGroups::new_pattern(
-            "model.layers",
-            target_units,
-            "model.mtp.layers",
-            prediction_steps,
-            prediction_pattern,
-        )?;
         Ok(Self {
             args,
             static_modules,
-            groups,
+            definition,
             target_units,
             prediction_steps,
             prediction_pattern,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
             expert_realization: None,
         })
-    }
-
-    fn schedule(args: &ModelArgs) -> Result<(usize, usize, usize), Error> {
-        let target_units = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-        let prediction_steps =
-            usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        let prediction_units = args.mtp_policies().map_err(Error::backend)?.len();
-        let prediction_pattern = if prediction_steps == 0 {
-            0
-        } else {
-            prediction_units
-                .checked_div(prediction_steps)
-                .filter(|n| *n > 0)
-                .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?
-        };
-        Ok((target_units, prediction_steps, prediction_pattern))
     }
 
     fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
@@ -515,7 +505,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Returns the prediction depth count declared by the execution graph.
     pub fn mtp_len(&self) -> usize {
-        self.groups.prediction_count()
+        self.definition.prediction_groups().len()
     }
 
     /// Borrows pinned static modules.
@@ -529,14 +519,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     /// Returns the authoritative target plus MTP state layout.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
         state_layout(&self.args).map_err(Error::backend)
-    }
-
-    /// Returns the replicated or planner-derived heterogeneous state layout.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| self.state_layout(), Ok)
     }
 
     /// Returns planner-derived geometry for a rank-local realization.
@@ -968,25 +950,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     fn validate_group(&self, group: usize) -> Result<usize, Error> {
-        self.groups.unit_count(group)
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path_inner(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.groups.unit_path(group, index)
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn state_index(&self, group: usize, index: usize) -> Result<usize, Error> {
-        if group == 0 {
-            return Ok(index);
-        }
-        self.target_units
-            .checked_add(
-                (group - 1)
-                    .checked_mul(self.prediction_pattern)
-                    .and_then(|start| start.checked_add(index))
-                    .ok_or_else(|| Error::backend("Nemotron-H MTP state index overflowed"))?,
-            )
-            .ok_or_else(|| Error::backend("Nemotron-H total state index overflowed"))
+        Ok(self.definition.unit(group, index)?.state.start)
     }
 
     /// Executes a target or prediction unit through a runtime expert provider.
@@ -1136,30 +1108,29 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            crate::transport::decoder()
-        } else {
-            prediction_group_transport(group)
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated traversal group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn prediction_execution_groups(&self) -> Vec<String> {
-        self.groups.prediction_execution_groups()
+        self.definition.prediction_groups().to_vec()
     }
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(0, self.target_units, layout)
+        self.definition.state_partition_plan().clone()
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.groups.execution_graph()
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
         self.validate_group(group)
@@ -1298,7 +1269,15 @@ where
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.begin(group, initial, dependencies)
+        let declared = self.definition.parameters().graph().dependencies(group);
+        if declared.is_none_or(|declared| declared.len() != dependencies.len()) {
+            return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+                component: self.definition.id().into(),
+                resource: format!("dependencies for group {group}"),
+            }
+            .into());
+        }
+        Ok(dependencies.first().copied().unwrap_or(initial).clone())
     }
 
     fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
@@ -1456,14 +1435,6 @@ where
             forward.draft_logits.as_ref(),
         ])
     }
-}
-
-fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = crate::transport::prediction();
-    if group == 1 {
-        transport.first_owner_static_roles.push("mtp".into());
-    }
-    transport
 }
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
