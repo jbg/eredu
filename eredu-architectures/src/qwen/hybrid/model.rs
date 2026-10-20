@@ -15,7 +15,7 @@ use eredu_runtime::{
 
 use crate::{
     decoder::{StaticModuleSpec, StaticModules},
-    hybrid_decoder::HybridDecoder,
+    hybrid_decoder::HybridStaticModules,
 };
 
 use super::{
@@ -86,7 +86,7 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.definition.unit(group, index)?.path.clone();
         let lane = state
             .layer(self.state_index(group, index)?)
             .map_err(Error::backend)?;
@@ -158,7 +158,7 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.definition.unit(group, index)?.path.clone();
         let lane = state
             .layer(self.state_index(group, index)?)
             .map_err(Error::backend)?;
@@ -301,12 +301,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 /// One neutral layered model for Qwen3-Next and every Qwen3.5 text policy.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     config: HybridConfig,
-    decoder: HybridDecoder<B, Option<super::PredictionShared<B>>>,
+    static_modules: HybridStaticModules<B, Option<super::PredictionShared<B>>>,
+    definition: eredu_runtime::ComponentDefinition,
     target_layers: usize,
     prediction_steps: usize,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
     partition_target_start: usize,
-    global_parameters: Option<std::sync::Arc<ArchitectureParameterDescription>>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
 }
 
@@ -336,10 +336,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        if let Some(parameters) = &self.global_parameters {
-            return Ok(parameters.as_ref().clone());
-        }
-        super::parameter_description(&self.config).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
 
     fn static_parameter_recipes(
@@ -350,17 +347,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         String,
     > {
         let recipes = super::static_recipes(source)?;
-        crate::static_parameters::module_recipes(self.decoder.extended_static_modules(), recipes)
+        crate::static_parameters::module_recipes(&self.static_modules, recipes)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
-        if let Some(shared) = &self.decoder.extended_static_modules().extension {
+        if let Some(shared) = &self.static_modules.extension {
             visitor.visit("mtp", shared)?;
         }
-        let modules = self.decoder.static_modules();
+        let modules = self.static_modules();
         visitor.visit("embedding", &modules.embeddings)?;
         visitor.visit("norm", &modules.boundary.norm)?;
         if let Some(head) = &modules.lm_head {
@@ -373,10 +370,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
-        if let Some(shared) = &mut self.decoder.extended_static_modules_mut().extension {
+        if let Some(shared) = &mut self.static_modules.extension {
             visitor.visit_mut("mtp", shared)?;
         }
-        let modules = self.decoder.static_modules_mut();
+        let modules = self.static_modules_mut();
         visitor.visit_mut("embedding", &mut modules.embeddings)?;
         visitor.visit_mut("norm", &mut modules.boundary.norm)?;
         if let Some(head) = &mut modules.lm_head {
@@ -396,31 +393,39 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             "Qwen hybrid",
             crate::operator_requirements::QWEN_HYBRID,
         )?;
-        config.validate().map_err(Error::backend)?;
-        let target_layers = usize::try_from(config.num_hidden_layers).map_err(Error::backend)?;
-        let prediction_steps =
-            usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)?;
-        let decoder = HybridDecoder::new_with_prediction_groups(
-            crate::decoder::StaticModules::from_spec(static_module_spec(&config), context)?,
-            "model.layers",
-            target_layers,
-            "mtp.layers",
-            prediction_steps,
-            1,
-        )?
-        .with_static_extension(
-            (prediction_steps > 0)
-                .then(|| super::PredictionShared::new(&config, context))
-                .transpose()?,
-        );
+        let definition = super::component_definition(&config, None)?;
+        Self::from_definition(config, None, definition, context)
+    }
+
+    fn from_definition(
+        config: HybridConfig,
+        geometry: Option<LocalGeometry>,
+        definition: eredu_runtime::ComponentDefinition,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let target_layers = definition.unit_count(0)?;
+        let prediction_steps = definition.prediction_groups().len();
+        let spec = static_module_spec(&config);
+        let base = match &geometry {
+            Some(geometry) => StaticModules::from_parallel_spec(
+                spec,
+                geometry.embedding_range().clone(),
+                geometry.output_range().cloned(),
+                context,
+            )?,
+            None => StaticModules::from_spec(spec, context)?,
+        };
+        let extension = (prediction_steps > 0)
+            .then(|| super::PredictionShared::new(&config, context))
+            .transpose()?;
         Ok(Self {
             config,
-            decoder,
+            static_modules: HybridStaticModules { base, extension },
+            definition,
             target_layers,
             prediction_steps,
-            parallel_geometry: None,
+            parallel_geometry: geometry.map(std::sync::Arc::new),
             partition_target_start: 0,
-            global_parameters: None,
             expert_realization: None,
         })
     }
@@ -433,7 +438,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         B::vocabulary_parallel_lookup(
-            &mut self.decoder.static_modules_mut().embeddings,
+            &mut self.static_modules_mut().embeddings,
             tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
@@ -450,15 +455,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let hidden = if normalize {
-            self.decoder
-                .static_modules_mut()
+            self.static_modules_mut()
                 .boundary
                 .norm
                 .forward(hidden, context)?
         } else {
             hidden.clone()
         };
-        let modules = self.decoder.static_modules_mut();
+        let modules = self.static_modules_mut();
         match &mut modules.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(
@@ -476,7 +480,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.static_modules_mut().embed(tokens, context)
+        self.static_modules_mut().embed(tokens, context)
     }
 
     /// Enters a tensor-parallel target or prediction partition through token embedding.
@@ -496,15 +500,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let hidden = if normalize {
-            self.decoder
-                .static_modules_mut()
+            self.static_modules_mut()
                 .boundary
                 .norm
                 .forward(hidden, context)?
         } else {
             hidden.clone()
         };
-        let modules = self.decoder.static_modules_mut();
+        let modules = self.static_modules_mut();
         match &mut modules.lm_head {
             Some(head) => head.forward(&hidden, context),
             None => modules.embeddings.as_linear(&hidden, context),
@@ -537,19 +540,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
+            "Qwen hybrid",
+            crate::operator_requirements::QWEN_HYBRID,
+        )?;
+        crate::operator_requirements::require::<B>(
             "Qwen hybrid tensor parallelism",
             eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
         )?;
-        geometry.validate_for(&config).map_err(Error::backend)?;
-        let mut model = Self::new(config.clone(), context)?;
-        *model.decoder.static_modules_mut() = crate::decoder::StaticModules::from_parallel_spec(
-            static_spec(&config)?,
-            geometry.embedding_range().clone(),
-            geometry.output_range().cloned(),
-            context,
-        )?;
-        model.parallel_geometry = Some(std::sync::Arc::new(geometry));
-        Ok(model)
+        let definition = super::component_definition(&config, Some(&geometry))?;
+        Self::from_definition(config, Some(geometry), definition, context)
     }
 
     /// Returns normalized hybrid policy.
@@ -559,23 +558,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Returns the architecture-owned target and prediction traversal.
     pub fn unit_layout(&self) -> Result<ExecutionUnitLayout, Error> {
-        let graph = self.decoder.execution_graph()?;
-        let counts = (0..graph.groups().len())
-            .map(|group| self.decoder.group_unit_count(group))
-            .collect::<Result<Vec<_>, _>>()?;
-        ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)
+        Ok(self.definition.parameters().unit_layout().clone())
+    }
+
+    /// Borrows the validated graph, parameter ownership and selected state geometry.
+    pub const fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Returns the pinned shared prediction modules and base text modules.
     pub fn into_extended_static_modules(
         self,
     ) -> crate::hybrid_decoder::HybridStaticModules<B, Option<super::PredictionShared<B>>> {
-        self.decoder.into_extended_static_modules()
+        self.static_modules
     }
 
     fn prediction_shared_mut(&mut self) -> Result<&mut super::PredictionShared<B>, Error> {
-        self.decoder
-            .extended_static_modules_mut()
+        self.static_modules
             .extension
             .as_mut()
             .ok_or_else(|| Error::backend("Qwen prediction has no shared modules"))
@@ -583,22 +582,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Borrows pinned text modules.
     pub const fn static_modules(&self) -> &StaticModules<B> {
-        self.decoder.static_modules()
+        &self.static_modules.base
     }
 
     /// Mutably borrows pinned text modules for checkpoint binding.
     pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
-        self.decoder.static_modules_mut()
+        &mut self.static_modules.base
     }
 
     /// Consumes the text graph and returns its pinned decoder modules.
     pub fn into_static_modules(self) -> StaticModules<B> {
-        self.decoder.into_static_modules()
+        self.static_modules.base
     }
 
     /// Returns the prediction depth count declared by the constructed execution graph.
     pub fn mtp_len(&self) -> usize {
-        self.decoder.prediction_count()
+        self.definition.prediction_groups().len()
     }
 
     /// Returns target plus configured prediction state policy.
@@ -608,10 +607,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Returns replicated or planner-derived mutable state geometry.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| self.state_layout(), Ok)
+        Ok(self.definition.state_layout().clone())
     }
 
     /// Shares authoritative local geometry with placed residency factories.
@@ -627,7 +623,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         if group == 0 {
             let config = self
                 .parallel_geometry
@@ -658,13 +654,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 context,
             )?))
         }
-    }
-
-    pub(crate) fn retain_global_parameters(
-        &mut self,
-        parameters: ArchitectureParameterDescription,
-    ) {
-        self.global_parameters = Some(std::sync::Arc::new(parameters));
     }
 
     pub(crate) fn install_expert_realization(
@@ -714,7 +703,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         let state_index = self.state_index(group, index)?;
         match unit {
             Unit::Target(block) if group == 0 => block.forward_with_provider(
@@ -759,7 +748,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         let state_index = self.state_index(group, index)?;
         match unit {
             Unit::Target(block) if group == 0 => block.forward_parallel(
@@ -785,24 +774,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             ))),
         }
     }
-}
-
-fn static_spec(config: &HybridConfig) -> Result<StaticModuleSpec, Error> {
-    Ok(StaticModuleSpec {
-        normalization_groups: None,
-        embedding_weight: "model.embed_tokens.weight".into(),
-        normalization_weight: "model.norm.weight".into(),
-        head_weight: "lm_head.weight".into(),
-        vocabulary: config.vocab_size,
-        hidden_size: config.hidden_size,
-        normalization_epsilon: config.rms_norm_eps,
-        normalization_offset: 1.0,
-        embedding_quantization: config
-            .linear_format("model.embed_tokens.weight")
-            .weight_quantization(),
-        head_format: config.linear_format("lm_head.weight"),
-        tied_head: config.tie_word_embeddings,
-    })
 }
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
@@ -832,46 +803,45 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            crate::transport::decoder()
-        } else {
-            prediction_group_transport(group)
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated traversal group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn prediction_execution_groups(&self) -> Vec<String> {
-        self.decoder.prediction_execution_groups()
+        self.definition.prediction_groups().to_vec()
     }
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(0, self.target_layers, layout)
+        self.definition.state_partition_plan().clone()
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.decoder.execution_graph()
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.decoder.group_unit_count(group)
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.decoder.unit_path(group, index)
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
-        self.decoder.extended_static_modules()
+        &self.static_modules
     }
 
     fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        self.decoder.extended_static_modules_mut()
+        &mut self.static_modules
     }
 
     fn build_unit(
@@ -912,7 +882,7 @@ where
                 (tokens, Some(hidden), None, ForwardMode::Draft(depth))
             }
         };
-        let embedded = self.decoder.static_modules_mut().embed(tokens, context)?;
+        let embedded = self.static_modules_mut().embed(tokens, context)?;
         let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
         let position_layer = match mode {
             ForwardMode::Target => 0,
@@ -975,7 +945,28 @@ where
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.decoder.begin_group(group, initial, dependencies)
+        let expected = self
+            .definition
+            .parameters()
+            .graph()
+            .dependencies(group)
+            .ok_or_else(|| {
+                Error::from(eredu_runtime::ComponentDefinitionError::Address {
+                    component: self.definition.id().into(),
+                    group,
+                    index: 0,
+                })
+            })?
+            .len();
+        if dependencies.len() != expected {
+            return Err(Error::from(
+                eredu_runtime::ComponentDefinitionError::Invalid {
+                    component: self.definition.id().into(),
+                    resource: format!("dependencies for group {group}"),
+                },
+            ));
+        }
+        Ok(dependencies.first().copied().unwrap_or(initial).clone())
     }
 
     fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
@@ -1094,8 +1085,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match forward.mode {
-            ForwardMode::Target => self.decoder.finish_logits(hidden, context),
-            ForwardMode::Draft(_) => self.decoder.project_logits(hidden, context),
+            ForwardMode::Target => self.static_modules.base.finish_instrumented(
+                hidden,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::disabled(),
+            ),
+            ForwardMode::Draft(_) => self.static_modules.base.project_normalized(hidden, context),
         }
     }
 
@@ -1112,7 +1107,7 @@ where
     {
         if matches!(forward.mode, ForwardMode::Target) {
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.decoder.finish_logits_instrumented(
+            self.static_modules.base.finish_instrumented(
                 hidden,
                 context,
                 &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
@@ -1135,14 +1130,6 @@ where
             forward.target_hidden.as_ref(),
         ])
     }
-}
-
-fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = crate::transport::prediction();
-    if group == 1 {
-        transport.first_owner_static_roles.push("mtp".into());
-    }
-    transport
 }
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
@@ -1221,14 +1208,12 @@ where
         }
         if matches!(forward.mode, ForwardMode::Target) {
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.decoder
-                .static_modules_mut()
-                .finish_parallel_instrumented(
-                    hidden,
-                    parallel,
-                    context,
-                    &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-                )
+            self.static_modules_mut().finish_parallel_instrumented(
+                hidden,
+                parallel,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
         } else {
             self.finish_forward_parallel(hidden, state, forward, parallel, context)
         }
@@ -1268,7 +1253,7 @@ where
             }
         };
         let embedded = B::vocabulary_parallel_lookup(
-            &mut self.decoder.static_modules_mut().embeddings,
+            &mut self.static_modules_mut().embeddings,
             tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
@@ -1343,14 +1328,13 @@ where
         }
         let hidden = match forward.mode {
             ForwardMode::Target => self
-                .decoder
                 .static_modules_mut()
                 .boundary
                 .norm
                 .forward(hidden, context)?,
             ForwardMode::Draft(_) => hidden.clone(),
         };
-        let modules = self.decoder.static_modules_mut();
+        let modules = self.static_modules_mut();
         match &mut modules.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(

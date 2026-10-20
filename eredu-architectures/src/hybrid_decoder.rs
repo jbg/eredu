@@ -3,15 +3,8 @@
 use eredu_nn::{EmbeddingOperator, Error, LinearOperator, NeuralBackend, Tensor};
 
 use crate::decoder::{
-    DecoderBoundary, NormalizedBoundary, SequentialGroup, SequentialPredictionGroups,
-    StaticModules, TARGET_EXECUTION_GROUP,
+    DecoderBoundary, NormalizedBoundary, SequentialGroup, StaticModules, TARGET_EXECUTION_GROUP,
 };
-
-#[derive(Clone)]
-enum HybridExecutionGroups {
-    Target(SequentialGroup),
-    TargetAndPrediction(SequentialPredictionGroups),
-}
 
 /// Pinned decoder modules with architecture-owned shared execution parameters.
 #[derive(Debug, eredu_nn::Parameterized)]
@@ -36,17 +29,17 @@ impl<B: NeuralBackend, E: Clone, D: DecoderBoundary<B> + Clone> Clone
 
 /// Common hybrid execution shell with an optional architecture-owned extension.
 /// Family modules retain their operator policies and block equations; this shell
-/// owns embedding/finalization and the stable target/prediction group lifecycle.
+/// owns embedding/finalization and one stable target group.
 pub struct HybridDecoder<B: NeuralBackend, E = (), D: DecoderBoundary<B> = NormalizedBoundary<B>> {
     static_modules: HybridStaticModules<B, E, D>,
-    groups: HybridExecutionGroups,
+    group: SequentialGroup,
 }
 
 impl<B: NeuralBackend, E: Clone, D: DecoderBoundary<B> + Clone> Clone for HybridDecoder<B, E, D> {
     fn clone(&self) -> Self {
         Self {
             static_modules: self.static_modules.clone(),
-            groups: self.groups.clone(),
+            group: self.group.clone(),
         }
     }
 }
@@ -63,38 +56,7 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> HybridDecoder<B, (), D> {
                 base: static_modules,
                 extension: (),
             },
-            groups: HybridExecutionGroups::Target(SequentialGroup::new(
-                TARGET_EXECUTION_GROUP,
-                parameter_root,
-                units,
-            )?),
-        })
-    }
-
-    /// Owns pinned modules plus target and equally sized appended prediction groups.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_prediction_groups(
-        static_modules: StaticModules<B, D>,
-        target_parameter_root: &'static str,
-        target_units: usize,
-        prediction_parameter_root: &'static str,
-        prediction_groups: usize,
-        prediction_units: usize,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            static_modules: HybridStaticModules {
-                base: static_modules,
-                extension: (),
-            },
-            groups: HybridExecutionGroups::TargetAndPrediction(
-                SequentialPredictionGroups::new_pattern(
-                    target_parameter_root,
-                    target_units,
-                    prediction_parameter_root,
-                    prediction_groups,
-                    prediction_units,
-                )?,
-            ),
+            group: SequentialGroup::new(TARGET_EXECUTION_GROUP, parameter_root, units)?,
         })
     }
 
@@ -105,7 +67,7 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> HybridDecoder<B, (), D> {
                 base: self.static_modules.base,
                 extension,
             },
-            groups: self.groups,
+            group: self.group,
         }
     }
 }
@@ -143,44 +105,17 @@ impl<B: NeuralBackend, E, D: DecoderBoundary<B>> HybridDecoder<B, E, D> {
 
     /// Builds the target execution graph.
     pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        match &self.groups {
-            HybridExecutionGroups::Target(group) => group.execution_graph(),
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.execution_graph(),
-        }
-    }
-
-    /// Returns the number of prediction depths declared by the constructed graph.
-    pub fn prediction_count(&self) -> usize {
-        match &self.groups {
-            HybridExecutionGroups::Target(_) => 0,
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.prediction_count(),
-        }
-    }
-
-    /// Returns stable prediction-group identities in prediction-depth order.
-    pub fn prediction_execution_groups(&self) -> Vec<String> {
-        match &self.groups {
-            HybridExecutionGroups::Target(_) => Vec::new(),
-            HybridExecutionGroups::TargetAndPrediction(groups) => {
-                groups.prediction_execution_groups()
-            }
-        }
+        self.group.execution_graph()
     }
 
     /// Returns the number of units in the target group.
     pub fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match &self.groups {
-            HybridExecutionGroups::Target(target) => target.unit_count(group),
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_count(group),
-        }
+        self.group.unit_count(group)
     }
 
     /// Returns one stable family-owned parameter path after validating its address.
     pub fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        match &self.groups {
-            HybridExecutionGroups::Target(target) => target.unit_path(group, index),
-            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_path(group, index),
-        }
+        self.group.unit_path(group, index)
     }
 
     /// Selects the initial activation for the target group.
@@ -190,12 +125,7 @@ impl<B: NeuralBackend, E, D: DecoderBoundary<B>> HybridDecoder<B, E, D> {
         initial: &T,
         dependencies: &[&T],
     ) -> Result<T, Error> {
-        match &self.groups {
-            HybridExecutionGroups::Target(target) => target.begin(group, initial, dependencies),
-            HybridExecutionGroups::TargetAndPrediction(groups) => {
-                groups.begin(group, initial, dependencies)
-            }
-        }
+        self.group.begin(group, initial, dependencies)
     }
 
     /// Applies the architecture's residual readout and tied or separate vocabulary projection.

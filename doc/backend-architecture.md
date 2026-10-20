@@ -8612,6 +8612,16 @@ still uses native module visitation. Low-level unit parameter descriptions accep
 configuration and validated group coordinates without requiring a materialized
 unit.
 
+Qwen hybrid text construction retains one validated `ComponentDefinition` before
+allocating native static modules. Its graph, invocation paths, parameter owners,
+group transport and state partition plan come from that definition. Local
+construction retains checkpoint-global parameters with planner-derived mutable
+state geometry and materializes the selected vocabulary modules directly.
+Pinned target modules and shared MTP modules have one physical owner in the
+model. Low-level queries preserve the distinction between global state policy
+and the selected local state projection. The target-only `HybridDecoder` shell
+retains one sequential group for its remaining consumers.
+
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden
 values or projects through the actual tied embedding or untied head. Serial,

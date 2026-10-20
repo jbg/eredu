@@ -142,7 +142,6 @@ where
             context,
         )
         .map_err(architecture)?;
-        model.retain_global_parameters(source_parameters);
         model.set_partition_target_start(start);
         Some((model, source_layout))
     } else {
@@ -154,7 +153,6 @@ where
     let mut model =
         crate::qwen::hybrid::LayeredModel::<B>::new_parallel(selected_args, geometry, context)
             .map_err(architecture)?;
-    model.retain_global_parameters(parameters.clone());
     model.set_partition_target_start(start);
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition)
         .map_err(architecture)?;
@@ -302,7 +300,6 @@ where
             context,
         )
         .map_err(architecture)?;
-        model.retain_global_parameters(source_parameters);
         model.set_partition_target_start(start);
         model.install_expert_realization(source_plan);
         Some((model, source_layout))
@@ -315,7 +312,6 @@ where
     let mut model =
         crate::qwen::hybrid::LayeredModel::<B>::new_parallel(selected_args, geometry, context)
             .map_err(architecture)?;
-    model.retain_global_parameters(parameters.clone());
     model.set_partition_target_start(start);
     model.install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
