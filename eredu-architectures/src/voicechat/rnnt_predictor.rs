@@ -420,7 +420,6 @@ pub(crate) fn validate_row<T: Tensor>(
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for RnntPredictorKernel<B> {
-    type State = RnntPredictorRuntimeState<B::Tensor>;
     type Input<'a> = RnntPredictorInput<'a, B::Tensor>;
     type Unit = RnntPredictorUnit<B>;
     type ForwardContext = RnntPredictorForward<B::Tensor>;
@@ -555,7 +554,12 @@ impl<B: NeuralBackend> ComponentEquations<B, RnntPredictorRuntimeState<B::Tensor
     }
 }
 
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for RnntPredictorKernel<B> {
+impl<B: DistributedNeuralBackend>
+    ParallelComponentKernel<
+        B,
+        crate::voicechat::rnnt_predictor::RnntPredictorRuntimeState<B::Tensor>,
+    > for RnntPredictorKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

@@ -249,7 +249,12 @@ impl<B: NeuralBackend> RnntPredictorKernel<B> {
         }
     }
 }
-impl<B: DistributedNeuralBackend> PartitionComponentKernel<B> for RnntPredictorKernel<B> {
+impl<B: DistributedNeuralBackend>
+    PartitionComponentKernel<
+        B,
+        crate::voicechat::rnnt_predictor::RnntPredictorRuntimeState<B::Tensor>,
+    > for RnntPredictorKernel<B>
+{
     type Boundary = RnntPredictorBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, RnntError> {
         RnntPredictorBoundarySchema::new(self.dimensions)
@@ -307,7 +312,12 @@ impl<B: DistributedNeuralBackend> PartitionComponentKernel<B> for RnntPredictorK
         }
     }
 }
-impl<B: DistributedNeuralBackend> PipelineComponentKernel<B> for RnntPredictorKernel<B> {
+impl<B: DistributedNeuralBackend>
+    PipelineComponentKernel<
+        B,
+        crate::voicechat::rnnt_predictor::RnntPredictorRuntimeState<B::Tensor>,
+    > for RnntPredictorKernel<B>
+{
     fn input_dimensions(&self, _: &Self::Input<'_>) -> Result<(i32, i32), RnntError> {
         Ok((1, 1))
     }

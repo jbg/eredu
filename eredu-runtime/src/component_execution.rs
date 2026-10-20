@@ -303,8 +303,6 @@ impl<B: NeuralBackend> RuntimeState<B> for StatelessComponentState {
 /// Typed resource construction and request roots for independently leased modules.
 /// Implementing this trait alone declares no parallel or partition capability.
 pub trait ComponentKernel<B: NeuralBackend> {
-    /// Canonical state profile used for construction; equations may accept other profiles.
-    type State: RuntimeState<B>;
     /// Borrowed typed operation.
     type Input<'a>
     where
@@ -451,10 +449,8 @@ pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKer
 }
 
 /// Explicit parallel equations; availability is enforced by a trait bound.
-pub trait ParallelComponentKernel<
-    B: NeuralBackend,
-    S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
->: ComponentEquations<B, S>
+pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
+    ComponentEquations<B, S>
 {
     /// Explicit coverage of parallel internal equation hooks.
     fn parallel_observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
@@ -721,19 +717,20 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
             })
     }
     /// Constructs the ordinary local-stage traversal from declared state consumers.
-    pub fn into_partition_runtime<B, G, A, P>(
+    pub fn into_partition_runtime<B, S, G, A, P>(
         self,
         policy: P,
         partition: &crate::ArchitecturePartition<G, A>,
     ) -> Result<
-        crate::LayerwisePartitionRuntime<Self, B, K::State, P>,
+        crate::LayerwisePartitionRuntime<Self, B, S, P>,
         crate::LayerwisePartitionConstructionError,
     >
     where
         B: NeuralBackend,
         D: 'static,
         R: ComponentResourceAccess<B, K> + 'static,
-        K: crate::PartitionComponentKernel<B, Boundary = A> + 'static,
+        S: RuntimeState<B>,
+        K: crate::PartitionComponentKernel<B, S, Boundary = A> + 'static,
         A: crate::ArchitectureBoundary,
         P: crate::LayerwisePolicy<B, K::Unit>,
     {

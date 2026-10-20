@@ -359,7 +359,9 @@ impl<B: DistributedNeuralBackend> EncoderKernel<B> {
         })
     }
 }
-impl<B: DistributedNeuralBackend> PartitionComponentKernel<B> for EncoderKernel<B> {
+impl<B: DistributedNeuralBackend>
+    PartitionComponentKernel<B, eredu_runtime::StatelessComponentState> for EncoderKernel<B>
+{
     type Boundary = EncoderBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, Error> {
         EncoderBoundarySchema::new(&self.config)
@@ -442,7 +444,9 @@ impl<B: DistributedNeuralBackend> PartitionComponentKernel<B> for EncoderKernel<
         }
     }
 }
-impl<B: DistributedNeuralBackend> PipelineComponentKernel<B> for EncoderKernel<B> {
+impl<B: DistributedNeuralBackend> PipelineComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for EncoderKernel<B>
+{
     fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         self.request_dimensions(input)
     }

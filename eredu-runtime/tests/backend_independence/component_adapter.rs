@@ -19,7 +19,6 @@ struct Kernel {
     pinned: Option<FakeModule>,
 }
 impl ComponentKernel<FakeBackend> for Kernel {
-    type State = StatelessComponentState;
     type Input<'a> = (&'a FakeTensor, bool);
     type Unit = FakeUnit;
     type ForwardContext = bool;
@@ -461,7 +460,6 @@ struct CarryKernel {
 }
 type CarryState = DeviceState<FakeBackend, RetainedOrdinalLayerState>;
 impl ComponentKernel<FakeBackend> for CarryKernel {
-    type State = CarryState;
     type Input<'a> = &'a FakeTensor;
     type Unit = FakeUnit;
     type ForwardContext = ();
@@ -548,7 +546,7 @@ impl ComponentEquations<FakeBackend, CarryState> for CarryKernel {
     }
 }
 
-impl eredu_runtime::ParallelComponentKernel<FakeBackend> for CarryKernel {
+impl eredu_runtime::ParallelComponentKernel<FakeBackend, CarryState> for CarryKernel {
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -581,7 +579,7 @@ impl eredu_runtime::ParallelComponentKernel<FakeBackend> for CarryKernel {
         self.finish(hidden, state, forward, context)
     }
 }
-impl eredu_runtime::PartitionComponentKernel<FakeBackend> for CarryKernel {
+impl eredu_runtime::PartitionComponentKernel<FakeBackend, CarryState> for CarryKernel {
     type Boundary = NoAuxiliaryBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, Failure> {
         Ok(NoAuxiliaryBoundarySchema::new(1))
@@ -768,7 +766,7 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
     assert!(last.build_unit(0, 0, &()).is_err());
 }
 
-impl eredu_runtime::PipelineComponentKernel<FakeBackend> for CarryKernel {
+impl eredu_runtime::PipelineComponentKernel<FakeBackend, CarryState> for CarryKernel {
     fn input_dimensions(&self, _: &Self::Input<'_>) -> Result<(i32, i32), Failure> {
         Ok((1, 1))
     }

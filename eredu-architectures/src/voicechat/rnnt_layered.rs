@@ -714,7 +714,6 @@ fn rnnt_parameter_description_for_phases(
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
-    type State = StatelessComponentState;
     type Input<'a> = RnntInput<'a, B::Tensor>;
     type Unit = RnntUnit<B>;
     type ForwardContext = RnntForward<B::Tensor>;
@@ -1068,7 +1067,9 @@ impl<B: DistributedNeuralBackend> RnntKernel<B> {
         Ok(())
     }
 }
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for RnntKernel<B> {
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for RnntKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

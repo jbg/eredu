@@ -593,7 +593,6 @@ fn perception_graph() -> Result<ExecutionGraph, PerceptionError> {
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for PerceptionKernel<B> {
-    type State = PerceptionRuntimeState<B::Tensor>;
     type Input<'a> = PerceptionInput<'a, B::Tensor>;
     type Unit = PerceptionUnit<B>;
     type ForwardContext = PerceptionForward<B::Tensor>;
@@ -834,7 +833,12 @@ impl<B: NeuralBackend> PerceptionKernel<B> {
     }
 }
 
-impl<B: NeuralBackend> ParallelComponentKernel<B> for PerceptionKernel<B> {
+impl<B: NeuralBackend>
+    ParallelComponentKernel<
+        B,
+        crate::voicechat::perception_layered::PerceptionRuntimeState<B::Tensor>,
+    > for PerceptionKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

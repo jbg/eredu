@@ -16,10 +16,8 @@ pub struct ComponentPartitionContext<'a, B: NeuralBackend> {
 }
 
 /// Explicit typed ingress and egress capability for partitioned components.
-pub trait PartitionComponentKernel<
-    B: NeuralBackend,
-    S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
->: ParallelComponentKernel<B, S>
+pub trait PartitionComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
+    ParallelComponentKernel<B, S>
 {
     /// Explicit internal observation coverage for the selected partition call path.
     fn partition_observation_hooks(
@@ -115,10 +113,8 @@ pub trait PartitionComponentKernel<
 }
 
 /// Pipeline request geometry and semantic transport conversion.
-pub trait PipelineComponentKernel<
-    B: NeuralBackend,
-    S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
->: PartitionComponentKernel<B, S>
+pub trait PipelineComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
+    PartitionComponentKernel<B, S>
 {
     /// Request extents used to resolve the wire schema.
     fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error>;

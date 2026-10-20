@@ -721,7 +721,6 @@ pub fn tts_transformer_parameter_description(
     )?)
 }
 impl<B: NeuralBackend> ComponentKernel<B> for TransformerKernel<B> {
-    type State = TransformerStateMarker<B>;
     type Input<'a> = TransformerInput<'a, B::Tensor>;
     type Unit = TransformerUnit<B>;
     type ForwardContext = TransformerForward<B::Tensor>;

@@ -700,7 +700,6 @@ pub fn rvq_parameter_description(
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {
-    type State = StatelessComponentState;
     type Input<'a> = RvqInput<'a, B::Tensor>;
     type Unit = RvqUnit<B>;
     type ForwardContext = RvqForward<B::Tensor>;
@@ -1005,7 +1004,9 @@ impl<B: DistributedNeuralBackend> RvqKernel<B> {
         }
     }
 }
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for RvqKernel<B> {
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for RvqKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

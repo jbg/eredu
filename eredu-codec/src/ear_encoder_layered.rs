@@ -370,7 +370,6 @@ pub fn encoder_parameter_description(
     )?)
 }
 impl<B: NeuralBackend> ComponentKernel<B> for EncoderKernel<B> {
-    type State = StatelessComponentState;
     type Input<'a> = &'a B::Tensor;
     type Unit = EncoderUnit<B::Tensor>;
     type ForwardContext = EncoderForward;
@@ -552,7 +551,9 @@ impl<B: DistributedNeuralBackend> EncoderKernel<B> {
         Ok(B::sum_parallel(full, parallel, context)?)
     }
 }
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for EncoderKernel<B> {
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for EncoderKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

@@ -671,7 +671,6 @@ pub fn conditioning_parameter_description(
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {
-    type State = StatelessComponentState;
     type Input<'a> = ConditioningInput<B::Tensor>;
     type Unit = ConditioningUnit<B>;
     type ForwardContext = ConditioningForward<B::Tensor>;
@@ -1215,7 +1214,9 @@ fn gather_features<B: DistributedNeuralBackend>(
     )?)
 }
 
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for ConditioningKernel<B> {
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for ConditioningKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

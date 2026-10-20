@@ -410,7 +410,12 @@ impl<T: Tensor> PerceptionRuntimeState<T> {
     }
 }
 
-impl<B: NeuralBackend> eredu_runtime::PartitionComponentKernel<B> for PerceptionKernel<B> {
+impl<B: NeuralBackend>
+    eredu_runtime::PartitionComponentKernel<
+        B,
+        crate::voicechat::perception_layered::PerceptionRuntimeState<B::Tensor>,
+    > for PerceptionKernel<B>
+{
     type Boundary = PerceptionBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, PerceptionError> {
         Ok(PerceptionBoundarySchema::new(self.dimensions))
@@ -516,7 +521,12 @@ impl<B: NeuralBackend> eredu_runtime::PartitionComponentKernel<B> for Perception
     }
 }
 
-impl<B: NeuralBackend> eredu_runtime::PipelineComponentKernel<B> for PerceptionKernel<B> {
+impl<B: NeuralBackend>
+    eredu_runtime::PipelineComponentKernel<
+        B,
+        crate::voicechat::perception_layered::PerceptionRuntimeState<B::Tensor>,
+    > for PerceptionKernel<B>
+{
     fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), PerceptionError> {
         self.encoded_dimensions(input)
     }

@@ -493,7 +493,6 @@ pub fn quantizer_parameter_description(
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {
-    type State = StatelessComponentState;
     type Input<'a> = QuantizerInput<'a, B::Tensor>;
     type Unit = Codebook<B::Tensor>;
     type ForwardContext = QuantizerForward<B::Tensor>;
@@ -721,7 +720,9 @@ impl<B: DistributedNeuralBackend> QuantizerKernel<B> {
         )
     }
 }
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for QuantizerKernel<B> {
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for QuantizerKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

@@ -499,7 +499,6 @@ pub fn mog_parameter_description(
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {
-    type State = StatelessComponentState;
     type Input<'a> = MogInput<'a, B::Tensor>;
     type Unit = MogUnit<B>;
     type ForwardContext = MogForward<B::Tensor>;
@@ -811,7 +810,9 @@ impl<B: DistributedNeuralBackend> MogKernel<B> {
     }
 }
 
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for MogKernel<B> {
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for MogKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

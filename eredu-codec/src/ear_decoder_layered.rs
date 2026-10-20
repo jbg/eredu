@@ -482,7 +482,6 @@ pub fn decoder_parameter_description(
     )?)
 }
 impl<B: NeuralBackend> ComponentKernel<B> for DecoderKernel<B> {
-    type State = DecoderRuntimeState<B::Tensor>;
     type Input<'a> = &'a B::Tensor;
     type Unit = DecoderUnit<B::Tensor>;
     type ForwardContext = DecoderForward;
@@ -671,7 +670,10 @@ impl<B: DistributedNeuralBackend> DecoderKernel<B> {
         Ok(B::sum_parallel(full, parallel, context)?)
     }
 }
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for DecoderKernel<B> {
+impl<B: DistributedNeuralBackend>
+    ParallelComponentKernel<B, crate::ear_decoder_layered::DecoderRuntimeState<B::Tensor>>
+    for DecoderKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

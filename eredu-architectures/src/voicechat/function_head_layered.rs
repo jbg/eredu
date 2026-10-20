@@ -474,7 +474,6 @@ pub fn function_head_parameter_description(
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
-    type State = StatelessComponentState;
     type Input<'a> = &'a B::Tensor;
     type Unit = FunctionHead<B>;
     type ForwardContext = ();
@@ -604,7 +603,9 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Functi
     }
 }
 
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for FunctionHeadKernel<B> {
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for FunctionHeadKernel<B>
+{
     fn begin_parallel<'a>(
         &mut self,
         hidden: Self::Input<'a>,

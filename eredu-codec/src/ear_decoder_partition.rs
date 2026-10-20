@@ -610,7 +610,10 @@ impl<B: DistributedNeuralBackend> DecoderKernel<B> {
         })
     }
 }
-impl<B: DistributedNeuralBackend> PartitionComponentKernel<B> for DecoderKernel<B> {
+impl<B: DistributedNeuralBackend>
+    PartitionComponentKernel<B, crate::ear_decoder_layered::DecoderRuntimeState<B::Tensor>>
+    for DecoderKernel<B>
+{
     type Boundary = DecoderBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, Error> {
         DecoderBoundarySchema::new(&self.config)
@@ -703,7 +706,10 @@ impl<B: DistributedNeuralBackend> PartitionComponentKernel<B> for DecoderKernel<
         }
     }
 }
-impl<B: DistributedNeuralBackend> PipelineComponentKernel<B> for DecoderKernel<B> {
+impl<B: DistributedNeuralBackend>
+    PipelineComponentKernel<B, crate::ear_decoder_layered::DecoderRuntimeState<B::Tensor>>
+    for DecoderKernel<B>
+{
     fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         self.request_dimensions(input)
     }
