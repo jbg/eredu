@@ -647,7 +647,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &mut self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<Option<super::ExpertProviderDescriptor>, Error> {
-        let realization = super::expert_realization_plan(self, topology)?;
+        let realization =
+            super::expert_realization_plan(&self.args, self.parallel_geometry(), topology)?;
         if let Some(realization) = realization {
             self.install_expert_realization(realization);
         }

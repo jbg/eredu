@@ -47,46 +47,29 @@ pub fn replicated_expert_realization_plan(
             "Nemotron-H replicated routed text requires target-only sparse units",
         ));
     }
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
-    let target_group =
-        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
-    let unit_specs = args
-        .layer_schedule
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(_, policy)| *policy == LayerPolicy::SparseMoe)
-        .map(|(layer, _)| {
-            localized_expert_bank_spec(
-                args,
-                layer,
-                args.n_routed_experts,
-                args.moe_intermediate_size,
-            )
-            .map(|spec| ((target_group.clone(), layer), spec))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(
-        global_experts,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
-            0,
-        )
-        .map_err(eredu_nn::Error::backend)?,
-        unit_specs,
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
+        0,
     )
-    .map_err(eredu_nn::Error::backend)
+    .map_err(eredu_nn::Error::backend)?;
+    expert_realization_plan(args, None, topology)?.ok_or_else(|| {
+        eredu_nn::Error::backend("Nemotron-H replicated routed text has no expert realization")
+    })
 }
 
-/// Derives complete expert ownership and rank-local ReLU-squared bank geometry.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
+/// Derives complete expert ownership and rank-local ReLU-squared bank geometry
+/// from normalized configuration and optional validated local geometry.
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>, eredu_nn::Error> {
-    let args = architecture.args();
+    args.validate().map_err(eredu_nn::Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(args)
+            .map_err(eredu_nn::Error::backend)?;
+    }
     if !args.has_sparse_moe_layers() {
         return Ok(None);
     }
@@ -110,10 +93,7 @@ pub fn expert_realization_plan<
         if policy != LayerPolicy::SparseMoe {
             continue;
         }
-        let width = match architecture
-            .parallel_geometry()
-            .and_then(|geometry| geometry.target_unit(layer))
-        {
+        let width = match geometry.and_then(|geometry| geometry.target_unit(layer)) {
             Some(LayerGeometry::SparseMoe { routed, .. }) => *routed,
             Some(_) => {
                 return Err(eredu_nn::Error::backend(
@@ -151,10 +131,7 @@ pub fn expert_realization_plan<
         let unit = physical % pattern;
         let group = eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
             .map_err(eredu_nn::Error::backend)?;
-        let width = match architecture
-            .parallel_geometry()
-            .and_then(|geometry| geometry.prediction_unit(physical))
-        {
+        let width = match geometry.and_then(|geometry| geometry.prediction_unit(physical)) {
             Some(LayerGeometry::SparseMoe { routed, .. }) => *routed,
             Some(_) => {
                 return Err(eredu_nn::Error::backend(

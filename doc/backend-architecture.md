@@ -8576,6 +8576,15 @@ geometry independently of the state profile. These hooks do not grant prediction
 execution support; explicit family preparation and target contracts admit that
 operation. Captured roots remain in the ordinary forward-retention lifecycle.
 
+Nemotron-H derives expert ownership and rank-local ReLU-squared bank
+specifications from normalized `ModelArgs`, optional validated `LocalGeometry`
+and neutral rank topology. Target units and repeated prediction patterns retain
+separate group-relative invocation addresses and flattened bank identities.
+Replicated planning uses the same derivation. Selected and transform-source
+preparation consume these plans without constructing a native model for expert
+planning. The backend materializes the declared banks and supplies provider
+resources.
+
 Selected Nemotron-H targets use `ComponentAdapter` with `NemotronKernel`.
 The validated definition retains graph, canonical parameters, global unit paths,
 state references and transport class. The kernel retains exact Mamba/KV geometry,

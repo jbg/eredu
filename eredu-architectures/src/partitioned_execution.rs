@@ -11766,21 +11766,16 @@ where
             "routed Nemotron-H admission names a different execution group".into(),
         ));
     }
-    let plan_model = crate::nemotron_h::LayeredModel::<B>::new_parallel(
-        selected_args.clone(),
-        crate::nemotron_h::local_geometry(&selected_args, &layout).map_err(|error| {
-            DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-        })?,
-        context,
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let plan = crate::nemotron_h::expert_realization_plan(&plan_model, rank)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
-        .ok_or_else(|| {
-            DenseDecoderPartitionedDispatchError::Architecture(
-                "routed Nemotron-H has no selected expert realization".into(),
-            )
-        })?;
+    let plan_geometry = crate::nemotron_h::local_geometry(&selected_args, &layout)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let plan =
+        crate::nemotron_h::expert_realization_plan(&selected_args, Some(&plan_geometry), rank)
+            .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
+            .ok_or_else(|| {
+                DenseDecoderPartitionedDispatchError::Architecture(
+                    "routed Nemotron-H has no selected expert realization".into(),
+                )
+            })?;
     let geometry = crate::nemotron_h::partition_local_routed_geometry(
         &selected_args,
         &layout,
@@ -11828,17 +11823,12 @@ where
                 "routed Nemotron transform source changed local state geometry".into(),
             ));
         }
-        let source_plan_model = crate::nemotron_h::LayeredModel::<B>::new_parallel(
-            source_args.clone(),
-            source_local,
-            context,
-        )
-        .map_err(|e| error(e.to_string()))?;
-        let source_plan = crate::nemotron_h::expert_realization_plan(&source_plan_model, rank)
-            .map_err(|e| error(e.to_string()))?
-            .ok_or_else(|| {
-                error("routed Nemotron transform source has no expert realization".into())
-            })?;
+        let source_plan =
+            crate::nemotron_h::expert_realization_plan(&source_args, Some(&source_local), rank)
+                .map_err(|e| error(e.to_string()))?
+                .ok_or_else(|| {
+                    error("routed Nemotron transform source has no expert realization".into())
+                })?;
         let source_geometry = crate::nemotron_h::partition_local_routed_geometry(
             &source_args,
             &source_layout,
