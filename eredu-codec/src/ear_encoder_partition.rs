@@ -2,8 +2,7 @@
 use crate::{
     ear_encoder::{invalid, EncoderConfig, EncoderUnitSpec},
     ear_encoder_layered::{
-        encoder_local_dimensions, encoder_parameter_description, encoder_state_layout,
-        EncoderArchitecture, EncoderForward, EncoderRuntimeState,
+        encoder_local_dimensions, encoder_parameter_description, EncoderForward, EncoderKernel,
     },
     Error,
 };
@@ -11,10 +10,10 @@ use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementTyp
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
     ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype,
-    BoundaryTensorSpec, CommunicationRouteId, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, LocalModelLayout, PartitionBoundaryRoute,
-    PartitionedLayeredArchitecture, PipelinePartitionArchitecture, ResolvedBoundaryWireSchema,
-    StateLayout,
+    BoundaryTensorSpec, CommunicationRouteId, ComponentAdapter, ComponentDefinition,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, LocalModelLayout,
+    PartitionBoundaryRoute, PartitionComponentKernel, PipelineComponentKernel,
+    ResolvedBoundaryWireSchema, StatelessComponentState,
 };
 use std::{collections::BTreeMap, ops::Range};
 
@@ -251,7 +250,7 @@ pub fn validate_encoder_partition<G>(
     }
     ownership(config, prefix, partition).map(|_| ())
 }
-impl<B: NeuralBackend> EncoderArchitecture<B> {
+impl<B: NeuralBackend> EncoderKernel<B> {
     /// Selects exact unit ownership and retained route geometry for one pipeline stage.
     pub fn new_partition<G>(
         config: EncoderConfig,
@@ -259,7 +258,7 @@ impl<B: NeuralBackend> EncoderArchitecture<B> {
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, EncoderBoundarySchema>,
         cuts: &EncoderPipelineCuts,
-    ) -> Result<Self, Error> {
+    ) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
         let range = ownership(&config, prefix, partition)?;
         if cuts.schema != EncoderBoundarySchema::new(&config)? {
             return Err(invalid("encoder pipeline cuts belong to another geometry"));
@@ -272,18 +271,9 @@ impl<B: NeuralBackend> EncoderArchitecture<B> {
             range,
             cuts: cuts.clone(),
         });
-        Ok(value)
+        Ok(value.into_component()?.select_partition(partition)?)
     }
-    pub(crate) fn require_owned(&self, group: usize, index: usize) -> Result<(), Error> {
-        if self
-            .partition
-            .as_ref()
-            .is_some_and(|selected| group != 0 || !selected.range.contains(&index))
-        {
-            return Err(invalid("encoder unit is outside selected stage ownership"));
-        }
-        Ok(())
-    }
+
     fn selected(&self) -> Result<&EncoderPartition, Error> {
         self.partition
             .as_ref()
@@ -300,23 +290,18 @@ impl<B: NeuralBackend> EncoderArchitecture<B> {
         Ok((spectrum.dim(0), spectrum.dim(2)))
     }
 }
-impl<B: DistributedNeuralBackend> EncoderArchitecture<B> {
+impl<B: DistributedNeuralBackend> EncoderKernel<B> {
     /// Validates request identity and transported cut before any learned unit is acquired.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_prepared_partition(
         &self,
         input: LayeredPartitionInput<'_, B::Tensor, EncoderBoundary<B::Tensor>>,
         request: Option<(i32, i32)>,
-        state: &EncoderRuntimeState,
-        expected: Option<&StateLayout>,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, EncoderForward>, Error> {
         let selected = self.selected()?;
-        if expected.is_some()
-            || state.layout != encoder_state_layout()?
-            || self.is_parallel() != parallel.is_some()
-        {
+        if self.is_parallel() != parallel.is_some() {
             return Err(invalid(
                 "encoder partition state or collective selection differs",
             ));
@@ -374,50 +359,30 @@ impl<B: DistributedNeuralBackend> EncoderArchitecture<B> {
         })
     }
 }
-impl<B: DistributedNeuralBackend> PartitionedLayeredArchitecture<B, EncoderRuntimeState>
-    for EncoderArchitecture<B>
-{
+impl<B: DistributedNeuralBackend> PartitionComponentKernel<B> for EncoderKernel<B> {
     type Boundary = EncoderBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, Error> {
         EncoderBoundarySchema::new(&self.config)
     }
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, EncoderBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, EncoderBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
-        state: &mut EncoderRuntimeState,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        _: &mut StatelessComponentState,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, EncoderForward>, Error> {
-        if mask.is_some() || first != 0 || expected != &encoder_state_layout()? {
+        if mask.is_some() || selected.first_state_ordinal != 0 || selected.expected.is_some() {
             return Err(invalid(
                 "finite encoder partition has no mask or mutable state origin",
             ));
         }
-        self.begin_prepared_partition(input, None, state, None, None, context)
+        self.begin_prepared_partition(input, None, selected.parallel, selected.native)
     }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, EncoderBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut EncoderRuntimeState,
-        expected: &StateLayout,
-        first: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, EncoderForward>, Error> {
-        if mask.is_some() || first != 0 || expected != &encoder_state_layout()? {
-            return Err(invalid(
-                "finite encoder partition has no mask or mutable state origin",
-            ));
-        }
-        self.begin_prepared_partition(input, None, state, None, Some(parallel), context)
-    }
+
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
-        _: &mut EncoderRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &EncoderForward,
         owns_output: bool,
         parallel: Option<&B::ParallelContext>,
@@ -477,27 +442,22 @@ impl<B: DistributedNeuralBackend> PartitionedLayeredArchitecture<B, EncoderRunti
         }
     }
 }
-impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, EncoderRuntimeState>
-    for EncoderArchitecture<B>
-{
-    fn partition_input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
+impl<B: DistributedNeuralBackend> PipelineComponentKernel<B> for EncoderKernel<B> {
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         self.request_dimensions(input)
     }
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, EncoderBoundary<B::Tensor>)>,
-        state: &mut EncoderRuntimeState,
-        expected: Option<&StateLayout>,
-        first: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        _: &mut StatelessComponentState,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         _: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, EncoderForward>, Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        if first != 0 {
+        if selected.first_state_ordinal != 0 {
             return Err(invalid(
                 "finite encoder pipeline has no nonlocal mutable state origin",
             ));
@@ -507,12 +467,12 @@ impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, EncoderRuntim
             Some((hidden, auxiliary)) => LayeredPartitionInput::Hidden { hidden, auxiliary },
             None => LayeredPartitionInput::Tokens(input),
         };
-        self.begin_prepared_partition(ingress, Some(request), state, expected, parallel, context)
+        self.begin_prepared_partition(ingress, Some(request), selected.parallel, selected.native)
     }
-    fn partition_output_width(&self) -> i32 {
+    fn output_width(&self) -> i32 {
         self.config.latent_size
     }
-    fn partition_output_shape(
+    fn output_shape(
         &self,
         _: &Self::Input<'_>,
         batch: i32,
@@ -529,10 +489,7 @@ impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, EncoderRuntim
             self.config.latent_size,
         ])
     }
-    fn partition_boundary_schema(
-        &self,
-        route: &PartitionBoundaryRoute,
-    ) -> Result<Self::Boundary, Error> {
+    fn route_schema(&self, route: &PartitionBoundaryRoute) -> Result<Self::Boundary, Error> {
         if route.source_group != 0 || route.destination_group != 0 {
             return Err(invalid(
                 "encoder route refers to an unknown execution group",
@@ -540,19 +497,16 @@ impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, EncoderRuntim
         }
         self.selected()?.cuts.schema(route.route)
     }
-    fn partition_resolved_boundary_schema(
+    fn resolved_route_schema(
         &self,
         route: &PartitionBoundaryRoute,
         batch: i32,
         sequence: i32,
     ) -> Result<ResolvedBoundaryWireSchema, Error> {
-        self.partition_boundary_schema(route)?
-            .resolve(batch, sequence)
+        self.route_schema(route)?.resolve(batch, sequence)
     }
-    fn partition_retained_state_ordinals(&self, _: usize, _: usize, _: usize) -> Range<usize> {
-        0..0
-    }
-    fn partition_tensor_vocabulary_sharded(&self) -> bool {
+
+    fn tensor_vocabulary_sharded(&self) -> bool {
         false
     }
 }

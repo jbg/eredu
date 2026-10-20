@@ -1,12 +1,12 @@
 //! Native finite EAR encoder stages over shared pipeline transport and completion.
 
 use eredu_codec::{
-    ear_encoder_distribution::PreparedEncoderPipelineBindings,
-    ear_encoder_layered::{EncoderArchitecture, EncoderRuntimeState},
+    ear_encoder_distribution::PreparedEncoderPipelineBindings, ear_encoder_layered::EncoderKernel,
 };
 use eredu_core::{BackendFailure, DistributedCommitEpoch, DistributedCommitOutcome};
 use eredu_runtime::{
     DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, ResidencyReport,
+    StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
@@ -15,12 +15,15 @@ use crate::{
     MlxTensor,
 };
 
-type Architecture = EncoderArchitecture<MlxNeuralBackend>;
+type Architecture = eredu_runtime::ComponentAdapter<
+    eredu_runtime::ComponentDefinition,
+    EncoderKernel<MlxNeuralBackend>,
+>;
 
 /// One codec-selected finite encoder stage. The shared distributed driver owns
 /// parameter leases, transport, exact completion and commit agreement.
 pub struct MlxEarEncoderPipeline {
-    execution: MlxComponentPipeline<Architecture, EncoderRuntimeState>,
+    execution: MlxComponentPipeline<Architecture, StatelessComponentState>,
 }
 impl MlxEarEncoderPipeline {
     /// Current residency accounting for exactly the selected stage parameters.
@@ -44,7 +47,7 @@ impl MlxEarEncoderPipeline {
         epoch: DistributedCommitEpoch,
         stream: &Stream,
     ) -> Result<(MlxTensor, DistributedCommitOutcome), BackendFailure> {
-        let mut state = EncoderRuntimeState::new().map_err(BackendFailure::from_error)?;
+        let mut state = StatelessComponentState::new().map_err(BackendFailure::from_error)?;
         self.execution.forward(
             spectrum,
             &mut state,
@@ -71,7 +74,7 @@ pub fn materialize_ear_encoder_pipeline(
         prepared.into_parts();
     let (config, prefix, local_layout, source, units) = prepared.into_parts();
     let architecture =
-        Architecture::new_partition(config, &prefix, local_layout.as_ref(), &partition, &cuts)
+        EncoderKernel::new_partition(config, &prefix, local_layout.as_ref(), &partition, &cuts)
             .map_err(BackendFailure::from_error)?;
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,

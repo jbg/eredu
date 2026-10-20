@@ -105,6 +105,21 @@ pub trait PipelineComponentKernel<
     fn route_schema(&self, _route: &PartitionBoundaryRoute) -> Result<Self::Boundary, Self::Error> {
         self.boundary_schema()
     }
+    /// Resolves route extents for request cadence while preserving the typed wire roles.
+    fn resolved_route_schema(
+        &self,
+        route: &PartitionBoundaryRoute,
+        batch: i32,
+        sequence: i32,
+    ) -> Result<ResolvedBoundaryWireSchema, Self::Error>
+    where
+        Self::Error: From<eredu_nn::Error>,
+    {
+        self.route_schema(route)?
+            .wire_schema()
+            .and_then(|schema| schema.resolve(batch, sequence))
+            .map_err(|error| eredu_nn::Error::backend_source(error).into())
+    }
     /// Whether selected vocabulary shards require sum/gather publication.
     fn tensor_vocabulary_sharded(&self) -> bool;
 }
@@ -133,13 +148,14 @@ where
         first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
-        self.validate_partition_state(state.optional_layout(), Some(Some(expected)), None)?;
+        let expected = self.partition_entry_layout(Some(expected));
+        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
         self.kernel_mut().begin_partition(
             input,
             mask,
             state,
             ComponentPartitionContext {
-                expected: Some(expected),
+                expected,
                 first_state_ordinal,
                 parallel: None,
                 native: context,
@@ -160,13 +176,14 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
-        self.validate_partition_state(state.optional_layout(), Some(Some(expected)), None)?;
+        let expected = self.partition_entry_layout(Some(expected));
+        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
         self.kernel_mut().begin_partition(
             input,
             mask,
             state,
             ComponentPartitionContext {
-                expected: Some(expected),
+                expected,
                 first_state_ordinal,
                 parallel: Some(parallel),
                 native: context,
@@ -263,6 +280,17 @@ where
         route: &PartitionBoundaryRoute,
     ) -> Result<Self::Boundary, K::Error> {
         self.kernel().route_schema(route)
+    }
+    fn partition_resolved_boundary_schema(
+        &self,
+        route: &PartitionBoundaryRoute,
+        batch: i32,
+        sequence: i32,
+    ) -> Result<ResolvedBoundaryWireSchema, K::Error>
+    where
+        K::Error: From<eredu_nn::Error>,
+    {
+        self.kernel().resolved_route_schema(route, batch, sequence)
     }
     fn partition_retained_state_ordinals(
         &self,

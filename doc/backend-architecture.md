@@ -702,7 +702,7 @@ adapter rejects pinned parameter declarations; it does not infer missing
 capabilities from equation defaults.
 
 VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception,
-the TTS transformer and codec PRVQ
+the TTS transformer, codec PRVQ and the finite EAR encoder
 use this adapter with their typed kernels and runtime-owned empty pinned modules.
 Components without mutable state use shared stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
 bank-to-projection embedding operation. PRVQ retains selected depth ranges and
@@ -1475,6 +1475,14 @@ agreement. Restricted stage source views retain only owned recipes. Combined
 TP/PP selection verifies that tensor participants own the same unit range.
 The MLX adapter binds these retained contracts through `MlxComponentPipeline`.
 Spectral preprocessing and borrowed quantization remain separate components.
+
+`encoder_component_definition` retains the finite encoder's canonical unit paths,
+parameter owners and stateless transport declaration. `EncoderKernel` supplies
+geometry, equations and route-specific channel/cadence resolution through
+`ComponentAdapter`; full and pipeline construction use that same kernel. Empty
+pinned modules and stateless traversal metadata belong to the runtime. The shared
+pipeline adapter consumes typed route resolution instead of assuming request and
+intermediate frame counts are identical.
 
 An empty architecture state partition plan is valid only when every complete
 layout entry is `NoState`; it selects no local state on any stage. Layouts with

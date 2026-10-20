@@ -2,16 +2,14 @@
 
 use eredu_codec::{
     ear_encoder::{EncoderConfig, EncoderUnit},
-    ear_encoder_layered::{
-        EncoderArchitecture, EncoderExecution, EncoderRuntimeState, LayerwiseEncoder,
-    },
+    ear_encoder_layered::{EncoderExecution, EncoderKernel, LayerwiseEncoder},
     ear_encoder_preparation::PreparedEncoderBindings,
     Error,
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
     DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport,
+    ResidencyReport, StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
@@ -149,16 +147,17 @@ fn materialize(
             let (config, prefix, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
                 Some(local) => {
-                    EncoderArchitecture::<MlxNeuralBackend>::new_parallel(config, &prefix, local)
+                    EncoderKernel::<MlxNeuralBackend>::new_parallel(config, &prefix, local)
                 }
-                None => EncoderArchitecture::<MlxNeuralBackend>::new(config, &prefix),
+                None => EncoderKernel::<MlxNeuralBackend>::new(config, &prefix),
             }
+            .and_then(EncoderKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<EncoderRuntimeState>,
+                std::marker::PhantomData::<StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -173,7 +172,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<EncoderRuntimeState>,
+                        std::marker::PhantomData::<StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseEncoder::new(architecture, policy))

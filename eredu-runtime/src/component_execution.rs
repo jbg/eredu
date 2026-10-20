@@ -580,6 +580,21 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
             state_groups.contains(&group)
         })
     }
+    pub(crate) fn partition_entry_layout<'a>(
+        &self,
+        expected: Option<&'a StateLayout>,
+    ) -> Option<&'a StateLayout> {
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.state.is_none())
+            && expected == Some(&self.definition().state)
+        {
+            None
+        } else {
+            expected
+        }
+    }
     pub(crate) fn validate_partition_state(
         &self,
         actual: Option<&StateLayout>,
