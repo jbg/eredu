@@ -367,7 +367,10 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         let input = BackboneInput::prepare(
             fusion,
-            self.runtime.architecture_mut().static_modules_mut(),
+            self.runtime
+                .architecture_mut()
+                .kernel_mut()
+                .static_modules_mut(),
             request,
             context,
         )?;
@@ -384,6 +387,7 @@ where
         Ok(self
             .runtime
             .architecture_mut()
+            .kernel_mut()
             .static_modules_mut()
             .project_normalized(normalized, context)?)
     }
@@ -437,7 +441,11 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let modules = self.runtime.architecture_mut().static_modules_mut();
+        let modules = self
+            .runtime
+            .architecture_mut()
+            .kernel_mut()
+            .static_modules_mut();
         let input = match self.ingress_agreement.as_deref_mut() {
             Some(agree) => BackboneInput::prepare_parallel_guarded(
                 fusion,
@@ -464,6 +472,7 @@ where
         Ok(self
             .runtime
             .architecture_mut()
+            .kernel_mut()
             .static_modules_mut()
             .project_normalized_parallel(normalized, self.parallel, context)?)
     }

@@ -346,6 +346,16 @@ impl<B: NeuralBackend> RuntimeState<B> for StatelessComponentState {
 /// Typed resource construction and request roots for independently leased modules.
 /// Implementing this trait alone declares no parallel or partition capability.
 pub trait ComponentKernel<B: NeuralBackend> {
+    /// Family-authored checkpoint rewrites for pinned canonical resources.
+    fn static_parameter_recipes(
+        &self,
+        _source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        Ok(std::collections::BTreeMap::new())
+    }
     /// Borrowed typed operation.
     type Input<'a>
     where
@@ -970,6 +980,15 @@ where
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, K::Error> {
         Ok(self.definition().parameters.clone())
+    }
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        self.kernel.static_parameter_recipes(source)
     }
     fn visit_static_parameters<V: StaticParameterVisitor<B>>(
         &self,

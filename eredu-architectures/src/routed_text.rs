@@ -1479,14 +1479,14 @@ where
         ));
     };
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::nemotron_h::LayeredModel::<B>::new(args.clone(), context))
+        .then(|| crate::nemotron_h::CompleteNemotronKernel::<B>::new(args.clone(), context))
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_nemotron_h_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::nemotron_h::LayeredModel::<B>::new(selected_args, context)
+    let architecture = crate::nemotron_h::CompleteNemotronKernel::<B>::new(selected_args, context)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::nemotron_h(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;

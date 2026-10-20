@@ -8588,14 +8588,25 @@ formats and packed ReLU-squared bank geometry into exact physical companions;
 family code retains checkpoint identities and format policy. Full metadata and
 selected/source preparation consume the same cold declaration.
 
-Full Nemotron-H construction retains a validated `ComponentDefinition` before
-allocating pinned modules. Complete and selected views use the same definition
-builder. Graphs, parameter ownership, primary/prediction groups, transport,
+Full Nemotron-H execution uses `ComponentAdapter` with
+`CompleteNemotronKernel`. The adapter and its low-level kernel share one retained
+`Arc<ComponentDefinition>`; construction validates it before allocating pinned
+modules. Graphs, parameter ownership, primary/prediction groups, transport,
 invocation paths and state slots project from that definition. Target state
 follows pipeline unit ownership; appended prediction state belongs to the output
-owner. Rank-local construction retains its exact local state geometry in the
-definition while the explicit ordinary state-layout operation returns global
-geometry. Group assembly validates dependencies against the retained graph.
+owner. Rank-local construction retains exact local state geometry, while the
+explicit ordinary state-layout operation returns global geometry. Group assembly
+receives dependency activations after shared adapter validation.
+
+Complete kernels retain target/draft selection, embedding ingress, patterned MTP
+factories, provider geometry and draft readout without target normalization.
+Resident, bounded, text and observed drivers use the shared adapter. Explicit
+observation reports preserve the admitted coverage of complete and selected
+kernels. Pinned roles borrow actual module owners, and family checkpoint rewrites
+reach binding through the shared kernel recipe hook. Low-level partition and
+prediction primitives remain on `kernel_mut()`; driver-facing partition calls
+require retained selection. VoiceChat backbone and materialized prediction
+composition consume these same adapter/resource contracts.
 
 Nemotron-H derives expert ownership and rank-local ReLU-squared bank
 specifications from normalized `ModelArgs`, optional validated `LocalGeometry`
@@ -8617,8 +8628,8 @@ adapter validates selected ownership and addresses, visits borrowed canonical
 pinned roles and projects retained state slots. Low-level prediction embedding
 and projection operations use the actual modules through `kernel_mut()`.
 Existing materialized prediction extensions consume these target hooks through
-the same typed composition contracts. Full embedded-prediction execution retains
-its family equations and preparation.
+the same typed composition contracts. Embedded prediction retains its typed
+family equations, conditional group selection and prepared state.
 
 Complete and selected Kimi Linear execution use `ComponentAdapter` over the same
 `KimiKernel`. Typed complete and partition geometry retain global invocation

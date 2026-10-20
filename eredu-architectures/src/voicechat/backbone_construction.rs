@@ -145,7 +145,7 @@ impl PreparedBackboneParameters {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        let model = nemotron_h::LayeredModel::<B>::new(self.args.clone(), context)?;
+        let model = nemotron_h::CompleteNemotronKernel::<B>::new(self.args.clone(), context)?;
         let graph =
             <nemotron_h::LayeredModel<B> as LayeredArchitecture<B, S>>::execution_graph(&model)?;
         let count = self.args.num_hidden_layers as usize;
@@ -160,7 +160,7 @@ impl PreparedBackboneParameters {
         let (_, static_bindings) = prepare_bindings(
             self.source.clone(),
             self.static_recipes(),
-            model.static_modules(),
+            model.kernel().static_modules(),
             BackboneUnit::Static,
         )?;
         let mut units = Vec::with_capacity(count);
@@ -216,7 +216,7 @@ impl PreparedBackboneParameters {
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
         P: ParameterBackend<Parameter = B::Tensor>,
     {
-        let model = nemotron_h::LayeredModel::<B>::new(self.args.clone(), context)?;
+        let model = nemotron_h::CompleteNemotronKernel::<B>::new(self.args.clone(), context)?;
         let mut runtime = ResidentRuntime::<_, B, S>::new(model, context)?;
         if runtime.units().len() != 1
             || runtime.units()[0].len() != self.args.num_hidden_layers as usize
@@ -234,7 +234,7 @@ impl PreparedBackboneParameters {
         let (source, bindings) = prepare_bindings(
             self.source.clone(),
             self.static_recipes(),
-            runtime.architecture().static_modules(),
+            runtime.architecture().kernel().static_modules(),
             BackboneUnit::Static,
         )?;
         let static_plan = select(BackboneUnit::Static, source, bindings)?;
@@ -246,7 +246,7 @@ impl PreparedBackboneParameters {
             layers.push(select(id, source, bindings)?);
         }
         bind::<P, _>(
-            runtime.architecture_mut().static_modules_mut(),
+            runtime.architecture_mut().kernel_mut().static_modules_mut(),
             static_plan,
             materialization,
             BackboneUnit::Static,

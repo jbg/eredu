@@ -8757,17 +8757,6 @@ impl From<eredu_checkpoint::Error> for ReplicatedTextRequirementsError {
     }
 }
 
-impl<B, S> ReplicatedTextArchitecture<B, S> for crate::nemotron_h::LayeredModel<B>
-where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
-{
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        crate::nemotron_h::EmbeddedInput::Target { tokens, mask }
-    }
-}
-
 impl<B, S> ReplicatedTextArchitecture<B, S> for crate::qwen::hybrid::LayeredModel<B>
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,

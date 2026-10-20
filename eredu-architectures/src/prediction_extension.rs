@@ -1616,13 +1616,14 @@ where
         use eredu_nn::EmbeddingOperator;
         match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules_mut().embeddings,
+                &mut self.kernel_mut().static_modules_mut().embeddings,
                 tokens,
                 eredu_nn::EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             ),
             None => self
+                .kernel_mut()
                 .static_modules_mut()
                 .embeddings
                 .forward(tokens, context),
@@ -1636,8 +1637,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.static_modules_mut()
-            .project_instrumented(hidden, parallel, context, instrumentation)
+        self.kernel_mut().static_modules_mut().project_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -5032,7 +5037,7 @@ where
         }
         SafetensorsModelConfig::NemotronH(args) => {
             let source_architecture =
-                crate::nemotron_h::LayeredModel::<B>::new(args.clone(), source_context)
+                crate::nemotron_h::CompleteNemotronKernel::<B>::new(args.clone(), source_context)
                     .map_err(|error| invalid(error.to_string()))?;
             let source_description = source_architecture
                 .parameter_description(source_context)
@@ -5058,11 +5063,13 @@ where
             }
             let target_args =
                 crate::nemotron_h::with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let description =
-                crate::nemotron_h::LayeredModel::<B>::new(target_args.clone(), execution_context)
-                    .map_err(|error| invalid(error.to_string()))?
-                    .parameter_description(execution_context)
-                    .map_err(|error| invalid(error.to_string()))?;
+            let description = crate::nemotron_h::CompleteNemotronKernel::<B>::new(
+                target_args.clone(),
+                execution_context,
+            )
+            .map_err(|error| invalid(error.to_string()))?
+            .parameter_description(execution_context)
+            .map_err(|error| invalid(error.to_string()))?;
             let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
                 .map_err(invalid)?;
             let geometry = crate::nemotron_h::local_geometry(&target_args, &layout)

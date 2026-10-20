@@ -29,7 +29,8 @@ pub use config::{
 pub use mamba::Mamba2;
 pub use mlp::{expert_bank_spec, localized_expert_bank_spec, DenseMlp, SparseMoe};
 pub use model::{
-    ForwardContext, LayeredModel, TargetBoundary, TargetBoundarySchema, TargetPartitionInput, Unit,
+    CompleteNemotronKernel, ForwardContext, LayeredModel, TargetBoundary, TargetBoundarySchema,
+    TargetPartitionInput, Unit,
 };
 pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit, RetainedValues, TargetReadout};
 pub use parallel::{
