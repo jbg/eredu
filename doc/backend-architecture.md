@@ -680,6 +680,11 @@ consumes `InputExecution`, whose associated perception cache may be ordinary or
 stage-local. PCM carry, paired input state, execution output and the enclosing
 transaction retain that exact cache type through completion and publication.
 
+Pipeline-local shared decoder readout uses the typed `PartitionStaticModules`
+readout for final normalization, tied or untied vocabulary projection and
+component instrumentation. The enclosing decoder applies its configured logit
+softcap after that readout, preserving the same observation and subgroup semantics.
+
 `eredu-runtime::ComponentDefinition` retains canonical parameter ownership and its
 execution graph with logical unit paths, state references, group transport and
 primary/prediction identities. Construction validates addresses, paths, state

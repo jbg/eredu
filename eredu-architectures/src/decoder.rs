@@ -5246,41 +5246,9 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let norm =
-            self.static_modules.norm.as_mut().ok_or_else(|| {
-                Error::backend("decoder partition does not own final normalization")
-            })?;
-        let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
-        let logits = match (parallel, self.static_modules.lm_head.as_mut()) {
-            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, Some(head)) => {
-                instrumentation.project::<B>("projection_input", head, &hidden, None, context)
-            }
-            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, None) => instrumentation.project_embedding(
-                "projection_input",
-                self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
+        let logits =
+            self.static_modules
+                .finish_instrumented(hidden, parallel, context, instrumentation)?;
         softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
