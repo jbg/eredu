@@ -683,7 +683,10 @@ transaction retain that exact cache type through completion and publication.
 Shared decoder forward context constructs block attention inputs for complete and
 selected pipeline models. Ordinary, observed, parallel and routed equations borrow
 the same mask, cache, sliding-prefill policy and explicit rotary embeddings;
-selected models retain their local cache ordinal mapping.
+selected models retain their local cache ordinal mapping. Hidden-state ingress
+validates the selected state layout and derives causal visibility from the selected
+cache offset through one shared function, including supplied masks and explicit
+rotary embeddings.
 
 Pipeline-local shared decoder readout uses the typed `PartitionStaticModules`
 readout for final normalization, tied or untied vocabulary projection and

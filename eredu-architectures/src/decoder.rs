@@ -4487,6 +4487,53 @@ impl<T> ForwardContext<T> {
     }
 }
 
+// Full and selected decoder models resolve visibility through the same ingress.
+// The caller supplies the state ordinal in its own selected state view.
+#[allow(clippy::too_many_arguments)]
+fn begin_decoder_hidden<B, S>(
+    hidden: B::Tensor,
+    supplied_mask: Option<&B::Tensor>,
+    rotary_embeddings: Option<(&B::Tensor, &B::Tensor)>,
+    state: &mut S,
+    expected: &StateLayout,
+    first_state_ordinal: usize,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    if state.layout() != expected {
+        return Err(Error::backend(format!(
+            "decoder runtime state layout {:?} does not match architecture layout {expected:?}",
+            state.layout()
+        )));
+    }
+    let sequence = hidden.dim(1);
+    let mask = if let Some(mask) = supplied_mask {
+        Some(mask.clone())
+    } else if sequence > 1 {
+        let cache = state.layer(first_state_ordinal).map_err(Error::backend)?;
+        // The shared mask is consumed by full-attention layers. Sliding
+        // layers use their typed window-aware attention path, so deriving
+        // this mask from layer zero's retention policy would incorrectly
+        // impose that window on later full-attention layers.
+        Some(B::causal_mask(sequence, cache.offset(), None, context)?)
+    } else {
+        None
+    };
+    Ok(LayeredForwardState {
+        hidden,
+        context: ForwardContext {
+            mask,
+            allow_sliding_prefill: supplied_mask.is_none(),
+            rotary_embeddings: rotary_embeddings
+                .map(|(cosine, sine)| (cosine.clone(), sine.clone())),
+        },
+    })
+}
+
 /// Statically dispatched construction policy for one decoder block family.
 pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
     /// Architecture-selected feed-forward policy inside the shared block.
@@ -5207,43 +5254,6 @@ where
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
 {
-    fn begin_hidden<S>(
-        hidden: B::Tensor,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        _first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: AttentionCache<B::Tensor>,
-    {
-        if state.layout() != expected {
-            return Err(Error::backend(
-                "decoder runtime state does not match partition state layout",
-            ));
-        }
-        let sequence = hidden.dim(1);
-        let allow_sliding_prefill = mask.is_none();
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None if sequence > 1 => {
-                let cache = state.layer(0).map_err(Error::backend)?;
-                Some(B::causal_mask(sequence, cache.offset(), None, context)?)
-            }
-            None => None,
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask,
-                allow_sliding_prefill,
-                rotary_embeddings: None,
-            },
-        })
-    }
-
     pub(crate) fn finish_local(
         &mut self,
         hidden: &B::Tensor,
@@ -5426,9 +5436,10 @@ where
             .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?
             .forward(input.tokens, context)?;
         let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
-        Self::begin_hidden(
+        begin_decoder_hidden::<B, S>(
             hidden,
             input.mask,
+            None,
             state,
             self.geometry.complete_state_layout(),
             0,
@@ -5589,9 +5600,10 @@ where
             context,
         )?;
         let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
-        Self::begin_hidden(
+        begin_decoder_hidden::<B, S>(
             hidden,
             input.mask,
+            None,
             state,
             self.geometry.complete_state_layout(),
             0,
@@ -5924,7 +5936,7 @@ where
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
-        first_state_ordinal: usize,
+        _first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let hidden = match input {
@@ -5941,7 +5953,7 @@ where
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        Self::begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
+        begin_decoder_hidden::<B, S>(hidden, mask, None, state, expected, 0, context)
     }
 
     fn begin_partition_parallel<'a>(
@@ -5950,7 +5962,7 @@ where
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
-        first_state_ordinal: usize,
+        _first_state_ordinal: usize,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
@@ -5969,7 +5981,7 @@ where
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        Self::begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
+        begin_decoder_hidden::<B, S>(hidden, mask, None, state, expected, 0, context)
     }
 
     fn begin_partition_observed<'a, O>(
@@ -6320,7 +6332,7 @@ where
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        self.begin_embedded_with_layout_at(
+        begin_decoder_hidden::<B, S>(
             hidden,
             supplied_mask,
             None,
@@ -6361,7 +6373,7 @@ where
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        self.begin_embedded_with_layout_at(
+        begin_decoder_hidden::<B, S>(
             hidden,
             supplied_mask,
             None,
@@ -6386,7 +6398,7 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        self.begin_embedded_with_layout_at(
+        begin_decoder_hidden::<B, S>(
             hidden,
             supplied_mask,
             rotary_embeddings,
@@ -6395,51 +6407,6 @@ where
             0,
             context,
         )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn begin_embedded_with_layout_at<S>(
-        &mut self,
-        hidden: B::Tensor,
-        supplied_mask: Option<&B::Tensor>,
-        rotary_embeddings: Option<(&B::Tensor, &B::Tensor)>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: AttentionCache<B::Tensor>,
-    {
-        if state.layout() != expected {
-            return Err(Error::backend(format!(
-                "decoder runtime state layout {:?} does not match architecture layout {expected:?}",
-                state.layout()
-            )));
-        }
-        let sequence = hidden.dim(1);
-        let mask = if let Some(mask) = supplied_mask {
-            Some(mask.clone())
-        } else if sequence > 1 {
-            let cache = state.layer(first_state_ordinal).map_err(Error::backend)?;
-            // The shared mask is consumed by full-attention layers. Sliding
-            // layers use their typed window-aware attention path, so deriving
-            // this mask from layer zero's retention policy would incorrectly
-            // impose that window on later full-attention layers.
-            Some(B::causal_mask(sequence, cache.offset(), None, context)?)
-        } else {
-            None
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask,
-                allow_sliding_prefill: supplied_mask.is_none(),
-                rotary_embeddings: rotary_embeddings
-                    .map(|(cosine, sine)| (cosine.clone(), sine.clone())),
-            },
-        })
     }
 
     /// Executes one replicated block using architecture-owned forward state.
