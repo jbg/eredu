@@ -715,10 +715,13 @@ caches. Routed banks retain global invocation indices independently of cache slo
 The adapter supplies ordinary, observed, parallel, provider-aware and pipeline
 driver contracts, including exact local state and pinned-role selection.
 
-Low-level decoder operations borrow `kernel()` or `kernel_mut()`. Complete kernels
-expose `prepare_partition` and `prepare_partition_parallel` with explicit state
+Low-level decoder operations borrow `kernel()` or `kernel_mut()`. The generic kernel
+exposes `prepare_partition` and `prepare_partition_parallel` with explicit state
 geometry and caller-selected cache origin; the typed partition kernel capability
-also supplies observed ingress and boundary/final egress. Driver-facing partition
+also supplies observed ingress and boundary/final egress. Ordinary driver calls
+use the same embedded-input and block methods as direct low-level execution.
+Block methods map global invocations through the selected local cache geometry,
+including composition-supplied feed-forward equations. Driver-facing partition
 calls require retained ownership selection. Cloning an adapter clones its typed
 resources and geometry and retains the validated definition and ownership.
 `DecoderStaticResources` borrows canonical embedding, normalization and output

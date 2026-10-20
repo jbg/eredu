@@ -142,7 +142,7 @@ impl<B: DistributedNeuralBackend> eredu_nn::Parameterized<B::Tensor> for Partiti
     fn set_trainable(&mut self, trainable: bool) {
         self.base
             .kernel_mut()
-            .partition_static_modules_mut()
+            .static_modules_mut()
             .set_trainable(trainable);
     }
     fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, B::Tensor>>(
@@ -160,7 +160,7 @@ impl<B: DistributedNeuralBackend> eredu_nn::Parameterized<B::Tensor> for Partiti
     ) {
         self.base
             .kernel_mut()
-            .partition_static_modules_mut()
+            .static_modules_mut()
             .visit_parameters_mut(visitor);
     }
 }

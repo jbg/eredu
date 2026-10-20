@@ -5462,7 +5462,7 @@ where
     G: DecoderGeometry<C>,
     P: BlockFactory<B, C>,
 {
-    fn finish_local_serial_instrumented(
+    fn finish_hidden_instrumented(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
@@ -5490,8 +5490,8 @@ where
         &self.static_modules
     }
 
-    /// Borrows only statics retained by the selected pipeline owner for binding.
-    pub(crate) fn partition_static_modules_mut(&mut self) -> &mut M {
+    /// Mutably borrows the physically retained static aggregate for binding.
+    pub fn static_modules_mut(&mut self) -> &mut M {
         &mut self.static_modules
     }
 
@@ -5839,15 +5839,7 @@ where
             .input_embedding()?
             .forward(input.tokens, context)?;
         let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
-        begin_decoder_hidden::<B, S>(
-            hidden,
-            input.mask,
-            None,
-            state,
-            self.geometry.ordinary_state_layout(&self.args)?.as_ref(),
-            0,
-            context,
-        )
+        self.begin_embedded(hidden, input.mask, state, context)
     }
     fn begin_observed<'a, O>(
         &mut self,
@@ -5885,11 +5877,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let index = address.index();
-        let cache = state
-            .layer(self.geometry.state_index(index)?)
-            .map_err(Error::backend)?;
-        unit.forward(forward.attention_input(hidden, cache), context)
+        self.forward_block(address.index(), unit, hidden, state, forward, context)
     }
     fn execute_observed<O>(
         &mut self,
@@ -5923,11 +5911,7 @@ where
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_local_serial_instrumented(
-            hidden,
-            context,
-            &mut ComponentInstrumentation::disabled(),
-        )
+        self.finish_hidden_instrumented(hidden, context, &mut ComponentInstrumentation::disabled())
     }
     fn projects_final_text_position() -> bool {
         G::FINAL_TEXT_POSITION
@@ -5940,7 +5924,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         if G::FINAL_TEXT_POSITION {
-            self.finish_local_serial_instrumented(
+            self.finish_hidden_instrumented(
                 &final_hidden_position(hidden, context)?,
                 context,
                 &mut ComponentInstrumentation::disabled(),
@@ -5961,7 +5945,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.finish_local_serial_instrumented(
+        self.finish_hidden_instrumented(
             hidden,
             context,
             &mut ComponentInstrumentation::new("readout", &mut observer),
@@ -6029,11 +6013,15 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let index = address.index();
-        let cache = state
-            .layer(self.geometry.state_index(index)?)
-            .map_err(Error::backend)?;
-        unit.forward_tensor_parallel(forward.attention_input(hidden, cache), parallel, context)
+        self.forward_block_parallel(
+            address.index(),
+            unit,
+            hidden,
+            state,
+            forward,
+            parallel,
+            context,
+        )
     }
     fn execute_parallel_observed<O>(
         &mut self,
@@ -6541,11 +6529,6 @@ where
             .map_err(Error::from)
     }
 
-    /// Mutably borrows pinned modules for neutral checkpoint binding.
-    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
-        &mut self.static_modules
-    }
-
     /// Returns planner-derived geometry when this is a rank-local realization.
     pub fn parallel_geometry(&self) -> Option<&LocalGeometry<C>> {
         match self.geometry.parallel.as_ref() {
@@ -6558,7 +6541,16 @@ where
     pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<LocalGeometry<C>>> {
         self.geometry.parallel.as_ref().map(std::sync::Arc::clone)
     }
+}
 
+impl<B, C, P, M, G> DecoderKernel<B, C, P, M, G>
+where
+    B: NeuralBackend,
+    C: Config,
+    P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
+{
     /// Prepares architecture-owned mask state after an execution policy has
     /// produced embeddings, including vocabulary-parallel embeddings.
     pub fn begin_embedded<S>(
@@ -6572,8 +6564,16 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        let expected = state_layout(&self.args)?;
-        self.begin_embedded_with_layout(hidden, supplied_mask, state, &expected, context)
+        let expected = self.geometry.ordinary_state_layout(&self.args)?;
+        begin_decoder_hidden::<B, S>(
+            hidden,
+            supplied_mask,
+            None,
+            state,
+            expected.as_ref(),
+            0,
+            context,
+        )
     }
 
     /// Prepares architecture-owned mask state against an explicitly realized
@@ -6618,7 +6618,11 @@ where
     {
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                let hidden = self.static_modules.embed(tokens, context)?;
+                let hidden = self
+                    .static_modules
+                    .decoder_resources_mut()
+                    .input_embedding()?
+                    .forward(tokens, context)?;
                 scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
@@ -6654,7 +6658,9 @@ where
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
                 let hidden = B::vocabulary_parallel_lookup(
-                    &mut self.static_modules.embeddings,
+                    self.static_modules
+                        .decoder_resources_mut()
+                        .input_embedding()?,
                     tokens,
                     EmbeddingLookupPolicy::Strict,
                     parallel,
@@ -6714,7 +6720,9 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
         block.forward(forward.attention_input(hidden, cache), context)
     }
 
@@ -6740,7 +6748,9 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
         block.forward_with_feed_forward(
             forward.attention_input(hidden, cache),
             context,
@@ -6766,7 +6776,9 @@ where
         S::LayerState: AttentionCache<B::Tensor>,
         P::FeedForward: TensorParallelProjectionOperator<B>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
         block.forward_tensor_parallel(forward.attention_input(hidden, cache), parallel, context)
     }
 
@@ -6793,7 +6805,9 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
         block.forward_tensor_parallel_with_feed_forward(
             forward.attention_input(hidden, cache),
             parallel,
@@ -6811,19 +6825,6 @@ where
         self.finish_hidden_instrumented(hidden, context, &mut ComponentInstrumentation::disabled())
     }
 
-    fn finish_hidden_instrumented(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error> {
-        let logits =
-            self.static_modules
-                .decoder_resources_mut()
-                .finish(hidden, context, instrumentation)?;
-        softcap_logits(logits, self.args.output_softcap(), context)
-    }
-
     /// Applies rank-local normalization and vocabulary-parallel projection for
     /// an output-owning pipeline partition.
     pub fn finish_hidden_parallel(
@@ -6835,29 +6836,12 @@ where
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        self.finish_hidden_parallel_instrumented(
+        self.finish_local_instrumented(
             hidden,
-            parallel,
+            Some(parallel),
             context,
             &mut ComponentInstrumentation::disabled(),
         )
-    }
-
-    fn finish_hidden_parallel_instrumented(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::DistributedNeuralBackend,
-    {
-        let logits = self
-            .static_modules
-            .decoder_resources_mut()
-            .finish_parallel(hidden, Some(parallel), context, instrumentation)?;
-        softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
 
