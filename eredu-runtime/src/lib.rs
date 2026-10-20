@@ -24,9 +24,9 @@ pub mod component;
 /// Validated declarations and typed component execution adapters.
 pub mod component_execution;
 pub use component_execution::{
-    ComponentAdapter, ComponentDefinition, ComponentDefinitionError, ComponentKernel,
-    ComponentUnit, EmptyParameterModule, ParallelComponentKernel, ParameterStorageId, StateSlotId,
-    StatelessComponentState,
+    ComponentAdapter, ComponentDefinition, ComponentDefinitionError, ComponentEquations,
+    ComponentKernel, ComponentUnit, EmptyParameterModule, ParallelComponentKernel,
+    ParameterStorageId, StateSlotId, StatelessComponentState,
 };
 mod component_partition;
 pub use component_partition::{

@@ -687,8 +687,10 @@ ranges, partition rules and optional group semantics without native allocation.
 `ParameterStorageId` and `StateSlotId` distinguish physical parameter ownership
 from invocation addresses and mutable state. `ComponentAdapter` implements the
 ordinary architecture and layered contracts for independently leased components;
-its typed `ComponentKernel` supplies equations, operation activity, request roots
-and family cache identity. Parallel adaptation requires the separate
+its typed `ComponentKernel` supplies resource construction, operation activity,
+request roots and family cache identity. `ComponentEquations` supplies equations
+for each concrete state profile, including borrowed cache slices and owned stage
+caches, while retaining the same resources and request context. Parallel adaptation requires the separate
 `ParallelComponentKernel` bound. Typed partition and pipeline adaptation require
 `PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
 selection validates canonical parameter ownership and the declared state projection,
@@ -699,7 +701,8 @@ local-stage traversal without a family-authored state-group predicate. The
 adapter rejects pinned parameter declarations; it does not infer missing
 capabilities from equation defaults.
 
-VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception and codec PRVQ
+VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception,
+the TTS transformer and codec PRVQ
 use this adapter with their typed kernels and runtime-owned empty pinned modules.
 Components without mutable state use shared stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
 bank-to-projection embedding operation. PRVQ retains selected depth ranges and
@@ -1934,9 +1937,12 @@ Both are embedded-input components with no vocabulary axis. Blocks and final
 normalization construct separately; causal calls consume caller-owned unpublished
 attention caches and validate frontiers/capacity before mutation.
 
-`TransformerArchitecture` executes both stacks through the shared resident or
-layerwise traversal, with one unit per block and a separate final-normalization
-unit. It has no learned static parameters. The shared decoder's
+`TransformerKernel` supplies equations for both stacks through `ComponentAdapter`,
+with one independently leased unit per block and a separate final-normalization
+unit. Resident, bounded and selected pipeline execution use this declaration.
+Typed equation hooks accept either borrowed caches or owned candidate storage;
+normalization-only stages own no attention slots. The shared adapter owns graph,
+address and local state mapping and empty pinned parameter visitation. The shared decoder's
 `embedded_parameter_description` supplies block and normalization topology without
 inventing vocabulary parameters; speech maps those groups to its own execution
 units. `PreparedTtsTransformerBindings` checks admitted shapes and recipes without

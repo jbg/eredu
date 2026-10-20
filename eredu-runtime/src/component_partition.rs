@@ -16,7 +16,11 @@ pub struct ComponentPartitionContext<'a, B: NeuralBackend> {
 }
 
 /// Explicit typed ingress and egress capability for partitioned components.
-pub trait PartitionComponentKernel<B: NeuralBackend>: ParallelComponentKernel<B> {
+pub trait PartitionComponentKernel<
+    B: NeuralBackend,
+    S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
+>: ParallelComponentKernel<B, S>
+{
     /// Family-owned transport schema and auxiliary values.
     type Boundary: ArchitectureBoundary;
     /// Complete boundary geometry before route selection.
@@ -30,7 +34,7 @@ pub trait PartitionComponentKernel<B: NeuralBackend>: ParallelComponentKernel<B>
             <Self::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
         >,
         mask: Option<&B::Tensor>,
-        state: &mut Self::State,
+        state: &mut S,
         selected: ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
     /// Assembles an already transported group input without graph dependency values.
@@ -38,7 +42,7 @@ pub trait PartitionComponentKernel<B: NeuralBackend>: ParallelComponentKernel<B>
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        state: &mut Self::State,
+        state: &mut S,
         forward: &mut Self::ForwardContext,
         _parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
@@ -49,7 +53,7 @@ pub trait PartitionComponentKernel<B: NeuralBackend>: ParallelComponentKernel<B>
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut Self::State,
+        state: &mut S,
         forward: &Self::ForwardContext,
         owns_output: bool,
         parallel: Option<&B::ParallelContext>,
@@ -64,7 +68,11 @@ pub trait PartitionComponentKernel<B: NeuralBackend>: ParallelComponentKernel<B>
 }
 
 /// Pipeline request geometry and semantic transport conversion.
-pub trait PipelineComponentKernel<B: NeuralBackend>: PartitionComponentKernel<B> {
+pub trait PipelineComponentKernel<
+    B: NeuralBackend,
+    S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
+>: PartitionComponentKernel<B, S>
+{
     /// Request extents used to resolve the wire schema.
     fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error>;
     /// Resumes the same component equation after pipeline transport.
@@ -75,7 +83,7 @@ pub trait PipelineComponentKernel<B: NeuralBackend>: PartitionComponentKernel<B>
             B::Tensor,
             <Self::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
         )>,
-        state: &mut Self::State,
+        state: &mut S,
         selected: ComponentPartitionContext<'_, B>,
         observer: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
@@ -101,11 +109,12 @@ pub trait PipelineComponentKernel<B: NeuralBackend>: PartitionComponentKernel<B>
     fn tensor_vocabulary_sharded(&self) -> bool;
 }
 
-impl<B, D, K> PartitionedLayeredArchitecture<B, K::State> for ComponentAdapter<D, K>
+impl<B, D, K, S> PartitionedLayeredArchitecture<B, S> for ComponentAdapter<D, K>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
-    K: PartitionComponentKernel<B> + 'static,
+    S: RuntimeState<B>,
+    K: PartitionComponentKernel<B, S> + 'static,
 {
     type Boundary = K::Boundary;
     fn boundary_schema(&self) -> Result<Self::Boundary, K::Error> {
@@ -119,7 +128,7 @@ where
             <Self::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
         >,
         mask: Option<&B::Tensor>,
-        state: &mut K::State,
+        state: &mut S,
         expected: &StateLayout,
         first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
@@ -145,7 +154,7 @@ where
             <Self::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
         >,
         mask: Option<&B::Tensor>,
-        state: &mut K::State,
+        state: &mut S,
         expected: &StateLayout,
         first_state_ordinal: usize,
         parallel: &B::ParallelContext,
@@ -168,7 +177,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        state: &mut K::State,
+        state: &mut S,
         forward: &mut K::ForwardContext,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
@@ -180,7 +189,7 @@ where
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut K::State,
+        state: &mut S,
         forward: &K::ForwardContext,
         owns_output: bool,
         parallel: Option<&B::ParallelContext>,
@@ -197,11 +206,12 @@ where
             .finish_partition(hidden, state, forward, owns_output, parallel, context)
     }
 }
-impl<B, D, K> PipelinePartitionArchitecture<B, K::State> for ComponentAdapter<D, K>
+impl<B, D, K, S> PipelinePartitionArchitecture<B, S> for ComponentAdapter<D, K>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
-    K: PipelineComponentKernel<B> + 'static,
+    S: RuntimeState<B>,
+    K: PipelineComponentKernel<B, S> + 'static,
 {
     fn partition_input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), K::Error> {
         self.kernel().input_dimensions(input)
@@ -213,7 +223,7 @@ where
             B::Tensor,
             <Self::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
         )>,
-        state: &mut K::State,
+        state: &mut S,
         expected: Option<&StateLayout>,
         first_state_ordinal: usize,
         parallel: Option<&B::ParallelContext>,
@@ -264,5 +274,40 @@ where
     }
     fn partition_tensor_vocabulary_sharded(&self) -> bool {
         self.kernel().tensor_vocabulary_sharded()
+    }
+}
+
+impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
+    /// Enters the ordinary local-stage driver with its selected optional state geometry.
+    pub fn begin_prepared_partition<B, S>(
+        &mut self,
+        input: LayeredPartitionInput<
+            '_,
+            B::Tensor,
+            <K::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: Option<&StateLayout>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error>
+    where
+        B: NeuralBackend,
+        S: RuntimeState<B>,
+        K: PartitionComponentKernel<B, S>,
+    {
+        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
+        self.kernel_mut().begin_partition(
+            input,
+            mask,
+            state,
+            ComponentPartitionContext {
+                expected,
+                first_state_ordinal: 0,
+                parallel,
+                native: context,
+            },
+        )
     }
 }

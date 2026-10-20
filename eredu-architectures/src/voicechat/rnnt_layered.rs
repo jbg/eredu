@@ -17,12 +17,12 @@ use eredu_nn::{
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
-    ComponentAdapter, ComponentDefinition, ComponentKernel, ComponentUnit, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredForwardState,
-    LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
-    MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState,
-    SubmissionBackend, TensorPlacement,
+    ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel, ComponentUnit,
+    ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
+    LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
+    LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
+    StatelessComponentState, SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -765,6 +765,27 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
             context,
         )
     }
+
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        self.selection.phases()[group].ordinal() == forward.group
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut roots = vec![&forward.input];
+        if let Some(previous) = &forward.previous {
+            previous.visit_retained_tensors(&mut |value| roots.push(value));
+        }
+        for layer in &forward.candidate.layers {
+            roots.extend([&layer.hidden, &layer.cell]);
+        }
+        roots.into_iter()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for RnntKernel<B> {
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -794,9 +815,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
                 "RNNT graph dependencies mismatch",
             )),
         }
-    }
-    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        self.selection.phases()[group].ordinal() == forward.group
     }
     fn execute(
         &mut self,
@@ -836,20 +854,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
             ));
         }
         Ok(hidden.clone())
-    }
-    fn retained_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut roots = vec![&forward.input];
-        if let Some(previous) = &forward.previous {
-            previous.visit_retained_tensors(&mut |value| roots.push(value));
-        }
-        for layer in &forward.candidate.layers {
-            roots.extend([&layer.hidden, &layer.cell]);
-        }
-        roots.into_iter()
     }
 }
 

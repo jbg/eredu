@@ -14,12 +14,13 @@ use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
-    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ResidentRuntime,
-    StateLayout, StatelessComponentState, SubmissionBackend, TensorPlacement,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
+    LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, ResidentRuntime, StateLayout, StatelessComponentState, SubmissionBackend,
+    TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -728,6 +729,46 @@ impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {
             )?),
         })
     }
+
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        group == forward.input.group()
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut roots = Vec::with_capacity(4);
+        match &forward.input {
+            ConditioningInput::CharacterEmbed(_) => {}
+            ConditioningInput::CharacterFinish(_, hidden) => roots.push(hidden),
+            ConditioningInput::Prefill {
+                embedded,
+                conditioning,
+                ..
+            }
+            | ConditioningInput::Decode {
+                embedded,
+                conditioning,
+                ..
+            } => {
+                roots.push(embedded);
+                roots.extend(conditioning.as_ref());
+            }
+            ConditioningInput::Fuse(audio, text) => {
+                roots.push(audio);
+                roots.push(text);
+            }
+        }
+        if let Some(lanes) = &forward.lanes {
+            roots.push(&lanes.audio);
+            roots.push(&lanes.text);
+        }
+        roots.into_iter()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for ConditioningKernel<B> {
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -757,9 +798,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {
                 "conditioning graph dependency mismatch",
             )),
         }
-    }
-    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        group == forward.input.group()
     }
     fn execute(
         &mut self,
@@ -840,40 +878,8 @@ impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {
     ) -> Result<B::Tensor, TtsError> {
         Ok(hidden.clone())
     }
-    fn retained_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut roots = Vec::with_capacity(4);
-        match &forward.input {
-            ConditioningInput::CharacterEmbed(_) => {}
-            ConditioningInput::CharacterFinish(_, hidden) => roots.push(hidden),
-            ConditioningInput::Prefill {
-                embedded,
-                conditioning,
-                ..
-            }
-            | ConditioningInput::Decode {
-                embedded,
-                conditioning,
-                ..
-            } => {
-                roots.push(embedded);
-                roots.extend(conditioning.as_ref());
-            }
-            ConditioningInput::Fuse(audio, text) => {
-                roots.push(audio);
-                roots.push(text);
-            }
-        }
-        if let Some(lanes) = &forward.lanes {
-            roots.push(&lanes.audio);
-            roots.push(&lanes.text);
-        }
-        roots.into_iter()
-    }
 }
+
 /// Conditioning using the existing prepared parameter provider and bounded traversal.
 pub struct LayerwiseConditioning<B, P>
 where

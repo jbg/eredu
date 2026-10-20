@@ -11,13 +11,13 @@ use eredu_nn::{
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
-    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
-    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParallelLayeredInvocation, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
-    TensorPlacement,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    OwnedParameterGroupSpec, ParallelComponentKernel, ParallelLayeredInvocation,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
+    StatelessComponentState, SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -530,6 +530,20 @@ impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
             context,
         )
     }
+
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        _: &'a (),
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for FunctionHeadKernel<B> {
     fn begin<'a>(
         &mut self,
         hidden: Self::Input<'a>,
@@ -563,9 +577,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
         }
         Ok(initial.clone())
     }
-    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
-        true
-    }
     fn execute(
         &mut self,
         _address: ExecutionUnitAddress,
@@ -591,14 +602,8 @@ impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
     ) -> Result<B::Tensor, ChannelError> {
         Ok(hidden.clone())
     }
-    fn retained_values<'a>(
-        &'a self,
-        _: &'a (),
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        std::iter::empty()
-    }
 }
+
 impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for FunctionHeadKernel<B> {
     fn begin_parallel<'a>(
         &mut self,

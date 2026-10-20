@@ -8,13 +8,12 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
-    LayeredForwardState, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParameterGroupOwner, RuntimeLayerState,
-    RuntimeState, StateError, StateLayout, StaticParameterVisitor, StaticParameterVisitorMut,
-    SubmissionBackend,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
+    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, RuntimeLayerState,
+    RuntimeState, StateError, StateLayout, SubmissionBackend,
 };
 use std::{marker::PhantomData, ops::DerefMut};
 
@@ -27,6 +26,9 @@ mod pipeline;
 /// Invalid portable transformer policy, state, or native execution.
 #[derive(Debug, thiserror::Error)]
 pub enum TransformerError {
+    /// Shared component declaration or selected ownership is invalid.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// Invalid supplied geometry, cache frontier or request mode.
     #[error("{0}")]
     Configuration(&'static str),
@@ -68,22 +70,6 @@ pub enum TransformerUnit<B: NeuralBackend> {
     /// Offset RMS normalization after all blocks.
     Norm(B::Normalization),
 }
-/// Empty static role: all learned weights belong to independently leased units.
-pub struct TransformerStaticModules;
-impl<T: 'static> Parameterized<T> for TransformerStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
-}
-
 /// Resident and bounded stacks expose one execution contract over borrowed caches.
 pub trait TransformerExecution<B: NeuralBackend> {
     /// Identity certifying immutable parameters and deterministic encoder results.
@@ -210,7 +196,7 @@ impl<'a, B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>>
 
     /// Borrows caches under the architecture's exact selected rank-local layout.
     pub fn for_architecture(
-        architecture: &TransformerArchitecture<B>,
+        architecture: &TransformerKernel<B>,
         caches: D,
     ) -> Result<Self, TransformerError>
     where
@@ -222,7 +208,7 @@ impl<'a, B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>>
             ));
         }
         Ok(Self {
-            layout: architecture.state_layout()?,
+            layout: architecture.state_layout.clone(),
             position: caches.first().map_or(0, |cache| cache.offset()),
             identity: architecture.config.architecture_fingerprint(),
             caches,
@@ -299,6 +285,69 @@ impl<B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>> Runti
     }
 }
 
+/// Canonical embedded-input transformer operations and cache references.
+pub fn tts_transformer_component_definition(
+    config: &TransformerConfig,
+) -> Result<ComponentDefinition, TransformerError> {
+    transformer_component_definition_with_state(config, transformer_state_layout(config)?)
+}
+fn transformer_component_definition_with_state(
+    config: &TransformerConfig,
+    state: StateLayout,
+) -> Result<ComponentDefinition, TransformerError> {
+    let parameters = tts_transformer_parameter_description(config)?;
+    let units = (0..parameters.unit_layout().len())
+        .map(|ordinal| {
+            let address = parameters
+                .unit_layout()
+                .address(ordinal)
+                .expect("canonical unit");
+            ComponentUnit {
+                path: if address.group() == 0 {
+                    format!("{}.layers.{}", config.parameter_root(), address.index())
+                } else {
+                    format!("{}.norm", config.parameter_root())
+                },
+                state: if address.group() == 0 && config.geometry().causal {
+                    address.index()..address.index() + 1
+                } else {
+                    0..0
+                },
+            }
+        })
+        .collect();
+    let transport = (0..2)
+        .map(|group| ArchitectureGroupTransport {
+            placement: ArchitectureGroupPlacement::Pipeline,
+            kind: if group == 1 {
+                ArchitectureGroupKind::Projector
+            } else if config.geometry().causal {
+                ArchitectureGroupKind::Decoder
+            } else {
+                ArchitectureGroupKind::AudioEncoder
+            },
+            first_owner_static_roles: vec![],
+            last_owner_static_roles: vec![],
+            merge_destination: ArchitectureMergeDestination::LastOwner,
+            parallel_subgroup: None,
+            request_optional: false,
+        })
+        .collect();
+    Ok(ComponentDefinition::new(
+        config.parameter_root(),
+        parameters,
+        units,
+        transport,
+        config.parameter_root(),
+        vec![],
+        state,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+            0,
+            0..config.geometry().num_hidden_layers,
+        )]),
+    )?)
+}
+
 /// Embedded input for either transformer invocation, with explicit key visibility.
 pub struct TransformerInput<'a, T> {
     /// Embedded batch, sequence and hidden features.
@@ -317,15 +366,14 @@ pub struct TransformerForward<T> {
 }
 
 /// Exact transformer graph with separately materializable final normalization.
-pub struct TransformerArchitecture<B: NeuralBackend> {
+pub struct TransformerKernel<B: NeuralBackend> {
     config: TransformerConfig,
     local_blocks: Option<Vec<TransformerConfig>>,
     state_layout: StateLayout,
     partition: Option<partition::TransformerOwnership>,
-    empty: TransformerStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> TransformerArchitecture<B> {
+impl<B: NeuralBackend> TransformerKernel<B> {
     /// Validates normalized policy without allocating native parameters.
     pub fn new(config: TransformerConfig) -> Result<Self, TransformerError> {
         config.validate_config()?;
@@ -335,7 +383,6 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
             local_blocks: None,
             state_layout,
             partition: None,
-            empty: TransformerStaticModules,
             backend: PhantomData,
         })
     }
@@ -360,9 +407,17 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
             local_blocks: Some(blocks),
             state_layout,
             partition: None,
-            empty: TransformerStaticModules,
             backend: PhantomData,
         })
+    }
+    /// Couples the selected geometry with shared typed execution contracts.
+    pub fn into_component(
+        self,
+    ) -> Result<ComponentAdapter<ComponentDefinition, Self>, TransformerError> {
+        Ok(ComponentAdapter::new(
+            transformer_component_definition_with_state(&self.config, self.state_layout.clone())?,
+            self,
+        )?)
     }
     /// Whether parameter construction and execution require tensor collectives.
     pub fn is_parallel(&self) -> bool {
@@ -372,55 +427,8 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
     pub fn config(&self) -> &TransformerConfig {
         &self.config
     }
-    /// Graph shared by both state-borrow realizations.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, TransformerError> {
-        transformer_graph(&self.config)
-    }
-    /// Number of blocks or final norm units in a group.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, TransformerError> {
-        match group {
-            0 => Ok(self.config.geometry().num_hidden_layers),
-            1 => Ok(1),
-            _ => Err(TransformerError::Configuration(
-                "unknown TTS transformer group",
-            )),
-        }
-    }
-    /// Canonical parameter namespace of one unit.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, TransformerError> {
-        if index >= self.group_unit_count(group)? {
-            return Err(TransformerError::Configuration(
-                "TTS transformer unit exceeds group",
-            ));
-        }
-        Ok(if group == 0 {
-            format!("{}.layers.{index}", self.config.parameter_root())
-        } else {
-            format!("{}.norm", self.config.parameter_root())
-        })
-    }
-    /// Constructs a single unloaded unit under the retained physical formats.
-    pub fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerUnit<B>, TransformerError> {
-        self.unit_path(group, index)?;
-        self.require_owned(group, index)?;
-        Ok(if group == 0 {
-            TransformerUnit::Block(
-                self.local_blocks
-                    .as_ref()
-                    .map_or(&self.config, |blocks| &blocks[index])
-                    .build_block(index, context)?,
-            )
-        } else {
-            TransformerUnit::Norm(self.config.build_final_norm::<B>(context)?)
-        })
-    }
 }
-impl<B: NeuralBackend> TransformerArchitecture<B> {
+impl<B: NeuralBackend> TransformerKernel<B> {
     /// Validates exact retained ownership and frontier without learned execution.
     pub fn validate_causal_state<C, D>(
         &self,
@@ -478,7 +486,10 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
         Ok(position)
     }
 
-    fn begin<C: AttentionCache<B::Tensor> + RuntimeLayerState<B>, D: DerefMut<Target = [C]>>(
+    fn begin_input<
+        C: AttentionCache<B::Tensor> + RuntimeLayerState<B>,
+        D: DerefMut<Target = [C]>,
+    >(
         &mut self,
         input: TransformerInput<'_, B::Tensor>,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
@@ -486,7 +497,7 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
     ) -> Result<LayeredForwardState<B::Tensor, TransformerForward<B::Tensor>>, TransformerError>
     {
         let sequence = validate_input(&self.config, input.embedded)?;
-        if state.layout != self.state_layout()? {
+        if state.layout != self.state_layout.clone() {
             return Err(TransformerError::Configuration(
                 "TTS runtime state layout mismatch",
             ));
@@ -709,17 +720,22 @@ pub fn tts_transformer_parameter_description(
         &graph, &layout, expected, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for TransformerArchitecture<B> {
-    type DefinitionError = TransformerError;
-    fn state_layout(&self) -> Result<StateLayout, TransformerError> {
-        Ok(self.state_layout.clone())
-    }
+impl<B: NeuralBackend> ComponentKernel<B> for TransformerKernel<B> {
+    type State = TransformerStateMarker<B>;
+    type Input<'a> = TransformerInput<'a, B::Tensor>;
+    type Unit = TransformerUnit<B>;
+    type ForwardContext = TransformerForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
+    where
+        B::Tensor: 'a;
+    type Error = TransformerError;
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, TransformerError> {
-        let global = self.state_layout()?;
+        let global = self.state_layout.clone();
         let begin = state.global_layer_offset();
         let end = begin
             .checked_add(state.layout().len())
@@ -742,91 +758,42 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for TransformerArchitecture<B> 
             topology,
         )?)
     }
-    fn parameter_description(
+    fn build_unit(
         &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, TransformerError> {
-        tts_transformer_parameter_description(&self.config)
+        address: ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TransformerUnit<B>, TransformerError> {
+        let group = address.group();
+        let index = address.index();
+        Ok(if group == 0 {
+            TransformerUnit::Block(
+                self.local_blocks
+                    .as_ref()
+                    .map_or(&self.config, |blocks| &blocks[index])
+                    .build_block(index, context)?,
+            )
+        } else {
+            TransformerUnit::Norm(self.config.build_final_norm::<B>(context)?)
+        })
     }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
     }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.keys.iter().chain(forward.mask.iter())
     }
 }
-
-impl<B, C, D: DerefMut<Target = [C]>> LayeredArchitecture<B, TransformerRuntimeState<'_, B, C, D>>
-    for TransformerArchitecture<B>
+impl<B, C, D: DerefMut<Target = [C]>> ComponentEquations<B, TransformerRuntimeState<'_, B, C, D>>
+    for TransformerKernel<B>
 where
     B: NeuralBackend,
     C: AttentionCache<B::Tensor> + RuntimeLayerState<B>,
 {
-    type Input<'a> = TransformerInput<'a, B::Tensor>;
-    type StaticModules = TransformerStaticModules;
-    type Unit = TransformerUnit<B>;
-    type ForwardContext = TransformerForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
-    where
-        B::Tensor: 'a;
-    type Error = TransformerError;
-    fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: if group == 1 {
-                ArchitectureGroupKind::Projector
-            } else if self.config.geometry().causal {
-                ArchitectureGroupKind::Decoder
-            } else {
-                ArchitectureGroupKind::AudioEncoder
-            },
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        self.config.parameter_root()
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
-            0,
-            0..self.config.geometry().num_hidden_layers,
-        )])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, TransformerError> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, TransformerError> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, TransformerError> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &TransformerStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut TransformerStaticModules {
-        &mut self.empty
-    }
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerUnit<B>, TransformerError> {
-        self.build_unit(group, index, context)
-    }
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
@@ -837,46 +804,22 @@ where
                 "selected TTS transformer requires its parallel or partition invocation",
             ));
         }
-        self.begin(input, state, context)
+        self.begin_input(input, state, context)
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
-        group: usize,
+        _: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
         _: &mut TransformerRuntimeState<'_, B, C, D>,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
-        match (group, dependencies) {
-            (0, []) => Ok(initial.clone()),
-            (1, [one]) => Ok((*one).clone()),
-            _ => Err(TransformerError::Configuration(
-                "TTS transformer group dependency mismatch",
-            )),
-        }
+        Ok(dependencies.first().copied().unwrap_or(initial).clone())
     }
-    fn state_ordinal(&self, _: usize, index: usize, _: usize) -> usize {
-        index.saturating_sub(self.partition.as_ref().map_or(0, |p| p.blocks.start))
-    }
-    fn retained_state_ordinals(
-        &self,
-        group: usize,
-        index: usize,
-        _: usize,
-    ) -> std::ops::Range<usize> {
-        if group == 0 && self.config.geometry().causal {
-            let local = index.saturating_sub(self.partition.as_ref().map_or(0, |p| p.blocks.start));
-            local..local + 1
-        } else {
-            0..0
-        }
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut TransformerUnit<B>,
         hidden: &B::Tensor,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
@@ -888,10 +831,18 @@ where
                 "rank-local TTS transformer requires parallel execution",
             ));
         }
-        self.execute_unit(group, index, unit, hidden, state, forward, None, context)
+        self.execute_unit(
+            address.group(),
+            address.index(),
+            unit,
+            hidden,
+            state,
+            forward,
+            None,
+            context,
+        )
     }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
@@ -903,16 +854,8 @@ where
         }
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.keys.iter().chain(forward.mask.iter())
-    }
 }
-impl<B: NeuralBackend> TransformerArchitecture<B> {
+impl<B: NeuralBackend> TransformerKernel<B> {
     #[allow(clippy::too_many_arguments)]
     fn execute_unit<
         C: AttentionCache<B::Tensor> + RuntimeLayerState<B>,
@@ -928,8 +871,6 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
-        self.unit_path(group, index)?;
-        self.require_owned(group, index)?;
         match (group, unit) {
             (0, TransformerUnit::Block(block)) => {
                 if self.config.geometry().causal {
@@ -1024,13 +965,12 @@ fn forward_block<B: NeuralBackend, C: AttentionCache<B::Tensor>>(
 }
 
 impl<B, C, D: DerefMut<Target = [C]>>
-    ParallelLayeredArchitecture<B, TransformerRuntimeState<'_, B, C, D>>
-    for TransformerArchitecture<B>
+    ParallelComponentKernel<B, TransformerRuntimeState<'_, B, C, D>> for TransformerKernel<B>
 where
     B: NeuralBackend,
     C: AttentionCache<B::Tensor> + RuntimeLayerState<B>,
 {
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
@@ -1042,12 +982,11 @@ where
                 "parallel TTS execution requires complete rank-local construction",
             ));
         }
-        self.begin(input, state, context)
+        self.begin_input(input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
@@ -1056,8 +995,8 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
         self.execute_unit(
-            group,
-            index,
+            address.group(),
+            address.index(),
             unit,
             hidden,
             state,
@@ -1066,7 +1005,7 @@ where
             context,
         )
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
@@ -1109,7 +1048,12 @@ where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, TransformerUnit<B>>,
 {
-    runtime: LayerwiseRuntime<TransformerArchitecture<B>, B, TransformerStateMarker<B>, P>,
+    runtime: LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+        B,
+        TransformerStateMarker<B>,
+        P,
+    >,
 }
 impl<B, P> LayerwiseTransformer<B, P>
 where
@@ -1118,7 +1062,10 @@ where
     P::Error: std::fmt::Display,
 {
     /// Adopts an exact already-prepared unit policy without allocating duplicate parameters.
-    pub fn new(architecture: TransformerArchitecture<B>, policy: P) -> Self {
+    pub fn new(
+        architecture: ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+        policy: P,
+    ) -> Self {
         Self {
             runtime: LayerwiseRuntime::new(architecture, policy),
         }
@@ -1126,13 +1073,23 @@ where
     /// Existing shared runtime for diagnostics and parameter inspection.
     pub fn runtime(
         &self,
-    ) -> &LayerwiseRuntime<TransformerArchitecture<B>, B, TransformerStateMarker<B>, P> {
+    ) -> &LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+        B,
+        TransformerStateMarker<B>,
+        P,
+    > {
         &self.runtime
     }
     /// Existing shared runtime for bounded parameter operations.
     pub fn runtime_mut(
         &mut self,
-    ) -> &mut LayerwiseRuntime<TransformerArchitecture<B>, B, TransformerStateMarker<B>, P> {
+    ) -> &mut LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+        B,
+        TransformerStateMarker<B>,
+        P,
+    > {
         &mut self.runtime
     }
 }
@@ -1158,7 +1115,7 @@ where
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn config(&self) -> &TransformerConfig {
-        self.runtime.architecture().config()
+        self.runtime.architecture().kernel().config()
     }
     fn forward_encoder(
         &mut self,
@@ -1226,8 +1183,10 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
-        let mut state =
-            TransformerRuntimeState::<B, C>::for_architecture(self.runtime.architecture(), caches)?;
+        let mut state = TransformerRuntimeState::<B, C>::for_architecture(
+            self.runtime.architecture().kernel(),
+            caches,
+        )?;
         self.runtime
             .forward_parallel_with_state(
                 TransformerInput {
@@ -1250,7 +1209,7 @@ where
     ) -> Result<B::Tensor, TransformerError> {
         let mut empty = [];
         let mut state = TransformerRuntimeState::<B, NoTransformerCache<B>>::for_architecture(
-            self.runtime.architecture(),
+            self.runtime.architecture().kernel(),
             &mut empty,
         )?;
         self.runtime

@@ -10,12 +10,13 @@ use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, T
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
-    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
-    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend, TensorPlacement,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -741,6 +742,25 @@ impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {
         self.build_unit(address.group(), address.index(), context)
     }
 
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        group == 0 || forward.embed
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        [
+            Some(&forward.codes),
+            forward.latent.as_ref(),
+            forward.candidate.as_ref().map(RefinementState::codes),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for RvqKernel<B> {
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -770,9 +790,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {
                 "RVQ dependencies differ from graph",
             )),
         }
-    }
-    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        group == 0 || forward.embed
     }
     fn execute(
         &mut self,
@@ -823,20 +840,8 @@ impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {
     ) -> Result<B::Tensor, TtsError> {
         Ok(hidden.clone())
     }
-    fn retained_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        [
-            Some(&forward.codes),
-            forward.latent.as_ref(),
-            forward.candidate.as_ref().map(RefinementState::codes),
-        ]
-        .into_iter()
-        .flatten()
-    }
 }
+
 impl<B: DistributedNeuralBackend> RvqKernel<B> {
     /// Rejects a mismatched rank or communicator before parameter acquisition.
     pub fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), TtsError> {

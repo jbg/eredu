@@ -11,12 +11,13 @@ use eredu_nn::{DistributedNeuralBackend, Index, NeuralBackend, Tensor, TensorEle
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
-    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
-    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend, TensorPlacement,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    TensorPlacement,
 };
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -527,6 +528,27 @@ impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {
     ) -> Result<Self::Unit, Error> {
         self.build_unit(address.group(), address.index(), context)
     }
+
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        forward.range.contains(&group)
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut roots = Vec::with_capacity(forward.codes.len() + 5);
+        roots.push(&forward.input);
+        roots.extend(forward.codes.iter());
+        roots.extend(forward.selected.as_ref());
+        if let Some(result) = &forward.result {
+            roots.extend([&result.codes, &result.residual, &result.quantized]);
+        }
+        roots.into_iter()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for QuantizerKernel<B> {
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -554,9 +576,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {
         } else {
             Err(invalid("residual quantizer graph dependency mismatch"))
         }
-    }
-    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        forward.range.contains(&group)
     }
     fn execute(
         &mut self,
@@ -596,21 +615,8 @@ impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {
         }
         Ok(hidden.clone())
     }
-    fn retained_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut roots = Vec::with_capacity(forward.codes.len() + 5);
-        roots.push(&forward.input);
-        roots.extend(forward.codes.iter());
-        roots.extend(forward.selected.as_ref());
-        if let Some(result) = &forward.result {
-            roots.extend([&result.codes, &result.residual, &result.quantized]);
-        }
-        roots.into_iter()
-    }
 }
+
 impl<B: DistributedNeuralBackend> QuantizerKernel<B> {
     /// Rejects a mismatched communicator before parameter acquisition.
     pub fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), Error> {

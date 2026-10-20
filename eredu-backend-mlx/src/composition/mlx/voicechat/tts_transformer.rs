@@ -3,8 +3,8 @@
 use eredu_architectures::voicechat::{
     tts_transformer::TransformerConfig,
     tts_transformer_layered::{
-        CausalTransformerExecution, LayerwiseTransformer, TransformerArchitecture,
-        TransformerError, TransformerExecution, TransformerStateMarker, TransformerUnit,
+        CausalTransformerExecution, LayerwiseTransformer, TransformerError, TransformerExecution,
+        TransformerKernel, TransformerStateMarker, TransformerUnit,
     },
     tts_transformer_preparation::PreparedTtsTransformerBindings,
 };
@@ -201,10 +201,11 @@ fn materialize(
             let (config, layout, source, units) = prepared.into_parts();
             let mut architecture = match parallel {
                 Some((local, _)) => {
-                    TransformerArchitecture::<MlxNeuralBackend>::new_parallel(config, local)
+                    TransformerKernel::<MlxNeuralBackend>::new_parallel(config, local)
                 }
-                None => TransformerArchitecture::<MlxNeuralBackend>::new(config),
+                None => TransformerKernel::<MlxNeuralBackend>::new(config),
             }
+            .and_then(TransformerKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let state_layout = architecture
                 .state_layout()

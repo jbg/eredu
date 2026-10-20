@@ -2,9 +2,9 @@
 
 use eredu_architectures::voicechat::{
     tts_transformer_layered::{
-        tts_transformer_parameter_description, TransformerArchitecture, TransformerBoundary,
-        TransformerBoundarySchema, TransformerError, TransformerRuntimeState,
-        TransformerStateMarker, TransformerUnit,
+        tts_transformer_parameter_description, TransformerBoundary, TransformerBoundarySchema,
+        TransformerError, TransformerKernel, TransformerRuntimeState, TransformerStateMarker,
+        TransformerUnit,
     },
     tts_transformer_preparation::PreparedTtsTransformerPartitionBindings,
 };
@@ -35,7 +35,10 @@ use crate::{
 
 type Unit = TransformerUnit<MlxNeuralBackend>;
 type Runtime<P> = LayerwisePartitionRuntime<
-    TransformerArchitecture<MlxNeuralBackend>,
+    eredu_runtime::ComponentAdapter<
+        eredu_runtime::ComponentDefinition,
+        TransformerKernel<MlxNeuralBackend>,
+    >,
     MlxNeuralBackend,
     TransformerStateMarker<MlxNeuralBackend>,
     P,
@@ -71,6 +74,7 @@ impl MlxTtsTransformerPartition {
             Execution::Bounded(runtime) => runtime.architecture(),
         };
         let caches = architecture
+            .kernel()
             .attention_cache_layout()
             .map(|layout| {
                 MlxKeyValueState::device(layout.clone()).map(|state| state.as_ref().to_vec())
@@ -78,7 +82,7 @@ impl MlxTtsTransformerPartition {
             .transpose()
             .map_err(BackendFailure::from_error)?
             .unwrap_or_default();
-        TransformerRuntimeState::for_partition(architecture, caches)
+        TransformerRuntimeState::for_partition(architecture.kernel(), caches)
             .map_err(BackendFailure::from_error)
     }
 
@@ -217,7 +221,7 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
             "prepared TTS stage differs from selected unit or state authority",
         )));
     }
-    let mut architecture = TransformerArchitecture::<MlxNeuralBackend>::from_partition(
+    let mut architecture = TransformerKernel::<MlxNeuralBackend>::from_partition(
         config,
         local_layout.as_ref(),
         partition,

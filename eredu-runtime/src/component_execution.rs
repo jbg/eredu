@@ -295,10 +295,10 @@ impl<B: NeuralBackend> RuntimeState<B> for StatelessComponentState {
     }
 }
 
-/// Family equations for a component with independently leased parameter modules.
+/// Typed resource construction and request roots for independently leased modules.
 /// Implementing this trait alone declares no parallel or partition capability.
 pub trait ComponentKernel<B: NeuralBackend> {
-    /// Mutable state selected by the family, independent of parameter storage.
+    /// Canonical state profile used for construction; equations may accept other profiles.
     type State: RuntimeState<B>;
     /// Borrowed typed operation.
     type Input<'a>
@@ -327,43 +327,10 @@ pub trait ComponentKernel<B: NeuralBackend> {
         address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error>;
-    /// Prepares a typed operation.
-    fn begin<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut Self::State,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
-    /// Selects or assembles group input after shared dependency-count validation.
-    fn begin_group(
-        &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        state: &mut Self::State,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
+
     /// Operation-specific group activity.
     fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool;
-    /// Runs the family equation against an already admitted resource.
-    fn execute(
-        &mut self,
-        address: ExecutionUnitAddress,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut Self::State,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
-    /// Converts the final activation to the typed operation's ordinary tensor result.
-    fn finish(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut Self::State,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
+
     /// Retains operation inputs and candidates until native completion is established.
     fn retained_values<'a>(
         &'a self,
@@ -372,13 +339,57 @@ pub trait ComponentKernel<B: NeuralBackend> {
     ) -> Self::RetainedContextValues<'a>;
 }
 
+/// Typed equations over one concrete borrowed or owned state profile.
+/// Resource construction and request roots remain independent of cache storage ownership.
+pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKernel<B> {
+    /// Prepares a typed operation.
+    fn begin<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+    /// Selects or assembles group input after shared dependency-count validation.
+    fn begin_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+    /// Runs the family equation against an already admitted resource.
+    fn execute(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+    /// Converts the final activation to the typed operation's ordinary tensor result.
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+}
+
 /// Explicit parallel equations; availability is enforced by a trait bound.
-pub trait ParallelComponentKernel<B: NeuralBackend>: ComponentKernel<B> {
+pub trait ParallelComponentKernel<
+    B: NeuralBackend,
+    S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
+>: ComponentEquations<B, S>
+{
     /// Parallel ingress and communicator validation.
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut Self::State,
+        state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
@@ -388,7 +399,7 @@ pub trait ParallelComponentKernel<B: NeuralBackend>: ComponentKernel<B> {
         address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        state: &mut Self::State,
+        state: &mut S,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -397,7 +408,7 @@ pub trait ParallelComponentKernel<B: NeuralBackend>: ComponentKernel<B> {
     fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut Self::State,
+        state: &mut S,
         forward: &Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -524,6 +535,27 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
         }
         Ok(())
     }
+    fn group_has_state_geometry(&self, group: usize) -> bool {
+        let definition = self.definition();
+        if definition.state_partition.rules().iter().any(|rule| {
+            matches!(rule.placement(), crate::ArchitectureStatePlacement::GroupUnits { group: owner } if owner == group)
+        }) {
+            return true;
+        }
+        let layout = definition.parameters.unit_layout();
+        let Some(units) = layout.group_range(group) else {
+            return false;
+        };
+        units
+            .filter_map(|ordinal| layout.address(ordinal))
+            .any(|address| {
+                !definition
+                    .unit(group, address.index())
+                    .expect("declared unit")
+                    .state
+                    .is_empty()
+            })
+    }
     /// Constructs the ordinary local-stage traversal from declared state consumers.
     pub fn into_partition_runtime<B, G, A, P>(
         self,
@@ -541,24 +573,8 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
         P: crate::LayerwisePolicy<B, K::Unit>,
     {
         let selected = self.select_partition(partition)?;
-        let state_groups = (0..selected.definition().parameters.unit_layout().len())
-            .map(|ordinal| {
-                selected
-                    .definition()
-                    .parameters
-                    .unit_layout()
-                    .address(ordinal)
-                    .expect("canonical unit")
-            })
-            .filter(|address| {
-                !selected
-                    .definition()
-                    .unit(address.group(), address.index())
-                    .expect("declared unit")
-                    .state
-                    .is_empty()
-            })
-            .map(|address| address.group())
+        let state_groups = (0..selected.definition().parameters.graph().groups().len())
+            .filter(|group| selected.group_has_state_geometry(*group))
             .collect::<std::collections::BTreeSet<_>>();
         crate::LayerwisePartitionRuntime::new(selected, policy, partition, |group| {
             state_groups.contains(&group)
@@ -579,22 +595,18 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
                 })?;
         let declared = selected.state.as_ref().map(PartitionState::layout);
         let entry_declared = selected.units.first().and_then(|(group, _)| {
-            selected
-                .units
-                .iter()
-                .filter(|(owned, _)| owned == group)
-                .any(|(group, index)| {
-                    !self
-                        .definition()
-                        .unit(*group, *index)
-                        .expect("selected unit")
-                        .state
-                        .is_empty()
-                })
+            self.group_has_state_geometry(*group)
                 .then_some(declared)
                 .flatten()
         });
-        if actual != declared
+        let actual_matches = actual == declared
+            || (actual.is_none()
+                && declared.is_some_and(|layout| {
+                    layout.layers().iter().all(|policy| {
+                        matches!(policy, eredu_core::cache::LayerCachePolicy::NoState)
+                    })
+                }));
+        if !actual_matches
             || expected_entry.is_some_and(|expected| expected != entry_declared)
             || owns_output.is_some_and(|owns| owns != selected.owns_output)
         {
@@ -699,11 +711,12 @@ where
         Ok(())
     }
 }
-impl<B, D, K> LayeredArchitecture<B, K::State> for ComponentAdapter<D, K>
+impl<B, D, K, S> LayeredArchitecture<B, S> for ComponentAdapter<D, K>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
-    K: ComponentKernel<B> + 'static,
+    S: RuntimeState<B>,
+    K: ComponentEquations<B, S> + 'static,
 {
     type Input<'a>
         = K::Input<'a>
@@ -768,7 +781,7 @@ where
     fn begin_forward<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut K::State,
+        state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
         self.kernel.begin(input, state, context)
@@ -778,7 +791,7 @@ where
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
-        state: &mut K::State,
+        state: &mut S,
         forward: &mut K::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
@@ -813,7 +826,7 @@ where
         index: usize,
         unit: &mut K::Unit,
         hidden: &B::Tensor,
-        state: &mut K::State,
+        state: &mut S,
         forward: &mut K::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
@@ -829,7 +842,7 @@ where
     fn finish_forward(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut K::State,
+        state: &mut S,
         forward: &K::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
@@ -848,16 +861,17 @@ where
         )
     }
 }
-impl<B, D, K> ParallelLayeredArchitecture<B, K::State> for ComponentAdapter<D, K>
+impl<B, D, K, S> ParallelLayeredArchitecture<B, S> for ComponentAdapter<D, K>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
-    K: ParallelComponentKernel<B> + 'static,
+    S: RuntimeState<B>,
+    K: ParallelComponentKernel<B, S> + 'static,
 {
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut K::State,
+        state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
@@ -869,7 +883,7 @@ where
         index: usize,
         unit: &mut K::Unit,
         hidden: &B::Tensor,
-        state: &mut K::State,
+        state: &mut S,
         forward: &mut K::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -887,7 +901,7 @@ where
     fn finish_forward_parallel(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut K::State,
+        state: &mut S,
         forward: &K::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,

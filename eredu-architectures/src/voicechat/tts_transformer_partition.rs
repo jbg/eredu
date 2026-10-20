@@ -4,7 +4,6 @@ use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
     ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype,
     BoundaryTensorSpec, LayeredPartitionInput, LayeredPartitionOutput,
-    PartitionedLayeredArchitecture,
 };
 use std::ops::Range;
 
@@ -87,7 +86,6 @@ impl ArchitectureBoundary for TransformerBoundarySchema {
 
 pub(super) struct TransformerOwnership {
     pub(super) blocks: Range<usize>,
-    norm: bool,
     input: bool,
     output: bool,
     pub(super) local_state: Option<StateLayout>,
@@ -157,14 +155,13 @@ pub(super) fn validate_partition<G>(
     }
     Ok(TransformerOwnership {
         blocks,
-        norm,
         input,
         output,
         local_state,
     })
 }
 
-impl<B: NeuralBackend> TransformerArchitecture<B> {
+impl<B: NeuralBackend> TransformerKernel<B> {
     /// Exact attention-cache allocation for this selected component. Character
     /// encoding and normalization-only stages allocate no attention-cache slots.
     pub fn attention_cache_layout(&self) -> Option<&StateLayout> {
@@ -184,7 +181,7 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
         config: TransformerConfig,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, TransformerBoundarySchema>,
-    ) -> Result<Self, TransformerError> {
+    ) -> Result<ComponentAdapter<ComponentDefinition, Self>, TransformerError> {
         let mut model = match layout {
             Some(layout) => Self::new_parallel(config, layout)?,
             None => Self::new(config)?,
@@ -194,37 +191,7 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
             &model.state_layout,
             partition,
         )?);
-        Ok(model)
-    }
-
-    /// Adopts the selected stage into shared resident or bounded traversal.
-    /// Transformer blocks own the declared state schedule; the separate final
-    /// normalization has no cache slots. Native adapters supply only a provider.
-    pub fn into_partition_runtime<G, P>(
-        self,
-        policy: P,
-        partition: &ArchitecturePartition<G, TransformerBoundarySchema>,
-    ) -> Result<
-        eredu_runtime::LayerwisePartitionRuntime<Self, B, TransformerStateMarker<B>, P>,
-        eredu_runtime::LayerwisePartitionConstructionError,
-    >
-    where
-        P: LayerwisePolicy<B, TransformerUnit<B>>,
-    {
-        eredu_runtime::LayerwisePartitionRuntime::new(self, policy, partition, |group| group == 0)
-    }
-
-    pub(super) fn require_owned(&self, group: usize, index: usize) -> Result<(), TransformerError> {
-        if let Some(selected) = &self.partition {
-            if !((group == 0 && selected.blocks.contains(&index))
-                || (group == 1 && index == 0 && selected.norm))
-            {
-                return Err(TransformerError::Configuration(
-                    "TTS unit is outside the selected partition",
-                ));
-            }
-        }
-        Ok(())
+        Ok(model.into_component()?.select_partition(partition)?)
     }
 
     /// Prepares one shared-driver stage, including explicitly stateless norm stages.
@@ -392,7 +359,7 @@ impl<'a, B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>>
 {
     /// Borrows only caches owned by the selected stage; a norm stage owns none.
     pub fn for_partition(
-        architecture: &TransformerArchitecture<B>,
+        architecture: &TransformerKernel<B>,
         caches: D,
     ) -> Result<Self, TransformerError>
     where
@@ -429,64 +396,44 @@ impl<
         B: NeuralBackend,
         C: AttentionCache<B::Tensor> + RuntimeLayerState<B>,
         D: DerefMut<Target = [C]>,
-    > PartitionedLayeredArchitecture<B, TransformerRuntimeState<'_, B, C, D>>
-    for TransformerArchitecture<B>
+    > eredu_runtime::PartitionComponentKernel<B, TransformerRuntimeState<'_, B, C, D>>
+    for TransformerKernel<B>
 {
     type Boundary = TransformerBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, TransformerError> {
         Ok(TransformerBoundarySchema::new(&self.config))
     }
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TransformerBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, TransformerBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut TransformerRuntimeState<'_, B, C, D>,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TransformerError> {
-        if first != 0 {
+        if selected.first_state_ordinal != 0 {
             return Err(TransformerError::Configuration(
                 "TTS partition cache ordinals must begin at zero",
             ));
         }
-        self.begin_prepared_partition(input, mask, state, Some(expected), None, context)
+        self.begin_prepared_partition(
+            input,
+            mask,
+            state,
+            selected.expected,
+            selected.parallel,
+            selected.native,
+        )
     }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TransformerBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut TransformerRuntimeState<'_, B, C, D>,
-        expected: &StateLayout,
-        first: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TransformerError> {
-        if first != 0 {
-            return Err(TransformerError::Configuration(
-                "TTS partition cache ordinals must begin at zero",
-            ));
-        }
-        self.begin_prepared_partition(input, mask, state, Some(expected), Some(parallel), context)
-    }
+
     fn enter_partition_group(
         &mut self,
-        group: usize,
+        _: usize,
         initial: &B::Tensor,
         _: &mut TransformerRuntimeState<'_, B, C, D>,
         _: &mut Self::ForwardContext,
         _: Option<&B::ParallelContext>,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
-        let selected = self
-            .partition
-            .as_ref()
-            .ok_or(TransformerError::Configuration("missing TTS partition"))?;
-        if !((group == 0 && !selected.blocks.is_empty()) || (group == 1 && selected.norm)) {
-            return Err(TransformerError::Configuration(
-                "TTS partition does not own this execution group",
-            ));
-        }
         Ok(initial.clone())
     }
     fn finish_partition(

@@ -2,7 +2,8 @@ use super::*;
 use eredu_runtime::LayerRuntimeState;
 use eredu_runtime::{
     ArchitectureStatePartitionPlan, ComponentAdapter, ComponentDefinition,
-    ComponentDefinitionError, ComponentKernel, ComponentUnit, StatelessComponentState,
+    ComponentDefinitionError, ComponentEquations, ComponentKernel, ComponentUnit,
+    StatelessComponentState,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -45,10 +46,24 @@ impl ComponentKernel<FakeBackend> for Kernel {
             marker: (address.group() * 10 + address.index()) as i32,
         })
     }
+
+    fn executes_group(&self, group: usize, extended: &bool) -> bool {
+        group == 0 || *extended
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        _: &'a bool,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+}
+impl ComponentEquations<FakeBackend, StatelessComponentState> for Kernel {
     fn begin<'a>(
         &mut self,
         (input, extended): Self::Input<'a>,
-        _: &mut Self::State,
+        _: &mut StatelessComponentState,
         _: &(),
     ) -> Result<LayeredForwardState<FakeTensor, bool>, Failure> {
         Ok(LayeredForwardState {
@@ -61,21 +76,18 @@ impl ComponentKernel<FakeBackend> for Kernel {
         _: usize,
         initial: &FakeTensor,
         dependencies: &[&FakeTensor],
-        _: &mut Self::State,
+        _: &mut StatelessComponentState,
         _: &mut bool,
         _: &(),
     ) -> Result<FakeTensor, Failure> {
         Ok(dependencies.first().copied().unwrap_or(initial).clone())
-    }
-    fn executes_group(&self, group: usize, extended: &bool) -> bool {
-        group == 0 || *extended
     }
     fn execute(
         &mut self,
         address: ExecutionUnitAddress,
         unit: &mut FakeUnit,
         hidden: &FakeTensor,
-        _: &mut Self::State,
+        _: &mut StatelessComponentState,
         _: &mut bool,
         _: &(),
     ) -> Result<FakeTensor, Failure> {
@@ -89,18 +101,11 @@ impl ComponentKernel<FakeBackend> for Kernel {
     fn finish(
         &mut self,
         hidden: &FakeTensor,
-        _: &mut Self::State,
+        _: &mut StatelessComponentState,
         _: &bool,
         _: &(),
     ) -> Result<FakeTensor, Failure> {
         Ok(hidden.clone())
-    }
-    fn retained_values<'a>(
-        &'a self,
-        _: &'a bool,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        std::iter::empty()
     }
 }
 
@@ -209,6 +214,20 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
             marker: address.index() as i32,
         })
     }
+
+    fn executes_group(&self, _: usize, _: &()) -> bool {
+        true
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        _: &'a (),
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+}
+impl ComponentEquations<FakeBackend, CarryState> for CarryKernel {
     fn begin<'a>(
         &mut self,
         input: &'a FakeTensor,
@@ -230,9 +249,6 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
         _: &(),
     ) -> Result<FakeTensor, Failure> {
         Ok(dependencies.first().copied().unwrap_or(input).clone())
-    }
-    fn executes_group(&self, _: usize, _: &()) -> bool {
-        true
     }
     fn execute(
         &mut self,
@@ -261,14 +277,8 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
     ) -> Result<FakeTensor, Failure> {
         Ok(hidden.clone())
     }
-    fn retained_values<'a>(
-        &'a self,
-        _: &'a (),
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        std::iter::empty()
-    }
 }
+
 impl eredu_runtime::ParallelComponentKernel<FakeBackend> for CarryKernel {
     fn begin_parallel<'a>(
         &mut self,

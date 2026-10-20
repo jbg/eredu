@@ -468,6 +468,26 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntPredictorKernel<B> {
             layer: build_predictor_layer::<B>(self.dimensions, index, context)?,
         })
     }
+
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut roots = vec![&forward.prototype];
+        for layer in &forward.candidate.layers {
+            roots.extend([&layer.hidden, &layer.cell]);
+        }
+        roots.into_iter()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, RnntPredictorRuntimeState<B::Tensor>>
+    for RnntPredictorKernel<B>
+{
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -489,9 +509,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntPredictorKernel<B> {
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
         Ok(initial.clone())
-    }
-    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
-        true
     }
     fn execute(
         &mut self,
@@ -536,17 +553,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntPredictorKernel<B> {
         self.complete(hidden, state, forward)?;
         Ok(hidden.clone())
     }
-    fn retained_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut roots = vec![&forward.prototype];
-        for layer in &forward.candidate.layers {
-            roots.extend([&layer.hidden, &layer.cell]);
-        }
-        roots.into_iter()
-    }
 }
 
 impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for RnntPredictorKernel<B> {
@@ -557,7 +563,7 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for RnntPredictorKe
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
-        ComponentKernel::begin(self, input, state, context)
+        ComponentEquations::begin(self, input, state, context)
     }
     fn execute_parallel(
         &mut self,

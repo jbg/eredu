@@ -313,7 +313,10 @@ impl PartitionedConfig for TransformerConfig {
 /// Resident component assembly using the same layered equations as bounded execution.
 pub struct TtsTransformer<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        super::tts_transformer_layered::TransformerArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            super::tts_transformer_layered::TransformerKernel<B>,
+        >,
         B,
         super::tts_transformer_layered::TransformerStateMarker<B>,
     >,
@@ -355,7 +358,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
     ) -> Result<Self, super::tts_transformer_layered::TransformerError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_transformer_layered::TransformerArchitecture::new(config)?,
+                super::tts_transformer_layered::TransformerKernel::new(config)?.into_component()?,
                 context,
             )?,
         })
@@ -367,7 +370,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
         norm: B::Normalization,
     ) -> Result<Self, super::tts_transformer_layered::TransformerError> {
         use super::tts_transformer_layered::{
-            TransformerArchitecture, TransformerError, TransformerUnit,
+            TransformerError, TransformerKernel, TransformerUnit,
         };
         let units = vec![
             blocks.into_iter().map(TransformerUnit::Block).collect(),
@@ -375,7 +378,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
         ];
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::from_units(
-                TransformerArchitecture::new(config)?,
+                TransformerKernel::new(config)?.into_component()?,
                 units,
             )
             .map_err(|error| match error {
@@ -391,7 +394,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
     }
     /// Exact retained transformer equations and physical formats.
     pub fn config(&self) -> &TransformerConfig {
-        self.runtime.architecture().config()
+        self.runtime.architecture().kernel().config()
     }
     /// Runs independent character rows with bidirectional key-padding masks.
     pub fn forward_encoder(

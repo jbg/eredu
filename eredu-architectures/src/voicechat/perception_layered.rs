@@ -16,11 +16,11 @@ use eredu_nn::{Index, LinearOperator, NeuralBackend, Parameterized, Tensor};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
-    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
-    ParameterRole, RuntimeState, StateError, StateLayout, SubmissionBackend,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
+    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
+    ParameterGroupOwner, ParameterRole, RuntimeState, StateError, StateLayout, SubmissionBackend,
 };
 use std::{marker::PhantomData, num::NonZeroU32};
 
@@ -662,6 +662,22 @@ impl<B: NeuralBackend> ComponentKernel<B> for PerceptionKernel<B> {
             }
         })
     }
+
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.encoder.iter()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, PerceptionRuntimeState<B::Tensor>>
+    for PerceptionKernel<B>
+{
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -689,9 +705,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for PerceptionKernel<B> {
             forward.encoder = Some(hidden.clone());
         }
         Ok(hidden.clone())
-    }
-    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
-        true
     }
     fn execute(
         &mut self,
@@ -726,14 +739,8 @@ impl<B: NeuralBackend> ComponentKernel<B> for PerceptionKernel<B> {
         ))?;
         Ok(hidden.clone())
     }
-    fn retained_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.encoder.iter()
-    }
 }
+
 impl<B: NeuralBackend> PerceptionKernel<B> {
     fn begin_input<'a>(
         &mut self,

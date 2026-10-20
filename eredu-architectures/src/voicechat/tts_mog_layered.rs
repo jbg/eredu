@@ -9,12 +9,13 @@ use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, T
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentKernel,
-    ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
-    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend, TensorPlacement,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -561,6 +562,33 @@ impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {
             )?),
         })
     }
+
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        if forward.selected {
+            group == 2
+        } else {
+            group != 2
+        }
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        [
+            forward.prediction.as_ref().map(|p| &p.hidden),
+            forward.prediction.as_ref().map(|p| &p.logits),
+            forward.mixture.as_ref(),
+            forward.gaussian.as_ref(),
+            forward.sample.as_ref().map(|s| &s.mean),
+            forward.sample.as_ref().map(|s| &s.log_std),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for MogKernel<B> {
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -589,13 +617,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {
             _ => Err(TtsError::Configuration(
                 "MoG group dependencies differ from graph",
             )),
-        }
-    }
-    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        if forward.selected {
-            group == 2
-        } else {
-            group != 2
         }
     }
     fn execute(
@@ -653,22 +674,6 @@ impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
         Ok(hidden.clone())
-    }
-    fn retained_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: ExecutionUnitAddress,
-    ) -> Self::RetainedContextValues<'a> {
-        [
-            forward.prediction.as_ref().map(|p| &p.hidden),
-            forward.prediction.as_ref().map(|p| &p.logits),
-            forward.mixture.as_ref(),
-            forward.gaussian.as_ref(),
-            forward.sample.as_ref().map(|s| &s.mean),
-            forward.sample.as_ref().map(|s| &s.log_std),
-        ]
-        .into_iter()
-        .flatten()
     }
 }
 
