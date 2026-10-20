@@ -14,12 +14,10 @@ use crate::{
     },
     MlxTensor,
 };
+use eredu_architectures::voicechat::rnnt_layered::{RnntKernel, RnntUnit};
 use eredu_architectures::voicechat::{
     rnnt::{RnntDimensions, RnntError, RnntProjectionExecution},
-    rnnt_projection_layered::{
-        LayerwiseRnntProjection, RnntProjectionArchitecture, RnntProjectionInput,
-        RnntProjectionRuntimeState, RnntProjectionUnit,
-    },
+    rnnt_projection_layered::{LayerwiseRnntProjection, RnntProjectionInput},
     rnnt_projection_preparation::{
         validate_projection_parallel_communication, PreparedRnntProjectionBindings,
     },
@@ -31,7 +29,7 @@ use eredu_runtime::{
 };
 use safemlx::{Array, Stream};
 
-type Unit = RnntProjectionUnit<MlxNeuralBackend>;
+type Unit = RnntUnit<MlxNeuralBackend>;
 enum Execution {
     Resident(LayerwiseRnntProjection<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
     Bounded(LayerwiseRnntProjection<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
@@ -225,16 +223,17 @@ fn materialize(
             let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
                 Some(local) => {
-                    RnntProjectionArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local)
+                    RnntKernel::<MlxNeuralBackend>::projections_parallel(dimensions, local)
                 }
-                None => RnntProjectionArchitecture::<MlxNeuralBackend>::new(dimensions),
+                None => RnntKernel::<MlxNeuralBackend>::projections(dimensions),
             }
+            .and_then(RnntKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<RnntProjectionRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -249,7 +248,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<RnntProjectionRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseRnntProjection::new(architecture, policy))

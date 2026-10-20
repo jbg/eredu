@@ -7,7 +7,7 @@ use super::rnnt::{
     affine, build_predictor_layer, encoder_projection_input, parameter, step_predictor_layer,
     RnntDimensions, RnntError, RnntExecution, RnntPredictionState,
 };
-use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
+use eredu_core::BackendFailure;
 use eredu_nn::{
     recurrent::{Lstm, LstmState},
     DistributedNeuralBackend, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
@@ -16,13 +16,13 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
-    ExecutionUnitLayout, LayeredArchitecture, LayeredForwardState, LayeredInvocation,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, RuntimeState, StateError, StateLayout,
-    StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend, TensorPlacement,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ComponentAdapter, ComponentDefinition, ComponentKernel, ComponentUnit, ExecutionGraph,
+    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredForwardState,
+    LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
+    MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState,
+    SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -33,6 +33,102 @@ const GROUPS: [&str; 5] = [
     "voicechat.rnnt.joint.pred",
     "voicechat.rnnt.joint.joint_net.2",
 ];
+#[derive(Clone, Copy)]
+enum RnntPhase {
+    Embedding,
+    Predictor,
+    Encoder,
+    Prediction,
+    Output,
+}
+impl RnntPhase {
+    fn ordinal(self) -> usize {
+        self as usize
+    }
+    fn id(self) -> &'static str {
+        GROUPS[self.ordinal()]
+    }
+    fn units(self, dimensions: RnntDimensions) -> usize {
+        if matches!(self, Self::Predictor) {
+            dimensions.predictor_layers
+        } else {
+            1
+        }
+    }
+    fn path(self, index: usize) -> String {
+        match self {
+            Self::Embedding => EMBEDDING.into(),
+            Self::Predictor => format!("{PREDICTOR}.layer{index}"),
+            Self::Encoder => "stt_model.rnnt_joint.enc".into(),
+            Self::Prediction => "stt_model.rnnt_joint.pred".into(),
+            Self::Output => "stt_model.rnnt_joint.joint_net.2".into(),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum RnntSelection {
+    Complete,
+    Projections,
+}
+impl RnntSelection {
+    fn phases(self) -> &'static [RnntPhase] {
+        match self {
+            Self::Complete => &[
+                RnntPhase::Embedding,
+                RnntPhase::Predictor,
+                RnntPhase::Encoder,
+                RnntPhase::Prediction,
+                RnntPhase::Output,
+            ],
+            Self::Projections => &[
+                RnntPhase::Embedding,
+                RnntPhase::Encoder,
+                RnntPhase::Prediction,
+                RnntPhase::Output,
+            ],
+        }
+    }
+}
+fn rnnt_component_definition(
+    dimensions: RnntDimensions,
+    selection: RnntSelection,
+) -> Result<ComponentDefinition, RnntError> {
+    let phases = selection.phases();
+    let parameters = rnnt_parameter_description_for_phases(dimensions, phases)?;
+    let units = phases
+        .iter()
+        .flat_map(|phase| {
+            (0..phase.units(dimensions)).map(move |index| ComponentUnit {
+                path: phase.path(index),
+                state: 0..0,
+            })
+        })
+        .collect();
+    let transport = ArchitectureGroupTransport {
+        placement: ArchitectureGroupPlacement::Pipeline,
+        kind: ArchitectureGroupKind::Projector,
+        first_owner_static_roles: vec![],
+        last_owner_static_roles: vec![],
+        merge_destination: ArchitectureMergeDestination::LastOwner,
+        parallel_subgroup: None,
+        request_optional: false,
+    };
+    let primary = match selection {
+        RnntSelection::Complete => RnntPhase::Embedding,
+        RnntSelection::Projections => RnntPhase::Output,
+    };
+    Ok(ComponentDefinition::new(
+        "voicechat.rnnt",
+        parameters,
+        units,
+        vec![transport; phases.len()],
+        primary.id(),
+        vec![],
+        state_layout()?,
+        ArchitectureStatePartitionPlan::new([]),
+    )?)
+}
+
 const EMBEDDING: &str = "stt_model.rnnt_decoder.prediction.embed.weight";
 const PREDICTOR: &str = "stt_model.rnnt_decoder.prediction.dec_rnn.lstm";
 
@@ -57,56 +153,8 @@ pub struct RnntUnit<B: NeuralBackend> {
     placement: Option<RnntLocalDimensions>,
     module: UnitModule<B>,
 }
-/// No learned RNNT parameter is permanently resident outside the unit provider.
-pub struct RnntStaticModules;
-impl<T: 'static> Parameterized<T> for RnntStaticModules {
-    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, T>>(&'a self, _: &mut V) {}
-    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, T>>(&'a mut self, _: &mut V) {}
-    fn set_trainable(&mut self, _: bool) {}
-}
-
 fn state_layout() -> Result<StateLayout, RnntError> {
-    Ok(StateLayout::new(LayerSchedule::new(
-        1,
-        vec![LayerCachePolicy::NoState],
-    )?)?)
-}
-/// Stateless traversal metadata; caller-owned `RnntState` retains recurrent history.
-pub struct RnntRuntimeState {
-    layout: StateLayout,
-}
-impl RnntRuntimeState {
-    /// Creates host metadata without backend allocation.
-    pub fn new() -> Result<Self, RnntError> {
-        Ok(Self {
-            layout: state_layout()?,
-        })
-    }
-}
-impl<B: NeuralBackend> RuntimeState<B> for RnntRuntimeState {
-    type RetainedValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    fn layout(&self) -> &StateLayout {
-        &self.layout
-    }
-    fn optional_layout(&self) -> Option<&StateLayout> {
-        None
-    }
-    fn retained_values(
-        &self,
-        ordinal: usize,
-        _: ExecutionUnitAddress,
-    ) -> Result<Self::RetainedValues<'_>, StateError> {
-        if ordinal != 0 {
-            return Err(StateError::UnknownLayer {
-                layer: ordinal,
-                count: 1,
-            });
-        }
-        Ok(std::iter::empty())
-    }
+    Ok(StatelessComponentState::state_layout()?)
 }
 
 /// One neural phase selected before acquiring any parameter.
@@ -284,20 +332,20 @@ struct ParallelRnnt<B: NeuralBackend> {
 }
 
 /// Canonical phase graph and independently materializable RNNT units.
-pub struct RnntArchitecture<B: NeuralBackend> {
+pub struct RnntKernel<B: NeuralBackend> {
     dimensions: RnntDimensions,
+    selection: RnntSelection,
     parallel: Option<ParallelRnnt<B>>,
-    empty: RnntStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> RnntArchitecture<B> {
+impl<B: NeuralBackend> RnntKernel<B> {
     /// Validates geometry without allocating any native parameter.
     pub fn new(dimensions: RnntDimensions) -> Result<Self, RnntError> {
         dimensions.validate()?;
         Ok(Self {
             dimensions,
+            selection: RnntSelection::Complete,
             parallel: None,
-            empty: RnntStaticModules,
             backend: PhantomData,
         })
     }
@@ -309,42 +357,27 @@ impl<B: NeuralBackend> RnntArchitecture<B> {
     pub fn dimensions(&self) -> RnntDimensions {
         self.dimensions
     }
-    /// Stable phase ordering; inactive phases pass their input through unchanged.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, RnntError> {
-        graph()
+    /// Selects only embedding and joint affines; no recurrent parameter is owned.
+    pub fn projections(dimensions: RnntDimensions) -> Result<Self, RnntError> {
+        let mut kernel = Self::new(dimensions)?;
+        kernel.selection = RnntSelection::Projections;
+        Ok(kernel)
     }
-    /// Each affine is one unit and each predictor layer is one unit.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, RnntError> {
-        match group {
-            1 => Ok(self.dimensions.predictor_layers),
-            0 | 2..=4 => Ok(1),
-            _ => Err(RnntError::InvalidConfiguration(
-                "unknown RNNT execution group",
-            )),
-        }
-    }
-    /// Canonical checkpoint identity of this independently leased owner.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, RnntError> {
-        if index >= self.group_unit_count(group)? {
-            return Err(RnntError::InvalidConfiguration("RNNT unit exceeds group"));
-        }
-        Ok(match group {
-            0 => EMBEDDING.into(),
-            1 => format!("{PREDICTOR}.layer{index}"),
-            2 => "stt_model.rnnt_joint.enc".into(),
-            3 => "stt_model.rnnt_joint.pred".into(),
-            4 => "stt_model.rnnt_joint.joint_net.2".into(),
-            _ => unreachable!(),
-        })
+    /// Couples selected family equations with one exact semantic declaration.
+    pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
+        Ok(ComponentAdapter::new(
+            rnnt_component_definition(self.dimensions, self.selection)?,
+            self,
+        )?)
     }
     /// Declares only one requested embedding, recurrent layer or joint affine.
-    pub fn build_unit(
+    fn build_resource(
         &self,
-        group: usize,
+        phase: RnntPhase,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RnntUnit<B>, RnntError> {
-        self.unit_path(group, index)?;
+        let group = phase.ordinal();
         let d = self.dimensions;
         let module = match group {
             0 => {
@@ -366,7 +399,7 @@ impl<B: NeuralBackend> RnntArchitecture<B> {
             1 => UnitModule::Predictor(build_predictor_layer(d, index, context)?),
             2..=4 => {
                 let (input, output) = projection_shape(d, group);
-                let path = self.unit_path(group, index)?;
+                let path = phase.path(index);
                 let spec = affine(
                     input,
                     output,
@@ -397,10 +430,10 @@ impl<B: NeuralBackend> RnntArchitecture<B> {
     fn begin_input<'a>(
         &mut self,
         input: RnntInput<'a, B::Tensor>,
-        state: &mut RnntRuntimeState,
+        state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, RnntForward<B::Tensor>>, RnntError> {
-        if state.layout != state_layout()? {
+        if *state.layout() != state_layout()? {
             return Err(RnntError::InvalidState("RNNT traversal layout mismatch"));
         }
         let (group, input, previous) = match input {
@@ -431,6 +464,16 @@ impl<B: NeuralBackend> RnntArchitecture<B> {
             RnntInput::Prediction(input) => (3, input.clone(), None),
             RnntInput::Output(input) => (4, input.clone(), None),
         };
+        if !self
+            .selection
+            .phases()
+            .iter()
+            .any(|phase| phase.ordinal() == group)
+        {
+            return Err(RnntError::InvalidState(
+                "RNNT operation is absent from the selected component",
+            ));
+        }
         if group >= 2 && input.shape() != [1, projection_shape(self.dimensions, group).0] {
             return Err(RnntError::InvalidState(
                 "RNNT joint input has incompatible row geometry",
@@ -461,7 +504,6 @@ impl<B: NeuralBackend> RnntArchitecture<B> {
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.unit_path(group, index)?;
         if parallel.is_some() != self.is_parallel() {
             return Err(RnntError::InvalidConfiguration(
                 "RNNT invocation differs from selected collective execution",
@@ -546,29 +588,43 @@ fn projection_shape(d: RnntDimensions, group: usize) -> (i32, i32) {
         _ => unreachable!(),
     }
 }
-fn graph() -> Result<ExecutionGraph, RnntError> {
+fn graph(phases: &[RnntPhase]) -> Result<ExecutionGraph, RnntError> {
     Ok(ExecutionGraph::new(
-        GROUPS
+        phases
             .iter()
             .enumerate()
-            .map(|(index, name)| {
+            .map(|(index, phase)| {
                 if index == 0 {
-                    ExecutionGroupSpec::root(*name)
+                    ExecutionGroupSpec::root(phase.id())
                 } else {
-                    ExecutionGroupSpec::with_dependencies(*name, [GROUPS[index - 1]])
+                    ExecutionGroupSpec::with_dependencies(phase.id(), [phases[index - 1].id()])
                 }
             })
             .collect(),
-        GROUPS[4],
+        phases
+            .last()
+            .expect("nonempty semantic phase selection")
+            .id(),
     )?)
 }
 /// Cold exact geometry, canonical identities and separate ownership of all RNNT parameters.
 pub fn rnnt_parameter_description(
     d: RnntDimensions,
 ) -> Result<ArchitectureParameterDescription, RnntError> {
+    rnnt_parameter_description_for_phases(d, RnntSelection::Complete.phases())
+}
+pub(super) fn rnnt_projection_description(
+    d: RnntDimensions,
+) -> Result<ArchitectureParameterDescription, RnntError> {
+    rnnt_parameter_description_for_phases(d, RnntSelection::Projections.phases())
+}
+fn rnnt_parameter_description_for_phases(
+    d: RnntDimensions,
+    phases: &[RnntPhase],
+) -> Result<ArchitectureParameterDescription, RnntError> {
     d.validate()?;
-    let graph = graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [1, d.predictor_layers, 1, 1, 1])?;
+    let graph = graph(phases)?;
+    let layout = ExecutionUnitLayout::new(&graph, phases.iter().map(|phase| phase.units(d)))?;
     let mut specs = Vec::new();
     let mut owned = Vec::new();
     let member = |name: String, shape: Vec<usize>| {
@@ -583,8 +639,10 @@ pub fn rnnt_parameter_description(
             },
         )
     };
-    for (group, group_name) in GROUPS.iter().enumerate() {
-        let count = if group == 1 { d.predictor_layers } else { 1 };
+    for (local_group, phase) in phases.iter().enumerate() {
+        let group = phase.ordinal();
+        let group_name = phase.id();
+        let count = phase.units(d);
         for index in 0..count {
             let (name, members) = match group {
                 0 => (
@@ -617,7 +675,7 @@ pub fn rnnt_parameter_description(
                         _ => unreachable!(),
                     };
                     (
-                        (*group_name).into(),
+                        group_name.into(),
                         vec![
                             member(
                                 format!("stt_model.rnnt_joint.{path}.weight"),
@@ -640,7 +698,10 @@ pub fn rnnt_parameter_description(
             specs.push(spec.clone());
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(
-                    layout.group_id(group).expect("known RNNT group").clone(),
+                    layout
+                        .group_id(local_group)
+                        .expect("known RNNT group")
+                        .clone(),
                     index,
                 ),
                 spec,
@@ -651,11 +712,18 @@ pub fn rnnt_parameter_description(
         &graph, &layout, specs, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for RnntArchitecture<B> {
-    type DefinitionError = RnntError;
-    fn state_layout(&self) -> Result<StateLayout, RnntError> {
-        state_layout()
-    }
+
+impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
+    type State = StatelessComponentState;
+    type Input<'a> = RnntInput<'a, B::Tensor>;
+    type Unit = RnntUnit<B>;
+    type ForwardContext = RnntForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = RnntError;
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -668,91 +736,39 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for RnntArchitecture<B> {
         }
         Ok(eredu_runtime::ModelStateIdentity::new(
             "nemotron_voicechat",
-            "voicechat_rnnt",
-            format!(
-                "{:?}:{:?}",
-                self.dimensions,
-                self.parallel.as_ref().map(|selected| &selected.layout)
-            ),
+            match self.selection {
+                RnntSelection::Complete => "voicechat_rnnt",
+                RnntSelection::Projections => "rnnt_projections",
+            },
+            match self.selection {
+                RnntSelection::Complete => format!(
+                    "{:?}:{:?}",
+                    self.dimensions,
+                    self.parallel.as_ref().map(|selected| &selected.layout)
+                ),
+                RnntSelection::Projections => format!("{:?}", self.dimensions),
+            },
             1,
             0,
             0,
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, RnntError> {
-        rnnt_parameter_description(self.dimensions)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, RnntRuntimeState> for RnntArchitecture<B> {
-    type Input<'a> = RnntInput<'a, B::Tensor>;
-    type StaticModules = RnntStaticModules;
-    type Unit = RnntUnit<B>;
-    type ForwardContext = RnntForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = RnntError;
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::Projector,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        GROUPS[0]
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, RnntError> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, RnntError> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, RnntError> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &RnntStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut RnntStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RnntUnit<B>, RnntError> {
-        self.build_unit(group, index, context)
+        self.build_resource(
+            self.selection.phases()[address.group()],
+            address.index(),
+            context,
+        )
     }
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut RnntRuntimeState,
+        state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
         if self.is_parallel() {
@@ -762,12 +778,12 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntRuntimeState> for RnntArchitec
         }
         self.begin_input(input, state, context)
     }
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
-        _: &mut RnntRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
@@ -779,43 +795,52 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntRuntimeState> for RnntArchitec
             )),
         }
     }
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        group == forward.group
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        self.selection.phases()[group].ordinal() == forward.group
     }
-    fn retained_state_ordinals(&self, _: usize, _: usize, _: usize) -> std::ops::Range<usize> {
-        0..0
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut RnntUnit<B>,
         hidden: &B::Tensor,
-        _: &mut RnntRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.execute_unit(group, index, unit, hidden, forward, None, context)
+        self.execute_unit(
+            self.selection.phases()[address.group()].ordinal(),
+            address.index(),
+            unit,
+            hidden,
+            forward,
+            None,
+            context,
+        )
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
-        _: &mut RnntRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        if forward.completed != self.group_unit_count(forward.group)? {
+        if forward.completed
+            != if forward.group == RnntPhase::Predictor.ordinal() {
+                self.dimensions.predictor_layers
+            } else {
+                1
+            }
+        {
             return Err(RnntError::InvalidState(
                 "RNNT traversal omitted selected neural units",
             ));
         }
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
+    fn retained_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
+        _: ExecutionUnitAddress,
     ) -> Self::RetainedContextValues<'a> {
         let mut roots = vec![&forward.input];
         if let Some(previous) = &forward.previous {
@@ -834,7 +859,12 @@ where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, RnntUnit<B>>,
 {
-    runtime: LayerwiseRuntime<RnntArchitecture<B>, B, RnntRuntimeState, P>,
+    runtime: LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >,
 }
 impl<B, P> LayerwiseRnnt<B, P>
 where
@@ -843,19 +873,34 @@ where
     P::Error: std::fmt::Display,
 {
     /// Adopts an exact provider of independently materializable RNNT units.
-    pub fn new(architecture: RnntArchitecture<B>, policy: P) -> Self {
+    pub fn new(
+        architecture: ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        policy: P,
+    ) -> Self {
         Self {
             runtime: LayerwiseRuntime::new(architecture, policy),
         }
     }
     /// Shared runtime and its retained provider accounting.
-    pub fn runtime(&self) -> &LayerwiseRuntime<RnntArchitecture<B>, B, RnntRuntimeState, P> {
+    pub fn runtime(
+        &self,
+    ) -> &LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &self.runtime
     }
     /// Shared runtime for provider inspection and parameter operations.
     pub fn runtime_mut(
         &mut self,
-    ) -> &mut LayerwiseRuntime<RnntArchitecture<B>, B, RnntRuntimeState, P> {
+    ) -> &mut LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    > {
         &mut self.runtime
     }
 }
@@ -881,7 +926,7 @@ where
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> RnntDimensions {
-        self.runtime.architecture().dimensions()
+        self.runtime.architecture().kernel().dimensions()
     }
     fn embed_token(
         &mut self,
@@ -891,7 +936,7 @@ where
         self.runtime
             .invoke(
                 RnntInput::Embed(token),
-                &mut RnntRuntimeState::new()?,
+                &mut StatelessComponentState::new()?,
                 context,
             )
             .map_err(runtime_error)
@@ -905,7 +950,7 @@ where
         self.runtime
             .invoke_with_context(
                 RnntInput::Predict { input, previous },
-                &mut RnntRuntimeState::new()?,
+                &mut StatelessComponentState::new()?,
                 context,
             )
             .map_err(runtime_error)?
@@ -920,7 +965,7 @@ where
         self.runtime
             .invoke(
                 RnntInput::Encode(encoder),
-                &mut RnntRuntimeState::new()?,
+                &mut StatelessComponentState::new()?,
                 context,
             )
             .map_err(runtime_error)
@@ -933,7 +978,7 @@ where
         self.runtime
             .invoke(
                 RnntInput::Prediction(prediction),
-                &mut RnntRuntimeState::new()?,
+                &mut StatelessComponentState::new()?,
                 context,
             )
             .map_err(runtime_error)
@@ -946,32 +991,37 @@ where
         self.runtime
             .invoke(
                 RnntInput::Output(hidden),
-                &mut RnntRuntimeState::new()?,
+                &mut StatelessComponentState::new()?,
                 context,
             )
             .map_err(runtime_error)
     }
 }
 
-impl<B: DistributedNeuralBackend> RnntArchitecture<B> {
+impl<B: DistributedNeuralBackend> RnntKernel<B> {
     /// Selects exact vocabulary shards and recurrent replicas without native allocation.
     pub fn new_parallel(
         dimensions: RnntDimensions,
         layout: &LocalModelLayout,
     ) -> Result<Self, RnntError> {
-        Self::new_parallel_for_description(
-            dimensions,
-            layout,
-            rnnt_parameter_description(dimensions)?,
-        )
+        Self::new_parallel_selected(dimensions, layout, RnntSelection::Complete)
     }
-    pub(crate) fn new_parallel_for_description(
+    /// Retains exact projection-only placement with no predictor replicas.
+    pub fn projections_parallel(
         dimensions: RnntDimensions,
         layout: &LocalModelLayout,
-        description: ArchitectureParameterDescription,
     ) -> Result<Self, RnntError> {
+        Self::new_parallel_selected(dimensions, layout, RnntSelection::Projections)
+    }
+    fn new_parallel_selected(
+        dimensions: RnntDimensions,
+        layout: &LocalModelLayout,
+        selection: RnntSelection,
+    ) -> Result<Self, RnntError> {
+        let description = rnnt_parameter_description_for_phases(dimensions, selection.phases())?;
         let local = rnnt_local_dimensions_for_description(dimensions, layout, &description)?;
         let mut architecture = Self::new(dimensions)?;
+        architecture.selection = selection;
         architecture.parallel = Some(ParallelRnnt {
             local,
             layout: layout.clone(),
@@ -1014,41 +1064,46 @@ impl<B: DistributedNeuralBackend> RnntArchitecture<B> {
         Ok(())
     }
 }
-impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, RnntRuntimeState>
-    for RnntArchitecture<B>
-{
-    fn begin_forward_parallel<'a>(
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for RnntKernel<B> {
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut RnntRuntimeState,
+        state: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
         self.validate_parallel(parallel)?;
         self.begin_input(input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        _: &mut RnntRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.execute_unit(group, index, unit, hidden, forward, Some(parallel), context)
+        self.execute_unit(
+            self.selection.phases()[address.group()].ordinal(),
+            address.index(),
+            unit,
+            hidden,
+            forward,
+            Some(parallel),
+            context,
+        )
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut RnntRuntimeState,
+        state: &mut StatelessComponentState,
         forward: &Self::ForwardContext,
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
 }
 impl<B, P> LayerwiseRnnt<B, P>
@@ -1067,7 +1122,7 @@ where
         self.runtime
             .forward_parallel_with_context_hook(
                 input,
-                &mut RnntRuntimeState::new()?,
+                &mut StatelessComponentState::new()?,
                 parallel,
                 context,
                 |_, _, _| Ok(()),

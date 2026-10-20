@@ -634,7 +634,7 @@ selected floating precision before projection. Text rendering, punctuation bias,
 turn counters and coupled audio scheduling remain outside this neural component.
 
 `RnntExecution` shares that decoding policy across ordinary and provider-backed
-execution. `RnntArchitecture` leases the embedding, each LSTM layer, and the three
+execution. `RnntKernel` leases the embedding, each LSTM layer, and the three
 joint projections independently. Phase-specific traversal acquires only the units
 needed for prediction or joint evaluation and retains candidate hidden/cell values
 through their unit completion. Exact prepared recipes normalize bounded execution
@@ -692,12 +692,18 @@ and family cache identity. Parallel adaptation requires the separate
 `ParallelComponentKernel` bound. The adapter rejects pinned parameter declarations;
 it does not infer missing capabilities from equation defaults.
 
-VoiceChat RVQ, MoG, character conditioning, the function head and codec PRVQ
+VoiceChat RVQ, MoG, character conditioning, the function head, RNNT and codec PRVQ
 use this adapter with their typed kernels. They use runtime-owned empty pinned
 modules and stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
 bank-to-projection embedding operation. PRVQ retains selected depth ranges and
 ordered residual subtraction. Their collective-bearing equations retain explicit
 rank agreement and transient input/candidate roots through ordinary completion.
+RNNT's complete and projection-only selections use one kernel and typed semantic
+phases. Each selection derives its graph, paths, unit counts and canonical
+parameter groups from those phases. Projection execution owns no recurrent
+parameters. The resident RNNT consumes the same kernel as bounded execution;
+caller-owned LSTM parent and candidate state remains separate from parameter
+leases, including repeated cached predictor steps.
 
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
@@ -895,7 +901,7 @@ the returned local candidate only after commitment. The adapter includes the ful
 predictor step in rank agreement before parameter reads. This predictor primitive does
 not select a coupled speech session.
 
-`RnntProjectionArchitecture` gives embedding and the three joint affines a compact
+`RnntKernel::projections` selects embedding and the three joint affines in a compact
 four-unit provider. It reuses ordinary RNNT equations and exact vocabulary
 partitioning, while its seven-tensor source view excludes recurrent weights.
 Recurrent pipeline stages retain only their selected LSTM layers; projection

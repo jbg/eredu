@@ -13,7 +13,7 @@ use crate::{
 };
 use eredu_architectures::voicechat::{
     rnnt::{RnntDimensions, RnntError, RnntExecution, RnntPredictionState},
-    rnnt_layered::{LayerwiseRnnt, RnntArchitecture, RnntRuntimeState, RnntUnit},
+    rnnt_layered::{LayerwiseRnnt, RnntKernel, RnntUnit},
     rnnt_preparation::{validate_parallel_communication, PreparedRnntBindings},
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
@@ -209,17 +209,16 @@ fn materialize(
         || {
             let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
-                Some(local) => {
-                    RnntArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local)
-                }
-                None => RnntArchitecture::<MlxNeuralBackend>::new(dimensions),
+                Some(local) => RnntKernel::<MlxNeuralBackend>::new_parallel(dimensions, local),
+                None => RnntKernel::<MlxNeuralBackend>::new(dimensions),
             }
+            .and_then(RnntKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<RnntRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -234,7 +233,7 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<RnntRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
                 Execution::Resident(LayerwiseRnnt::new(architecture, policy))

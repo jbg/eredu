@@ -3,7 +3,7 @@ use super::{
     rnnt::{
         build_predictor_layer, step_predictor_layer, RnntDimensions, RnntError, RnntPredictionState,
     },
-    rnnt_layered::{rnnt_parameter_description, RnntStaticModules},
+    rnnt_layered::rnnt_parameter_description,
     rnnt_predictor_partition::{
         validate_rnnt_predictor_partition, RnntPredictorBoundarySchema, RnntPredictorPipelineCuts,
     },
@@ -281,7 +281,7 @@ pub struct RnntPredictorForward<T> {
 pub struct RnntPredictorArchitecture<B: NeuralBackend> {
     pub(crate) dimensions: RnntDimensions,
     pub(crate) partition: Option<(Range<usize>, RnntPredictorPipelineCuts)>,
-    empty: RnntStaticModules,
+    empty: eredu_runtime::EmptyParameterModule,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> RnntPredictorArchitecture<B> {
@@ -291,7 +291,7 @@ impl<B: NeuralBackend> RnntPredictorArchitecture<B> {
         Ok(Self {
             dimensions,
             partition: None,
-            empty: RnntStaticModules,
+            empty: eredu_runtime::EmptyParameterModule,
             backend: PhantomData,
         })
     }
@@ -453,7 +453,7 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntPredictorRuntimeState<B::Tenso
     for RnntPredictorArchitecture<B>
 {
     type Input<'a> = RnntPredictorInput<'a, B::Tensor>;
-    type StaticModules = RnntStaticModules;
+    type StaticModules = eredu_runtime::EmptyParameterModule;
     type Unit = RnntPredictorUnit<B>;
     type ForwardContext = RnntPredictorForward<B::Tensor>;
     type RetainedContextValues<'a>
@@ -498,10 +498,10 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RnntPredictorRuntimeState<B::Tenso
             "stt_model.rnnt_decoder.prediction.dec_rnn.lstm.layer{index}"
         ))
     }
-    fn static_modules(&self) -> &RnntStaticModules {
+    fn static_modules(&self) -> &eredu_runtime::EmptyParameterModule {
         &self.empty
     }
-    fn static_modules_mut(&mut self) -> &mut RnntStaticModules {
+    fn static_modules_mut(&mut self) -> &mut eredu_runtime::EmptyParameterModule {
         &mut self.empty
     }
     fn build_unit(

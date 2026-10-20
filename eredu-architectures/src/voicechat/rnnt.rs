@@ -12,8 +12,7 @@ use eredu_runtime::execution_control::{
 
 use eredu_nn::{
     recurrent::{Lstm, LstmLayerSpec, LstmLayerState, LstmState},
-    EmbeddingOperator, EmbeddingSpec, LinearOperator, LinearSpec, NeuralBackend, ParameterSpec,
-    Parameterized, Tensor,
+    LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor,
 };
 
 use super::config::RnntConfig;
@@ -81,6 +80,9 @@ impl RnntDimensions {
 /// Portable neural/decoding failures. A failed transition leaves its parent state unchanged.
 #[derive(Debug, thiserror::Error)]
 pub enum RnntError {
+    /// Shared component declaration or invocation failed.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// Portable execution graph, layout or ownership is invalid.
     #[error(transparent)]
     Graph(#[from] eredu_runtime::ExecutionGraphError),
@@ -410,16 +412,49 @@ pub struct RnntFrame<T> {
 }
 
 /// VoiceChat RNNT prediction and joint networks using ordinary parameter operators.
-#[derive(Debug, Parameterized)]
-#[parameterized(tensor = "B::Tensor")]
 pub struct Rnnt<B: NeuralBackend> {
-    #[parameter(skip)]
-    dimensions: RnntDimensions,
-    embedding: B::Embedding,
-    predictor: Lstm<B>,
-    encoder_projection: B::Linear,
-    prediction_projection: B::Linear,
-    output_projection: B::Linear,
+    runtime: eredu_runtime::ResidentRuntime<
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            super::rnnt_layered::RnntKernel<B>,
+        >,
+        B,
+        eredu_runtime::StatelessComponentState,
+    >,
+}
+impl<B: NeuralBackend> std::fmt::Debug for Rnnt<B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Rnnt")
+            .field(
+                "dimensions",
+                &self.runtime.architecture().kernel().dimensions(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+impl<B: NeuralBackend> Parameterized<B::Tensor> for Rnnt<B> {
+    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, B::Tensor>>(
+        &'a self,
+        visitor: &mut V,
+    ) {
+        for unit in self.runtime.units().iter().flatten() {
+            unit.visit_parameters(visitor);
+        }
+    }
+    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>>(
+        &'a mut self,
+        visitor: &mut V,
+    ) {
+        for unit in self.runtime.units_mut().iter_mut().flatten() {
+            unit.visit_parameters_mut(visitor);
+        }
+    }
+    fn set_trainable(&mut self, trainable: bool) {
+        for unit in self.runtime.units_mut().iter_mut().flatten() {
+            unit.set_trainable(trainable);
+        }
+    }
 }
 
 pub(super) fn parameter(id: String, group: &str) -> ParameterSpec {
@@ -444,56 +479,14 @@ pub(super) fn affine(
     }
 }
 impl<B: NeuralBackend> Rnnt<B> {
-    /// Declares exact canonical checkpoint identities, without loading artifacts.
-    /// Materialization uses the ordinary parameter visitor and source-recipe contracts.
+    /// Declares resident resources through the same typed kernel as bounded execution.
     pub fn new(
         dimensions: RnntDimensions,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, RnntError> {
-        dimensions.validate()?;
-        let embedding = B::embedding(
-            EmbeddingSpec {
-                vocabulary: dimensions.vocab_size + 1,
-                dimensions: dimensions.predictor_width,
-                weight: parameter(
-                    "stt_model.rnnt_decoder.prediction.embed.weight".into(),
-                    "voicechat.rnnt.embedding",
-                ),
-                format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-                    .expect("dense embedding"),
-            },
-            context,
-        )?;
-        let specs = (0..dimensions.predictor_layers)
-            .map(|index| predictor_layer_spec(dimensions, index))
-            .collect::<Result<Vec<_>, _>>()?;
-        let joint = |input, output, name: &str| {
-            affine(
-                input,
-                output,
-                format!("stt_model.rnnt_joint.{name}.weight"),
-                format!("stt_model.rnnt_joint.{name}.bias"),
-                &format!("voicechat.rnnt.joint.{name}"),
-            )
-        };
         Ok(Self {
-            dimensions,
-            embedding,
-            predictor: Lstm::new(specs, context)?,
-            encoder_projection: B::linear(
-                joint(dimensions.encoder_width, dimensions.joint_width, "enc"),
-                context,
-            )?,
-            prediction_projection: B::linear(
-                joint(dimensions.predictor_width, dimensions.joint_width, "pred"),
-                context,
-            )?,
-            output_projection: B::linear(
-                joint(
-                    dimensions.joint_width,
-                    dimensions.vocab_size + 1,
-                    "joint_net.2",
-                ),
+            runtime: eredu_runtime::ResidentRuntime::new(
+                super::rnnt_layered::RnntKernel::new(dimensions)?.into_component()?,
                 context,
             )?,
         })
@@ -925,37 +918,21 @@ pub fn step_predictor_layer<B: NeuralBackend>(
     let mut next = layer.step(input, &previous, context)?;
     Ok(next.layers.pop().expect("one validated recurrent layer"))
 }
-pub(super) fn step_predictor<B: NeuralBackend>(
-    predictor: &mut Lstm<B>,
-    input: &B::Tensor,
-    previous: Option<&LstmState<B::Tensor>>,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<LstmState<B::Tensor>, RnntError> {
-    let zero;
-    let previous = if let Some(previous) = previous {
-        previous
-    } else {
-        zero = predictor.zero_state_like(input, context)?;
-        &zero
-    };
-    Ok(predictor.step(input, previous, context)?)
-}
+
 impl<B: NeuralBackend> RnntExecution<B> for Rnnt<B> {
     fn dimensions(&self) -> RnntDimensions {
-        self.dimensions
+        self.runtime.architecture().kernel().dimensions()
     }
     fn embed_token(
         &mut self,
         token: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        if token > self.dimensions.vocab_size as usize {
-            return Err(RnntError::InvalidState(
-                "RNNT embedding token exceeds vocabulary",
-            ));
-        }
-        let token = B::Tensor::from_i32_slice(&[token as i32], &[1], context)?;
-        Ok(self.embedding.forward(&token, context)?)
+        self.runtime.forward(
+            super::rnnt_layered::RnntInput::Embed(token),
+            &mut eredu_runtime::StatelessComponentState::new()?,
+            context,
+        )
     }
     fn predictor_step(
         &mut self,
@@ -963,55 +940,47 @@ impl<B: NeuralBackend> RnntExecution<B> for Rnnt<B> {
         previous: Option<&RnntPredictionState<B::Tensor>>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RnntPredictionState<B::Tensor>, RnntError> {
-        if input.shape() != [1, self.dimensions.predictor_width] {
-            return Err(RnntError::InvalidState(
-                "RNNT predictor expects [1,predictor_width]",
-            ));
-        }
-        if let Some(previous) = previous {
-            previous.validate(self.dimensions, &self.predictor_ownership())?;
-        }
-        RnntPredictionState::full(
-            self.dimensions,
-            step_predictor(
-                &mut self.predictor,
-                input,
-                previous.map(RnntPredictionState::local_state),
+        self.runtime
+            .forward_with_context(
+                super::rnnt_layered::RnntInput::Predict { input, previous },
+                &mut eredu_runtime::StatelessComponentState::new()?,
                 context,
-            )?,
-        )
+            )?
+            .1
+            .into_predictor()
     }
     fn encode_frame(
         &mut self,
-        encoder: &B::Tensor,
+        input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.validate_frame(encoder)?;
-        let input = encoder_projection_input::<B>(&self.encoder_projection, encoder, context)?;
-        Ok(self.encoder_projection.forward(&input, context)?)
+        self.validate_frame(input)?;
+        self.runtime.forward(
+            super::rnnt_layered::RnntInput::Encode(input),
+            &mut eredu_runtime::StatelessComponentState::new()?,
+            context,
+        )
     }
     fn project_prediction(
         &mut self,
-        prediction: &B::Tensor,
+        input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        if prediction.shape() != [1, self.dimensions.predictor_width] {
-            return Err(RnntError::InvalidState(
-                "RNNT predictor joint input has incompatible row geometry",
-            ));
-        }
-        Ok(self.prediction_projection.forward(prediction, context)?)
+        self.runtime.forward(
+            super::rnnt_layered::RnntInput::Prediction(input),
+            &mut eredu_runtime::StatelessComponentState::new()?,
+            context,
+        )
     }
     fn project_output(
         &mut self,
-        hidden: &B::Tensor,
+        input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        if hidden.shape() != [1, self.dimensions.joint_width] {
-            return Err(RnntError::InvalidState(
-                "RNNT output joint input has incompatible row geometry",
-            ));
-        }
-        Ok(self.output_projection.forward(hidden, context)?)
+        self.runtime.forward(
+            super::rnnt_layered::RnntInput::Output(input),
+            &mut eredu_runtime::StatelessComponentState::new()?,
+            context,
+        )
     }
 }
