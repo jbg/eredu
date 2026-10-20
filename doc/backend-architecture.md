@@ -8606,11 +8606,20 @@ row layouts and placement units. Target and MTP groups retain distinct execution
 owners; shared prediction fusion and norms declare their actual MTP consumers.
 Full, selected and prediction-extension text preparation consume this
 checkpoint-global declaration without constructing native modules. Conditional
-Qwen uses the same text parameter declaration alongside its vision metadata,
-preserving canonical group identities across the composite graph. Vision metadata
-still uses native module visitation. Low-level unit parameter descriptions accept
-configuration and validated group coordinates without requiring a materialized
-unit.
+Qwen composes its text and shared vision declarations into one cold parameter
+description, preserving canonical group identities across the composite graph.
+Conditional partition and prediction-extension preparation consume that description
+without constructing a discovery model. Low-level unit parameter descriptions
+accept configuration and validated group coordinates without native modules.
+
+Shared Qwen vision declarations and materialization consume the same patch,
+position, normalization, attention, MLP and merger specifications. Runtime encoding
+expansion supplies physical companions, row layouts and placement units. FP8 QKV
+scale segments use block-row coordinates; weight and bias segments retain weight
+rows. Ingress storage, the final merger and each DeepStack merger keep their
+explicit static role or logical-unit consumers. Qwen3-VL and Qwen4 experimental
+metadata consume these same vision declarations. Family code retains patch and
+shuffle geometry, window schedules, DeepStack capture order and media equations.
 
 Full and selected Qwen hybrid text execution uses `ComponentAdapter` with one
 `QwenKernel`. The adapter and kernel retain the same `Arc<ComponentDefinition>`

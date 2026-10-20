@@ -439,12 +439,9 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
             .parameter_description(context)?
             .groups()
             .to_vec();
-        for group in crate::qwen::vision::static_parallel_parameter_groups(
-            &self.modules.vision,
-            &self.vision,
-            "model.visual",
-        )
-        .map_err(Error::backend)?
+        for group in
+            crate::qwen::vision::static_parallel_parameter_groups(&self.vision, "model.visual")
+                .map_err(Error::backend)?
         {
             groups.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::static_role("vision"),
@@ -452,10 +449,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
             ));
         }
         for index in 0..self.vision.layer_count() {
-            let module =
-                VisionBlock::<B>::new_with_root(&self.vision, "model.visual", index, context)?;
             for group in crate::qwen::vision::block_parallel_parameter_groups(
-                &module,
                 &self.vision,
                 "model.visual",
                 index,

@@ -1458,17 +1458,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         // parameter authority must nevertheless continue to describe the
         // immutable checkpoint-global groups selected at admission; applying
         // TP placement to the local shapes would shard them a second time.
-        let global_static = self.parallel_geometry.is_some().then(|| {
-            Ok::<_, Error>((
-                qwen::StaticModules::new(&self.args.text, context)?,
-                VisionStatic::new_with_root(self.args.vision.clone(), "model.visual", context)?,
-            ))
-        });
-        let global_static = global_static.transpose()?;
-        let (text_modules, vision_modules) = global_static.as_ref().map_or(
-            (&self.static_modules.text, &self.static_modules.vision),
-            |(text, vision)| (text, vision),
-        );
+        let global_static = self
+            .parallel_geometry
+            .is_some()
+            .then(|| qwen::StaticModules::new(&self.args.text, context))
+            .transpose()?;
+        let text_modules = global_static.as_ref().unwrap_or(&self.static_modules.text);
         let text_static = static_parallel_parameter_groups::<B>(
             &text_modules.embeddings,
             &text_modules.boundary.norm,
@@ -1476,8 +1471,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             &self.args.text.parameter_root,
         )
         .map_err(Error::backend)?;
-        let vision_static = crate::qwen::vision::owned_static_parallel_parameter_groups::<B>(
-            vision_modules,
+        let vision_static = crate::qwen::vision::owned_static_parallel_parameter_groups(
             &self.args.vision,
             "model.visual",
             eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP).map_err(Error::backend)?,
@@ -1514,30 +1508,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 .expect("Qwen3-VL layout group")
                 .clone();
             for index in 0..count {
-                let unit = if self.parallel_geometry.is_some() {
-                    match group_index {
-                        0 => Unit::Vision(VisionBlock::new_with_root(
-                            &self.args.vision,
-                            "model.visual",
-                            index,
-                            context,
-                        )?),
-                        1 => Unit::Text(qwen::new_routed_block(&self.args.text, index, context)?),
-                        _ => unreachable!("Qwen3-VL has two execution groups"),
-                    }
+                let groups = if group_index == 0 {
+                    block_parallel_parameter_groups(&self.args.vision, "model.visual", index)
                 } else {
-                    self.construct_unit(group_index, index, context)?
-                };
-                let groups = match unit {
-                    Unit::Vision(block) => block_parallel_parameter_groups(
-                        &block,
-                        &self.args.vision,
-                        "model.visual",
-                        index,
-                    ),
-                    Unit::Text(block) => {
-                        qwen::routed_layer_parallel_parameter_groups(&block, &self.args.text, index)
-                    }
+                    let block = if self.parallel_geometry.is_some() {
+                        qwen::new_routed_block(&self.args.text, index, context)?
+                    } else {
+                        let Unit::Text(block) = self.construct_unit(group_index, index, context)?
+                        else {
+                            unreachable!("declared text group")
+                        };
+                        block
+                    };
+                    qwen::routed_layer_parallel_parameter_groups(&block, &self.args.text, index)
                 }
                 .map_err(Error::backend)?;
                 expected.extend(groups.iter().cloned());

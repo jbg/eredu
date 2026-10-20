@@ -5,6 +5,7 @@ mod config;
 mod memory;
 mod model;
 mod parallel;
+mod specs;
 
 pub(crate) use checkpoint::{gguf_plan, temporal_patch_recipe};
 pub use checkpoint::{safetensors_plan, translate_gguf_weight_name};

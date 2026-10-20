@@ -2445,15 +2445,10 @@ where
                         .into(),
                 ));
             }
-            let description =
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), context)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
+            let parameters = crate::qwen::hybrid::conditional_parameter_description(&args)
                 .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -3343,15 +3338,10 @@ where
                         .into(),
                 ));
             }
-            let description =
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), context)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
+            let parameters = crate::qwen::hybrid::conditional_parameter_description(&args)
                 .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;

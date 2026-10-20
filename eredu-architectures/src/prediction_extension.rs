@@ -4956,8 +4956,7 @@ where
             // projections. Execution uses ResidentExpertProvider, independently
             // of the target's expert residency policy.
             let description = if args.vision.is_some() {
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), source_context)
-                    .and_then(|model| model.parameter_description(source_context))
+                crate::qwen::hybrid::conditional_parameter_description(args)
             } else {
                 crate::qwen::hybrid::parameter_description(&args.text)
                     .map_err(eredu_nn::Error::backend)

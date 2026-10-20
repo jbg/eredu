@@ -483,3 +483,83 @@ pub fn component_definition(
     )
     .map_err(eredu_nn::Error::from)
 }
+
+pub(crate) fn conditional_execution_graph(
+    parsed: &super::ParsedHybridConfig,
+) -> Result<eredu_runtime::ExecutionGraph, eredu_nn::Error> {
+    use eredu_runtime::ExecutionGroupSpec;
+    parsed.text.validate().map_err(eredu_nn::Error::backend)?;
+    parsed
+        .vision
+        .as_ref()
+        .ok_or_else(|| eredu_nn::Error::backend("conditional Qwen requires vision config"))?
+        .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
+        .map_err(eredu_nn::Error::backend)?;
+    let mut groups = vec![
+        ExecutionGroupSpec::root(super::VISION_EXECUTION_GROUP),
+        ExecutionGroupSpec::with_dependencies(
+            crate::decoder::TARGET_EXECUTION_GROUP,
+            [super::VISION_EXECUTION_GROUP],
+        ),
+    ];
+    let mut output = crate::decoder::TARGET_EXECUTION_GROUP.to_owned();
+    for depth in 0..parsed.text.mtp_num_hidden_layers {
+        let id = format!("mtp.{depth}");
+        groups.push(ExecutionGroupSpec::with_dependencies(id.clone(), [output]));
+        output = id;
+    }
+    eredu_runtime::ExecutionGraph::new(groups, output).map_err(eredu_nn::Error::backend)
+}
+
+/// Declares canonical vision, target and prediction ownership without native modules.
+pub fn conditional_parameter_description(
+    parsed: &super::ParsedHybridConfig,
+) -> Result<ArchitectureParameterDescription, eredu_nn::Error> {
+    let graph = conditional_execution_graph(parsed)?;
+    let vision = parsed.vision.as_ref().expect("validated vision config");
+    let text = parameter_description(&parsed.text).map_err(eredu_nn::Error::backend)?;
+    let counts = std::iter::once(vision.layer_count()).chain(
+        (0..text.unit_layout().group_count()).map(|group| {
+            text.unit_layout()
+                .group_range(group)
+                .expect("declared text group")
+                .len()
+        }),
+    );
+    let layout = ExecutionUnitLayout::new(&graph, counts).map_err(eredu_nn::Error::backend)?;
+    let mut owned = text.groups().to_vec();
+    let group = eredu_runtime::ExecutionGroupId::new(super::VISION_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
+    owned.extend(
+        crate::qwen::vision::owned_static_parallel_parameter_groups(
+            vision,
+            "model.visual",
+            group.clone(),
+            "vision",
+        )
+        .map_err(eredu_nn::Error::backend)?,
+    );
+    for layer in 0..vision.layer_count() {
+        owned.extend(
+            crate::qwen::vision::block_parallel_parameter_groups(vision, "model.visual", layer)
+                .map_err(eredu_nn::Error::backend)?
+                .into_iter()
+                .map(|group_spec| {
+                    OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::execution_unit(group.clone(), layer),
+                        group_spec,
+                    )
+                }),
+        );
+    }
+    ArchitectureParameterDescription::new(
+        &graph,
+        &layout,
+        owned
+            .iter()
+            .map(|group| group.group().clone())
+            .collect::<Vec<_>>(),
+        owned,
+    )
+    .map_err(eredu_nn::Error::backend)
+}

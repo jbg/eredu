@@ -9,11 +9,11 @@ use eredu_nn::{
         attention_chunk_lengths, bilinear_interpolation_samples, inverse_permutation,
         patch_positions, validate_patch_grid, window_partition, InterpolationMode, PatchTraversal,
     },
-    EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec, NeuralBackend,
-    Parameter, ParameterSpec, Parameterized, SegmentedAttentionInput, Tensor,
+    EmbeddingOperator, Error, Index, LinearOperator, LinearSpec, NeuralBackend, Parameter,
+    Parameterized, SegmentedAttentionInput, Tensor,
 };
 
-use super::{VisionAttentionPolicy, VisionConfig, VisionMode};
+use super::{specs::rooted, VisionAttentionPolicy, VisionConfig, VisionMode};
 
 /// Prepared flattened patches and their `(time, height, width)` grids.
 pub struct VisionInput<'a, T> {
@@ -146,16 +146,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
         width: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let make = |field: &str| {
-            Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.{field}")).map_err(Error::backend)?,
-                &[width],
-                context,
-            )
-        };
+        let spec = super::specs::norm_spec(prefix, width)?;
         Ok(Self {
-            weight: make("weight")?,
-            bias: make("bias")?,
+            weight: Parameter::unloaded(spec.weight, &[spec.dimensions], context)?,
+            bias: Parameter::unloaded(spec.bias, &[spec.dimensions], context)?,
         })
     }
     fn forward(
@@ -189,33 +183,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
         root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let spec = FlattenedPatchSpec {
-            channels: config.in_channels,
-            temporal: config.temporal_patch_size,
-            height: config.patch_size,
-            width: config.patch_size,
-            output: config.hidden_size,
-        };
+        let spec = super::specs::patch_spec(config, root)?;
+        let shape = spec.weight_shape();
         Ok(Self {
-            weight: Parameter::unloaded(
-                ParameterSpec::trainable(rooted(root, "patch_embed.proj.weight"))
-                    .map_err(Error::backend)?,
-                &[
-                    config.hidden_size,
-                    config.in_channels,
-                    config.temporal_patch_size,
-                    config.patch_size,
-                    config.patch_size,
-                ],
-                context,
-            )?,
-            bias: Parameter::unloaded(
-                ParameterSpec::trainable(rooted(root, "patch_embed.proj.bias"))
-                    .map_err(Error::backend)?,
-                &[config.hidden_size],
-                context,
-            )?,
-            spec,
+            weight: Parameter::unloaded(spec.weight, &shape, context)?,
+            bias: Parameter::unloaded(spec.bias, &[spec.geometry.output], context)?,
+            spec: spec.geometry,
         })
     }
     fn forward(
@@ -233,29 +206,6 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
     }
 }
 
-fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    config: &VisionConfig,
-    prefix: &str,
-    input: i32,
-    output: i32,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let weight = format!("{prefix}.weight");
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-            bias: Some(ParameterSpec::trainable(format!("{prefix}.bias")).map_err(Error::backend)?),
-            format: crate::linear_format::standard_linear_format(
-                &weight,
-                config.linear_format(relative_vision_name(&weight)),
-            )?,
-        },
-        context,
-    )
-}
-
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub(super) struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
@@ -270,30 +220,17 @@ pub(super) struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
-    fn new_with_heads(
+    fn from_specs(
         config: &VisionConfig,
-        parameter_root: &str,
-        layer: usize,
         heads: i32,
+        specs: [LinearSpec; 2],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = rooted(parameter_root, &format!("blocks.{layer}.attn"));
+        let [qkv, output] = specs;
         let head_dim = config.hidden_size / config.num_heads;
         Ok(Self {
-            qkv: linear::<B>(
-                config,
-                &format!("{root}.qkv"),
-                config.hidden_size,
-                3 * heads * head_dim,
-                context,
-            )?,
-            output: linear::<B>(
-                config,
-                &format!("{root}.proj"),
-                heads * head_dim,
-                config.hidden_size,
-                context,
-            )?,
+            qkv: B::linear(qkv, context)?,
+            output: B::linear(output, context)?,
             heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
@@ -399,24 +336,19 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let root = rooted(parameter_root, &format!("blocks.{layer}"));
+        let [qkv, output, fc1, fc2] = super::specs::block_projection_specs(
+            config,
+            parameter_root,
+            layer,
+            heads,
+            intermediate,
+        )?;
         Ok(Self {
             norm1: LayerNorm::new(&format!("{root}.norm1"), config.hidden_size, context)?,
-            attention: Attention::new_with_heads(config, parameter_root, layer, heads, context)?,
+            attention: Attention::from_specs(config, heads, [qkv, output], context)?,
             norm2: LayerNorm::new(&format!("{root}.norm2"), config.hidden_size, context)?,
-            fc1: linear::<B>(
-                config,
-                &format!("{root}.mlp.linear_fc1"),
-                config.hidden_size,
-                intermediate,
-                context,
-            )?,
-            fc2: linear::<B>(
-                config,
-                &format!("{root}.mlp.linear_fc2"),
-                intermediate,
-                config.hidden_size,
-                context,
-            )?,
+            fc1: B::linear(fc1, context)?,
+            fc2: B::linear(fc2, context)?,
             activation: config.hidden_act.clone(),
         })
     }
@@ -508,32 +440,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let unit = config.spatial_merge_size * config.spatial_merge_size;
-        let width = config.hidden_size * unit;
+        let (unit, width, norm_width) = super::specs::merger_geometry(config, postshuffle)?;
+        let [fc1, fc2] = super::specs::merger_projection_specs(config, prefix, intermediate)?;
         Ok(Self {
-            norm: LayerNorm::new(
-                &format!("{prefix}.norm"),
-                if postshuffle {
-                    width
-                } else {
-                    config.hidden_size
-                },
-                context,
-            )?,
-            fc1: linear::<B>(
-                config,
-                &format!("{prefix}.linear_fc1"),
-                width,
-                intermediate,
-                context,
-            )?,
-            fc2: linear::<B>(
-                config,
-                &format!("{prefix}.linear_fc2"),
-                intermediate,
-                config.out_hidden_size,
-                context,
-            )?,
+            norm: LayerNorm::new(&format!("{prefix}.norm"), norm_width, context)?,
+            fc1: B::linear(fc1, context)?,
+            fc2: B::linear(fc2, context)?,
             unit,
             width,
             postshuffle,
@@ -600,7 +512,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parameter_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let width = config.hidden_size * config.spatial_merge_size * config.spatial_merge_size;
+        let (_, width, _) = super::specs::merger_geometry(&config, false)?;
         let intermediates = vec![width; config.deepstack_layer_count() + 1];
         Self::new_parallel_with_root(config, parameter_root, &intermediates, context)
     }
@@ -621,16 +533,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             ));
         }
         let position = B::embedding(
-            EmbeddingSpec {
-                vocabulary: config.num_position_embeddings,
-                dimensions: config.hidden_size,
-                weight: ParameterSpec::trainable(rooted(parameter_root, "pos_embed.weight"))
-                    .map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &rooted(parameter_root, "pos_embed.weight"),
-                    eredu_checkpoint::LinearFormat::Dense,
-                )?,
-            },
+            super::specs::position_spec(&config, parameter_root)?,
             context,
         )?;
         let patch = PatchEmbed::new(&config, parameter_root, context)?;
@@ -903,22 +806,6 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
         }
         self.static_modules.finish(&hidden, &mut state, context)
     }
-}
-
-fn rooted(root: &str, relative: &str) -> String {
-    if root.is_empty() {
-        relative.to_owned()
-    } else {
-        format!("{root}.{relative}")
-    }
-}
-
-fn relative_vision_name(name: &str) -> &str {
-    ["blocks.", "merger.", "deepstack_merger_list."]
-        .into_iter()
-        .filter_map(|marker| name.find(marker).map(|index| &name[index..]))
-        .next()
-        .unwrap_or(name)
 }
 
 fn gathered_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(

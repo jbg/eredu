@@ -8,19 +8,15 @@ use eredu_nn::{
     LinearOperator, NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ParameterProvider,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterProvider,
     PartitionedLayeredArchitecture, ResidentExpertProvider, RoutedLayeredArchitecture,
     RuntimeStateComponents, StateLayout,
 };
 
 use crate::qwen::ingress::{prepare_input, prepared_semantic_tokens, ProjectedTokenPolicy};
-use crate::qwen::vision::{
-    block_parallel_parameter_groups, VisionBlock, VisionInput, VisionMode, VisionState,
-    VisionStatic,
-};
+use crate::qwen::vision::{VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic};
 use crate::qwen::vl::InputPart;
 use crate::{
     composite_execution::{CompositeArchitecture, PreparedCompositeInput},
@@ -944,9 +940,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        super::conditional_parameter_description(&self.parsed)
     }
 
     fn static_parameter_recipes(
@@ -1174,23 +1170,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
     }
 
     fn canonical_execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        let mut groups = vec![
-            ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-            ExecutionGroupSpec::with_dependencies(
-                crate::decoder::TARGET_EXECUTION_GROUP,
-                [VISION_EXECUTION_GROUP],
-            ),
-        ];
-        let mut output = "target".to_owned();
-        for depth in 0..self.prediction_steps {
-            let id = format!("mtp.{depth}");
-            groups.push(ExecutionGroupSpec::with_dependencies(
-                id.clone(),
-                [output.clone()],
-            ));
-            output = id;
-        }
-        ExecutionGraph::new(groups, output).map_err(Error::backend)
+        super::parameters::conditional_execution_graph(&self.parsed)
     }
 
     fn canonical_group_unit_count(&self, group: usize) -> Result<usize, Error> {
@@ -1229,61 +1209,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
                 .expect("validated vision")
                 .deepstack_layer_count(),
         }
-    }
-
-    /// Describes vision, target, and prediction parameters with explicit
-    /// canonical graph ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = self.canonical_execution_graph()?;
-        let layout = self.unit_layout()?;
-        let vision = self.parsed.vision.as_ref().expect("validated vision");
-        let text = super::parameter_description(&self.parsed.text).map_err(Error::backend)?;
-        let mut owned = text.groups().to_vec();
-        // Vision metadata retains checkpoint-global shapes on selected ranks.
-        let global_vision = self
-            .parallel_geometry
-            .is_some()
-            .then(|| VisionStatic::<B>::new_with_root(vision.clone(), "model.visual", context))
-            .transpose()?;
-        let vision_modules = global_vision
-            .as_ref()
-            .unwrap_or(&self.static_modules.vision);
-        owned.extend(
-            crate::qwen::vision::owned_static_parallel_parameter_groups::<B>(
-                vision_modules,
-                vision,
-                "model.visual",
-                eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP)
-                    .map_err(Error::backend)?,
-                "vision",
-            )
-            .map_err(Error::backend)?,
-        );
-        let group_id = layout.group_id(0).expect("declared vision group");
-        for index in 0..vision.layer_count() {
-            let block = VisionBlock::<B>::new_with_root(vision, "model.visual", index, context)?;
-            let groups = block_parallel_parameter_groups(&block, vision, "model.visual", index)
-                .map_err(Error::backend)?;
-            owned.extend(groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                    group,
-                )
-            }));
-        }
-        ArchitectureParameterDescription::new(
-            &graph,
-            &layout,
-            owned
-                .iter()
-                .map(|group| group.group().clone())
-                .collect::<Vec<_>>(),
-            owned,
-        )
-        .map_err(Error::backend)
     }
 
     /// Builds the exact configured vision/text/MTP graph.
