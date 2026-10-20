@@ -105,19 +105,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation =
             crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
-        match parallel {
-            Some(parallel) => self.static_modules.text.finish_parallel_instrumented(
-                hidden,
-                parallel,
-                context,
-                &mut instrumentation,
-            ),
-            None => {
-                self.static_modules
-                    .text
-                    .finish_instrumented(hidden, context, &mut instrumentation)
-            }
-        }
+        self.finish_readout(hidden, true, parallel, context, &mut instrumentation)
     }
 }
 

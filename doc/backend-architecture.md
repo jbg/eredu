@@ -8645,7 +8645,11 @@ geometry with planner-derived mutable state and validates exact unit/state
 ownership. Low-level equations and consuming module extraction live on the kernel;
 extraction rejects selected ownership that lacks required complete-model roots.
 The target-only `HybridDecoder` shell retains one sequential group for its remaining
-consumers. Conditional Qwen retains its separate vision/text driver.
+consumers. Conditional Qwen materializes its declared text and prediction roots
+directly from the shared construction specs. Its serial, parallel, observed and
+partition readout entry points share one equation over borrowed decoder resources;
+target readout normalizes once and prediction readout consumes normalized hidden
+values. Conditional Qwen retains its vision/text driver and media assembly.
 
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden

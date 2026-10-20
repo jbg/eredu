@@ -5,7 +5,7 @@ mod observation;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Index,
-    LinearOperator, NormalizationOperator, Parameterized, Tensor,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
@@ -15,6 +15,7 @@ use eredu_runtime::{
     RuntimeStateComponents, StateLayout,
 };
 
+use crate::decoder::{DecoderStaticResources, StaticModules};
 use crate::qwen::ingress::{prepare_input, prepared_semantic_tokens, ProjectedTokenPolicy};
 use crate::qwen::vision::{VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic};
 use crate::qwen::vl::InputPart;
@@ -1133,14 +1134,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => head.forward(hidden, context),
-            None => self
-                .static_modules
-                .text
-                .embeddings
-                .as_linear(hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            false,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     pub(crate) fn project_prediction_instrumented(
@@ -1150,9 +1150,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.static_modules
-            .text
-            .project_instrumented(hidden, parallel, context, instrumentation)
+        self.finish_readout(hidden, false, parallel, context, instrumentation)
     }
 
     /// Projects an already-normalized prediction hidden value through the selected TP head.
@@ -1210,18 +1208,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             .validate_for(VisionMode::WindowScheduled)
             .map_err(Error::backend)?;
         let definition = super::conditional_component_definition(&parsed, None)?;
-        let text_model = super::QwenKernel::<B>::new(parsed.text.clone(), context)?;
-        let text = text_model.into_parts().1.into_extended_static_modules()?;
-        let target_layers =
-            usize::try_from(parsed.text.num_hidden_layers).map_err(Error::backend)?;
-        let prediction_steps =
-            usize::try_from(parsed.text.mtp_num_hidden_layers).map_err(Error::backend)?;
+        let target_layers = definition.unit_count(1)?;
+        let prediction_steps = definition.prediction_groups().len();
+        let text =
+            StaticModules::from_spec(super::model::static_module_spec(&parsed.text), context)?;
+        let prediction = (prediction_steps > 0)
+            .then(|| super::PredictionShared::new(&parsed.text, context))
+            .transpose()?;
         Ok(Self {
             parsed,
             definition,
             static_modules: ConditionalStaticModules {
-                text: text.base,
-                prediction: text.extension,
+                text,
+                prediction,
                 vision: VisionStatic::new_with_root(vision, "model.visual", context)?,
             },
             target_layers,
@@ -1257,24 +1256,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = if normalize {
-            self.static_modules
-                .text
-                .boundary
-                .norm
-                .forward(hidden, context)?
-        } else {
-            hidden.clone()
-        };
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.text.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            normalize,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Builds the conditional graph with planner-derived local modules.
@@ -1296,30 +1284,33 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             .validate_for(VisionMode::WindowScheduled)
             .map_err(Error::backend)?;
         let definition = super::conditional_component_definition(&parsed, Some(&geometry))?;
-        let text_model = super::QwenKernel::<B>::new_parallel(
-            parsed.text.clone(),
-            geometry.text().clone(),
+        crate::operator_requirements::require::<B>(
+            "Qwen hybrid tensor parallelism",
+            eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+        )?;
+        let target_layers = definition.unit_count(1)?;
+        let prediction_steps = definition.prediction_groups().len();
+        let text = StaticModules::from_parallel_spec(
+            super::model::static_module_spec(&parsed.text),
+            geometry.text().embedding_range().clone(),
+            geometry.text().output_range().cloned(),
             context,
         )?;
-        let target_layers =
-            usize::try_from(parsed.text.num_hidden_layers).map_err(Error::backend)?;
-        let prediction_steps =
-            usize::try_from(parsed.text.mtp_num_hidden_layers).map_err(Error::backend)?;
+        let prediction = (prediction_steps > 0)
+            .then(|| super::PredictionShared::new(&parsed.text, context))
+            .transpose()?;
         Ok(Self {
             parsed,
             definition,
-            static_modules: {
-                let text = text_model.into_parts().1.into_extended_static_modules()?;
-                ConditionalStaticModules {
-                    text: text.base,
-                    prediction: text.extension,
-                    vision: VisionStatic::new_parallel_with_root(
-                        vision_config,
-                        "model.visual",
-                        geometry.merger_widths(),
-                        context,
-                    )?,
-                }
+            static_modules: ConditionalStaticModules {
+                text,
+                prediction,
+                vision: VisionStatic::new_parallel_with_root(
+                    vision_config,
+                    "model.visual",
+                    geometry.merger_widths(),
+                    context,
+                )?,
             },
             target_layers,
             prediction_steps,
@@ -1867,26 +1858,35 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         })
     }
 
+    fn finish_readout(
+        &mut self,
+        hidden: &B::Tensor,
+        normalize: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let resources = self.static_modules.text.decoder_resources_mut();
+        if normalize {
+            resources.finish_parallel(hidden, parallel, context, instrumentation)
+        } else {
+            resources.project(hidden, parallel, context, instrumentation)
+        }
+    }
+
     /// Applies the conditional target normalization and vocabulary projection.
     pub fn finish_pipeline_logits(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self
-            .static_modules
-            .text
-            .boundary
-            .norm
-            .forward(hidden, context)?;
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => head.forward(&hidden, context),
-            None => self
-                .static_modules
-                .text
-                .embeddings
-                .as_linear(&hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            true,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Executes one text unit through a runtime-owned routed-expert provider.
@@ -2449,23 +2449,13 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = match forward.mode {
-            ForwardMode::Target => self
-                .static_modules
-                .text
-                .boundary
-                .norm
-                .forward(hidden, context)?,
-            ForwardMode::Draft(_) => hidden.clone(),
-        };
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => head.forward(&hidden, context),
-            None => self
-                .static_modules
-                .text
-                .embeddings
-                .as_linear(&hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            matches!(forward.mode, ForwardMode::Target),
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     fn retained_context_values<'a>(
@@ -2769,24 +2759,13 @@ where
         if self.parallel_geometry.is_none() {
             return Err(Error::backend("conditional Qwen3.5 has no local geometry"));
         }
-        let hidden = match forward.mode {
-            ForwardMode::Target => self
-                .static_modules
-                .text
-                .boundary
-                .norm
-                .forward(hidden, context)?,
-            ForwardMode::Draft(_) => hidden.clone(),
-        };
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.text.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            matches!(forward.mode, ForwardMode::Target),
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
