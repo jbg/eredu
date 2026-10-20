@@ -187,6 +187,7 @@ fn component_equation_failure_aborts_the_same_policy_and_allows_retry() {
 // A mutable fixture uses global invocation addresses and independently sliced carry.
 struct CarryKernel {
     offset: usize,
+    has_ingress: bool,
 }
 type CarryState = DeviceState<FakeBackend, RetainedOrdinalLayerState>;
 impl ComponentKernel<FakeBackend> for CarryKernel {
@@ -223,12 +224,12 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
         &mut self,
         _: usize,
         input: &FakeTensor,
-        _: &[&FakeTensor],
+        dependencies: &[&FakeTensor],
         _: &mut CarryState,
         _: &mut (),
         _: &(),
     ) -> Result<FakeTensor, Failure> {
-        Ok(input.clone())
+        Ok(dependencies.first().copied().unwrap_or(input).clone())
     }
     fn executes_group(&self, _: usize, _: &()) -> bool {
         true
@@ -242,6 +243,9 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
         _: &mut (),
         _: &(),
     ) -> Result<FakeTensor, Failure> {
+        if self.has_ingress && address.group() == 0 {
+            return Ok(hidden.clone());
+        }
         let carry = state.layer(address.index() - self.offset).unwrap();
         carry.0 .0[0] += 1;
         let mut output = hidden.clone();
@@ -381,7 +385,14 @@ fn carry_state(layout: StateLayout) -> CarryState {
 
 #[test]
 fn component_partitions_preserve_repeated_advancement_and_local_carry_retention() {
-    let full = ComponentAdapter::new(carry_definition(), CarryKernel { offset: 0 }).unwrap();
+    let full = ComponentAdapter::new(
+        carry_definition(),
+        CarryKernel {
+            offset: 0,
+            has_ingress: false,
+        },
+    )
+    .unwrap();
     let mut resident = ResidentRuntime::new(full, &()).unwrap();
     let mut fullstate = carry_state(carry_definition().state_layout().clone());
     let mut stages = [0..1, 1..3].map(|range| {
@@ -390,6 +401,7 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
             declaration.clone(),
             CarryKernel {
                 offset: range.start,
+                has_ingress: false,
             },
         )
         .unwrap();
@@ -475,4 +487,134 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
     }
     let (last, _, _) = &stages[1];
     assert!(last.build_unit(0, 0, &()).is_err());
+}
+
+impl eredu_runtime::PipelineComponentKernel<FakeBackend> for CarryKernel {
+    fn input_dimensions(&self, _: &Self::Input<'_>) -> Result<(i32, i32), Failure> {
+        Ok((1, 1))
+    }
+    fn begin_pipeline<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(FakeTensor, NoAuxiliaryBoundary)>,
+        state: &mut CarryState,
+        selected: eredu_runtime::ComponentPartitionContext<'_, FakeBackend>,
+        _: &mut O,
+    ) -> Result<LayeredForwardState<FakeTensor, ()>, Failure>
+    where
+        O: eredu_runtime::ActivationObserver<FakeTensor, Failure> + ?Sized,
+    {
+        let input = match incoming {
+            Some((hidden, auxiliary)) => LayeredPartitionInput::Hidden { hidden, auxiliary },
+            None => LayeredPartitionInput::Tokens(input),
+        };
+        eredu_runtime::PartitionComponentKernel::begin_partition(self, input, None, state, selected)
+    }
+    fn output_width(&self) -> i32 {
+        1
+    }
+    fn tensor_vocabulary_sharded(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
+    let base = carry_definition();
+    let source = ComponentAdapter::new(
+        base.clone(),
+        CarryKernel {
+            offset: 0,
+            has_ingress: false,
+        },
+    )
+    .unwrap();
+    let graph = ExecutionGraph::new(
+        vec![
+            ExecutionGroupSpec::root("ingress"),
+            ExecutionGroupSpec::with_dependencies("carry", ["ingress"]),
+        ],
+        "carry",
+    )
+    .unwrap();
+    let layout = ExecutionUnitLayout::new(&graph, [1, 3]).unwrap();
+    let parameters = ArchitectureParameterDescription::new(&graph, &layout, [], []).unwrap();
+    let mut units = vec![ComponentUnit {
+        path: "ingress".into(),
+        state: 0..0,
+    }];
+    units.extend((0..3).map(|index| base.unit(0, index).unwrap().clone()));
+    let definition = ComponentDefinition::new(
+        "staged-carry",
+        parameters,
+        units,
+        vec![source.group_transport(0), source.group_transport(0)],
+        "carry",
+        vec![],
+        base.state_layout().clone(),
+        ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::group_units(1, 0..3),
+        ]),
+    )
+    .unwrap();
+    let adapter = ComponentAdapter::new(
+        definition.clone(),
+        CarryKernel {
+            offset: 0,
+            has_ingress: true,
+        },
+    )
+    .unwrap();
+    let partition = ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
+        &adapter,
+        [("ingress", 0..1), ("carry", 0..3)],
+        PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        definition.parameters(),
+    )
+    .unwrap();
+    let mut state = carry_state(partition.state().unwrap().layout().clone());
+    let mut runtime = adapter
+        .into_partition_runtime(RecordingPolicy::bounded(4), &partition)
+        .unwrap();
+    let incorrect_entry = RuntimeState::<FakeBackend>::layout(&state).clone();
+    let input = FakeTensor(vec![9]);
+    assert!(runtime
+        .forward_with_preparation(&mut state, None, &(), |adapter, state, _| {
+            eredu_runtime::PipelinePartitionArchitecture::begin_pipeline_partition(
+                adapter,
+                &input,
+                None,
+                state,
+                Some(&incorrect_entry),
+                0,
+                None,
+                &(),
+                &mut eredu_runtime::inspection::NoopObserver,
+            )
+        })
+        .is_err());
+    for step in 1..=3 {
+        let input = FakeTensor(vec![9]);
+        let output = runtime
+            .forward_with_preparation(&mut state, None, &(), |adapter, state, expected| {
+                eredu_runtime::PipelinePartitionArchitecture::begin_pipeline_partition(
+                    adapter,
+                    &input,
+                    None,
+                    state,
+                    expected,
+                    0,
+                    None,
+                    &(),
+                    &mut eredu_runtime::inspection::NoopObserver,
+                )
+            })
+            .unwrap();
+        let LayeredPartitionOutput::Final { output, .. } = output else {
+            panic!("stage owns output")
+        };
+        assert_eq!(output, FakeTensor(vec![9, step, step, step]));
+    }
 }

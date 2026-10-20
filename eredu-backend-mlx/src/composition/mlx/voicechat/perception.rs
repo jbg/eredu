@@ -3,7 +3,7 @@
 use eredu_architectures::voicechat::{
     perception::{PerceptionDimensions, PerceptionError, PerceptionOutput, PerceptionState},
     perception_layered::{
-        LayerwisePerception, PerceptionArchitecture, PerceptionExecution, PerceptionRuntimeState,
+        LayerwisePerception, PerceptionExecution, PerceptionKernel, PerceptionRuntimeState,
         PerceptionUnit,
     },
     perception_preparation::PreparedPerceptionBindings,
@@ -169,11 +169,12 @@ fn materialize(
             let (dimensions, layout, source, units) = prepared.into_parts();
             let mut architecture = match parallel {
                 Some((local, _)) => {
-                    PerceptionArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local)
+                    PerceptionKernel::<MlxNeuralBackend>::new_parallel(dimensions, local)
                 }
-                None => PerceptionArchitecture::<MlxNeuralBackend>::new(dimensions),
+                None => PerceptionKernel::<MlxNeuralBackend>::new(dimensions),
             }
             .and_then(|architecture| architecture.with_precision(precision))
+            .and_then(PerceptionKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let state_layout = architecture
                 .state_layout()

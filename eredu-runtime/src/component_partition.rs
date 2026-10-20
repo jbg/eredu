@@ -5,7 +5,7 @@ use std::{borrow::Borrow, ops::Range};
 
 /// Selected local state and execution context for a partition equation.
 pub struct ComponentPartitionContext<'a, B: NeuralBackend> {
-    /// Exact selected local mutable-state geometry.
+    /// Selected entry-group state geometry, absent for parameter-only ingress.
     pub expected: Option<&'a StateLayout>,
     /// Driver-selected local state origin.
     pub first_state_ordinal: usize,
@@ -33,6 +33,18 @@ pub trait PartitionComponentKernel<B: NeuralBackend>: ParallelComponentKernel<B>
         state: &mut Self::State,
         selected: ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+    /// Assembles an already transported group input without graph dependency values.
+    fn enter_partition_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        state: &mut Self::State,
+        forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.begin_group(group, initial, &[], state, forward, context)
+    }
     /// Publishes the completed local result or its typed boundary.
     fn finish_partition(
         &mut self,
@@ -77,9 +89,14 @@ pub trait PipelineComponentKernel<B: NeuralBackend>: PartitionComponentKernel<B>
         input: &Self::Input<'_>,
         batch: i32,
         sequence: i32,
-    ) -> Result<Vec<i32>, Self::Error>;
+    ) -> Result<Vec<i32>, Self::Error> {
+        let _ = input;
+        Ok(vec![batch, sequence, self.output_width()])
+    }
     /// Schema for the declared directed route.
-    fn route_schema(&self, route: &PartitionBoundaryRoute) -> Result<Self::Boundary, Self::Error>;
+    fn route_schema(&self, _route: &PartitionBoundaryRoute) -> Result<Self::Boundary, Self::Error> {
+        self.boundary_schema()
+    }
     /// Whether selected vocabulary shards require sum/gather publication.
     fn tensor_vocabulary_sharded(&self) -> bool;
 }
@@ -107,7 +124,7 @@ where
         first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
-        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
+        self.validate_partition_state(state.optional_layout(), Some(Some(expected)), None)?;
         self.kernel_mut().begin_partition(
             input,
             mask,
@@ -134,7 +151,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
-        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
+        self.validate_partition_state(state.optional_layout(), Some(Some(expected)), None)?;
         self.kernel_mut().begin_partition(
             input,
             mask,
@@ -146,6 +163,19 @@ where
                 native: context,
             },
         )
+    }
+    fn enter_partition_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        state: &mut K::State,
+        forward: &mut K::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, K::Error> {
+        self.validate_partition_group(group)?;
+        self.kernel_mut()
+            .enter_partition_group(group, initial, state, forward, parallel, context)
     }
     fn finish_partition(
         &mut self,
@@ -162,11 +192,7 @@ where
         >,
         K::Error,
     > {
-        self.validate_partition_state(
-            state.optional_layout(),
-            state.optional_layout(),
-            Some(owns_output),
-        )?;
+        self.validate_partition_state(state.optional_layout(), None, Some(owns_output))?;
         self.kernel_mut()
             .finish_partition(hidden, state, forward, owns_output, parallel, context)
     }
@@ -197,7 +223,7 @@ where
     where
         O: ActivationObserver<B::Tensor, K::Error> + ?Sized,
     {
-        self.validate_partition_state(state.optional_layout(), expected, None)?;
+        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
         self.kernel_mut().begin_pipeline(
             input,
             incoming,

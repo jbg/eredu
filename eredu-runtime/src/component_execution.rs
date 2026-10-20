@@ -508,10 +508,66 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
         self.selection = Some(selected);
         Ok(self)
     }
+    pub(crate) fn validate_partition_group(
+        &self,
+        group: usize,
+    ) -> Result<(), ComponentDefinitionError> {
+        if self
+            .selection
+            .as_ref()
+            .is_none_or(|selection| !selection.units.iter().any(|(owned, _)| *owned == group))
+        {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.definition().id.clone(),
+                resource: format!("partition group {group}"),
+            });
+        }
+        Ok(())
+    }
+    /// Constructs the ordinary local-stage traversal from declared state consumers.
+    pub fn into_partition_runtime<B, G, A, P>(
+        self,
+        policy: P,
+        partition: &crate::ArchitecturePartition<G, A>,
+    ) -> Result<
+        crate::LayerwisePartitionRuntime<Self, B, K::State, P>,
+        crate::LayerwisePartitionConstructionError,
+    >
+    where
+        B: NeuralBackend,
+        D: 'static,
+        K: crate::PartitionComponentKernel<B, Boundary = A> + 'static,
+        A: crate::ArchitectureBoundary,
+        P: crate::LayerwisePolicy<B, K::Unit>,
+    {
+        let selected = self.select_partition(partition)?;
+        let state_groups = (0..selected.definition().parameters.unit_layout().len())
+            .map(|ordinal| {
+                selected
+                    .definition()
+                    .parameters
+                    .unit_layout()
+                    .address(ordinal)
+                    .expect("canonical unit")
+            })
+            .filter(|address| {
+                !selected
+                    .definition()
+                    .unit(address.group(), address.index())
+                    .expect("declared unit")
+                    .state
+                    .is_empty()
+            })
+            .map(|address| address.group())
+            .collect::<std::collections::BTreeSet<_>>();
+        crate::LayerwisePartitionRuntime::new(selected, policy, partition, |group| {
+            state_groups.contains(&group)
+        })
+    }
     pub(crate) fn validate_partition_state(
         &self,
         actual: Option<&StateLayout>,
-        expected: Option<&StateLayout>,
+        expected_entry: Option<Option<&StateLayout>>,
         owns_output: Option<bool>,
     ) -> Result<(), ComponentDefinitionError> {
         let selected =
@@ -522,8 +578,24 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
                     resource: "missing retained partition".into(),
                 })?;
         let declared = selected.state.as_ref().map(PartitionState::layout);
+        let entry_declared = selected.units.first().and_then(|(group, _)| {
+            selected
+                .units
+                .iter()
+                .filter(|(owned, _)| owned == group)
+                .any(|(group, index)| {
+                    !self
+                        .definition()
+                        .unit(*group, *index)
+                        .expect("selected unit")
+                        .state
+                        .is_empty()
+                })
+                .then_some(declared)
+                .flatten()
+        });
         if actual != declared
-            || expected != declared
+            || expected_entry.is_some_and(|expected| expected != entry_declared)
             || owns_output.is_some_and(|owns| owns != selected.owns_output)
         {
             return Err(ComponentDefinitionError::Invalid {

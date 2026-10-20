@@ -1,12 +1,10 @@
 //! Exact local perception state and post-subsampling pipeline boundaries.
 use super::*;
 use eredu_nn::TensorElementType;
-use eredu_runtime::PipelinePartitionArchitecture;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
     ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype,
     BoundaryTensorSpec, LayeredPartitionInput, LayeredPartitionOutput,
-    PartitionedLayeredArchitecture,
 };
 use std::ops::Range;
 
@@ -153,46 +151,22 @@ pub fn validate_perception_partition<G>(
     ownership(dimensions, partition).map(|_| ())
 }
 
-impl<B: NeuralBackend> PerceptionArchitecture<B> {
+impl<B: NeuralBackend> PerceptionKernel<B> {
     /// Constructs only the parameters and cache owners selected for one stage.
     pub fn new_partition<G>(
         dimensions: PerceptionDimensions,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, PerceptionBoundarySchema>,
-    ) -> Result<Self, PerceptionError> {
+    ) -> Result<
+        eredu_runtime::ComponentAdapter<eredu_runtime::ComponentDefinition, Self>,
+        PerceptionError,
+    > {
         let mut architecture = match layout {
             Some(layout) => Self::new_parallel(dimensions, layout)?,
             None => Self::new(dimensions)?,
         };
         architecture.partition = Some(ownership(dimensions, partition)?);
-        Ok(architecture)
-    }
-    /// Uses the shared local-stage traversal with architecture-declared state ownership.
-    pub fn into_partition_runtime<G, P>(
-        self,
-        policy: P,
-        partition: &ArchitecturePartition<G, PerceptionBoundarySchema>,
-    ) -> Result<
-        eredu_runtime::LayerwisePartitionRuntime<Self, B, PerceptionRuntimeState<B::Tensor>, P>,
-        eredu_runtime::LayerwisePartitionConstructionError,
-    >
-    where
-        P: LayerwisePolicy<B, PerceptionUnit<B>>,
-    {
-        eredu_runtime::LayerwisePartitionRuntime::new(self, policy, partition, |group| group == 1)
-    }
-    pub(super) fn require_owned(&self, group: usize, index: usize) -> Result<(), PerceptionError> {
-        if let Some(selected) = &self.partition {
-            if !((group == 0 && index == 0 && selected.subsampling)
-                || (group == 1 && selected.blocks.contains(&index))
-                || (group == 2 && index == 0 && selected.projection))
-            {
-                return Err(PerceptionError::Configuration(
-                    "perception unit is outside selected ownership",
-                ));
-            }
-        }
-        Ok(())
+        Ok(architecture.into_component()?.select_partition(partition)?)
     }
     /// Validates a restored stage cache without materializing learned parameters.
     /// Every cache belongs to this rank's exact interval and uses released F32 geometry.
@@ -394,7 +368,7 @@ impl<B: NeuralBackend> PerceptionArchitecture<B> {
 impl<T: Tensor> PerceptionRuntimeState<T> {
     /// Creates initial local caches or a checked independent candidate from an existing stage.
     pub fn for_partition<B: NeuralBackend<Tensor = T>>(
-        architecture: &PerceptionArchitecture<B>,
+        architecture: &PerceptionKernel<B>,
         previous: Option<&Self>,
     ) -> Result<Self, PerceptionError> {
         let selected = architecture
@@ -436,40 +410,19 @@ impl<T: Tensor> PerceptionRuntimeState<T> {
     }
 }
 
-impl<B: NeuralBackend> PartitionedLayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
-    for PerceptionArchitecture<B>
-{
+impl<B: NeuralBackend> eredu_runtime::PartitionComponentKernel<B> for PerceptionKernel<B> {
     type Boundary = PerceptionBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, PerceptionError> {
         Ok(PerceptionBoundarySchema::new(self.dimensions))
     }
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, PerceptionBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, PerceptionBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut PerceptionRuntimeState<B::Tensor>,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, PerceptionError> {
-        if first != 0 || mask.is_some() {
-            return Err(PerceptionError::State(
-                "perception partition has no external mask or nonlocal cache origin",
-            ));
-        }
-        self.begin_prepared_partition(input, 0, None, state, Some(expected), None, context)
-    }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, PerceptionBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut PerceptionRuntimeState<B::Tensor>,
-        expected: &StateLayout,
-        first: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, PerceptionError> {
-        if first != 0 || mask.is_some() {
+        if selected.first_state_ordinal != 0 || mask.is_some() {
             return Err(PerceptionError::State(
                 "perception partition has no external mask or nonlocal cache origin",
             ));
@@ -479,11 +432,12 @@ impl<B: NeuralBackend> PartitionedLayeredArchitecture<B, PerceptionRuntimeState<
             0,
             None,
             state,
-            Some(expected),
-            Some(parallel),
-            context,
+            selected.expected,
+            selected.parallel,
+            selected.native,
         )
     }
+
     fn enter_partition_group(
         &mut self,
         group: usize,
@@ -493,14 +447,6 @@ impl<B: NeuralBackend> PartitionedLayeredArchitecture<B, PerceptionRuntimeState<
         _: Option<&B::ParallelContext>,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, PerceptionError> {
-        let selected = self
-            .partition
-            .as_ref()
-            .ok_or(PerceptionError::Configuration(
-                "perception stage ownership is absent",
-            ))?;
-        let first = if group == 1 { selected.blocks.start } else { 0 };
-        self.require_owned(group, first)?;
         if group == 2 {
             forward.encoder = Some(initial.clone());
         }
@@ -570,30 +516,22 @@ impl<B: NeuralBackend> PartitionedLayeredArchitecture<B, PerceptionRuntimeState<
     }
 }
 
-impl<B: NeuralBackend> PipelinePartitionArchitecture<B, PerceptionRuntimeState<B::Tensor>>
-    for PerceptionArchitecture<B>
-{
-    fn partition_input_dimensions(
-        &self,
-        input: &Self::Input<'_>,
-    ) -> Result<(i32, i32), PerceptionError> {
+impl<B: NeuralBackend> eredu_runtime::PipelineComponentKernel<B> for PerceptionKernel<B> {
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), PerceptionError> {
         self.encoded_dimensions(input)
     }
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, PerceptionBoundary<B::Tensor>)>,
         state: &mut PerceptionRuntimeState<B::Tensor>,
-        expected: Option<&StateLayout>,
-        first: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         _: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, PerceptionError>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, PerceptionError> + ?Sized,
     {
-        if first != 0 {
+        if selected.first_state_ordinal != 0 {
             return Err(PerceptionError::State(
                 "perception cache ordinals must be local",
             ));
@@ -615,23 +553,16 @@ impl<B: NeuralBackend> PipelinePartitionArchitecture<B, PerceptionRuntimeState<B
             input.drop_preencoded,
             Some(count),
             state,
-            expected,
-            parallel,
-            context,
+            selected.expected,
+            selected.parallel,
+            selected.native,
         )
     }
-    fn partition_output_width(&self) -> i32 {
+    fn output_width(&self) -> i32 {
         self.dimensions.block.width + self.dimensions.output_width
     }
-    fn partition_retained_state_ordinals(
-        &self,
-        group: usize,
-        index: usize,
-        ordinal: usize,
-    ) -> Range<usize> {
-        self.retained_state_ordinals(group, index, ordinal)
-    }
-    fn partition_tensor_vocabulary_sharded(&self) -> bool {
+
+    fn tensor_vocabulary_sharded(&self) -> bool {
         false
     }
 }

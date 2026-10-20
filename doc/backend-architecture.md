@@ -657,7 +657,7 @@ asymmetric two-dimensional padding, relative-position shift and masking, GLU
 convolution and half-weight feed-forward residuals. Canonical OIHW convolution
 parameters become OHWI views for the neutral convolution contract. Attention
 retains normalized inputs and convolution retains post-GLU values in compact,
-bounded caches. `PerceptionArchitecture` declares ordered subsampling, Conformer
+bounded caches. `PerceptionKernel` declares ordered subsampling, Conformer
 and projection groups. Subsampling, each Conformer block and the final projection
 are independently materialized execution units; the graph has no learned static
 parameters. Resident `Perception` and provider-backed `LayerwisePerception` use
@@ -693,13 +693,15 @@ and family cache identity. Parallel adaptation requires the separate
 `PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
 selection validates canonical parameter ownership and the declared state projection,
 retains global invocation addresses, and maps declared state slots to local ordinals.
-Ingress checks the selected state geometry; egress checks output ownership. The
+Ingress checks both the complete local state and its entry-group projection;
+egress checks output ownership. Declared state consumers also select the ordinary
+local-stage traversal without a family-authored state-group predicate. The
 adapter rejects pinned parameter declarations; it does not infer missing
 capabilities from equation defaults.
 
-VoiceChat RVQ, MoG, character conditioning, the function head, RNNT and codec PRVQ
-use this adapter with their typed kernels. They use runtime-owned empty pinned
-modules and stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
+VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception and codec PRVQ
+use this adapter with their typed kernels and runtime-owned empty pinned modules.
+Components without mutable state use shared stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
 bank-to-projection embedding operation. PRVQ retains selected depth ranges and
 ordered residual subtraction. Their collective-bearing equations retain explicit
 rank agreement and transient input/candidate roots through ordinary completion.
@@ -709,6 +711,11 @@ parameter groups from those phases. Projection execution owns no recurrent
 parameters. The resident RNNT consumes the same kernel as bounded execution;
 caller-owned LSTM parent and candidate state remains separate from parameter
 leases, including repeated cached predictor steps.
+Perception declares subsampling, independently leased Conformer layers and projection
+with cache references only on the Conformer invocations. Complete, tensor-parallel
+and selected pipeline execution share `PerceptionKernel`. A parameter-only ingress
+or projection stage owns no cache slots. Typed boundaries retain frame frontiers;
+projection ingress captures the raw encoder result alongside its projected output.
 
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint

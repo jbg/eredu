@@ -11,6 +11,9 @@ use std::marker::PhantomData;
 /// Rejected local stage geometry before any invocation or parameter acquisition.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerwisePartitionConstructionError {
+    /// Component selection differs from its validated declaration.
+    #[error(transparent)]
+    Definition(#[from] crate::ComponentDefinitionError),
     /// Canonical partition or architecture declarations disagree.
     #[error("invalid layered stage: {0}")]
     Contract(String),
