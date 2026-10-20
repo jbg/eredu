@@ -716,8 +716,13 @@ retains global invocation addresses, and maps declared state slots to local ordi
 Ingress checks both the complete local state and its entry-group projection;
 egress checks output ownership. Declared state consumers also select the ordinary
 local-stage traversal without a family-authored state-group predicate. The
-adapter rejects pinned parameter declarations; it does not infer missing
-capabilities from equation defaults.
+adapter uses `EmptyParameterModule` for wholly leased components. Kernels with
+pinned storage expose `ComponentPinnedResources`; `KernelParameterModules` borrows
+those same modules for binding, editing and completion roots without duplicating
+ownership. Complete construction checks exact canonical roles. Selected construction
+checks physically retained roles against the partition, including shared consumers
+and replicas. Selection rejects a retained pinned module outside that ownership.
+The adapter does not infer missing capabilities from equation defaults.
 
 VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception,
 the TTS transformer, codec PRVQ and the EAR encoder/decoder

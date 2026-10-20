@@ -201,7 +201,7 @@ impl ParameterGroupOwner {
         }
     }
 
-    fn static_storage_role(&self) -> Option<&str> {
+    pub(crate) fn static_storage_role(&self) -> Option<&str> {
         match self {
             Self::StaticRole(role) => Some(role),
             Self::StaticAnyOf(roles) => roles.first().map(String::as_str),

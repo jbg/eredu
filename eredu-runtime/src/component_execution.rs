@@ -2,10 +2,10 @@
 
 use crate::{
     ActivationObserver, ArchitectureGroupTransport, ArchitectureParameterDescription,
-    ArchitectureParameters, ArchitectureStatePartitionPlan, ExecutionGraph, ExecutionUnitAddress,
-    LayeredArchitecture, LayeredForwardState, ModelStateIdentity, ParallelLayeredArchitecture,
-    PartitionState, RuntimeState, StateError, StateLayout, StaticParameterVisitor,
-    StaticParameterVisitorMut,
+    ArchitectureParameters, ArchitectureStatePartitionPlan, ComponentResourceAccess,
+    ExecutionGraph, ExecutionUnitAddress, LayeredArchitecture, LayeredForwardState,
+    ModelStateIdentity, ParallelLayeredArchitecture, PartitionState, RuntimeState, StateError,
+    StateLayout, StaticParameterVisitor, StaticParameterVisitorMut,
 };
 use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 use std::{borrow::Borrow, ops::Range};
@@ -159,6 +159,10 @@ impl ComponentDefinition {
             state,
             state_partition,
         })
+    }
+    /// Stable identity used in typed declaration and binding errors.
+    pub fn id(&self) -> &str {
+        &self.id
     }
     /// Canonical storage and graph ownership.
     pub fn parameters(&self) -> &ArchitectureParameterDescription {
@@ -544,10 +548,11 @@ struct ComponentSelection {
 }
 
 /// Shared driver-facing contracts over one declaration and typed family kernel.
-pub struct ComponentAdapter<D, K> {
+pub struct ComponentAdapter<D, K, R = EmptyParameterModule> {
     definition: D,
     kernel: K,
-    empty: EmptyParameterModule,
+    resources: R,
+    resource_roles: std::collections::BTreeSet<String>,
     selection: Option<ComponentSelection>,
 }
 impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
@@ -568,9 +573,46 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
         Ok(Self {
             definition,
             kernel,
-            empty: EmptyParameterModule,
+            resources: EmptyParameterModule,
+            resource_roles: Default::default(),
             selection: None,
         })
+    }
+}
+impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
+    pub(crate) fn from_resources(
+        definition: D,
+        kernel: K,
+        resources: R,
+        resource_roles: std::collections::BTreeSet<String>,
+    ) -> Self {
+        Self {
+            definition,
+            kernel,
+            resources,
+            resource_roles,
+            selection: None,
+        }
+    }
+    pub(crate) fn validate_resource_roles(
+        &self,
+        groups: &[crate::OwnedParameterGroupSpec],
+    ) -> Result<(), ComponentDefinitionError> {
+        let expected: std::collections::BTreeSet<_> = groups
+            .iter()
+            .filter_map(|group| group.owner().static_storage_role())
+            .map(str::to_owned)
+            .collect();
+        if self.resource_roles != expected {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.definition().id.clone(),
+                resource: format!(
+                    "pinned roles {:?}, expected {expected:?}",
+                    self.resource_roles
+                ),
+            });
+        }
+        Ok(())
     }
     /// Retains validated rank-local ownership without changing global invocation identities.
     pub fn select_partition<G, A>(
@@ -588,6 +630,7 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
         {
             return Err(invalid("partition parameter ownership"));
         }
+        self.validate_resource_roles(partition.parameter_bindings())?;
         let expected = definition
             .state_partition
             .resolve_partition(
@@ -689,6 +732,7 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
     where
         B: NeuralBackend,
         D: 'static,
+        R: ComponentResourceAccess<B, K> + 'static,
         K: crate::PartitionComponentKernel<B, Boundary = A> + 'static,
         A: crate::ArchitectureBoundary,
         P: crate::LayerwisePolicy<B, K::Unit>,
@@ -811,10 +855,11 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
             .expect("validated ordinal"))
     }
 }
-impl<B, D, K> ArchitectureParameters<B> for ComponentAdapter<D, K>
+impl<B, D, K, R> ArchitectureParameters<B> for ComponentAdapter<D, K, R>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
+    R: ComponentResourceAccess<B, K> + 'static,
     K: ComponentKernel<B> + 'static,
 {
     type DefinitionError = K::Error;
@@ -836,21 +881,22 @@ where
     }
     fn visit_static_parameters<V: StaticParameterVisitor<B>>(
         &self,
-        _: &mut V,
+        visitor: &mut V,
     ) -> Result<(), V::Error> {
-        Ok(())
+        self.resources.visit(&self.kernel, visitor)
     }
     fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
         &mut self,
-        _: &mut V,
+        visitor: &mut V,
     ) -> Result<(), V::Error> {
-        Ok(())
+        self.resources.visit_mut(&mut self.kernel, visitor)
     }
 }
-impl<B, D, K, S> LayeredArchitecture<B, S> for ComponentAdapter<D, K>
+impl<B, D, K, S, R> LayeredArchitecture<B, S> for ComponentAdapter<D, K, R>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
+    R: ComponentResourceAccess<B, K> + 'static,
     S: RuntimeState<B>,
     K: ComponentEquations<B, S> + 'static,
 {
@@ -958,7 +1004,7 @@ where
         = K::Input<'a>
     where
         Self: 'a;
-    type StaticModules = EmptyParameterModule;
+    type StaticModules = R::Modules;
     type Unit = K::Unit;
     type ForwardContext = K::ForwardContext;
     type RetainedContextValues<'a>
@@ -1000,11 +1046,11 @@ where
     fn unit_path(&self, group: usize, index: usize) -> Result<String, K::Error> {
         Ok(self.definition().unit(group, index)?.path.clone())
     }
-    fn static_modules(&self) -> &EmptyParameterModule {
-        &self.empty
+    fn static_modules(&self) -> &R::Modules {
+        self.resources.modules(&self.kernel)
     }
-    fn static_modules_mut(&mut self) -> &mut EmptyParameterModule {
-        &mut self.empty
+    fn static_modules_mut(&mut self) -> &mut R::Modules {
+        self.resources.modules_mut(&mut self.kernel)
     }
     fn build_unit(
         &self,
@@ -1097,10 +1143,11 @@ where
         )
     }
 }
-impl<B, D, K, S> ParallelLayeredArchitecture<B, S> for ComponentAdapter<D, K>
+impl<B, D, K, S, R> ParallelLayeredArchitecture<B, S> for ComponentAdapter<D, K, R>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
+    R: ComponentResourceAccess<B, K> + 'static,
     S: RuntimeState<B>,
     K: ParallelComponentKernel<B, S> + 'static,
 {

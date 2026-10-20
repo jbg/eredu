@@ -28,6 +28,10 @@ pub use component_execution::{
     ComponentKernel, ComponentUnit, EmptyParameterModule, ParallelComponentKernel,
     ParameterStorageId, StateSlotId, StatelessComponentState,
 };
+mod component_resources;
+pub use component_resources::{
+    ComponentPinnedResources, ComponentResourceAccess, KernelParameterModules,
+};
 mod component_partition;
 pub use component_partition::{
     ComponentPartitionContext, PartitionComponentKernel, PipelineComponentKernel,

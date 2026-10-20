@@ -16,6 +16,7 @@ enum Failure {
 
 struct Kernel {
     fail: bool,
+    pinned: Option<FakeModule>,
 }
 impl ComponentKernel<FakeBackend> for Kernel {
     type State = StatelessComponentState;
@@ -57,6 +58,33 @@ impl ComponentKernel<FakeBackend> for Kernel {
         _: ExecutionUnitAddress,
     ) -> Self::RetainedContextValues<'a> {
         std::iter::empty()
+    }
+}
+impl eredu_runtime::ComponentPinnedResources<FakeBackend> for Kernel {
+    type Modules = Option<FakeModule>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.pinned
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.pinned
+    }
+    fn visit_pinned<V: StaticParameterVisitor<FakeBackend>>(
+        &self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(module) = &self.pinned {
+            visitor.visit("readout", module)?;
+        }
+        Ok(())
+    }
+    fn visit_pinned_mut<V: StaticParameterVisitorMut<FakeBackend>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(module) = &mut self.pinned {
+            visitor.visit_mut("readout", module)?;
+        }
+        Ok(())
     }
 }
 impl ComponentEquations<FakeBackend, StatelessComponentState> for Kernel {
@@ -153,11 +181,15 @@ impl ComponentEquations<FakeBackend, StatelessComponentState> for Kernel {
         _: &bool,
         _: &(),
     ) -> Result<FakeTensor, Failure> {
-        Ok(hidden.clone())
+        let mut output = hidden.clone();
+        if let Some(module) = &self.pinned {
+            output.0.extend_from_slice(&module.weight.0);
+        }
+        Ok(output)
     }
 }
 
-fn adapter(fail: bool) -> ComponentAdapter<ComponentDefinition, Kernel> {
+fn definition(pinned: bool) -> ComponentDefinition {
     let graph = ExecutionGraph::new(
         vec![
             ExecutionGroupSpec::root("first"),
@@ -167,7 +199,28 @@ fn adapter(fail: bool) -> ComponentAdapter<ComponentDefinition, Kernel> {
     )
     .unwrap();
     let layout = ExecutionUnitLayout::new(&graph, [1, 1]).unwrap();
-    let parameters = ArchitectureParameterDescription::new(&graph, &layout, [], []).unwrap();
+    let groups = if pinned {
+        vec![eredu_runtime::ParameterGroupSpec::new(
+            "readout",
+            eredu_runtime::ParameterRole::Replicated,
+            [eredu_runtime::ParameterMemberSpec::new(
+                "weight",
+                [1],
+                eredu_runtime::MemberSharding::Replicated,
+            )],
+        )
+        .unwrap()]
+    } else {
+        vec![]
+    };
+    let owned = groups.iter().cloned().map(|group| {
+        eredu_runtime::OwnedParameterGroupSpec::new(
+            eredu_runtime::ParameterGroupOwner::static_any_of(["readout", "embedding"]),
+            group,
+        )
+    });
+    let parameters =
+        ArchitectureParameterDescription::new(&graph, &layout, groups.clone(), owned).unwrap();
     let transport = ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::Projector,
@@ -197,7 +250,10 @@ fn adapter(fail: bool) -> ComponentAdapter<ComponentDefinition, Kernel> {
         ArchitectureStatePartitionPlan::new([]),
     )
     .unwrap();
-    ComponentAdapter::new(definition, Kernel { fail }).unwrap()
+    definition
+}
+fn adapter(fail: bool) -> ComponentAdapter<ComponentDefinition, Kernel> {
+    ComponentAdapter::new(definition(false), Kernel { fail, pinned: None }).unwrap()
 }
 
 #[test]
@@ -309,6 +365,95 @@ fn component_observation_failure_aborts_and_intervention_reaches_downstream_equa
     );
 }
 
+#[test]
+fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement() {
+    struct Replace;
+    impl StaticParameterVisitorMut<FakeBackend> for Replace {
+        type Error = Infallible;
+        fn visit_mut<M: Parameterized<FakeTensor>>(
+            &mut self,
+            role: &str,
+            module: &mut M,
+        ) -> Result<(), Infallible> {
+            assert_eq!(role, "readout");
+            struct Slot;
+            impl<'a> ParameterVisitorMut<'a, FakeTensor> for Slot {
+                fn visit_mut(&mut self, _: eredu_nn::ParameterMetadata, value: &'a mut FakeTensor) {
+                    *value = FakeTensor(vec![42]);
+                }
+            }
+            module.visit_parameters_mut(&mut Slot);
+            Ok(())
+        }
+    }
+    let declaration = definition(true);
+    let kernel = || Kernel {
+        fail: false,
+        pinned: Some(FakeModule {
+            weight: FakeTensor(vec![5]),
+        }),
+    };
+    assert!(ComponentAdapter::new(declaration.clone(), kernel()).is_err());
+    assert!(ComponentAdapter::with_pinned_resources::<FakeBackend>(
+        declaration.clone(),
+        Kernel {
+            fail: false,
+            pinned: None
+        }
+    )
+    .is_err());
+    let mut component =
+        ComponentAdapter::with_pinned_resources::<FakeBackend>(declaration.clone(), kernel())
+            .unwrap();
+    component.visit_static_parameters_mut(&mut Replace).unwrap();
+    let input = FakeTensor(vec![7]);
+    let mut state = StatelessComponentState::new().unwrap();
+    let mut bounded = LayerwiseRuntime::new(component, RecordingPolicy::bounded(2));
+    assert_eq!(
+        bounded.forward((&input, true), &mut state, &()).unwrap().0,
+        [7, 0, 10, 42]
+    );
+    let partition =
+        ArchitecturePartition::from_architecture::<FakeBackend, StatelessComponentState, _, _>(
+            bounded.architecture(),
+            [("first", 0..1)],
+            PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
+            (),
+            NoAuxiliaryBoundarySchema::new(1),
+            declaration.parameters(),
+        )
+        .unwrap();
+    // A cut cannot silently retain a readout replica that it does not own.
+    assert!(
+        ComponentAdapter::with_pinned_resources::<FakeBackend>(declaration.clone(), kernel())
+            .unwrap()
+            .select_partition(&partition)
+            .is_err()
+    );
+    ComponentAdapter::with_partition_resources::<FakeBackend, _, _>(
+        declaration.clone(),
+        Kernel {
+            fail: false,
+            pinned: None,
+        },
+        &partition,
+    )
+    .unwrap();
+    // A tied output consumer still binds its replica through the canonical readout role.
+    let tied =
+        ArchitecturePartition::from_architecture::<FakeBackend, StatelessComponentState, _, _>(
+            bounded.architecture(),
+            [("second", 0..1)],
+            PartitionOwnership::new(false, true, ["embedding"]).unwrap(),
+            (),
+            NoAuxiliaryBoundarySchema::new(1),
+            declaration.parameters(),
+        )
+        .unwrap();
+    ComponentAdapter::with_partition_resources::<FakeBackend, _, _>(declaration, kernel(), &tied)
+        .unwrap();
+}
+
 // A mutable fixture uses global invocation addresses and independently sliced carry.
 struct CarryKernel {
     offset: usize,
@@ -327,7 +472,11 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Failure> {
-        Kernel { fail: false }.state_identity(state, topology)
+        Kernel {
+            fail: false,
+            pinned: None,
+        }
+        .state_identity(state, topology)
     }
     fn build_unit(&self, address: ExecutionUnitAddress, _: &()) -> Result<FakeUnit, Failure> {
         Ok(FakeUnit {

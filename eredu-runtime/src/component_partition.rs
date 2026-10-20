@@ -171,10 +171,11 @@ pub trait PipelineComponentKernel<
     fn tensor_vocabulary_sharded(&self) -> bool;
 }
 
-impl<B, D, K, S> PartitionedLayeredArchitecture<B, S> for ComponentAdapter<D, K>
+impl<B, D, K, S, R> PartitionedLayeredArchitecture<B, S> for ComponentAdapter<D, K, R>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
+    R: ComponentResourceAccess<B, K> + 'static,
     S: RuntimeState<B>,
     K: PartitionComponentKernel<B, S> + 'static,
 {
@@ -339,10 +340,11 @@ where
             .finish_partition(hidden, state, forward, owns_output, parallel, context)
     }
 }
-impl<B, D, K, S> PipelinePartitionArchitecture<B, S> for ComponentAdapter<D, K>
+impl<B, D, K, S, R> PipelinePartitionArchitecture<B, S> for ComponentAdapter<D, K, R>
 where
     B: NeuralBackend,
     D: Borrow<ComponentDefinition> + 'static,
+    R: ComponentResourceAccess<B, K> + 'static,
     S: RuntimeState<B>,
     K: PipelineComponentKernel<B, S> + 'static,
 {
@@ -421,7 +423,7 @@ where
     }
 }
 
-impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
+impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
     /// Enters the ordinary local-stage driver with its selected optional state geometry.
     pub fn begin_prepared_partition<B, S>(
         &mut self,
