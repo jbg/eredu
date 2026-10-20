@@ -349,7 +349,7 @@ pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKer
     }
 
     /// Whether unit equations own their input/output observation and intervention seams.
-    fn observes_unit_boundaries(&self, _group: usize, _index: usize) -> bool {
+    fn observes_unit_boundaries(&self, _address: ExecutionUnitAddress) -> bool {
         false
     }
 
@@ -859,14 +859,45 @@ where
     }
 
     fn observes_unit_boundaries(&self, group: usize, index: usize) -> bool {
-        self.kernel.observes_unit_boundaries(group, index)
+        self.address(group, index)
+            .is_ok_and(|address| self.kernel.observes_unit_boundaries(address))
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        if self
+            .definition()
+            .parameters
+            .graph()
+            .groups()
+            .get(group)
+            .is_none()
+        {
+            return Err(ComponentDefinitionError::Address {
+                component: self.definition().id.clone(),
+                group,
+                index: 0,
+            }
+            .into());
+        }
         self.kernel.group_input_observation_path(group)
     }
 
     fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        if self
+            .definition()
+            .parameters
+            .graph()
+            .groups()
+            .get(group)
+            .is_none()
+        {
+            return Err(ComponentDefinitionError::Address {
+                component: self.definition().id.clone(),
+                group,
+                index: 0,
+            }
+            .into());
+        }
         self.kernel.group_output_observation_path(group)
     }
 
