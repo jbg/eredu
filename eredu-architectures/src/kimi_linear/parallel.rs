@@ -823,6 +823,360 @@ fn validate_realization(
     Ok(local)
 }
 
+/// Declares complete KDA/MLA and dense/routed topology without native resources.
+pub fn parameter_description(
+    args: &ModelArgs,
+) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
+    use eredu_runtime::{
+        ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout,
+        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterMemberSpec,
+    };
+    let invalid = |error: eredu_nn::Error| ParallelPlanError::InvalidGroup(error.to_string());
+    args.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let layers = args.num_hidden_layers as usize;
+    let graph = ExecutionGraph::chain([crate::decoder::TARGET_EXECUTION_GROUP])
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let layout = ExecutionUnitLayout::new(&graph, [layers])
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let owner_group = layout.group_id(0).expect("Kimi target group").clone();
+    let hidden = args.hidden_size as usize;
+    let mut formats = std::collections::BTreeMap::new();
+    let mut projections = std::collections::BTreeSet::new();
+    let mut projection = |name: String, output: usize, input: usize, sharding| {
+        projections.insert(name.clone());
+        ParameterMemberSpec::new(name, vec![output, input], sharding)
+    };
+    let mut owned = Vec::new();
+    for (name, role, owner, member) in [
+        (
+            "model.embed_tokens",
+            ParameterRole::Vocabulary,
+            if args.tie_word_embeddings {
+                ParameterGroupOwner::static_any_of(["embedding", "output"])
+            } else {
+                ParameterGroupOwner::static_role("embedding")
+            },
+            projection(
+                "model.embed_tokens.weight".into(),
+                args.vocab_size as usize,
+                hidden,
+                MemberSharding::Balanced { axis: 0 },
+            ),
+        ),
+        (
+            "model.norm",
+            ParameterRole::Replicated,
+            ParameterGroupOwner::static_role("norm"),
+            ParameterMemberSpec::new(
+                "model.norm.weight",
+                vec![hidden],
+                MemberSharding::Replicated,
+            ),
+        ),
+    ] {
+        owned.push(OwnedParameterGroupSpec::new(
+            owner,
+            ParameterGroupSpec::new(name, role, [member])?,
+        ));
+    }
+    if !args.tie_word_embeddings {
+        owned.push(OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_role("output"),
+            ParameterGroupSpec::new(
+                "lm_head",
+                ParameterRole::Vocabulary,
+                [projection(
+                    "lm_head.weight".into(),
+                    args.vocab_size as usize,
+                    hidden,
+                    MemberSharding::Balanced { axis: 0 },
+                )],
+            )?,
+        ));
+    }
+    let sum = |name: &str, first: i32, second: i32| {
+        first
+            .checked_add(second)
+            .map(|width| width as usize)
+            .ok_or_else(|| {
+                ParallelPlanError::InvalidGroup(format!("Kimi {name} width exceeds i32"))
+            })
+    };
+    let product = |name: &str, first: usize, second: usize| {
+        first
+            .checked_mul(second)
+            .filter(|width| i32::try_from(*width).is_ok())
+            .ok_or_else(|| {
+                ParallelPlanError::InvalidGroup(format!("Kimi {name} width exceeds i32"))
+            })
+    };
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        let root = format!("model.layers.{layer}");
+        let attention = format!("{root}.self_attn");
+        let mut members = Vec::new();
+        let heads = match policy.attention {
+            AttentionKind::Kda => {
+                let heads = args.kda_config.num_heads as usize;
+                let head = args.kda_config.head_dim as usize;
+                let width = product(&attention, heads, head)?;
+                for field in ["q_proj", "k_proj", "v_proj"] {
+                    members.push(projection(
+                        format!("{attention}.{field}.weight"),
+                        width,
+                        hidden,
+                        MemberSharding::Partitioned { axis: 0 },
+                    ));
+                }
+                for field in ["q_conv1d", "k_conv1d", "v_conv1d"] {
+                    members.push(ParameterMemberSpec::new(
+                        format!("{attention}.{field}.weight"),
+                        vec![width, 1, args.kda_config.short_conv_kernel_size as usize],
+                        MemberSharding::Partitioned { axis: 0 },
+                    ));
+                }
+                for field in ["f_a_proj", "g_a_proj"] {
+                    members.push(projection(
+                        format!("{attention}.{field}.weight"),
+                        head,
+                        hidden,
+                        MemberSharding::Replicated,
+                    ));
+                }
+                for field in ["f_b_proj", "g_b_proj"] {
+                    members.push(projection(
+                        format!("{attention}.{field}.weight"),
+                        width,
+                        head,
+                        MemberSharding::Partitioned { axis: 0 },
+                    ));
+                }
+                members.push(projection(
+                    format!("{attention}.b_proj.weight"),
+                    heads,
+                    hidden,
+                    MemberSharding::Partitioned { axis: 0 },
+                ));
+                members.push(ParameterMemberSpec::new(
+                    format!("{attention}.A_log"),
+                    vec![1, 1, heads, 1],
+                    MemberSharding::Partitioned { axis: 2 },
+                ));
+                members.push(ParameterMemberSpec::new(
+                    format!("{attention}.dt_bias"),
+                    vec![width],
+                    MemberSharding::Partitioned { axis: 0 },
+                ));
+                members.push(ParameterMemberSpec::new(
+                    format!("{attention}.o_norm.weight"),
+                    vec![head],
+                    MemberSharding::Replicated,
+                ));
+                members.push(projection(
+                    format!("{attention}.o_proj.weight"),
+                    hidden,
+                    width,
+                    MemberSharding::Partitioned { axis: 1 },
+                ));
+                heads
+            }
+            AttentionKind::Mla => {
+                let heads = args.num_attention_heads as usize;
+                let query = product(
+                    &attention,
+                    heads,
+                    sum(&attention, args.qk_nope_head_dim, args.qk_rope_head_dim)?,
+                )?;
+                if let Some(rank) = args.q_lora_rank {
+                    members.push(projection(
+                        format!("{attention}.q_a_proj.weight"),
+                        rank as usize,
+                        hidden,
+                        MemberSharding::Replicated,
+                    ));
+                    members.push(ParameterMemberSpec::new(
+                        format!("{attention}.q_a_layernorm.weight"),
+                        vec![rank as usize],
+                        MemberSharding::Replicated,
+                    ));
+                    members.push(projection(
+                        format!("{attention}.q_b_proj.weight"),
+                        query,
+                        rank as usize,
+                        MemberSharding::Partitioned { axis: 0 },
+                    ));
+                } else {
+                    members.push(projection(
+                        format!("{attention}.q_proj.weight"),
+                        query,
+                        hidden,
+                        MemberSharding::Partitioned { axis: 0 },
+                    ));
+                }
+                members.push(projection(
+                    format!("{attention}.kv_a_proj_with_mqa.weight"),
+                    sum(&attention, args.kv_lora_rank, args.qk_rope_head_dim)?,
+                    hidden,
+                    MemberSharding::Replicated,
+                ));
+                members.push(ParameterMemberSpec::new(
+                    format!("{attention}.kv_a_layernorm.weight"),
+                    vec![args.kv_lora_rank as usize],
+                    MemberSharding::Replicated,
+                ));
+                if args.split_kv_b {
+                    for (field, width) in [
+                        ("k_b_proj", args.qk_nope_head_dim),
+                        ("v_b_proj", args.v_head_dim),
+                    ] {
+                        members.push(projection(
+                            format!("{attention}.{field}.weight"),
+                            product(&attention, heads, width as usize)?,
+                            args.kv_lora_rank as usize,
+                            MemberSharding::Partitioned { axis: 0 },
+                        ));
+                    }
+                } else {
+                    members.push(projection(
+                        format!("{attention}.kv_b_proj.weight"),
+                        product(
+                            &attention,
+                            heads,
+                            sum(&attention, args.qk_nope_head_dim, args.v_head_dim)?,
+                        )?,
+                        args.kv_lora_rank as usize,
+                        MemberSharding::Partitioned { axis: 0 },
+                    ));
+                }
+                members.push(projection(
+                    format!("{attention}.o_proj.weight"),
+                    hidden,
+                    product(&attention, heads, args.v_head_dim as usize)?,
+                    MemberSharding::Partitioned { axis: 1 },
+                ));
+                heads
+            }
+        };
+        let mut groups = vec![ParameterGroupSpec::partitioned(
+            format!("{attention}.heads"),
+            ParameterRole::AttentionHeads,
+            heads,
+            members,
+        )?];
+        for field in ["input_layernorm", "post_attention_layernorm"] {
+            groups.push(ParameterGroupSpec::new(
+                format!("{root}.{field}"),
+                ParameterRole::Replicated,
+                [ParameterMemberSpec::new(
+                    format!("{root}.{field}.weight"),
+                    vec![hidden],
+                    MemberSharding::Replicated,
+                )],
+            )?);
+        }
+        if policy.feed_forward == FeedForwardPolicy::SparseMoe {
+            let selector = super::moe::selector_spec(args, layer).map_err(invalid)?;
+            formats.insert(
+                selector.weight().id.as_str().to_owned(),
+                selector.format().clone(),
+            );
+            groups.push(eredu_runtime::top_k_group_selector_logical_group(
+                format!("{root}.mlp.gate"),
+                &selector,
+            )?);
+            let bank = super::moe::expert_bank_spec(args, layer).map_err(invalid)?;
+            let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout() else {
+                return Err(ParallelPlanError::InvalidGroup(
+                    "Kimi requires packed experts".into(),
+                ));
+            };
+            for part in [gate_up, down] {
+                formats.insert(part.weight().id.as_str().to_owned(), part.format().clone());
+            }
+            groups.push(eredu_runtime::packed_gated_product_logical_group(
+                format!("{root}.mlp.experts.intermediate"),
+                &bank,
+                args.moe_intermediate_size as usize,
+            )?);
+        }
+        let (prefix, width) = match policy.feed_forward {
+            FeedForwardPolicy::Dense => (format!("{root}.mlp"), args.intermediate_size as usize),
+            FeedForwardPolicy::SparseMoe => (
+                format!("{root}.mlp.shared_experts"),
+                args.moe_intermediate_size as usize,
+            ),
+        };
+        groups.push(ParameterGroupSpec::partitioned(
+            format!("{prefix}.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            width,
+            [
+                projection(
+                    format!("{prefix}.gate_proj.weight"),
+                    width,
+                    hidden,
+                    MemberSharding::Partitioned { axis: 0 },
+                ),
+                projection(
+                    format!("{prefix}.up_proj.weight"),
+                    width,
+                    hidden,
+                    MemberSharding::Partitioned { axis: 0 },
+                ),
+                projection(
+                    format!("{prefix}.down_proj.weight"),
+                    hidden,
+                    width,
+                    MemberSharding::Partitioned { axis: 1 },
+                ),
+            ],
+        )?);
+        owned.extend(groups.into_iter().map(|group| {
+            OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(owner_group.clone(), layer),
+                group,
+            )
+        }));
+    }
+    let mut expanded = Vec::with_capacity(owned.len());
+    for owner in owned {
+        let groups = eredu_runtime::expand_linear_format_parameter_groups(
+            vec![owner.group().clone()],
+            |member| {
+                let name = member.target();
+                if let Some(format) = formats.get(name) {
+                    return Ok(Some(format.clone()));
+                }
+                projections
+                    .contains(name)
+                    .then(|| {
+                        crate::linear_format::standard_linear_format(
+                            name,
+                            args.weight_quantization_for(name).into(),
+                        )
+                        .map_err(invalid)
+                    })
+                    .transpose()
+            },
+        )?;
+        expanded.extend(
+            groups
+                .into_iter()
+                .map(|group| OwnedParameterGroupSpec::new(owner.owner().clone(), group)),
+        );
+    }
+    ArchitectureParameterDescription::new(
+        &graph,
+        &layout,
+        expanded
+            .iter()
+            .map(|group| group.group().clone())
+            .collect::<Vec<_>>(),
+        expanded,
+    )
+    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
+}
+
 /// Declares vocabulary and replicated final-normalization groups.
 pub fn static_parallel_parameter_groups<B>(
     modules: &StaticModules<B>,

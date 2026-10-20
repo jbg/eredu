@@ -123,30 +123,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("model.layers.{layer}.mlp");
-        let gate_name = format!("{prefix}.gate.weight");
-        let mut routing = TopKGroupSelectionSpec::new(
-            args.num_experts,
-            args.num_experts_per_token,
-            GroupScoring::Sigmoid,
-            args.moe_renormalize,
-        )?;
-        if args.use_grouped_topk {
-            routing = routing.with_groups(args.num_expert_group, args.topk_group)?;
-        }
-        routing = routing.with_weight_policy(1e-20, args.routed_scaling_factor)?;
-        let selector = TopKGroupSelectorSpec::new(
-            args.hidden_size,
-            ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
-            crate::linear_format::standard_linear_format(
-                &gate_name,
-                args.weight_quantization_for(&gate_name).into(),
-            )?,
-            routing,
-        )?
-        .with_correction_bias(
-            ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
-                .map_err(Error::backend)?,
-        )?;
+        let selector = selector_spec(args, layer)?;
         let router = B::top_k_group_selector(selector, context)?;
         let experts = B::grouped_gated_product(spec, context)?;
         Ok(Self {
@@ -164,6 +141,37 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             )?,
         })
     }
+}
+
+pub(crate) fn selector_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<TopKGroupSelectorSpec, Error> {
+    let prefix = format!("model.layers.{layer}.mlp");
+    let gate_name = format!("{prefix}.gate.weight");
+    let mut routing = TopKGroupSelectionSpec::new(
+        args.num_experts,
+        args.num_experts_per_token,
+        GroupScoring::Sigmoid,
+        args.moe_renormalize,
+    )?;
+    if args.use_grouped_topk {
+        routing = routing.with_groups(args.num_expert_group, args.topk_group)?;
+    }
+    routing = routing.with_weight_policy(1e-20, args.routed_scaling_factor)?;
+    TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
+        crate::linear_format::standard_linear_format(
+            &gate_name,
+            args.weight_quantization_for(&gate_name).into(),
+        )?,
+        routing,
+    )?
+    .with_correction_bias(
+        ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
+            .map_err(Error::backend)?,
+    )
 }
 
 /// Returns the architecture-owned routed expert specification for one sparse layer.

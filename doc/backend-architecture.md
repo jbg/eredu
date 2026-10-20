@@ -8751,6 +8751,13 @@ validated `LocalGeometry` and rank topology determine expert plans without nativ
 modules or a backend type. Replicated planning uses that algorithm with complete
 ownership. Routed preparation consumes these neutral plans for both selected and
 transform-source layouts.
+Kimi's complete parameter topology is also cold: KDA projections, convolutions,
+per-head/per-channel parameters, MLA direct or low-rank queries and
+fused or split KV-B, dense/shared feed-forward projections and routed banks derive
+from normalized policy. Exact linear-format expansion supplies encoding
+companions and compatible partition units. Full metadata and dense/routed
+partition source preparation consume this declaration without constructing
+native modules for discovery.
 
 Kimi attention and LFM2 attention/convolution companions inherit their primary projection's semantic head or
 output-column sharding through neutral parameter metadata. Their own physical

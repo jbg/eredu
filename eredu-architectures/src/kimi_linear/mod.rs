@@ -34,9 +34,9 @@ pub use moe::{
 };
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
-    partition_local_geometry, partition_local_routed_geometry, partitioned_state_layout,
-    static_parallel_parameter_groups, LocalGeometry, PartitionExpertBankOwnership,
-    PartitionLocalGeometry,
+    parameter_description, partition_local_geometry, partition_local_routed_geometry,
+    partitioned_state_layout, static_parallel_parameter_groups, LocalGeometry,
+    PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
 pub use partitioned::{KimiKernel, PartitionedLayeredModel};
 
@@ -46,10 +46,9 @@ use eredu_nn::{
     Error, GroupedNeuralBackend, NormalizationOperator, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
-    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, ModelStateIdentity,
-    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ParameterGroupOwner, ParameterProvider, PartitionedLayeredArchitecture,
+    ArchitectureParameterDescription, ExpertPass, LayerRuntimeState, LayeredArchitecture,
+    LayeredForwardState, LayeredPartitionInput, ModelStateIdentity, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
@@ -103,9 +102,9 @@ where
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        parameter_description(&self.args).map_err(Error::backend)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -211,53 +210,6 @@ where
     /// Returns normalized architecture policy.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    /// Describes every static and heterogeneous block parameter with explicit
-    /// canonical unit ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = self.group.execution_graph()?;
-        let count = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?;
-        let layout = ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?;
-        let static_groups =
-            static_parallel_parameter_groups(&self.static_modules).map_err(Error::backend)?;
-        let mut expected = static_groups.clone();
-        let mut owned = static_groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                OwnedParameterGroupSpec::new(
-                    if index == 0 && self.args.tie_word_embeddings {
-                        ParameterGroupOwner::static_any_of(["embedding", "output"])
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
-                    group,
-                )
-            })
-            .collect::<Vec<_>>();
-        let owner_group = layout.group_id(0).expect("Kimi layout group").clone();
-        for index in 0..count {
-            let unit = self.construct_unit(0, index, context)?;
-            let groups = layer_parallel_parameter_groups(&unit, &self.args, index)
-                .map_err(Error::backend)?;
-            expected.extend(groups.iter().cloned());
-            owned.extend(groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-                    group,
-                )
-            }));
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
     }
 
     /// Borrows embedding, final normalization, and vocabulary modules.
