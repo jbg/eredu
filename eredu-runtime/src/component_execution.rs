@@ -42,6 +42,12 @@ pub enum ComponentDefinitionError {
     },
 }
 
+impl From<ComponentDefinitionError> for eredu_nn::Error {
+    fn from(error: ComponentDefinitionError) -> Self {
+        Self::backend_source(error)
+    }
+}
+
 /// Stable identity of canonical parameter storage, distinct from an invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ParameterStorageId(pub crate::ParameterGroupOwner);
@@ -828,7 +834,7 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
     pub fn definition(&self) -> &ComponentDefinition {
         self.definition.borrow()
     }
-    fn address(
+    pub(crate) fn address(
         &self,
         group: usize,
         index: usize,

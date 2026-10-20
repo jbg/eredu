@@ -163,6 +163,18 @@ pub trait PipelineComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
             .and_then(|schema| schema.resolve(batch, sequence))
             .map_err(|error| eredu_nn::Error::backend_source(error).into())
     }
+    /// Semantic execution order of banks within one validated invocation.
+    fn routed_bank_order(&self, _address: ExecutionUnitAddress) -> Vec<RoutedBankId> {
+        vec![RoutedBankId::new(0)]
+    }
+    /// Collectives surrounding one declared bank invocation.
+    fn routed_bank_tensor_reductions(
+        &self,
+        _address: ExecutionUnitAddress,
+        _bank: RoutedBankId,
+    ) -> Result<RoutedTensorReductions, Self::Error> {
+        Ok(RoutedTensorReductions::hidden(1, 1))
+    }
     /// Whether selected vocabulary shards require sum/gather publication.
     fn tensor_vocabulary_sharded(&self) -> bool;
 }
@@ -413,6 +425,32 @@ where
         _: usize,
     ) -> Range<usize> {
         self.local_state_slots(group, index)
+    }
+    fn partition_routed_bank_order(&self, unit: usize) -> Vec<RoutedBankId> {
+        let group = self
+            .definition()
+            .parameters()
+            .graph()
+            .group_index(self.primary_execution_group())
+            .expect("declared primary group");
+        self.kernel().routed_bank_order(
+            self.address(group, unit)
+                .expect("validated routed traversal"),
+        )
+    }
+    fn partition_routed_bank_tensor_reductions(
+        &self,
+        unit: usize,
+        bank: RoutedBankId,
+    ) -> Result<RoutedTensorReductions, K::Error> {
+        let group = self
+            .definition()
+            .parameters()
+            .graph()
+            .group_index(self.primary_execution_group())
+            .expect("declared primary group");
+        self.kernel()
+            .routed_bank_tensor_reductions(self.address(group, unit)?, bank)
     }
     fn partition_tensor_vocabulary_sharded(&self) -> bool {
         self.kernel().tensor_vocabulary_sharded()

@@ -141,6 +141,7 @@ pub struct PartitionedTextModel<B: NeuralBackend> {
 impl<B: DistributedNeuralBackend> eredu_nn::Parameterized<B::Tensor> for PartitionedTextModel<B> {
     fn set_trainable(&mut self, trainable: bool) {
         self.base
+            .kernel_mut()
             .partition_static_modules_mut()
             .set_trainable(trainable);
     }
@@ -148,13 +149,17 @@ impl<B: DistributedNeuralBackend> eredu_nn::Parameterized<B::Tensor> for Partiti
         &'a self,
         visitor: &mut V,
     ) {
-        self.base.static_modules().visit_parameters(visitor);
+        self.base
+            .kernel()
+            .static_modules()
+            .visit_parameters(visitor);
     }
     fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>>(
         &'a mut self,
         visitor: &mut V,
     ) {
         self.base
+            .kernel_mut()
             .partition_static_modules_mut()
             .visit_parameters_mut(visitor);
     }
@@ -172,12 +177,12 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            base: PartitionedLayeredModel::from_partition(config, parameters, partition, context)?,
+            base: decoder::DecoderKernel::from_partition(config, parameters, partition, context)?,
         })
     }
     /// Complete family equations, including optional draft adapter topology.
     pub fn config(&self) -> &FamilyConfig {
-        self.base.args()
+        self.base.kernel().args()
     }
     /// Constructs exactly one locally owned layer and its optional low-rank matrices.
     pub fn construct_unit(
@@ -185,7 +190,7 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextLayer<B>, Error> {
-        let base = self.base.construct_unit(index, context)?;
+        let base = self.base.kernel().construct_unit(index, context)?;
         let draft_adapter = self
             .config()
             .draft_adapter()
@@ -438,7 +443,7 @@ impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for PartitionedTextM
         std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         String,
     > {
-        super::checkpoint::module_source_recipes(self.base.static_modules(), source)
+        super::checkpoint::module_source_recipes(self.base.kernel().static_modules(), source)
     }
     fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
         &self,
@@ -501,7 +506,7 @@ where
         )
     }
     fn static_modules(&self) -> &Self::StaticModules {
-        self.base.static_modules()
+        self.base.kernel().static_modules()
     }
     fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
         <PartitionedLayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::static_modules_mut(
@@ -609,7 +614,7 @@ where
         _: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.base.finish_local(hidden, None, context)
+        self.base.kernel_mut().finish_local(hidden, None, context)
     }
     fn finish_forward_observed<O>(
         &mut self,
@@ -623,7 +628,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.finish_local_instrumented(
+        self.base.kernel_mut().finish_local_instrumented(
             hidden,
             None,
             context,
@@ -658,7 +663,7 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
         S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let range = self.base.local_geometry().owned_units();
+        let range = self.base.kernel().local_geometry().owned_units();
         if group != 0 || !range.contains(&index) {
             return Err(Error::backend(
                 "shared text partition attempted an unowned unit",
@@ -784,7 +789,9 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.base.finish_local(hidden, Some(parallel), context)
+        self.base
+            .kernel_mut()
+            .finish_local(hidden, Some(parallel), context)
     }
     fn finish_forward_parallel_observed<O>(
         &mut self,
@@ -799,7 +806,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.finish_local_instrumented(
+        self.base.kernel_mut().finish_local_instrumented(
             hidden,
             Some(parallel),
             context,
@@ -932,7 +939,7 @@ where
         }
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         Ok(LayeredPartitionOutput::Final {
-            output: self.base.finish_local_instrumented(
+            output: self.base.kernel_mut().finish_local_instrumented(
                 hidden,
                 parallel,
                 context,

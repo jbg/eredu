@@ -10429,20 +10429,19 @@ where
                 validate_transform_task_owner(task.name(), source_owner, target_owner)
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             }
-            let source_architecture =
-                crate::decoder::PartitionedLayeredModel::<B, C, P>::from_partition(
-                    source_args,
-                    &source_parameters,
-                    &source_partition,
-                    context,
-                )
-                .map_err(|error| {
-                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-                })?;
+            let source_architecture = crate::decoder::DecoderKernel::<B, C, P>::from_partition(
+                source_args,
+                &source_parameters,
+                &source_partition,
+                context,
+            )
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
             Ok((source_architecture, source_layout))
         })
         .transpose()?;
-    let architecture = crate::decoder::PartitionedLayeredModel::<B, C, P>::from_partition(
+    let architecture = crate::decoder::DecoderKernel::<B, C, P>::from_partition(
         selected_args,
         &parameters,
         &partition,
@@ -11425,7 +11424,7 @@ where
             .collect::<BTreeSet<_>>();
         tasks.retain(|task| !targets.contains(task.name()));
     }
-    let architecture = crate::decoder::PartitionedLayeredModel::<B, C, P>::from_partition(
+    let architecture = crate::decoder::DecoderKernel::<B, C, P>::from_partition(
         selected_args,
         &parameters,
         &partition,

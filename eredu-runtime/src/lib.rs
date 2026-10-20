@@ -28,6 +28,10 @@ pub use component_execution::{
     ComponentKernel, ComponentUnit, EmptyParameterModule, ParallelComponentKernel,
     ParameterStorageId, StateSlotId, StatelessComponentState,
 };
+mod component_text;
+pub use component_text::TextComponentKernel;
+mod component_routed;
+pub use component_routed::{ParallelRoutedComponentKernel, RoutedComponentKernel};
 mod component_resources;
 pub use component_resources::{
     ComponentPinnedResources, ComponentResourceAccess, KernelParameterModules,

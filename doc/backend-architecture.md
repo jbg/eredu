@@ -688,6 +688,14 @@ validates the selected state layout and derives causal visibility from the selec
 cache offset through one shared function, including supplied masks and explicit
 rotary embeddings.
 
+Selected decoder execution uses `ComponentAdapter` with `DecoderKernel` and
+kernel-owned `PartitionStaticModules`. Its definition retains canonical parameters,
+global paths, state references and decoder transport before module construction.
+The kernel owns attention, readout, routed-bank ordering and exceptional local
+geometry. The adapter supplies ordinary, observed, parallel, provider-aware and
+pipeline driver contracts, including exact local state and pinned-role selection.
+Low-level decoder operations remain available through the typed kernel.
+
 Pipeline-local shared decoder readout uses the typed `PartitionStaticModules`
 readout for final normalization, tied or untied vocabulary projection and
 component instrumentation. The enclosing decoder applies its configured logit
@@ -711,6 +719,12 @@ the same adapter. Unit hooks receive validated invocation addresses; partition
 hooks run after the same state and ownership checks as ordinary ingress and egress.
 Internal hook coverage and ownership of unit boundary interventions are explicit
 kernel reports, independent of the presence of default hook methods.
+Provider-aware execution requires `RoutedComponentKernel`; tensor-parallel provider
+execution additionally requires `ParallelRoutedComponentKernel`. The shared adapter
+validates invocation ownership before passing a provider to either equation. Kernels
+report component and sparse expert observation coverage explicitly. Pipeline bank
+order and collective requirements are typed kernel hooks over validated invocations.
+Text request construction uses the independent `TextComponentKernel` capability.
 Parallel adaptation requires the separate
 `ParallelComponentKernel` bound. Typed partition and pipeline adaptation require
 `PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
