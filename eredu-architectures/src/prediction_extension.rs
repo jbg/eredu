@@ -9,7 +9,6 @@ pub use qwen4_exp::{
 };
 pub use routed_preparation::PreparedRoutedPrediction;
 
-use eredu_nn::EmbeddingOperator as _;
 use std::num::NonZeroUsize;
 
 pub(crate) mod invocation;
@@ -2119,11 +2118,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
         match parallel {
-            Some(parallel) => self.pipeline_embed_parallel(tokens, parallel, context),
-            None => self
-                .static_modules_mut()
-                .embeddings
-                .forward(tokens, context),
+            Some(parallel) => self
+                .kernel_mut()
+                .pipeline_embed_parallel(tokens, parallel, context),
+            None => self.kernel_mut().begin_partition_embedding(tokens, context),
         }
     }
     fn project_prediction(
@@ -2133,8 +2131,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.static_modules_mut()
-            .project_instrumented(hidden, parallel, context, instrumentation)
+        crate::decoder::DecoderStaticResources::decoder_resources_mut(
+            self.kernel_mut().static_modules_mut(),
+        )
+        .project(hidden, parallel, context, instrumentation)
     }
 }
 

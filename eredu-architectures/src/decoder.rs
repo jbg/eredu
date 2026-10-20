@@ -3970,7 +3970,7 @@ pub struct StaticModuleSpec {
 }
 
 impl StaticModuleSpec {
-    fn construction_specs(
+    pub(crate) fn construction_specs(
         &self,
     ) -> Result<
         (

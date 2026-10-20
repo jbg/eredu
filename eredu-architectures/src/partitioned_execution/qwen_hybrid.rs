@@ -75,7 +75,6 @@ where
             "dense Qwen hybrid admission names another execution group",
         ));
     }
-    let start = owned.units().start;
     let geometry =
         crate::qwen::hybrid::local_geometry(&selected_args, &layout).map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
@@ -136,13 +135,13 @@ where
                 "dense Qwen hybrid transform source changed local unit addresses",
             ));
         }
-        let mut model = crate::qwen::hybrid::LayeredModel::<B>::new_parallel(
+        let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             source_args,
-            source_geometry,
+            &source_parameters,
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
-        model.set_partition_target_start(start);
         Some((model, source_layout))
     } else {
         None
@@ -150,10 +149,13 @@ where
     let capability_estimate =
         crate::capability::qwen_hybrid_text(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let mut model =
-        crate::qwen::hybrid::LayeredModel::<B>::new_parallel(selected_args, geometry, context)
-            .map_err(architecture)?;
-    model.set_partition_target_start(start);
+    let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
+        selected_args,
+        &parameters,
+        &partition,
+        context,
+    )
+    .map_err(architecture)?;
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition)
         .map_err(architecture)?;
     finish(
@@ -235,7 +237,6 @@ where
             "routed Qwen hybrid admission names another execution group",
         ));
     }
-    let start = owned.units().start;
     let geometry =
         crate::qwen::hybrid::local_geometry(&selected_args, &layout).map_err(architecture)?;
     let plan =
@@ -294,14 +295,14 @@ where
                 "routed Qwen hybrid transform source changed local unit addresses",
             ));
         }
-        let mut model = crate::qwen::hybrid::LayeredModel::<B>::new_parallel(
+        let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             args.clone(),
-            source_geometry,
+            &source_parameters,
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
-        model.set_partition_target_start(start);
-        model.install_expert_realization(source_plan);
+        model.kernel_mut().install_expert_realization(source_plan);
         Some((model, source_layout))
     } else {
         None
@@ -309,11 +310,14 @@ where
     let capability_estimate =
         crate::capability::qwen_hybrid_text(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let mut model =
-        crate::qwen::hybrid::LayeredModel::<B>::new_parallel(selected_args, geometry, context)
-            .map_err(architecture)?;
-    model.set_partition_target_start(start);
-    model.install_expert_realization(plan.clone());
+    let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
+        selected_args,
+        &parameters,
+        &partition,
+        context,
+    )
+    .map_err(architecture)?;
+    model.kernel_mut().install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         model,
         source_architecture,

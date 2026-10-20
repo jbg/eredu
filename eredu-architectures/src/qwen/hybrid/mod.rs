@@ -53,7 +53,10 @@ pub use config::{
     ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use linear_attention::recurrent_spec;
-pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
+pub use model::{
+    state_identity, ForwardContext, LayeredModel, QwenKernel, QwenStaticModules,
+    TargetPartitionInput, Unit,
+};
 pub use mtp::{
     prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionUnit,
 };

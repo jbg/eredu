@@ -8612,15 +8612,25 @@ still uses native module visitation. Low-level unit parameter descriptions accep
 configuration and validated group coordinates without requiring a materialized
 unit.
 
-Qwen hybrid text construction retains one validated `ComponentDefinition` before
-allocating native static modules. Its graph, invocation paths, parameter owners,
-group transport and state partition plan come from that definition. Local
-construction retains checkpoint-global parameters with planner-derived mutable
-state geometry and materializes the selected vocabulary modules directly.
-Pinned target modules and shared MTP modules have one physical owner in the
-model. Low-level queries preserve the distinction between global state policy
-and the selected local state projection. The target-only `HybridDecoder` shell
-retains one sequential group for its remaining consumers.
+Full and selected Qwen hybrid text execution uses `ComponentAdapter` with one
+`QwenKernel`. The adapter and kernel retain the same `Arc<ComponentDefinition>`
+before native materialization. The shared adapter supplies graph traversal,
+validated addresses, parameter visitation, retained roots, partition ownership
+and text/runtime contracts. Typed hooks retain recurrent and attention equations,
+routed provider access, target captures, MTP fusion and collective semantics.
+Observation capabilities retain the selected path's explicit target-only predicates.
+
+Qwen pinned resources contain optional embedding, readout boundary, untied head
+and shared MTP modules. Full construction supplies all declared roots; selected
+target construction supplies only the canonical static owners present in its
+partition bindings. Tied output partitions retain their actual embedding replica.
+The same kernel and resource equations serve serial, parallel, observed and
+partitioned execution. Local construction retains checkpoint-global parameter
+geometry with planner-derived mutable state and validates exact unit/state
+ownership. Low-level equations and consuming module extraction live on the kernel;
+extraction rejects selected ownership that lacks required complete-model roots.
+The target-only `HybridDecoder` shell retains one sequential group for its remaining
+consumers. Conditional Qwen retains its separate vision/text driver.
 
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden

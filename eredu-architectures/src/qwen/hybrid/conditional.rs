@@ -1302,8 +1302,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         vision
             .validate_for(VisionMode::WindowScheduled)
             .map_err(Error::backend)?;
-        let text_model = super::LayeredModel::<B>::new(parsed.text.clone(), context)?;
-        let text = text_model.into_extended_static_modules();
+        let text_model = super::QwenKernel::<B>::new(parsed.text.clone(), context)?;
+        let text = text_model.into_parts().1.into_extended_static_modules()?;
         let target_layers =
             usize::try_from(parsed.text.num_hidden_layers).map_err(Error::backend)?;
         let prediction_steps =
@@ -1386,7 +1386,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         vision_config
             .validate_for(VisionMode::WindowScheduled)
             .map_err(Error::backend)?;
-        let text_model = super::LayeredModel::<B>::new_parallel(
+        let text_model = super::QwenKernel::<B>::new_parallel(
             parsed.text.clone(),
             geometry.text().clone(),
             context,
@@ -1398,7 +1398,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         Ok(Self {
             parsed,
             static_modules: {
-                let text = text_model.into_extended_static_modules();
+                let text = text_model.into_parts().1.into_extended_static_modules()?;
                 ConditionalStaticModules {
                     text: text.base,
                     prediction: text.extension,

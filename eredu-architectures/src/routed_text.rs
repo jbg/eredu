@@ -1211,14 +1211,14 @@ where
         ));
     };
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::qwen::hybrid::LayeredModel::<B>::new(args.clone(), context))
+        .then(|| crate::qwen::hybrid::QwenKernel::<B>::new(args.clone(), context))
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_qwen_hybrid_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::qwen::hybrid::LayeredModel::<B>::new(selected_args, context)
+    let architecture = crate::qwen::hybrid::QwenKernel::<B>::new(selected_args, context)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::qwen_hybrid_text(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;

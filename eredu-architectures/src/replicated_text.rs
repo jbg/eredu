@@ -8757,21 +8757,6 @@ impl From<eredu_checkpoint::Error> for ReplicatedTextRequirementsError {
     }
 }
 
-impl<B, S> ReplicatedTextArchitecture<B, S> for crate::qwen::hybrid::LayeredModel<B>
-where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
-{
-    fn supports_chunked_prefill() -> bool {
-        crate::qwen::hybrid::CHUNKED_TEXT_PREFILL
-    }
-
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        crate::qwen::hybrid::EmbeddedInput::Target { tokens, mask }
-    }
-}
-
 impl<B, S> ReplicatedTextArchitecture<B, S> for crate::deepseek::v3::Model<B>
 where
     B: eredu_nn::GroupedNeuralBackend

@@ -3,18 +3,19 @@
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
-    LinearOperator, NormalizationOperator, Parameterized, Tensor,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, ModelStateIdentity,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterProvider,
-    PartitionedLayeredArchitecture, ResidentExpertProvider, RoutedLayeredArchitecture,
-    RuntimeStateComponents, StateLayout,
+    ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState,
+    LayeredPartitionInput, LayeredPartitionOutput, ModelStateIdentity, ParameterProvider,
+    ResidentExpertProvider, RuntimeStateComponents, StateLayout,
+};
+use eredu_runtime::{
+    ComponentEquations as _, ParallelComponentKernel as _, PartitionComponentKernel as _,
 };
 
 use crate::{
-    decoder::{StaticModuleSpec, StaticModules},
+    decoder::{DecoderStaticResources, StaticModuleSpec, StaticModules},
     hybrid_decoder::HybridStaticModules,
 };
 
@@ -31,194 +32,6 @@ pub enum Unit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     Target(Block<B>),
     /// One embedded prediction depth.
     Prediction(PredictionUnit<B>),
-}
-
-impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn routed_unit_observations(&self) -> bool {
-        self.prediction_steps == 0
-    }
-
-    fn routed_sparse_observations(&self) -> bool {
-        self.prediction_steps == 0
-    }
-
-    fn forward_unit_with_provider<P>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: ParameterProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        LayeredModel::forward_unit_with_provider(
-            self, group, index, unit, hidden, state, forward, provider, context,
-        )
-    }
-
-    fn forward_unit_observed_with_provider<P, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: ParameterProvider<B>,
-        P::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let path = self.definition.unit(group, index)?.path.clone();
-        let lane = state
-            .layer(self.state_index(group, index)?)
-            .map_err(Error::backend)?;
-        let points = eredu_runtime::RoutedObservationPoints::new(
-            eredu_runtime::RoutedBankId::new(0),
-            format!("{path}.mlp"),
-            self.config.num_experts,
-        );
-        match unit {
-            Unit::Target(block) if group == 0 => block.forward_components_with_provider(
-                &path,
-                points,
-                hidden,
-                forward.mask.as_ref(),
-                lane,
-                context,
-                provider,
-                observer,
-            ),
-            Unit::Prediction(unit) if group > 0 => unit.forward_observed_with_provider(
-                self.prediction_shared_mut()?,
-                &path,
-                points,
-                hidden,
-                &forward.embedded,
-                forward.mask.as_ref(),
-                lane,
-                context,
-                provider,
-                observer,
-            ),
-            _ => Err(Error::backend(format!(
-                "Qwen hybrid unit does not match execution group {group}"
-            ))),
-        }
-    }
-}
-
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn parallel_routed_unit_observations(&self) -> bool {
-        self.prediction_steps == 0
-    }
-
-    fn parallel_routed_sparse_observations(&self) -> bool {
-        self.prediction_steps == 0
-    }
-
-    fn forward_unit_parallel_observed_with_provider<P, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        P: eredu_runtime::TensorParallelParameterProvider<B>,
-        P::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let path = self.definition.unit(group, index)?.path.clone();
-        let lane = state
-            .layer(self.state_index(group, index)?)
-            .map_err(Error::backend)?;
-        let points = eredu_runtime::RoutedObservationPoints::new(
-            eredu_runtime::RoutedBankId::new(0),
-            format!("{path}.mlp"),
-            self.config.num_experts,
-        );
-        match unit {
-            Unit::Target(block) if group == 0 => block.forward_components_parallel_with_provider(
-                &path,
-                points,
-                hidden,
-                forward.mask.as_ref(),
-                lane,
-                parallel,
-                context,
-                provider,
-                observer,
-            ),
-            Unit::Prediction(unit) if group > 0 => unit.forward_parallel_observed_with_provider(
-                self.prediction_shared_mut()?,
-                &path,
-                points,
-                hidden,
-                &forward.embedded,
-                forward.mask.as_ref(),
-                lane,
-                parallel,
-                context,
-                provider,
-                observer,
-            ),
-            _ => Err(Error::backend(format!(
-                "Qwen hybrid unit does not match execution group {group}"
-            ))),
-        }
-    }
-
-    fn forward_unit_parallel_with_provider<P>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: eredu_runtime::TensorParallelParameterProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        LayeredModel::forward_unit_with_provider_parallel(
-            self, group, index, unit, hidden, state, forward, provider, parallel, context,
-        )
-    }
 }
 
 /// Request-local values retained through one target or prediction pass.
@@ -250,7 +63,7 @@ impl<T> ForwardContext<T> {
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B> {
     /// Resumes an already embedded target partition in the canonical layered context.
     pub fn resume_target_partition(
         &self,
@@ -299,110 +112,88 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 }
 
 /// One neutral layered model for Qwen3-Next and every Qwen3.5 text policy.
-pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub type LayeredModel<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    QwenKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Physical pinned resources for full or selected Qwen hybrid execution.
+#[derive(Debug, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct QwenStaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    /// Input or tied-output embedding on its declared owner.
+    pub embeddings: Option<B::Embedding>,
+    /// Final normalization on the output owner.
+    pub boundary: Option<crate::decoder::NormalizedBoundary<B>>,
+    /// Separate vocabulary head when untied and locally owned.
+    pub lm_head: Option<B::Linear>,
+    /// Canonical prediction fusion and normalization shared by local MTP consumers.
+    pub prediction: Option<super::PredictionShared<B>>,
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for QwenStaticModules<B> {
+    fn clone(&self) -> Self {
+        Self {
+            embeddings: self.embeddings.clone(),
+            boundary: self.boundary.clone(),
+            lm_head: self.lm_head.clone(),
+            prediction: self.prediction.clone(),
+        }
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderStaticResources<B>
+    for QwenStaticModules<B>
+{
+    fn decoder_resources(&self) -> crate::decoder::DecoderResources<'_, B> {
+        crate::decoder::DecoderResources {
+            embedding: self.embeddings.as_ref(),
+            norm: self.boundary.as_ref().map(|boundary| &boundary.norm),
+            head: self.lm_head.as_ref(),
+        }
+    }
+    fn decoder_resources_mut(&mut self) -> crate::decoder::DecoderResourcesMut<'_, B> {
+        crate::decoder::DecoderResourcesMut {
+            embedding: self.embeddings.as_mut(),
+            norm: self.boundary.as_mut().map(|boundary| &mut boundary.norm),
+            head: self.lm_head.as_mut(),
+        }
+    }
+}
+
+/// Typed target, prediction and partition equations over the selected resource owners.
+pub struct QwenKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     config: HybridConfig,
-    static_modules: HybridStaticModules<B, Option<super::PredictionShared<B>>>,
-    definition: eredu_runtime::ComponentDefinition,
+    static_modules: QwenStaticModules<B>,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     target_layers: usize,
     prediction_steps: usize,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
-    partition_target_start: usize,
+    owned_target: std::ops::Range<usize>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
-{
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: PromptCacheTopology,
-    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
-        state_identity(
-            &self.config,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    }
-
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        Ok(self.definition.parameters().clone())
-    }
-
-    fn static_parameter_recipes(
-        &self,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<
-        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-        String,
-    > {
-        let recipes = super::static_recipes(source)?;
-        crate::static_parameters::module_recipes(&self.static_modules, recipes)
-    }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitor<B>,
-    {
-        if let Some(shared) = &self.static_modules.extension {
-            visitor.visit("mtp", shared)?;
-        }
-        let modules = self.static_modules();
-        visitor.visit("embedding", &modules.embeddings)?;
-        visitor.visit("norm", &modules.boundary.norm)?;
-        if let Some(head) = &modules.lm_head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
-    }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitorMut<B>,
-    {
-        if let Some(shared) = &mut self.static_modules.extension {
-            visitor.visit_mut("mtp", shared)?;
-        }
-        let modules = self.static_modules_mut();
-        visitor.visit_mut("embedding", &mut modules.embeddings)?;
-        visitor.visit_mut("norm", &mut modules.boundary.norm)?;
-        if let Some(head) = &mut modules.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
-    }
-}
-
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B> {
     /// Builds unloaded pinned modules and the exact configured graph.
     pub fn new(
         config: HybridConfig,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid",
             crate::operator_requirements::QWEN_HYBRID,
         )?;
-        let definition = super::component_definition(&config, None)?;
+        let definition = std::sync::Arc::new(super::component_definition(&config, None)?);
         Self::from_definition(config, None, definition, context)
     }
 
     fn from_definition(
         config: HybridConfig,
         geometry: Option<LocalGeometry>,
-        definition: eredu_runtime::ComponentDefinition,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
         let target_layers = definition.unit_count(0)?;
         let prediction_steps = definition.prediction_groups().len();
         let spec = static_module_spec(&config);
@@ -418,16 +209,157 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let extension = (prediction_steps > 0)
             .then(|| super::PredictionShared::new(&config, context))
             .transpose()?;
-        Ok(Self {
+        let kernel = Self {
             config,
-            static_modules: HybridStaticModules { base, extension },
-            definition,
+            static_modules: QwenStaticModules {
+                embeddings: Some(base.embeddings),
+                boundary: Some(base.boundary),
+                lm_head: base.lm_head,
+                prediction: extension,
+            },
+            definition: std::sync::Arc::clone(&definition),
             target_layers,
             prediction_steps,
             parallel_geometry: geometry.map(std::sync::Arc::new),
-            partition_target_start: 0,
+            owned_target: 0..target_layers,
             expert_realization: None,
-        })
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
+    }
+
+    fn embedding_mut(&mut self) -> Result<&mut B::Embedding, Error> {
+        self.static_modules
+            .embeddings
+            .as_mut()
+            .ok_or_else(|| Error::backend("Qwen component does not own input embedding"))
+    }
+
+    fn finish_readout(
+        &mut self,
+        hidden: &B::Tensor,
+        normalize: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let mut resources = self.static_modules.decoder_resources_mut();
+        let hidden = if normalize {
+            resources.normalize(hidden, context, instrumentation)?
+        } else {
+            hidden.clone()
+        };
+        resources.project(&hidden, parallel, context, instrumentation)
+    }
+
+    /// Materializes only the static resources and units owned by a selected target partition.
+    pub fn from_partition(
+        config: HybridConfig,
+        parameters: &ArchitectureParameterDescription,
+        partition: &eredu_runtime::ArchitecturePartition<
+            LocalGeometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredModel<B>, Error> {
+        crate::operator_requirements::require::<B>(
+            "Qwen hybrid",
+            crate::operator_requirements::QWEN_HYBRID,
+        )?;
+        crate::operator_requirements::require::<B>(
+            "Qwen hybrid tensor parallelism",
+            eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+        )?;
+        if config.mtp_num_hidden_layers != 0 {
+            return Err(Error::backend(
+                "selected Qwen target construction requires prediction-free admission",
+            ));
+        }
+        let geometry = partition.local_geometry();
+        let definition = std::sync::Arc::new(super::component_definition(&config, Some(geometry))?);
+        if definition.parameters() != parameters
+            || partition.boundary_schema()
+                != &eredu_runtime::NoAuxiliaryBoundarySchema::new(config.hidden_size)
+        {
+            return Err(Error::backend(
+                "Qwen partition parameters or boundary differ from its configuration",
+            ));
+        }
+        let [owned] = partition.groups() else {
+            return Err(Error::backend(
+                "Qwen target partition must own one execution group",
+            ));
+        };
+        if owned.group().as_str() != definition.primary_group() {
+            return Err(Error::backend(
+                "Qwen target partition names another execution group",
+            ));
+        }
+        let state = partition
+            .state()
+            .ok_or_else(|| Error::backend("Qwen target partition has no selected state"))?;
+        let range = owned.global_units();
+        let expected = geometry
+            .state_layout()
+            .slice(range.clone())
+            .map_err(Error::backend)?;
+        if state.global_layer_offset() != range.start || state.layout() != &expected {
+            return Err(Error::backend(
+                "Qwen partition state differs from its owned target units",
+            ));
+        }
+        let stores = |role: &str| {
+            partition
+                .parameter_bindings()
+                .iter()
+                .any(|group| group.owner().accepts_static_role(role))
+        };
+        let (embedding, head, norm) = static_module_spec(&config).construction_specs()?;
+        let embeddings = stores("embedding")
+            .then(|| {
+                B::vocabulary_parallel_embedding(
+                    embedding,
+                    geometry.embedding_range().clone(),
+                    context,
+                )
+            })
+            .transpose()?;
+        let boundary = stores("norm")
+            .then(|| crate::decoder::NormalizedBoundary::new(norm, context))
+            .transpose()?;
+        let lm_head = if stores("output") {
+            head.map(|spec| {
+                B::vocabulary_parallel_linear(
+                    spec,
+                    geometry.output_range().cloned().ok_or_else(|| {
+                        Error::backend("Qwen output owner has no selected vocabulary range")
+                    })?,
+                    context,
+                )
+            })
+            .transpose()?
+        } else {
+            None
+        };
+        let kernel = Self {
+            target_layers: definition.unit_count(0)?,
+            prediction_steps: 0,
+            config,
+            static_modules: QwenStaticModules {
+                embeddings,
+                boundary,
+                lm_head,
+                prediction: None,
+            },
+            definition: std::sync::Arc::clone(&definition),
+            parallel_geometry: Some(std::sync::Arc::new(geometry.clone())),
+            owned_target: range,
+            expert_realization: None,
+        };
+        eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
+            definition, kernel, partition,
+        )
+        .map_err(Error::from)
     }
 
     /// Applies the architecture-owned tensor-parallel token embedding boundary.
@@ -438,7 +370,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         B::vocabulary_parallel_lookup(
-            &mut self.static_modules_mut().embeddings,
+            self.embedding_mut()?,
             tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
@@ -454,24 +386,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = if normalize {
-            self.static_modules_mut()
-                .boundary
-                .norm
-                .forward(hidden, context)?
-        } else {
-            hidden.clone()
-        };
-        let modules = self.static_modules_mut();
-        match &mut modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            normalize,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Enters a serial target or prediction partition through token embedding.
@@ -480,7 +401,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.static_modules_mut().embed(tokens, context)
+        self.embedding_mut()?.forward(tokens, context)
     }
 
     /// Enters a tensor-parallel target or prediction partition through token embedding.
@@ -499,19 +420,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         normalize: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = if normalize {
-            self.static_modules_mut()
-                .boundary
-                .norm
-                .forward(hidden, context)?
-        } else {
-            hidden.clone()
-        };
-        let modules = self.static_modules_mut();
-        match &mut modules.lm_head {
-            Some(head) => head.forward(&hidden, context),
-            None => modules.embeddings.as_linear(&hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            normalize,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Finishes a serial target partition with final normalization.
@@ -538,7 +453,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         config: HybridConfig,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid",
             crate::operator_requirements::QWEN_HYBRID,
@@ -547,7 +462,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             "Qwen hybrid tensor parallelism",
             eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
         )?;
-        let definition = super::component_definition(&config, Some(&geometry))?;
+        let definition =
+            std::sync::Arc::new(super::component_definition(&config, Some(&geometry))?);
         Self::from_definition(config, Some(geometry), definition, context)
     }
 
@@ -562,37 +478,55 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     /// Borrows the validated graph, parameter ownership and selected state geometry.
-    pub const fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
         &self.definition
     }
 
     /// Returns the pinned shared prediction modules and base text modules.
     pub fn into_extended_static_modules(
         self,
-    ) -> crate::hybrid_decoder::HybridStaticModules<B, Option<super::PredictionShared<B>>> {
-        self.static_modules
+    ) -> Result<HybridStaticModules<B, Option<super::PredictionShared<B>>>, Error> {
+        let modules = self.static_modules;
+        if !self.config.tie_word_embeddings && modules.lm_head.is_none() {
+            return Err(Error::backend(
+                "Qwen component does not own its untied head",
+            ));
+        }
+        Ok(HybridStaticModules {
+            base: StaticModules {
+                embeddings: modules
+                    .embeddings
+                    .ok_or_else(|| Error::backend("Qwen component does not own embedding"))?,
+                boundary: modules
+                    .boundary
+                    .ok_or_else(|| Error::backend("Qwen component does not own readout"))?,
+                lm_head: modules.lm_head,
+            },
+            extension: modules.prediction,
+        })
     }
 
     fn prediction_shared_mut(&mut self) -> Result<&mut super::PredictionShared<B>, Error> {
         self.static_modules
-            .extension
+            .prediction
             .as_mut()
             .ok_or_else(|| Error::backend("Qwen prediction has no shared modules"))
     }
 
     /// Borrows pinned text modules.
-    pub const fn static_modules(&self) -> &StaticModules<B> {
-        &self.static_modules.base
+    pub const fn static_modules(&self) -> &QwenStaticModules<B> {
+        &self.static_modules
     }
 
     /// Mutably borrows pinned text modules for checkpoint binding.
-    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
-        &mut self.static_modules.base
+    pub fn static_modules_mut(&mut self) -> &mut QwenStaticModules<B> {
+        &mut self.static_modules
     }
 
     /// Consumes the text graph and returns its pinned decoder modules.
-    pub fn into_static_modules(self) -> StaticModules<B> {
-        self.static_modules.base
+    pub fn into_static_modules(self) -> Result<StaticModules<B>, Error> {
+        self.into_extended_static_modules()
+            .map(|modules| modules.base)
     }
 
     /// Returns the prediction depth count declared by the constructed execution graph.
@@ -603,11 +537,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     /// Returns target plus configured prediction state policy.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
         state_layout(&self.config).map_err(Error::backend)
-    }
-
-    /// Returns replicated or planner-derived mutable state geometry.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        Ok(self.definition.state_layout().clone())
     }
 
     /// Shares authoritative local geometry with placed residency factories.
@@ -625,6 +554,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     ) -> Result<Unit<B>, Error> {
         self.definition.unit(group, index)?;
         if group == 0 {
+            self.state_index(group, index)?;
             let config = self
                 .parallel_geometry
                 .as_ref()
@@ -663,25 +593,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         self.expert_realization = Some(realization);
     }
 
-    /// Binds global target-unit addresses to this partition's local cache lanes.
-    pub(crate) fn set_partition_target_start(&mut self, start: usize) {
-        self.partition_target_start = start;
-    }
-
     fn state_index(&self, group: usize, index: usize) -> Result<usize, Error> {
+        let slot = self.definition.unit(group, index)?.state.start;
         if group == 0 {
-            return index
-                .checked_sub(self.partition_target_start)
-                .ok_or_else(|| Error::backend("Qwen target unit precedes its partition state"));
+            if !self.owned_target.contains(&index) {
+                return Err(Error::backend(
+                    "Qwen target unit is outside selected ownership",
+                ));
+            }
+            Ok(slot - self.owned_target.start)
+        } else {
+            Ok(slot)
         }
-        if index != 0 || group > self.prediction_steps {
-            return Err(Error::backend(format!(
-                "Qwen hybrid execution address ({group}, {index}) is outside its graph"
-            )));
-        }
-        self.target_layers
-            .checked_add(group - 1)
-            .ok_or_else(|| Error::backend("Qwen hybrid state index overflowed"))
     }
 
     /// Executes one graph unit through a runtime-owned routed-expert provider.
@@ -776,829 +699,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 }
 
-impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.prediction_steps == 0;
-        eredu_runtime::inspection::ObservationHookSupport::internal(
-            target_only,
-            target_only,
-            target_only,
-        )
-    }
-
-    type Input<'a> = EmbeddedInput<'a, B::Tensor>;
-    type StaticModules =
-        crate::hybrid_decoder::HybridStaticModules<B, Option<super::PredictionShared<B>>>;
-    type Unit = Unit<B>;
-    type ForwardContext = ForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = RetainedValues<'a, B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        self.definition
-            .group_transport(group)
-            .expect("validated traversal group")
-            .clone()
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        self.definition.primary_group()
-    }
-
-    fn prediction_execution_groups(&self) -> Vec<String> {
-        self.definition.prediction_groups().to_vec()
-    }
-
-    fn state_partition_plan(
-        &self,
-        _layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        self.definition.state_partition_plan().clone()
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        Ok(self.definition.parameters().graph().clone())
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.definition.unit_count(group).map_err(Error::from)
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        Ok(self.definition.unit(group, index)?.path.clone())
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Self::Error> {
-        self.construct_unit(group, index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self.state_layout()?;
-        if state.layout() != &expected {
-            return Err(Error::backend(format!(
-                "Qwen hybrid runtime state layout {:?} does not match {expected:?}",
-                state.layout()
-            )));
-        }
-        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
-            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
-            EmbeddedInput::Draft {
-                tokens,
-                hidden,
-                depth,
-            } => {
-                if depth >= self.prediction_steps {
-                    return Err(Error::backend(format!(
-                        "Qwen hybrid MTP depth {depth} is outside {} configured groups",
-                        self.prediction_steps
-                    )));
-                }
-                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
-            }
-        };
-        let embedded = self.static_modules_mut().embed(tokens, context)?;
-        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
-        let position_layer = match mode {
-            ForwardMode::Target => 0,
-            ForwardMode::Draft(depth) => self.target_layers + depth,
-        };
-        let mask = if let Some(mask) = supplied_mask {
-            Some(mask.clone())
-        } else if embedded.dim(1) > 1 {
-            Some(B::causal_mask(
-                embedded.dim(1),
-                state
-                    .layer(position_layer)
-                    .map_err(Error::backend)?
-                    .position(),
-                None,
-                context,
-            )?)
-        } else {
-            None
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                tokens: tokens.clone(),
-                embedded,
-                mask,
-                mode,
-                target_hidden: None,
-            },
-        })
-    }
-
-    fn begin_forward_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let mut forward = self.begin_forward(input, state, context)?;
-        if matches!(forward.context.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-                    .apply("embedding", forward.hidden)?;
-            forward.context.embedded = forward.hidden.clone();
-        }
-        Ok(forward)
-    }
-
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        let expected = self
-            .definition
-            .parameters()
-            .graph()
-            .dependencies(group)
-            .ok_or_else(|| {
-                Error::from(eredu_runtime::ComponentDefinitionError::Address {
-                    component: self.definition.id().into(),
-                    group,
-                    index: 0,
-                })
-            })?
-            .len();
-        if dependencies.len() != expected {
-            return Err(Error::from(
-                eredu_runtime::ComponentDefinitionError::Invalid {
-                    component: self.definition.id().into(),
-                    resource: format!("dependencies for group {group}"),
-                },
-            ));
-        }
-        Ok(dependencies.first().copied().unwrap_or(initial).clone())
-    }
-
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        match forward.mode {
-            ForwardMode::Target => group == 0,
-            ForwardMode::Draft(depth) => group == depth + 1,
-        }
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.forward_unit_with_provider(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            &mut ResidentExpertProvider,
-            context,
-        )
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        <Self as RoutedLayeredArchitecture<B, S>>::forward_unit_observed_with_provider(
-            self,
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            eredu_runtime::ExpertPass::Prefill,
-            &mut ResidentExpertProvider,
-            context,
-            observer,
-        )
-    }
-
-    fn complete_execution_group(
-        &mut self,
-        group: usize,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        if group == 0 || matches!(forward.mode, ForwardMode::Draft(depth) if group == depth + 1) {
-            forward.target_hidden = Some(hidden.clone());
-        }
-        Ok(hidden.clone())
-    }
-
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        matches!(forward.mode, ForwardMode::Target)
-            .then_some(forward.target_hidden.as_ref())
-            .flatten()
-    }
-
-    fn prediction_target_placeholder_shape(
-        &self,
-        forward: &Self::ForwardContext,
-    ) -> Result<Option<Vec<i32>>, Self::Error> {
-        Ok(Some(vec![
-            forward.embedded.dim(0),
-            forward.embedded.dim(1),
-            self.config.hidden_size,
-        ]))
-    }
-
-    fn projects_final_text_position() -> bool {
-        true
-    }
-
-    fn finish_text_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.finish_forward(
-            &crate::decoder::final_hidden_position(hidden, context)?,
-            state,
-            forward,
-            context,
-        )
-    }
-
-    fn finish_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        match forward.mode {
-            ForwardMode::Target => self.static_modules.base.finish_instrumented(
-                hidden,
-                context,
-                &mut crate::decoder::ComponentInstrumentation::disabled(),
-            ),
-            ForwardMode::Draft(_) => self.static_modules.base.project_normalized(hidden, context),
-        }
-    }
-
-    fn finish_forward_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        if matches!(forward.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.static_modules.base.finish_instrumented(
-                hidden,
-                context,
-                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-            )
-        } else {
-            self.finish_forward(hidden, state, forward, context)
-        }
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        RetainedValues::new([
-            Some(&forward.tokens),
-            Some(&forward.embedded),
-            forward.mask.as_ref(),
-            forward.target_hidden.as_ref(),
-        ])
-    }
-}
-
-impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.prediction_steps == 0;
-        eredu_runtime::inspection::ObservationHookSupport::internal(
-            target_only,
-            target_only,
-            target_only,
-        )
-    }
-
-    fn begin_forward_parallel_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let mut forward = self.begin_forward_parallel(input, state, parallel, context)?;
-        if matches!(forward.context.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-                    .apply("embedding", forward.hidden)?;
-            forward.context.embedded = forward.hidden.clone();
-        }
-        Ok(forward)
-    }
-
-    fn forward_unit_parallel_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        <Self as ParallelRoutedLayeredArchitecture<B, S>>::forward_unit_parallel_observed_with_provider(
-            self, group, index, unit, hidden, state, forward,
-            if hidden.dim(1) == 1 { eredu_runtime::ExpertPass::Decode } else { eredu_runtime::ExpertPass::Prefill },
-            &mut ResidentExpertProvider, parallel, context, observer,
-        )
-    }
-
-    fn finish_forward_parallel_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        if self.parallel_geometry.is_none() {
-            return Err(Error::backend("Qwen hybrid model has no local geometry"));
-        }
-        if matches!(forward.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.static_modules_mut().finish_parallel_instrumented(
-                hidden,
-                parallel,
-                context,
-                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-            )
-        } else {
-            self.finish_forward_parallel(hidden, state, forward, parallel, context)
-        }
-    }
-
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self
-            .parallel_geometry
-            .as_ref()
-            .ok_or_else(|| Error::backend("Qwen hybrid model has no local geometry"))?
-            .state_layout();
-        if state.layout() != expected {
-            return Err(Error::backend(
-                "Qwen hybrid rank-local state layout mismatch",
-            ));
-        }
-        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
-            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
-            EmbeddedInput::Draft {
-                tokens,
-                hidden,
-                depth,
-            } => {
-                if depth >= self.prediction_steps {
-                    return Err(Error::backend(format!(
-                        "Qwen hybrid MTP depth {depth} is outside {} configured groups",
-                        self.prediction_steps
-                    )));
-                }
-                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
-            }
-        };
-        let embedded = B::vocabulary_parallel_lookup(
-            &mut self.static_modules_mut().embeddings,
-            tokens,
-            EmbeddingLookupPolicy::Strict,
-            parallel,
-            context,
-        )?;
-        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
-        let position_layer = match mode {
-            ForwardMode::Target => 0,
-            ForwardMode::Draft(depth) => self.target_layers + depth,
-        };
-        let mask = if let Some(mask) = supplied_mask {
-            Some(mask.clone())
-        } else if embedded.dim(1) > 1 {
-            Some(B::causal_mask(
-                embedded.dim(1),
-                state
-                    .layer(position_layer)
-                    .map_err(Error::backend)?
-                    .position(),
-                None,
-                context,
-            )?)
-        } else {
-            None
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                tokens: tokens.clone(),
-                embedded,
-                mask,
-                mode,
-                target_hidden: None,
-            },
-        })
-    }
-
-    fn forward_unit_parallel(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.forward_unit_with_provider_parallel(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            &mut ResidentExpertProvider,
-            parallel,
-            context,
-        )
-    }
-
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        if self.parallel_geometry.is_none() {
-            return Err(Error::backend("Qwen hybrid model has no local geometry"));
-        }
-        let hidden = match forward.mode {
-            ForwardMode::Target => self
-                .static_modules_mut()
-                .boundary
-                .norm
-                .forward(hidden, context)?,
-            ForwardMode::Draft(_) => hidden.clone(),
-        };
-        let modules = self.static_modules_mut();
-        match &mut modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
-    }
-}
-
-impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn partition_observation_hooks(
-        &self,
-        _tensor_parallel: bool,
-    ) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.prediction_steps == 0;
-        eredu_runtime::inspection::ObservationHookSupport::internal(
-            target_only,
-            target_only,
-            target_only,
-        )
-    }
-
-    type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
-
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
-            self.config().hidden_size,
-        ))
-    }
-
-    fn begin_partition<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if state.layout() != expected {
-            return Err(Error::backend(
-                "Qwen hybrid partition state layout mismatch",
-            ));
-        }
-        let (input, sequence) = match input {
-            LayeredPartitionInput::Tokens(tokens) => {
-                (TargetPartitionInput::Tokens(tokens), tokens.dim(1))
-            }
-            LayeredPartitionInput::Hidden { hidden, .. } => {
-                let sequence = hidden.dim(1);
-                (TargetPartitionInput::Hidden(hidden), sequence)
-            }
-        };
-        let offset = state
-            .layer(first_state_ordinal)
-            .map_err(Error::backend)?
-            .position();
-        self.begin_routed_target_partition(input, mask, sequence, offset, None, context)
-    }
-
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if state.layout() != expected {
-            return Err(Error::backend(
-                "Qwen hybrid partition state layout mismatch",
-            ));
-        }
-        let (input, sequence) = match input {
-            LayeredPartitionInput::Tokens(tokens) => {
-                (TargetPartitionInput::Tokens(tokens), tokens.dim(1))
-            }
-            LayeredPartitionInput::Hidden { hidden, .. } => {
-                let sequence = hidden.dim(1);
-                (TargetPartitionInput::Hidden(hidden), sequence)
-            }
-        };
-        let offset = state
-            .layer(first_state_ordinal)
-            .map_err(Error::backend)?
-            .position();
-        self.begin_routed_target_partition(input, mask, sequence, offset, Some(parallel), context)
-    }
-
-    fn begin_partition_observed<'a, O>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
-        let mut forward = match parallel {
-            Some(parallel) => self.begin_partition_parallel(
-                input,
-                mask,
-                state,
-                expected,
-                first_state_ordinal,
-                parallel,
-                context,
-            ),
-            None => {
-                self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
-            }
-        }?;
-        if embedded {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-                    .apply("embedding", forward.hidden)?;
-            forward.context.embedded = forward.hidden.clone();
-        }
-        Ok(forward)
-    }
-
-    fn finish_partition_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredPartitionOutput<B::Tensor>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        if !owns_output {
-            return self.finish_partition(hidden, state, forward, false, parallel, context);
-        }
-        let output = match parallel {
-            Some(parallel) => self.finish_forward_parallel_observed(
-                hidden, state, forward, parallel, context, observer,
-            ),
-            None => self.finish_forward_observed(hidden, state, forward, context, observer),
-        }?;
-        Ok(LayeredPartitionOutput::Final {
-            output,
-            retained: Some(hidden.clone()),
-        })
-    }
-
-    fn finish_partition(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredPartitionOutput<B::Tensor>, Self::Error> {
-        if owns_output {
-            let output = match parallel {
-                Some(parallel) => {
-                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
-                }
-                None => self.finish_forward(hidden, state, forward, context)?,
-            };
-            Ok(LayeredPartitionOutput::Final {
-                output,
-                retained: Some(hidden.clone()),
-            })
-        } else {
-            Ok(LayeredPartitionOutput::Boundary {
-                hidden: hidden.clone(),
-                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
-            })
-        }
-    }
-}
-
-impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for LayeredModel<B>
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn partition_input_dimensions(
-        &self,
-        input: &Self::Input<'_>,
-    ) -> Result<(i32, i32), Self::Error> {
-        match input {
-            EmbeddedInput::Target { tokens, .. } => Ok((tokens.dim(0), tokens.dim(1))),
-            _ => Err(eredu_nn::Error::backend(
-                "target partition received prediction input",
-            )),
-        }
-    }
-
-    fn begin_pipeline_partition<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        incoming: Option<(
-            B::Tensor,
-            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
-        )>,
-        state: &mut S,
-        expected: Option<&eredu_runtime::StateLayout>,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let expected = expected.ok_or_else(|| {
-            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
-        })?;
-        let (tokens, mask) = match input {
-            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
-            _ => {
-                return Err(eredu_nn::Error::backend(
-                    "target partition received prediction input",
-                ))
-            }
-        };
-        let input = match incoming {
-            Some((hidden, auxiliary)) => {
-                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
-            }
-            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
-        };
-        self.begin_partition_observed(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            parallel,
-            context,
-            observer,
-        )
-    }
-
-    fn partition_output_width(&self) -> i32 {
-        self.config.vocab_size
-    }
-}
-
 /// Allocation-free request-local retained tensor iterator.
 pub struct RetainedValues<'a, T> {
     values: [Option<&'a T>; 4],
@@ -1675,5 +775,923 @@ pub(super) fn static_module_spec(config: &HybridConfig) -> StaticModuleSpec {
             .weight_quantization(),
         head_format: config.linear_format("lm_head.weight"),
         tied_head: config.tie_word_embeddings,
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ComponentKernel<B>
+    for QwenKernel<B>
+{
+    type Input<'a> = EmbeddedInput<'a, B::Tensor>;
+    type Unit = Unit<B>;
+    type ForwardContext = ForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = RetainedValues<'a, B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Self::Error> {
+        state_identity(
+            &self.config,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
+    }
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        let recipes = super::static_recipes(source)?;
+        crate::static_parameters::module_recipes(&self.static_modules, recipes)
+    }
+    fn build_unit(
+        &self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, Self::Error> {
+        let (group, index) = (address.group(), address.index());
+        self.construct_unit(group, index, context)
+    }
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        match forward.mode {
+            ForwardMode::Target => group == 0,
+            ForwardMode::Draft(depth) => group == depth + 1,
+        }
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        RetainedValues::new([
+            Some(&forward.tokens),
+            Some(&forward.embedded),
+            forward.mask.as_ref(),
+            forward.target_hidden.as_ref(),
+        ])
+    }
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        matches!(forward.mode, ForwardMode::Target)
+            .then_some(forward.target_hidden.as_ref())
+            .flatten()
+    }
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        Ok(Some(vec![
+            forward.embedded.dim(0),
+            forward.embedded.dim(1),
+            self.config.hidden_size,
+        ]))
+    }
+}
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::ComponentPinnedResources<B> for QwenKernel<B>
+{
+    type Modules = QwenStaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V: eredu_runtime::StaticParameterVisitor<B>>(
+        &self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(shared) = &self.static_modules.prediction {
+            visitor.visit("mtp", shared)?;
+        }
+        self.static_modules.decoder_resources().visit(visitor)
+    }
+    fn visit_pinned_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(shared) = &mut self.static_modules.prediction {
+            visitor.visit_mut("mtp", shared)?;
+        }
+        self.static_modules.decoder_resources_mut().visit(visitor)
+    }
+}
+impl<B, S> eredu_runtime::ComponentEquations<B, S> for QwenKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let target_only = self.prediction_steps == 0;
+        eredu_runtime::inspection::ObservationHookSupport::internal(
+            target_only,
+            target_only,
+            target_only,
+        )
+    }
+    fn begin<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self.state_layout()?;
+        if state.layout() != &expected {
+            return Err(Error::backend(format!(
+                "Qwen hybrid runtime state layout {:?} does not match {expected:?}",
+                state.layout()
+            )));
+        }
+        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
+            EmbeddedInput::Draft {
+                tokens,
+                hidden,
+                depth,
+            } => {
+                if depth >= self.prediction_steps {
+                    return Err(Error::backend(format!(
+                        "Qwen hybrid MTP depth {depth} is outside {} configured groups",
+                        self.prediction_steps
+                    )));
+                }
+                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
+            }
+        };
+        let embedded = self.embedding_mut()?.forward(tokens, context)?;
+        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
+        let position_layer = match mode {
+            ForwardMode::Target => 0,
+            ForwardMode::Draft(depth) => self.target_layers + depth,
+        };
+        let mask = if let Some(mask) = supplied_mask {
+            Some(mask.clone())
+        } else if embedded.dim(1) > 1 {
+            Some(B::causal_mask(
+                embedded.dim(1),
+                state
+                    .layer(position_layer)
+                    .map_err(Error::backend)?
+                    .position(),
+                None,
+                context,
+            )?)
+        } else {
+            None
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                tokens: tokens.clone(),
+                embedded,
+                mask,
+                mode,
+                target_hidden: None,
+            },
+        })
+    }
+    fn begin_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let mut forward = self.begin(input, state, context)?;
+        if matches!(forward.context.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+    fn begin_group(
+        &mut self,
+        _group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(dependencies.first().copied().unwrap_or(initial).clone())
+    }
+    fn execute(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let (group, index) = (address.group(), address.index());
+        self.forward_unit_with_provider(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            &mut ResidentExpertProvider,
+            context,
+        )
+    }
+    fn execute_observed<O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        <Self as eredu_runtime::RoutedComponentKernel<B, S>>::execute_routed_observed(
+            self,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            eredu_runtime::ExpertPass::Prefill,
+            &mut ResidentExpertProvider,
+            context,
+            observer,
+        )
+    }
+    fn complete_group(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if group == 0 || matches!(forward.mode, ForwardMode::Draft(depth) if group == depth + 1) {
+            forward.target_hidden = Some(hidden.clone());
+        }
+        Ok(hidden.clone())
+    }
+    fn projects_final_text_position() -> bool {
+        true
+    }
+    fn finish_text(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.finish(
+            &crate::decoder::final_hidden_position(hidden, context)?,
+            state,
+            forward,
+            context,
+        )
+    }
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.finish_readout(
+            hidden,
+            matches!(forward.mode, ForwardMode::Target),
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+    fn finish_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        if matches!(forward.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.finish_readout(
+                hidden,
+                true,
+                None,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
+        } else {
+            self.finish(hidden, state, forward, context)
+        }
+    }
+}
+impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for QwenKernel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let target_only = self.prediction_steps == 0;
+        eredu_runtime::inspection::ObservationHookSupport::internal(
+            target_only,
+            target_only,
+            target_only,
+        )
+    }
+    fn begin_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let mut forward = self.begin_parallel(input, state, parallel, context)?;
+        if matches!(forward.context.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+    fn execute_parallel_observed<O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        <Self as eredu_runtime::ParallelRoutedComponentKernel<B, S>>::execute_parallel_routed_observed(
+            self, address, unit, hidden, state, forward,
+            if hidden.dim(1) == 1 { eredu_runtime::ExpertPass::Decode } else { eredu_runtime::ExpertPass::Prefill },
+            &mut ResidentExpertProvider, parallel, context, observer,
+        )
+    }
+    fn finish_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend("Qwen hybrid model has no local geometry"));
+        }
+        if matches!(forward.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.finish_readout(
+                hidden,
+                true,
+                Some(parallel),
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
+        } else {
+            self.finish_parallel(hidden, state, forward, parallel, context)
+        }
+    }
+    fn begin_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self
+            .parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("Qwen hybrid model has no local geometry"))?
+            .state_layout();
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "Qwen hybrid rank-local state layout mismatch",
+            ));
+        }
+        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
+            EmbeddedInput::Draft {
+                tokens,
+                hidden,
+                depth,
+            } => {
+                if depth >= self.prediction_steps {
+                    return Err(Error::backend(format!(
+                        "Qwen hybrid MTP depth {depth} is outside {} configured groups",
+                        self.prediction_steps
+                    )));
+                }
+                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
+            }
+        };
+        let embedded = B::vocabulary_parallel_lookup(
+            self.embedding_mut()?,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
+        let position_layer = match mode {
+            ForwardMode::Target => 0,
+            ForwardMode::Draft(depth) => self.target_layers + depth,
+        };
+        let mask = if let Some(mask) = supplied_mask {
+            Some(mask.clone())
+        } else if embedded.dim(1) > 1 {
+            Some(B::causal_mask(
+                embedded.dim(1),
+                state
+                    .layer(position_layer)
+                    .map_err(Error::backend)?
+                    .position(),
+                None,
+                context,
+            )?)
+        } else {
+            None
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                tokens: tokens.clone(),
+                embedded,
+                mask,
+                mode,
+                target_hidden: None,
+            },
+        })
+    }
+    fn execute_parallel(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let (group, index) = (address.group(), address.index());
+        self.forward_unit_with_provider_parallel(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            &mut ResidentExpertProvider,
+            parallel,
+            context,
+        )
+    }
+    fn finish_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend("Qwen hybrid model has no local geometry"));
+        }
+        self.finish_readout(
+            hidden,
+            matches!(forward.mode, ForwardMode::Target),
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+}
+impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for QwenKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn routed_unit_observations(&self) -> bool {
+        self.prediction_steps == 0
+    }
+    fn routed_sparse_observations(&self) -> bool {
+        self.prediction_steps == 0
+    }
+    fn execute_routed<P>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let (group, index) = (address.group(), address.index());
+        QwenKernel::forward_unit_with_provider(
+            self, group, index, unit, hidden, state, forward, provider, context,
+        )
+    }
+    fn execute_routed_observed<P, O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (group, index) = (address.group(), address.index());
+        let path = self.definition.unit(group, index)?.path.clone();
+        let lane = state
+            .layer(self.state_index(group, index)?)
+            .map_err(Error::backend)?;
+        let points = eredu_runtime::RoutedObservationPoints::new(
+            eredu_runtime::RoutedBankId::new(0),
+            format!("{path}.mlp"),
+            self.config.num_experts,
+        );
+        match unit {
+            Unit::Target(block) if group == 0 => block.forward_components_with_provider(
+                &path,
+                points,
+                hidden,
+                forward.mask.as_ref(),
+                lane,
+                context,
+                provider,
+                observer,
+            ),
+            Unit::Prediction(unit) if group > 0 => unit.forward_observed_with_provider(
+                self.prediction_shared_mut()?,
+                &path,
+                points,
+                hidden,
+                &forward.embedded,
+                forward.mask.as_ref(),
+                lane,
+                context,
+                provider,
+                observer,
+            ),
+            _ => Err(Error::backend(format!(
+                "Qwen hybrid unit does not match execution group {group}"
+            ))),
+        }
+    }
+}
+impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for QwenKernel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn parallel_routed_unit_observations(&self) -> bool {
+        self.prediction_steps == 0
+    }
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        self.prediction_steps == 0
+    }
+    fn execute_parallel_routed<P>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let (group, index) = (address.group(), address.index());
+        QwenKernel::forward_unit_with_provider_parallel(
+            self, group, index, unit, hidden, state, forward, provider, parallel, context,
+        )
+    }
+    fn execute_parallel_routed_observed<P, O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let (group, index) = (address.group(), address.index());
+        let path = self.definition.unit(group, index)?.path.clone();
+        let lane = state
+            .layer(self.state_index(group, index)?)
+            .map_err(Error::backend)?;
+        let points = eredu_runtime::RoutedObservationPoints::new(
+            eredu_runtime::RoutedBankId::new(0),
+            format!("{path}.mlp"),
+            self.config.num_experts,
+        );
+        match unit {
+            Unit::Target(block) if group == 0 => block.forward_components_parallel_with_provider(
+                &path,
+                points,
+                hidden,
+                forward.mask.as_ref(),
+                lane,
+                parallel,
+                context,
+                provider,
+                observer,
+            ),
+            Unit::Prediction(unit) if group > 0 => unit.forward_parallel_observed_with_provider(
+                self.prediction_shared_mut()?,
+                &path,
+                points,
+                hidden,
+                &forward.embedded,
+                forward.mask.as_ref(),
+                lane,
+                parallel,
+                context,
+                provider,
+                observer,
+            ),
+            _ => Err(Error::backend(format!(
+                "Qwen hybrid unit does not match execution group {group}"
+            ))),
+        }
+    }
+}
+impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for QwenKernel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        let target_only = self.prediction_steps == 0;
+        eredu_runtime::inspection::ObservationHookSupport::internal(
+            target_only,
+            target_only,
+            target_only,
+        )
+    }
+    type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
+            self.config().hidden_size,
+        ))
+    }
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = selected.expected.ok_or_else(|| {
+            Error::backend("Qwen hybrid partition requires selected state geometry")
+        })?;
+        let (first_state_ordinal, parallel, context) = (
+            selected.first_state_ordinal,
+            selected.parallel,
+            selected.native,
+        );
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "Qwen hybrid partition state layout mismatch",
+            ));
+        }
+        let (input, sequence) = match input {
+            LayeredPartitionInput::Tokens(tokens) => {
+                (TargetPartitionInput::Tokens(tokens), tokens.dim(1))
+            }
+            LayeredPartitionInput::Hidden { hidden, .. } => {
+                let sequence = hidden.dim(1);
+                (TargetPartitionInput::Hidden(hidden), sequence)
+            }
+        };
+        let offset = state
+            .layer(first_state_ordinal)
+            .map_err(Error::backend)?
+            .position();
+        self.begin_routed_target_partition(input, mask, sequence, offset, parallel, context)
+    }
+    fn begin_partition_observed<'a, O>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
+        let mut forward = self.begin_partition(input, mask, state, selected)?;
+        if embedded {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, Self::Error> {
+        if owns_output {
+            let output = match parallel {
+                Some(parallel) => {
+                    self.finish_parallel(hidden, state, forward, parallel, context)?
+                }
+                None => self.finish(hidden, state, forward, context)?,
+            };
+            Ok(LayeredPartitionOutput::Final {
+                output,
+                retained: Some(hidden.clone()),
+            })
+        } else {
+            Ok(LayeredPartitionOutput::Boundary {
+                hidden: hidden.clone(),
+                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
+            })
+        }
+    }
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, false, parallel, context);
+        }
+        let output = match parallel {
+            Some(parallel) => {
+                self.finish_parallel_observed(hidden, state, forward, parallel, context, observer)
+            }
+            None => self.finish_observed(hidden, state, forward, context, observer),
+        }?;
+        Ok(LayeredPartitionOutput::Final {
+            output,
+            retained: Some(hidden.clone()),
+        })
+    }
+    fn enter_partition_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if group != 0 {
+            return Err(Error::backend(
+                "Qwen target partition cannot enter a prediction group without its producer",
+            ));
+        }
+        Ok(initial.clone())
+    }
+}
+impl<B, S> eredu_runtime::PipelineComponentKernel<B, S> for QwenKernel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn tensor_vocabulary_sharded(&self) -> bool {
+        true
+    }
+
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+        match input {
+            EmbeddedInput::Target { tokens, .. } => Ok((tokens.dim(0), tokens.dim(1))),
+            _ => Err(eredu_nn::Error::backend(
+                "target partition received prediction input",
+            )),
+        }
+    }
+    fn begin_pipeline<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        )>,
+        state: &mut S,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
+        observer: &mut O,
+    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (tokens, mask) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
+            _ => {
+                return Err(eredu_nn::Error::backend(
+                    "target partition received prediction input",
+                ))
+            }
+        };
+        let input = match incoming {
+            Some((hidden, auxiliary)) => {
+                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
+            }
+            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        };
+        self.begin_partition_observed(input, mask, state, selected, observer)
+    }
+    fn output_width(&self) -> i32 {
+        self.config.vocab_size
+    }
+}
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::TextComponentKernel<B> for QwenKernel<B>
+{
+    fn supports_chunked_prefill() -> bool {
+        super::CHUNKED_TEXT_PREFILL
+    }
+    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
+        EmbeddedInput::target(tokens, mask)
     }
 }

@@ -715,6 +715,11 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         }
         Ok(())
     }
+    /// Consumes the adapter and transfers its retained definition and resource owners.
+    pub fn into_parts(self) -> (D, K, R) {
+        (self.definition, self.kernel, self.resources)
+    }
+
     /// Retains validated rank-local ownership without changing global invocation identities.
     pub fn select_partition<G, A>(
         mut self,
