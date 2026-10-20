@@ -680,6 +680,11 @@ consumes `InputExecution`, whose associated perception cache may be ordinary or
 stage-local. PCM carry, paired input state, execution output and the enclosing
 transaction retain that exact cache type through completion and publication.
 
+Shared decoder forward context constructs block attention inputs for complete and
+selected pipeline models. Ordinary, observed, parallel and routed equations borrow
+the same mask, cache, sliding-prefill policy and explicit rotary embeddings;
+selected models retain their local cache ordinal mapping.
+
 Pipeline-local shared decoder readout uses the typed `PartitionStaticModules`
 readout for final normalization, tied or untied vocabulary projection and
 component instrumentation. The enclosing decoder applies its configured logit

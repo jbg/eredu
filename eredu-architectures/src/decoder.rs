@@ -4466,6 +4466,25 @@ impl<T> ForwardContext<T> {
     pub fn visibility_mask(&self) -> Option<&T> {
         self.mask.as_ref()
     }
+
+    /// Borrows the same invocation geometry for every ordinary block equation.
+    fn attention_input<'a, C>(
+        &'a self,
+        hidden: &'a T,
+        cache: &'a mut C,
+    ) -> AttentionInput<'a, T, C> {
+        AttentionInput {
+            hidden,
+            selected_positions: None,
+            mask: self.mask.as_ref(),
+            cache: Some(cache),
+            allow_sliding_prefill: self.allow_sliding_prefill,
+            rotary_position: self
+                .rotary_embeddings
+                .as_ref()
+                .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
+        }
+    }
 }
 
 /// Statically dispatched construction policy for one decoder block family.
@@ -5467,17 +5486,7 @@ where
         let cache = state
             .layer(index - self.geometry.owned_units.start)
             .map_err(Error::backend)?;
-        unit.forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
-            context,
-        )
+        unit.forward(forward.attention_input(hidden, cache), context)
     }
 
     fn forward_unit_observed<O>(
@@ -5503,14 +5512,7 @@ where
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
         )
@@ -5632,18 +5634,7 @@ where
         let cache = state
             .layer(index - self.geometry.owned_units.start)
             .map_err(Error::backend)?;
-        unit.forward_tensor_parallel(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
-            parallel,
-            context,
-        )
+        unit.forward_tensor_parallel(forward.attention_input(hidden, cache), parallel, context)
     }
 
     fn forward_unit_parallel_observed<O>(
@@ -5670,14 +5661,7 @@ where
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_tensor_parallel_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             parallel,
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
@@ -5777,14 +5761,7 @@ where
             .map_err(Error::backend)?;
         unit.forward_routed_observed(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             context,
@@ -5817,14 +5794,7 @@ where
             .map_err(Error::backend)?;
         unit.forward_routed(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             context,
@@ -5880,14 +5850,7 @@ where
             .map_err(Error::backend)?;
         unit.forward_routed_parallel_observed(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             parallel,
@@ -5922,14 +5885,7 @@ where
             .map_err(Error::backend)?;
         unit.forward_routed_parallel(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             parallel,
@@ -6501,20 +6457,7 @@ where
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
-        block.forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            context,
-        )
+        block.forward(forward.attention_input(hidden, cache), context)
     }
 
     /// Executes one replicated block while delegating its feed-forward policy
@@ -6541,17 +6484,7 @@ where
     {
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward_with_feed_forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             context,
             feed_forward,
         )
@@ -6576,21 +6509,7 @@ where
         P::FeedForward: TensorParallelProjectionOperator<B>,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
-        block.forward_tensor_parallel(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            parallel,
-            context,
-        )
+        block.forward_tensor_parallel(forward.attention_input(hidden, cache), parallel, context)
     }
 
     /// Executes one tensor-parallel block while delegating its feed-forward
@@ -6618,17 +6537,7 @@ where
     {
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward_tensor_parallel_with_feed_forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             parallel,
             context,
             feed_forward,
@@ -6990,17 +6899,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
         )
@@ -7164,17 +7063,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_tensor_parallel_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             parallel,
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
@@ -7429,17 +7318,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         unit.forward_routed_observed(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             context,
@@ -7467,17 +7346,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         unit.forward_routed(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             context,
@@ -7527,17 +7396,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         unit.forward_routed_parallel_observed(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             parallel,
@@ -7567,17 +7426,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         unit.forward_routed_parallel(
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             parallel,
