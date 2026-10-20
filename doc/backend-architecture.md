@@ -8649,7 +8649,15 @@ consumers. Conditional Qwen materializes its declared text and prediction roots
 directly from the shared construction specs. Its serial, parallel, observed and
 partition readout entry points share one equation over borrowed decoder resources;
 target readout normalizes once and prediction readout consumes normalized hidden
-values. Conditional Qwen retains its vision/text driver and media assembly.
+values. Conditional Qwen uses one request-ingress equation for serial and
+tensor-parallel target or prediction input. Strict token lookup selects the
+retained vocabulary mechanism; media validation, masks, projected-input checks,
+DeepStack placeholders and request roots share the same preparation. Pipeline
+vision ingress consumes the same typed part preparation. Text state lookup uses
+the declaration's invocation mapping and rejects slots outside selected pipeline
+ownership. Consuming state selection validates the exact declared slice and global
+offset, accepts an identical retained selection, and rejects an incompatible one.
+Conditional Qwen retains its vision/text driver and media assembly.
 
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden
