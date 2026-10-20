@@ -4918,23 +4918,6 @@ impl<B: NeuralBackend> Clone for PartitionStaticModules<B> {
     }
 }
 
-impl<B: NeuralBackend> PartitionStaticModules<B> {
-    /// Shared readout for an output-owning pipeline partition.
-    pub(crate) fn finish_instrumented(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::DistributedNeuralBackend,
-    {
-        self.decoder_resources_mut()
-            .finish_parallel(hidden, parallel, context, instrumentation)
-    }
-}
-
 /// Canonical pinned decoder roles borrowed from their physical module owners.
 pub struct DecoderResources<'a, B: NeuralBackend> {
     /// Input or tied-output embedding, when physically retained.

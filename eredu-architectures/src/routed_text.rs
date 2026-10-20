@@ -1117,14 +1117,14 @@ where
         ));
     };
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::kimi_linear::LayeredModel::<B>::new(args.clone(), context))
+        .then(|| crate::kimi_linear::CompleteKimiKernel::<B>::new(args.clone(), context))
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_kimi_linear_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::kimi_linear::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::kimi_linear::LayeredModel::<B>::new(selected_args, context)
+    let architecture = crate::kimi_linear::CompleteKimiKernel::<B>::new(selected_args, context)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::kimi_linear(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;

@@ -1,4 +1,4 @@
-//! Selected Kimi Linear equations over recurrent and compressed-attention state.
+//! Shared complete and selected Kimi equations over recurrent and compressed state.
 
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
@@ -14,7 +14,7 @@ use eredu_runtime::{
 };
 
 use super::{AttentionKind, ForwardContext, ModelArgs, PartitionLocalGeometry};
-use crate::decoder::{DecoderStaticResources, LayeredInput, PartitionStaticModules};
+use crate::decoder::{DecoderStaticResources, LayeredInput, PartitionStaticModules, StaticModules};
 use eredu_runtime::ExpertPass;
 
 /// Shared typed adapter for one exact selected Kimi Linear ownership view.
@@ -24,19 +24,120 @@ pub type PartitionedLayeredModel<B> = eredu_runtime::ComponentAdapter<
     eredu_runtime::KernelParameterModules,
 >;
 
-/// Selected Kimi equations and mixed recurrent/compressed-attention geometry.
-pub struct KimiKernel<B>
+/// Kimi equations over complete or selected native resource ownership.
+pub struct KimiKernel<B, M = PartitionStaticModules<B>, G = PartitionLocalGeometry>
 where
     B: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
 {
     args: ModelArgs,
-    static_modules: PartitionStaticModules<B>,
-    geometry: PartitionLocalGeometry,
+    static_modules: M,
+    geometry: G,
+    backend: std::marker::PhantomData<fn() -> B>,
 }
 
-fn component_definition(
+/// Complete Kimi equations with complete pinned modules and admitted local geometry.
+pub type CompleteKimiKernel<B> = KimiKernel<B, StaticModules<B>, CompleteKimiGeometry>;
+
+/// Stateful Kimi geometry independent of native parameter ownership.
+pub trait KimiGeometry: 'static {
+    /// Complete rank-local state declaration before pipeline slicing.
+    fn complete_state_layout(&self) -> &StateLayout;
+    /// Architecture-global units physically owned by the kernel.
+    fn owned_units(&self) -> std::ops::Range<usize>;
+    /// Admitted geometry for one global invocation.
+    fn block(&self, args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error>;
+    /// Selected routed bank geometry, when ownership specializes the bank.
+    fn routed_spec(&self, _index: usize) -> Option<eredu_nn::GroupedGatedProductSpec> {
+        None
+    }
+    /// Ordinary execution retains global-state admission on a TP construction.
+    fn ordinary_state_layout<'a>(
+        &'a self,
+        _args: &ModelArgs,
+    ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
+        Ok(std::borrow::Cow::Borrowed(self.complete_state_layout()))
+    }
+    /// Parallel ingress and readout require admitted local geometry.
+    fn parallel_state_layout(&self) -> Result<&StateLayout, Error> {
+        Ok(self.complete_state_layout())
+    }
+    /// Maps one global invocation to its actual mutable-state ordinal.
+    fn state_index(&self, index: usize) -> Result<usize, Error> {
+        let owned = self.owned_units();
+        if !owned.contains(&index) {
+            return Err(Error::backend(format!(
+                "Kimi unit {index} is outside owned range {owned:?}"
+            )));
+        }
+        Ok(index - owned.start)
+    }
+}
+
+/// Complete state and optional tensor-local KDA/MLA block geometry.
+pub struct CompleteKimiGeometry {
+    parallel: Option<std::sync::Arc<super::LocalGeometry>>,
+    state: StateLayout,
+    units: usize,
+}
+impl KimiGeometry for CompleteKimiGeometry {
+    fn complete_state_layout(&self) -> &StateLayout {
+        &self.state
+    }
+    fn owned_units(&self) -> std::ops::Range<usize> {
+        0..self.units
+    }
+    fn block(&self, args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error> {
+        self.state_index(index)?;
+        match &self.parallel {
+            Some(geometry) => geometry.block(index).copied().ok_or_else(|| {
+                Error::backend(format!("missing rank-local Kimi block geometry {index}"))
+            }),
+            None => Ok(super::BlockGeometry::replicated(args)),
+        }
+    }
+    fn ordinary_state_layout<'a>(
+        &'a self,
+        args: &ModelArgs,
+    ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
+        match self.parallel {
+            Some(_) => super::state_layout(args)
+                .map(std::borrow::Cow::Owned)
+                .map_err(Error::backend),
+            None => Ok(std::borrow::Cow::Borrowed(&self.state)),
+        }
+    }
+    fn parallel_state_layout(&self) -> Result<&StateLayout, Error> {
+        self.parallel
+            .as_ref()
+            .map(|geometry| geometry.state_layout())
+            .ok_or_else(|| Error::backend("Kimi model was not built with local geometry"))
+    }
+}
+impl KimiGeometry for PartitionLocalGeometry {
+    fn complete_state_layout(&self) -> &StateLayout {
+        self.complete_state_layout()
+    }
+    fn owned_units(&self) -> std::ops::Range<usize> {
+        self.owned_units()
+    }
+    fn block(&self, _args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error> {
+        self.block(index).copied().ok_or_else(|| {
+            Error::backend(format!(
+                "Kimi unit {index} is outside owned range {:?}",
+                self.owned_units()
+            ))
+        })
+    }
+    fn routed_spec(&self, index: usize) -> Option<eredu_nn::GroupedGatedProductSpec> {
+        self.expert_realization()
+            .and_then(|plan| plan.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, index))
+            .cloned()
+    }
+}
+
+pub(crate) fn component_definition(
     parameters: ArchitectureParameterDescription,
     state: StateLayout,
 ) -> Result<eredu_runtime::ComponentDefinition, Error> {
@@ -200,50 +301,54 @@ where
             args,
             static_modules,
             geometry,
+            backend: std::marker::PhantomData,
         };
         eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
             definition, kernel, partition,
         )
         .map_err(Error::from)
     }
+}
 
-    /// Normalized dense Kimi policy.
+impl<B, M, G> KimiKernel<B, M, G>
+where
+    B: eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
+{
+    /// Normalized Kimi policy.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
     }
 
     /// Exact local TP/PP geometry.
-    pub const fn local_geometry(&self) -> &PartitionLocalGeometry {
+    pub const fn local_geometry(&self) -> &G {
         &self.geometry
     }
 
-    /// Pinned modules physically allocated on this pipeline partition.
-    pub const fn static_modules(&self) -> &PartitionStaticModules<B> {
+    /// Pinned modules physically retained by this ownership view.
+    pub const fn static_modules(&self) -> &M {
         &self.static_modules
+    }
+
+    /// Mutably borrows the actual pinned modules for parameter editing.
+    pub fn static_modules_mut(&mut self) -> &mut M {
+        &mut self.static_modules
     }
 
     /// Constructs one owned global unit and rejects all other indices.
     pub fn construct_unit(
         &self,
-        global_unit: usize,
+        index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<super::Block<B>, Error> {
-        let geometry = self.geometry.block(global_unit).ok_or_else(|| {
-            Error::backend(format!(
-                "Kimi unit {global_unit} is not owned by local range {:?}",
-                self.geometry.owned_units()
-            ))
-        })?;
-        let routed_spec = self
-            .geometry
-            .expert_realization()
-            .and_then(|plan| plan.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, global_unit))
-            .cloned();
         super::Block::new_with_geometry_and_routed_spec(
             &self.args,
-            global_unit,
-            *geometry,
-            routed_spec,
+            index,
+            self.geometry.block(&self.args, index)?,
+            self.geometry.routed_spec(index),
             context,
         )
     }
@@ -299,7 +404,7 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.static_modules.finish_instrumented(
+        self.finish_local_instrumented(
             hidden,
             parallel,
             context,
@@ -307,17 +412,33 @@ where
         )
     }
 
+    fn finish_local_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        if parallel.is_some() {
+            self.geometry.parallel_state_layout()?;
+        }
+        self.static_modules.decoder_resources_mut().finish_parallel(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
+    }
+
     fn local_state_ordinal(&self, global_unit: usize) -> Result<usize, Error> {
-        let owned = self.geometry.owned_units();
-        owned
-            .contains(&global_unit)
-            .then(|| global_unit - owned.start)
-            .ok_or_else(|| Error::backend("Kimi attempted state access for an unowned unit"))
+        self.geometry.state_index(global_unit)
     }
 }
 
-impl<B> eredu_runtime::ComponentKernel<B> for KimiKernel<B>
+impl<B, M, G> eredu_runtime::ComponentKernel<B> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
@@ -361,13 +482,15 @@ where
     }
 }
 
-impl<B> eredu_runtime::ComponentPinnedResources<B> for KimiKernel<B>
+impl<B, M, G> eredu_runtime::ComponentPinnedResources<B> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
 {
-    type Modules = PartitionStaticModules<B>;
+    type Modules = M;
     fn pinned_modules(&self) -> &Self::Modules {
         &self.static_modules
     }
@@ -388,8 +511,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ComponentEquations<B, S> for KimiKernel<B>
+impl<B, S, M, G> eredu_runtime::ComponentEquations<B, S> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
@@ -405,20 +530,14 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self.geometry.ordinary_state_layout(&self.args)?;
         let hidden = self
             .static_modules
-            .embeddings
-            .as_mut()
+            .decoder_resources_mut()
+            .embedding
             .ok_or_else(|| Error::backend("Kimi partition does not own input embedding"))?
             .forward(input.tokens, context)?;
-        self.begin_hidden(
-            hidden,
-            input.mask,
-            state,
-            self.geometry.complete_state_layout(),
-            0,
-            context,
-        )
+        self.begin_hidden(hidden, input.mask, state, &expected, 0, context)
     }
     fn begin_observed<'a, O>(
         &mut self,
@@ -456,14 +575,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward(
-            hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
-            context,
-        )
+        self.forward_block(address.index(), unit, hidden, state, forward, context)
     }
     fn execute_observed<O>(
         &mut self,
@@ -516,7 +628,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        self.static_modules.finish_instrumented(
+        self.finish_local_instrumented(
             hidden,
             None,
             context,
@@ -525,8 +637,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for KimiKernel<B>
+impl<B, S, M, G> eredu_runtime::ParallelComponentKernel<B, S> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
@@ -543,24 +657,18 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self.geometry.parallel_state_layout()?;
         let hidden = B::vocabulary_parallel_lookup(
             self.static_modules
-                .embeddings
-                .as_mut()
+                .decoder_resources_mut()
+                .embedding
                 .ok_or_else(|| Error::backend("Kimi partition does not own input embedding"))?,
             input.tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
             context,
         )?;
-        self.begin_hidden(
-            hidden,
-            input.mask,
-            state,
-            self.geometry.complete_state_layout(),
-            0,
-            context,
-        )
+        self.begin_hidden(hidden, input.mask, state, expected, 0, context)
     }
     fn begin_parallel_observed<'a, O>(
         &mut self,
@@ -589,12 +697,12 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward_parallel(
+        self.forward_block_parallel(
+            address.index(),
+            unit,
             hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
+            state,
+            forward,
             parallel,
             context,
         )
@@ -654,7 +762,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.static_modules.finish_instrumented(
+        self.finish_local_instrumented(
             hidden,
             Some(parallel),
             context,
@@ -663,8 +771,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for KimiKernel<B>
+impl<B, S, M, G> eredu_runtime::RoutedComponentKernel<B, S> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
@@ -699,12 +809,12 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward_with_feed_forward(
+        self.forward_block_with_feed_forward(
+            address.index(),
+            unit,
             hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
+            state,
+            forward,
             context,
             |policy, normalized, context| {
                 policy.forward_with_provider(normalized, pass, context, provider)
@@ -755,8 +865,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for KimiKernel<B>
+impl<B, S, M, G> eredu_runtime::ParallelRoutedComponentKernel<B, S> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
@@ -785,12 +897,12 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward_parallel_with_feed_forward(
+        self.forward_block_parallel_with_feed_forward(
+            address.index(),
+            unit,
             hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
+            state,
+            forward,
             parallel,
             context,
             |policy, normalized, parallel, context| {
@@ -843,8 +955,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for KimiKernel<B>
+impl<B, S, M, G> eredu_runtime::PartitionComponentKernel<B, S> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
@@ -873,13 +987,17 @@ where
         let expected = selected
             .expected
             .ok_or_else(|| Error::backend("Kimi partition requires selected state geometry"))?;
+        if selected.parallel.is_some() {
+            self.geometry.parallel_state_layout()?;
+        }
         let context = selected.native;
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                let embedding =
-                    self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                        Error::backend("Kimi partition does not own input embedding")
-                    })?;
+                let embedding = self
+                    .static_modules
+                    .decoder_resources_mut()
+                    .embedding
+                    .ok_or_else(|| Error::backend("Kimi partition does not own input embedding"))?;
                 match selected.parallel {
                     Some(parallel) => B::vocabulary_parallel_lookup(
                         embedding,
@@ -977,9 +1095,11 @@ where
     }
 }
 
-impl<B> eredu_runtime::TextComponentKernel<B> for KimiKernel<B>
+impl<B, M, G> eredu_runtime::TextComponentKernel<B> for KimiKernel<B, M, G>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
+    B: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
 {
@@ -988,8 +1108,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::PipelineComponentKernel<B, S> for KimiKernel<B>
+impl<B, S, M, G> eredu_runtime::PipelineComponentKernel<B, S> for KimiKernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + BlockwiseAttentionBackend,
@@ -1043,5 +1165,223 @@ where
             1,
             if routed { 2 } else { 1 },
         ))
+    }
+}
+
+impl<B, M, G> KimiKernel<B, M, G>
+where
+    B: eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
+    M: DecoderStaticResources<B>,
+    G: KimiGeometry,
+{
+    /// Begins from embedded input using explicit admitted state geometry.
+    pub fn begin_embedded_with_layout<S>(
+        &self,
+        hidden: B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        self.begin_hidden(hidden, mask, state, expected, 0, context)
+    }
+    /// Executes one owned block through its actual local state slot.
+    pub fn forward_block<S>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            context,
+        )
+    }
+    /// Executes an owned block with a supplied feed-forward operation.
+    pub fn forward_block_with_feed_forward<S, F>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+        F: FnOnce(
+            &mut super::FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward_with_feed_forward(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            context,
+            feed_forward,
+        )
+    }
+    /// Executes the same owned block using tensor-parallel operators.
+    pub fn forward_block_parallel<S>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward_parallel(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            parallel,
+            context,
+        )
+    }
+    /// Executes an owned parallel block with a supplied feed-forward operation.
+    pub fn forward_block_parallel_with_feed_forward<S, F>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+        F: FnOnce(
+            &mut super::FeedForward<B>,
+            &B::Tensor,
+            &B::ParallelContext,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward_parallel_with_feed_forward(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            parallel,
+            context,
+            feed_forward,
+        )
+    }
+}
+
+impl<B> CompleteKimiKernel<B>
+where
+    B: eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
+{
+    /// Validates the complete declaration before native materialization.
+    pub fn new(
+        args: ModelArgs,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<super::LayeredModel<B>, Error> {
+        crate::operator_requirements::require::<B>(
+            "Kimi Linear",
+            crate::operator_requirements::KIMI_LINEAR,
+        )?;
+        let definition = super::component_definition(&args)?;
+        let geometry = CompleteKimiGeometry {
+            parallel: None,
+            state: definition.state_layout().clone(),
+            units: definition.unit_count(0)?,
+        };
+        let static_modules = StaticModules::from_spec(super::static_spec(&args), context)?;
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(
+            definition,
+            Self {
+                args,
+                static_modules,
+                geometry,
+                backend: std::marker::PhantomData,
+            },
+        )
+        .map_err(Error::from)
+    }
+    /// Constructs the same equations with admitted tensor-local resources.
+    pub fn new_parallel(
+        args: ModelArgs,
+        geometry: super::LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<super::LayeredModel<B>, Error> {
+        crate::operator_requirements::require::<B>(
+            "Kimi Linear",
+            crate::operator_requirements::KIMI_LINEAR,
+        )?;
+        args.validate().map_err(Error::backend)?;
+        geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = component_definition(
+            super::parameter_description(&args).map_err(Error::backend)?,
+            geometry.state_layout().clone(),
+        )?;
+        let static_modules = StaticModules::from_parallel_spec(
+            super::static_spec(&args),
+            geometry.embedding_range().clone(),
+            geometry.output_range().cloned(),
+            context,
+        )?;
+        let geometry = CompleteKimiGeometry {
+            parallel: Some(std::sync::Arc::new(geometry)),
+            state: definition.state_layout().clone(),
+            units: definition.unit_count(0)?,
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(
+            definition,
+            Self {
+                args,
+                static_modules,
+                geometry,
+                backend: std::marker::PhantomData,
+            },
+        )
+        .map_err(Error::from)
+    }
+    /// Returns admitted tensor-local block and state geometry.
+    pub fn parallel_geometry(&self) -> Option<&super::LocalGeometry> {
+        self.geometry.parallel.as_deref()
+    }
+    /// Shares authoritative geometry with a backend residency policy.
+    pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<super::LocalGeometry>> {
+        self.geometry.parallel.as_ref().map(std::sync::Arc::clone)
+    }
+    /// Returns the ordinary global-state declaration for low-level execution.
+    pub fn state_layout(&self) -> Result<StateLayout, Error> {
+        super::state_layout(&self.args).map_err(Error::backend)
     }
 }

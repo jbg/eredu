@@ -8568,16 +8568,20 @@ and the admitted fused or split KV-B layout. Shared SwiGLU declarations reuse th
 ordinary gated-unit builder. The backend supplies the existing projections,
 convolution, recurrence, parameters and completion resources.
 
-Selected Kimi Linear execution uses `ComponentAdapter` with `KimiKernel`.
-Its validated definition owns graph, canonical parameters, global invocation
-paths, state references and transport. The kernel retains admitted block and
-bank geometry, compressed MLA state and KDA state equations. Construction
-validates the definition before materializing selected pinned modules. Shared
-resource visitation borrows the actual decoder roles, and the adapter projects
-selected state slots and validates addresses and dependencies. Ordinary and
-parallel observations invoke the resident provider through the same typed
-provider hooks. Low-level geometry and unit construction are available through
-`kernel()`.
+Complete and selected Kimi Linear execution use `ComponentAdapter` over the same
+`KimiKernel`. Typed complete and partition geometry retain global invocation
+ownership, actual local state indices, specialized expert banks, ordinary global
+state admission and tensor-local parallel admission. The kernel retains KDA and
+compressed MLA equations and borrows canonical pinned roles through
+`DecoderStaticResources`; actual complete or selected modules remain owned by
+their aggregate. The validated definition owns graph, canonical parameters,
+paths, state references and transport. Constructors validate that definition
+before materializing pinned modules, and the shared adapter validates selection,
+addresses and dependencies. Ordinary and parallel observations use the same
+typed provider hooks with the resident provider. Low-level block construction,
+embedded ingress and serial/parallel block operations remain on `kernel()` and
+`kernel_mut()`. A partition driver requires retained selection; low-level kernel
+partition hooks use explicit admitted state and context.
 
 The shared pipeline kernel contract declares both unit-level routed reductions
 and optional bank-specific reductions. A bank uses its unit's routed declaration
@@ -8587,8 +8591,8 @@ reduction before exchange and two feed-forward reductions for a sparse unit
 selection rejects before collective execution.
 
 Kimi's ordinary, routed, replicated and partitioned execution use the same
-instrumented sublayer drivers. Partition readout uses the neutral
-`PartitionStaticModules` driver; capture happens at the input/output owner and
+instrumented sublayer drivers. Readout uses borrowed decoder resources over the
+actual pinned modules; capture happens at the input/output owner and
 state lookup retains the partition's local ordinal. Discovery alone does not
 establish loaded collector support or native validation.
 
