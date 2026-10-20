@@ -225,12 +225,17 @@ fn expert_bank_spec_with_width(
     .map(|spec| spec.with_reduction(eredu_nn::GroupReduction::SequentialGroupOrder))
 }
 
-/// Derives complete expert ownership and rank-local bank geometry from LFM2.
-pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    architecture: &super::LayeredModel<B>,
+/// Derives expert ownership from normalized policy and optional admitted local geometry.
+/// This operation allocates no native modules and requires no backend context.
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&super::LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
-    let args = architecture.args();
+    args.validate().map_err(Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry.validate_for(args).map_err(Error::backend)?;
+    }
     if !args.has_sparse_moe_layers() {
         return Ok(None);
     }
@@ -253,8 +258,7 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
         if policy.feed_forward != FeedForwardPolicy::SparseMoe {
             continue;
         }
-        let width = architecture
-            .parallel_geometry()
+        let width = geometry
             .and_then(|geometry| geometry.block(layer))
             .map_or(args.moe_intermediate_size, |geometry| {
                 geometry.expert_intermediate
@@ -275,29 +279,13 @@ pub fn replicated_expert_realization_plan(
     if !args.has_sparse_moe_layers() {
         return Err(Error::backend("LFM2 routed text requires sparse units"));
     }
-    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
-    let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
-        .map_err(Error::backend)?;
-    let unit_specs = args
-        .layer_schedule
-        .iter()
-        .enumerate()
-        .filter(|(_, policy)| policy.feed_forward == FeedForwardPolicy::SparseMoe)
-        .map(|(layer, _)| {
-            expert_bank_spec_with_width(args, layer, args.moe_intermediate_size)
-                .map(|spec| ((owner_group.clone(), layer), spec))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(
-        global_experts,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
-            0,
-        )
-        .map_err(Error::backend)?,
-        unit_specs,
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
+        0,
     )
-    .map_err(Error::backend)
+    .map_err(Error::backend)?;
+    expert_realization_plan(args, None, topology)?
+        .ok_or_else(|| Error::backend("LFM2 routed text requires sparse units"))
 }
 
 /// Per-layer dense or routed feed-forward policy.

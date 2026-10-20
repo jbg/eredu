@@ -8707,6 +8707,11 @@ source formats from exact admitted requirements, verifies target/source semantic
 addresses and local state geometry, and passes its typed source layout into the
 shared runtime factory. This includes the routed expert realization and shared
 bank geometry; the backend only materializes the retained source and target.
+LFM2 derives expert ownership and local bank specifications directly from
+`ModelArgs`, optional validated `LocalGeometry` and rank topology. The operation
+has no backend type or native context. Replicated expert planning uses the same
+algorithm, and partition preparation consumes these neutral plans for both source
+and selected parameter layouts.
 
 Kimi attention and LFM2 attention/convolution companions inherit their primary projection's semantic head or
 output-column sharding through neutral parameter metadata. Their own physical
