@@ -367,6 +367,17 @@ pub trait ComponentKernel<B: NeuralBackend> {
         state: &PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<ModelStateIdentity, Self::Error>;
+    /// Borrows the exact target activation retained for an external prediction operation.
+    fn prediction_target_capture(_forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        None
+    }
+    /// Exact capture geometry for a partition that does not publish target output.
+    fn prediction_target_placeholder_shape(
+        &self,
+        _forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        Ok(None)
+    }
     /// Builds one unloaded resource after shared address validation.
     fn build_unit(
         &self,
@@ -488,6 +499,17 @@ pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKer
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+    /// Closes one validated group and retains its dependency-facing values.
+    fn complete_group(
+        &mut self,
+        _group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(hidden.clone())
+    }
     /// Runs the family equation against an already admitted resource.
     fn execute(
         &mut self,
@@ -574,6 +596,18 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+    /// Closes the same group under an admitted parallel context.
+    fn complete_group_parallel(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.complete_group(group, hidden, state, forward, context)
+    }
     /// Parallel unit equation, including architecture-specific collectives.
     fn execute_parallel(
         &mut self,
@@ -1142,6 +1176,27 @@ where
         self.kernel
             .begin_group(group, initial, dependencies, state, forward, context)
     }
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut K::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, K::Error> {
+        self.definition().unit_count(group)?;
+        self.kernel
+            .complete_group(group, hidden, state, forward, context)
+    }
+    fn prediction_target_capture(forward: &K::ForwardContext) -> Option<&B::Tensor> {
+        K::prediction_target_capture(forward)
+    }
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &K::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, K::Error> {
+        self.kernel.prediction_target_placeholder_shape(forward)
+    }
     fn should_execute_group(&self, group: usize, forward: &K::ForwardContext) -> bool {
         self.kernel.executes_group(group, forward)
     }
@@ -1303,6 +1358,19 @@ where
             parallel,
             context,
         )
+    }
+    fn complete_execution_group_parallel(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut K::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, K::Error> {
+        self.definition().unit_count(group)?;
+        self.kernel
+            .complete_group_parallel(group, hidden, state, forward, parallel, context)
     }
     fn finish_forward_parallel(
         &mut self,

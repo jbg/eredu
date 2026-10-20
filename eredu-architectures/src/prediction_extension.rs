@@ -1577,8 +1577,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
         match parallel {
-            Some(parallel) => self.embed_prediction_parallel(tokens, parallel, context),
-            None => self.embed_prediction(tokens, context),
+            Some(parallel) => self
+                .kernel_mut()
+                .embed_prediction_parallel(tokens, parallel, context),
+            None => self.kernel_mut().embed_prediction(tokens, context),
         }
     }
 
@@ -1589,7 +1591,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.project_prediction_instrumented(hidden, parallel, context, instrumentation)
+        self.kernel_mut().project_prediction_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 }
 

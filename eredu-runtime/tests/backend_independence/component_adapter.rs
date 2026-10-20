@@ -895,3 +895,133 @@ fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
         assert_eq!(output, FakeTensor(vec![9, step, step, step]));
     }
 }
+
+// Group closure contributes to dependencies while its captured target remains a
+// separate retained value for a later readout. A failed closure aborts the pass.
+struct CaptureKernel {
+    fail_completion: bool,
+}
+impl ComponentKernel<FakeBackend> for CaptureKernel {
+    type Input<'a> = &'a FakeTensor;
+    type Unit = FakeUnit;
+    type ForwardContext = Option<FakeTensor>;
+    type RetainedContextValues<'a> = std::option::Iter<'a, FakeTensor>;
+    type Error = Failure;
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Failure> {
+        Kernel {
+            fail: false,
+            pinned: None,
+        }
+        .state_identity(state, topology)
+    }
+    fn build_unit(&self, address: ExecutionUnitAddress, _: &()) -> Result<FakeUnit, Failure> {
+        Ok(FakeUnit {
+            marker: (address.group() * 10 + address.index()) as i32,
+        })
+    }
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&FakeTensor> {
+        forward.as_ref()
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.iter()
+    }
+}
+impl ComponentEquations<FakeBackend, StatelessComponentState> for CaptureKernel {
+    fn begin<'a>(
+        &mut self,
+        input: &'a FakeTensor,
+        _: &mut StatelessComponentState,
+        _: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Failure> {
+        Ok(LayeredForwardState {
+            hidden: input.clone(),
+            context: None,
+        })
+    }
+    fn begin_group(
+        &mut self,
+        _: usize,
+        initial: &FakeTensor,
+        dependencies: &[&FakeTensor],
+        _: &mut StatelessComponentState,
+        _: &mut Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Failure> {
+        Ok(dependencies.first().copied().unwrap_or(initial).clone())
+    }
+    fn execute(
+        &mut self,
+        _: ExecutionUnitAddress,
+        unit: &mut FakeUnit,
+        hidden: &FakeTensor,
+        _: &mut StatelessComponentState,
+        _: &mut Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Failure> {
+        let mut output = hidden.clone();
+        output.0.push(unit.marker);
+        Ok(output)
+    }
+    fn complete_group(
+        &mut self,
+        group: usize,
+        hidden: &FakeTensor,
+        _: &mut StatelessComponentState,
+        forward: &mut Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Failure> {
+        if group == 0 {
+            *forward = Some(hidden.clone());
+        }
+        if self.fail_completion && group == 1 {
+            return Err(Failure::Equation);
+        }
+        let mut output = hidden.clone();
+        output.0.push(100 + group as i32);
+        Ok(output)
+    }
+    fn finish(
+        &mut self,
+        hidden: &FakeTensor,
+        _: &mut StatelessComponentState,
+        forward: &Self::ForwardContext,
+        _: &(),
+    ) -> Result<FakeTensor, Failure> {
+        let mut output = hidden.clone();
+        output.0.extend_from_slice(
+            &Self::prediction_target_capture(forward)
+                .ok_or(Failure::Equation)?
+                .0,
+        );
+        Ok(output)
+    }
+}
+
+#[test]
+fn component_group_completion_preserves_dependencies_capture_and_retry() {
+    let component = |fail_completion| {
+        ComponentAdapter::new(definition(false), CaptureKernel { fail_completion }).unwrap()
+    };
+    let input = FakeTensor(vec![7]);
+    let mut state = StatelessComponentState::new().unwrap();
+    let mut resident = ResidentRuntime::new(component(false), &()).unwrap();
+    let mut bounded = LayerwiseRuntime::new(component(true), RecordingPolicy::bounded(2));
+    assert!(bounded.forward(&input, &mut state, &()).is_err());
+    assert_eq!(bounded.policy().aborts, 1);
+    assert!(!bounded.policy().forward_active);
+    bounded.architecture_mut().kernel_mut().fail_completion = false;
+    let expected = resident.forward(&input, &mut state, &()).unwrap();
+    assert_eq!(expected.0, [7, 0, 100, 10, 101, 7, 0]);
+    assert_eq!(bounded.forward(&input, &mut state, &()).unwrap(), expected);
+}

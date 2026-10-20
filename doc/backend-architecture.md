@@ -8568,6 +8568,28 @@ and the admitted fused or split KV-B layout. Shared SwiGLU declarations reuse th
 ordinary gated-unit builder. The backend supplies the existing projections,
 convolution, recurrence, parameters and completion resources.
 
+Shared component equations close each validated group before its result enters
+dependency traversal or partition publication. Parallel closure uses the same
+ordinary hook unless a kernel supplies distinct collective semantics. Kernels can
+retain an exact prediction-target capture and declare non-output placeholder
+geometry independently of the state profile. These hooks do not grant prediction
+execution support; explicit family preparation and target contracts admit that
+operation. Captured roots remain in the ordinary forward-retention lifecycle.
+
+Selected Nemotron-H targets use `ComponentAdapter` with `NemotronKernel`.
+The validated definition retains graph, canonical parameters, global unit paths,
+state references and transport class. The kernel retains exact Mamba/KV geometry,
+provider equations, typed target boundary schema and readout policy. Group closure
+captures the unnormalized target activation. Boundary transport carries original
+tokens, effective input embeddings and exact readout control; supplied embeddings
+can select normalized hidden output without vocabulary projection. The shared
+adapter validates selected ownership and addresses, visits borrowed canonical
+pinned roles and projects retained state slots. Low-level prediction embedding
+and projection operations use the actual modules through `kernel_mut()`.
+Existing materialized prediction extensions consume these target hooks through
+the same typed composition contracts. Full embedded-prediction execution retains
+its family equations and preparation.
+
 Complete and selected Kimi Linear execution use `ComponentAdapter` over the same
 `KimiKernel`. Typed complete and partition geometry retain global invocation
 ownership, actual local state indices, specialized expert banks, ordinary global

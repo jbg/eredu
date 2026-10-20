@@ -9955,20 +9955,19 @@ where
                     "Nemotron-H transform source changed local unit addresses".into(),
                 ));
             }
-            let source_architecture =
-                crate::nemotron_h::PartitionedLayeredModel::<B>::from_partition(
-                    source_args,
-                    &source_parameters,
-                    &source_partition,
-                    context,
-                )
-                .map_err(|error| {
-                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-                })?;
+            let source_architecture = crate::nemotron_h::NemotronKernel::<B>::from_partition(
+                source_args,
+                &source_parameters,
+                &source_partition,
+                context,
+            )
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
             Ok((source_architecture, source_layout))
         })
         .transpose()?;
-    let architecture = crate::nemotron_h::PartitionedLayeredModel::<B>::from_partition(
+    let architecture = crate::nemotron_h::NemotronKernel::<B>::from_partition(
         selected_args,
         &parameters,
         &partition,
@@ -11864,7 +11863,7 @@ where
                 "routed Nemotron transform source changed local unit addresses".into(),
             ));
         }
-        let source = crate::nemotron_h::PartitionedLayeredModel::<B>::from_partition(
+        let source = crate::nemotron_h::NemotronKernel::<B>::from_partition(
             source_args,
             &source_parameters,
             &source_partition,
@@ -11876,7 +11875,7 @@ where
         None
     };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
-        crate::nemotron_h::PartitionedLayeredModel::<B>::from_partition(
+        crate::nemotron_h::NemotronKernel::<B>::from_partition(
             selected_args,
             &parameters,
             &partition,

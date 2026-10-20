@@ -36,7 +36,7 @@ pub use parallel::{
     static_parallel_parameter_groups, unit_parallel_parameter_groups, LocalGeometry,
     PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
-pub use partitioned::{PartitionedForwardContext, PartitionedLayeredModel};
+pub use partitioned::{NemotronKernel, PartitionedForwardContext, PartitionedLayeredModel};
 
 /// Derives the complete replicated target expert plan from normalized geometry.
 pub fn replicated_expert_realization_plan(
