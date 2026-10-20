@@ -8587,6 +8587,10 @@ role and tied output consumers. The shared runtime expands declared linear
 formats and packed ReLU-squared bank geometry into exact physical companions;
 family code retains checkpoint identities and format policy. Full metadata and
 selected/source preparation consume the same cold declaration.
+Materialized prediction-extension preparation also derives source and executable
+metadata from this declaration. It selects exact formats and local placement
+before constructing typed prediction units; embedding and readout continue to
+borrow target resources.
 
 Full Nemotron-H execution uses `ComponentAdapter` with
 `CompleteNemotronKernel`. The adapter and its low-level kernel share one retained

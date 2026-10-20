@@ -5036,11 +5036,7 @@ where
             })
         }
         SafetensorsModelConfig::NemotronH(args) => {
-            let source_architecture =
-                crate::nemotron_h::CompleteNemotronKernel::<B>::new(args.clone(), source_context)
-                    .map_err(|error| invalid(error.to_string()))?;
-            let source_description = source_architecture
-                .parameter_description(source_context)
+            let source_description = crate::nemotron_h::parameter_description(args)
                 .map_err(|error| invalid(error.to_string()))?;
             // Auxiliary tasks can lower prediction matrices independently of the
             // target. Preserve source formats elsewhere and construct executable
@@ -5063,13 +5059,8 @@ where
             }
             let target_args =
                 crate::nemotron_h::with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let description = crate::nemotron_h::CompleteNemotronKernel::<B>::new(
-                target_args.clone(),
-                execution_context,
-            )
-            .map_err(|error| invalid(error.to_string()))?
-            .parameter_description(execution_context)
-            .map_err(|error| invalid(error.to_string()))?;
+            let description = crate::nemotron_h::parameter_description(&target_args)
+                .map_err(|error| invalid(error.to_string()))?;
             let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
                 .map_err(invalid)?;
             let geometry = crate::nemotron_h::local_geometry(&target_args, &layout)
