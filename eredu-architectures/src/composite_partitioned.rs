@@ -2468,27 +2468,31 @@ where
                 .collect::<Vec<_>>();
             let ownership = selected.requirements().ownership().clone();
             let rank = selected.requirements().topology();
+            let realization = if routed {
+                Some(
+                    crate::qwen::hybrid::conditional_expert_realization_plan(
+                        &args,
+                        Some(&local),
+                        rank,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "routed conditional Qwen has no expert realization".into(),
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
             let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_parallel(
                 args.clone(),
                 local,
                 context,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let realization = if routed {
-                Some(
-                    crate::qwen::hybrid::conditional_expert_realization_plan(&architecture, rank)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?
-                        .ok_or_else(|| {
-                            CompositePartitionPreparationError::Architecture(
-                                "routed conditional Qwen has no expert realization".into(),
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
             let geometry = match &realization {
                 Some(_) => crate::qwen::hybrid::routed_conditional_partition_local_geometry(
                     &args,
@@ -3362,27 +3366,31 @@ where
                 .collect::<Vec<_>>();
             let ownership = selected.requirements().ownership().clone();
             let rank = selected.requirements().topology();
+            let realization = if routed {
+                Some(
+                    crate::qwen::hybrid::conditional_expert_realization_plan(
+                        &args,
+                        Some(&local),
+                        rank,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "routed conditional Qwen has no expert realization".into(),
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
             let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_parallel(
                 args.clone(),
                 local,
                 context,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let realization = if routed {
-                Some(
-                    crate::qwen::hybrid::conditional_expert_realization_plan(&architecture, rank)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?
-                        .ok_or_else(|| {
-                            CompositePartitionPreparationError::Architecture(
-                                "routed conditional Qwen has no expert realization".into(),
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
             let geometry = match &realization {
                 Some(_) => crate::qwen::hybrid::routed_conditional_partition_local_geometry(
                     &args,

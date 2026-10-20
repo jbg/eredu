@@ -63,23 +63,11 @@ pub use parallel::{
     ConditionalPartitionLocalFoundation, ConditionalPartitionLocalGeometry, LocalGeometry,
 };
 
-/// Derives complete expert ownership and local bank geometry for Qwen hybrid text/MTP units.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
-{
-    let geometry = architecture.shared_parallel_geometry();
-    realization_plan(architecture.config(), geometry.as_deref(), topology)
-}
-
-/// Derives the complete replicated target expert plan from normalized geometry.
+/// Derives the complete replicated target/MTP expert plan from normalized geometry.
 pub fn replicated_expert_realization_plan(
     config: &HybridConfig,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    realization_plan(
+    expert_realization_plan(
         config,
         None,
         eredu_core::ParallelRankTopology::new(
@@ -91,18 +79,29 @@ pub fn replicated_expert_realization_plan(
     .ok_or_else(|| eredu_nn::Error::backend("Qwen hybrid routed text requires sparse units"))
 }
 
-/// Derives complete expert ownership and local bank geometry for conditional Qwen hybrid units.
-pub fn conditional_expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &ConditionalLayeredModel<B>,
+/// Derives conditional text/MTP expert ownership from neutral policy and optional local geometry.
+pub fn conditional_expert_realization_plan(
+    parsed: &ParsedHybridConfig,
+    geometry: Option<&ConditionalLocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
-    let geometry = architecture.shared_parallel_geometry();
-    realization_plan(
-        &architecture.parsed().text,
-        geometry.as_deref().map(ConditionalLocalGeometry::text),
+    parsed
+        .vision
+        .as_ref()
+        .ok_or_else(|| {
+            eredu_nn::Error::backend("conditional Qwen expert planning requires vision config")
+        })?
+        .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
+        .map_err(eredu_nn::Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(parsed)
+            .map_err(eredu_nn::Error::backend)?;
+    }
+    expert_realization_plan(
+        &parsed.text,
+        geometry.map(ConditionalLocalGeometry::text),
         topology,
     )
 }
@@ -113,19 +112,23 @@ pub(crate) fn partition_expert_realization_plan(
     geometry: &LocalGeometry,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    geometry
-        .validate_for(config)
-        .map_err(eredu_nn::Error::backend)?;
-    realization_plan(config, Some(geometry), topology)?
+    expert_realization_plan(config, Some(geometry), topology)?
         .ok_or_else(|| eredu_nn::Error::backend("Qwen partition has no routed units"))
 }
 
-fn realization_plan(
+/// Derives target and MTP bank ownership without a backend type or native resources.
+pub fn expert_realization_plan(
     config: &HybridConfig,
     geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
+    config.validate().map_err(eredu_nn::Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(config)
+            .map_err(eredu_nn::Error::backend)?;
+    }
     if !config.is_moe() {
         return Ok(None);
     }

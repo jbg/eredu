@@ -8592,6 +8592,14 @@ metadata from this declaration. It selects exact formats and local placement
 before constructing typed prediction units; embedding and readout continue to
 borrow target resources.
 
+Qwen hybrid expert ownership planning accepts normalized text or conditional
+configuration, optional validated local geometry and neutral rank topology.
+Replicated and partition planning use the same derivation for target and MTP bank
+identities. Conditional planning validates the vision policy and its text-local
+geometry without a backend model, then supplies the retained expert plan before
+rank-local executable construction. Native metadata discovery for Qwen hybrid
+parameters remains separate from expert ownership planning.
+
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden
 values or projects through the actual tied embedding or untied head. Serial,
