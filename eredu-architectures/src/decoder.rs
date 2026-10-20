@@ -3394,41 +3394,6 @@ pub(crate) fn routed_parameter_description(
                 "routed decoder unit {layer} has incompatible selector and bank geometry"
             )));
         }
-        let mut router = vec![eredu_runtime::ParameterMemberSpec::new(
-            block.selector.weight().id.as_str(),
-            vec![
-                block.bank.group_count() as usize,
-                block.selector.input_dimensions() as usize,
-            ],
-            MemberSharding::Replicated,
-        )];
-        if let Some(bias) = block.selector.bias() {
-            router.push(eredu_runtime::ParameterMemberSpec::new(
-                bias.id.as_str(),
-                vec![block.bank.group_count() as usize],
-                MemberSharding::Replicated,
-            ));
-        }
-        for parameter in [
-            block.selector.correction_bias(),
-            block.selector.coefficient_scale(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            router.push(eredu_runtime::ParameterMemberSpec::new(
-                parameter.id.as_str(),
-                vec![block.bank.group_count() as usize],
-                MemberSharding::Replicated,
-            ));
-        }
-        if let Some(transform) = block.selector.input_transform() {
-            router.push(eredu_runtime::ParameterMemberSpec::new(
-                transform.scale().id.as_str(),
-                vec![block.selector.input_dimensions() as usize],
-                MemberSharding::Replicated,
-            ));
-        }
         formats.insert(
             block.selector.weight().id.as_str().to_owned(),
             block.selector.format().encoding(),
@@ -3452,7 +3417,10 @@ pub(crate) fn routed_parameter_description(
             crate::linear_format::input_partition_alignment(down.format().encoding()) as usize,
         )?;
         groups.push(vec![
-            ParameterGroupSpec::new(block.selector_name, ParameterRole::Replicated, router)?,
+            eredu_runtime::top_k_group_selector_logical_group(
+                block.selector_name,
+                &block.selector,
+            )?,
             eredu_runtime::packed_gated_product_logical_group(block.bank_name, &block.bank, units)?,
         ]);
     }

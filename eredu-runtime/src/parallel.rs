@@ -638,6 +638,41 @@ where
     partitioned_group_with_preferred_units(logical_name, role, preferred_units, collector.members)
 }
 
+/// Declares the replicated logical resources of a top-k group selector.
+/// Encoding companions are expanded before placement by
+/// `expand_linear_format_parameter_groups`.
+pub fn top_k_group_selector_logical_group(
+    logical_name: impl Into<String>,
+    spec: &eredu_nn::TopKGroupSelectorSpec,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    spec.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let groups = spec.selection().group_count() as usize;
+    let input = spec.input_dimensions() as usize;
+    let mut members = Vec::new();
+    for (parameter, shape) in std::iter::once((spec.weight(), vec![groups, input]))
+        .chain(spec.bias().map(|parameter| (parameter, vec![groups])))
+        .chain(
+            spec.correction_bias()
+                .map(|parameter| (parameter, vec![groups])),
+        )
+        .chain(
+            spec.coefficient_scale()
+                .map(|parameter| (parameter, vec![groups])),
+        )
+        .chain(
+            spec.input_transform()
+                .map(|transform| (transform.scale(), vec![input])),
+        )
+    {
+        members.push(
+            ParameterMemberSpec::new(parameter.id.as_str(), shape, MemberSharding::Replicated)
+                .with_parameter_metadata(&ParameterMetadata::from_spec(parameter, true)),
+        );
+    }
+    ParameterGroupSpec::new(logical_name, ParameterRole::Replicated, members)
+}
+
 /// Declares logical matrices and biases for a packed gated-product bank.
 /// The caller selects semantic partition units and expands the exact encoding
 /// companions through `expand_linear_format_parameter_groups` before placement.

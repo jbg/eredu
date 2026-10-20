@@ -8707,6 +8707,13 @@ source formats from exact admitted requirements, verifies target/source semantic
 addresses and local state geometry, and passes its typed source layout into the
 shared runtime factory. This includes the routed expert realization and shared
 bank geometry; the backend only materializes the retained source and target.
+LFM2 declares complete dense and routed parameter topology from normalized
+configuration without constructing native modules. Its embedding formats,
+attention/convolution geometry, dense layers, selectors and packed expert banks
+supply exact canonical members and ownership before placement. Runtime expands
+selector resources and encoded projection companions through shared neutral
+geometry helpers. Routed partition preparation uses these declarations for both
+selected and transform-source layouts.
 LFM2 derives expert ownership and local bank specifications directly from
 `ModelArgs`, optional validated `LocalGeometry` and rank topology. The operation
 has no backend type or native context. Replicated expert planning uses the same

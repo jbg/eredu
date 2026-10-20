@@ -11456,13 +11456,8 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: RoutedPartitionedProductionVisitor<B, S>,
 {
-    let description_model = crate::lfm2::LayeredModel::<B>::new(selected_args.clone(), context)
+    let parameters = crate::lfm2::parameter_description(&selected_args)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let parameters = eredu_runtime::ArchitectureParameters::parameter_description(
-        &description_model,
-        context,
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -11518,13 +11513,8 @@ where
             crate::replicated_text::requirement_formats(selected.base().text().requirements()),
         )
         .map_err(error)?;
-        let source_description = crate::lfm2::LayeredModel::<B>::new(source_args.clone(), context)
-            .map_err(|e| error(e.to_string()))?;
-        let source_parameters = eredu_runtime::ArchitectureParameters::parameter_description(
-            &source_description,
-            context,
-        )
-        .map_err(|e| error(e.to_string()))?;
+        let source_parameters =
+            crate::lfm2::parameter_description(&source_args).map_err(|e| error(e.to_string()))?;
         validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)

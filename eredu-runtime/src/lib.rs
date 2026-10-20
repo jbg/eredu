@@ -321,9 +321,10 @@ pub use parallel::{
     expand_linear_format_parameter_groups, module_parameter_group,
     packed_gated_product_logical_group, partition_chunk_range, partition_parameter_group_chunks,
     partitioned_module_parameter_group, partitioned_projection_group, projection_parameter_group,
-    segmented_projection_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    PartitionUnitAssignment, ProjectionSharding, ShardingPolicy, TensorPlacement,
+    segmented_projection_group, top_k_group_selector_logical_group, LocalModelLayout,
+    LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, PartitionUnitAssignment, ProjectionSharding,
+    ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     apply_parameter_storage_layouts, bind_materialized_unit, bind_materialized_unit_excluding,

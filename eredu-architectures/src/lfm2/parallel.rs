@@ -804,6 +804,15 @@ pub fn dense_parameter_description(
             "dense LFM2 parameter topology does not accept routed layers".into(),
         ));
     }
+    parameter_description(args)
+}
+
+/// Declares complete dense and routed parameter ownership without native resources.
+pub fn parameter_description(
+    args: &ModelArgs,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    args.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layers = usize::try_from(args.num_hidden_layers)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into()))?;
     let graph = ExecutionGraph::new(
@@ -851,9 +860,7 @@ pub fn dense_parameter_description(
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 hidden width exceeds usize".into()))?;
     let kv_heads = usize::try_from(args.num_key_value_heads)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 KV heads exceed usize".into()))?;
-    let intermediate = usize::try_from(args.dense_intermediate_size).map_err(|_| {
-        ParallelPlanError::InvalidGroup("LFM2 intermediate width exceeds usize".into())
-    })?;
+    let mut formats = std::collections::BTreeMap::new();
     for layer in 0..layers {
         let root = format!("model.layers.{layer}");
         match args
@@ -961,44 +968,94 @@ pub fn dense_parameter_description(
                 )],
             )?);
         }
-        let alignment = args
-            .weight_quantization_for(&format!("{root}.feed_forward.w2.weight"))
-            .map_or(Ok(1), |quantization| {
-                usize::try_from(quantization.group_size()).map_err(|_| {
-                    ParallelPlanError::InvalidGroup(
-                        "LFM2 dense quantization group exceeds usize".into(),
-                    )
-                })
-            })?;
-        groups.push(ParameterGroupSpec::partitioned(
-            format!("{root}.feed_forward.intermediate"),
-            ParameterRole::FeedForwardIntermediate,
-            aligned_partition_units(&root, intermediate, 1, alignment)?,
-            [
-                ParameterMemberSpec::new(
-                    format!("{root}.feed_forward.w1.weight"),
-                    vec![intermediate, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.feed_forward.w3.weight"),
-                    vec![intermediate, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.feed_forward.w2.weight"),
-                    vec![hidden, intermediate],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
-        )?);
+        match args
+            .layer_policy(layer)
+            .expect("validated LFM2 schedule")
+            .feed_forward
+        {
+            super::FeedForwardPolicy::Dense => {
+                let intermediate = args.dense_intermediate_size as usize;
+                let alignment = args
+                    .weight_quantization_for(&format!("{root}.feed_forward.w2.weight"))
+                    .map_or(Ok(1), |quantization| {
+                        usize::try_from(quantization.group_size()).map_err(|_| {
+                            ParallelPlanError::InvalidGroup(
+                                "LFM2 dense quantization group exceeds usize".into(),
+                            )
+                        })
+                    })?;
+                groups.push(ParameterGroupSpec::partitioned(
+                    format!("{root}.feed_forward.intermediate"),
+                    ParameterRole::FeedForwardIntermediate,
+                    aligned_partition_units(&root, intermediate, 1, alignment)?,
+                    [
+                        ParameterMemberSpec::new(
+                            format!("{root}.feed_forward.w1.weight"),
+                            vec![intermediate, hidden],
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                        ParameterMemberSpec::new(
+                            format!("{root}.feed_forward.w3.weight"),
+                            vec![intermediate, hidden],
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                        ParameterMemberSpec::new(
+                            format!("{root}.feed_forward.w2.weight"),
+                            vec![hidden, intermediate],
+                            MemberSharding::Partitioned { axis: 1 },
+                        ),
+                    ],
+                )?);
+            }
+            super::FeedForwardPolicy::SparseMoe => {
+                let selector = super::moe::selector_spec(args, layer)
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+                let bank = super::moe::expert_bank_spec(args, layer)
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+                formats.insert(
+                    selector.weight().id.as_str().to_owned(),
+                    selector.format().clone(),
+                );
+                let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout()
+                else {
+                    return Err(ParallelPlanError::InvalidGroup(
+                        "LFM2 requires packed expert projections".into(),
+                    ));
+                };
+                for projection in [gate_up, down] {
+                    formats.insert(
+                        projection.weight().id.as_str().to_owned(),
+                        projection.format().clone(),
+                    );
+                }
+                let name = format!("{root}.feed_forward.experts.intermediate");
+                let units = aligned_partition_units(
+                    &name,
+                    bank.intermediate_dimensions() as usize,
+                    1,
+                    crate::linear_format::input_partition_alignment(down.format().encoding())
+                        as usize,
+                )?;
+                groups.push(eredu_runtime::top_k_group_selector_logical_group(
+                    format!("{root}.feed_forward.gate"),
+                    &selector,
+                )?);
+                groups.push(eredu_runtime::packed_gated_product_logical_group(
+                    name, &bank, units,
+                )?);
+            }
+        }
     }
     let groups = eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
         let name = member.target();
+        if let Some(format) = formats.get(name) {
+            return Ok(Some(format.clone()));
+        }
         let linear = name.ends_with(".weight")
             && (name.contains("_proj.weight")
                 || name.contains("feed_forward.w")
-                || name == "lm_head.weight");
+                || name == "lm_head.weight"
+                || name == "model.embed_tokens.weight");
         linear
             .then(|| {
                 crate::linear_format::standard_linear_format(
