@@ -207,6 +207,107 @@ pub fn owned_static_parallel_parameter_groups(
     execution_group: eredu_runtime::ExecutionGroupId,
     role: &str,
 ) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, ParallelPlanError> {
+    Ok(static_resource_groups(config, root, execution_group, role)?
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StaticResource {
+    Ingress,
+    Merger,
+    DeepStack(usize),
+}
+
+/// Exact cold selection of vision ingress and merger banks from canonical bindings.
+#[derive(Debug, Clone)]
+pub struct VisionStaticSelection {
+    pub(super) config: VisionConfig,
+    pub(super) root: String,
+    pub(super) ingress: bool,
+    pub(super) merger: bool,
+    pub(super) deepstack: Vec<bool>,
+}
+impl VisionStaticSelection {
+    /// Selects all pinned resources for complete-tower construction.
+    pub fn all(config: VisionConfig, root: &str) -> Result<Self, ParallelPlanError> {
+        config.validate().map_err(invalid)?;
+        let deepstack = vec![true; config.deepstack_layer_count()];
+        Ok(Self {
+            config,
+            root: root.to_owned(),
+            ingress: true,
+            merger: true,
+            deepstack,
+        })
+    }
+
+    /// Resolves complete native resources from selected canonical parameter groups.
+    /// Encoded companions and normalization/projection groups remain indivisible.
+    pub fn from_parameter_bindings(
+        config: VisionConfig,
+        root: &str,
+        execution_group: eredu_runtime::ExecutionGroupId,
+        role: &str,
+        bindings: &[eredu_runtime::OwnedParameterGroupSpec],
+    ) -> Result<Self, ParallelPlanError> {
+        let declared = static_resource_groups(&config, root, execution_group, role)?;
+        let mut selected = std::collections::BTreeSet::new();
+        for binding in bindings
+            .iter()
+            .filter(|group| group.owner().accepts_static_role(role))
+        {
+            if !declared.iter().any(|(_, group)| group == binding) {
+                return Err(invalid(format!(
+                    "vision {root:?}: incompatible pinned group {}",
+                    binding.group().logical_name()
+                )));
+            }
+            if !selected.insert(binding.group().logical_name()) {
+                return Err(invalid(format!(
+                    "vision {root:?}: duplicate pinned group {}",
+                    binding.group().logical_name()
+                )));
+            }
+        }
+        let mut resources = std::collections::BTreeMap::<_, (usize, usize)>::new();
+        for (resource, group) in declared {
+            let counts = resources.entry(resource).or_default();
+            counts.0 += usize::from(selected.contains(group.group().logical_name()));
+            counts.1 += 1;
+        }
+        for (resource, (present, total)) in &resources {
+            if *present != 0 && present != total {
+                return Err(invalid(format!(
+                    "vision {root:?}: incomplete pinned resource {resource:?}"
+                )));
+            }
+        }
+        let owns = |resource| {
+            resources
+                .get(&resource)
+                .is_some_and(|(present, _)| *present > 0)
+        };
+        let deepstack = (0..config.deepstack_layer_count())
+            .map(|bank| owns(StaticResource::DeepStack(bank)))
+            .collect();
+        Ok(Self {
+            config,
+            root: root.to_owned(),
+            ingress: owns(StaticResource::Ingress),
+            merger: owns(StaticResource::Merger),
+            deepstack,
+        })
+    }
+}
+
+fn static_resource_groups(
+    config: &VisionConfig,
+    root: &str,
+    execution_group: eredu_runtime::ExecutionGroupId,
+    role: &str,
+) -> Result<Vec<(StaticResource, eredu_runtime::OwnedParameterGroupSpec)>, ParallelPlanError> {
     use eredu_runtime::{OwnedParameterGroupSpec, ParameterGroupOwner, ParameterMemberSpec};
     config.validate().map_err(invalid)?;
     let last = config
@@ -225,67 +326,81 @@ pub fn owned_static_parallel_parameter_groups(
         .formats
         .insert(position.weight.id.as_str().into(), position.format);
     let mut groups = vec![
-        OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role(role),
-            ParameterGroupSpec::new(
-                format!("{root}.position"),
-                ParameterRole::Replicated,
-                [ParameterMemberSpec::new(
-                    position.weight.id.as_str(),
-                    vec![position.vocabulary as usize, position.dimensions as usize],
-                    MemberSharding::Replicated,
-                )],
-            )?,
+        (
+            StaticResource::Ingress,
+            OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::static_role(role),
+                ParameterGroupSpec::new(
+                    format!("{root}.position"),
+                    ParameterRole::Replicated,
+                    [ParameterMemberSpec::new(
+                        position.weight.id.as_str(),
+                        vec![position.vocabulary as usize, position.dimensions as usize],
+                        MemberSharding::Replicated,
+                    )],
+                )?,
+            ),
         ),
-        OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role(role),
-            ParameterGroupSpec::new(
-                format!("{root}.patch"),
-                ParameterRole::Replicated,
-                [
-                    ParameterMemberSpec::new(
-                        patch.weight.id.as_str(),
-                        patch_shape,
-                        MemberSharding::Replicated,
-                    ),
-                    ParameterMemberSpec::new(
-                        patch.bias.id.as_str(),
-                        vec![patch.geometry.output as usize],
-                        MemberSharding::Replicated,
-                    ),
-                ],
-            )?,
+        (
+            StaticResource::Ingress,
+            OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::static_role(role),
+                ParameterGroupSpec::new(
+                    format!("{root}.patch"),
+                    ParameterRole::Replicated,
+                    [
+                        ParameterMemberSpec::new(
+                            patch.weight.id.as_str(),
+                            patch_shape,
+                            MemberSharding::Replicated,
+                        ),
+                        ParameterMemberSpec::new(
+                            patch.bias.id.as_str(),
+                            vec![patch.geometry.output as usize],
+                            MemberSharding::Replicated,
+                        ),
+                    ],
+                )?,
+            ),
         ),
     ];
-    for (prefix, unit, postshuffle) in std::iter::once((rooted(root, "merger"), last, false)).chain(
-        config
-            .deepstack_layers()
-            .into_iter()
-            .enumerate()
-            .map(|(index, unit)| {
-                (
-                    rooted(root, &format!("deepstack_merger_list.{index}")),
-                    unit as usize,
-                    true,
-                )
-            }),
-    ) {
+    for (resource, prefix, unit, postshuffle) in
+        std::iter::once((StaticResource::Merger, rooted(root, "merger"), last, false)).chain(
+            config
+                .deepstack_layers()
+                .into_iter()
+                .enumerate()
+                .map(|(index, unit)| {
+                    (
+                        StaticResource::DeepStack(index),
+                        rooted(root, &format!("deepstack_merger_list.{index}")),
+                        unit as usize,
+                        true,
+                    )
+                }),
+        )
+    {
         let owner =
             ParameterGroupOwner::static_unit_consumers(role, [(execution_group.clone(), unit)]);
         groups.extend(
             declaration
                 .merger(config, &prefix, postshuffle)?
                 .into_iter()
-                .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
+                .map(|group| (resource, OwnedParameterGroupSpec::new(owner.clone(), group))),
         );
     }
     let mut expanded = Vec::with_capacity(groups.len());
-    for group in groups {
+    for (resource, group) in groups {
         expanded.extend(
             declaration
                 .expand(vec![group.group().clone()])?
                 .into_iter()
-                .map(|expanded| OwnedParameterGroupSpec::new(group.owner().clone(), expanded)),
+                .map(|expanded| {
+                    (
+                        resource,
+                        OwnedParameterGroupSpec::new(group.owner().clone(), expanded),
+                    )
+                }),
         );
     }
     Ok(expanded)

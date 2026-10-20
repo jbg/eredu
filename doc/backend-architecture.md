@@ -8626,6 +8626,14 @@ rows. Ingress storage, the final merger and each DeepStack merger keep their
 explicit static role or logical-unit consumers. Qwen3-VL and Qwen4 experimental
 metadata consume these same vision declarations. Family code retains patch and
 shuffle geometry, window schedules, DeepStack capture order and media equations.
+`VisionStaticSelection` resolves complete ingress and merger resources from those
+same canonical parameter groups before allocation. It rejects incomplete encoded
+or normalization/projection resources, duplicates and incompatible declarations.
+`VisionStatic` retains optional patch/position/final-merger modules and sparse
+DeepStack banks in their original bank identities. Complete and selected resources
+run the same equations; an operation rejects a missing required resource before
+submitting its equation. Parameter-free continuation geometry remains available
+when a rank retains no pinned vision parameters.
 
 Full and selected Qwen hybrid text execution uses `ComponentAdapter` with one
 `QwenKernel`. The adapter and kernel retain the same `Arc<ComponentDefinition>`

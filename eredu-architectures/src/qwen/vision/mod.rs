@@ -22,4 +22,5 @@ pub use model::{
 pub use parallel::{
     block_parallel_parameter_groups, local_block_geometry, local_merger_widths,
     owned_static_parallel_parameter_groups, static_parallel_parameter_groups,
+    VisionStaticSelection,
 };

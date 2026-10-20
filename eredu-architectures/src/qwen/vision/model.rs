@@ -489,10 +489,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    pub(super) position: B::Embedding,
-    pub(super) patch: PatchEmbed<B>,
-    pub(super) merger: Merger<B>,
-    pub(super) deepstack_mergers: Vec<Merger<B>>,
+    pub(super) position: Option<B::Embedding>,
+    pub(super) patch: Option<PatchEmbed<B>>,
+    pub(super) merger: Option<Merger<B>>,
+    pub(super) deepstack_mergers: Vec<Option<Merger<B>>>,
     #[parameter(skip)]
     config: VisionConfig,
 }
@@ -524,7 +524,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         merger_intermediates: &[i32],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::backend)?;
+        let selection =
+            super::VisionStaticSelection::all(config, parameter_root).map_err(Error::backend)?;
+        Self::from_selection(selection, merger_intermediates, context)
+    }
+
+    /// Materializes exactly the pinned resources selected from the canonical declaration.
+    pub fn from_selection(
+        selection: super::VisionStaticSelection,
+        merger_intermediates: &[i32],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let super::VisionStaticSelection {
+            config,
+            root,
+            ingress,
+            merger,
+            deepstack,
+        } = selection;
         if merger_intermediates.len() != config.deepstack_layer_count() + 1
             || merger_intermediates.iter().any(|width| *width <= 0)
         {
@@ -532,29 +549,40 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                 "vision merger local-width plan is incomplete",
             ));
         }
-        let position = B::embedding(
-            super::specs::position_spec(&config, parameter_root)?,
-            context,
-        )?;
-        let patch = PatchEmbed::new(&config, parameter_root, context)?;
-        let merger = Merger::new_with_intermediate(
-            &config,
-            &rooted(parameter_root, "merger"),
-            false,
-            config.mode == VisionMode::WindowScheduled,
-            merger_intermediates[0],
-            context,
-        )?;
-        let deepstack_mergers = (0..config.deepstack_layer_count())
-            .map(|i| {
+        let position = ingress
+            .then(|| B::embedding(super::specs::position_spec(&config, &root)?, context))
+            .transpose()?;
+        let patch = ingress
+            .then(|| PatchEmbed::new(&config, &root, context))
+            .transpose()?;
+        let merger = merger
+            .then(|| {
                 Merger::new_with_intermediate(
                     &config,
-                    &rooted(parameter_root, &format!("deepstack_merger_list.{i}")),
-                    true,
+                    &rooted(&root, "merger"),
                     false,
-                    merger_intermediates[i + 1],
+                    config.mode == VisionMode::WindowScheduled,
+                    merger_intermediates[0],
                     context,
                 )
+            })
+            .transpose()?;
+        let deepstack_mergers = deepstack
+            .into_iter()
+            .enumerate()
+            .map(|(i, selected)| {
+                selected
+                    .then(|| {
+                        Merger::new_with_intermediate(
+                            &config,
+                            &rooted(&root, &format!("deepstack_merger_list.{i}")),
+                            true,
+                            false,
+                            merger_intermediates[i + 1],
+                            context,
+                        )
+                    })
+                    .transpose()
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
@@ -564,6 +592,14 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             deepstack_mergers,
             config,
         })
+    }
+
+    /// Whether this rank physically retains any pinned vision parameter.
+    pub fn has_parameters(&self) -> bool {
+        self.patch.is_some()
+            || self.position.is_some()
+            || self.merger.is_some()
+            || self.deepstack_mergers.iter().any(Option::is_some)
     }
 
     /// Embeds patches and constructs reusable continuation state.
@@ -578,17 +614,25 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             Some(input.pixels.dim(0)),
         )
         .map_err(Error::backend)?;
-        let mut hidden = self.patch.forward(input.pixels, context)?;
+        let position = self
+            .position
+            .as_mut()
+            .ok_or_else(|| Error::backend("vision ingress does not own position parameters"))?;
+        let patch = self
+            .patch
+            .as_mut()
+            .ok_or_else(|| Error::backend("vision ingress does not own patch parameters"))?;
+        let mut hidden = patch.forward(input.pixels, context)?;
         let positions = match self.config.mode {
             VisionMode::DeepStack => interpolated_positions::<B>(
-                &mut self.position,
+                position,
                 input.grid,
                 self.config.num_position_embeddings,
                 self.config.spatial_merge_size,
                 context,
             )?,
             VisionMode::WindowScheduled => gathered_positions::<B>(
-                &mut self.position,
+                position,
                 input.grid,
                 self.config.num_position_embeddings,
                 context,
@@ -694,6 +738,19 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             .config
             .layer_policy(layer)
             .ok_or_else(|| Error::backend(format!("vision schedule has no block {layer}")))?;
+        let merger = policy
+            .deepstack_merger
+            .map(|index| {
+                self.deepstack_mergers
+                    .get_mut(index as usize)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| {
+                        Error::backend(format!(
+                            "vision block {layer} does not own DeepStack merger {index}"
+                        ))
+                    })
+            })
+            .transpose()?;
         let hidden = block.forward_impl(
             hidden,
             state.chunks(policy.attention),
@@ -702,11 +759,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             parallel,
             context,
         )?;
-        if let Some(index) = policy.deepstack_merger {
-            let merger = self
-                .deepstack_mergers
-                .get_mut(index as usize)
-                .ok_or_else(|| Error::backend("missing DeepStack merger"))?;
+        if let Some(merger) = merger {
             let feature = merger
                 .forward_impl(&hidden, parallel, context)?
                 .expand_dims(0, context)?;
@@ -742,7 +795,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<VisionOutput<B::Tensor>, Error> {
-        let merged = self.merger.forward_impl(hidden, parallel, context)?;
+        let merged = self
+            .merger
+            .as_mut()
+            .ok_or_else(|| Error::backend("vision output does not own final merger parameters"))?
+            .forward_impl(hidden, parallel, context)?;
         let inverse = inverse_permutation(&state.permutation).map_err(Error::backend)?;
         let inverse = B::Tensor::from_i32_slice(&inverse, &[inverse.len() as i32], context)?;
         let embeddings = merged
