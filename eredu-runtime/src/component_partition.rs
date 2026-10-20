@@ -21,6 +21,53 @@ pub trait PartitionComponentKernel<
     S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
 >: ParallelComponentKernel<B, S>
 {
+    /// Explicit internal observation coverage for the selected partition call path.
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+    /// Enters the same validated partition with optional internal instrumentation.
+    fn begin_partition_observed<O>(
+        &mut self,
+        input: LayeredPartitionInput<
+            '_,
+            B::Tensor,
+            <Self::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        selected: ComponentPartitionContext<'_, B>,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.begin_partition(input, mask, state, selected)
+    }
+    /// Publishes the same local result with optional internal instrumentation.
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        Self::Error,
+    >
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.finish_partition(hidden, state, forward, owns_output, parallel, context)
+    }
     /// Family-owned transport schema and auxiliary values.
     type Boundary: ArchitectureBoundary;
     /// Complete boundary geometry before route selection.
@@ -131,6 +178,75 @@ where
     S: RuntimeState<B>,
     K: PartitionComponentKernel<B, S> + 'static,
 {
+    fn partition_observation_hooks(
+        &self,
+        tensor_parallel: bool,
+    ) -> crate::inspection::ObservationHookSupport {
+        self.kernel().partition_observation_hooks(tensor_parallel)
+    }
+    fn begin_partition_observed<'a, O>(
+        &mut self,
+        input: LayeredPartitionInput<
+            'a,
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &crate::StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let expected = self.partition_entry_layout(Some(expected));
+        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
+        self.kernel_mut().begin_partition_observed(
+            input,
+            mask,
+            state,
+            ComponentPartitionContext {
+                expected,
+                first_state_ordinal,
+                parallel,
+                native: context,
+            },
+            observer,
+        )
+    }
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        Self::Error,
+    >
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.validate_partition_state(state.optional_layout(), None, Some(owns_output))?;
+        self.kernel_mut().finish_partition_observed(
+            hidden,
+            state,
+            forward,
+            owns_output,
+            parallel,
+            context,
+            observer,
+        )
+    }
     type Boundary = K::Boundary;
     fn boundary_schema(&self) -> Result<Self::Boundary, K::Error> {
         self.kernel().boundary_schema()

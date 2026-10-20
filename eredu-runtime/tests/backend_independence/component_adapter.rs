@@ -60,6 +60,54 @@ impl ComponentKernel<FakeBackend> for Kernel {
     }
 }
 impl ComponentEquations<FakeBackend, StatelessComponentState> for Kernel {
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
+    fn begin_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut StatelessComponentState,
+        context: &(),
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<FakeTensor, bool>, Failure>
+    where
+        O: eredu_runtime::ActivationObserver<FakeTensor, Failure> + ?Sized,
+    {
+        let mut forward = self.begin(input, state, context)?;
+        forward.hidden =
+            eredu_runtime::observe_and_intervene(observer, "fixture.input", &forward.hidden)?;
+        Ok(forward)
+    }
+    fn execute_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut FakeUnit,
+        hidden: &FakeTensor,
+        state: &mut StatelessComponentState,
+        forward: &mut bool,
+        context: &(),
+        observer: &mut O,
+    ) -> Result<FakeTensor, Failure>
+    where
+        O: eredu_runtime::ActivationObserver<FakeTensor, Failure> + ?Sized,
+    {
+        let output = self.execute(address, unit, hidden, state, forward, context)?;
+        eredu_runtime::observe_and_intervene(observer, "fixture.internal", &output)
+    }
+    fn finish_observed<O>(
+        &mut self,
+        hidden: &FakeTensor,
+        state: &mut StatelessComponentState,
+        forward: &bool,
+        context: &(),
+        observer: &mut O,
+    ) -> Result<FakeTensor, Failure>
+    where
+        O: eredu_runtime::ActivationObserver<FakeTensor, Failure> + ?Sized,
+    {
+        let output = self.finish(hidden, state, forward, context)?;
+        eredu_runtime::observe_and_intervene(observer, "fixture.readout", &output)
+    }
     fn begin<'a>(
         &mut self,
         (input, extended): Self::Input<'a>,
@@ -183,6 +231,78 @@ fn component_equation_failure_aborts_the_same_policy_and_allows_retry() {
     assert_eq!(runtime.policy().aborts, 1);
     assert!(!runtime.policy().forward_active);
     runtime.architecture_mut().kernel_mut().fail = false;
+    assert_eq!(
+        runtime.forward((&input, true), &mut state, &()).unwrap().0,
+        [7, 0, 10]
+    );
+}
+
+#[test]
+fn component_observation_failure_aborts_and_intervention_reaches_downstream_equations() {
+    struct Observer {
+        fail_at: Option<&'static str>,
+        seen: Vec<String>,
+    }
+    impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for Observer {
+        fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Failure> {
+            self.seen.push(path.into());
+            if self.fail_at == Some(path) {
+                return Err(Failure::Equation);
+            }
+            Ok(())
+        }
+        fn intervene(
+            &mut self,
+            path: &str,
+            value: &FakeTensor,
+        ) -> Result<Option<FakeTensor>, Failure> {
+            if path != "fixture.internal" {
+                return Ok(None);
+            }
+            let mut value = value.clone();
+            value.0.push(99);
+            Ok(Some(value))
+        }
+    }
+    let mut runtime = LayerwiseRuntime::new(adapter(false), RecordingPolicy::bounded(2));
+    let input = FakeTensor(vec![7]);
+    let mut state = StatelessComponentState::new().unwrap();
+    for path in ["fixture.input", "fixture.internal", "fixture.readout"] {
+        let mut observer = Observer {
+            fail_at: Some(path),
+            seen: vec![],
+        };
+        assert!(runtime
+            .forward_with_observer((&input, true), &mut state, &(), &mut observer)
+            .is_err());
+        assert!(!runtime.policy().forward_active);
+        assert_eq!(observer.seen.last().unwrap(), path);
+    }
+    // Input admission fails before a residency pass starts.
+    assert_eq!(runtime.policy().aborts, 2);
+    let mut observer = Observer {
+        fail_at: None,
+        seen: vec![],
+    };
+    let output = runtime
+        .forward_with_observer((&input, true), &mut state, &(), &mut observer)
+        .unwrap();
+    assert_eq!(output.0, [7, 0, 99, 10, 99]);
+    let internal: Vec<_> = observer
+        .seen
+        .iter()
+        .filter(|p| p.starts_with("fixture."))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        internal,
+        [
+            "fixture.input",
+            "fixture.internal",
+            "fixture.internal",
+            "fixture.readout"
+        ]
+    );
     assert_eq!(
         runtime.forward((&input, true), &mut state, &()).unwrap().0,
         [7, 0, 10]

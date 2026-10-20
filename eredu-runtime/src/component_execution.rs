@@ -1,10 +1,11 @@
 //! Validated component declarations and typed equation adapters.
 
 use crate::{
-    ArchitectureGroupTransport, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ExecutionGraph, ExecutionUnitAddress, LayeredArchitecture,
-    LayeredForwardState, ModelStateIdentity, ParallelLayeredArchitecture, PartitionState,
-    RuntimeState, StateError, StateLayout, StaticParameterVisitor, StaticParameterVisitorMut,
+    ActivationObserver, ArchitectureGroupTransport, ArchitectureParameterDescription,
+    ArchitectureParameters, ArchitectureStatePartitionPlan, ExecutionGraph, ExecutionUnitAddress,
+    LayeredArchitecture, LayeredForwardState, ModelStateIdentity, ParallelLayeredArchitecture,
+    PartitionState, RuntimeState, StateError, StateLayout, StaticParameterVisitor,
+    StaticParameterVisitorMut,
 };
 use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 use std::{borrow::Borrow, ops::Range};
@@ -342,6 +343,72 @@ pub trait ComponentKernel<B: NeuralBackend> {
 /// Typed equations over one concrete borrowed or owned state profile.
 /// Resource construction and request roots remain independent of cache storage ownership.
 pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKernel<B> {
+    /// Explicit coverage of ordinary internal equation hooks.
+    fn observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+
+    /// Whether unit equations own their input/output observation and intervention seams.
+    fn observes_unit_boundaries(&self, _group: usize, _index: usize) -> bool {
+        false
+    }
+
+    /// Optional semantic path for the selected group input.
+    fn group_input_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Optional semantic path for the completed group output.
+    fn group_output_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Runs ordinary ingress with optional internal observation and intervention.
+    fn begin_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.begin(input, state, context)
+    }
+
+    /// Runs one validated unit with optional internal observation and intervention.
+    fn execute_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.execute(address, unit, hidden, state, forward, context)
+    }
+
+    /// Runs ordinary readout with optional internal observation and intervention.
+    fn finish_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.finish(hidden, state, forward, context)
+    }
+
     /// Prepares a typed operation.
     fn begin<'a>(
         &mut self,
@@ -385,6 +452,60 @@ pub trait ParallelComponentKernel<
     S: RuntimeState<B> = <Self as ComponentKernel<B>>::State,
 >: ComponentEquations<B, S>
 {
+    /// Explicit coverage of parallel internal equation hooks.
+    fn parallel_observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+
+    /// Runs parallel ingress with optional internal observation and intervention.
+    fn begin_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.begin_parallel(input, state, parallel, context)
+    }
+
+    /// Runs one validated parallel unit with optional internal instrumentation.
+    fn execute_parallel_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.execute_parallel(address, unit, hidden, state, forward, parallel, context)
+    }
+
+    /// Runs parallel readout with optional internal observation and intervention.
+    fn finish_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.finish_parallel(hidden, state, forward, parallel, context)
+    }
+
     /// Parallel ingress and communicator validation.
     fn begin_parallel<'a>(
         &mut self,
@@ -733,6 +854,75 @@ where
     S: RuntimeState<B>,
     K: ComponentEquations<B, S> + 'static,
 {
+    fn observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
+        self.kernel.observation_hooks()
+    }
+
+    fn observes_unit_boundaries(&self, group: usize, index: usize) -> bool {
+        self.kernel.observes_unit_boundaries(group, index)
+    }
+
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        self.kernel.group_input_observation_path(group)
+    }
+
+    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        self.kernel.group_output_observation_path(group)
+    }
+
+    fn begin_forward_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.kernel.begin_observed(input, state, context, observer)
+    }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.kernel.execute_observed(
+            self.address(group, index)?,
+            unit,
+            hidden,
+            state,
+            forward,
+            context,
+            observer,
+        )
+    }
+
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.kernel
+            .finish_observed(hidden, state, forward, context, observer)
+    }
+
     type Input<'a>
         = K::Input<'a>
     where
@@ -883,6 +1073,68 @@ where
     S: RuntimeState<B>,
     K: ParallelComponentKernel<B, S> + 'static,
 {
+    fn parallel_observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
+        self.kernel.parallel_observation_hooks()
+    }
+
+    fn begin_forward_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.kernel
+            .begin_parallel_observed(input, state, parallel, context, observer)
+    }
+
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group_index: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.kernel.execute_parallel_observed(
+            self.address(group_index, index)?,
+            unit,
+            hidden,
+            state,
+            forward,
+            parallel,
+            context,
+            observer,
+        )
+    }
+
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.kernel
+            .finish_parallel_observed(hidden, state, forward, parallel, context, observer)
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,

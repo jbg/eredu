@@ -695,7 +695,12 @@ ordinary architecture and layered contracts for independently leased components;
 its typed `ComponentKernel` supplies resource construction, operation activity,
 request roots and family cache identity. `ComponentEquations` supplies equations
 for each concrete state profile, including borrowed cache slices and owned stage
-caches, while retaining the same resources and request context. Parallel adaptation requires the separate
+caches, while retaining the same resources and request context. Ordinary, parallel and partition equations expose typed observation hooks through
+the same adapter. Unit hooks receive validated invocation addresses; partition
+hooks run after the same state and ownership checks as ordinary ingress and egress.
+Internal hook coverage and ownership of unit boundary interventions are explicit
+kernel reports, independent of the presence of default hook methods.
+Parallel adaptation requires the separate
 `ParallelComponentKernel` bound. Typed partition and pipeline adaptation require
 `PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
 selection validates canonical parameter ownership and the declared state projection,
