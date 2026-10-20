@@ -10124,20 +10124,19 @@ where
                     "Kimi Linear transform source changed local unit addresses".into(),
                 ));
             }
-            let source_architecture =
-                crate::kimi_linear::PartitionedLayeredModel::<B>::from_partition(
-                    source_args,
-                    &source_parameters,
-                    &source_partition,
-                    context,
-                )
-                .map_err(|error| {
-                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-                })?;
+            let source_architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
+                source_args,
+                &source_parameters,
+                &source_partition,
+                context,
+            )
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
             Ok((source_architecture, source_layout))
         })
         .transpose()?;
-    let architecture = crate::kimi_linear::PartitionedLayeredModel::<B>::from_partition(
+    let architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
         selected_args,
         &parameters,
         &partition,
@@ -11733,7 +11732,7 @@ where
                 "routed Kimi Linear transform source changed local unit addresses".into(),
             ));
         }
-        let source = crate::kimi_linear::PartitionedLayeredModel::<B>::from_partition(
+        let source = crate::kimi_linear::KimiKernel::<B>::from_partition(
             source_args,
             &source_parameters,
             &source_partition,
@@ -11745,7 +11744,7 @@ where
         None
     };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
-        crate::kimi_linear::PartitionedLayeredModel::<B>::from_partition(
+        crate::kimi_linear::KimiKernel::<B>::from_partition(
             selected_args,
             &parameters,
             &partition,

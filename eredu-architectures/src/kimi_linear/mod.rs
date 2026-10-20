@@ -38,7 +38,7 @@ pub use parallel::{
     static_parallel_parameter_groups, LocalGeometry, PartitionExpertBankOwnership,
     PartitionLocalGeometry,
 };
-pub use partitioned::PartitionedLayeredModel;
+pub use partitioned::{KimiKernel, PartitionedLayeredModel};
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{

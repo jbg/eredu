@@ -8568,6 +8568,24 @@ and the admitted fused or split KV-B layout. Shared SwiGLU declarations reuse th
 ordinary gated-unit builder. The backend supplies the existing projections,
 convolution, recurrence, parameters and completion resources.
 
+Selected Kimi Linear execution uses `ComponentAdapter` with `KimiKernel`.
+Its validated definition owns graph, canonical parameters, global invocation
+paths, state references and transport. The kernel retains admitted block and
+bank geometry, compressed MLA state and KDA state equations. Construction
+validates the definition before materializing selected pinned modules. Shared
+resource visitation borrows the actual decoder roles, and the adapter projects
+selected state slots and validates addresses and dependencies. Ordinary and
+parallel observations invoke the resident provider through the same typed
+provider hooks. Low-level geometry and unit construction are available through
+`kernel()`.
+
+The shared pipeline kernel contract declares both unit-level routed reductions
+and optional bank-specific reductions. A bank uses its unit's routed declaration
+unless the kernel supplies a bank-specific order. Kimi declares one mixer
+reduction before exchange and two feed-forward reductions for a sparse unit
+(routed output and shared expert), or one for a dense unit. A mismatched routed
+selection rejects before collective execution.
+
 Kimi's ordinary, routed, replicated and partitioned execution use the same
 instrumented sublayer drivers. Partition readout uses the neutral
 `PartitionStaticModules` driver; capture happens at the input/output owner and

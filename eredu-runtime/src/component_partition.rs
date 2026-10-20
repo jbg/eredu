@@ -167,13 +167,21 @@ pub trait PipelineComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
     fn routed_bank_order(&self, _address: ExecutionUnitAddress) -> Vec<RoutedBankId> {
         vec![RoutedBankId::new(0)]
     }
+    /// Architecture-declared collective order around one unit's routed exchange.
+    fn routed_tensor_reductions(
+        &self,
+        _address: ExecutionUnitAddress,
+        _routed: bool,
+    ) -> Result<RoutedTensorReductions, Self::Error> {
+        Ok(RoutedTensorReductions::hidden(1, 1))
+    }
     /// Collectives surrounding one declared bank invocation.
     fn routed_bank_tensor_reductions(
         &self,
-        _address: ExecutionUnitAddress,
+        address: ExecutionUnitAddress,
         _bank: RoutedBankId,
     ) -> Result<RoutedTensorReductions, Self::Error> {
-        Ok(RoutedTensorReductions::hidden(1, 1))
+        self.routed_tensor_reductions(address, true)
     }
     /// Whether selected vocabulary shards require sum/gather publication.
     fn tensor_vocabulary_sharded(&self) -> bool;
@@ -425,6 +433,20 @@ where
         _: usize,
     ) -> Range<usize> {
         self.local_state_slots(group, index)
+    }
+    fn partition_routed_tensor_reductions(
+        &self,
+        unit: usize,
+        routed: bool,
+    ) -> Result<RoutedTensorReductions, K::Error> {
+        let group = self
+            .definition()
+            .parameters()
+            .graph()
+            .group_index(self.primary_execution_group())
+            .expect("declared primary group");
+        self.kernel()
+            .routed_tensor_reductions(self.address(group, unit)?, routed)
     }
     fn partition_routed_bank_order(&self, unit: usize) -> Vec<RoutedBankId> {
         let group = self
