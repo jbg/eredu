@@ -1,4 +1,4 @@
-//! Selected LFM2 equations over mixed attention/convolution geometry.
+//! Shared complete and selected LFM2 equations over mixed state geometry.
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, LinearSpec,
@@ -13,8 +13,8 @@ use eredu_runtime::PartitionComponentKernel as _;
 
 use super::{ForwardContext, ModelArgs, PartitionLocalGeometry};
 use crate::decoder::{
-    ComponentInstrumentation, DecoderProjectionOperator, DecoderStaticResources, LayeredInput,
-    PartitionStaticModules,
+    ComponentInstrumentation, DecoderStaticResources, LayeredInput, PartitionStaticModules,
+    StaticModules,
 };
 
 /// Shared execution adapter for one exact selected LFM2 ownership view.
@@ -25,10 +25,124 @@ pub type PartitionedLayeredModel<B> = eredu_runtime::ComponentAdapter<
 >;
 
 /// LFM2 block equations and mixed attention/convolution geometry for one rank.
-pub struct Lfm2Kernel<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct Lfm2Kernel<
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    M = PartitionStaticModules<B>,
+    G = PartitionLocalGeometry,
+> {
     args: ModelArgs,
-    static_modules: PartitionStaticModules<B>,
-    geometry: PartitionLocalGeometry,
+    static_modules: M,
+    geometry: G,
+    backend: std::marker::PhantomData<fn() -> B>,
+}
+
+/// Complete LFM2 equations with complete pinned modules and admitted local geometry.
+pub type CompleteLfm2Kernel<B> = Lfm2Kernel<B, StaticModules<B>, CompleteLfm2Geometry>;
+
+/// Architecture geometry independent of native parameter ownership.
+pub trait Lfm2Geometry: 'static {
+    /// Admission for chunked text prefill.
+    const CHUNKED_PREFILL: bool = false;
+    /// Whether text readout projects only the final hidden position.
+    const FINAL_TEXT_POSITION: bool = false;
+    /// Whether public routed discovery supplies the family's logical seams.
+    const ROUTING_POINTS: bool = false;
+    /// Complete rank-local state before pipeline slicing.
+    fn complete_state_layout(&self) -> &StateLayout;
+    /// Architecture-global invocations physically owned here.
+    fn owned_units(&self) -> std::ops::Range<usize>;
+    /// Local block geometry for one admitted global invocation.
+    fn block(&self, args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error>;
+    /// Selected routed bank geometry, when ownership requires specialization.
+    fn routed_spec(&self, _index: usize) -> Option<eredu_nn::GroupedGatedProductSpec> {
+        None
+    }
+    /// Ordinary execution retains its global state admission on a TP construction.
+    fn ordinary_state_layout<'a>(
+        &'a self,
+        _args: &ModelArgs,
+    ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
+        Ok(std::borrow::Cow::Borrowed(self.complete_state_layout()))
+    }
+    /// Tensor-parallel execution requires admitted rank-local geometry.
+    fn parallel_state_layout(&self) -> Result<&StateLayout, Error> {
+        Ok(self.complete_state_layout())
+    }
+    /// Maps a validated global invocation to its actual local mutable-state slot.
+    fn state_index(&self, index: usize) -> Result<usize, Error> {
+        let owned = self.owned_units();
+        if !owned.contains(&index) {
+            return Err(Error::backend(format!(
+                "LFM2 unit {index} is outside owned range {owned:?}"
+            )));
+        }
+        Ok(index - owned.start)
+    }
+}
+
+/// Complete state and optional tensor-local block geometry retained before materialization.
+pub struct CompleteLfm2Geometry {
+    parallel: Option<std::sync::Arc<super::LocalGeometry>>,
+    state: StateLayout,
+    units: usize,
+}
+impl Lfm2Geometry for CompleteLfm2Geometry {
+    const CHUNKED_PREFILL: bool = super::CHUNKED_TEXT_PREFILL;
+    const FINAL_TEXT_POSITION: bool = true;
+    const ROUTING_POINTS: bool = true;
+    fn complete_state_layout(&self) -> &StateLayout {
+        &self.state
+    }
+    fn owned_units(&self) -> std::ops::Range<usize> {
+        0..self.units
+    }
+    fn block(&self, args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error> {
+        self.state_index(index)?;
+        match &self.parallel {
+            Some(geometry) => geometry.block(index).copied().ok_or_else(|| {
+                Error::backend(format!("missing rank-local LFM2 block geometry {index}"))
+            }),
+            None => Ok(super::BlockGeometry::replicated(args)),
+        }
+    }
+    fn ordinary_state_layout<'a>(
+        &'a self,
+        args: &ModelArgs,
+    ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
+        match self.parallel {
+            Some(_) => super::state_layout(args)
+                .map(std::borrow::Cow::Owned)
+                .map_err(Error::backend),
+            None => Ok(std::borrow::Cow::Borrowed(&self.state)),
+        }
+    }
+    fn parallel_state_layout(&self) -> Result<&StateLayout, Error> {
+        self.parallel
+            .as_ref()
+            .map(|geometry| geometry.state_layout())
+            .ok_or_else(|| Error::backend("LFM2 model was not built with local geometry"))
+    }
+}
+impl Lfm2Geometry for PartitionLocalGeometry {
+    fn complete_state_layout(&self) -> &StateLayout {
+        self.complete_state_layout()
+    }
+    fn owned_units(&self) -> std::ops::Range<usize> {
+        self.owned_units()
+    }
+    fn block(&self, _args: &ModelArgs, index: usize) -> Result<super::BlockGeometry, Error> {
+        self.block(index).copied().ok_or_else(|| {
+            Error::backend(format!(
+                "LFM2 unit {index} is outside owned range {:?}",
+                self.owned_units()
+            ))
+        })
+    }
+    fn routed_spec(&self, index: usize) -> Option<eredu_nn::GroupedGatedProductSpec> {
+        self.expert_realization()
+            .and_then(|plan| plan.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, index))
+            .cloned()
+    }
 }
 
 pub(crate) fn component_definition(
@@ -182,26 +296,39 @@ where
             args,
             static_modules,
             geometry,
+            backend: std::marker::PhantomData,
         };
         eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
             definition, kernel, partition,
         )
         .map_err(Error::from)
     }
+}
 
+impl<B, M, G> Lfm2Kernel<B, M, G>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
+{
     /// Normalized LFM2 policy.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
     }
 
     /// Exact local TP/PP geometry.
-    pub const fn local_geometry(&self) -> &PartitionLocalGeometry {
+    pub const fn local_geometry(&self) -> &G {
         &self.geometry
     }
 
     /// Pinned modules physically allocated on this pipeline partition.
-    pub const fn static_modules(&self) -> &PartitionStaticModules<B> {
+    pub const fn static_modules(&self) -> &M {
         &self.static_modules
+    }
+
+    /// Mutably borrows the actual pinned resources for parameter editing.
+    pub fn static_modules_mut(&mut self) -> &mut M {
+        &mut self.static_modules
     }
 
     /// Constructs one owned block and rejects every other global index.
@@ -210,22 +337,12 @@ where
         global_unit: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<super::Block<B>, Error> {
-        let geometry = self.geometry.block(global_unit).ok_or_else(|| {
-            Error::backend(format!(
-                "LFM2 unit {global_unit} is not owned by local range {:?}",
-                self.geometry.owned_units()
-            ))
-        })?;
-        let routed_spec = self
-            .geometry
-            .expert_realization()
-            .and_then(|plan| plan.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, global_unit))
-            .cloned();
+        let geometry = self.geometry.block(&self.args, global_unit)?;
         super::Block::new_with_geometry_and_routed_spec(
             &self.args,
             global_unit,
-            *geometry,
-            routed_spec,
+            geometry,
+            self.geometry.routed_spec(global_unit),
             context,
         )
     }
@@ -296,21 +413,26 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.static_modules
-            .finish_instrumented(hidden, parallel, context, instrumentation)
+        if parallel.is_some() {
+            self.geometry.parallel_state_layout()?;
+        }
+        self.static_modules.decoder_resources_mut().finish_parallel(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 
     fn local_state_ordinal(&self, global_unit: usize) -> Result<usize, Error> {
-        let owned = self.geometry.owned_units();
-        owned
-            .contains(&global_unit)
-            .then(|| global_unit - owned.start)
-            .ok_or_else(|| Error::backend("LFM2 attempted state access for an unowned unit"))
+        self.geometry.state_index(global_unit)
     }
 }
 
-impl<B> eredu_runtime::ComponentKernel<B> for Lfm2Kernel<B>
+impl<B, M, G> eredu_runtime::ComponentKernel<B> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;
@@ -352,11 +474,13 @@ where
     }
 }
 
-impl<B> eredu_runtime::ComponentPinnedResources<B> for Lfm2Kernel<B>
+impl<B, M, G> eredu_runtime::ComponentPinnedResources<B> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-    type Modules = PartitionStaticModules<B>;
+    type Modules = M;
     fn pinned_modules(&self) -> &Self::Modules {
         &self.static_modules
     }
@@ -377,8 +501,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ComponentEquations<B, S> for Lfm2Kernel<B>
+impl<B, S, M, G> eredu_runtime::ComponentEquations<B, S> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
@@ -392,20 +518,19 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self.geometry.ordinary_state_layout(&self.args)?;
+        if state.layout() != expected.as_ref() {
+            return Err(Error::backend(
+                "LFM2 runtime state does not match its admitted layout",
+            ));
+        }
         let hidden = self
             .static_modules
-            .embeddings
-            .as_mut()
+            .decoder_resources_mut()
+            .embedding
             .ok_or_else(|| Error::backend("LFM2 partition does not own input embedding"))?
             .forward(input.tokens, context)?;
-        self.begin_hidden(
-            hidden,
-            input.mask,
-            state,
-            self.geometry.complete_state_layout(),
-            0,
-            context,
-        )
+        self.begin_hidden(hidden, input.mask, state, &expected, 0, context)
     }
     fn begin_observed<'a, O>(
         &mut self,
@@ -443,14 +568,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward(
-            hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
-            context,
-        )
+        self.forward_block(address.index(), unit, hidden, state, forward, context)
     }
     fn execute_observed<O>(
         &mut self,
@@ -468,6 +586,15 @@ where
         let index = address.index();
         let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
+        let points = G::ROUTING_POINTS
+            .then(|| self.args.routed_observation_points(&path, index))
+            .flatten();
+        let pass = if hidden.dim(1) > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let mut provider = eredu_runtime::ResidentExpertProvider;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_instrumented_with_feed_forward(
             hidden,
@@ -476,7 +603,14 @@ where
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
             |policy, normalized, context, instrumentation| {
-                policy.forward_feed_forward_observed(normalized, context, instrumentation)
+                policy.forward_observed_with_provider(
+                    normalized,
+                    pass,
+                    context,
+                    &mut provider,
+                    instrumentation,
+                    points,
+                )
             },
         )
     }
@@ -488,6 +622,26 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.finish_local(hidden, None, context)
+    }
+    fn projects_final_text_position() -> bool {
+        G::FINAL_TEXT_POSITION
+    }
+    fn finish_text(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if G::FINAL_TEXT_POSITION {
+            self.finish_local(
+                &crate::decoder::final_hidden_position(hidden, context)?,
+                None,
+                context,
+            )
+        } else {
+            self.finish(hidden, state, forward, context)
+        }
     }
     fn finish_observed<O>(
         &mut self,
@@ -510,8 +664,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for Lfm2Kernel<B>
+impl<B, S, M, G> eredu_runtime::ParallelComponentKernel<B, S> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
@@ -526,24 +682,18 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self.geometry.parallel_state_layout()?;
         let hidden = B::vocabulary_parallel_lookup(
             self.static_modules
-                .embeddings
-                .as_mut()
+                .decoder_resources_mut()
+                .embedding
                 .ok_or_else(|| Error::backend("LFM2 partition does not own input embedding"))?,
             input.tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
             context,
         )?;
-        self.begin_hidden(
-            hidden,
-            input.mask,
-            state,
-            self.geometry.complete_state_layout(),
-            0,
-            context,
-        )
+        self.begin_hidden(hidden, input.mask, state, expected, 0, context)
     }
     fn begin_parallel_observed<'a, O>(
         &mut self,
@@ -572,12 +722,12 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward_parallel(
+        self.forward_block_parallel(
+            address.index(),
+            unit,
             hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
+            state,
+            forward,
             parallel,
             context,
         )
@@ -641,12 +791,28 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for Lfm2Kernel<B>
+impl<B, S, M, G> eredu_runtime::RoutedComponentKernel<B, S> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn routing_points(
+        &self,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
+        self.geometry.state_index(address.index())?;
+        Ok(if G::ROUTING_POINTS {
+            self.args.routed_observation_points(
+                &format!("model.layers.{}", address.index()),
+                address.index(),
+            )
+        } else {
+            None
+        })
+    }
     fn routed_unit_observations(&self) -> bool {
         true
     }
@@ -709,12 +875,12 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward_with_feed_forward(
+        self.forward_block_with_feed_forward(
+            address.index(),
+            unit,
             hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
+            state,
+            forward,
             context,
             |policy, normalized, context| {
                 policy.forward_with_provider(normalized, pass, context, provider)
@@ -723,8 +889,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for Lfm2Kernel<B>
+impl<B, S, M, G> eredu_runtime::ParallelRoutedComponentKernel<B, S> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
@@ -794,12 +962,12 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let index = address.index();
-        let ordinal = self.local_state_ordinal(index)?;
-        unit.forward_parallel_with_feed_forward(
+        self.forward_block_parallel_with_feed_forward(
+            address.index(),
+            unit,
             hidden,
-            forward.mask.as_ref(),
-            state.layer(ordinal).map_err(Error::backend)?,
+            state,
+            forward,
             parallel,
             context,
             |policy, normalized, parallel, context| {
@@ -809,8 +977,10 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for Lfm2Kernel<B>
+impl<B, S, M, G> eredu_runtime::PartitionComponentKernel<B, S> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
@@ -840,10 +1010,11 @@ where
         let context = selected.native;
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                let embedding =
-                    self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                        Error::backend("LFM2 partition does not own input embedding")
-                    })?;
+                let embedding = self
+                    .static_modules
+                    .decoder_resources_mut()
+                    .embedding
+                    .ok_or_else(|| Error::backend("LFM2 partition does not own input embedding"))?;
                 match selected.parallel {
                     Some(parallel) => B::vocabulary_parallel_lookup(
                         embedding,
@@ -934,17 +1105,24 @@ where
     }
 }
 
-impl<B> eredu_runtime::TextComponentKernel<B> for Lfm2Kernel<B>
+impl<B, M, G> eredu_runtime::TextComponentKernel<B> for Lfm2Kernel<B, M, G>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
+    fn supports_chunked_prefill() -> bool {
+        G::CHUNKED_PREFILL
+    }
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
 }
 
-impl<B, S> eredu_runtime::PipelineComponentKernel<B, S> for Lfm2Kernel<B>
+impl<B, S, M, G> eredu_runtime::PipelineComponentKernel<B, S> for Lfm2Kernel<B, M, G>
 where
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
@@ -974,5 +1152,211 @@ where
             None => LayeredPartitionInput::Tokens(input.tokens),
         };
         self.begin_partition_observed(transported, input.mask, state, selected, observer)
+    }
+}
+
+impl<B, M, G> Lfm2Kernel<B, M, G>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    M: DecoderStaticResources<B>,
+    G: Lfm2Geometry,
+{
+    /// Begins from embedded inputs with explicit admitted state geometry.
+    pub fn begin_embedded_with_layout<S>(
+        &self,
+        hidden: B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        self.begin_hidden(hidden, mask, state, expected, 0, context)
+    }
+    /// Executes one owned block through its local mutable-state slot.
+    pub fn forward_block<S>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            context,
+        )
+    }
+    /// Executes an owned block with a supplied feed-forward operation.
+    pub fn forward_block_with_feed_forward<S, F>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut super::FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward_with_feed_forward(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            context,
+            feed_forward,
+        )
+    }
+    /// Executes the same owned block with tensor-parallel operators.
+    pub fn forward_block_parallel<S>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward_parallel(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            parallel,
+            context,
+        )
+    }
+    /// Executes an owned parallel block with a supplied feed-forward operation.
+    pub fn forward_block_parallel_with_feed_forward<S, F>(
+        &mut self,
+        index: usize,
+        block: &mut super::Block<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut super::FeedForward<B>,
+            &B::Tensor,
+            &B::ParallelContext,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let ordinal = self.geometry.state_index(index)?;
+        block.forward_parallel_with_feed_forward(
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            parallel,
+            context,
+            feed_forward,
+        )
+    }
+}
+
+impl<B> CompleteLfm2Kernel<B>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    /// Validates the complete declaration before constructing native resources.
+    pub fn new(
+        args: ModelArgs,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<super::LayeredModel<B>, Error> {
+        let definition = super::component_definition(&args)?;
+        let geometry = CompleteLfm2Geometry {
+            parallel: None,
+            state: definition.state_layout().clone(),
+            units: definition.unit_count(0)?,
+        };
+        let static_modules = StaticModules::from_spec(super::static_spec(&args), context)?;
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(
+            definition,
+            Self {
+                args,
+                static_modules,
+                geometry,
+                backend: std::marker::PhantomData,
+            },
+        )
+        .map_err(Error::from)
+    }
+    /// Constructs the same equations with admitted tensor-local geometry.
+    pub fn new_parallel(
+        args: ModelArgs,
+        geometry: super::LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<super::LayeredModel<B>, Error> {
+        args.validate().map_err(Error::backend)?;
+        geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = component_definition(
+            super::parameter_description(&args).map_err(Error::backend)?,
+            geometry.state_layout().clone(),
+        )?;
+        let static_modules = StaticModules::from_parallel_spec(
+            super::static_spec(&args),
+            geometry.embedding_range().clone(),
+            geometry.output_range().cloned(),
+            context,
+        )?;
+        let geometry = CompleteLfm2Geometry {
+            parallel: Some(std::sync::Arc::new(geometry)),
+            state: definition.state_layout().clone(),
+            units: definition.unit_count(0)?,
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(
+            definition,
+            Self {
+                args,
+                static_modules,
+                geometry,
+                backend: std::marker::PhantomData,
+            },
+        )
+        .map_err(Error::from)
+    }
+    /// Returns planner-derived geometry for a tensor-local realization.
+    pub fn parallel_geometry(&self) -> Option<&super::LocalGeometry> {
+        self.geometry.parallel.as_deref()
+    }
+    /// Shares admitted local geometry with a backend residency policy.
+    pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<super::LocalGeometry>> {
+        self.geometry.parallel.as_ref().map(std::sync::Arc::clone)
+    }
+    /// Returns the ordinary global state declaration for low-level callers.
+    pub fn state_layout(&self) -> Result<StateLayout, Error> {
+        super::state_layout(&self.args).map_err(Error::backend)
     }
 }

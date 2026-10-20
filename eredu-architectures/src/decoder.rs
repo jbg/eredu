@@ -5060,7 +5060,7 @@ impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
         }
         .project(&hidden, context, instrumentation)
     }
-    fn finish_parallel(
+    pub(crate) fn finish_parallel(
         mut self,
         hidden: &B::Tensor,
         parallel: Option<&B::ParallelContext>,

@@ -7173,15 +7173,19 @@ Physical aliases and a node's display ordinal do not determine placement. Whole-
 operator's selected collective reduction, and still require actual driver hooks.
 A block boundary is registered only when its observation path is declared by that
 node; changing the observation catalog alone cannot create a driver hook.
-Selected LFM2 execution uses `ComponentAdapter` with `Lfm2Kernel`. The kernel
-retains mixed attention/convolution geometry, block equations and provider hooks.
-`Lfm2Kernel::from_partition` validates its definition before materializing selected
-pinned modules. Graph, canonical parameters, global unit paths, state references
-and transport belong to that definition; the adapter validates selected ownership
-and maps retained state slots. Low-level construction and geometry are available
-through `kernel()`. Canonical pinned-role visitation and normalized readout use
-the shared decoder resource facilities. Complete LFM2 construction retains its
-family lifecycle and block policy.
+Complete and selected LFM2 execution use `ComponentAdapter` over the same
+`Lfm2Kernel`. Typed complete and partition geometry retain their state admission,
+global invocation ownership, local state indices, routed banks, chunked-prefill
+policy and final-position readout policy. The kernel borrows canonical pinned
+roles through `DecoderStaticResources`; complete and selected aggregates retain
+their actual native modules. Graph, parameters, paths, state references and
+transport project from the validated definition. Constructors validate that
+definition before materializing pinned modules, and the shared adapter validates
+selected ownership and retained state slots. Low-level construction, embedded
+ingress and block operations use the same equations through `kernel()` and
+`kernel_mut()`. Normalized readout and pinned parameter traversal use the shared
+decoder resource facilities. A partition driver requires retained selection;
+complete construction alone does not authorize an arbitrary partition view.
 
 LFM2's ordinary, tensor-parallel and partition methods share block residual
 ordering and readout instrumentation. Its dense feed-forward scalar hook precedes

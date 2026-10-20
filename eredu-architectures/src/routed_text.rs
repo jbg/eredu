@@ -1024,14 +1024,14 @@ where
         ));
     };
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::lfm2::LayeredModel::<B>::new(args.clone(), context))
+        .then(|| crate::lfm2::CompleteLfm2Kernel::<B>::new(args.clone(), context))
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_lfm2_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::lfm2::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::lfm2::LayeredModel::<B>::new(selected_args, context)
+    let architecture = crate::lfm2::CompleteLfm2Kernel::<B>::new(selected_args, context)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::lfm2(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
