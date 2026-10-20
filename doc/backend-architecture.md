@@ -8746,6 +8746,11 @@ LFM2 derives expert ownership and local bank specifications directly from
 has no backend type or native context. Replicated expert planning uses the same
 algorithm, and partition preparation consumes these neutral plans for both source
 and selected parameter layouts.
+Kimi Linear uses the same ownership boundary: normalized `ModelArgs`, optional
+validated `LocalGeometry` and rank topology determine expert plans without native
+modules or a backend type. Replicated planning uses that algorithm with complete
+ownership. Routed preparation consumes these neutral plans for both selected and
+transform-source layouts.
 
 Kimi attention and LFM2 attention/convolution companions inherit their primary projection's semantic head or
 output-column sharding through neutral parameter metadata. Their own physical
