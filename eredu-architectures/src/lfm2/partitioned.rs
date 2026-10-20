@@ -31,7 +31,7 @@ pub struct Lfm2Kernel<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedN
     geometry: PartitionLocalGeometry,
 }
 
-fn component_definition(
+pub(crate) fn component_definition(
     parameters: ArchitectureParameterDescription,
     state: StateLayout,
 ) -> Result<eredu_runtime::ComponentDefinition, Error> {

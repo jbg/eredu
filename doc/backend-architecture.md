@@ -8714,6 +8714,11 @@ supply exact canonical members and ownership before placement. Runtime expands
 selector resources and encoded projection companions through shared neutral
 geometry helpers. Routed partition preparation uses these declarations for both
 selected and transform-source layouts.
+Full LFM2 construction validates and retains the same component declaration
+before allocating pinned modules. Ordinary construction retains global state;
+tensor-parallel construction retains admitted local state and creates its pinned
+modules directly at that placement. Parameter discovery, execution addresses and
+unit counts project from this retained declaration.
 LFM2 derives expert ownership and local bank specifications directly from
 `ModelArgs`, optional validated `LocalGeometry` and rank topology. The operation
 has no backend type or native context. Replicated expert planning uses the same

@@ -59,10 +59,20 @@ pub struct ForwardContext<T> {
     mask: Option<T>,
 }
 
+/// Validates complete LFM2 parameter, invocation, state and transport declarations.
+/// This operation requires no native backend resources.
+pub fn component_definition(args: &ModelArgs) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    partitioned::component_definition(
+        parameter_description(args).map_err(Error::backend)?,
+        state_layout(args).map_err(Error::backend)?,
+    )
+}
+
 /// Shared layered LFM2 lifecycle over a heterogeneous physical schedule.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
     decoder: HybridDecoder<B>,
+    definition: eredu_runtime::ComponentDefinition,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
@@ -72,7 +82,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
+        Ok(self.definition.state_layout().clone())
     }
 
     fn state_identity(
@@ -92,7 +102,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        parameter_description(&self.args).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -126,7 +136,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     /// Builds unloaded pinned modules and validates the complete schedule.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
-        let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+        let definition = component_definition(&args)?;
+        let layers = definition.unit_count(0)?;
         let decoder = HybridDecoder::new(
             StaticModules::from_spec(static_spec(&args), context)?,
             "model.layers",
@@ -135,6 +146,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         Ok(Self {
             args,
             decoder,
+            definition,
             parallel_geometry: None,
         })
     }
@@ -147,22 +159,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     ) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
-        let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-        let spec = static_spec(&args);
-        let mut decoder = HybridDecoder::new(
-            StaticModules::from_spec(spec.clone(), context)?,
+        let definition = partitioned::component_definition(
+            parameter_description(&args).map_err(Error::backend)?,
+            geometry.state_layout().clone(),
+        )?;
+        let layers = definition.unit_count(0)?;
+        let decoder = HybridDecoder::new(
+            StaticModules::from_parallel_spec(
+                static_spec(&args),
+                geometry.embedding_range().clone(),
+                geometry.output_range().cloned(),
+                context,
+            )?,
             "model.layers",
             layers,
-        )?;
-        *decoder.static_modules_mut() = StaticModules::from_parallel_spec(
-            spec,
-            geometry.embedding_range().clone(),
-            geometry.output_range().cloned(),
-            context,
         )?;
         Ok(Self {
             args,
             decoder,
+            definition,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
         })
     }
@@ -187,12 +202,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         state_layout(&self.args).map_err(Error::backend)
     }
 
-    /// State layout for this model's replicated or rank-local construction.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| self.state_layout(), Ok)
+    /// Borrows the validated declaration retained before native construction.
+    pub const fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Returns planner-derived geometry for a rank-local realization.
@@ -212,7 +224,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Block<B>, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         match &self.parallel_geometry {
             Some(geometry) => Block::new_with_geometry(
                 &self.args,
@@ -365,7 +377,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        self.decoder.unit_path(0, index)?;
+        self.definition.unit(0, index)?;
         block.forward(
             hidden,
             forward.mask.as_ref(),
@@ -394,7 +406,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        self.decoder.unit_path(0, index)?;
+        self.definition.unit(0, index)?;
         block.forward_with_feed_forward(
             hidden,
             forward.mask.as_ref(),
@@ -454,7 +466,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
         B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
-        self.decoder.unit_path(0, index)?;
+        self.definition.unit(0, index)?;
         block.forward_parallel(
             hidden,
             forward.mask.as_ref(),
@@ -487,7 +499,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        self.decoder.unit_path(0, index)?;
+        self.definition.unit(0, index)?;
         block.forward_parallel_with_feed_forward(
             hidden,
             forward.mask.as_ref(),
@@ -532,15 +544,15 @@ where
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.decoder.execution_graph()
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.decoder.group_unit_count(group)
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.decoder.unit_path(group, index)
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -623,7 +635,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.forward_block(index, unit, hidden, state, forward, context)
     }
 
@@ -775,7 +787,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.forward_block_parallel(index, unit, hidden, state, forward, parallel, context)
     }
 
@@ -1017,7 +1029,7 @@ where
         group: usize,
         index: usize,
     ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
-        let unit_path = self.decoder.unit_path(group, index)?;
+        let unit_path = self.definition.unit(group, index)?.path.clone();
         Ok(self.args.routed_observation_points(&unit_path, index))
     }
 
@@ -1045,7 +1057,7 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.forward_block_with_feed_forward(
             index,
             unit,
@@ -1076,7 +1088,7 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = self.decoder.unit_path(group, index)?;
+        let path = self.definition.unit(group, index)?.path.clone();
         let points = self.args.routed_observation_points(&path, index);
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_instrumented_with_feed_forward(
@@ -1174,7 +1186,7 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.forward_block_parallel_with_feed_forward(
             index,
             unit,
