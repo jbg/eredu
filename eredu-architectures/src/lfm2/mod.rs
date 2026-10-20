@@ -35,7 +35,7 @@ pub use parallel::{
     partition_local_routed_geometry, partitioned_state_layout, static_parallel_parameter_groups,
     LocalGeometry, PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
-pub use partitioned::PartitionedLayeredModel;
+pub use partitioned::{Lfm2Kernel, PartitionedLayeredModel};
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{AttentionCache, EmbeddingLookupPolicy, Error, GroupedNeuralBackend, Tensor};

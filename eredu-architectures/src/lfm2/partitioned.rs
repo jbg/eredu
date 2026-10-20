@@ -1,29 +1,64 @@
-//! Exact resident TP/PP construction for dense prediction-free LFM2.
+//! Selected LFM2 equations over mixed attention/convolution geometry.
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, LinearSpec,
     NormalizationConstructionSpec, ParameterSpec, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, LayeredPartitionInput, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
-    RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    ArchitectureParameterDescription, LayerRuntimeState, LayeredForwardState,
+    LayeredPartitionInput, ParameterProvider, RuntimeStateComponents, StateLayout,
 };
+
+use eredu_runtime::PartitionComponentKernel as _;
 
 use super::{ForwardContext, ModelArgs, PartitionLocalGeometry};
 use crate::decoder::{
-    ComponentInstrumentation, DecoderProjectionOperator, LayeredInput, PartitionStaticModules,
+    ComponentInstrumentation, DecoderProjectionOperator, DecoderStaticResources, LayeredInput,
+    PartitionStaticModules,
 };
 
-/// Dense LFM2 whose units and pinned modules are limited to one admitted rank.
-pub struct PartitionedLayeredModel<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-> {
+/// Shared execution adapter for one exact selected LFM2 ownership view.
+pub type PartitionedLayeredModel<B> = eredu_runtime::ComponentAdapter<
+    eredu_runtime::ComponentDefinition,
+    Lfm2Kernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// LFM2 block equations and mixed attention/convolution geometry for one rank.
+pub struct Lfm2Kernel<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
     static_modules: PartitionStaticModules<B>,
     geometry: PartitionLocalGeometry,
+}
+
+fn component_definition(
     parameters: ArchitectureParameterDescription,
+    state: StateLayout,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    let units = (0..parameters.unit_layout().len())
+        .map(|ordinal| {
+            let address = parameters
+                .unit_layout()
+                .address(ordinal)
+                .expect("declared unit");
+            eredu_runtime::ComponentUnit {
+                path: format!("model.layers.{}", address.index()),
+                state: address.index()..address.index() + 1,
+            }
+        })
+        .collect();
+    let partition = crate::transport::pipeline_state(0, &state);
+    eredu_runtime::ComponentDefinition::new(
+        "lfm2",
+        parameters,
+        units,
+        vec![crate::transport::decoder()],
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        vec![],
+        state,
+        partition,
+    )
+    .map_err(Error::from)
 }
 
 fn partition_static_modules<B, A>(
@@ -97,25 +132,18 @@ where
     })
 }
 
-impl<B> PartitionedLayeredModel<B>
+impl<B> Lfm2Kernel<B>
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-    /// Constructs only modules already selected by one exact dense LFM2 partition.
+    /// Constructs only modules already selected by one exact LFM2 partition.
     pub fn from_partition<A>(
         args: ModelArgs,
         parameters: &ArchitectureParameterDescription,
         partition: &eredu_runtime::ArchitecturePartition<PartitionLocalGeometry, A>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<PartitionedLayeredModel<B>, Error> {
         args.validate().map_err(Error::backend)?;
-        if parameters.graph() != partition.graph()
-            || parameters.unit_layout() != partition.unit_layout()
-        {
-            return Err(Error::backend(
-                "LFM2 partition belongs to a different parameter topology",
-            ));
-        }
         partition
             .local_geometry()
             .validate_for(&args)
@@ -147,16 +175,21 @@ where
             ));
         }
         let geometry = partition.local_geometry().clone();
+        let definition =
+            component_definition(parameters.clone(), geometry.complete_state_layout().clone())?;
         let static_modules = partition_static_modules(&args, &geometry, partition, context)?;
-        Ok(Self {
+        let kernel = Self {
             args,
             static_modules,
             geometry,
-            parameters: parameters.clone(),
-        })
+        };
+        eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
+            definition, kernel, partition,
+        )
+        .map_err(Error::from)
     }
 
-    /// Normalized dense LFM2 policy.
+    /// Normalized LFM2 policy.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
     }
@@ -263,126 +296,24 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let norm = self
-            .static_modules
-            .norm
-            .as_mut()
-            .ok_or_else(|| Error::backend("LFM2 partition does not own final normalization"))?;
-        let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
-        let logits =
-            match (parallel, self.static_modules.lm_head.as_mut()) {
-                (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
-                    "projection_input",
-                    head,
-                    &hidden,
-                    parallel,
-                    context,
-                ),
-                (None, Some(head)) => {
-                    instrumentation.project::<B>("projection_input", head, &hidden, None, context)
-                }
-                (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
-                    "projection_input",
-                    self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                        Error::backend("tied LFM2 output partition has no embedding")
-                    })?,
-                    &hidden,
-                    parallel,
-                    context,
-                ),
-                (None, None) => instrumentation.project_embedding(
-                    "projection_input",
-                    self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                        Error::backend("tied LFM2 output partition has no embedding")
-                    })?,
-                    &hidden,
-                    context,
-                ),
-            }?;
-        let logits = instrumentation.apply("linear", logits)?;
-        Ok(logits)
+        self.static_modules
+            .finish_instrumented(hidden, parallel, context, instrumentation)
     }
 
     fn local_state_ordinal(&self, global_unit: usize) -> Result<usize, Error> {
         let owned = self.geometry.owned_units();
         owned
             .contains(&global_unit)
-            .then_some(global_unit - owned.start)
+            .then(|| global_unit - owned.start)
             .ok_or_else(|| Error::backend("LFM2 attempted state access for an unowned unit"))
     }
 }
 
-impl<B> eredu_runtime::ArchitectureParameters<B> for PartitionedLayeredModel<B>
+impl<B> eredu_runtime::ComponentKernel<B> for Lfm2Kernel<B>
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-{
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        Ok(self.geometry.complete_state_layout().clone())
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        super::state_identity(
-            &self.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    }
-
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        Ok(self.parameters.clone())
-    }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitor<B>,
-    {
-        if let Some(embedding) = &self.static_modules.embeddings {
-            visitor.visit("embedding", embedding)?;
-        }
-        if let Some(norm) = &self.static_modules.norm {
-            visitor.visit("norm", norm)?;
-        }
-        if let Some(head) = &self.static_modules.lm_head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
-    }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitorMut<B>,
-    {
-        if let Some(embedding) = &mut self.static_modules.embeddings {
-            visitor.visit_mut("embedding", embedding)?;
-        }
-        if let Some(norm) = &mut self.static_modules.norm {
-            visitor.visit_mut("norm", norm)?;
-        }
-        if let Some(head) = &mut self.static_modules.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
-    }
-}
-
-impl<B, S> LayeredArchitecture<B, S> for PartitionedLayeredModel<B>
-where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;
-    type StaticModules = PartitionStaticModules<B>;
     type Unit = super::Block<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
@@ -390,67 +321,72 @@ where
     where
         B::Tensor: 'a;
     type Error = Error;
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::Error> {
+        super::state_identity(
+            &self.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
+    }
+    fn build_unit(
+        &self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, Error> {
+        self.construct_unit(address.index(), context)
+    }
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.mask.iter()
+    }
+}
 
+impl<B> eredu_runtime::ComponentPinnedResources<B> for Lfm2Kernel<B>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    type Modules = PartitionStaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V: eredu_runtime::StaticParameterVisitor<B>>(
+        &self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources().visit(visitor)
+    }
+    fn visit_pinned_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources_mut().visit(visitor)
+    }
+}
+
+impl<B, S> eredu_runtime::ComponentEquations<B, S> for Lfm2Kernel<B>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
-
-    fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::transport::decoder()
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
-    }
-
-    fn state_partition_plan(
-        &self,
-        layout: &StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(0, layout)
-    }
-
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        Ok(self.parameters.graph().clone())
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend("LFM2 group is outside the target decoder"));
-        }
-        usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        if group != 0
-            || index >= usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
-        {
-            return Err(Error::backend("LFM2 unit is outside the target decoder"));
-        }
-        Ok(format!("model.layers.{index}"))
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend("LFM2 group is outside the target decoder"));
-        }
-        self.construct_unit(index, context)
-    }
-
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -471,8 +407,7 @@ where
             context,
         )
     }
-
-    fn begin_forward_observed<'a, O>(
+    fn begin_observed<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -482,41 +417,33 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let mut forward = self.begin_forward(input, state, context)?;
+        let mut forward = self.begin(input, state, context)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
             .apply("embedding", forward.hidden)?;
         Ok(forward)
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
-        group: usize,
+        _group: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        _dependencies: &[&B::Tensor],
         _state: &mut S,
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::backend("LFM2 target group has invalid dependencies"));
-        }
         Ok(initial.clone())
     }
-
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend("LFM2 group is outside the target decoder"));
-        }
+        let index = address.index();
         let ordinal = self.local_state_ordinal(index)?;
         unit.forward(
             hidden,
@@ -525,11 +452,9 @@ where
             context,
         )
     }
-
-    fn forward_unit_observed<O>(
+    fn execute_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -540,7 +465,8 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let index = address.index();
+        let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_instrumented_with_feed_forward(
@@ -554,8 +480,7 @@ where
             },
         )
     }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -564,8 +489,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         self.finish_local(hidden, None, context)
     }
-
-    fn finish_forward_observed<O>(
+    fn finish_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -584,18 +508,9 @@ where
             &mut ComponentInstrumentation::new("readout", &mut observer),
         )
     }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.mask.iter()
-    }
 }
 
-impl<B, S> ParallelLayeredArchitecture<B, S> for PartitionedLayeredModel<B>
+impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for Lfm2Kernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -604,8 +519,7 @@ where
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
-
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -631,8 +545,7 @@ where
             context,
         )
     }
-
-    fn begin_forward_parallel_observed<'a, O>(
+    fn begin_parallel_observed<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -643,17 +556,15 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let mut forward = self.begin_forward_parallel(input, state, parallel, context)?;
+        let mut forward = self.begin_parallel(input, state, parallel, context)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
             .apply("embedding", forward.hidden)?;
         Ok(forward)
     }
-
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -661,9 +572,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend("LFM2 group is outside the target decoder"));
-        }
+        let index = address.index();
         let ordinal = self.local_state_ordinal(index)?;
         unit.forward_parallel(
             hidden,
@@ -673,11 +582,9 @@ where
             context,
         )
     }
-
-    fn forward_unit_parallel_observed<O>(
+    fn execute_parallel_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -689,7 +596,8 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let index = address.index();
+        let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_parallel_observed(
@@ -701,8 +609,7 @@ where
             &mut ComponentInstrumentation::new(&path, &mut observer),
         )
     }
-
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -712,8 +619,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         self.finish_local(hidden, Some(parallel), context)
     }
-
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -735,7 +641,7 @@ where
     }
 }
 
-impl<B, S> RoutedLayeredArchitecture<B, S> for PartitionedLayeredModel<B>
+impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for Lfm2Kernel<B>
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -744,15 +650,12 @@ where
     fn routed_unit_observations(&self) -> bool {
         true
     }
-
     fn routed_sparse_observations(&self) -> bool {
         true
     }
-
-    fn forward_unit_observed_with_provider<P, O>(
+    fn execute_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -767,7 +670,8 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let index = address.index();
+        let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
         let points = self.args.routed_observation_points(&path, index);
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
@@ -790,11 +694,9 @@ where
             },
         )
     }
-
-    fn forward_unit_with_provider<P>(
+    fn execute_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -807,9 +709,7 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        if group != 0 {
-            return Err(Error::backend("LFM2 group is outside the target decoder"));
-        }
+        let index = address.index();
         let ordinal = self.local_state_ordinal(index)?;
         unit.forward_with_feed_forward(
             hidden,
@@ -823,7 +723,7 @@ where
     }
 }
 
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for PartitionedLayeredModel<B>
+impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for Lfm2Kernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -832,15 +732,12 @@ where
     fn parallel_routed_unit_observations(&self) -> bool {
         true
     }
-
     fn parallel_routed_sparse_observations(&self) -> bool {
         true
     }
-
-    fn forward_unit_parallel_observed_with_provider<P, O>(
+    fn execute_parallel_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -856,7 +753,8 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let index = address.index();
+        let path = format!("model.layers.{}", address.index());
         let ordinal = self.local_state_ordinal(index)?;
         let points = self.args.routed_observation_points(&path, index);
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
@@ -880,11 +778,9 @@ where
             },
         )
     }
-
-    fn forward_unit_parallel_with_provider<P>(
+    fn execute_parallel_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -898,9 +794,7 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        if group != 0 {
-            return Err(Error::backend("LFM2 group is outside the target decoder"));
-        }
+        let index = address.index();
         let ordinal = self.local_state_ordinal(index)?;
         unit.forward_parallel_with_feed_forward(
             hidden,
@@ -915,103 +809,76 @@ where
     }
 }
 
-impl<B, S> PartitionedLayeredArchitecture<B, S> for PartitionedLayeredModel<B>
+impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for Lfm2Kernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
-
     fn partition_observation_hooks(
         &self,
         _tensor_parallel: bool,
     ) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
-
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
         Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
             self.args.hidden_size,
         ))
     }
-
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = selected
+            .expected
+            .ok_or_else(|| Error::backend("LFM2 partition requires selected state geometry"))?;
+        let context = selected.native;
         let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => self
-                .static_modules
-                .embeddings
-                .as_mut()
-                .ok_or_else(|| Error::backend("LFM2 partition does not own input embedding"))?
-                .forward(tokens, context)?,
+            LayeredPartitionInput::Tokens(tokens) => {
+                let embedding =
+                    self.static_modules.embeddings.as_mut().ok_or_else(|| {
+                        Error::backend("LFM2 partition does not own input embedding")
+                    })?;
+                match selected.parallel {
+                    Some(parallel) => B::vocabulary_parallel_lookup(
+                        embedding,
+                        tokens,
+                        EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?,
+                    None => embedding.forward(tokens, context)?,
+                }
+            }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        self.begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
+        self.begin_hidden(
+            hidden,
+            mask,
+            state,
+            expected,
+            selected.first_state_ordinal,
+            context,
+        )
     }
-
-    fn begin_partition_parallel<'a>(
+    fn begin_partition_observed<O>(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
-                self.static_modules
-                    .embeddings
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("LFM2 partition does not own input embedding"))?,
-                tokens,
-                EmbeddingLookupPolicy::Strict,
-                parallel,
-                context,
-            )?,
-            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
-        };
-        self.begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
-    }
-
-    fn begin_partition_observed<'a, O>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         observer: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
-        let mut forward = match parallel {
-            Some(parallel) => self.begin_partition_parallel(
-                input,
-                mask,
-                state,
-                expected,
-                first_state_ordinal,
-                parallel,
-                context,
-            ),
-            None => {
-                self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
-            }
-        }?;
+        let mut forward = self.begin_partition(input, mask, state, selected)?;
         if embedded {
             let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
             forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
@@ -1019,7 +886,6 @@ where
         }
         Ok(forward)
     }
-
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
@@ -1041,7 +907,6 @@ where
             })
         }
     }
-
     fn finish_partition_observed<O>(
         &mut self,
         hidden: &B::Tensor,
@@ -1069,70 +934,45 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ReplicatedTextArchitecture<B, S> for PartitionedLayeredModel<B>
+impl<B> eredu_runtime::TextComponentKernel<B> for Lfm2Kernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
 }
 
-impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for PartitionedLayeredModel<B>
+impl<B, S> eredu_runtime::PipelineComponentKernel<B, S> for Lfm2Kernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn partition_input_dimensions(
-        &self,
-        input: &Self::Input<'_>,
-    ) -> Result<(i32, i32), Self::Error> {
+    fn tensor_vocabulary_sharded(&self) -> bool {
+        true
+    }
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
         Ok((input.tokens.dim(0), input.tokens.dim(1)))
     }
-
-    fn begin_pipeline_partition<'a, O>(
+    fn output_width(&self) -> i32 {
+        self.args.vocab_size
+    }
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
-        incoming: Option<(
-            B::Tensor,
-            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
-        )>,
+        incoming: Option<(B::Tensor, eredu_runtime::NoAuxiliaryBoundary)>,
         state: &mut S,
-        expected: Option<&eredu_runtime::StateLayout>,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         observer: &mut O,
-    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let expected = expected.ok_or_else(|| {
-            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
-        })?;
-        let (tokens, mask) = (input.tokens, input.mask);
-        let input = match incoming {
-            Some((hidden, auxiliary)) => {
-                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
-            }
-            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        let transported = match incoming {
+            Some((hidden, auxiliary)) => LayeredPartitionInput::Hidden { hidden, auxiliary },
+            None => LayeredPartitionInput::Tokens(input.tokens),
         };
-        self.begin_partition_observed(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            parallel,
-            context,
-            observer,
-        )
-    }
-
-    fn partition_output_width(&self) -> i32 {
-        self.args.vocab_size
+        self.begin_partition_observed(transported, input.mask, state, selected, observer)
     }
 }

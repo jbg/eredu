@@ -7173,6 +7173,16 @@ Physical aliases and a node's display ordinal do not determine placement. Whole-
 operator's selected collective reduction, and still require actual driver hooks.
 A block boundary is registered only when its observation path is declared by that
 node; changing the observation catalog alone cannot create a driver hook.
+Selected LFM2 execution uses `ComponentAdapter` with `Lfm2Kernel`. The kernel
+retains mixed attention/convolution geometry, block equations and provider hooks.
+`Lfm2Kernel::from_partition` validates its definition before materializing selected
+pinned modules. Graph, canonical parameters, global unit paths, state references
+and transport belong to that definition; the adapter validates selected ownership
+and maps retained state slots. Low-level construction and geometry are available
+through `kernel()`. Canonical pinned-role visitation and normalized readout use
+the shared decoder resource facilities. Complete LFM2 construction retains its
+family lifecycle and block policy.
+
 LFM2's ordinary, tensor-parallel and partition methods share block residual
 ordering and readout instrumentation. Its dense feed-forward scalar hook precedes
 the row-parallel projection; the convolution hook follows the complete mixer

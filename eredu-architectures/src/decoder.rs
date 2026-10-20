@@ -5029,7 +5029,8 @@ impl<B: NeuralBackend> DecoderStaticResources<B> for PartitionStaticModules<B> {
     }
 }
 impl<B: NeuralBackend> DecoderResources<'_, B> {
-    fn visit<V: eredu_runtime::StaticParameterVisitor<B>>(
+    /// Visits each physically retained canonical decoder role once.
+    pub fn visit<V: eredu_runtime::StaticParameterVisitor<B>>(
         self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
@@ -5046,7 +5047,8 @@ impl<B: NeuralBackend> DecoderResources<'_, B> {
     }
 }
 impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
-    fn visit<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+    /// Mutably visits the same canonical roles and physical resources.
+    pub fn visit<V: eredu_runtime::StaticParameterVisitorMut<B>>(
         self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {

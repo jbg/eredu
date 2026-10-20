@@ -10264,7 +10264,7 @@ where
                     "LFM2 transform source changed local unit addresses".into(),
                 ));
             }
-            let source_architecture = crate::lfm2::PartitionedLayeredModel::<B>::from_partition(
+            let source_architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
                 source_args,
                 &source_parameters,
                 &source_partition,
@@ -10276,7 +10276,7 @@ where
             Ok((source_architecture, source_layout))
         })
         .transpose()?;
-    let architecture = crate::lfm2::PartitionedLayeredModel::<B>::from_partition(
+    let architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
         selected_args,
         &parameters,
         &partition,
@@ -11577,7 +11577,7 @@ where
                 "routed LFM2 transform source changed local unit addresses".into(),
             ));
         }
-        let source = crate::lfm2::PartitionedLayeredModel::<B>::from_partition(
+        let source = crate::lfm2::Lfm2Kernel::<B>::from_partition(
             source_args,
             &source_parameters,
             &source_partition,
@@ -11589,7 +11589,7 @@ where
         None
     };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
-        crate::lfm2::PartitionedLayeredModel::<B>::from_partition(
+        crate::lfm2::Lfm2Kernel::<B>::from_partition(
             selected_args,
             &parameters,
             &partition,
