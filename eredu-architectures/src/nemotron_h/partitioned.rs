@@ -1,8 +1,8 @@
 //! Exact TP/PP target construction and retained prediction-shared roles for Nemotron-H.
 
 use eredu_nn::{
-    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator,
-    LinearSpec, NormalizationConstructionSpec, ParameterSpec, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, LinearSpec,
+    NormalizationConstructionSpec, ParameterSpec, Tensor,
 };
 use eredu_runtime::PartitionComponentKernel as _;
 use eredu_runtime::{
@@ -331,14 +331,13 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let norm = self.static_modules.norm.as_mut().ok_or_else(|| {
-            Error::backend("Nemotron-H partition does not own final normalization")
-        })?;
-        let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
-        if readout == TargetReadout::NormalizedHidden {
-            return Ok(hidden);
-        }
-        self.project_prediction_instrumented(&hidden, parallel, context, instrumentation)
+        readout.apply(
+            self.static_modules.decoder_resources_mut(),
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 
     pub(crate) fn project_prediction_instrumented(
@@ -348,37 +347,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let logits = match (parallel, self.static_modules.lm_head.as_mut()) {
-            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                hidden,
-                parallel,
-                context,
-            ),
-            (None, Some(head)) => {
-                instrumentation.project::<B>("projection_input", head, hidden, None, context)
-            }
-            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied Nemotron-H output partition has no embedding")
-                })?,
-                hidden,
-                parallel,
-                context,
-            ),
-            (None, None) => instrumentation.project_embedding(
-                "projection_input",
-                self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied Nemotron-H output partition has no embedding")
-                })?,
-                hidden,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
-        Ok(logits)
+        self.static_modules.decoder_resources_mut().project(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 
     /// Embeds one prediction token through the target-owned vocabulary table.
@@ -419,15 +393,12 @@ where
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match self.static_modules.lm_head.as_mut() {
-            Some(head) => head.forward(hidden, context),
-            None => self
-                .static_modules
-                .embeddings
-                .as_mut()
-                .ok_or_else(|| Error::backend("Nemotron-H prediction target has no output"))?
-                .as_linear(hidden, context),
-        }
+        self.static_modules.decoder_resources_mut().project(
+            hidden,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Projects prediction hidden state through the TP-sharded target vocabulary table.
@@ -437,18 +408,12 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match self.static_modules.lm_head.as_mut() {
-            Some(head) => B::vocabulary_parallel_project(head, hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                self.static_modules
-                    .embeddings
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("Nemotron-H prediction target has no output"))?,
-                hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.static_modules.decoder_resources_mut().project(
+            hidden,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 }
 

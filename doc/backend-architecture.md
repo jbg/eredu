@@ -8592,6 +8592,14 @@ metadata from this declaration. It selects exact formats and local placement
 before constructing typed prediction units; embedding and readout continue to
 borrow target resources.
 
+Complete and selected Nemotron-H target readout uses one `TargetReadout`
+equation over borrowed decoder resources. It normalizes once, then returns hidden
+values or projects through the actual tied embedding or untied head. Serial,
+parallel and observed calls use the same equation and projection instrumentation.
+Prediction readout projects the already-normalized draft activation and omits
+target-only observation seams. Low-level target and prediction operations use
+these same resource equations.
+
 Full Nemotron-H execution uses `ComponentAdapter` with
 `CompleteNemotronKernel`. The adapter and its low-level kernel share one retained
 `Arc<ComponentDefinition>`; construction validates it before allocating pinned

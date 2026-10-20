@@ -2,7 +2,7 @@
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
-    NormalizationOperator, Parameterized, Tensor,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{
     LayerRuntimeState, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
@@ -13,7 +13,9 @@ use super::{
     state_layout, Block, EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator,
     PredictionUnit, RetainedValues, TargetReadout,
 };
-use crate::decoder::{DecoderStaticResources, StaticModuleSpec, StaticModules};
+use crate::decoder::{
+    ComponentInstrumentation, DecoderStaticResources, StaticModuleSpec, StaticModules,
+};
 use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
 
 /// One target or appended prediction physical unit.
@@ -747,17 +749,44 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         })
     }
 
+    fn finish_readout(
+        &mut self,
+        hidden: &B::Tensor,
+        mode: ForwardMode,
+        readout: TargetReadout,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let resources = self.static_modules.decoder_resources_mut();
+        match mode {
+            ForwardMode::Target => {
+                readout.apply(resources, hidden, parallel, context, instrumentation)
+            }
+            // Prediction units own their final norm; target observation seams do not apply.
+            ForwardMode::Draft(_) => resources.project(
+                hidden,
+                parallel,
+                context,
+                &mut ComponentInstrumentation::disabled(),
+            ),
+        }
+    }
+
     /// Applies the replicated target output boundary.
     pub fn finish_partition_target(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
-            Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
-            None => self.static_modules.embeddings.as_linear(&hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            ForwardMode::Target,
+            TargetReadout::Logits,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Applies the tensor-parallel target output boundary.
@@ -767,16 +796,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            ForwardMode::Target,
+            TargetReadout::Logits,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Applies tensor-parallel vocabulary lookup for a prediction boundary.
@@ -803,15 +830,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match &mut self.static_modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.embeddings,
-                hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.static_modules.decoder_resources_mut().project(
+            hidden,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     fn unit_path_inner(&self, group: usize, index: usize) -> Result<String, Error> {
@@ -1227,27 +1251,19 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match forward.mode {
-            ForwardMode::Target => {
-                let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
-                if forward.readout == TargetReadout::NormalizedHidden {
-                    return Ok(hidden);
-                }
-                match &mut self.static_modules.lm_head {
-                    Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
-                    None => self.static_modules.embeddings.as_linear(&hidden, context),
-                }
-            }
-            ForwardMode::Draft(_) => match &mut self.static_modules.lm_head {
-                Some(head) => eredu_nn::LinearOperator::forward(head, hidden, context),
-                None => self.static_modules.embeddings.as_linear(hidden, context),
-            },
-        }
+        self.finish_readout(
+            hidden,
+            forward.mode,
+            forward.readout,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
     fn finish_observed<O>(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut S,
+        _state: &mut S,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
@@ -1255,23 +1271,15 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if matches!(forward.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            let mut instrumentation =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
-            if forward.readout == TargetReadout::NormalizedHidden {
-                instrumentation.normalize_readout(
-                    hidden,
-                    &mut self.static_modules.boundary.norm,
-                    context,
-                )
-            } else {
-                self.static_modules
-                    .finish_instrumented(hidden, context, &mut instrumentation)
-            }
-        } else {
-            self.finish(hidden, state, forward, context)
-        }
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.finish_readout(
+            hidden,
+            forward.mode,
+            forward.readout,
+            None,
+            context,
+            &mut ComponentInstrumentation::new("readout", &mut observer),
+        )
     }
 }
 impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for CompleteNemotronKernel<B>
@@ -1377,28 +1385,19 @@ where
                 "Nemotron-H model was not built with rank-local geometry",
             ));
         }
-        let hidden = match forward.mode {
-            ForwardMode::Target => self.static_modules.boundary.norm.forward(hidden, context)?,
-            ForwardMode::Draft(_) => hidden.clone(),
-        };
-        if forward.mode == ForwardMode::Target && forward.readout == TargetReadout::NormalizedHidden
-        {
-            return Ok(hidden);
-        }
-        match &mut self.static_modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            forward.mode,
+            forward.readout,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
     fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut S,
+        _state: &mut S,
         forward: &Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -1407,30 +1406,19 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if forward.mode != ForwardMode::Target {
-            return self.finish_parallel(hidden, state, forward, parallel, context);
-        }
         if self.parallel_geometry.is_none() {
             return Err(Error::backend(
                 "Nemotron-H model was not built with rank-local geometry",
             ));
         }
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        let mut instrumentation =
-            crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
-        let normalized = instrumentation.normalize_readout(
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.finish_readout(
             hidden,
-            &mut self.static_modules.boundary.norm,
-            context,
-        )?;
-        if forward.readout == TargetReadout::NormalizedHidden {
-            return Ok(normalized);
-        }
-        self.static_modules.project_instrumented(
-            &normalized,
+            forward.mode,
+            forward.readout,
             Some(parallel),
             context,
-            &mut instrumentation,
+            &mut ComponentInstrumentation::new("readout", &mut observer),
         )
     }
 }

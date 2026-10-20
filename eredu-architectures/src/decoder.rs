@@ -5018,7 +5018,7 @@ impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
         self.embedding
             .ok_or_else(|| Error::backend("decoder does not own input embedding"))
     }
-    fn normalize(
+    pub(crate) fn normalize(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
@@ -5042,6 +5042,26 @@ impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
             head: self.head,
         }
         .project(&hidden, context, instrumentation)
+    }
+    /// Projects without normalization through the actually retained vocabulary owner.
+    pub(crate) fn project(
+        self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        let output = DecoderOutput::<B> {
+            embedding: self.embedding,
+            head: self.head,
+        };
+        match parallel {
+            Some(parallel) => output.project_parallel(hidden, parallel, context, instrumentation),
+            None => output.project(hidden, context, instrumentation),
+        }
     }
     pub(crate) fn finish_parallel(
         mut self,
