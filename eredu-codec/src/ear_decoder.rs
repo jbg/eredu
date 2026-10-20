@@ -778,7 +778,10 @@ impl<T: Tensor> DecoderUnit<T> {
 /// Resident decoder using the same layered traversal as bounded providers.
 pub struct NeuralDecoder<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        crate::ear_decoder_layered::DecoderArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            crate::ear_decoder_layered::DecoderKernel<B>,
+        >,
         B,
         crate::ear_decoder_layered::DecoderRuntimeState<B::Tensor>,
     >,
@@ -847,7 +850,8 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
                 "EAR decoder units do not match configured order, namespace and geometry",
             ));
         }
-        let architecture = crate::ear_decoder_layered::DecoderArchitecture::new(config, &prefix)?;
+        let architecture =
+            crate::ear_decoder_layered::DecoderKernel::new(config, &prefix)?.into_component()?;
         let runtime = eredu_runtime::ResidentRuntime::from_units(architecture, vec![units])
             .map_err(|error| match error {
                 eredu_runtime::ResidentUnitsError::Architecture(error) => error,
@@ -857,7 +861,7 @@ impl<B: NeuralBackend> NeuralDecoder<B> {
     }
     /// Exact decoder-order geometry.
     pub fn config(&self) -> &DecoderConfig {
-        self.runtime.architecture().config()
+        self.runtime.architecture().kernel().config()
     }
     /// Ordered independently materializable units.
     pub fn units(&self) -> &[DecoderUnit<B::Tensor>] {

@@ -702,7 +702,7 @@ adapter rejects pinned parameter declarations; it does not infer missing
 capabilities from equation defaults.
 
 VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception,
-the TTS transformer, codec PRVQ and the finite EAR encoder
+the TTS transformer, codec PRVQ and the EAR encoder/decoder
 use this adapter with their typed kernels and runtime-owned empty pinned modules.
 Components without mutable state use shared stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
 bank-to-projection embedding operation. PRVQ retains selected depth ranges and
@@ -1374,9 +1374,11 @@ these contracts, reversing the checkpoint's encoder-ordered stages. Speech
 control-code replacement, timestamps and conversational policy remain outside
 the codec.
 
-`ear_decoder_layered` runs the same neural equations through shared resident and
-layerwise traversal. Upsampling convolutions, ConvNeXt blocks and the output
-projection are independent units with no learned static parameters. Each unit
+`decoder_component_definition` declares independently leased units and per-unit
+carry identities. `DecoderKernel` supplies the same streaming neural equations to
+`ComponentAdapter` for complete and selected pipeline execution. The shared adapter
+owns graph, parameter visitation and local state-root mapping. Upsampling
+convolutions, ConvNeXt blocks and the output projection are independent units with no learned static parameters. Each unit
 retains its candidate convolution carry through completion; a failed traversal
 does not replace the supplied parent state. `DecoderExecution` connects these
 providers to `AudioDecoder` and VoiceChat speech composition. Initial state and

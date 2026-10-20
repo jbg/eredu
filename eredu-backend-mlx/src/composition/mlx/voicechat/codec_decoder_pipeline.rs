@@ -2,7 +2,7 @@
 
 use eredu_codec::{
     ear_decoder_distribution::PreparedDecoderPipelineBindings,
-    ear_decoder_layered::{DecoderArchitecture, DecoderRuntimeState},
+    ear_decoder_layered::{DecoderKernel, DecoderRuntimeState},
 };
 use eredu_core::{BackendFailure, DistributedCommitEpoch, DistributedCommitOutcome};
 use eredu_runtime::{
@@ -18,7 +18,10 @@ use crate::{
 
 /// Caller-owned unpublished local convolution state for one selected decoder stage.
 pub type MlxEarDecoderPipelineState = DecoderRuntimeState<MlxTensor>;
-type Architecture = DecoderArchitecture<MlxNeuralBackend>;
+type Architecture = eredu_runtime::ComponentAdapter<
+    eredu_runtime::ComponentDefinition,
+    DecoderKernel<MlxNeuralBackend>,
+>;
 
 /// One codec-selected streaming decoder stage. The shared distributed driver owns
 /// parameter leases, transport, exact completion and commit agreement.
@@ -55,7 +58,7 @@ impl MlxEarDecoderPipeline {
         parent: &MlxEarDecoderPipelineState,
     ) -> Result<MlxEarDecoderPipelineState, BackendFailure> {
         parent
-            .finish_partition(self.execution.architecture())
+            .finish_partition(self.execution.architecture().kernel())
             .map_err(BackendFailure::from_error)
     }
 
@@ -97,7 +100,7 @@ impl eredu_codec::ear_pipeline::DecoderPipelineExecution<MlxNeuralBackend>
     type State = MlxEarDecoderPipelineState;
 
     fn config(&self) -> &eredu_codec::ear_decoder::DecoderConfig {
-        self.execution.architecture().config()
+        self.execution.architecture().kernel().config()
     }
 
     fn initial_state(&self) -> Result<Self::State, eredu_codec::Error> {
@@ -111,7 +114,7 @@ impl eredu_codec::ear_pipeline::DecoderPipelineExecution<MlxNeuralBackend>
         finished: bool,
     ) -> Result<(), eredu_codec::Error> {
         parent.validate_stream_partition(
-            self.execution.architecture(),
+            self.execution.architecture().kernel(),
             batch,
             if finished {
                 eredu_codec::streaming::StreamPhase::Finished
@@ -162,9 +165,9 @@ pub fn materialize_ear_decoder_pipeline(
         .clone();
     let (config, prefix, local_layout, source, units) = prepared.into_parts();
     let architecture =
-        Architecture::new_partition(config, &prefix, local_layout.as_ref(), &partition, &cuts)
+        DecoderKernel::new_partition(config, &prefix, local_layout.as_ref(), &partition, &cuts)
             .map_err(BackendFailure::from_error)?;
-    let state = DecoderRuntimeState::for_partition(&architecture, None)
+    let state = DecoderRuntimeState::for_partition(architecture.kernel(), None)
         .map_err(BackendFailure::from_error)?;
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,

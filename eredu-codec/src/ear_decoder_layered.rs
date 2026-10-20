@@ -5,17 +5,16 @@ use crate::{
     Error,
 };
 use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
-use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, TensorElementType};
+use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
-    LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, RuntimeState,
-    StateError, StateLayout, StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend,
-    TensorPlacement,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
+    LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, RuntimeState, StateError, StateLayout, SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -246,22 +245,41 @@ pub fn decoder_state_layout(config: &DecoderConfig) -> Result<StateLayout, Error
         policies,
     )?)?)
 }
-/// All learned decoder parameters belong to execution units.
-pub struct DecoderStaticModules;
-impl<T: 'static> Parameterized<T> for DecoderStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
+/// Streaming neural decoder operations, independent leases and per-unit carry identities.
+pub fn decoder_component_definition(
+    config: &DecoderConfig,
+    prefix: &str,
+) -> Result<ComponentDefinition, Error> {
+    let parameters = decoder_parameter_description(config, prefix)?;
+    let count = parameters.unit_layout().len();
+    let units = (0..count)
+        .map(|index| ComponentUnit {
+            path: format!("{prefix}.layers.{index}"),
+            state: index..index + 1,
+        })
+        .collect();
+    Ok(ComponentDefinition::new(
+        "ear.decoder",
+        parameters,
+        units,
+        vec![ArchitectureGroupTransport {
+            placement: ArchitectureGroupPlacement::Pipeline,
+            kind: ArchitectureGroupKind::AudioDecoder,
+            first_owner_static_roles: vec![],
+            last_owner_static_roles: vec![],
+            merge_destination: ArchitectureMergeDestination::LastOwner,
+            parallel_subgroup: None,
+            request_optional: false,
+        }],
+        DECODER,
+        vec![],
+        decoder_state_layout(config)?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+            0,
+            0..count,
+        )]),
+    )?)
 }
-
 /// Original latent request geometry and canonical unit progress for one transition.
 #[derive(Debug, Clone)]
 pub struct DecoderForward {
@@ -270,16 +288,15 @@ pub struct DecoderForward {
     pub(crate) next_unit: usize,
 }
 /// Codec-owned canonical unit construction and causal state geometry.
-pub struct DecoderArchitecture<B: NeuralBackend> {
+pub struct DecoderKernel<B: NeuralBackend> {
     pub(crate) config: DecoderConfig,
     pub(crate) specs: Vec<DecoderUnitSpec>,
     pub(crate) prefix: String,
     pub(crate) partition: Option<crate::ear_decoder_partition::DecoderPartition>,
-    empty: DecoderStaticModules,
     parallel: Option<(DecoderLocalDimensions, LocalModelLayout)>,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> DecoderArchitecture<B> {
+impl<B: NeuralBackend> DecoderKernel<B> {
     /// Validates the complete decoder before constructing native resources.
     pub fn new(config: DecoderConfig, prefix: &str) -> Result<Self, Error> {
         let specs = config.unit_specs()?;
@@ -291,7 +308,6 @@ impl<B: NeuralBackend> DecoderArchitecture<B> {
             specs,
             prefix: prefix.into(),
             partition: None,
-            empty: DecoderStaticModules,
             parallel: None,
             backend: PhantomData,
         })
@@ -307,6 +323,13 @@ impl<B: NeuralBackend> DecoderArchitecture<B> {
         value.parallel = Some((local, layout.clone()));
         Ok(value)
     }
+    /// Retains the validated decoder operations and their shared execution adapter.
+    pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
+        Ok(ComponentAdapter::new(
+            decoder_component_definition(&self.config, &self.prefix)?,
+            self,
+        )?)
+    }
     /// Whether this decoder requires tensor-parallel invocation.
     pub fn is_parallel(&self) -> bool {
         self.parallel.is_some()
@@ -318,43 +341,8 @@ impl<B: NeuralBackend> DecoderArchitecture<B> {
     pub fn config(&self) -> &DecoderConfig {
         &self.config
     }
-    /// Stable learned-unit graph.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        decoder_graph()
-    }
-    /// Ordered upsample, residual and spectral output units.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        if group == 0 {
-            Ok(self.specs.len())
-        } else {
-            Err(invalid("unknown EAR decoder group"))
-        }
-    }
-    /// Canonical checkpoint namespace for the requested unit.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= self.group_unit_count(group)? {
-            return Err(invalid("EAR decoder unit exceeds selected group"));
-        }
-        Ok(format!("{}.layers.{index}", self.prefix))
-    }
-    /// Constructs only the requested unloaded unit.
-    pub fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<DecoderUnit<B::Tensor>, Error> {
-        self.unit_path(group, index)?;
-        self.require_owned(group, index)?;
-        DecoderUnit::new_selected(
-            self.specs[index],
-            &self.prefix,
-            self.local_unit(index),
-            context,
-        )
-    }
 }
-impl<B: NeuralBackend> DecoderArchitecture<B> {
+impl<B: NeuralBackend> DecoderKernel<B> {
     fn begin_input(
         &self,
         latent: &B::Tensor,
@@ -493,11 +481,16 @@ pub fn decoder_parameter_description(
         &graph, &layout, expected, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for DecoderArchitecture<B> {
-    type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        decoder_state_layout(&self.config)
-    }
+impl<B: NeuralBackend> ComponentKernel<B> for DecoderKernel<B> {
+    type State = DecoderRuntimeState<B::Tensor>;
+    type Input<'a> = &'a B::Tensor;
+    type Unit = DecoderUnit<B::Tensor>;
+    type ForwardContext = DecoderForward;
+    type RetainedContextValues<'a>
+        = std::iter::Empty<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -524,81 +517,32 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for DecoderArchitecture<B> {
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        decoder_parameter_description(&self.config, &self.prefix)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, DecoderRuntimeState<B::Tensor>>
-    for DecoderArchitecture<B>
-{
-    type Input<'a> = &'a B::Tensor;
-    type StaticModules = DecoderStaticModules;
-    type Unit = DecoderUnit<B::Tensor>;
-    type ForwardContext = DecoderForward;
-    type RetainedContextValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::AudioDecoder,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        DECODER
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
-            0,
-            0..self.specs.len(),
-        )])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &DecoderStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut DecoderStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.build_unit(group, index, context)
+    ) -> Result<DecoderUnit<B::Tensor>, Error> {
+        let index = address.index();
+        DecoderUnit::new_selected(
+            self.specs[index],
+            &self.prefix,
+            self.local_unit(index),
+            context,
+        )
     }
-    fn begin_forward<'a>(
+    fn executes_group(&self, _: usize, _: &DecoderForward) -> bool {
+        true
+    }
+    fn retained_values<'a>(
+        &'a self,
+        _: &'a DecoderForward,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, DecoderRuntimeState<B::Tensor>> for DecoderKernel<B> {
+    fn begin<'a>(
         &mut self,
         latent: Self::Input<'a>,
         state: &mut DecoderRuntimeState<B::Tensor>,
@@ -611,47 +555,27 @@ impl<B: NeuralBackend> LayeredArchitecture<B, DecoderRuntimeState<B::Tensor>>
         }
         self.begin_input(latent, state, context)
     }
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
-        group: usize,
+        _: usize,
         initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
+        _: &[&B::Tensor],
         _: &mut DecoderRuntimeState<B::Tensor>,
         _: &mut DecoderForward,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(invalid("EAR decoder graph dependency mismatch"));
-        }
         Ok(initial.clone())
     }
-    fn retained_state_ordinals(&self, _: usize, index: usize, _: usize) -> std::ops::Range<usize> {
-        let local = index
-            - self
-                .partition
-                .as_ref()
-                .map_or(0, |selected| selected.range.start);
-        local..local + 1
-    }
-    fn state_ordinal(&self, _: usize, index: usize, _: usize) -> usize {
-        index
-            - self
-                .partition
-                .as_ref()
-                .map_or(0, |selected| selected.range.start)
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut DecoderRuntimeState<B::Tensor>,
         forward: &mut DecoderForward,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.unit_path(group, index)?;
-        self.require_owned(group, index)?;
+        let index = address.index();
         if index != forward.next_unit {
             return Err(invalid(
                 "decoder units must execute in canonical invocation order",
@@ -671,7 +595,7 @@ impl<B: NeuralBackend> LayeredArchitecture<B, DecoderRuntimeState<B::Tensor>>
         forward.next_unit = index + 1;
         Ok(output)
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _: &mut DecoderRuntimeState<B::Tensor>,
@@ -683,16 +607,8 @@ impl<B: NeuralBackend> LayeredArchitecture<B, DecoderRuntimeState<B::Tensor>>
         }
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
-        &'a self,
-        _: &'a DecoderForward,
-        _: usize,
-        _: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        std::iter::empty()
-    }
 }
-impl<B: DistributedNeuralBackend> DecoderArchitecture<B> {
+impl<B: DistributedNeuralBackend> DecoderKernel<B> {
     /// Checks the actual communicator against all selected unit placements before acquisition.
     pub fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), Error> {
         let (_, selected) = self
@@ -755,10 +671,8 @@ impl<B: DistributedNeuralBackend> DecoderArchitecture<B> {
         Ok(B::sum_parallel(full, parallel, context)?)
     }
 }
-impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, DecoderRuntimeState<B::Tensor>>
-    for DecoderArchitecture<B>
-{
-    fn begin_forward_parallel<'a>(
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B> for DecoderKernel<B> {
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut DecoderRuntimeState<B::Tensor>,
@@ -771,10 +685,9 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, DecoderRuntimeS
         self.validate_parallel(parallel)?;
         self.begin_input(input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut DecoderRuntimeState<B::Tensor>,
@@ -782,8 +695,7 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, DecoderRuntimeS
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.unit_path(group, index)?;
-        self.require_owned(group, index)?;
+        let index = address.index();
         if index != forward.next_unit {
             return Err(invalid(
                 "decoder units must execute in canonical invocation order",
@@ -809,7 +721,7 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, DecoderRuntimeS
         forward.next_unit = index + 1;
         Ok(output)
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         state: &mut DecoderRuntimeState<B::Tensor>,
@@ -817,7 +729,7 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, DecoderRuntimeS
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
 }
 /// Neural decoder using the existing prepared parameter provider and bounded traversal.
@@ -826,7 +738,12 @@ where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, DecoderUnit<B::Tensor>>,
 {
-    runtime: LayerwiseRuntime<DecoderArchitecture<B>, B, DecoderRuntimeState<B::Tensor>, P>,
+    runtime: LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
+        B,
+        DecoderRuntimeState<B::Tensor>,
+        P,
+    >,
 }
 impl<B, P> LayerwiseDecoder<B, P>
 where
@@ -835,7 +752,10 @@ where
     P::Error: std::fmt::Display,
 {
     /// Adopts an exact decoder unit policy.
-    pub fn new(architecture: DecoderArchitecture<B>, policy: P) -> Self {
+    pub fn new(
+        architecture: ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
+        policy: P,
+    ) -> Self {
         Self {
             runtime: LayerwiseRuntime::new(architecture, policy),
         }
@@ -843,13 +763,23 @@ where
     /// Existing shared provider/runtime for diagnostics and parameter inspection.
     pub fn runtime(
         &self,
-    ) -> &LayerwiseRuntime<DecoderArchitecture<B>, B, DecoderRuntimeState<B::Tensor>, P> {
+    ) -> &LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
+        B,
+        DecoderRuntimeState<B::Tensor>,
+        P,
+    > {
         &self.runtime
     }
     /// Existing shared provider/runtime for bounded parameter operations.
     pub fn runtime_mut(
         &mut self,
-    ) -> &mut LayerwiseRuntime<DecoderArchitecture<B>, B, DecoderRuntimeState<B::Tensor>, P> {
+    ) -> &mut LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
+        B,
+        DecoderRuntimeState<B::Tensor>,
+        P,
+    > {
         &mut self.runtime
     }
 }
@@ -876,7 +806,7 @@ where
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn config(&self) -> &DecoderConfig {
-        self.runtime.architecture().config()
+        self.runtime.architecture().kernel().config()
     }
     fn step(
         &mut self,

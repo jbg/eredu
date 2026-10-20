@@ -2,9 +2,7 @@
 
 use eredu_codec::{
     ear_decoder::{DecoderConfig, DecoderState, DecoderUnit},
-    ear_decoder_layered::{
-        DecoderArchitecture, DecoderExecution, DecoderRuntimeState, LayerwiseDecoder,
-    },
+    ear_decoder_layered::{DecoderExecution, DecoderKernel, DecoderRuntimeState, LayerwiseDecoder},
     ear_decoder_preparation::PreparedDecoderBindings,
     Error,
 };
@@ -154,10 +152,11 @@ fn materialize(
             let (config, prefix, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
                 Some(local) => {
-                    DecoderArchitecture::<MlxNeuralBackend>::new_parallel(config, &prefix, local)
+                    DecoderKernel::<MlxNeuralBackend>::new_parallel(config, &prefix, local)
                 }
-                None => DecoderArchitecture::<MlxNeuralBackend>::new(config, &prefix),
+                None => DecoderKernel::<MlxNeuralBackend>::new(config, &prefix),
             }
+            .and_then(DecoderKernel::into_component)
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
