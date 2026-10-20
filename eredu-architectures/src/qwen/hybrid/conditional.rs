@@ -887,6 +887,7 @@ impl<T> ConditionalForwardContext<T> {
 /// One neutral conditional Qwen3.5 graph.
 pub struct ConditionalLayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     parsed: ParsedHybridConfig,
+    definition: eredu_runtime::ComponentDefinition,
     static_modules: ConditionalStaticModules<B>,
     target_layers: usize,
     prediction_steps: usize,
@@ -902,7 +903,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
+        Ok(self.definition.state_layout().clone())
     }
 
     fn state_identity(
@@ -942,7 +943,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        super::conditional_parameter_description(&self.parsed)
+        Ok(self.definition.parameters().clone())
     }
 
     fn static_parameter_recipes(
@@ -1169,33 +1170,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         &self.parsed
     }
 
-    fn canonical_execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        super::parameters::conditional_execution_graph(&self.parsed)
-    }
-
-    fn canonical_group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self
-                .parsed
-                .vision
-                .as_ref()
-                .expect("validated vision")
-                .layer_count()),
-            1 => Ok(self.target_layers),
-            group if group < self.prediction_steps + 2 => Ok(1),
-            _ => Err(Error::backend(
-                "conditional Qwen3.5 execution group is invalid",
-            )),
-        }
-    }
-
     /// Returns the architecture-owned vision, target, and prediction traversal.
     pub fn unit_layout(&self) -> Result<ExecutionUnitLayout, Error> {
-        let graph = self.canonical_execution_graph()?;
-        let counts = (0..graph.groups().len())
-            .map(|group| self.canonical_group_unit_count(group))
-            .collect::<Result<Vec<_>, _>>()?;
-        ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)
+        Ok(self.definition.parameters().unit_layout().clone())
+    }
+
+    /// Borrows canonical invocation, parameter, transport and state ownership.
+    pub const fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Returns the family-owned activation schema transported between stages.
@@ -1227,6 +1209,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         vision
             .validate_for(VisionMode::WindowScheduled)
             .map_err(Error::backend)?;
+        let definition = super::conditional_component_definition(&parsed, None)?;
         let text_model = super::QwenKernel::<B>::new(parsed.text.clone(), context)?;
         let text = text_model.into_parts().1.into_extended_static_modules()?;
         let target_layers =
@@ -1235,6 +1218,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             usize::try_from(parsed.text.mtp_num_hidden_layers).map_err(Error::backend)?;
         Ok(Self {
             parsed,
+            definition,
             static_modules: ConditionalStaticModules {
                 text: text.base,
                 prediction: text.extension,
@@ -1311,6 +1295,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         vision_config
             .validate_for(VisionMode::WindowScheduled)
             .map_err(Error::backend)?;
+        let definition = super::conditional_component_definition(&parsed, Some(&geometry))?;
         let text_model = super::QwenKernel::<B>::new_parallel(
             parsed.text.clone(),
             geometry.text().clone(),
@@ -1322,6 +1307,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             usize::try_from(parsed.text.mtp_num_hidden_layers).map_err(Error::backend)?;
         Ok(Self {
             parsed,
+            definition,
             static_modules: {
                 let text = text_model.into_parts().1.into_extended_static_modules()?;
                 ConditionalStaticModules {
@@ -1371,17 +1357,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         self.prediction_steps
     }
 
-    /// Returns replicated or planner-derived target/MTP state geometry.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(
-                || super::state_layout(&self.parsed.text).map_err(Error::backend),
-                Ok,
-            )
-    }
-
     /// Shares planner-owned local geometry with placed unit factories.
     pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<ConditionalLocalGeometry>> {
         self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
@@ -1403,22 +1378,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalUnit<B>, Error> {
-        let count = match group {
-            0 => self
-                .parsed
-                .vision
-                .as_ref()
-                .expect("validated vision")
-                .layer_count(),
-            1 => self.target_layers,
-            group if group < self.prediction_steps + 2 => 1,
-            _ => return Err(Error::backend("conditional Qwen3.5 group is invalid")),
-        };
-        if index >= count {
-            return Err(Error::backend(
-                "conditional Qwen3.5 unit is outside its group",
-            ));
-        }
+        self.definition.unit(group, index)?;
         match group {
             0 => {
                 let vision = self.parsed.vision.as_ref().expect("validated vision");
@@ -2144,57 +2104,37 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        match group {
-            0 => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            },
-            1 => crate::transport::decoder(),
-            _ => conditional_prediction_group_transport(group),
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn prediction_execution_groups(&self) -> Vec<String> {
-        (0..self.prediction_steps)
-            .map(|depth| format!("mtp.{depth}"))
-            .collect()
+        self.definition.prediction_groups().to_vec()
     }
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(1, self.target_layers, layout)
+        self.definition.state_partition_plan().clone()
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        self.canonical_execution_graph()
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.canonical_group_unit_count(group)
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend(
-                "conditional Qwen3.5 unit is outside its group",
-            ));
-        }
-        Ok(match group {
-            0 => format!("model.visual.blocks.{index}"),
-            1 => format!("model.layers.{index}"),
-            _ => format!("mtp.layers.{}", group - 2),
-        })
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
@@ -2546,16 +2486,6 @@ where
         }
         values.into_iter()
     }
-}
-
-fn conditional_prediction_group_transport(
-    group: usize,
-) -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = crate::transport::prediction();
-    if group == 2 {
-        transport.first_owner_static_roles.push("mtp".into());
-    }
-    transport
 }
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for ConditionalLayeredModel<B>

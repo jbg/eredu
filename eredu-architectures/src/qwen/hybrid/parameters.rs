@@ -563,3 +563,84 @@ pub fn conditional_parameter_description(
     )
     .map_err(eredu_nn::Error::backend)
 }
+
+/// Validates conditional invocation, transport and text/MTP state ownership before materialization.
+pub fn conditional_component_definition(
+    parsed: &super::ParsedHybridConfig,
+    geometry: Option<&super::ConditionalLocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+    let parameters = conditional_parameter_description(parsed)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry
+                .validate_for(parsed)
+                .map_err(eredu_nn::Error::backend)?;
+            geometry.state_layout().clone()
+        }
+        None => super::state_layout(&parsed.text).map_err(eredu_nn::Error::backend)?,
+    };
+    let layout = parameters.unit_layout();
+    let vision_units = layout.group_range(0).expect("declared vision group").len();
+    let targets = layout.group_range(1).expect("declared target group").len();
+    let units = (0..layout.len())
+        .map(|ordinal| {
+            let address = layout.address(ordinal).expect("declared invocation");
+            let (path, state) = match address.group() {
+                0 => (format!("model.visual.blocks.{}", address.index()), 0..0),
+                group => {
+                    let slot = ordinal - vision_units;
+                    let path = if group == 1 {
+                        format!("model.layers.{}", address.index())
+                    } else {
+                        format!("mtp.layers.{}", group - 2)
+                    };
+                    (path, slot..slot + 1)
+                }
+            };
+            eredu_runtime::ComponentUnit { path, state }
+        })
+        .collect();
+    let groups = parameters.graph().groups().len();
+    let prediction = (2..groups)
+        .map(|group| {
+            layout
+                .group_id(group)
+                .expect("declared prediction group")
+                .as_str()
+                .to_owned()
+        })
+        .collect();
+    let transport = (0..groups)
+        .map(|group| match group {
+            0 => eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+                first_owner_static_roles: vec!["vision".into()],
+                last_owner_static_roles: Vec::new(),
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
+                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
+                request_optional: true,
+            },
+            1 => crate::transport::decoder(),
+            group => {
+                let mut transport = crate::transport::prediction();
+                if group == 2 {
+                    transport.first_owner_static_roles.push("mtp".into());
+                }
+                transport
+            }
+        })
+        .collect();
+    let partition = crate::transport::pipeline_with_output_state(1, targets, &state);
+    eredu_runtime::ComponentDefinition::new(
+        "qwen-hybrid-conditional",
+        parameters,
+        units,
+        transport,
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        prediction,
+        state,
+        partition,
+    )
+    .map_err(eredu_nn::Error::from)
+}

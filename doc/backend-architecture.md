@@ -8608,8 +8608,14 @@ Full, selected and prediction-extension text preparation consume this
 checkpoint-global declaration without constructing native modules. Conditional
 Qwen composes its text and shared vision declarations into one cold parameter
 description, preserving canonical group identities across the composite graph.
-Conditional partition and prediction-extension preparation consume that description
-without constructing a discovery model. Low-level unit parameter descriptions
+Conditional construction validates and retains one `ComponentDefinition` before
+native materialization. Graph traversal, unit addresses, parameter metadata,
+transport and state ownership project from that definition. Optional vision units
+have empty mutable-state mappings; target and MTP slots retain text coordinates
+and rank-local recurrent/cache geometry. The target pipeline owns its unit-aligned
+state, and the output owner retains prediction state. Conditional partition and
+prediction-extension preparation consume the cold parameter description without
+constructing a discovery model. Low-level unit parameter descriptions
 accept configuration and validated group coordinates without native modules.
 
 Shared Qwen vision declarations and materialization consume the same patch,
