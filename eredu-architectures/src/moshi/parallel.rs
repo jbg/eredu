@@ -20,7 +20,7 @@ use eredu_runtime::{
 };
 
 use super::{
-    LayeredModel, MoshiConfig, MoshiTransformerConfig, StaticModules, Unit, DEPTH_STATE_SEGMENT,
+    MoshiConfig, MoshiKernel, MoshiTransformerConfig, StaticModules, Unit, DEPTH_STATE_SEGMENT,
     TEMPORAL_STATE_SEGMENT,
 };
 
@@ -1117,7 +1117,7 @@ pub fn unit_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBacke
     }
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
     /// Declares pinned parameter groups for semantic tensor-parallel planning.
     pub fn static_parameter_groups(&self) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
         static_parameter_groups(self.static_modules())

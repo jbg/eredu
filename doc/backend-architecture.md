@@ -4891,6 +4891,18 @@ mechanisms are bound beneath that wrapper and do not restate a family identity.
 Family metadata such as `EffectiveModelType` remains in
 `eredu_architectures::moshi`.
 
+Moshi execution retains a validated `ComponentDefinition` before native module
+construction. `MoshiKernel` supplies temporal and depth equations to the shared
+`ComponentAdapter`, which owns runtime addressing, parameter traversal, state
+mapping and group transport. Temporal blocks retain independent persistent cache
+slots. Each independently leased depth slice explicitly reuses the same
+frame-local depth cache range; starting a frame resets that segment without
+resetting temporal history. Pinned embeddings, normalization and text projection
+retain their canonical roles. Serial and parallel execution use the same
+declaration, with selected local geometry supplying the state layout. Realtime
+construction identity is a typed kernel capability forwarded by the shared
+adapter; frame decisions and sampling remain architecture policy.
+
 Realtime artifact loading also crosses the backend boundary as a neutral
 architecture preparation. Moshi inspection parses optional native defaults or
 released PersonaPlex configuration, resolves the confined `moshi_name` or

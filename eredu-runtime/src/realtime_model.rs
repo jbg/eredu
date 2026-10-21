@@ -43,6 +43,18 @@ pub trait RealtimeArchitectureIdentity {
     ) -> Result<RealtimeArchitectureConstructionIdentity, String>;
 }
 
+impl<D, K, R> RealtimeArchitectureIdentity for crate::ComponentAdapter<D, K, R>
+where
+    D: std::borrow::Borrow<crate::ComponentDefinition>,
+    K: RealtimeArchitectureIdentity,
+{
+    fn realtime_construction_identity(
+        &self,
+    ) -> Result<RealtimeArchitectureConstructionIdentity, String> {
+        self.kernel().realtime_construction_identity()
+    }
+}
+
 /// Concrete state paired with the exact realization its mechanism implemented.
 pub struct RealizedRealtimeState<S> {
     state: S,

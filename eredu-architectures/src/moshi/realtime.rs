@@ -151,11 +151,15 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>,
 {
     fn realtime_decision_boundary(&self) -> Result<DecisionBoundary, eredu_nn::Error> {
-        DecisionBoundary::new(self.config())
+        DecisionBoundary::new(self.kernel().config())
     }
 
     fn realtime_temporal_cardinality(&self) -> usize {
-        self.config().frame_schedule().total_audio_codebooks() + 1
+        self.kernel()
+            .config()
+            .frame_schedule()
+            .total_audio_codebooks()
+            + 1
     }
 }
 
@@ -1302,18 +1306,21 @@ where
 
     visitor.construction_started();
     let source_architecture = source_config
-        .map(|config| super::LayeredModel::<B>::new(config, context))
+        .map(|config| {
+            super::MoshiKernel::<B>::new(config, context).and_then(super::MoshiKernel::into_model)
+        })
         .transpose()
         .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
     let architecture = match parallel.as_ref() {
-        Some(parallel) => super::LayeredModel::<B>::new_selected_parallel(
+        Some(parallel) => super::MoshiKernel::<B>::new_selected_parallel(
             execution_config,
             parallel.geometry().clone(),
             parallel.execution_identity().to_owned(),
             context,
         ),
-        None => super::LayeredModel::<B>::new(execution_config, context),
+        None => super::MoshiKernel::<B>::new(execution_config, context),
     }
+    .and_then(super::MoshiKernel::into_model)
     .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
     visitor
         .visit(

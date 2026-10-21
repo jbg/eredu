@@ -8,13 +8,62 @@ use eredu_nn::{
     VocabularyParallelRange,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, LayeredTraversalPoint, ParallelLayeredArchitecture,
+    ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel,
+    ComponentPinnedResources, ComponentUnit, ExecutionUnitAddress, KernelParameterModules,
+    LayerRuntimeState, LayeredForwardState, LayeredTraversalPoint, ParallelComponentKernel,
     ResettableRuntimeState, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionError,
     StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, TokenDomain,
 };
+use std::sync::Arc;
 
 use super::{block, depth::DepthSlice, MoshiConfig};
+
+/// Shared execution adapter for Moshi temporal and depth equations.
+pub type LayeredModel<B> =
+    ComponentAdapter<Arc<ComponentDefinition>, MoshiKernel<B>, KernelParameterModules>;
+
+/// Declares canonical storage, invocation state and transport before native construction.
+pub fn component_definition(
+    config: &MoshiConfig,
+    geometry: Option<&super::LocalGeometry>,
+) -> Result<ComponentDefinition, Error> {
+    config.temporal().validate_config()?;
+    config.depth_template().validate_config()?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry.validate_for(config).map_err(Error::backend)?;
+            geometry.state_layout().clone()
+        }
+        None => state_layout(config)?,
+    };
+    let parameters = super::parallel::parameter_description(config).map_err(Error::backend)?;
+    let temporal = config.temporal().num_hidden_layers() as usize;
+    let depth = config.depth_template().num_hidden_layers() as usize;
+    let units = (0..temporal)
+        .map(|index| ComponentUnit {
+            path: format!("transformer.layers.{index}"),
+            state: index..index + 1,
+        })
+        .chain(
+            (0..config.frame_schedule().depth_audio_codebooks()).map(|index| ComponentUnit {
+                path: format!("depformer.slices.{index}"),
+                state: temporal..temporal + depth,
+            }),
+        )
+        .collect();
+    let ownership = crate::transport::pipeline_with_output_state(0, temporal, &state);
+    ComponentDefinition::new(
+        "moshi",
+        parameters,
+        units,
+        vec![crate::transport::decoder(), crate::transport::prediction()],
+        "temporal_transformer",
+        vec!["depth_codebook_slices".into()],
+        state,
+        ownership,
+    )
+    .map_err(Error::from)
+}
 
 /// Persistent temporal-cache segment identity.
 pub const TEMPORAL_STATE_SEGMENT: &str = "temporal";
@@ -331,7 +380,8 @@ pub fn state_layout(config: &MoshiConfig) -> Result<StateLayout, Error> {
 }
 
 /// One portable Moshi-family model shared by resident and bounded runtimes.
-pub struct LayeredModel<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct MoshiKernel<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    definition: Arc<ComponentDefinition>,
     config: MoshiConfig,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<super::LocalGeometry>,
@@ -339,7 +389,7 @@ pub struct LayeredModel<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>
-    eredu_runtime::RealtimeArchitectureIdentity for LayeredModel<B>
+    eredu_runtime::RealtimeArchitectureIdentity for MoshiKernel<B>
 {
     fn realtime_construction_identity(
         &self,
@@ -361,7 +411,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>
                         return Err(
                             "Moshi tensor-parallel architecture has no selected execution identity"
                                 .into(),
-                        )
+                        );
                     }
                 })?,
             ),
@@ -369,91 +419,16 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>
     }
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ArchitectureParameters<B>
-    for LayeredModel<B>
-{
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        topology.validate().map_err(Error::backend)?;
-        let layer_count = self.state_layout_impl()?.len();
-        let global_layer_end = state
-            .global_layer_offset()
-            .checked_add(state.layout().len())
-            .ok_or_else(|| Error::backend("Moshi owned state range overflowed"))?;
-        if global_layer_end > layer_count {
-            return Err(Error::backend(format!(
-                "Moshi owns state layers {}..{global_layer_end}, outside {layer_count} layers",
-                state.global_layer_offset()
-            )));
-        }
-        eredu_runtime::ModelStateIdentity::new(
-            self.config.family(),
-            self.config.effective_model_type().as_str(),
-            self.config.architecture_fingerprint(),
-            layer_count,
-            state.global_layer_offset(),
-            0,
-            topology,
-        )
-        .map_err(Error::backend)
-    }
-
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parallel::parameter_description(&self.config).map_err(Error::backend)
-    }
-
-    fn static_parameter_recipes(
-        &self,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<
-        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-        String,
-    > {
-        let recipes = super::checkpoint::canonical_recipes(&self.config, source)?.into_outputs();
-        crate::static_parameters::module_recipes(&self.static_modules, recipes)
-    }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitor<B>,
-    {
-        visitor.visit("embedding", &self.static_modules.embeddings)?;
-        visitor.visit("norm", &self.static_modules.output_norm)?;
-        visitor.visit("output", &self.static_modules.text_output)
-    }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitorMut<B>,
-    {
-        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.output_norm)?;
-        visitor.visit_mut("output", &mut self.static_modules.text_output)
-    }
-}
-
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
     /// Builds unloaded pinned modules from one normalized configuration.
     pub fn new(
         config: MoshiConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.temporal().validate_config()?;
-        config.depth_template().validate_config()?;
+        let definition = Arc::new(component_definition(&config, None)?);
         let static_modules = StaticModules::new(&config, context)?;
         Ok(Self {
+            definition,
             config,
             static_modules,
             parallel_geometry: None,
@@ -467,11 +442,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
         geometry: super::LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.temporal().validate_config()?;
-        config.depth_template().validate_config()?;
-        geometry.validate_for(&config).map_err(Error::backend)?;
+        let definition = Arc::new(component_definition(&config, Some(&geometry))?);
         let static_modules = StaticModules::new_parallel(&config, &geometry, context)?;
         Ok(Self {
+            definition,
             config,
             static_modules,
             parallel_geometry: Some(geometry),
@@ -490,6 +464,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
         let mut model = Self::new_parallel(config, geometry, context)?;
         model.parallel_execution_identity = Some(execution_identity);
         Ok(model)
+    }
+
+    /// Couples the validated declaration with its typed equations and pinned resources.
+    pub fn into_model(self) -> Result<LayeredModel<B>, Error> {
+        ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
+            .map_err(Error::from)
     }
 
     /// Borrows normalized architecture policy.
@@ -515,35 +495,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
             .saturating_add(1)
     }
 
-    /// State layout for this model's replicated or rank-local construction.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| state_layout(&self.config), Ok)
-    }
-
     fn build_unit_impl(
         &self,
         group: usize,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
-        let count = match group {
-            0 => usize::try_from(self.config.temporal().num_hidden_layers())
-                .map_err(Error::backend)?,
-            1 => self.config.frame_schedule().depth_audio_codebooks(),
-            _ => {
-                return Err(Error::backend(format!(
-                    "Moshi execution group {group} is outside 0..2"
-                )))
-            }
-        };
-        if index >= count {
-            return Err(Error::backend(format!(
-                "Moshi unit {index} is outside execution group {group}"
-            )));
-        }
         if let Some(geometry) = &self.parallel_geometry {
             return geometry.build_unit(&self.config, group, index, context);
         }
@@ -598,111 +555,115 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     }
 }
 
-fn group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-    match group {
-        0 => crate::transport::decoder(),
-        _ => crate::transport::prediction(),
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentPinnedResources<B>
+    for MoshiKernel<B>
+{
+    type Modules = StaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitor<B>,
+    {
+        visitor.visit("embedding", &self.static_modules.embeddings)?;
+        visitor.visit("norm", &self.static_modules.output_norm)?;
+        visitor.visit("output", &self.static_modules.text_output)
+    }
+    fn visit_pinned_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
+        visitor.visit_mut("norm", &mut self.static_modules.output_norm)?;
+        visitor.visit_mut("output", &mut self.static_modules.text_output)
     }
 }
-
-impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B> + ResettableRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-{
-    type Input<'a> = Input<'a, B::Tensor>;
-    type StaticModules = StaticModules<B>;
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKernel<B> for MoshiKernel<B> {
+    type Input<'a>
+        = Input<'a, B::Tensor>
+    where
+        Self: 'a;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
         = std::iter::Flatten<std::array::IntoIter<Option<&'a B::Tensor>, 3>>
     where
+        Self: 'a,
         B::Tensor: 'a;
     type Error = Error;
-
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        group_transport(group)
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        "temporal_transformer"
-    }
-
-    fn prediction_execution_groups(&self) -> Vec<String> {
-        vec!["depth_codebook_slices".to_owned()]
-    }
-
-    fn state_partition_plan(
+    fn state_identity(
         &self,
-        layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        let temporal_layers = layout
-            .segments()
-            .first()
-            .map(|segment| segment.layers().end)
-            .unwrap_or(0);
-        crate::transport::pipeline_with_output_state(0, temporal_layers, layout)
-    }
-
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
-            .map_err(Error::backend)
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        match group {
-            0 => {
-                usize::try_from(self.config.temporal().num_hidden_layers()).map_err(Error::backend)
-            }
-            1 => Ok(self.config.frame_schedule().depth_audio_codebooks()),
-            _ => Err(Error::backend(format!(
-                "Moshi execution group {group} is outside 0..2"
-            ))),
-        }
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        let count = match group {
-            0 => usize::try_from(self.config.temporal().num_hidden_layers())
-                .map_err(Error::backend)?,
-            1 => self.config.frame_schedule().depth_audio_codebooks(),
-            _ => {
-                return Err(Error::backend(format!(
-                    "Moshi execution group {group} is outside 0..2"
-                )))
-            }
-        };
-        if index >= count {
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::Error> {
+        topology.validate().map_err(Error::backend)?;
+        let layer_count = self.definition.state_layout().len();
+        let global_layer_end = state
+            .global_layer_offset()
+            .checked_add(state.layout().len())
+            .ok_or_else(|| Error::backend("Moshi owned state range overflowed"))?;
+        if global_layer_end > layer_count {
             return Err(Error::backend(format!(
-                "Moshi unit {index} is outside execution group {group}"
+                "Moshi owns state layers {}..{global_layer_end}, outside {layer_count} layers",
+                state.global_layer_offset()
             )));
         }
-        match group {
-            0 => Ok(format!("transformer.layers.{index}")),
-            1 => Ok(format!("depformer.slices.{index}")),
-            _ => unreachable!("group was validated"),
-        }
+        eredu_runtime::ModelStateIdentity::new(
+            self.config.family(),
+            self.config.effective_model_type().as_str(),
+            self.config.architecture_fingerprint(),
+            layer_count,
+            state.global_layer_offset(),
+            0,
+            topology,
+        )
+        .map_err(Error::backend)
     }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        let recipes = super::checkpoint::canonical_recipes(&self.config, source)?.into_outputs();
+        crate::static_parameters::module_recipes(&self.static_modules, recipes)
     }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Self::Error> {
-        self.build_unit_impl(group, index, context)
+    ) -> Result<Self::Unit, Error> {
+        self.build_unit_impl(address.group(), address.index(), context)
     }
-
-    fn begin_forward<'a>(
+    fn executes_group(&self, _group: usize, _forward: &Self::ForwardContext) -> bool {
+        true
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        [
+            forward.temporal_mask.as_ref(),
+            forward.temporal_output.as_ref(),
+            forward.previous_depth_token.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+impl<B, S> ComponentEquations<B, S> for MoshiKernel<B>
+where
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -722,8 +683,7 @@ where
         let expected = state_layout(&self.config)?;
         self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
@@ -741,41 +701,17 @@ where
             ))),
         }
     }
-
-    fn state_ordinal(&self, group: usize, index: usize, ordinal: usize) -> usize {
-        if group == 1 {
-            self.config.temporal().num_hidden_layers() as usize
-        } else {
-            debug_assert_eq!(ordinal, index);
-            ordinal
-        }
-    }
-
-    fn retained_state_ordinals(
-        &self,
-        group: usize,
-        index: usize,
-        ordinal: usize,
-    ) -> std::ops::Range<usize> {
-        if group == 1 {
-            let start = self.config.temporal().num_hidden_layers() as usize;
-            start..start + self.config.depth_template().num_hidden_layers() as usize
-        } else {
-            debug_assert_eq!(ordinal, index);
-            ordinal..ordinal + 1
-        }
-    }
-
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        let group = address.group();
+        let index = address.index();
         match (group, unit) {
             (0, Unit::Temporal(block)) => block::forward(
                 block,
@@ -812,8 +748,7 @@ where
             )),
         }
     }
-
-    fn complete_execution_group(
+    fn complete_group(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -834,8 +769,7 @@ where
             Ok(hidden.clone())
         }
     }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         _hidden: &B::Tensor,
         _state: &mut S,
@@ -847,30 +781,14 @@ where
             .clone()
             .ok_or_else(|| Error::backend("Moshi text logits are unavailable"))
     }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        [
-            forward.temporal_mask.as_ref(),
-            forward.temporal_output.as_ref(),
-            forward.previous_depth_token.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-    }
 }
-
-impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> ParallelComponentKernel<B, S> for MoshiKernel<B>
 where
     B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B> + ResettableRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -894,11 +812,9 @@ where
         let expected = geometry.state_layout().clone();
         self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
     }
-
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -906,6 +822,8 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        let group = address.group();
+        let index = address.index();
         match (group, unit) {
             (0, Unit::Temporal(block)) => super::forward_temporal_block_parallel(
                 block, index, hidden, state, forward, parallel, context,
@@ -935,8 +853,7 @@ where
             _ => Err(Error::backend("Moshi parallel unit/group mismatch")),
         }
     }
-
-    fn complete_execution_group_parallel(
+    fn complete_group_parallel(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -960,8 +877,7 @@ where
             Ok(hidden.clone())
         }
     }
-
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         _hidden: &B::Tensor,
         _state: &mut S,
@@ -969,13 +885,9 @@ where
         _parallel: &B::ParallelContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        forward
-            .text_logits
-            .clone()
-            .ok_or_else(|| Error::backend("Moshi text logits are unavailable"))
+        <Self as ComponentEquations<B, S>>::finish(self, _hidden, _state, forward, _context)
     }
 }
-
 /// Stateless mapping from the two-group graph to ordered runtime decisions.
 #[derive(Debug, Clone, Copy)]
 pub struct DecisionBoundary {
