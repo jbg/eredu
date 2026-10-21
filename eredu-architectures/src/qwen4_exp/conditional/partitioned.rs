@@ -32,6 +32,11 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
         let parameters = parameter_description(&spec.geometry().definition()?, &vision)?
             .with_partition_layout(topology, layout.clone())
             .map_err(Error::backend)?;
+        let definition = std::sync::Arc::new(definition_with_parameters(
+            &target.local_spec().definition()?,
+            &vision,
+            parameters,
+        )?);
         let blocks = (0..vision.layer_count())
             .map(|index| {
                 crate::qwen::vision::local_block_geometry(&vision, "model.visual", index, layout)
@@ -58,7 +63,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             vision_local: Some(blocks),
             vision_input_owner: topology.pipeline_parallel_rank() == 0,
             partition_state: Some(state.clone()),
-            global_parameters: Some(parameters),
+            definition,
         })
     }
 
@@ -68,6 +73,16 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
         realization: &crate::ExpertRealizationPlan<GroupedGatedProductSpec>,
     ) -> Result<Self, Error> {
         self.modules.target = self.modules.target.with_expert_realization(realization)?;
+        let parameters = if self.definition.parameters().partition_layout().is_some() {
+            self.definition.parameters().clone()
+        } else {
+            declare_parameters(self.modules.target.definition(), &self.vision)?
+        };
+        self.definition = std::sync::Arc::new(definition_with_parameters(
+            self.modules.target.definition(),
+            &self.vision,
+            parameters,
+        )?);
         Ok(self)
     }
 

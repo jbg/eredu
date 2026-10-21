@@ -5,9 +5,7 @@ use crate::qwen4_exp::{
     conditional::{self, ConditionalModel},
     media::MediaIngress,
 };
-use eredu_runtime::{
-    ExecutionUnitLayout, ReplicatedTextParameterOwner as Owner, ReplicatedTextRequirements,
-};
+use eredu_runtime::{ReplicatedTextParameterOwner as Owner, ReplicatedTextRequirements};
 fn invalid(e: impl std::fmt::Display) -> PreparationError {
     PreparationError::Contract(e.to_string())
 }
@@ -122,9 +120,12 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
         }
     }
     let old = target.text();
-    let graph = conditional::graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [spec.units.len(), vision_config.layer_count()])
-        .map_err(invalid)?;
+    let definition = conditional::definition(&spec.definition()?, vision_config)?;
+    let graph = definition.parameters().graph().clone();
+    let layout = definition.parameters().unit_layout().clone();
+    let transport = (0..graph.groups().len())
+        .map(|group| definition.group_transport(group).cloned().map_err(invalid))
+        .collect::<Result<Vec<_>, _>>()?;
     let auxiliary_names = old
         .auxiliary_parameters()
         .iter()
@@ -159,8 +160,8 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
             .union(crate::operator_requirements::QWEN_VISION),
         graph,
         layout,
-        vec![crate::transport::decoder(), conditional::vision_transport()],
-        old.state_layout().clone(),
+        transport,
+        definition.state_layout().clone(),
         old.state_access(),
         parameters,
     )

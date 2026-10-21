@@ -10848,7 +10848,17 @@ resources through the ordinary component adapter or the enclosing composite;
 base-width lookup and prediction projection preserve their own equations.
 
 `conditional::parameter_description` composes retained target storage with vision
-parameter geometry without a native context. Tensor/expert placement uses global,
+parameter geometry without a native context. It projects from
+`conditional::definition`, which retains target invocation paths and mutable-state
+slots alongside stateless vision units, graph dependencies and transport contracts.
+Complete and selected conditional construction validate and retain this definition
+in an `Arc` before native allocation. Runtime metadata and address checks project
+from that authority; selected definitions retain canonical parameter placement
+with tensor-local target state geometry. Consuming expert selection validates the
+updated definition before publishing the composition.
+Cold joint requirements project their graph, unit layout, transport and state
+from this same declaration before execution selection.
+Tensor/expert placement uses global,
 tensor-local and expert-local declarations; `TargetSpec::with_expert_realization`
 consumes geometry and validates the exact admitted expert identities before
 returning the local specification. Native target updates use the same selection

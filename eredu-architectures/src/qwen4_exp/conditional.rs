@@ -18,7 +18,7 @@ pub mod prefill;
 const TARGET_INDEX: usize = 0;
 const VISION_INDEX: usize = 1;
 
-pub(crate) fn graph() -> Result<ExecutionGraph, Error> {
+fn graph() -> Result<ExecutionGraph, Error> {
     // Flat parameter-bank coordinates stay target-first. Dependency order is
     // independent of declaration order, so the encoder still executes first.
     ExecutionGraph::new(
@@ -35,6 +35,54 @@ pub(crate) fn graph() -> Result<ExecutionGraph, Error> {
 }
 /// Composes retained target storage and vision geometry without native resources.
 pub fn parameter_description(
+    target: &ComponentDefinition,
+    vision: &VisionConfig,
+) -> Result<ArchitectureParameterDescription, Error> {
+    Ok(definition(target, vision)?.parameters().clone())
+}
+
+/// Validates target and optional vision invocations before native construction.
+pub fn definition(
+    target: &ComponentDefinition,
+    vision: &VisionConfig,
+) -> Result<ComponentDefinition, Error> {
+    definition_with_parameters(target, vision, declare_parameters(target, vision)?)
+}
+
+fn definition_with_parameters(
+    target: &ComponentDefinition,
+    vision: &VisionConfig,
+    parameters: ArchitectureParameterDescription,
+) -> Result<ComponentDefinition, Error> {
+    let mut units = (0..target.unit_count(TARGET_INDEX)?)
+        .map(|index| {
+            target
+                .unit(TARGET_INDEX, index)
+                .cloned()
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    units.extend((0..vision.layer_count()).map(|index| ComponentUnit {
+        path: format!("model.visual.blocks.{index}"),
+        state: 0..0,
+    }));
+    ComponentDefinition::new(
+        "qwen4_exp_conditional",
+        parameters,
+        units,
+        vec![
+            target.group_transport(TARGET_INDEX)?.clone(),
+            vision_transport(),
+        ],
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        vec![],
+        target.state_layout().clone(),
+        target.state_partition_plan().clone(),
+    )
+    .map_err(Error::from)
+}
+
+fn declare_parameters(
     target: &ComponentDefinition,
     vision: &VisionConfig,
 ) -> Result<ArchitectureParameterDescription, Error> {
@@ -73,7 +121,7 @@ pub fn parameter_description(
     .map_err(Error::backend)
 }
 
-pub(crate) fn vision_transport() -> ArchitectureGroupTransport {
+fn vision_transport() -> ArchitectureGroupTransport {
     ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::VisionEncoder,
@@ -224,7 +272,7 @@ pub struct ConditionalModel<B: GroupedNeuralBackend + DistributedNeuralBackend> 
     vision_local: Option<Vec<(i32, i32)>>,
     vision_input_owner: bool,
     partition_state: Option<PartitionState>,
-    global_parameters: Option<ArchitectureParameterDescription>,
+    definition: std::sync::Arc<ComponentDefinition>,
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
     /// Constructs pinned modules only; encoder and target units are built on demand.
@@ -235,6 +283,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         validate_ingress(spec.geometry(), &ingress, &vision)?;
+        let definition = std::sync::Arc::new(definition(&spec.geometry().definition()?, &vision)?);
         Ok(Self {
             modules: ConditionalStatic {
                 target: TargetKernel::new(spec, context)?,
@@ -245,7 +294,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             vision_local: None,
             vision_input_owner: true,
             partition_state: None,
-            global_parameters: None,
+            definition,
         })
     }
     fn begin_media<S>(
@@ -422,18 +471,18 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
     pub fn ingress(&self) -> &MediaIngress {
         &self.ingress
     }
+    /// Retained target/vision invocation, parameter, state and transport authority.
+    pub fn definition(&self) -> &ComponentDefinition {
+        &self.definition
+    }
     fn unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self.modules.target.spec.units.len()),
-            1 => Ok(self.vision.layer_count()),
-            _ => Err(Error::backend("conditional execution group out of bounds")),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn check_unit(&self, group: usize, index: usize) -> Result<(), Error> {
-        if index >= self.unit_count(group)? {
-            return Err(Error::backend("conditional unit out of bounds"));
-        }
-        Ok(())
+        self.definition
+            .unit(group, index)
+            .map(|_| ())
+            .map_err(Error::from)
     }
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<B>
@@ -441,7 +490,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
 {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<StateLayout, Error> {
-        Ok(self.modules.target.definition().state_layout().clone())
+        Ok(self.definition.state_layout().clone())
     }
     fn state_identity(
         &self,
@@ -466,10 +515,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        if let Some(parameters) = &self.global_parameters {
-            return Ok(parameters.clone());
-        }
-        parameter_description(self.modules.target.definition(), &self.vision)
+        Ok(self.definition.parameters().clone())
     }
 
     fn static_parameter_recipes(
@@ -575,38 +621,32 @@ where
         )
     }
     fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        graph()
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
         self.unit_count(group)
     }
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
-        if group == VISION_INDEX {
-            vision_transport()
-        } else {
-            crate::transport::decoder()
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated conditional group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
+        self.definition.primary_group()
     }
-    fn state_partition_plan(&self, layout: &StateLayout) -> ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(TARGET_INDEX, layout)
+    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
+        self.definition.state_partition_plan().clone()
     }
     fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
-        if group == TARGET_INDEX {
-            index
-        } else {
-            0
-        }
+        self.definition
+            .unit(group, index)
+            .expect("validated conditional unit")
+            .state
+            .start
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.check_unit(group, index)?;
-        Ok(if group == VISION_INDEX {
-            format!("model.visual.blocks.{index}")
-        } else {
-            self.modules.target.spec.units[index].path()
-        })
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
         &self.modules
