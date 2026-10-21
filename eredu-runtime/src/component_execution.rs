@@ -606,6 +606,19 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+    /// Enters a validated group at its architecture-owned collective wave.
+    fn begin_group_parallel(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.begin_group(group, initial, dependencies, state, forward, context)
+    }
     /// Closes the same group under an admitted parallel context.
     fn complete_group_parallel(
         &mut self,
@@ -858,6 +871,25 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
             return Err(ComponentDefinitionError::Invalid {
                 component: self.definition().id.clone(),
                 resource: format!("partition group {group}"),
+            });
+        }
+        Ok(())
+    }
+    fn validate_group_dependencies(
+        &self,
+        group: usize,
+        count: usize,
+    ) -> Result<(), ComponentDefinitionError> {
+        if self
+            .definition()
+            .parameters
+            .graph()
+            .dependencies(group)
+            .is_none_or(|declared| declared.len() != count)
+        {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.definition().id.clone(),
+                resource: format!("dependencies for group {group}"),
             });
         }
         Ok(())
@@ -1249,19 +1281,7 @@ where
         forward: &mut K::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
-        if self
-            .definition()
-            .parameters
-            .graph()
-            .dependencies(group)
-            .is_none_or(|declared| declared.len() != dependencies.len())
-        {
-            return Err(ComponentDefinitionError::Invalid {
-                component: self.definition().id.clone(),
-                resource: format!("dependencies for group {group}"),
-            }
-            .into());
-        }
+        self.validate_group_dependencies(group, dependencies.len())?;
         self.kernel
             .begin_group(group, initial, dependencies, state, forward, context)
     }
@@ -1442,6 +1462,27 @@ where
             self.address(group, index)?,
             unit,
             hidden,
+            state,
+            forward,
+            parallel,
+            context,
+        )
+    }
+    fn begin_execution_group_parallel(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        state: &mut S,
+        forward: &mut K::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, K::Error> {
+        self.validate_group_dependencies(group, dependencies.len())?;
+        self.kernel.begin_group_parallel(
+            group,
+            initial,
+            dependencies,
             state,
             forward,
             parallel,

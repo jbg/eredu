@@ -9047,6 +9047,11 @@ authoritative parameter on each invocation. It does not retain a separate gain
 tensor across parameter replacement or unloading, so overlays and residency
 transitions cannot reuse a stale derived parameter.
 
+Shared component adapters validate group identities and dependency cardinality
+before serial or parallel group ingress. Parallel kernels can place token lookup
+or another collective at the group's declared wave; the default uses the ordinary
+group equation. Invalid ingress cannot advance kernel state or issue a collective.
+
 Muse component execution uses a single architecture-owned block driver for
 ordinary, provider-backed, tensor-parallel, and observed calls. Its hooks expose
 the actual gated attention channels and FFN units before their selected output

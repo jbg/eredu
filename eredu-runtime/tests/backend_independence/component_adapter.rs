@@ -637,6 +637,20 @@ impl eredu_runtime::ParallelComponentKernel<FakeBackend, CarryState> for CarryKe
     ) -> Result<LayeredForwardState<FakeTensor, ()>, Failure> {
         self.begin(input, state, context)
     }
+    fn begin_group_parallel(
+        &mut self,
+        group: usize,
+        input: &FakeTensor,
+        dependencies: &[&FakeTensor],
+        state: &mut CarryState,
+        forward: &mut (),
+        _: &(),
+        context: &(),
+    ) -> Result<FakeTensor, Failure> {
+        // A collective-wave ingress advances carry only after graph validation.
+        state.layer(0).unwrap().0 .0[0] += 1;
+        self.begin_group(group, input, dependencies, state, forward, context)
+    }
     fn execute_parallel(
         &mut self,
         address: ExecutionUnitAddress,
@@ -1140,4 +1154,39 @@ fn component_group_completion_preserves_dependencies_capture_and_retry() {
     let expected = resident.forward(&input, &mut state, &()).unwrap();
     assert_eq!(expected.0, [7, 0, 100, 10, 101, 7, 0]);
     assert_eq!(bounded.forward(&input, &mut state, &()).unwrap(), expected);
+}
+
+#[test]
+fn component_parallel_group_ingress_validates_before_advancing_state() {
+    let declaration = carry_definition();
+    let mut state = carry_state(declaration.state_layout().clone());
+    let mut adapter = ComponentAdapter::new(
+        declaration,
+        CarryKernel {
+            offset: 0,
+            has_ingress: false,
+        },
+    )
+    .unwrap();
+    let input = FakeTensor(vec![7]);
+    let before = state.layer(0).unwrap().0 .0[0];
+    for (group, dependencies) in [(0, vec![&input]), (1, vec![])] {
+        assert!(adapter
+            .begin_execution_group_parallel(
+                group,
+                &input,
+                &dependencies,
+                &mut state,
+                &mut (),
+                &(),
+                &(),
+            )
+            .is_err());
+        assert_eq!(state.layer(0).unwrap().0 .0[0], before);
+    }
+    let result = adapter
+        .begin_execution_group_parallel(0, &input, &[], &mut state, &mut (), &(), &())
+        .unwrap();
+    assert_eq!(result.0, input.0);
+    assert_eq!(state.layer(0).unwrap().0 .0[0], before + 1);
 }
