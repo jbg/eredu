@@ -1,12 +1,10 @@
 //! Shared traversal adapter; no family-specific generation or residency engine.
 use super::*;
-use eredu_nn::{Parameterized, RotaryPosition};
+use eredu_nn::RotaryPosition;
 use eredu_runtime::{
-    module_parameter_group, ArchitectureParameterDescription, ArchitectureParameters,
-    ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterRole,
-    ResidentExpertProvider, RoutedLayeredArchitecture, StaticParameterVisitor,
-    StaticParameterVisitorMut,
+    ArchitectureParameterDescription, ArchitectureParameters, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, ResidentExpertProvider, RoutedLayeredArchitecture,
+    StaticParameterVisitor, StaticParameterVisitorMut,
 };
 
 /// Original IDs plus optional already-replaced media embeddings for one target pass.
@@ -204,74 +202,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
     }
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
         if let Some(parameters) = &self.global_parameters {
             return Ok((**parameters).clone());
         }
-        let graph = self.decoder.execution_graph()?;
-        let layout =
-            ExecutionUnitLayout::new(&graph, [self.spec.units.len()]).map_err(Error::backend)?;
-        let mut expected = Vec::new();
-        let mut owned = Vec::new();
-        fn add<T: Tensor, M: Parameterized<T>>(
-            name: &str,
-            role: ParameterRole,
-            owner: ParameterGroupOwner,
-            module: &M,
-            expected: &mut Vec<eredu_runtime::ParameterGroupSpec>,
-            owned: &mut Vec<OwnedParameterGroupSpec>,
-        ) -> Result<(), Error> {
-            let group =
-                module_parameter_group(name, role, module, |_, _| Ok(MemberSharding::Replicated))
-                    .map_err(Error::backend)?;
-            expected.push(group.clone());
-            owned.push(OwnedParameterGroupSpec::new(owner, group));
-            Ok(())
-        }
-        let modules = self.decoder.static_modules();
-        add(
-            "embedding",
-            ParameterRole::Vocabulary,
-            if self.spec.head.is_none() {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role("embedding")
-            },
-            &modules.embeddings,
-            &mut expected,
-            &mut owned,
-        )?;
-        add(
-            "readout",
-            ParameterRole::Replicated,
-            ParameterGroupOwner::static_role("norm"),
-            &modules.boundary,
-            &mut expected,
-            &mut owned,
-        )?;
-        if let Some(head) = &modules.lm_head {
-            add(
-                "output",
-                ParameterRole::Vocabulary,
-                ParameterGroupOwner::static_role("output"),
-                head,
-                &mut expected,
-                &mut owned,
-            )?;
-        }
-        for (index, spec) in self.spec.units.iter().enumerate() {
-            add(
-                &spec.path(),
-                ParameterRole::Replicated,
-                ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), index),
-                &self.construct_unit(index, context)?,
-                &mut expected,
-                &mut owned,
-            )?;
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
+        self.spec.parameter_description()
     }
     fn static_parameter_recipes(
         &self,

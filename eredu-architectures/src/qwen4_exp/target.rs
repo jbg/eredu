@@ -25,6 +25,8 @@ use eredu_runtime::{
 };
 use std::collections::BTreeMap;
 
+mod parameters;
+
 /// Bounds retained by target construction, independently of table/cache residency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetLimits {

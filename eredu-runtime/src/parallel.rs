@@ -205,7 +205,8 @@ impl ParameterMemberSpec {
         }
     }
 
-    fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
+    /// Retains canonical encoding relationships from a backend-neutral parameter declaration.
+    pub fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
         self.linear_row_layout = metadata.linear_row_layout;
         self.linear_companion = metadata.linear_companion;
         self.linear_companion_of = metadata

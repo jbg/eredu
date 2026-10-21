@@ -65,10 +65,7 @@ impl PreparedTargetPartition {
             .geometry()
             .tensor_partition(rank.tensor_parallel_rank(), rank.tensor_parallel_size())
             .map_err(invalid)?;
-        let global_model = TargetModel::<B>::new(bound.clone(), context).map_err(invalid)?;
-        let mut parameters = global_model
-            .parameter_description(context)
-            .map_err(invalid)?;
+        let mut parameters = bound.geometry().parameter_description().map_err(invalid)?;
         let mut model = TargetModel::<B>::new_tensor_parallel(bound, tensor.clone(), context)
             .map_err(invalid)?;
         let local_parameters = model.parameter_description(context).map_err(invalid)?;
@@ -112,10 +109,9 @@ impl PreparedTargetPartition {
         let source_architecture =
             if crate::replicated_text::selected_uses_transform(selected.base().text()) {
                 let source_bound = source_partition.source_bound_spec().clone();
-                let source_global =
-                    TargetModel::<B>::new(source_bound.clone(), context).map_err(invalid)?;
-                let source_parameters = source_global
-                    .parameter_description(context)
+                let source_parameters = source_bound
+                    .geometry()
+                    .parameter_description()
                     .map_err(invalid)?;
                 validate_transform_parameter_space(&source_parameters, &parameters)
                     .map_err(invalid)?;

@@ -10808,6 +10808,16 @@ sublayer. Checkpoint layer numbers and execution ordinals remain distinct, inclu
 expert/table owners. The target uses `HybridDecoder` vocabulary handling and the shared
 resident, host-layerwise and disk-streamed execution machinery.
 
+`TargetSpec::parameter_description` declares canonical parameter ownership and
+physical shapes without a device or native module. It uses the exact selected
+recurrent, indexed, lexical and feed-forward specifications, including independent
+expert identities and tied vocabulary consumers. Runtime expands declared linear
+encodings and their companions. Row-table payloads remain in their independently
+admitted providers. Target inspection and global partition/transform-source
+planning consume this declaration without constructing temporary global models.
+Parameter-member declarations retain neutral encoding relationships through
+`ParameterMemberSpec::with_parameter_metadata`.
+
 `DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse;
 the shared shell owns vocabulary parameters, collectives, execution groups and readout
 instrumentation. `NormalizedBoundary` supplies ordinary normalization. Flash-Next's
