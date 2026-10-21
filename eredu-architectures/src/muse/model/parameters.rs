@@ -15,10 +15,11 @@ pub(crate) fn describe(args: &DecoderConfig) -> Result<ArchitectureParameterDesc
     let layout =
         ExecutionUnitLayout::new(&graph, counts.iter().copied()).map_err(Error::backend)?;
     let text_static = static_parameter_groups(args).map_err(Error::backend)?;
-    let vision_static = vision_static_parameter_groups(args).map_err(Error::backend)?;
+    let vision_static = crate::muse::parallel::vision_static_resource_groups(args)
+        .map_err(Error::backend_source)?;
     let mut expected = text_static
         .iter()
-        .chain(&vision_static)
+        .chain(vision_static.iter().map(|(_, group)| group))
         .cloned()
         .collect::<Vec<_>>();
     let mut owned = text_static
@@ -38,12 +39,13 @@ pub(crate) fn describe(args: &DecoderConfig) -> Result<ArchitectureParameterDesc
                 group,
             )
         })
-        .chain(vision_static.into_iter().map(|group| {
-            let consumers = crate::muse::parallel::vision_static_consumer_units(
-                args,
-                group.members()[0].target(),
-            )
-            .expect("declared Muse vision static group has consumers");
+        .chain(vision_static.into_iter().map(|(resource, group)| {
+            let consumers = resource.consumers(
+                args.vision_config
+                    .as_ref()
+                    .expect("declared vision")
+                    .layer_count(),
+            );
             OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::static_unit_consumers(
                     "vision",

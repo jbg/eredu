@@ -31,9 +31,8 @@ use crate::{
 
 use super::{
     layer_parameter_groups, state_layout, static_parameter_groups, vision_layer_parameter_groups,
-    vision_static_parameter_groups, DecoderConfig, LocalGeometry,
-    StaticModules as TextStaticModules, TransformerBlock, VisionBlock, VisionInput, VisionState,
-    VisionStatic,
+    DecoderConfig, LocalGeometry, StaticModules as TextStaticModules, TransformerBlock,
+    VisionBlock, VisionInput, VisionState, VisionStatic,
 };
 
 /// Prepared encoder products survive bounded decoder-prefill transactions.

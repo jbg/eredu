@@ -52,7 +52,9 @@ pub use parallel::{
     PartitionLocalFoundation, PartitionLocalGeometry,
 };
 pub use text::{Attention, FeedForward, Mlp, SparseMoe, StaticModules, TransformerBlock};
-pub use vision::{VisionBlock, VisionInput, VisionState, VisionStatic, VisionTower};
+pub use vision::{
+    VisionBlock, VisionInput, VisionState, VisionStatic, VisionStaticSelection, VisionTower,
+};
 
 /// Declares canonical expert ownership and TP/EP-local bank geometry without native resources.
 pub fn expert_realization_plan(

@@ -4501,6 +4501,16 @@ canonical bindings select optional text owners before native allocation through
 foreign, duplicate or incomplete module groups, resolves tied aliases, and leaves
 sibling component resources independent. Selected untied projection requires
 its declared head even when an input table is retained.
+Muse vision groups declare semantic block owners and independently materialized
+patch/position, static-normalization, adapter and projection resources. Full,
+static and per-block parameter reports project these identities. Cold
+`VisionStaticSelection` resolves canonical bindings through runtime
+`select_pinned_groups`; each group includes its encoded companions. Native
+materialization allocates only the retained modules, and ingress, adaptation and
+readout validate their required resources before equations or observation hooks.
+The current vision ownership retains patch/position and static norms on every
+vision owner, and retains the language adapter and projection on the final owner.
+Request-local permutation and rotary tensors keep the same completion lifetime.
 Distinct registered identities select typed attention,
 normalization, residual, feed-forward and media policies. The backend binds the
 retained declarations through ordinary native mechanisms and selects no family

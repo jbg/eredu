@@ -444,6 +444,19 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
     assert!(complete
         .select_complete_pinned_roles(groups, &["embedding"])
         .is_err());
+    // Independent resources within a role retain their own canonical group admission.
+    assert_eq!(
+        complete
+            .select_pinned_groups(groups, &["embedding"])
+            .unwrap(),
+        vec![&complete_groups[0]],
+    );
+    assert!(complete
+        .select_pinned_groups(
+            &[complete_groups[0].clone(), complete_groups[0].clone()],
+            &["embedding"]
+        )
+        .is_err());
     assert!(declaration
         .select_complete_pinned_roles(&[companion], &["embedding"])
         .is_err());
