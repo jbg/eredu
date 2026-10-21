@@ -68,6 +68,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        self.execution_address(group, index)?;
         if group != 1 {
             return <Self as LayeredArchitecture<B, S>>::forward_unit(
                 self, group, index, unit, hidden, state, forward, context,
@@ -121,6 +122,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        self.execution_address(group, index)?;
         if group != 1 {
             return <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
                 self, group, index, unit, hidden, state, forward, parallel, context,

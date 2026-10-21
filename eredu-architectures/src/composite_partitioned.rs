@@ -2275,20 +2275,13 @@ where
                 )
                 .map_err(CompositePartitionPreparationError::Architecture)?;
             }
-            let mut architecture =
-                crate::muse::LayeredModel::<B>::new_parallel(args.clone(), local, context)
-                    .and_then(|architecture| {
-                        architecture.with_partition_state(partition.state().cloned().ok_or_else(
-                            || {
-                                eredu_nn::Error::backend(
-                                    "Muse selected partition has no state ownership",
-                                )
-                            },
-                        )?)
-                    })
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+            let mut architecture = crate::muse::LayeredModel::<B>::from_partition(
+                args.clone(),
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if let Some(realization) = &realization {
                 architecture = architecture
                     .with_expert_realization(realization.clone())
@@ -3116,12 +3109,7 @@ where
     crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
         .map_err(|error| error.to_string())?;
     let mut architecture =
-        crate::muse::LayeredModel::<B>::new_parallel(source.clone(), local, context)
-            .and_then(|architecture| {
-                architecture.with_partition_state(partition.state().cloned().ok_or_else(|| {
-                    eredu_nn::Error::backend("Muse selected partition has no state ownership")
-                })?)
-            })
+        crate::muse::LayeredModel::<B>::from_partition(source.clone(), local, &partition, context)
             .map_err(|error| error.to_string())?;
     if let Some(realization) = realization {
         architecture = architecture

@@ -4519,9 +4519,19 @@ Request-local permutation and rotary tensors keep the same completion lifetime.
 Muse target and transform-source preparation construct the authoritative
 `ArchitecturePartition` from the component definition before native construction.
 They validate selected state ownership and dense/routed local geometry there.
-Native construction receives the partition's state projection; shared preparation
-consumes the retained partition and canonical bindings. Decoder KV and waveform histories retain independent global slots and
-explicit stateless gaps across pipeline cuts.
+Native construction consumes that partition's shared `ComponentSelection` and
+canonical text/vision bindings; shared preparation retains the same authoritative
+partition. Complete and selected Muse models use one native construction path.
+Selected models allocate only owned pinned resources and acquire units through the
+runtime selection's global addresses. Receiver ingress retains token roots and
+request activity without unowned embedding lookups or vision projections; actual
+hidden values enter through the declared transport boundary. Vision activity is
+independent of locally retained vision equation state, and tied output storage
+does not authorize token ingress on a decoder receiver. Pinned recipe destinations
+follow the actually retained modules. Static and unit recipe groups resolve only
+their participating expert banks, so restricted sources require no neighboring
+layer or bank payloads. Decoder KV and waveform histories retain independent
+global slots and explicit stateless gaps across pipeline cuts.
 Distinct registered identities select typed attention,
 normalization, residual, feed-forward and media policies. The backend binds the
 retained declarations through ordinary native mechanisms and selects no family

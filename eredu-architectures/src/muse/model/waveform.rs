@@ -40,8 +40,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     Error::backend("Muse waveform input requires an admitted audio tower")
                 })?,
                 input,
-                self.partition_state
-                    .as_ref()
+                self.selected_state()
                     .and_then(|state| {
                         state
                             .selected_global_layers()
@@ -59,15 +58,38 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             None => None,
         };
         self.align_media_clocks(audio.is_some(), decoder_positions, state)?;
+        let vision_active = vision_input.is_some();
         let (vision_hidden, vision) = match vision_input {
             Some(input) => {
-                let (hidden, state) = self
+                let config = self.args.vision_config.as_ref().ok_or_else(|| {
+                    Error::backend("Muse input requires an admitted vision tower")
+                })?;
+                eredu_nn::sequence_layout::validate_patch_grid(
+                    input.grid,
+                    config.merge_size,
+                    Some(input.pixels.dim(0)),
+                )
+                .map_err(Error::backend)?;
+                if input.pixels.shape().len() != 2
+                    || input.pixels.dim(1)
+                        != config.temporal_patch_size * 3 * config.patch_size * config.patch_size
+                {
+                    return Err(Error::backend(
+                        "Muse vision input has incompatible patch geometry",
+                    ));
+                }
+                match self
                     .static_modules
                     .vision
                     .as_mut()
-                    .ok_or_else(|| Error::backend("Muse input requires an admitted vision tower"))?
-                    .begin(input, context)?;
-                (Some(hidden), Some(state))
+                    .filter(|vision| vision.has_parameters())
+                {
+                    Some(vision) => {
+                        let (hidden, state) = vision.begin(input, context)?;
+                        (Some(hidden), Some(state))
+                    }
+                    None => (None, None),
+                }
             }
             None => (None, None),
         };
@@ -77,7 +99,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let hidden = match (vision_hidden, waveform.as_ref()) {
             (Some(hidden), _) => hidden,
             (None, Some(waveform)) => waveform.clone(),
-            (None, None) => self.assemble(&parts, None, None, context)?,
+            (None, None) if self.owns_input && !vision_active => {
+                self.assemble(&parts, None, None, context)?
+            }
+            (None, None) => {
+                let batch = match parts
+                    .first()
+                    .ok_or_else(|| Error::backend("Muse request has no input parts"))?
+                {
+                    PreparedPart::Text { tokens, .. }
+                    | PreparedPart::PendingText { tokens }
+                    | PreparedPart::Audio { tokens }
+                    | PreparedPart::Media { tokens } => tokens.dim(0),
+                };
+                B::Tensor::full_f32(
+                    0.0,
+                    &[batch, decoder_positions, self.args.hidden_size],
+                    context,
+                )?
+            }
         };
         Ok(LayeredForwardState {
             hidden,
@@ -85,6 +125,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 mask: mask.cloned(),
                 parts,
                 vision,
+                vision_active,
                 audio,
                 waveform,
                 decoder_positions,

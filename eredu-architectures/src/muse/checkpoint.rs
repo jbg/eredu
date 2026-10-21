@@ -807,7 +807,12 @@ fn select_safetensors_recipe_group<C: RecipeCatalog + ?Sized>(
         .map_or(0, |vision| vision.layer_count());
     let text_layers = dimension(args.num_hidden_layers, "text layer count")?;
     let mut selected_recipes = BTreeMap::new();
-    for (target, recipe) in safetensors_recipes(args, catalog)? {
+    let mut recipes = direct_safetensors_recipes(&safetensors_plan(args)?, catalog);
+    if let Some((1, layer)) = selected.filter(|_| args.is_moe()) {
+        let expert = safetensors_expert_recipes(catalog, args, layer)?;
+        recipes.extend(gated_product_materialization_recipes(catalog, &expert)?);
+    }
+    for (target, recipe) in recipes {
         let owner = if target.starts_with("model.audio_tower.") {
             let audio = args
                 .audio_config

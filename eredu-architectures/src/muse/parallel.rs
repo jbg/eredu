@@ -165,6 +165,36 @@ impl PartitionLocalGeometry {
         self.audio_units.clone()
     }
 
+    pub(super) fn validate_complete_geometry(
+        &self,
+        args: &DecoderConfig,
+        complete: &LocalGeometry,
+    ) -> Result<(), ParallelPlanError> {
+        self.validate_for(args)?;
+        complete.validate_for(args)?;
+        if self.complete_state_layout != complete.state_layout
+            || self.embedding_range != complete.embedding_range
+            || self.output_range != complete.output_range
+        {
+            return Err(invalid(
+                "selected Muse geometry differs from complete placement",
+            ));
+        }
+        for unit in self.text_units.clone() {
+            let expected = complete
+                .text_block(unit)
+                .ok_or_else(|| invalid("missing complete Muse text geometry"))?;
+            if self.text_block(unit).is_none_or(|block| {
+                block.architecture_fingerprint() != expected.architecture_fingerprint()
+            }) {
+                return Err(invalid(
+                    "selected Muse text block differs from complete placement",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_state(
         &self,
         state: &eredu_runtime::PartitionState,
