@@ -8686,7 +8686,16 @@ boundaries carry contributions expanded to the complete decoder sequence,
 matching their wire schema and removing the
 receiver's need for the original visual mask. Expansion and target-unit addition
 use the same contribution equation and preserve observation attribution.
-Conditional Qwen retains its vision/text driver and media assembly.
+Conditional Qwen uses `ComponentAdapter<Arc<ComponentDefinition>, ConditionalKernel,
+KernelParameterModules>` for full and selected vision/text execution. One retained
+kernel supplies ordinary, parallel, routed, observed and partition equations;
+the shared adapter supplies the runtime contracts, validated addresses, graph
+projections, parameter traversal, state ownership and completion roots. Composite
+hooks retain media admission, assembly and transport geometry. Composition consumes
+the authoritative cold partition used for materialization, including its global
+state offsets and selected local state.
+Low-level media, prediction and restricted-state operations live on
+`ConditionalKernel`; constructors return the shared adapter.
 
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden

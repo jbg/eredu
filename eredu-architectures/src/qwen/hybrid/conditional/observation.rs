@@ -1,7 +1,7 @@
 //! Target component seams over the ordinary conditional block and media drivers.
 use super::*;
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKernel<B> {
     fn observed_target_entry<O>(
         &self,
         group: usize,
@@ -28,8 +28,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
 
     pub(super) fn forward_target_observed<S, P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut ConditionalUnit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -45,9 +44,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let (group, index) = (address.group(), address.index());
         if group == 0 {
-            return <Self as LayeredArchitecture<B, S>>::forward_unit(
-                self, group, index, unit, hidden, state, forward, context,
+            return <Self as eredu_runtime::ComponentEquations<B, S>>::execute(
+                self, address, unit, hidden, state, forward, context,
             );
         }
         if group != 1 {
@@ -110,12 +110,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    ConditionalLayeredModel<B>
+    ConditionalKernel<B>
 {
     pub(super) fn forward_target_parallel_observed<S, P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut ConditionalUnit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -132,9 +131,10 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let (group, index) = (address.group(), address.index());
         if group == 0 {
-            return <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
-                self, group, index, unit, hidden, state, forward, parallel, context,
+            return <Self as eredu_runtime::ParallelComponentKernel<B, S>>::execute_parallel(
+                self, address, unit, hidden, state, forward, parallel, context,
             );
         }
         if group != 1 {

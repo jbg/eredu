@@ -8386,7 +8386,7 @@ where
             .then(|| qwen_hybrid_composite_with_formats(args, self.source_linear_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args, self.context))
+            .map(|args| crate::qwen::hybrid::ConditionalKernel::<B>::new(args, self.context))
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = qwen_hybrid_composite_with_formats(args, self.target_linear_formats.clone())
@@ -8395,7 +8395,7 @@ where
         let cache_identity =
             crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
         let architecture =
-            crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(target, self.context)
+            crate::qwen::hybrid::ConditionalKernel::<B>::new(target, self.context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
@@ -8522,7 +8522,7 @@ where
                 .then(|| qwen_hybrid_composite_with_formats(args, source_linear_formats))
                 .transpose()
                 .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args, context))
+                .map(|args| crate::qwen::hybrid::ConditionalKernel::<B>::new(args, context))
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let target = qwen_hybrid_composite_with_formats(args, target_linear_formats)
@@ -8530,10 +8530,8 @@ where
             let effective_model_type = target.text.model_type.clone();
             let cache_identity =
                 crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
-            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(
-                target, context,
-            )
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture = crate::qwen::hybrid::ConditionalKernel::<B>::new(target, context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             visit_constructed_prediction_target!(
                 architecture,
                 source,

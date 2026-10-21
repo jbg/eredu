@@ -39,7 +39,7 @@ pub use checkpoint::{
     translate_vision_gguf_weight_name, unit_recipes,
 };
 pub use conditional::{
-    ConditionalForwardContext, ConditionalInput, ConditionalLayeredModel,
+    ConditionalForwardContext, ConditionalInput, ConditionalKernel, ConditionalLayeredModel,
     ConditionalPartitionInput, ConditionalPipelineBoundary, ConditionalPipelineBoundarySchema,
     ConditionalPipelinePrepared, ConditionalPipelineVisionState, ConditionalStaticModules,
     ConditionalUnit, VISION_EXECUTION_GROUP,

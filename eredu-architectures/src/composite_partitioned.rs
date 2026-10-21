@@ -1762,27 +1762,33 @@ where
     macro_rules! prepare {
         ($architecture:expr, $parameters:expr, $geometry:expr, $partition_geometry:expr,
          $capability:expr, $effective:expr, $output_width:expr, $foundation:expr,
-         $routed:expr $(, $source:expr)?) => {{
+         $routed:expr $(, $source:expr)? $(; partition = $retained:expr)?) => {{
             let source_architecture = None$(.or($source))?;
             let architecture = $architecture;
-            let boundary =
-                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+            let partition = None$(.or(Some($retained)))?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    let boundary =
+                        <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?;
+                    ArchitecturePartition::from_architecture::<B, S, _, _>(
+                        &architecture,
+                        selected
+                            .requirements()
+                            .groups()
+                            .iter()
+                            .map(|group| (group.group().as_str(), group.units())),
+                        selected.requirements().ownership().clone(),
+                        $partition_geometry,
+                        boundary,
+                        &$parameters,
+                    )
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-                &architecture,
-                selected
-                    .requirements()
-                    .groups()
-                    .iter()
-                    .map(|group| (group.group().as_str(), group.units())),
-                selected.requirements().ownership().clone(),
-                $partition_geometry,
-                boundary,
-                &$parameters,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+                    })
+                })?;
             if selected.requirements().state() != partition.state() {
                 return Err(CompositePartitionPreparationError::Architecture(
                     "constructed composite partition state differs from cold admission".into(),
@@ -2522,18 +2528,17 @@ where
                 boundary,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture =
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::from_partition(
-                    args.clone(),
-                    local,
-                    &partition,
-                    context,
-                )
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+            let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
+                args.clone(),
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if let Some(plan) = &realization {
-                architecture.install_expert_realization(plan.clone());
+                architecture
+                    .kernel_mut()
+                    .install_expert_realization(plan.clone());
             }
             let routed_execution = realization
                 .clone()
@@ -2590,7 +2595,7 @@ where
                         .map_err(|error| error.to_string()),
                     }
                 },
-                routed_execution
+                routed_execution; partition = partition
             )
         }
         CompositeConfig::Inkling(source) => {
@@ -3263,27 +3268,33 @@ where
     macro_rules! finish_prediction_target {
         ($target:ty, $architecture:expr, $parameters:expr, $layout:expr, $geometry:expr,
          $capability:expr, $effective:expr, $output_width:expr, $foundation:expr,
-         $routed:expr $(, $source:expr)?) => {{
+         $routed:expr $(, $source:expr)? $(; partition = $retained:expr)?) => {{
             let source_architecture = None$(.or($source))?;
             let architecture = $architecture;
-            let boundary =
-                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+            let partition = None$(.or(Some($retained)))?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    let boundary =
+                        <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?;
+                    ArchitecturePartition::from_architecture::<B, S, _, _>(
+                        &architecture,
+                        selected
+                            .requirements()
+                            .groups()
+                            .iter()
+                            .map(|group| (group.group().as_str(), group.units())),
+                        selected.requirements().ownership().clone(),
+                        $geometry.clone(),
+                        boundary,
+                        &$parameters,
+                    )
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-                &architecture,
-                selected
-                    .requirements()
-                    .groups()
-                    .iter()
-                    .map(|group| (group.group().as_str(), group.units())),
-                selected.requirements().ownership().clone(),
-                $geometry.clone(),
-                boundary,
-                &$parameters,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+                    })
+                })?;
             if selected.requirements().state() != partition.state() {
                 return Err(CompositePartitionPreparationError::Architecture(
                     "constructed composite prediction partition state differs from cold admission"
@@ -3428,18 +3439,17 @@ where
                 boundary,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture =
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::from_partition(
-                    args.clone(),
-                    local,
-                    &partition,
-                    context,
-                )
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+            let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
+                args.clone(),
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if let Some(plan) = &realization {
-                architecture.install_expert_realization(plan.clone());
+                architecture
+                    .kernel_mut()
+                    .install_expert_realization(plan.clone());
             }
             let routed_execution = realization
                 .clone()
@@ -3497,7 +3507,7 @@ where
                         .map_err(|error| error.to_string()),
                     }
                 },
-                routed_execution
+                routed_execution; partition = partition
             )
         }
         CompositeConfig::Inkling(source) => {
