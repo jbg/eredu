@@ -2,7 +2,7 @@
 use super::*;
 use crate::decoder::ComponentInstrumentation;
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
     fn component_text_entry<O>(
         &self,
         index: usize,
@@ -37,7 +37,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_components<S, P, O>(
         &mut self,
@@ -105,7 +105,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    LayeredModel<B>
+    VlKernel<B>
 {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_components_parallel<S, P, O>(

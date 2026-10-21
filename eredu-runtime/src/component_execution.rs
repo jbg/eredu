@@ -867,6 +867,27 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
             expected
         }
     }
+    /// A typed partition boundary can resume local state after stateless groups.
+    /// Pipeline ingress still validates the first selected group's optional geometry.
+    pub(crate) fn validate_partition_resume_state(
+        &self,
+        actual: Option<&StateLayout>,
+        expected: Option<&StateLayout>,
+    ) -> Result<(), ComponentDefinitionError> {
+        self.validate_partition_state(actual, None, None)?;
+        let declared = self
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.state.as_ref())
+            .map(PartitionState::layout);
+        if expected != declared {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.definition().id.clone(),
+                resource: "partition boundary state layout".into(),
+            });
+        }
+        Ok(())
+    }
     pub(crate) fn validate_partition_state(
         &self,
         actual: Option<&StateLayout>,

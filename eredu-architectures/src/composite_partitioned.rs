@@ -2393,7 +2393,7 @@ where
                 crate::qwen::vl::PipelineBoundarySchema::from_args(&args),
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let architecture = crate::qwen::vl::LayeredModel::<B>::from_partition(
+            let architecture = crate::qwen::vl::VlKernel::<B>::from_partition(
                 args.clone(),
                 local,
                 &partition,
@@ -2863,7 +2863,7 @@ where
     crate::qwen::vl::PartitionLocalFoundation::from_partition(&source, &partition)
         .map_err(|e| e.to_string())?;
     let architecture =
-        crate::qwen::vl::LayeredModel::<B>::from_partition(source, local, &partition, context)
+        crate::qwen::vl::VlKernel::<B>::from_partition(source, local, &partition, context)
             .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }

@@ -872,21 +872,56 @@ fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
             )
         })
         .is_err());
-    for step in 1..=3 {
+    let incorrect_resume = incorrect_entry.slice(0..1).unwrap();
+    assert!(runtime
+        .forward_with_preparation(&mut state, None, &(), |adapter, state, _| {
+            eredu_runtime::PartitionedLayeredArchitecture::begin_partition(
+                adapter,
+                LayeredPartitionInput::Hidden {
+                    hidden: input.clone(),
+                    auxiliary: NoAuxiliaryBoundary,
+                },
+                None,
+                state,
+                &incorrect_resume,
+                0,
+                &(),
+            )
+        })
+        .is_err());
+    for step in 1..=6 {
         let input = FakeTensor(vec![9]);
         let output = runtime
             .forward_with_preparation(&mut state, None, &(), |adapter, state, expected| {
-                eredu_runtime::PipelinePartitionArchitecture::begin_pipeline_partition(
-                    adapter,
-                    &input,
-                    None,
-                    state,
-                    expected,
-                    0,
-                    None,
-                    &(),
-                    &mut eredu_runtime::inspection::NoopObserver,
-                )
+                if step % 2 == 0 {
+                    // A boundary resumes the stateful group even when this rank
+                    // also owns an earlier stateless ingress group.
+                    let local = RuntimeState::<FakeBackend>::layout(state).clone();
+                    eredu_runtime::PartitionedLayeredArchitecture::begin_partition(
+                        adapter,
+                        LayeredPartitionInput::Hidden {
+                            hidden: input.clone(),
+                            auxiliary: NoAuxiliaryBoundary,
+                        },
+                        None,
+                        state,
+                        &local,
+                        0,
+                        &(),
+                    )
+                } else {
+                    eredu_runtime::PipelinePartitionArchitecture::begin_pipeline_partition(
+                        adapter,
+                        &input,
+                        None,
+                        state,
+                        expected,
+                        0,
+                        None,
+                        &(),
+                        &mut eredu_runtime::inspection::NoopObserver,
+                    )
+                }
             })
             .unwrap();
         let LayeredPartitionOutput::Final { output, .. } = output else {

@@ -8175,14 +8175,14 @@ where
             .then(|| qwen_vl_with_formats(args, self.source_linear_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::qwen::vl::LayeredModel::<B>::new(args, self.context))
+            .map(|args| crate::qwen::vl::VlKernel::<B>::new(args, self.context))
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = qwen_vl_with_formats(args, self.target_linear_formats.clone())
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = crate::qwen::vl::prompt_cache_architecture_fingerprint(&target);
-        let architecture = crate::qwen::vl::LayeredModel::<B>::new(target, self.context)
+        let architecture = crate::qwen::vl::VlKernel::<B>::new(target, self.context)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,

@@ -9097,6 +9097,20 @@ roots retain original prepared products, rotary values, position delta and
 DeepStack values. One readout equation over borrowed decoder resources serves
 ordinary, parallel, observed and low-level output operations.
 
+Full and selected Qwen3-VL execute through
+`ComponentAdapter<Arc<ComponentDefinition>, VlKernel, KernelParameterModules>`.
+The adapter and kernel retain the same definition. The adapter implements graph
+traversal, validated logical addressing, selected state and parameter ownership,
+pinned visitation, retained roots and the ordinary runtime contracts. Typed kernel
+hooks supply ordinary, parallel, routed, observed and partition equations.
+Ordinary units use the same provider-aware equation with the resident provider.
+Architecture composite hooks retain media admission, assembly, collective schedules
+and boundary geometry. Typed boundary resume validates the complete retained
+local state independently of earlier stateless groups; pipeline ingress validates
+the first selected group's optional state geometry. Both paths validate actual
+state and output ownership against the same retained selection. Constructors on `VlKernel` return the shared adapter;
+low-level pipeline and independent unit/state-view operations live on the kernel.
+
 Qwen3-VL's text traversal uses the ordinary Qwen decoder's component driver,
 including resident and independently supplied experts, rotary embeddings and
 local mutable state. Its architecture wrapper adds the assembled embedding and

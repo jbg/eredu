@@ -220,7 +220,7 @@ where
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let expected = self.partition_entry_layout(Some(expected));
-        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
+        self.validate_partition_resume_state(state.optional_layout(), expected)?;
         self.kernel_mut().begin_partition_observed(
             input,
             mask,
@@ -282,7 +282,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
         let expected = self.partition_entry_layout(Some(expected));
-        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
+        self.validate_partition_resume_state(state.optional_layout(), expected)?;
         self.kernel_mut().begin_partition(
             input,
             mask,
@@ -310,7 +310,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, K::ForwardContext>, K::Error> {
         let expected = self.partition_entry_layout(Some(expected));
-        self.validate_partition_state(state.optional_layout(), Some(expected), None)?;
+        self.validate_partition_resume_state(state.optional_layout(), expected)?;
         self.kernel_mut().begin_partition(
             input,
             mask,

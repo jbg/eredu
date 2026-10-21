@@ -22,7 +22,7 @@ pub use model::{
     prepare_input, vision_dependency_boundary_schema, vision_partition_boundary_schema,
     ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,
     PipelinePartitionInput, PipelinePrepared, PipelineVisionState, PreparedInput, StaticModules,
-    Unit, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    Unit, VlKernel, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     local_geometry, partition_local_geometry, partition_local_routed_geometry, LocalGeometry,
