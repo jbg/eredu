@@ -386,6 +386,74 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
         }
     }
     let declaration = definition(true);
+    let groups = declaration.parameters().groups();
+    let roles = declaration
+        .select_complete_pinned_roles(groups, &["readout", "embedding"])
+        .unwrap();
+    assert_eq!(
+        roles.into_iter().collect::<Vec<_>>(),
+        ["embedding", "readout"]
+    );
+    assert!(declaration
+        .select_complete_pinned_roles(&[], &["readout", "embedding"])
+        .unwrap()
+        .is_empty());
+    assert!(declaration
+        .select_complete_pinned_roles(&[groups[0].clone(), groups[0].clone()], &["embedding"])
+        .is_err());
+    // A pinned module may have separate canonical groups that must be admitted together.
+    let companion = eredu_runtime::OwnedParameterGroupSpec::new(
+        groups[0].owner().clone(),
+        eredu_runtime::ParameterGroupSpec::new(
+            "readout.bias",
+            eredu_runtime::ParameterRole::Replicated,
+            [eredu_runtime::ParameterMemberSpec::new(
+                "bias",
+                [1],
+                eredu_runtime::MemberSharding::Replicated,
+            )],
+        )
+        .unwrap(),
+    );
+    let complete_groups = vec![groups[0].clone(), companion.clone()];
+    let complete = ComponentDefinition::new(
+        "coupled-pinned-fixture",
+        ArchitectureParameterDescription::new(
+            declaration.parameters().graph(),
+            declaration.parameters().unit_layout(),
+            complete_groups
+                .iter()
+                .map(|binding| binding.group().clone()),
+            complete_groups.clone(),
+        )
+        .unwrap(),
+        vec![
+            declaration.unit(0, 0).unwrap().clone(),
+            declaration.unit(1, 0).unwrap().clone(),
+        ],
+        vec![
+            declaration.group_transport(0).unwrap().clone(),
+            declaration.group_transport(1).unwrap().clone(),
+        ],
+        "first",
+        vec![],
+        declaration.state_layout().clone(),
+        declaration.state_partition_plan().clone(),
+    )
+    .unwrap();
+    assert!(complete
+        .select_complete_pinned_roles(groups, &["embedding"])
+        .is_err());
+    assert!(declaration
+        .select_complete_pinned_roles(&[companion], &["embedding"])
+        .is_err());
+    assert_eq!(
+        complete
+            .select_complete_pinned_roles(&complete_groups, &["embedding"])
+            .unwrap()
+            .len(),
+        1
+    );
     let kernel = || Kernel {
         fail: false,
         pinned: Some(FakeModule {

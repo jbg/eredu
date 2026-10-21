@@ -7,6 +7,8 @@ mod prefill;
 mod waveform;
 use prefill::DecoderPrefill;
 
+use crate::decoder::DecoderStaticResources;
+
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
     Parameterized, Tensor,
@@ -1046,12 +1048,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         if let Some(vision) = &self.static_modules.vision {
             visitor.visit("vision", vision)?;
         }
-        visitor.visit("embedding", &self.static_modules.text.embeddings)?;
-        visitor.visit("norm", &self.static_modules.text.final_norm)?;
-        if let Some(head) = &self.static_modules.text.head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
+        self.static_modules.text.decoder_resources().visit(visitor)
     }
 
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
@@ -1061,12 +1058,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         if let Some(vision) = &mut self.static_modules.vision {
             visitor.visit_mut("vision", vision)?;
         }
-        visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.text.final_norm)?;
-        if let Some(head) = &mut self.static_modules.text.head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
+        self.static_modules
+            .text
+            .decoder_resources_mut()
+            .visit(visitor)
     }
 }
 
@@ -1241,7 +1236,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         B::vocabulary_parallel_lookup(
-            &mut self.static_modules.text.embeddings,
+            self.static_modules.text.embedding_mut()?,
             tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
@@ -1258,15 +1253,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let hidden = self.static_modules.text.final_hidden(hidden, context)?;
-        let logits = match &mut self.static_modules.text.head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context)?,
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.text.embeddings,
-                &hidden,
-                parallel,
-                context,
-            )?,
-        };
+        let logits =
+            self.static_modules
+                .text
+                .raw_vocabulary_projection(&hidden, Some(parallel), context)?;
         self.static_modules.text.finish_logits(logits, context)
     }
 
@@ -1550,7 +1540,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 }
                 DecoderInputPart::Text(tokens) => {
                     let embeddings = B::vocabulary_parallel_lookup(
-                        &mut self.static_modules.text.embeddings,
+                        self.static_modules.text.embedding_mut()?,
                         tokens,
                         EmbeddingLookupPolicy::Strict,
                         parallel,
@@ -1652,7 +1642,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 Some(
                     self.static_modules
                         .text
-                        .embeddings
+                        .embedding()?
                         .output_element_type()
                         .ok_or_else(|| {
                             Error::backend("Muse decoder embedding output precision is unavailable")
@@ -2253,7 +2243,7 @@ where
             for part in &mut forward.parts {
                 if let PreparedPart::PendingText { tokens } = part {
                     let embeddings = B::vocabulary_parallel_lookup(
-                        &mut self.static_modules.text.embeddings,
+                        self.static_modules.text.embedding_mut()?,
                         tokens,
                         EmbeddingLookupPolicy::Strict,
                         parallel,

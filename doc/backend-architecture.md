@@ -4492,6 +4492,15 @@ preparation, inspection and assistant target placement use the same declaration.
 Vision units retain no mutable state; decoder units reference their KV slots, and
 waveform units reference separate histories after the decoder slots, including
 stateless gaps required by the declared audio schedule.
+Muse text arithmetic borrows the shared `decoder::PartitionStaticModules` resource
+aggregate. Ordinary, parallel, assistant and observed readout use the same decoder
+resource views for normalization, vocabulary projection and canonical visitation;
+Muse supplies input normalization, stage rounding and logit transforms. Source-free
+canonical bindings select optional text owners before native allocation through
+`ComponentDefinition::select_complete_pinned_roles`. This runtime projection rejects
+foreign, duplicate or incomplete module groups, resolves tied aliases, and leaves
+sibling component resources independent. Selected untied projection requires
+its declared head even when an input table is retained.
 Distinct registered identities select typed attention,
 normalization, residual, feed-forward and media policies. The backend binds the
 retained declarations through ordinary native mechanisms and selects no family

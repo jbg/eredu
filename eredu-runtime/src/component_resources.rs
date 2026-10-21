@@ -147,3 +147,63 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K, KernelParameterMo
         Self::pinned::<B>(definition, kernel)?.select_partition(partition)
     }
 }
+
+impl ComponentDefinition {
+    /// Resolves optional pinned modules whose canonical groups must coexist as one resource.
+    ///
+    /// Every supplied group in the requested roles must exactly match this definition.
+    /// A role selects either all its groups or none, including shared-storage aliases.
+    /// Other roles and execution-unit groups remain available for sibling components.
+    pub fn select_complete_pinned_roles(
+        &self,
+        bindings: &[crate::OwnedParameterGroupSpec],
+        roles: &[&str],
+    ) -> Result<BTreeSet<String>, ComponentDefinitionError> {
+        let invalid = |resource| ComponentDefinitionError::Invalid {
+            component: self.id().to_owned(),
+            resource,
+        };
+        if roles.iter().any(|role| role.trim().is_empty()) {
+            return Err(invalid("empty pinned role".into()));
+        }
+        let declared = self.parameters().groups();
+        let mut selected = BTreeSet::new();
+        for binding in bindings.iter().filter(|binding| {
+            roles
+                .iter()
+                .any(|role| binding.owner().accepts_static_role(role))
+        }) {
+            let index = declared
+                .iter()
+                .position(|group| group == binding)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "incompatible pinned group {}",
+                        binding.group().logical_name()
+                    ))
+                })?;
+            if !selected.insert(index) {
+                return Err(invalid(format!(
+                    "duplicate pinned group {}",
+                    binding.group().logical_name()
+                )));
+            }
+        }
+        let mut present = BTreeSet::new();
+        for &role in roles {
+            let groups = declared
+                .iter()
+                .enumerate()
+                .filter(|(_, binding)| binding.owner().accepts_static_role(role));
+            let total = groups.clone().count();
+            let count = groups.filter(|(index, _)| selected.contains(index)).count();
+            if count != 0 {
+                if count != total {
+                    return Err(invalid(format!("incomplete pinned resource {role}")));
+                }
+                present.insert(role.to_owned());
+            }
+        }
+        Ok(present)
+    }
+}
