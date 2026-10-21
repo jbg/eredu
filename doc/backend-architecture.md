@@ -11745,3 +11745,11 @@ transform-source preparation use the same selected constructor. Composite family
 equations borrow this same typed child kernel under the enclosing component's
 resource and completion lifecycle; they retain their declared media assembly and
 boundary semantics.
+
+DiffusionGemma composite parameter catalogs are source-free. Shared Gemma vision
+geometry declares patch and position storage, optional standardization, per-layer
+clipping bounds and projection matrices under the family's physical roots.
+Ordinary format expansion supplies exact packed weights and companion metadata.
+Composite target and transform-source planning consume these declarations without
+constructing image modules or traversing native placeholders. Text storage retains
+its canonical shared owners when projected into the composite execution graph.

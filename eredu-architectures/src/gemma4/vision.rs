@@ -1,5 +1,7 @@
 //! Backend-neutral Gemma 4 vision configuration and reusable projection units.
 
+pub(crate) mod parameters;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::rotary::RopeValue;

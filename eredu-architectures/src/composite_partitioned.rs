@@ -1827,14 +1827,10 @@ where
 
         CompositeConfig::Diffusion(source) => {
             let args = source.with_checkpoint_formats(target_formats);
-            let description =
-                crate::diffusion_gemma::composite::Model::<B>::new(args.clone(), context).map_err(
-                    |error| CompositePartitionPreparationError::Architecture(error.to_string()),
-                )?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
+            let parameters = crate::diffusion_gemma::composite::parameter_description(&args)
                 .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let rank = selected.requirements().topology();
             let layout = derive_partitioned_local_layout(&parameters, rank)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -1935,17 +1931,12 @@ where
                         )
                     })
                 {
-                    let source_model =
-                        crate::diffusion_gemma::composite::Model::<B>::new(source.clone(), context)
-                            .map_err(|error| {
-                                CompositePartitionPreparationError::Architecture(error.to_string())
-                            })?;
                     let source_parameters =
-                        source_model
-                            .parameter_description(context)
-                            .map_err(|error| {
+                        crate::diffusion_gemma::composite::parameter_description(source).map_err(
+                            |error| {
                                 CompositePartitionPreparationError::Architecture(error.to_string())
-                            })?;
+                            },
+                        )?;
                     crate::partitioned_execution::validate_transform_parameter_space(
                         &source_parameters,
                         &parameters,

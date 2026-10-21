@@ -116,6 +116,78 @@ pub fn graph(config: &FamilyConfig) -> Result<(ExecutionGraph, ExecutionUnitLayo
     Ok((graph, units))
 }
 
+/// Canonical shared text and image storage, declared without native modules.
+pub fn parameter_description(
+    config: &FamilyConfig,
+) -> Result<ArchitectureParameterDescription, Error> {
+    let (graph, units) = graph(config)?;
+    let mut owned = super::parallel::parameter_description(config)
+        .map_err(Error::backend_source)?
+        .groups()
+        .to_vec();
+    let vision = config
+        .vision
+        .as_ref()
+        .ok_or_else(|| Error::backend("composite requires an image tower"))?;
+    for group in
+        crate::gemma4::vision::parameters::static_groups(vision, "model.encoder.vision_tower")
+            .map_err(Error::backend_source)?
+    {
+        owned.push(OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_role("vision"),
+            group,
+        ));
+    }
+    let weight = "model.encoder.embed_vision.embedding_projection.weight";
+    let projection = eredu_runtime::ParameterGroupSpec::new(
+        "model.encoder.embed_vision",
+        eredu_runtime::ParameterRole::Replicated,
+        [eredu_runtime::ParameterMemberSpec::new(
+            weight,
+            vec![
+                config.text.hidden_size as usize,
+                vision.hidden_size as usize,
+            ],
+            eredu_runtime::MemberSharding::Replicated,
+        )],
+    )
+    .map_err(Error::backend_source)?;
+    for group in eredu_runtime::expand_linear_format_parameter_groups(vec![projection], |member| {
+        crate::linear_format::standard_parallel_linear_format(
+            member,
+            config.text.linear_format_for(member.target()),
+        )
+    })
+    .map_err(Error::backend_source)?
+    {
+        owned.push(OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_role("vision_projection"),
+            group,
+        ));
+    }
+    for index in 0..vision.num_hidden_layers as usize {
+        for group in crate::gemma4::vision::parameters::layer_groups(
+            vision,
+            "model.encoder.vision_tower",
+            index,
+        )
+        .map_err(Error::backend_source)?
+        {
+            owned.push(OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(units.group_id(0).unwrap().clone(), index),
+                group,
+            ));
+        }
+    }
+    ArchitectureParameterDescription::new(
+        &graph,
+        &units,
+        owned.iter().map(|n| n.group().clone()),
+        owned.clone(),
+    )
+    .map_err(Error::backend_source)
+}
+
 /// Image parameters are replicated within a tensor group and cut per layer by PP.
 pub fn vision_transport() -> ArchitectureGroupTransport {
     use eredu_runtime::*;
@@ -416,87 +488,11 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
     }
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let (graph, units) = graph(&self.config)?;
-        let mut owned = Vec::new();
-        for group in
-            super::parallel::static_parameter_groups(&self.config).map_err(Error::backend)?
-        {
-            let name = group.logical_name();
-            let owner = if name.ends_with("embed_tokens") && self.config.text.tie_word_embeddings {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role(if name.ends_with("embed_tokens") {
-                    "embedding"
-                } else if name == "model.decoder.norm" {
-                    "norm"
-                } else if name == "lm_head" {
-                    "output"
-                } else {
-                    "conditioning"
-                })
-            };
-            owned.push(OwnedParameterGroupSpec::new(owner, group));
-        }
-        for index in 0..self.config.text.num_hidden_layers() {
-            for group in super::parallel::layer_parameter_groups(&self.config, index)
-                .map_err(Error::backend)?
-            {
-                owned.push(OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(units.group_id(1).unwrap().clone(), index),
-                    group,
-                ));
-            }
-        }
-        for (role, name, groups) in [
-            (
-                "vision",
-                "model.encoder.vision_tower.static",
-                crate::gemma4::parallel::media_unit_parameter_groups::<B>(
-                    "model.encoder.vision_tower.static",
-                    &self.statics.image.tower,
-                ),
-            ),
-            (
-                "vision_projection",
-                "model.encoder.embed_vision",
-                crate::gemma4::parallel::media_unit_parameter_groups::<B>(
-                    "model.encoder.embed_vision",
-                    &self.statics.image.projector,
-                ),
-            ),
-        ] {
-            let _ = name;
-            for group in groups.map_err(Error::backend)? {
-                owned.push(OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::static_role(role),
-                    group,
-                ));
-            }
-        }
-        for index in 0..self.config.vision.as_ref().unwrap().num_hidden_layers as usize {
-            let layer = ImageStatic::<B>::build_layer(&self.config, index, context)?;
-            for group in crate::gemma4::parallel::media_unit_parameter_groups::<B>(
-                format!("model.encoder.vision_tower.encoder.layers.{index}"),
-                &layer,
-            )
-            .map_err(Error::backend)?
-            {
-                owned.push(OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(units.group_id(0).unwrap().clone(), index),
-                    group,
-                ));
-            }
-        }
-        ArchitectureParameterDescription::new(
-            &graph,
-            &units,
-            owned.iter().map(|n| n.group().clone()),
-            owned.clone(),
-        )
-        .map_err(Error::backend)
+        parameter_description(&self.config)
     }
+
     fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
         &self,
         visitor: &mut V,
