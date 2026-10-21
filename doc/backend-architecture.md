@@ -8686,6 +8686,12 @@ DeepStack banks in their original bank identities. Complete and selected resourc
 run the same equations; an operation rejects a missing required resource before
 submitting its equation. Parameter-free continuation geometry remains available
 when a rank retains no pinned vision parameters.
+`VisionStatic::select` consumes an already constructed aggregate and retains a
+validated subset without rebuilding parameters or changing local placement. It
+rejects a different root or configuration and any resource absent from the retained
+aggregate. Repeating the same selection preserves its modules. Explicit static
+ownership may refine a resource's declared logical consumers while preserving its
+exact canonical parameter groups.
 
 Full and selected Qwen hybrid text execution uses `ComponentAdapter` with one
 `QwenKernel`. The adapter and kernel retain the same `Arc<ComponentDefinition>`
@@ -10846,6 +10852,11 @@ runtime lifecycle and invokes those typed hooks directly. Its expert selection
 also consumes the composition. External prediction borrows target vocabulary
 resources through the ordinary component adapter or the enclosing composite;
 base-width lookup and prediction projection preserve their own equations.
+`ComponentPinnedResources` exposes the conditional composition's target and vision
+aggregate directly. Parameter traversal excludes kernel geometry and visits target
+storage before vision storage. Selected executable construction validates partition
+ownership against the retained definition and retains exactly its pinned resources;
+empty vision aggregates retain continuation geometry and expose no parameter role.
 
 `conditional::parameter_description` composes retained target storage with vision
 parameter geometry without a native context. It projects from
@@ -10871,7 +10882,8 @@ Shared `StaticModules` owns vocabulary parameters, collectives and readout
 instrumentation. `BoundaryModules` retains optional embedding, residual readout
 and untied projection resources for selected owners. Selection uses canonical
 static storage roles from parameter bindings, including tied vocabulary storage
-and explicitly declared prediction replicas. Parameter-free residual expansion
+and explicitly declared prediction replicas. Selection rejects a requested role
+whose module is no longer retained. Parameter-free residual expansion
 uses the declared geometry without retaining an unowned readout.
 `ComponentPinnedResources` exposes the target's actual pinned
 aggregate and canonical role traversal to binding and completion owners. Target,

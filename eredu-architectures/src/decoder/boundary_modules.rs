@@ -34,12 +34,23 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> From<StaticModules<B, D>> for Boun
 }
 impl<B: NeuralBackend, D: DecoderBoundary<B>> BoundaryModules<B, D> {
     /// Consumes the aggregate and retains its declared canonical storage roles.
-    pub fn select(mut self, bindings: &[OwnedParameterGroupSpec]) -> Self {
+    pub fn select(mut self, bindings: &[OwnedParameterGroupSpec]) -> Result<Self, Error> {
         let owns = |role| {
             bindings
                 .iter()
                 .any(|group| group.owner().static_storage_role() == Some(role))
         };
+        for (role, present) in [
+            ("embedding", self.embeddings.is_some()),
+            ("norm", self.boundary.is_some()),
+            ("output", self.lm_head.is_some()),
+        ] {
+            if owns(role) && !present {
+                return Err(Error::backend(format!(
+                    "decoder selection requires unretained pinned role {role:?}"
+                )));
+            }
+        }
         if !owns("embedding") {
             self.embeddings = None;
         }
@@ -49,7 +60,7 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> BoundaryModules<B, D> {
         if !owns("output") {
             self.lm_head = None;
         }
-        self
+        Ok(self)
     }
 
     /// Borrows the selected base-width lookup without residual expansion.

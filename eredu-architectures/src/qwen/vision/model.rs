@@ -495,6 +495,8 @@ pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) deepstack_mergers: Vec<Option<Merger<B>>>,
     #[parameter(skip)]
     config: VisionConfig,
+    #[parameter(skip)]
+    root: String,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
@@ -594,7 +596,46 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             merger,
             deepstack_mergers,
             config,
+            root,
         })
+    }
+
+    /// Consumes pinned resources into an exact subset without rebuilding parameters.
+    /// Geometry, identity and all requested resources must match the retained modules.
+    pub fn select(mut self, selection: super::VisionStaticSelection) -> Result<Self, Error> {
+        if self.config != selection.config
+            || self.root != selection.root
+            || self.deepstack_mergers.len() != selection.deepstack.len()
+            || (selection.ingress && !self.owns_ingress())
+            || (selection.merger && self.merger.is_none())
+            || selection
+                .deepstack
+                .iter()
+                .zip(&self.deepstack_mergers)
+                .any(|(selected, module)| *selected && module.is_none())
+        {
+            return Err(Error::backend(format!(
+                "vision {:?}: selection differs from retained configuration, root or resources",
+                self.root
+            )));
+        }
+        if !selection.ingress {
+            self.position = None;
+            self.patch = None;
+        }
+        if !selection.merger {
+            self.merger = None;
+        }
+        for (selected, module) in selection
+            .deepstack
+            .into_iter()
+            .zip(&mut self.deepstack_mergers)
+        {
+            if !selected {
+                *module = None;
+            }
+        }
+        Ok(self)
     }
 
     /// Whether this rank owns the complete patch and position ingress equation.

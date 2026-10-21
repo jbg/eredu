@@ -264,7 +264,10 @@ impl VisionStaticSelection {
             .iter()
             .filter(|group| group.owner().accepts_static_role(role))
         {
-            if !declared.iter().any(|(_, group)| group == binding) {
+            if !declared.iter().any(|(_, group)| {
+                group.group() == binding.group()
+                    && group.owner().refines_storage_owner(binding.owner())
+            }) {
                 return Err(invalid(format!(
                     "vision {root:?}: incompatible pinned group {}",
                     binding.group().logical_name()

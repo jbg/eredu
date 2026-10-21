@@ -276,6 +276,9 @@ impl PreparedConditionalPartition {
             target.spec().configuration().vocabulary,
         )
         .map_err(invalid)?;
+        let architecture = architecture
+            .select_partition_resources(&partition)
+            .map_err(invalid)?;
         prepare_composite_partition::<B, S, _, _, _>(
             architecture,
             source_architecture,

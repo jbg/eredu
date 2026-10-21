@@ -67,6 +67,44 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
         })
     }
 
+    /// Retains exactly the canonical pinned resources owned by this partition.
+    pub fn select_partition_resources<G, A>(
+        mut self,
+        partition: &ArchitecturePartition<G, A>,
+    ) -> Result<Self, Error> {
+        self.definition.select_partition(partition)?;
+        let expected = self
+            .partition_state
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| PartitionState::new(self.definition.state_layout().clone(), 0))
+            .map_err(Error::backend)?;
+        if partition.state() != Some(&expected) {
+            return Err(Error::backend(
+                "conditional resource selection differs from retained state ownership",
+            ));
+        }
+        let vision = crate::qwen::vision::VisionStaticSelection::from_parameter_bindings(
+            self.vision.clone(),
+            "model.visual",
+            partition
+                .unit_layout()
+                .group_id(VISION_INDEX)
+                .expect("validated vision group")
+                .clone(),
+            "vision",
+            partition.parameter_bindings(),
+        )
+        .map_err(Error::backend_source)?;
+        self.modules.vision = self.modules.vision.select(vision)?;
+        self.modules.target.statics = self
+            .modules
+            .target
+            .statics
+            .select(partition.parameter_bindings())?;
+        Ok(self)
+    }
+
     /// Binds local routed operators while preserving global router identities.
     pub fn with_expert_realization(
         mut self,

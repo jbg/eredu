@@ -6,7 +6,7 @@ use super::{
 use crate::qwen::vision::{VisionBlock, VisionConfig, VisionState, VisionStatic};
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, EmbeddingOperator, Error, GroupedNeuralBackend,
-    Parameterized, Tensor,
+    Tensor,
 };
 use eredu_runtime::*;
 
@@ -154,6 +154,8 @@ pub(crate) fn validate_ingress(
 }
 
 /// Pinned modules. The target owns the single vocabulary and residual readout.
+#[derive(eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct ConditionalStatic<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     target: TargetKernel<B>,
     vision: VisionStatic<B>,
@@ -164,28 +166,6 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend + Clone> Clone for Condi
             target: self.target.clone(),
             vision: self.vision.clone(),
         }
-    }
-}
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Parameterized<B::Tensor>
-    for ConditionalStatic<B>
-{
-    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, B::Tensor>>(
-        &'a self,
-        visitor: &mut V,
-    ) {
-        self.target.statics.visit_parameters(visitor);
-        self.vision.visit_parameters(visitor);
-    }
-    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>>(
-        &'a mut self,
-        visitor: &mut V,
-    ) {
-        self.target.statics.visit_parameters_mut(visitor);
-        self.vision.visit_parameters_mut(visitor);
-    }
-    fn set_trainable(&mut self, trainable: bool) {
-        self.target.statics.set_trainable(trainable);
-        self.vision.set_trainable(trainable);
     }
 }
 /// One independently materialized encoder block or target execution unit.
@@ -485,6 +465,34 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             .map_err(Error::from)
     }
 }
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ComponentPinnedResources<B>
+    for ConditionalModel<B>
+{
+    type Modules = ConditionalStatic<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.modules
+    }
+    fn visit_pinned<V: StaticParameterVisitor<B>>(&self, visitor: &mut V) -> Result<(), V::Error> {
+        self.modules.target.visit_pinned(visitor)?;
+        if self.modules.vision.has_parameters() {
+            visitor.visit("vision", &self.modules.vision)?;
+        }
+        Ok(())
+    }
+    fn visit_pinned_mut<V: StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.modules.target.visit_pinned_mut(visitor)?;
+        if self.modules.vision.has_parameters() {
+            visitor.visit_mut("vision", &mut self.modules.vision)?;
+        }
+        Ok(())
+    }
+}
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<B>
     for ConditionalModel<B>
 {
@@ -533,15 +541,13 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.modules.target.visit_pinned(visitor)?;
-        visitor.visit("vision", &self.modules.vision)
+        self.visit_pinned(visitor)
     }
     fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.modules.target.visit_pinned_mut(visitor)?;
-        visitor.visit_mut("vision", &mut self.modules.vision)
+        self.visit_pinned_mut(visitor)
     }
 }
 impl<B, S> LayeredArchitecture<B, S> for ConditionalModel<B>
@@ -649,10 +655,10 @@ where
         Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
-        &self.modules
+        self.pinned_modules()
     }
     fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.modules
+        self.pinned_modules_mut()
     }
     fn build_unit(
         &self,

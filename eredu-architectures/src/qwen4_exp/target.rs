@@ -535,12 +535,20 @@ pub type TargetModel<B> = eredu_runtime::ComponentAdapter<
 
 /// Family equations and construction geometry for independently leased target units.
 /// Standalone execution and media composition borrow the same typed kernel.
+#[derive(eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct TargetKernel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
+    #[parameter(skip)]
     pub(crate) spec: TargetSpec,
+    #[parameter(skip)]
     hashes: BTreeMap<usize, NGramHashSpec>,
+    #[parameter(skip)]
     state_fingerprint: String,
+    #[parameter(skip)]
     tensor_partition: Option<TargetTensorPartition>,
+    #[parameter(skip)]
     partition_state: eredu_runtime::PartitionState,
+    #[parameter(skip)]
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     pub(crate) statics: BoundaryModules<B, ResidualBoundary<B>>,
 }
@@ -572,7 +580,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
             .state()
             .ok_or_else(|| Error::backend("target partition requires selected state geometry"))?;
         self = self.with_partition_state(state)?;
-        self.statics = self.statics.select(partition.parameter_bindings());
+        self.statics = self.statics.select(partition.parameter_bindings())?;
         eredu_runtime::ComponentAdapter::with_partition_resources::<B, G, A>(
             self.definition.clone(),
             self,
