@@ -4902,6 +4902,12 @@ retain their canonical roles. Serial and parallel execution use the same
 declaration, with selected local geometry supplying the state layout. Realtime
 construction identity is a typed kernel capability forwarded by the shared
 adapter; frame decisions and sampling remain architecture policy.
+`MoshiParameterContract` retains the source-free definition alongside exact
+matrix formats. Parameter descriptions and replicated state requirements are
+projections of that definition. Pure tensor-parallel selection projects its
+group counts and state ownership, then retains a definition with validated local
+geometry. Realtime construction consumes the retained source and selected
+definitions directly before allocating pinned native resources.
 
 Realtime artifact loading also crosses the backend boundary as a neutral
 architecture preparation. Moshi inspection parses optional native defaults or

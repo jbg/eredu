@@ -27,6 +27,22 @@ pub fn component_definition(
     config: &MoshiConfig,
     geometry: Option<&super::LocalGeometry>,
 ) -> Result<ComponentDefinition, Error> {
+    let definition = super::parallel::parameter_contract(config)
+        .map_err(Error::backend)?
+        .into_definition();
+    match geometry {
+        None => Ok(Arc::unwrap_or_clone(definition)),
+        Some(geometry) => {
+            definition_with_parameters(config, Some(geometry), definition.parameters().clone())
+        }
+    }
+}
+
+pub(super) fn definition_with_parameters(
+    config: &MoshiConfig,
+    geometry: Option<&super::LocalGeometry>,
+    parameters: eredu_runtime::ArchitectureParameterDescription,
+) -> Result<ComponentDefinition, Error> {
     config.temporal().validate_config()?;
     config.depth_template().validate_config()?;
     let state = match geometry {
@@ -36,7 +52,6 @@ pub fn component_definition(
         }
         None => state_layout(config)?,
     };
-    let parameters = super::parallel::parameter_description(config).map_err(Error::backend)?;
     let temporal = config.temporal().num_hidden_layers() as usize;
     let depth = config.depth_template().num_hidden_layers() as usize;
     let units = (0..temporal)
@@ -425,15 +440,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
         config: MoshiConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = Arc::new(component_definition(&config, None)?);
-        let static_modules = StaticModules::new(&config, context)?;
-        Ok(Self {
-            definition,
-            config,
-            static_modules,
-            parallel_geometry: None,
-            parallel_execution_identity: None,
-        })
+        let definition = super::parallel::parameter_contract(&config)
+            .map_err(Error::backend)?
+            .into_definition();
+        Self::from_prepared(config, definition, None, None, context)
     }
 
     /// Builds the same model lifecycle with planner-derived rank-local modules.
@@ -443,13 +453,26 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let definition = Arc::new(component_definition(&config, Some(&geometry))?);
-        let static_modules = StaticModules::new_parallel(&config, &geometry, context)?;
+        Self::from_prepared(config, definition, Some(geometry), None, context)
+    }
+
+    pub(super) fn from_prepared(
+        config: MoshiConfig,
+        definition: Arc<ComponentDefinition>,
+        parallel_geometry: Option<super::LocalGeometry>,
+        parallel_execution_identity: Option<String>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let static_modules = match &parallel_geometry {
+            Some(geometry) => StaticModules::new_parallel(&config, geometry, context)?,
+            None => StaticModules::new(&config, context)?,
+        };
         Ok(Self {
             definition,
             config,
             static_modules,
-            parallel_geometry: Some(geometry),
-            parallel_execution_identity: None,
+            parallel_geometry,
+            parallel_execution_identity,
         })
     }
 

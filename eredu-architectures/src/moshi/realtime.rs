@@ -27,9 +27,8 @@ use eredu_runtime::{
 };
 
 use super::{
-    observation_points, parameter_contract, select_parallel_execution, state_layout,
-    DecisionBoundary, MoshiConfig, MoshiParallelSelection, MoshiParameterContract,
-    MoshiPreparationPlan,
+    observation_points, parameter_contract, select_parallel_execution, DecisionBoundary,
+    MoshiConfig, MoshiParallelSelection, MoshiParameterContract, MoshiPreparationPlan,
 };
 
 /// Derives portable input validation from normalized Moshi architecture policy.
@@ -1285,8 +1284,8 @@ where
     let (
         preparation,
         execution_config,
-        _source_parameters,
-        _execution_parameters,
+        source_parameters,
+        execution_parameters,
         parallel,
         contract,
     ) = prepared.into_parts();
@@ -1307,18 +1306,32 @@ where
     visitor.construction_started();
     let source_architecture = source_config
         .map(|config| {
-            super::MoshiKernel::<B>::new(config, context).and_then(super::MoshiKernel::into_model)
+            super::MoshiKernel::<B>::from_prepared(
+                config,
+                source_parameters.into_definition(),
+                None,
+                None,
+                context,
+            )
+            .and_then(super::MoshiKernel::into_model)
         })
         .transpose()
         .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
     let architecture = match parallel.as_ref() {
-        Some(parallel) => super::MoshiKernel::<B>::new_selected_parallel(
+        Some(parallel) => super::MoshiKernel::<B>::from_prepared(
             execution_config,
-            parallel.geometry().clone(),
-            parallel.execution_identity().to_owned(),
+            parallel.retained_definition(),
+            Some(parallel.geometry().clone()),
+            Some(parallel.execution_identity().to_owned()),
             context,
         ),
-        None => super::MoshiKernel::<B>::new(execution_config, context),
+        None => super::MoshiKernel::<B>::from_prepared(
+            execution_config,
+            execution_parameters.into_definition(),
+            None,
+            None,
+            context,
+        ),
     }
     .and_then(super::MoshiKernel::into_model)
     .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
@@ -1516,7 +1529,7 @@ fn build_candidate(
         Some(
             select_parallel_execution(
                 &execution_config,
-                execution_parameters.description(),
+                &execution_parameters,
                 rank,
                 maximum_batch_size,
                 maximum_sequence_length,
@@ -1551,13 +1564,9 @@ fn build_candidate(
         topology.tensor()
     ))?;
     let state = parallel.as_ref().map_or_else(
-        || {
-            state_layout(&execution_config).map_err(|error| {
-                MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string())
-            })
-        },
-        |parallel| Ok(parallel.geometry().state_layout().clone()),
-    )?;
+        || execution_parameters.definition().state_layout().clone(),
+        |parallel| parallel.definition().state_layout().clone(),
+    );
     let mut mechanisms = vec![
         RealtimeMechanism::TensorOperations,
         RealtimeMechanism::NeuralOperations,

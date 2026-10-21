@@ -7,16 +7,15 @@ use eredu_checkpoint::LinearFormat;
 use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, ParallelRankTopology};
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, ArchitectureGroupKind,
-    ArchitectureParameterDescription, ArchitecturePartition, CommunicationCompletionPolicy,
-    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
-    CommunicationOperationRequirement, CommunicationTensorLimits, ExecutionGraph,
-    ExecutionUnitLayout, LayerRuntimeState, LayeredPartitionDriver, LocalModelLayout,
-    MemberSharding, NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec, ParallelPlanError,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    PartitionOwnership, PartitionedExecutionPlan, PipelineActivationDtype, PipelineWireContract,
-    StateLayout, StateSegmentLifetime, StateSegmentSpec, TensorPlacement,
-    TopologyCommunicationPlan,
+    aligned_partition_units, module_parameter_group, ArchitectureParameterDescription,
+    ArchitecturePartition, CommunicationCompletionPolicy, CommunicationGroupRequirements,
+    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
+    CommunicationTensorLimits, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
+    LayeredPartitionDriver, LocalModelLayout, MemberSharding, NoAuxiliaryBoundarySchema,
+    OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, PartitionOwnership, PartitionedExecutionPlan,
+    PipelineActivationDtype, PipelineWireContract, StateLayout, StateSegmentLifetime,
+    StateSegmentSpec, TensorPlacement, TopologyCommunicationPlan,
 };
 
 use super::{
@@ -89,14 +88,24 @@ impl MoshiMatrixContract {
 /// Complete Moshi parameter topology plus exact primary-matrix formats.
 #[derive(Debug, Clone)]
 pub struct MoshiParameterContract {
-    description: ArchitectureParameterDescription,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     matrices: BTreeMap<String, MoshiMatrixContract>,
 }
 
 impl MoshiParameterContract {
     /// Complete neutral ownership and sharding description.
-    pub const fn description(&self) -> &ArchitectureParameterDescription {
-        &self.description
+    pub fn description(&self) -> &ArchitectureParameterDescription {
+        self.definition.parameters()
+    }
+
+    /// Validated invocation, parameter, state and transport contract.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
+    }
+
+    /// Transfers the retained source-free definition to component construction.
+    pub fn into_definition(self) -> std::sync::Arc<eredu_runtime::ComponentDefinition> {
+        self.definition
     }
 
     /// Exact primary matrix contracts keyed by canonical target.
@@ -106,7 +115,7 @@ impl MoshiParameterContract {
 
     /// Consumes this contract into its complete parameter description.
     pub fn into_description(self) -> ArchitectureParameterDescription {
-        self.description
+        std::sync::Arc::unwrap_or_clone(self.definition).into_parameters()
     }
 }
 
@@ -117,6 +126,7 @@ impl MoshiParameterContract {
 /// semantic parallel axis while constructing the local model.
 #[derive(Debug, Clone)]
 pub struct MoshiParallelSelection {
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     topology: eredu_core::ParallelTopology,
     layout: LocalModelLayout,
     geometry: LocalGeometry,
@@ -127,6 +137,15 @@ pub struct MoshiParallelSelection {
 }
 
 impl MoshiParallelSelection {
+    /// Validated contract with exact selected local state geometry.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
+    }
+
+    pub(super) fn retained_definition(&self) -> std::sync::Arc<eredu_runtime::ComponentDefinition> {
+        self.definition.clone()
+    }
+
     /// Selected pure tensor-parallel topology.
     pub const fn topology(&self) -> eredu_core::ParallelTopology {
         self.topology
@@ -190,7 +209,7 @@ impl MoshiParallelSelection {
 /// without expanding the excluded realtime lifecycle.
 pub fn select_parallel_execution<'a>(
     config: &MoshiConfig,
-    parameters: &ArchitectureParameterDescription,
+    contract: &MoshiParameterContract,
     rank: ParallelRankTopology,
     maximum_batch_size: i32,
     maximum_sequence_length: i32,
@@ -198,6 +217,8 @@ pub fn select_parallel_execution<'a>(
     completion: CommunicationCompletionPolicy,
     aliases: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<MoshiParallelSelection, ParallelPlanError> {
+    let definition = contract.definition();
+    let parameters = definition.parameters();
     let topology = rank.topology();
     if topology.data() != 1
         || topology.tensor() <= 1
@@ -321,21 +342,14 @@ pub fn select_parallel_execution<'a>(
         })?;
     let communication = eredu_runtime::project_communication_manifest(topology, rank, &plan)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let temporal_units = usize::try_from(config.temporal().num_hidden_layers()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("Moshi temporal layer count exceeds usize".into())
-    })?;
-    let depth_units = config.frame_schedule().depth_audio_codebooks();
-    let complete_state = super::state_layout(config)
+    let temporal_units = definition
+        .unit_count(0)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let temporal_state_layers = complete_state
-        .segments()
-        .first()
-        .map(|segment| segment.layers().end)
-        .ok_or_else(|| {
-            ParallelPlanError::InvalidGroup("Moshi temporal state segment is missing".into())
-        })?;
-    let state_plan =
-        crate::transport::pipeline_with_output_state(0, temporal_state_layers, &complete_state);
+    let depth_units = definition
+        .unit_count(1)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let complete_state = definition.state_layout();
+    let state_plan = definition.state_partition_plan();
     let ownership = PartitionOwnership::new(true, true, ["embedding", "norm", "output"])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let partition = ArchitecturePartition::from_description(
@@ -345,8 +359,8 @@ pub fn select_parallel_execution<'a>(
             ("depth_codebook_slices", 0..depth_units),
         ],
         ownership,
-        &complete_state,
-        &state_plan,
+        complete_state,
+        state_plan,
         geometry.clone(),
         NoAuxiliaryBoundarySchema::new(config.temporal().hidden_size()),
     )
@@ -356,12 +370,17 @@ pub fn select_parallel_execution<'a>(
     let depth_driver =
         LayeredPartitionDriver::new_with_state_ownership(&partition, 1, 0..depth_units, false)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let transport = (0..parameters.graph().groups().len())
+        .map(|group| {
+            definition
+                .group_transport(group)
+                .map(|transport| (transport.kind, transport.request_optional))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let execution_plan = PartitionedExecutionPlan::new(
         parameters.graph().clone(),
-        vec![
-            (ArchitectureGroupKind::Decoder, false),
-            (ArchitectureGroupKind::Prediction, false),
-        ],
+        transport,
         vec![Some(temporal_driver), Some(depth_driver)],
         Vec::new(),
         None,
@@ -375,7 +394,12 @@ pub fn select_parallel_execution<'a>(
         rank.tensor_parallel_rank(),
         rank.tensor_parallel_size()
     );
+    let definition = std::sync::Arc::new(
+        super::model::definition_with_parameters(config, Some(&geometry), parameters.clone())
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
+    );
     Ok(MoshiParallelSelection {
+        definition,
         topology,
         layout,
         geometry,
@@ -615,8 +639,12 @@ pub fn parameter_contract(
         .collect::<Vec<_>>();
     let description = ArchitectureParameterDescription::new(&graph, &layout, expected, expanded)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let definition = std::sync::Arc::new(
+        super::model::definition_with_parameters(config, None, description)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
+    );
     Ok(MoshiParameterContract {
-        description,
+        definition,
         matrices,
     })
 }
