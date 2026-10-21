@@ -33,6 +33,42 @@ pub(crate) fn text_transport() -> eredu_runtime::ArchitectureGroupTransport {
     }
 }
 
+/// Validates shared text storage, context slots, and invocation addressing without native resources.
+pub fn component_definition(
+    config: &FamilyConfig,
+    geometry: Option<&super::parallel::LocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    let state = match geometry {
+        Some(geometry) => geometry
+            .complete_state_layout(config)
+            .map_err(Error::backend_source)?,
+        None => super::state_layout(config).map_err(Error::backend_source)?,
+    };
+    let layers = config.text.num_hidden_layers();
+    eredu_runtime::ComponentDefinition::new(
+        "diffusion_gemma_text",
+        super::parallel::parameter_description(config).map_err(Error::backend_source)?,
+        (0..layers)
+            .map(|index| eredu_runtime::ComponentUnit {
+                path: format!("model.decoder.layers.{index}"),
+                state: index..index + 1,
+            })
+            .collect(),
+        vec![text_transport()],
+        TEXT_EXECUTION_GROUP,
+        vec![],
+        state,
+        text_state_partition_plan(layers),
+    )
+    .map_err(Error::from)
+}
+
+fn text_state_partition_plan(layers: usize) -> eredu_runtime::ArchitectureStatePartitionPlan {
+    eredu_runtime::ArchitectureStatePartitionPlan::new([
+        eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..layers),
+    ])
+}
+
 /// Derives ownership of the shared routed banks for an admitted rank topology.
 pub fn expert_realization_plan(
     config: &FamilyConfig,
@@ -142,6 +178,7 @@ pub struct ForwardContext<T> {
 pub struct TextModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     config: FamilyConfig,
     statics: TextStatic<B>,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     geometry: Option<super::parallel::LocalGeometry>,
     experts: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
 }
@@ -151,6 +188,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for Tex
         Self {
             config: self.config.clone(),
             statics: self.statics.clone(),
+            definition: std::sync::Arc::clone(&self.definition),
             geometry: self.geometry.clone(),
             experts: self.experts.clone(),
         }
@@ -304,9 +342,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
         config: FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = std::sync::Arc::new(component_definition(&config, None)?);
         Ok(Self {
             statics: TextStatic::new(&config, context)?,
             config,
+            definition,
             geometry: None,
             experts: None,
         })
@@ -318,10 +358,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
         geometry: super::parallel::LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        geometry.validate_for(&config).map_err(Error::backend)?;
+        let definition = std::sync::Arc::new(component_definition(&config, Some(&geometry))?);
         Ok(Self {
             statics: TextStatic::new_parallel(&config, &geometry, context)?,
             config,
+            definition,
             geometry: Some(geometry),
             experts: None,
         })
@@ -383,8 +424,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
         &self.config
     }
 
-    fn graph(&self) -> Result<ExecutionGraph, Error> {
-        ExecutionGraph::chain([TEXT_EXECUTION_GROUP]).map_err(Error::backend)
+    /// Borrows the validated semantic definition retained before parameter construction.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     fn position<S>(&self, state: &mut S) -> Result<i32, Error>
@@ -392,11 +434,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
         S: LayerRuntimeState<B>,
         S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
     {
-        let expected = self
-            .geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .unwrap_or(super::state_layout(&self.config).map_err(Error::backend)?);
+        let expected = self.state_layout()?;
         if state.layout() != &expected {
             return Err(Error::backend(
                 "diffusion state does not match the retained local geometry",
@@ -463,8 +501,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ArchitectureP
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<StateLayout, Error> {
         match &self.geometry {
-            Some(geometry) => Ok(geometry.state_layout().clone()),
-            None => super::state_layout(&self.config).map_err(Error::backend),
+            Some(geometry) => self
+                .definition
+                .state_layout()
+                .slice(geometry.units())
+                .map_err(Error::backend_source),
+            None => Ok(self.definition.state_layout().clone()),
         }
     }
     fn state_identity(
@@ -487,7 +529,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ArchitectureP
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        super::parallel::parameter_description(&self.config).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
     fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
         &self,
@@ -594,36 +636,29 @@ where
         Self: 'a,
         B::Tensor: 'a;
     type Error = Error;
-    fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        text_transport()
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        self.definition
+            .group_transport(group)
+            .cloned()
+            .unwrap_or_else(|_| text_transport())
     }
     fn primary_execution_group(&self) -> &str {
-        TEXT_EXECUTION_GROUP
+        self.definition.primary_group()
     }
     fn state_partition_plan(
         &self,
         layout: &StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..layout.len()),
-        ])
+        text_state_partition_plan(layout.len())
     }
     fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        self.graph()
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        if group != 0 {
-            return Err(Error::backend("invalid diffusion text group"));
-        }
-        Ok(self.config.text.num_hidden_layers())
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend(
-                "diffusion unit lies outside the shared stack",
-            ));
-        }
-        Ok(format!("model.decoder.layers.{index}"))
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &TextStatic<B> {
         &self.statics

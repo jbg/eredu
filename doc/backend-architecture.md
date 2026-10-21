@@ -11710,3 +11710,13 @@ composite requirements, selected target construction, and transform-source
 construction consume the same source-free declaration. Expert ownership never
 requires native parameter modules; materialization retains the resulting plan
 without reconstructing group identities or expert widths.
+
+DiffusionGemma text construction retains a source-free validated component
+definition before allocating pinned modules. Canonical parameters, graph,
+invocation paths, and transport descriptions project that definition. Each
+shared layer references one authoritative context slot; refinement borrows the
+same slot through a read-only cache view. Local geometry projects owned slot
+policies into the global ordinal schedule, and partition construction consumes
+that schedule and the definition's state ownership rules. The existing text
+runtime's local state layout is the retained definition's selected interval,
+including nonzero global offsets; unowned slots remain declaration metadata.

@@ -112,6 +112,28 @@ impl LocalGeometry {
     pub fn state_layout(&self) -> &StateLayout {
         &self.state
     }
+    /// Complete global slot schedule with this coordinate's owned heads localized.
+    /// Unowned slots retain global geometry and are excluded by partition selection.
+    pub fn complete_state_layout(
+        &self,
+        config: &FamilyConfig,
+    ) -> Result<StateLayout, ParallelPlanError> {
+        self.validate_for(config)?;
+        let mut schedule = super::state_layout(config)
+            .map_err(|error| invalid(error.to_string()))?
+            .layers()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for (global, policy) in self.units().zip(self.state.layers().iter()) {
+            schedule[global] = policy.clone();
+        }
+        StateLayout::new(
+            eredu_core::LayerSchedule::new(schedule.len(), schedule)
+                .map_err(|error| invalid(error.to_string()))?,
+        )
+        .map_err(|error| invalid(error.to_string()))
+    }
     /// Exact per-unit head, dense and routed widths.
     pub fn block_args(&self, global_index: usize) -> Option<&ModelArgs> {
         global_index
@@ -261,31 +283,19 @@ pub fn partition(
     ParallelPlanError,
 > {
     let geometry = local_geometry(config, layout, units.clone())?;
-    let mut schedule = super::state_layout(config)
-        .map_err(|error| invalid(error.to_string()))?
-        .layers()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for (global, policy) in units.clone().zip(geometry.state_layout().layers().iter()) {
-        schedule[global] = policy.clone();
+    let definition = super::model::component_definition(config, Some(&geometry))
+        .map_err(|error| invalid(error.to_string()))?;
+    if parameters != definition.parameters() {
+        return Err(invalid(
+            "diffusion text partition changes canonical parameter ownership",
+        ));
     }
-    let complete = StateLayout::new(
-        eredu_core::LayerSchedule::new(schedule.len(), schedule)
-            .map_err(|error| invalid(error.to_string()))?,
-    )
-    .map_err(|error| invalid(error.to_string()))?;
     eredu_runtime::ArchitecturePartition::from_description(
         parameters,
         [(super::model::TEXT_EXECUTION_GROUP, units)],
         ownership,
-        &complete,
-        &eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(
-                0,
-                0..config.text.num_hidden_layers(),
-            ),
-        ]),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry,
         super::boundary::TextBoundarySchema::new(config.text.hidden_size),
     )
