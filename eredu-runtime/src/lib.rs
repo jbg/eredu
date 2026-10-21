@@ -29,7 +29,7 @@ pub use component_execution::{
     ParallelComponentKernel, ParameterStorageId, StateSlotId, StatelessComponentState,
 };
 mod component_text;
-pub use component_text::TextComponentKernel;
+pub use component_text::{RefinementComponentKernel, TextComponentKernel};
 mod component_routed;
 pub use component_routed::{ParallelRoutedComponentKernel, RoutedComponentKernel};
 mod component_resources;

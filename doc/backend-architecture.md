@@ -11720,3 +11720,10 @@ policies into the global ordinal schedule, and partition construction consumes
 that schedule and the definition's state ownership rules. The existing text
 runtime's local state layout is the retained definition's selected interval,
 including nonzero global offsets; unowned slots remain declaration metadata.
+
+Shared component text contracts retain the kernel's explicit invocation admission,
+iterative geometry, and output-row selection. Block refinement requires the
+separate `RefinementComponentKernel` capability; a default text hook alone does
+not advertise iterative execution. Composite parameter traversal borrows the same
+kernel-owned pinned aggregate used by execution, without an additional resource
+owner or parameter storage instance.

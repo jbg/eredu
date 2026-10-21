@@ -223,3 +223,21 @@ impl ComponentDefinition {
         Ok(present)
     }
 }
+
+// Composite modules borrow the same kernel-owned aggregate used by execution.
+impl<T: 'static, D: Borrow<ComponentDefinition>, K: Parameterized<T>> Parameterized<T>
+    for ComponentAdapter<D, K, KernelParameterModules>
+{
+    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, T>>(&'a self, visitor: &mut V) {
+        self.kernel().visit_parameters(visitor);
+    }
+    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, T>>(
+        &'a mut self,
+        visitor: &mut V,
+    ) {
+        self.kernel_mut().visit_parameters_mut(visitor);
+    }
+    fn set_trainable(&mut self, trainable: bool) {
+        self.kernel_mut().set_trainable(trainable);
+    }
+}
