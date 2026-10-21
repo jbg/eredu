@@ -8584,6 +8584,16 @@ declaration, as it does for text partitions, so split expert checkpoint layouts
 retain the same source-ownership policy as packed layouts. Unrelated keys remain
 unexpected; this does not authorize ignoring a checkpoint-name prefix.
 
+Inkling retains a source-free validated `ComponentDefinition` before native
+module construction. Its parameter description, execution graph, unit counts
+and paths project that definition. The declaration owns optional vision/audio
+transport, independently leased vision and text units, target cache/convolution
+slots and output-owned embedded-prediction state. Vision parameter geometry and
+encoded companions derive from the hMLP fold specifications through shared
+linear-format expansion. Parameter inspection and partition source planning do
+not construct native modules to discover their storage. Rank-local construction
+validates the same canonical parameters against selected state geometry.
+
 Inkling component instrumentation shares its ordinary decoder equations, including
 relative attention and all four causal convolution histories. Unit/channel hooks
 precede their actual down/output projections. Projection writes, the learned

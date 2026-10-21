@@ -28,9 +28,10 @@ pub use graph::{
     PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use model::{
-    prepare_input, state_identity, DecoderInputPart, ForwardContext, InklingStateLayouts,
-    LayeredModel, ModelInput, PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput,
-    Unit, AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    component_definition, parameter_description, prepare_input, state_identity, DecoderInputPart,
+    ForwardContext, InklingStateLayouts, LayeredModel, ModelInput, PartitionMtpOutput,
+    PreparedInput, StaticModules, TextPartitionInput, Unit, AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE,
+    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub(crate) use mtp::mtp_text_args;
 pub use mtp::{MtpDepth, MtpModel, MtpOutput, MtpShared};

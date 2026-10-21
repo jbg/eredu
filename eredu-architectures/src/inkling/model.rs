@@ -1,5 +1,8 @@
 //! One neutral Inkling multimodal model for resident and bounded runtimes.
 
+mod parameters;
+pub use parameters::{component_definition, parameter_description};
+
 use std::sync::Arc;
 
 use eredu_core::cache::PromptCacheTopology;
@@ -9,18 +12,16 @@ use eredu_nn::{
     ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, ModelStateIdentity, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
+    ArchitectureParameterDescription, ExecutionGraph, ExpertPass, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    ModelStateIdentity, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
     ParameterProvider, PartitionState, PartitionedLayeredArchitecture, RoutedLayeredArchitecture,
     StateLayout,
 };
 
 use super::{
-    composite_state_layout, layer_parameter_groups, mtp_parameter_groups, mtp_state_layout,
-    state_layout, static_parameter_groups, vision_layer_parameter_groups, AudioInput, AudioTower,
-    DecoderLayer, LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
+    composite_state_layout, mtp_state_layout, state_layout, AudioInput, AudioTower, DecoderLayer,
+    LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
 use crate::{
     composite_execution::{CompositeArchitecture, PreparedCompositeInput},
@@ -781,6 +782,7 @@ impl<T> ForwardContext<T> {
 
 /// Inkling architecture shared by resident, layerwise, and streamed runtimes.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    definition: Arc<eredu_runtime::ComponentDefinition>,
     args: ModelArgs,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<Arc<LocalGeometry>>,
@@ -867,7 +869,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        Ok(self.state_layouts()?.composite().clone())
+        Ok(self.definition.state_layout().clone())
     }
 
     fn state_identity(
@@ -885,9 +887,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        Ok(self.definition.parameters().clone())
     }
 
     fn static_parameter_recipes(
@@ -982,12 +984,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Builds unloaded pinned modules from normalized family configuration.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let definition = Arc::new(component_definition(&args, None)?);
         crate::operator_requirements::require::<B>(
             "Inkling",
             crate::operator_requirements::INKLING,
         )?;
         let static_modules = StaticModules::new(&args, context)?;
         Ok(Self {
+            definition,
             args,
             static_modules,
             parallel_geometry: None,
@@ -1002,13 +1006,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         geometry: Arc<LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = Arc::new(component_definition(&args, Some(&geometry))?);
         crate::operator_requirements::require::<B>(
             "Inkling",
             crate::operator_requirements::INKLING,
         )?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         Ok(Self {
+            definition,
             args,
             static_modules,
             parallel_geometry: Some(geometry),
@@ -1061,101 +1066,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     /// Returns normalized family configuration.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    /// Describes pinned media/text modules and every graph unit with explicit
-    /// architecture ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::new(
-            vec![
-                eredu_runtime::ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)?;
-        let counts = [
-            self.args
-                .vision_config
-                .as_ref()
-                .map_or(0, |vision| vision.num_hidden_layers as usize),
-            0,
-            self.args.text_config.num_hidden_layers as usize,
-        ];
-        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
-        let static_groups = static_parameter_groups(&self.args).map_err(Error::backend)?;
-        let mut static_roles = vec!["embedding", "embedding_norm", "norm", "output"];
-        if self.args.audio_config.is_some() {
-            static_roles.extend(["audio", "audio"]);
-        }
-        if self.args.vision_config.is_some() {
-            static_roles.extend(std::iter::repeat_n(
-                "vision",
-                static_groups.len() - static_roles.len(),
-            ));
-        }
-        debug_assert_eq!(static_groups.len(), static_roles.len());
-        let mtp_groups = mtp_parameter_groups(&self.args).map_err(Error::backend)?;
-        let mut expected = static_groups
-            .iter()
-            .chain(&mtp_groups)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut owned = static_groups
-            .into_iter()
-            .zip(static_roles)
-            .map(|(group, role)| {
-                let owner = if role == "embedding" {
-                    ParameterGroupOwner::static_any_of(["embedding", MTP_STATIC_ROLE])
-                } else {
-                    ParameterGroupOwner::static_role(role)
-                };
-                OwnedParameterGroupSpec::new(owner, group)
-            })
-            .chain(mtp_groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::static_role(MTP_STATIC_ROLE),
-                    group,
-                )
-            }))
-            .collect::<Vec<_>>();
-        for (group_index, &count) in counts.iter().enumerate() {
-            let owner_group = layout
-                .group_id(group_index)
-                .expect("Inkling layout group")
-                .clone();
-            for index in 0..count {
-                let groups = if group_index == 0 {
-                    let vision = self
-                        .args
-                        .vision_config
-                        .as_ref()
-                        .expect("vision group configured");
-                    let layer =
-                        VisionLayer::<B>::new(vision, index, vision.layer_specs()[index], context)?;
-                    vision_layer_parameter_groups::<B>(&layer, index)
-                } else {
-                    layer_parameter_groups(&self.args, index)
-                }
-                .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
     }
 
     /// Returns the transient target state required to enter this realization.
@@ -1870,39 +1780,7 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        match group {
-            0 => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            },
-            1 => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::AudioEncoder,
-                first_owner_static_roles: vec!["audio".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: None,
-                request_optional: true,
-            },
-            _ => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::Decoder,
-                first_owner_static_roles: vec!["embedding".into(), "embedding_norm".into()],
-                last_owner_static_roles: vec![
-                    "norm".into(),
-                    "output".into(),
-                    MTP_STATIC_ROLE.into(),
-                ],
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::LastOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::Decoder),
-                request_optional: false,
-            },
-        }
+        parameters::group_transport(group)
     }
 
     fn primary_execution_group(&self) -> &str {
@@ -1913,62 +1791,19 @@ where
         &self,
         layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        let target_layers = layout
-            .segments()
-            .iter()
-            .find(|segment| segment.id().as_str() == super::TARGET_STATE_SEGMENT)
-            .map(|segment| segment.layers().end)
-            .unwrap_or(layout.len());
-        crate::transport::pipeline_with_output_state(2, target_layers, layout)
+        parameters::state_partition_plan(layout)
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(
-            vec![
-                eredu_runtime::ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                eredu_runtime::ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        match group {
-            0 => Ok(self
-                .args
-                .vision_config
-                .as_ref()
-                .map_or(0, |vision| vision.num_hidden_layers as usize)),
-            1 => Ok(0),
-            2 => Ok(self.args.text_config.num_hidden_layers as usize),
-            _ => Err(Error::backend("Inkling has three execution groups")),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        let count = match group {
-            0 => self
-                .args
-                .vision_config
-                .as_ref()
-                .map_or(0, |vision| vision.num_hidden_layers as usize),
-            1 => 0,
-            2 => self.args.text_config.num_hidden_layers as usize,
-            _ => return Err(Error::backend("Inkling has three execution groups")),
-        };
-        if index >= count {
-            return Err(Error::backend("Inkling unit is outside its group"));
-        }
-        match group {
-            0 => Ok(format!("visual.layers.{index}")),
-            2 => Ok(format!("model.layers.{index}")),
-            _ => unreachable!(),
-        }
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {

@@ -3,11 +3,11 @@
 use std::{collections::BTreeMap, ops::Range};
 
 use eredu_checkpoint::LinearFormat;
-use eredu_nn::{NeuralBackend, VocabularyParallelRange};
+use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, module_parameter_group, ArchitecturePartition,
-    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, PartitionOwnership, PartitionState, StateLayout, TensorPlacement,
+    expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
+    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
+    PartitionState, StateLayout, TensorPlacement,
 };
 
 use crate::linear_format::standard_parallel_linear_format;
@@ -600,76 +600,135 @@ fn local_axis(
 pub fn static_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    pinned_parameter_groups(args).map(|groups| groups.into_iter().map(|(_, group)| group).collect())
+}
+
+pub(super) fn pinned_parameter_groups(
+    args: &ModelArgs,
+) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
     let hidden = dim(args.text_config.hidden_size)?;
     let vocabulary = dim(args.text_config.vocab_size)?;
     let mut groups = vec![
-        group(
-            "model.embed_tokens",
-            ParameterRole::Vocabulary,
-            [(
-                "model.embed_tokens.weight",
-                vec![vocabulary, hidden],
-                balanced(0),
-            )],
-        )?,
-        replicated(
-            "model.embed_norm",
-            [("model.embed_norm.weight", vec![hidden])],
-        )?,
-        replicated("model.norm", [("model.norm.weight", vec![hidden])])?,
-        group(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            [("lm_head.weight", vec![vocabulary, hidden], balanced(0))],
-        )?,
+        (
+            "embedding",
+            group(
+                "model.embed_tokens",
+                ParameterRole::Vocabulary,
+                [(
+                    "model.embed_tokens.weight",
+                    vec![vocabulary, hidden],
+                    balanced(0),
+                )],
+            )?,
+        ),
+        (
+            "embedding_norm",
+            replicated(
+                "model.embed_norm",
+                [("model.embed_norm.weight", vec![hidden])],
+            )?,
+        ),
+        (
+            "norm",
+            replicated("model.norm", [("model.norm.weight", vec![hidden])])?,
+        ),
+        (
+            "output",
+            group(
+                "lm_head",
+                ParameterRole::Vocabulary,
+                [("lm_head.weight", vec![vocabulary, hidden], balanced(0))],
+            )?,
+        ),
     ];
     if let Some(audio) = &args.audio_config {
-        groups.push(replicated(
-            "audio.codebook_embedding",
-            [(
-                "audio.encoder.weight",
-                vec![
-                    dim(audio.num_codebooks)?
-                        .checked_mul(dim(audio.codebook_size)?)
-                        .ok_or_else(|| invalid("Inkling audio vocabulary overflow"))?,
-                    hidden,
-                ],
-            )],
-        )?);
-        groups.push(replicated(
-            "audio.final_norm",
-            [("audio.final_norm.weight", vec![hidden])],
-        )?);
+        let audio_vocabulary = dim(audio.num_codebooks)?
+            .checked_mul(dim(audio.codebook_size)?)
+            .ok_or_else(|| invalid("Inkling audio vocabulary overflow"))?;
+        groups.push((
+            "audio",
+            replicated(
+                "audio.codebook_embedding",
+                [("audio.encoder.weight", vec![audio_vocabulary, hidden])],
+            )?,
+        ));
+        groups.push((
+            "audio",
+            replicated(
+                "audio.final_norm",
+                [("audio.final_norm.weight", vec![hidden])],
+            )?,
+        ));
     }
     if args.vision_config.is_some() {
-        groups.push(replicated(
-            "visual.final_norm",
-            [("visual.final_norm.weight", vec![hidden])],
-        )?);
+        groups.push((
+            "vision",
+            replicated(
+                "visual.final_norm",
+                [("visual.final_norm.weight", vec![hidden])],
+            )?,
+        ));
     }
-    expand_linear_format_parameter_groups(groups, |member| {
-        let name = member.target();
-        let format = if name.starts_with("visual.") {
-            args.vision_config
-                .as_ref()
-                .map_or(LinearFormat::Dense, |config| config.linear_format_for(name))
-        } else {
-            args.text_config.linear_format_for(name)
-        };
-        standard_parallel_linear_format(member, format)
-    })
+    let mut expanded = Vec::new();
+    for (role, group) in groups {
+        expanded.extend(
+            expand_linear_format_parameter_groups(vec![group], |member| {
+                let name = member.target();
+                let format = if name.starts_with("visual.") {
+                    args.vision_config
+                        .as_ref()
+                        .map_or(LinearFormat::Dense, |config| config.linear_format_for(name))
+                } else {
+                    args.text_config.linear_format_for(name)
+                };
+                standard_parallel_linear_format(member, format)
+            })?
+            .into_iter()
+            .map(|group| (role, group)),
+        );
+    }
+    Ok(expanded)
 }
 
 /// Declares one replicated Inkling vision execution unit.
-pub fn vision_layer_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    layer: &impl eredu_nn::Parameterized<B::Tensor>,
+pub fn vision_layer_parameter_groups(
+    config: &super::VisionConfig,
     index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(vec![module_parameter_group::<B::Tensor, _>(
-        format!("visual.layers.{index}"),
+    let (input, output, _, _) = config
+        .layer_specs()
+        .get(index)
+        .copied()
+        .filter(|_| index < config.num_hidden_layers as usize)
+        .ok_or_else(|| invalid(format!("Inkling vision layer {index} is out of range")))?;
+    let root = format!("visual.layers.{index}");
+    let projection = expand_linear_format_parameter_groups(
+        vec![ParameterGroupSpec::new(
+            &root,
+            ParameterRole::Replicated,
+            [member(
+                format!("{root}.projection.weight"),
+                vec![dim(output)?, dim(input)?],
+                MemberSharding::Replicated,
+            )],
+        )?],
+        |member| standard_parallel_linear_format(member, config.linear_format_for(member.target())),
+    )?;
+    // Canonical projection traversal orders physical parameters by identity;
+    // the following normalization remains a separate module in that traversal.
+    let mut members = projection[0].members().to_vec();
+    members.sort_by(|left, right| left.target().cmp(right.target()));
+    if index + 1 != config.num_hidden_layers as usize {
+        members.push(member(
+            format!("{root}.layer_norm.weight"),
+            vec![dim(output)?],
+            MemberSharding::Replicated,
+        ));
+    }
+    Ok(vec![ParameterGroupSpec::new(
+        root,
         ParameterRole::Replicated,
-        layer,
-        |_, _| Ok(MemberSharding::Replicated),
+        members,
     )?])
 }
 

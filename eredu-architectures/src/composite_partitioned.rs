@@ -2726,12 +2726,7 @@ where
                         .into(),
                 ));
             }
-            let description = crate::inkling::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
+            let parameters = crate::inkling::parameter_description(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let layout =
@@ -3213,10 +3208,7 @@ where
         ),
     )?;
     let source = &source_args;
-    let description = crate::inkling::LayeredModel::<B>::new(source.clone(), context)
-        .map_err(|error| error.to_string())?;
-    let parameters = description
-        .parameter_description(context)
+    let parameters = crate::inkling::parameter_description(source)
         .map_err(|error| error.to_string())?;
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()
@@ -3623,12 +3615,7 @@ where
                         .into(),
                 ));
             }
-            let description = crate::inkling::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
+            let parameters = crate::inkling::parameter_description(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let layout =
