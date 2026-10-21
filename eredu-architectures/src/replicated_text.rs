@@ -8187,7 +8187,7 @@ where
                 args.with_checkpoint_formats(self.source_formats.clone())
                     .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))
                     .and_then(|config| {
-                        crate::nemotron_labs_diffusion::composite::Model::<B>::new(
+                        crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::new(
                             config,
                             self.context,
                         )
@@ -8201,9 +8201,11 @@ where
             .with_checkpoint_formats(self.target_formats.clone())
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let identity = target.architecture_fingerprint();
-        let architecture =
-            crate::nemotron_labs_diffusion::composite::Model::<B>::new(target, self.context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture = crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::new(
+            target,
+            self.context,
+        )
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,

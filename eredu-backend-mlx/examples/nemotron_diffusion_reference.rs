@@ -321,7 +321,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let reference = Array::load_safetensors(reference_path, &weights_stream)?;
     if vision_context {
         type Composite = nemotron_labs_diffusion::composite::Model<Backend>;
-        let mut model = Composite::new(config.clone(), stream)?;
+        let mut model =
+            nemotron_labs_diffusion::composite::CompositeKernel::new(config.clone(), stream)?;
         let (policy, metadata) = prepare_layerwise_policy_with_bindings(
             source,
             &mut model,

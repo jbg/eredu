@@ -11818,3 +11818,16 @@ preparation, layer equations, observation seams and readout mechanisms. Only the
 complete resource/geometry specialization implements the explicit block-refinement
 kernel capability. Selected low-level ingress preparation remains available on the
 kernel; `from_partition` validates authoritative ownership before materialization.
+
+Complete Nemotron Pixtral composite execution uses `ComponentAdapter` over
+`CompositeKernel` and its pinned text/image aggregate. The composite borrows the
+same raw text kernel used by standalone text execution under the enclosing
+resource and completion lifecycle. Runtime implements graph and address checks,
+parameter traversal, state ownership projections, and ordinary, observed,
+parallel and provider-backed driver contracts. Family hooks retain request-local
+roots, prepared input
+admission, image marker assembly, request-optional tower/projection activity,
+collective schedules and image transport semantics. Serial and parallel ingress
+assembly and unit execution share equations with an optional neutral parallel
+context. Constructors live on `CompositeKernel`; direct module access uses
+`kernel()` and `kernel_mut()`.

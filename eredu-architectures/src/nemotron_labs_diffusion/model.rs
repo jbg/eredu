@@ -287,7 +287,7 @@ where
         }
         Ok(())
     }
-    fn run_unit<S, O>(
+    pub(super) fn run_unit<S, O>(
         &mut self,
         address: ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
