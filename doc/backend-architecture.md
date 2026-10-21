@@ -4484,7 +4484,15 @@ image modality without changing text checkpoint admission.
 
 The neutral `eredu-architectures::muse` module owns the shared Glimmer/Spark
 configuration, checkpoint recipes, parameter topology, media preparation, state
-geometry and construction. Distinct registered identities select typed attention,
+geometry and construction. A source-free `muse::component_definition` validates
+canonical parameter ownership, logical paths, independent state slots, transport
+and partition rules before native allocation. Live models retain this definition;
+graph, address, parameter, state and transport reports project it. Cold partition
+preparation, inspection and assistant target placement use the same declaration.
+Vision units retain no mutable state; decoder units reference their KV slots, and
+waveform units reference separate histories after the decoder slots, including
+stateless gaps required by the declared audio schedule.
+Distinct registered identities select typed attention,
 normalization, residual, feed-forward and media policies. The backend binds the
 retained declarations through ordinary native mechanisms and selects no family
 semantics. Spark preserves its exact released attention schedule and FP32

@@ -282,7 +282,10 @@ impl CompatibleExternalAssistantPreparation {
             crate::replicated_text::selected_formats(execution.text_realization()),
         )
         .map_err(invalid_assistant)?;
-        let parameters = muse::model::parameter_description(&args).map_err(invalid_assistant)?;
+        let parameters = muse::component_definition(&args, None)
+            .map_err(invalid_assistant)?
+            .parameters()
+            .clone();
         let index = crate::parameter_partition::ParameterMemberIndex::new(
             execution.text_realization().materialization_tasks(),
             &parameters,

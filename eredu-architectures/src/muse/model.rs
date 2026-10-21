@@ -2,7 +2,7 @@
 
 mod observation;
 mod parameters;
-pub(crate) use parameters::describe as parameter_description;
+pub use parameters::component_definition;
 mod prefill;
 mod waveform;
 use prefill::DecoderPrefill;
@@ -982,6 +982,7 @@ where
 /// The same architecture object used by resident and bounded runtimes.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: DecoderConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
     partition_state: Option<eredu_runtime::PartitionState>,
@@ -1025,7 +1026,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        parameter_description(&self.args)
+        Ok(self.definition.parameters().clone())
     }
 
     fn static_parameter_recipes(
@@ -1119,6 +1120,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             args.identity.model_type(),
             crate::operator_requirements::muse(&args),
         )?;
+        let definition = std::sync::Arc::new(component_definition(&args, None)?);
         let static_modules = StaticModules {
             text: TextStaticModules::new(&args, context)?,
             vision: args
@@ -1129,6 +1131,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         };
         Ok(Self {
             args,
+            definition,
             static_modules,
             parallel_geometry: None,
             partition_state: None,
@@ -1146,7 +1149,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             args.identity.model_type(),
             crate::operator_requirements::muse(&args),
         )?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = std::sync::Arc::new(component_definition(&args, Some(&geometry))?);
         let static_modules = StaticModules {
             text: TextStaticModules::new_parallel(&args, &geometry, context)?,
             vision: args
@@ -1157,6 +1160,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         };
         Ok(Self {
             args,
+            definition,
             static_modules,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
             partition_state: None,
@@ -1226,10 +1230,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Returns the replicated or planner-derived mutable-state layout.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| state_layout(&self.args).map_err(Error::backend), Ok)
+        Ok(self.definition.state_layout().clone())
     }
 
     /// Applies the architecture-owned tensor-parallel token embedding boundary.
@@ -1812,85 +1813,33 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 2 {
-            audio_group_transport()
-        } else if group == 0 {
-            vision_group_transport(&self.args)
-        } else {
-            crate::transport::decoder()
-        }
+        self.definition
+            .group_transport(group)
+            .cloned()
+            .unwrap_or_else(|_| crate::transport::decoder())
     }
 
     fn primary_execution_group(&self) -> &str {
-        TEXT_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        state_partition_plan(&self.args, layout)
+        self.definition.state_partition_plan().clone()
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        super::graph::execution_graph(&self.args)
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        match group {
-            0 => Ok(self.parallel_geometry.as_ref().map_or_else(
-                || {
-                    self.args
-                        .vision_config
-                        .as_ref()
-                        .map_or(0, |vision| vision.layer_count())
-                },
-                |geometry| geometry.vision_layers(),
-            )),
-            1 => Ok(self.args.num_hidden_layers as usize),
-            2 if self.args.audio_config.is_some() => Ok(self
-                .args
-                .audio_config
-                .as_ref()
-                .unwrap()
-                .execution_units()?
-                .len()),
-            _ => Err(Error::backend(
-                "Muse execution group is outside its admitted graph",
-            )),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        let count = match group {
-            0 => self
-                .args
-                .vision_config
-                .as_ref()
-                .map_or(0, |vision| vision.layer_count()),
-            1 => self.args.num_hidden_layers as usize,
-            2 if self.args.audio_config.is_some() => self
-                .args
-                .audio_config
-                .as_ref()
-                .unwrap()
-                .execution_units()?
-                .len(),
-            _ => {
-                return Err(Error::backend(
-                    "Muse execution group is outside its admitted graph",
-                ))
-            }
-        };
-        if index >= count {
-            return Err(Error::backend("Muse unit is outside its group"));
-        }
-        match group {
-            0 => Ok(format!("model.vision_tower.layers.{index}")),
-            1 => Ok(format!("model.layers.{index}")),
-            2 => Ok(self.args.audio_config.as_ref().unwrap().execution_units()?[index].path()),
-            _ => unreachable!(),
-        }
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
@@ -1974,12 +1923,9 @@ where
     }
 
     fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
-        match group {
-            0 => 0,
-            1 => index,
-            2 => self.args.num_hidden_layers as usize + index,
-            _ => index,
-        }
+        self.definition
+            .unit(group, index)
+            .map_or(index, |unit| unit.state.start)
     }
 
     fn retained_state_ordinals(
@@ -1988,15 +1934,9 @@ where
         index: usize,
         _ordinal: usize,
     ) -> std::ops::Range<usize> {
-        match group {
-            0 => 0..0,
-            1 => index..index + 1,
-            2 => {
-                let index = self.args.num_hidden_layers as usize + index;
-                index..index + 1
-            }
-            _ => 0..0,
-        }
+        self.definition
+            .unit(group, index)
+            .map_or(0..0, |unit| unit.state.clone())
     }
 
     fn begin_forward<'a>(

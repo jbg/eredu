@@ -429,8 +429,10 @@ fn record_rank_resources(
                 config,
                 crate::replicated_text::selected_formats(selected.text_realization()),
             )?;
-            let parameters = crate::muse::model::parameter_description(&config)
-                .map_err(|error| error.to_string())?;
+            let parameters = crate::muse::component_definition(&config, None)
+                .map_err(|error| error.to_string())?
+                .parameters()
+                .clone();
             (
                 parameters,
                 config.num_hidden_layers as usize,

@@ -6372,8 +6372,10 @@ fn composite_partitioned_state_layout(
                 .map_err(|error| error.to_string())
         }
         crate::replicated_text::CompositeConfig::Muse(args) => {
-            let parameters = crate::muse::model::parameter_description(args)
-                .map_err(|error| error.to_string())?;
+            let parameters = crate::muse::component_definition(args, None)
+                .map_err(|error| error.to_string())?
+                .parameters()
+                .clone();
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, rank)?;
             let local = crate::muse::local_decoder_config(args, 0, &layout)
                 .map_err(|error| error.to_string())?;

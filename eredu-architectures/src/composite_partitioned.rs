@@ -2184,9 +2184,12 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::muse::model::parameter_description(&args).map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let parameters = crate::muse::component_definition(&args, None)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?
+                .parameters()
+                .clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;

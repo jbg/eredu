@@ -41,9 +41,9 @@ pub use equations::{
 };
 pub use graph::{component_graph, state_layout};
 pub use model::{
-    prepare_composite_ingress, DecoderInputPart, ForwardContext, LayeredModel, ModelInput,
-    PreparedCompositeIngress, TextPartitionInput, Unit, TEXT_EXECUTION_GROUP,
-    VISION_EXECUTION_GROUP,
+    component_definition, prepare_composite_ingress, DecoderInputPart, ForwardContext,
+    LayeredModel, ModelInput, PreparedCompositeIngress, TextPartitionInput, Unit,
+    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     layer_parameter_groups, local_decoder_config, local_geometry, partition_local_geometry,
