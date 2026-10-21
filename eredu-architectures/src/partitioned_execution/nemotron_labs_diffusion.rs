@@ -17,7 +17,7 @@ where
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     V: PartitionedArchitectureVisitor<B, S>,
 {
-    use crate::nemotron_labs_diffusion::{parallel, partitioned::PartitionedTextModel};
+    use crate::nemotron_labs_diffusion::{parallel, partitioned::PartitionedTextKernel};
     let error = |message: String| DenseDecoderPartitionedDispatchError::Architecture(message);
     let target = args
         .with_checkpoint_formats(crate::replicated_text::selected_formats(selected.base()))
@@ -65,9 +65,13 @@ where
         )
         .map_err(|e| error(e.to_string()))?;
         validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
-        let model =
-            PartitionedTextModel::<B>::new(source, &description, &source_partition, context)
-                .map_err(|e| error(e.to_string()))?;
+        let model = PartitionedTextKernel::<B>::from_partition(
+            source,
+            &description,
+            &source_partition,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
         Some((model, source_layout))
     } else {
         None
@@ -81,8 +85,9 @@ where
     let capability_estimate = crate::capability::nemotron_labs_diffusion(&target, false)
         .map_err(|e| error(e.to_string()))?;
     let effective_model_type = crate::decoder::Config::model_identity(&target).to_owned();
-    let model = PartitionedTextModel::<B>::new(target, &parameters, &partition, context)
-        .map_err(|e| error(e.to_string()))?;
+    let model =
+        PartitionedTextKernel::<B>::from_partition(target, &parameters, &partition, context)
+            .map_err(|e| error(e.to_string()))?;
     let prepared =
         prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition).map_err(error)?;
     visitor

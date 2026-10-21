@@ -11806,3 +11806,15 @@ visibility and final-position projection. Serial and parallel unit execution use
 one equation with an optional neutral parallel context and instrumentation.
 Constructors live on `TextKernel` and return the shared adapter; low-level module
 and equation access uses `kernel()` and `kernel_mut()`.
+
+Selected Nemotron Labs Diffusion text uses the same `TextKernel`, specialized by
+`DecoderStaticResources` and `DecoderGeometry`. Its retained selection owns only
+its pinned roles and independently leased layers. Global unit addresses map to
+local context slots through shared decoder geometry; the declaration preserves
+global state identities. The shared adapter supplies typed partition and pipeline
+contracts, while family hooks validate and transport invocation mode, canonical
+prefix frontier and activation precision. Complete and selected text share mask
+preparation, layer equations, observation seams and readout mechanisms. Only the
+complete resource/geometry specialization implements the explicit block-refinement
+kernel capability. Selected low-level ingress preparation remains available on the
+kernel; `from_partition` validates authoritative ownership before materialization.

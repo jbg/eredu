@@ -1,7 +1,8 @@
 //! Retained composite ownership; each stage constructs only selected parameters.
+use super::super::model::ForwardContext as TextForward;
 use super::*;
 use crate::nemotron_labs_diffusion::partitioned::{
-    PartitionContext, PartitionedTextModel, TextBoundary, TextBoundarySchema,
+    PartitionedTextKernel, PartitionedTextModel, TextBoundary, TextBoundarySchema,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ArchitecturePartition, ArchitectureStatePartitionPlan,
@@ -200,7 +201,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
                     "composite text state differs from retained local ownership",
                 ));
             }
-            Some(PartitionedTextModel::new(
+            Some(PartitionedTextKernel::from_partition(
                 config.clone(),
                 &description,
                 &text_partition,
@@ -268,6 +269,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
                     .text
                     .as_ref()
                     .ok_or_else(|| Error::backend("partition owns no text layers"))?
+                    .kernel()
                     .construct_unit(index, context)?,
             )),
             _ => Err(Error::backend(
@@ -280,7 +282,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
         input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
-        LayeredForwardState<B::Tensor, ForwardContext<B::Tensor, PartitionContext<B::Tensor>>>,
+        LayeredForwardState<B::Tensor, ForwardContext<B::Tensor, TextForward<B::Tensor>>>,
         Error,
     > {
         let PreparedSegments {
@@ -391,7 +393,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
         &mut self,
         dependencies: &[&B::Tensor],
         state: &mut S,
-        forward: &mut ForwardContext<B::Tensor, PartitionContext<B::Tensor>>,
+        forward: &mut ForwardContext<B::Tensor, TextForward<B::Tensor>>,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
@@ -401,7 +403,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
         if let Some(output) = dependencies.first() {
             forward.image_output = Some((*output).clone());
         }
-        let prepared = self.text()?.prepare_partition_input(
+        let prepared = self.text()?.kernel_mut().prepare_partition_input(
             crate::nemotron_labs_diffusion::model::TextInput {
                 tokens: &forward.tokens,
                 mask: None,
@@ -445,7 +447,7 @@ where
         Self: 'a;
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
-    type ForwardContext = ForwardContext<B::Tensor, PartitionContext<B::Tensor>>;
+    type ForwardContext = ForwardContext<B::Tensor, TextForward<B::Tensor>>;
     type RetainedContextValues<'a>
         = std::vec::IntoIter<&'a B::Tensor>
     where

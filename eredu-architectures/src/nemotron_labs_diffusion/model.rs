@@ -1,7 +1,9 @@
 //! One parameter catalog serving causal execution and transient block refinement.
 
 use eredu_core::decoding::{AdapterScope, AttentionInvocation, CacheWritePolicy};
-use eredu_nn::{Error, NeuralBackend, ReadOnlyAttentionCache, ReadOnlyCache, Tensor};
+use eredu_nn::{
+    AttentionCache, Error, NeuralBackend, ReadOnlyAttentionCache, ReadOnlyCache, Tensor,
+};
 use eredu_runtime::{
     ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel,
     ComponentPinnedResources, ExecutionUnitAddress, KernelParameterModules, LayerRuntimeState,
@@ -32,6 +34,8 @@ pub struct ForwardContext<T> {
     pub mask: Option<T>,
     /// Explicit cache-write and score policy.
     pub invocation: AttentionInvocation,
+    /// Canonical prefix frontier transported to the next owner.
+    pub(crate) position: i32,
 }
 
 /// Complete text execution through the shared validated runtime adapter.
@@ -40,12 +44,21 @@ pub type TextModel<B> =
 
 /// Family invocation equations over the shared decoder's physical resources.
 #[derive(Clone)]
-pub struct TextKernel<B: NeuralBackend> {
-    definition: std::sync::Arc<ComponentDefinition>,
-    base: decoder::CompleteDecoderKernel<B, FamilyConfig>,
+pub struct TextKernel<
+    B: NeuralBackend,
+    M: decoder::DecoderStaticResources<B> = StaticModules<B>,
+    G: decoder::DecoderGeometry<FamilyConfig> = decoder::CompleteDecoderGeometry<FamilyConfig>,
+> {
+    pub(super) definition: std::sync::Arc<ComponentDefinition>,
+    pub(super) base: decoder::DecoderKernel<B, FamilyConfig, decoder::DenseBlockFactory, M, G>,
 }
 
-impl<B: NeuralBackend> eredu_nn::Parameterized<B::Tensor> for TextKernel<B> {
+impl<B, M, G> eredu_nn::Parameterized<B::Tensor> for TextKernel<B, M, G>
+where
+    B: NeuralBackend,
+    M: decoder::DecoderStaticResources<B>,
+    G: decoder::DecoderGeometry<FamilyConfig>,
+{
     fn set_trainable(&mut self, trainable: bool) {
         self.static_modules_mut().set_trainable(trainable);
     }
@@ -124,45 +137,15 @@ impl<B: NeuralBackend> TextLayer<B> {
     }
 }
 
-impl<B: NeuralBackend> TextKernel<B> {
+impl<B, M, G> TextKernel<B, M, G>
+where
+    B: NeuralBackend,
+    M: decoder::DecoderStaticResources<B>,
+    G: decoder::DecoderGeometry<FamilyConfig>,
+{
     /// Retained semantic declaration used by execution and inspection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
         &self.definition
-    }
-
-    /// Declares one shared base without allocating any second invocation stack.
-    pub fn new(
-        config: FamilyConfig,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TextModel<B>, Error> {
-        let definition = std::sync::Arc::new(super::definition::text(&config, None)?);
-        let base = decoder::CompleteDecoderKernel::new(config, context)?
-            .into_parts()
-            .1;
-        let kernel = Self {
-            definition: definition.clone(),
-            base,
-        };
-        ComponentAdapter::with_pinned_resources::<B>(definition, kernel).map_err(Error::from)
-    }
-    /// Declares the same base with exact tensor-parallel local geometry.
-    pub fn new_parallel(
-        config: FamilyConfig,
-        geometry: decoder::LocalGeometry<FamilyConfig>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TextModel<B>, Error>
-    where
-        B: eredu_nn::DistributedNeuralBackend,
-    {
-        let definition = std::sync::Arc::new(super::definition::text(&config, Some(&geometry))?);
-        let base = decoder::CompleteDecoderKernel::new_parallel(config, geometry, context)?
-            .into_parts()
-            .1;
-        let kernel = Self {
-            definition: definition.clone(),
-            base,
-        };
-        ComponentAdapter::with_pinned_resources::<B>(definition, kernel).map_err(Error::from)
     }
 
     /// Complete family geometry shared by all phases.
@@ -170,11 +153,11 @@ impl<B: NeuralBackend> TextKernel<B> {
         self.base.args()
     }
     /// Borrowed pinned parameter modules, with a singular storage owner.
-    pub fn static_modules(&self) -> &StaticModules<B> {
+    pub fn static_modules(&self) -> &M {
         self.base.static_modules()
     }
     /// Mutable binding access to that same pinned parameter catalog.
-    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
+    pub fn static_modules_mut(&mut self) -> &mut M {
         self.base.static_modules_mut()
     }
     /// Starts a text invocation from already assembled media/text embeddings.
@@ -209,21 +192,8 @@ impl<B: NeuralBackend> TextKernel<B> {
         {
             return Err(Error::backend("invalid shared-backbone embedding geometry"));
         }
-        let mut supplied = mask.cloned();
-        if invocation.cache_write == CacheWritePolicy::Transient && supplied.is_none() {
-            let offset = eredu_nn::AttentionCache::offset(state.layer(0).map_err(Error::backend)?);
-            let length = hidden.dim(1);
-            supplied = Some(B::Tensor::full_f32(
-                0.0,
-                &[
-                    length,
-                    offset
-                        .checked_add(length)
-                        .ok_or_else(|| Error::backend("block visibility overflow"))?,
-                ],
-                context,
-            )?);
-        }
+        let position = eredu_nn::AttentionCache::offset(state.layer(0).map_err(Error::backend)?);
+        let supplied = self.prepare_mask(mask, hidden.dim(1), invocation, state, context)?;
         let layout = state.layout().clone();
         let forward = self.base.begin_embedded_with_layout(
             hidden,
@@ -232,13 +202,7 @@ impl<B: NeuralBackend> TextKernel<B> {
             &layout,
             context,
         )?;
-        Ok(LayeredForwardState {
-            hidden: forward.hidden,
-            context: ForwardContext {
-                mask: forward.context.visibility_mask().cloned(),
-                invocation,
-            },
-        })
+        Ok(Self::invocation_forward(forward, invocation, position))
     }
 
     /// Constructs one independently addressable shared layer.
@@ -264,6 +228,49 @@ impl<B: NeuralBackend> TextKernel<B> {
             base,
             draft_adapter,
         })
+    }
+    pub(super) fn prepare_mask<S: LayerRuntimeState<B>>(
+        &self,
+        mask: Option<&B::Tensor>,
+        length: i32,
+        invocation: AttentionInvocation,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Error>
+    where
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        if let Some(mask) = mask {
+            return Ok(Some(mask.clone()));
+        }
+        if invocation.cache_write == CacheWritePolicy::Transient {
+            let frontier = state.layer(0).map_err(Error::backend)?.offset();
+            return Ok(Some(B::Tensor::full_f32(
+                0.0,
+                &[
+                    length,
+                    frontier
+                        .checked_add(length)
+                        .ok_or_else(|| Error::backend("partition canvas visibility overflow"))?,
+                ],
+                context,
+            )?));
+        }
+        Ok(None)
+    }
+    pub(super) fn invocation_forward(
+        forward: LayeredForwardState<B::Tensor, decoder::ForwardContext<B::Tensor>>,
+        invocation: AttentionInvocation,
+        position: i32,
+    ) -> LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>> {
+        LayeredForwardState {
+            hidden: forward.hidden,
+            context: ForwardContext {
+                mask: forward.context.visibility_mask().cloned(),
+                invocation,
+                position,
+            },
+        }
     }
     fn validate_input(input: &TextInput<'_, B::Tensor>) -> Result<(), Error> {
         if Self::invocation_input(input.tokens, input.feedback, input.mask, input.invocation)
@@ -297,7 +304,9 @@ impl<B: NeuralBackend> TextKernel<B> {
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let path = &self.definition.unit(address.group(), address.index())?.path;
-        let cache = state.layer(address.index()).map_err(Error::backend)?;
+        let cache = state
+            .layer(self.base.local_geometry().state_index(address.index())?)
+            .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new(path, &mut observer);
         unit.forward(
@@ -312,8 +321,13 @@ impl<B: NeuralBackend> TextKernel<B> {
     }
 }
 
-impl<B: NeuralBackend> ComponentPinnedResources<B> for TextKernel<B> {
-    type Modules = StaticModules<B>;
+impl<B, M, G> ComponentPinnedResources<B> for TextKernel<B, M, G>
+where
+    B: NeuralBackend,
+    M: decoder::DecoderStaticResources<B>,
+    G: decoder::DecoderGeometry<FamilyConfig>,
+{
+    type Modules = M;
     fn pinned_modules(&self) -> &Self::Modules {
         self.base.static_modules()
     }
@@ -333,7 +347,12 @@ impl<B: NeuralBackend> ComponentPinnedResources<B> for TextKernel<B> {
         self.base.visit_pinned_mut(visitor)
     }
 }
-impl<B: NeuralBackend> ComponentKernel<B> for TextKernel<B> {
+impl<B, M, G> ComponentKernel<B> for TextKernel<B, M, G>
+where
+    B: NeuralBackend,
+    M: decoder::DecoderStaticResources<B>,
+    G: decoder::DecoderGeometry<FamilyConfig>,
+{
     type Input<'a> = TextInput<'a, B::Tensor>;
     type Unit = TextLayer<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -376,11 +395,13 @@ impl<B: NeuralBackend> ComponentKernel<B> for TextKernel<B> {
         forward.mask.iter()
     }
 }
-impl<B, S> ComponentEquations<B, S> for TextKernel<B>
+impl<B, S, M, G> ComponentEquations<B, S> for TextKernel<B, M, G>
 where
     B: NeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+    M: decoder::DecoderStaticResources<B>,
+    G: decoder::DecoderGeometry<FamilyConfig>,
 {
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
@@ -392,13 +413,28 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         Self::validate_input(&input)?;
-        // Draft scope is inert when no optional adapter is installed. It never
-        // changes shared projections or any ordinary causal invocation.
-        let hidden = self
-            .base
-            .static_modules_mut()
-            .embed(input.tokens, context)?;
-        self.begin_embedded(hidden, input.mask, input.invocation, state, context)
+        let position = eredu_nn::AttentionCache::offset(state.layer(0).map_err(Error::backend)?);
+        let mask = self.prepare_mask(
+            input.mask,
+            input.tokens.dim(1),
+            input.invocation,
+            state,
+            context,
+        )?;
+        let expected = state.layout().clone();
+        let forward = self.base.prepare_partition(
+            eredu_runtime::LayeredPartitionInput::Tokens(input.tokens),
+            mask.as_ref(),
+            state,
+            &expected,
+            0,
+            context,
+        )?;
+        Ok(Self::invocation_forward(
+            forward,
+            input.invocation,
+            position,
+        ))
     }
     fn begin_observed<'a, O>(
         &mut self,
@@ -437,14 +473,14 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.static_modules_mut().finish_instrumented(
+        self.base.finish_hidden_instrumented(
             hidden,
             context,
             &mut ComponentInstrumentation::new("readout", &mut observer),
         )
     }
     fn projects_final_text_position() -> bool {
-        true
+        G::FINAL_TEXT_POSITION
     }
     fn finish_text(
         &mut self,
@@ -453,6 +489,9 @@ where
         _: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        if !G::FINAL_TEXT_POSITION {
+            return self.base.finish_hidden(hidden, context);
+        }
         let position = hidden.dim(1) - 1;
         let last = hidden.index(
             &[
@@ -513,11 +552,13 @@ where
         )
     }
 }
-impl<B, S> ParallelComponentKernel<B, S> for TextKernel<B>
+impl<B, S, M, G> ParallelComponentKernel<B, S> for TextKernel<B, M, G>
 where
     B: eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+    M: decoder::DecoderStaticResources<B>,
+    G: decoder::DecoderGeometry<FamilyConfig>,
 {
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         <Self as ComponentEquations<B, S>>::observation_hooks(self)
@@ -530,13 +571,29 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         Self::validate_input(&input)?;
-        let hidden = self.base.static_modules_mut().embed_parallel(
-            input.tokens,
-            eredu_nn::EmbeddingLookupPolicy::Strict,
+        let position = eredu_nn::AttentionCache::offset(state.layer(0).map_err(Error::backend)?);
+        let mask = self.prepare_mask(
+            input.mask,
+            input.tokens.dim(1),
+            input.invocation,
+            state,
+            context,
+        )?;
+        let expected = state.layout().clone();
+        let forward = self.base.prepare_partition_parallel(
+            eredu_runtime::LayeredPartitionInput::Tokens(input.tokens),
+            mask.as_ref(),
+            state,
+            &expected,
+            0,
             parallel,
             context,
         )?;
-        self.begin_embedded(hidden, input.mask, input.invocation, state, context)
+        Ok(Self::invocation_forward(
+            forward,
+            input.invocation,
+            position,
+        ))
     }
     fn begin_parallel_observed<'a, O>(
         &mut self,
@@ -578,9 +635,9 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.static_modules_mut().finish_parallel_instrumented(
+        self.base.finish_local_instrumented(
             hidden,
-            parallel,
+            Some(parallel),
             context,
             &mut ComponentInstrumentation::new("readout", &mut observer),
         )
@@ -632,7 +689,12 @@ where
         )
     }
 }
-impl<B: NeuralBackend> TextComponentKernel<B> for TextKernel<B> {
+impl<B, M, G> TextComponentKernel<B> for TextKernel<B, M, G>
+where
+    B: NeuralBackend,
+    M: decoder::DecoderStaticResources<B>,
+    G: decoder::DecoderGeometry<FamilyConfig>,
+{
     fn supports_chunked_prefill() -> bool {
         true
     }
@@ -647,9 +709,7 @@ impl<B: NeuralBackend> TextComponentKernel<B> for TextKernel<B> {
     fn block_refinement_geometry(
         &self,
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
-        Some(<Self as RefinementComponentKernel<B>>::refinement_geometry(
-            self,
-        ))
+        Some(self.config().generation_geometry())
     }
     fn invocation_input<'a>(
         tokens: &'a B::Tensor,
@@ -705,5 +765,42 @@ impl<B: NeuralBackend> RefinementComponentKernel<B> for TextKernel<B> {
             invocation: AttentionInvocation::DIFFUSION,
             feedback,
         }
+    }
+}
+
+impl<B: NeuralBackend> TextKernel<B> {
+    /// Materializes the complete declared text resources.
+    pub fn new(
+        config: FamilyConfig,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TextModel<B>, Error> {
+        let definition = std::sync::Arc::new(super::definition::text(&config, None)?);
+        let base = decoder::CompleteDecoderKernel::new(config, context)?
+            .into_parts()
+            .1;
+        let kernel = Self {
+            definition: definition.clone(),
+            base,
+        };
+        ComponentAdapter::with_pinned_resources::<B>(definition, kernel).map_err(Error::from)
+    }
+    /// Materializes exact tensor-local complete text resources.
+    pub fn new_parallel(
+        config: FamilyConfig,
+        geometry: decoder::LocalGeometry<FamilyConfig>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TextModel<B>, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        let definition = std::sync::Arc::new(super::definition::text(&config, Some(&geometry))?);
+        let base = decoder::CompleteDecoderKernel::new_parallel(config, geometry, context)?
+            .into_parts()
+            .1;
+        let kernel = Self {
+            definition: definition.clone(),
+            base,
+        };
+        ComponentAdapter::with_pinned_resources::<B>(definition, kernel).map_err(Error::from)
     }
 }

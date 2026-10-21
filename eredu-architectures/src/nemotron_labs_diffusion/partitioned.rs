@@ -1,21 +1,16 @@
-//! Shared invocation transport across independently owned text-layer partitions.
+//! Family invocation transport over shared selected text execution.
 use super::{
-    model::{TextInput, TextLayer},
+    model::{ForwardContext, TextInput, TextKernel},
     FamilyConfig,
 };
-use crate::decoder::{
-    self, ComponentInstrumentation, Config, PartitionStaticModules, PartitionedLayeredModel,
-};
-use eredu_core::decoding::{AttentionInvocation, CacheWritePolicy};
-use eredu_nn::{
-    AttentionCache, DistributedNeuralBackend, Error, NeuralBackend, ReadOnlyAttentionCache, Tensor,
-};
+use crate::decoder::{self, ComponentInstrumentation, Config, PartitionStaticModules};
+use eredu_core::decoding::AttentionInvocation;
+use eredu_nn::{AttentionCache, DistributedNeuralBackend, Error, Tensor};
 use eredu_runtime::{
-    ArchitectureParameters, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    LayeredPartitionInput, LayeredPartitionOutput, NoAuxiliaryBoundary,
-    ParallelLayeredArchitecture, PartitionedLayeredArchitecture, StateLayout,
+    ComponentAdapter, ComponentPartitionContext, KernelParameterModules, LayerRuntimeState,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, NoAuxiliaryBoundary,
+    PartitionComponentKernel, PipelineComponentKernel, StateLayout,
 };
-
 /// Immutable mode and original prefix position carried with the complete canvas.
 #[derive(Debug, Clone)]
 pub struct TextBoundary<T> {
@@ -121,59 +116,28 @@ pub(crate) fn precision_from_code(code: i32) -> Result<eredu_nn::TensorElementTy
         )),
     }
 }
-/// Invocation values retained separately from shared partition parameters.
-pub struct PartitionContext<T> {
-    pub(crate) mask: Option<T>,
-    pub(crate) invocation: AttentionInvocation,
-    pub(crate) position: i32,
-}
-/// Prepared first-owner embeddings plus complete immutable invocation metadata.
+/// Prepared residual ingress and request-local visibility.
 pub struct PreparedPartitionInvocation<T: 'static> {
     /// Owned residual ingress, ready for the ordinary partition driver.
     pub input: LayeredPartitionInput<'static, T, TextBoundary<T>>,
     /// Request visibility used unchanged by every owner.
     pub mask: Option<T>,
 }
-/// One retained neutral text partition, with no unowned embedding or readout storage.
-pub struct PartitionedTextModel<B: NeuralBackend> {
-    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
-    base: PartitionedLayeredModel<B, FamilyConfig>,
-}
-impl<B: DistributedNeuralBackend> eredu_nn::Parameterized<B::Tensor> for PartitionedTextModel<B> {
-    fn set_trainable(&mut self, trainable: bool) {
-        self.base
-            .kernel_mut()
-            .static_modules_mut()
-            .set_trainable(trainable);
-    }
-    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, B::Tensor>>(
-        &'a self,
-        visitor: &mut V,
-    ) {
-        self.base
-            .kernel()
-            .static_modules()
-            .visit_parameters(visitor);
-    }
-    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>>(
-        &'a mut self,
-        visitor: &mut V,
-    ) {
-        self.base
-            .kernel_mut()
-            .static_modules_mut()
-            .visit_parameters_mut(visitor);
-    }
-}
+/// Selected physical resources and global-to-local geometry for the shared text kernel.
+pub type PartitionedTextKernel<B> =
+    TextKernel<B, PartitionStaticModules<B>, decoder::PartitionLocalGeometry<FamilyConfig>>;
+/// Text partition using the same validated adapter and equations as complete execution.
+pub type PartitionedTextModel<B> = ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    PartitionedTextKernel<B>,
+    KernelParameterModules,
+>;
 
-impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
-    /// Retained semantic declaration used by execution and inspection.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        &self.definition
-    }
-
-    /// Builds only statics and units authorized by the selected neutral partition.
-    pub fn new(
+impl<B: DistributedNeuralBackend>
+    TextKernel<B, PartitionStaticModules<B>, decoder::PartitionLocalGeometry<FamilyConfig>>
+{
+    /// Materializes only resources authorized by the selected declaration.
+    pub fn from_partition(
         config: FamilyConfig,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
         partition: &eredu_runtime::ArchitecturePartition<
@@ -181,7 +145,7 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
             TextBoundarySchema,
         >,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<PartitionedTextModel<B>, Error> {
         let definition = std::sync::Arc::new(super::definition::text_partition(
             &config,
             parameters,
@@ -195,70 +159,17 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
             }
             .into());
         }
-        Ok(Self {
-            definition,
-            base: decoder::DecoderKernel::from_partition(config, parameters, partition, context)?,
-        })
-    }
-    /// Complete family equations, including optional draft adapter topology.
-    pub fn config(&self) -> &FamilyConfig {
-        self.base.kernel().args()
-    }
-    /// Constructs exactly one locally owned layer and its optional low-rank matrices.
-    pub fn construct_unit(
-        &self,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TextLayer<B>, Error> {
-        let base = self.base.kernel().construct_unit(index, context)?;
-        let draft_adapter = self
-            .config()
-            .draft_adapter()
-            .map(|a| {
-                a.layer(
-                    index,
-                    base.self_attention.query_heads * self.config().head_dim(),
-                    self.config().hidden_size(),
-                    context,
-                )
-            })
-            .transpose()?;
-        Ok(TextLayer {
+        let base = decoder::DecoderKernel::from_partition(config, parameters, partition, context)?
+            .into_parts()
+            .1;
+        let kernel = Self {
+            definition: definition.clone(),
             base,
-            draft_adapter,
-        })
+        };
+        ComponentAdapter::with_partition_resources::<B, _, _>(definition, kernel, partition)
+            .map_err(Error::from)
     }
-    fn prepare_mask<S: LayerRuntimeState<B>>(
-        &self,
-        mask: Option<&B::Tensor>,
-        length: i32,
-        invocation: AttentionInvocation,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<B::Tensor>, Error>
-    where
-        S::LayerState: AttentionCache<B::Tensor>,
-    {
-        if let Some(mask) = mask {
-            return Ok(Some(mask.clone()));
-        }
-        if invocation.cache_write == CacheWritePolicy::Transient {
-            let frontier = state.layer(0).map_err(Error::backend)?.offset();
-            return Ok(Some(B::Tensor::full_f32(
-                0.0,
-                &[
-                    length,
-                    frontier
-                        .checked_add(length)
-                        .ok_or_else(|| Error::backend("partition canvas visibility overflow"))?,
-                ],
-                context,
-            )?));
-        }
-        Ok(None)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn begin<S, O>(
+    fn resume_partition<S, O>(
         &mut self,
         input: LayeredPartitionInput<'_, B::Tensor, TextBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
@@ -268,10 +179,10 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, PartitionContext<B::Tensor>>, Error>
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
         S: LayerRuntimeState<B>,
-        S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+        S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let frontier = state.layer(0).map_err(Error::backend)?.offset();
@@ -303,17 +214,22 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
             }
         };
         let mask = self.prepare_mask(mask, length, invocation, state, context)?;
-        let forward=<PartitionedLayeredModel<B,FamilyConfig> as PartitionedLayeredArchitecture<B,S>>::begin_partition_observed(&mut self.base,input,mask.as_ref(),state,expected,first,parallel,context,observer)?;
-        Ok(LayeredForwardState {
-            hidden: forward.hidden,
-            context: PartitionContext {
-                mask: forward.context.visibility_mask().cloned(),
-                invocation,
-                position,
+        let forward = PartitionComponentKernel::begin_partition_observed(
+            &mut self.base,
+            input,
+            mask.as_ref(),
+            state,
+            ComponentPartitionContext {
+                expected: Some(expected),
+                first_state_ordinal: first,
+                parallel,
+                native: context,
             },
-        })
+            observer,
+        )?;
+        Ok(Self::invocation_forward(forward, invocation, position))
     }
-    /// Embeds the first-owner token span once and transports its request semantics.
+    /// Embeds first-owner tokens and retains immutable mode, frontier and precision.
     pub fn prepare_partition_input<S>(
         &mut self,
         input: TextInput<'_, B::Tensor>,
@@ -323,7 +239,7 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
     ) -> Result<PreparedPartitionInvocation<B::Tensor>, Error>
     where
         S: LayerRuntimeState<B>,
-        S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+        S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     {
         let expected = state.layout().clone();
         let forward = self.begin_input(
@@ -363,10 +279,10 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, PartitionContext<B::Tensor>>, Error>
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
         S: LayerRuntimeState<B>,
-        S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+        S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         mode_code(input.invocation)?;
@@ -397,7 +313,7 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
                     "pipeline owners disagree on invocation mode or causal frontier",
                 ));
             }
-            let mut forward = self.begin(
+            let mut forward = self.resume_partition(
                 LayeredPartitionInput::Hidden {
                     hidden,
                     auxiliary: boundary,
@@ -426,482 +342,79 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
             state,
             context,
         )?;
-        let forward=<PartitionedLayeredModel<B,FamilyConfig> as PartitionedLayeredArchitecture<B,S>>::begin_partition_observed(&mut self.base,LayeredPartitionInput::Tokens(input.tokens),mask.as_ref(),state,expected,0,parallel,context,observer)?;
-        Ok(LayeredForwardState {
-            hidden: forward.hidden,
-            context: PartitionContext {
-                mask: forward.context.visibility_mask().cloned(),
-                invocation: input.invocation,
-                position,
-            },
-        })
-    }
-}
-
-impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for PartitionedTextModel<B> {
-    type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        Ok(self.definition.state_layout().clone())
-    }
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.base.state_identity(state, topology)
-    }
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Error> {
-        Ok(self.definition.parameters().clone())
-    }
-    fn static_parameter_recipes(
-        &self,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<
-        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-        String,
-    > {
-        super::checkpoint::module_source_recipes(self.base.kernel().static_modules(), source)
-    }
-    fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
-        &self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        self.base.visit_static_parameters(visitor)
-    }
-    fn visit_static_parameters_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
-        &mut self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        self.base.visit_static_parameters_mut(visitor)
-    }
-}
-impl<B, S> LayeredArchitecture<B, S> for PartitionedTextModel<B>
-where
-    B: DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    type Input<'a> = TextInput<'a, B::Tensor>;
-    type StaticModules = PartitionStaticModules<B>;
-    type Unit = TextLayer<B>;
-    type ForwardContext = PartitionContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
-    }
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        self.definition
-            .group_transport(group)
-            .expect("validated execution group")
-            .clone()
-    }
-    fn primary_execution_group(&self) -> &str {
-        self.definition.primary_group()
-    }
-    fn state_partition_plan(
-        &self,
-        _layout: &StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        self.definition.state_partition_plan().clone()
-    }
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        Ok(self.definition.parameters().graph().clone())
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.definition.unit_count(group).map_err(Error::from)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        Ok(self.definition.unit(group, index)?.path.clone())
-    }
-    fn static_modules(&self) -> &Self::StaticModules {
-        self.base.kernel().static_modules()
-    }
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        <PartitionedLayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::static_modules_mut(
+        let forward = PartitionComponentKernel::begin_partition_observed(
             &mut self.base,
-        )
-    }
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        if group != 0 {
-            return Err(Error::backend("invalid text partition execution group"));
-        }
-        self.construct_unit(index, context)
-    }
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = state.layout().clone();
-        self.begin_input(
-            input,
-            None,
+            LayeredPartitionInput::Tokens(input.tokens),
+            mask.as_ref(),
             state,
-            &expected,
-            None,
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn begin_forward_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let expected = state.layout().clone();
-        self.begin_input(input, None, state, &expected, None, context, observer)
-    }
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        _: &mut S,
-        _: &mut Self::ForwardContext,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::backend("invalid text partition dependencies"));
-        }
-        Ok(initial.clone())
-    }
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.forward_unit_observed(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
+            ComponentPartitionContext {
+                expected: Some(expected),
+                first_state_ordinal: 0,
+                parallel,
+                native: context,
+            },
+            observer,
+        )?;
+        Ok(Self::invocation_forward(
             forward,
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.run_unit(
-            group, index, unit, hidden, state, forward, None, context, observer,
-        )
-    }
-    fn finish_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut S,
-        _: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.base.kernel_mut().finish_local(hidden, None, context)
-    }
-    fn finish_forward_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut S,
-        _: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.kernel_mut().finish_local_instrumented(
-            hidden,
-            None,
-            context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
-        )
-    }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.mask.iter()
+            input.invocation,
+            position,
+        ))
     }
 }
-impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
-    #[allow(clippy::too_many_arguments)]
-    fn run_unit<S, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut TextLayer<B>,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut PartitionContext<B::Tensor>,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let range = self.base.kernel().local_geometry().owned_units();
-        if group != 0 || !range.contains(&index) {
-            return Err(Error::backend(
-                "shared text partition attempted an unowned unit",
-            ));
-        }
-        let cache = state.layer(index - range.start).map_err(Error::backend)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        unit.forward(
-            hidden,
-            forward.mask.as_ref(),
-            forward.invocation,
-            cache,
-            parallel,
-            context,
-            &mut ComponentInstrumentation::new(&format!("model.layers.{index}"), &mut observer),
-        )
-    }
-}
-impl<B, S> ParallelLayeredArchitecture<B, S> for PartitionedTextModel<B>
+impl<B, S> PartitionComponentKernel<B, S> for PartitionedTextKernel<B>
 where
     B: DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        <Self as LayeredArchitecture<B, S>>::observation_hooks(self)
-    }
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = state.layout().clone();
-        self.begin_input(
-            input,
-            None,
-            state,
-            &expected,
-            Some(parallel),
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn begin_forward_parallel_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let expected = state.layout().clone();
-        self.begin_input(
-            input,
-            None,
-            state,
-            &expected,
-            Some(parallel),
-            context,
-            observer,
-        )
-    }
-    fn forward_unit_parallel(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.run_unit(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            Some(parallel),
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn forward_unit_parallel_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.run_unit(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            Some(parallel),
-            context,
-            observer,
-        )
-    }
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut S,
-        _: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.base
-            .kernel_mut()
-            .finish_local(hidden, Some(parallel), context)
-    }
-    fn finish_forward_parallel_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut S,
-        _: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.base.kernel_mut().finish_local_instrumented(
-            hidden,
-            Some(parallel),
-            context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
-        )
-    }
-}
-impl<B, S> PartitionedLayeredArchitecture<B, S> for PartitionedTextModel<B>
-where
-    B: DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
 {
     type Boundary = TextBoundarySchema;
     fn partition_observation_hooks(
         &self,
         _: bool,
     ) -> eredu_runtime::inspection::ObservationHookSupport {
-        <Self as LayeredArchitecture<B, S>>::observation_hooks(self)
+        <Self as eredu_runtime::ComponentEquations<B, S>>::observation_hooks(self)
     }
     fn boundary_schema(&self) -> Result<Self::Boundary, Error> {
         Ok(TextBoundarySchema::new(self.config().hidden_size()))
     }
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, TextBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin(
+        self.begin_partition_observed(
             input,
             mask,
             state,
-            expected,
-            first,
-            None,
-            context,
+            selected,
             &mut eredu_runtime::NoopObserver,
         )
     }
-    fn begin_partition_parallel<'a>(
+    fn begin_partition_observed<O>(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, TextBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin(
-            input,
-            mask,
-            state,
-            expected,
-            first,
-            Some(parallel),
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn begin_partition_observed<'a, O>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TextBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
         observer: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.begin(
-            input, mask, state, expected, first, parallel, context, observer,
+        self.resume_partition(
+            input,
+            mask,
+            state,
+            selected.expected.ok_or_else(|| {
+                Error::backend("shared text partition requires selected state geometry")
+            })?,
+            selected.first_state_ordinal,
+            selected.parallel,
+            selected.native,
+            observer,
         )
     }
     fn finish_partition(
@@ -954,7 +467,7 @@ where
         }
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         Ok(LayeredPartitionOutput::Final {
-            output: self.base.kernel_mut().finish_local_instrumented(
+            output: self.base.finish_local_instrumented(
                 hidden,
                 parallel,
                 context,
@@ -964,30 +477,30 @@ where
         })
     }
 }
-impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for PartitionedTextModel<B>
+impl<B, S> PipelineComponentKernel<B, S> for PartitionedTextKernel<B>
 where
     B: DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn partition_output_width(&self) -> i32 {
+    fn tensor_vocabulary_sharded(&self) -> bool {
+        true
+    }
+    fn output_width(&self) -> i32 {
         self.config().vocabulary_size()
     }
-    fn partition_input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         if input.tokens.shape().len() != 2 || input.tokens.dim(0) <= 0 || input.tokens.dim(1) <= 0 {
             return Err(Error::backend("invalid shared text pipeline token shape"));
         }
         Ok((input.tokens.dim(0), input.tokens.dim(1)))
     }
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, TextBoundary<B::Tensor>)>,
         state: &mut S,
-        expected: Option<&StateLayout>,
-        _: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
         observer: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
     where
@@ -997,44 +510,12 @@ where
             input,
             incoming,
             state,
-            expected.ok_or_else(|| {
+            selected.expected.ok_or_else(|| {
                 Error::backend("shared text pipeline requires selected state geometry")
             })?,
-            parallel,
-            context,
+            selected.parallel,
+            selected.native,
             observer,
         )
-    }
-}
-
-impl<B, S> eredu_runtime::ReplicatedTextArchitecture<B, S> for PartitionedTextModel<B>
-where
-    B: DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    fn supports_chunked_prefill() -> bool {
-        true
-    }
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        TextInput {
-            tokens,
-            mask,
-            invocation: AttentionInvocation::CAUSAL,
-            feedback: None,
-        }
-    }
-    fn invocation_input<'a>(
-        tokens: &'a B::Tensor,
-        feedback: Option<&'a B::Tensor>,
-        mask: Option<&'a B::Tensor>,
-        invocation: AttentionInvocation,
-    ) -> Option<Self::Input<'a>> {
-        <super::model::TextModel<B> as eredu_runtime::ReplicatedTextArchitecture<B, S>>::invocation_input(tokens, feedback, mask, invocation)
-    }
-    fn block_refinement_geometry(
-        &self,
-    ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
-        Some(self.config().generation_geometry())
     }
 }

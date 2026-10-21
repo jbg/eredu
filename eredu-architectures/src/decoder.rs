@@ -5435,7 +5435,7 @@ where
     G: DecoderGeometry<C>,
     P: BlockFactory<B, C>,
 {
-    fn finish_hidden_instrumented(
+    pub(crate) fn finish_hidden_instrumented(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
