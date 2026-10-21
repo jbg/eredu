@@ -156,6 +156,44 @@ impl LocalGeometry {
     pub fn conditioning_width(&self) -> Option<i32> {
         self.conditioning_width
     }
+    /// Projects pinned ownership by canonical identity without changing retained placement.
+    pub(super) fn select_pinned_resources(
+        &self,
+        config: &FamilyConfig,
+        definition: &eredu_runtime::ComponentDefinition,
+        bindings: &[eredu_runtime::OwnedParameterGroupSpec],
+    ) -> Result<Self, eredu_nn::Error> {
+        self.validate_for(config)
+            .map_err(eredu_nn::Error::backend_source)?;
+        let roles = definition.select_complete_pinned_roles(
+            bindings,
+            &["embedding", "norm", "output", "conditioning"],
+        )?;
+        let mut selected = self.clone();
+        let embedding = roles.contains("embedding")
+            || (config.text.tie_word_embeddings && roles.contains("output"));
+        let output = !config.text.tie_word_embeddings && roles.contains("output");
+        if (embedding && self.embedding.is_none())
+            || (output && self.output.is_none())
+            || (roles.contains("norm") && !self.norm)
+            || (roles.contains("conditioning") && self.conditioning_width.is_none())
+        {
+            return Err(eredu_nn::Error::backend(
+                "diffusion selected pinned resource has no retained placement",
+            ));
+        }
+        if !embedding {
+            selected.embedding = None;
+        }
+        if !output {
+            selected.output = None;
+        }
+        if !roles.contains("conditioning") {
+            selected.conditioning_width = None;
+        }
+        selected.norm = roles.contains("norm");
+        Ok(selected)
+    }
     /// Rejects reuse of local geometry with a different family configuration.
     pub fn validate_for(&self, config: &FamilyConfig) -> Result<(), ParallelPlanError> {
         if self.fingerprint != config.architecture_fingerprint() {

@@ -9,6 +9,10 @@ use eredu_runtime::{
     ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture,
 };
 
+use eredu_runtime::{
+    ParallelComponentKernel as _, ParallelRoutedComponentKernel as _, PartitionComponentKernel as _,
+};
+
 /// Shared text activation plus invocation and semantic image spans.
 pub struct Boundary<T> {
     /// Architecture invocation phase and authoritative context frontier.
@@ -65,7 +69,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
         geometry: super::super::parallel::CompositeGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let text = TextModel::new_parallel(config.clone(), geometry.text.clone(), context)?;
+        let text = TextKernel::materialize(config.clone(), Some(geometry.text.clone()), context)?;
         let image = ImageStatic::new(&config, context)?;
         Ok(Self {
             config,
@@ -79,7 +83,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
         mut self,
         plan: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) -> Result<Self, Error> {
-        self.statics.text = self.statics.text.clone().with_expert_realization(plan)?;
+        self.statics.text.set_expert_realization(plan)?;
         Ok(self)
     }
 }
@@ -91,7 +95,7 @@ where
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        <TextModel<B> as ParallelLayeredArchitecture<B, S>>::parallel_observation_hooks(
+        <TextKernel<B> as eredu_runtime::ParallelComponentKernel<B, S>>::parallel_observation_hooks(
             &self.statics.text,
         )
     }
@@ -132,7 +136,7 @@ where
         }
         forward.deferred = false;
         if let Some(feedback) = &forward.feedback {
-            let prepared = self.statics.text.begin_forward_parallel(
+            let prepared = self.statics.text.begin_parallel(
                 TextInput::Refinement {
                     tokens: &forward.tokens,
                     feedback: feedback.as_ref(),
@@ -213,7 +217,7 @@ where
     ) -> Result<B::Tensor, Error> {
         self.statics
             .text
-            .finish_forward_parallel(hidden, state, &forward.text, parallel, context)
+            .finish_parallel(hidden, state, &forward.text, parallel, context)
     }
     fn finish_forward_parallel_observed<
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
@@ -226,7 +230,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_forward_parallel_observed(
+        self.statics.text.finish_parallel_observed(
             hidden,
             state,
             &forward.text,
@@ -307,22 +311,18 @@ where
                     .ok_or_else(|| Error::backend("missing image invocation"))?,
                 context,
             ),
-            (1, Unit::Text(unit)) => self
-                .statics
-                .text
-                .forward_unit_parallel_observed_with_provider(
-                    0,
-                    index,
-                    unit,
-                    hidden,
-                    state,
-                    &mut forward.text,
-                    pass,
-                    provider,
-                    parallel,
-                    context,
-                    observer,
-                ),
+            (1, Unit::Text(unit)) => self.statics.text.execute_parallel_routed_observed(
+                self.statics.text.definition().unit_address(0, index)?,
+                unit,
+                hidden,
+                state,
+                &mut forward.text,
+                pass,
+                provider,
+                parallel,
+                context,
+                observer,
+            ),
             _ => Err(Error::backend("unit/group mismatch")),
         }
     }
@@ -360,7 +360,7 @@ where
         &self,
         parallel: bool,
     ) -> eredu_runtime::inspection::ObservationHookSupport {
-        <TextModel<B> as PartitionedLayeredArchitecture<B, S>>::partition_observation_hooks(
+        <TextKernel<B> as eredu_runtime::PartitionComponentKernel<B, S>>::partition_observation_hooks(
             &self.statics.text,
             parallel,
         )
@@ -563,25 +563,15 @@ impl<B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend> Model<B> 
                 )
             }
         };
-        let prepared = match parallel {
-            Some(parallel) => self.statics.text.begin_partition_parallel(
-                input,
-                visibility.as_ref(),
-                state,
-                expected,
-                0,
-                parallel,
-                context,
-            )?,
-            None => self.statics.text.begin_partition(
-                input,
-                visibility.as_ref(),
-                state,
-                expected,
-                0,
-                context,
-            )?,
-        };
+        let prepared = self.statics.text.resume_partition(
+            input,
+            visibility.as_ref(),
+            state,
+            expected,
+            0,
+            parallel,
+            context,
+        )?;
         let tokens = B::Tensor::from_i32_slice(
             &vec![0; prepared.hidden.dim(1) as usize],
             &[1, prepared.hidden.dim(1)],

@@ -11717,9 +11717,9 @@ invocation paths, and transport descriptions project that definition. Each
 shared layer references one authoritative context slot; refinement borrows the
 same slot through a read-only cache view. Local geometry projects owned slot
 policies into the global ordinal schedule, and partition construction consumes
-that schedule and the definition's state ownership rules. The existing text
-runtime's local state layout is the retained definition's selected interval,
-including nonzero global offsets; unowned slots remain declaration metadata.
+that schedule and the definition's state ownership rules. The shared adapter exposes the retained global declaration; the authoritative
+partition and kernel local state view select its owned interval, including
+nonzero global offsets. Unowned slots remain declaration metadata.
 
 Shared component text contracts retain the kernel's explicit invocation admission,
 iterative geometry, and output-row selection. Block refinement requires the
@@ -11727,3 +11727,21 @@ separate `RefinementComponentKernel` capability; a default text hook alone does
 not advertise iterative execution. Composite parameter traversal borrows the same
 kernel-owned pinned aggregate used by execution, without an additional resource
 owner or parameter storage instance.
+
+DiffusionGemma text execution uses `ComponentAdapter` over `TextKernel` and its
+single pinned aggregate. Runtime implements ordinary, provider-backed, observed,
+parallel, text/refinement, and typed pipeline contracts. Kernels retain equations,
+feedback precision, read-only refinement views, and invocation phase/frontier
+transport. Context output has no prediction-score kind; refinement publishes all
+position scores. Low-level operations borrow the kernel through `kernel()` or
+`kernel_mut()`; constructors live on `TextKernel` and return the shared adapter.
+
+Selected standalone text construction consumes an authoritative partition before
+allocation. Canonical binding identities select complete embedding, normalization,
+head, and feedback modules while preserving retained local placement. A tied
+readout replica does not imply ownership of token ingress. Receiver invocations
+require transported hidden values and phase/frontier metadata. Target and
+transform-source preparation use the same selected constructor. Composite family
+equations borrow this same typed child kernel under the enclosing component's
+resource and completion lifecycle; they retain their declared media assembly and
+boundary semantics.

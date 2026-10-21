@@ -12,7 +12,7 @@ pub struct TextBoundary<T> {
 }
 
 /// The same wire contract applies to context and canvas invocations.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextBoundarySchema {
     hidden: i32,
 }

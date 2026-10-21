@@ -3,7 +3,7 @@ mod partition;
 pub use partition::{Boundary, BoundarySchema};
 
 use super::{
-    model::{ForwardContext as TextForward, TextInput, TextModel},
+    model::{ForwardContext as TextForward, TextInput, TextKernel},
     text::TextLayer,
     vision::ImageStatic,
     EncoderAttention, FamilyConfig,
@@ -29,6 +29,11 @@ use eredu_runtime::{
     ParameterProvider, ResidentExpertProvider, RoutedLayeredArchitecture, StateLayout,
 };
 
+use eredu_runtime::{
+    ComponentEquations as _, ComponentKernel as _, ComponentPinnedResources as _,
+    RoutedComponentKernel as _,
+};
+
 /// Independently traversable image stack.
 pub const VISION_EXECUTION_GROUP: &str = "vision";
 
@@ -36,7 +41,7 @@ pub const VISION_EXECUTION_GROUP: &str = "vision";
 #[derive(Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct StaticModules<B: GroupedNeuralBackend + DistributedNeuralBackend> {
-    text: TextModel<B>,
+    text: TextKernel<B>,
     image: ImageStatic<B>,
 }
 
@@ -133,7 +138,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
     ) -> Result<Self, Error> {
         Ok(Self {
             statics: StaticModules {
-                text: TextModel::new(config.clone(), context)?,
+                text: TextKernel::materialize(config.clone(), None, context)?,
                 image: ImageStatic::new(&config, context)?,
             },
             config,
@@ -198,7 +203,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
                     state,
                 )?
             } else {
-                self.statics.text.begin_forward(
+                self.statics.text.begin(
                     TextInput::Refinement {
                         tokens: &tokens,
                         feedback,
@@ -496,7 +501,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.statics.text.visit_static_parameters(visitor)?;
+        self.statics.text.visit_pinned(visitor)?;
         visitor.visit("vision", &self.statics.image.tower)?;
         visitor.visit("vision_projection", &self.statics.image.projector)
     }
@@ -504,7 +509,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.statics.text.visit_static_parameters_mut(visitor)?;
+        self.statics.text.visit_pinned_mut(visitor)?;
         visitor.visit_mut("vision", &mut self.statics.image.tower)?;
         visitor.visit_mut("vision_projection", &mut self.statics.image.projector)
     }
@@ -530,12 +535,14 @@ where
         B::Tensor: 'a;
     type Error = Error;
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        <TextModel<B> as LayeredArchitecture<B, S>>::observation_hooks(&self.statics.text)
+        <TextKernel<B> as eredu_runtime::ComponentEquations<B, S>>::observation_hooks(
+            &self.statics.text,
+        )
     }
     fn output_score_kind(
         forward: &Self::ForwardContext,
     ) -> Option<eredu_core::refinement::PredictionScoreKind> {
-        <TextModel<B> as LayeredArchitecture<B, S>>::output_score_kind(&forward.text)
+        <TextKernel<B> as eredu_runtime::ComponentKernel<B>>::output_score_kind(&forward.text)
     }
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
         if group == 0 {
@@ -595,10 +602,9 @@ where
             )?))
         } else if group == 1 {
             Ok(Unit::Text(
-                <TextModel<B> as LayeredArchitecture<B, S>>::build_unit(
+                <TextKernel<B> as eredu_runtime::ComponentKernel<B>>::build_unit(
                     &self.statics.text,
-                    0,
-                    index,
+                    self.statics.text.definition().unit_address(0, index)?,
                     context,
                 )?,
             ))
@@ -630,7 +636,7 @@ where
             if forward.deferred {
                 forward.deferred = false;
                 if let Some(feedback) = &forward.feedback {
-                    let prepared = self.statics.text.begin_forward(
+                    let prepared = self.statics.text.begin(
                         TextInput::Refinement {
                             tokens: &forward.tokens,
                             feedback: feedback.as_ref(),
@@ -757,7 +763,7 @@ where
     ) -> Result<B::Tensor, Error> {
         self.statics
             .text
-            .finish_forward(hidden, state, &forward.text, context)
+            .finish(hidden, state, &forward.text, context)
     }
     fn finish_forward_observed<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
         &mut self,
@@ -769,7 +775,7 @@ where
     ) -> Result<B::Tensor, Error> {
         self.statics
             .text
-            .finish_forward_observed(hidden, state, &forward.text, context, observer)
+            .finish_observed(hidden, state, &forward.text, context, observer)
     }
     fn retained_context_values<'a>(
         &'a self,
@@ -779,11 +785,14 @@ where
     ) -> Self::RetainedContextValues<'a> {
         let mut values = Vec::new();
         values.extend(
-            <TextModel<B> as LayeredArchitecture<B, S>>::retained_context_values(
+            <TextKernel<B> as eredu_runtime::ComponentKernel<B>>::retained_values(
                 &self.statics.text,
                 &forward.text,
-                0,
-                0,
+                self.statics
+                    .text
+                    .definition()
+                    .unit_address(0, 0)
+                    .expect("declared shared stack"),
             ),
         );
         if let Some(vision) = &forward.vision {
@@ -872,9 +881,8 @@ where
                     .ok_or_else(|| Error::backend("missing image invocation state"))?,
                 context,
             ),
-            (1, Unit::Text(unit)) => self.statics.text.forward_unit_observed_with_provider(
-                0,
-                index,
+            (1, Unit::Text(unit)) => self.statics.text.execute_routed_observed(
+                self.statics.text.definition().unit_address(0, index)?,
                 unit,
                 hidden,
                 state,

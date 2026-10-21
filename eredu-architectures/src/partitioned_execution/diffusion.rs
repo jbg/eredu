@@ -102,14 +102,15 @@ where
                 "transform source changed shared unit addresses",
             ));
         }
-        let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+        let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
-            source_geometry,
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
-        let model = model
-            .with_expert_realization(source_plan)
+        model
+            .kernel_mut()
+            .set_expert_realization(source_plan)
             .map_err(architecture)?;
         Some((model, source_layout))
     } else {
@@ -118,14 +119,15 @@ where
     let capability_estimate =
         crate::capability::diffusion_gemma(&selected_args).map_err(architecture)?;
     let effective_model_type = "diffusion_gemma".to_owned();
-    let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+    let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
         selected_args,
-        geometry,
+        &partition,
         context,
     )
     .map_err(architecture)?;
-    let model = model
-        .with_expert_realization(plan.clone())
+    model
+        .kernel_mut()
+        .set_expert_realization(plan.clone())
         .map_err(architecture)?;
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         model,
@@ -229,9 +231,9 @@ where
                 "transform source changed shared unit addresses",
             ));
         }
-        let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+        let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
-            source_geometry,
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
@@ -242,9 +244,9 @@ where
     let capability_estimate =
         crate::capability::diffusion_gemma(&selected_args).map_err(architecture)?;
     let effective_model_type = "diffusion_gemma".to_owned();
-    let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+    let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
         selected_args,
-        geometry,
+        &partition,
         context,
     )
     .map_err(architecture)?;
