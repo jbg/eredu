@@ -2324,12 +2324,7 @@ where
                         .into(),
                 ));
             }
-            let description = crate::qwen::vl::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
+            let parameters = crate::qwen::vl::parameter_description(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let layout =
@@ -2790,11 +2785,7 @@ where
         .map(|(name, format)| (name, format.into()))
         .collect(),
     )?;
-    let description = crate::qwen::vl::LayeredModel::<B>::new(source.clone(), context)
-        .map_err(|e| e.to_string())?;
-    let parameters = description
-        .parameter_description(context)
-        .map_err(|e| e.to_string())?;
+    let parameters = crate::qwen::vl::parameter_description(&source).map_err(|e| e.to_string())?;
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()
     {

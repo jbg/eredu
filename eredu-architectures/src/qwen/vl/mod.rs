@@ -4,6 +4,7 @@ mod checkpoint;
 mod config;
 mod model;
 mod parallel;
+mod parameters;
 mod positions;
 
 pub use checkpoint::{
@@ -27,6 +28,8 @@ pub use parallel::{
     local_geometry, partition_local_geometry, partition_local_routed_geometry, LocalGeometry,
     PartitionLocalFoundation, PartitionLocalGeometry,
 };
+pub use parameters::{component_definition, parameter_description};
+
 pub use positions::{
     mrope_embeddings, mrope_spec, mrope_values, multimodal_position_ids, position_ids_tensor,
     PositionPart,

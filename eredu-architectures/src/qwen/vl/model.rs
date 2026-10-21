@@ -9,18 +9,13 @@ use eredu_nn::{
     LinearOperator, NormalizationOperator, Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ParameterProvider,
+    ArchitectureParameterDescription, ExecutionGraph, ExpertPass, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterProvider,
     PartitionedLayeredArchitecture, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
-use crate::decoder::static_parallel_parameter_groups;
-use crate::qwen::vision::{
-    block_parallel_parameter_groups, VisionBlock, VisionInput, VisionMode, VisionState,
-    VisionStatic,
-};
+use crate::qwen::vision::{VisionBlock, VisionInput, VisionState, VisionStatic};
 use crate::qwen::{self, AttentionInput};
 use crate::{
     composite_execution::{CompositeArchitecture, PreparedCompositeInput},
@@ -1078,6 +1073,7 @@ fn qwen_vl_routed_tensor_reductions() -> eredu_runtime::RoutedTensorReductions {
 /// One neutral composite model for dense and MoE Qwen3-VL.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
+    definition: eredu_runtime::ComponentDefinition,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
     partition_geometry: Option<std::sync::Arc<super::PartitionLocalGeometry>>,
@@ -1089,7 +1085,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
+        Ok(self.definition.state_layout().clone())
     }
 
     fn state_identity(
@@ -1108,9 +1104,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        Ok(self.definition.parameters().clone())
     }
 
     fn static_parameter_recipes(
@@ -1373,17 +1369,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Builds unloaded modules with their canonical checkpoint identities.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let definition = super::component_definition(&args, None)?;
         crate::operator_requirements::require::<B>(
             "Qwen3-VL",
             crate::operator_requirements::QWEN_VL,
         )?;
-        args.vision
-            .validate_for(VisionMode::DeepStack)
-            .map_err(Error::backend)?;
         let text = qwen::StaticModules::new(&args.text, context)?;
         let vision = VisionStatic::new_with_root(args.vision.clone(), "model.visual", context)?;
         Ok(Self {
             args,
+            definition,
             static_modules: StaticModules { text, vision },
             parallel_geometry: None,
             partition_geometry: None,
@@ -1396,14 +1391,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = super::component_definition(&args, Some(&geometry))?;
         crate::operator_requirements::require::<B>(
             "Qwen3-VL",
             crate::operator_requirements::QWEN_VL,
         )?;
-        args.vision
-            .validate_for(VisionMode::DeepStack)
-            .map_err(Error::backend)?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
         let text = qwen::StaticModules::new_parallel(&args.text, geometry.text(), context)?;
         let vision = VisionStatic::new_parallel_with_root(
             args.vision.clone(),
@@ -1413,6 +1405,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         )?;
         Ok(Self {
             args,
+            definition,
             static_modules: StaticModules { text, vision },
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
             partition_geometry: None,
@@ -1432,119 +1425,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self.args
     }
 
-    /// Describes shared-vision and text-decoder parameters with canonical
-    /// graph-unit ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)?;
-        let counts = [
-            self.args.vision.layer_count(),
-            usize::try_from(self.args.text.num_hidden_layers).map_err(Error::backend)?,
-        ];
-        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
-        // A partition-local model contains already-local tensor shapes. Its
-        // parameter authority must nevertheless continue to describe the
-        // immutable checkpoint-global groups selected at admission; applying
-        // TP placement to the local shapes would shard them a second time.
-        let global_static = self
-            .parallel_geometry
-            .is_some()
-            .then(|| qwen::StaticModules::new(&self.args.text, context))
-            .transpose()?;
-        let text_modules = global_static.as_ref().unwrap_or(&self.static_modules.text);
-        let text_static = static_parallel_parameter_groups::<B>(
-            &text_modules.embeddings,
-            &text_modules.boundary.norm,
-            text_modules.lm_head.as_ref(),
-            &self.args.text.parameter_root,
-        )
-        .map_err(Error::backend)?;
-        let vision_static = crate::qwen::vision::owned_static_parallel_parameter_groups(
-            &self.args.vision,
-            "model.visual",
-            eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP).map_err(Error::backend)?,
-            "vision",
-        )
-        .map_err(Error::backend)?;
-        let mut expected = text_static
-            .iter()
-            .cloned()
-            .chain(vision_static.iter().map(|owned| owned.group().clone()))
-            .collect::<Vec<_>>();
-        let mut owned = text_static
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                OwnedParameterGroupSpec::new(
-                    if index == 0 && self.args.text.tie_word_embeddings {
-                        ParameterGroupOwner::static_any_of(["embedding", "output"])
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
-                    group,
-                )
-            })
-            .chain(vision_static)
-            .collect::<Vec<_>>();
-        for (group_index, &count) in counts.iter().enumerate() {
-            let group_id = layout
-                .group_id(group_index)
-                .expect("Qwen3-VL layout group")
-                .clone();
-            for index in 0..count {
-                let groups = if group_index == 0 {
-                    block_parallel_parameter_groups(&self.args.vision, "model.visual", index)
-                } else {
-                    let block = if self.parallel_geometry.is_some() {
-                        qwen::new_routed_block(&self.args.text, index, context)?
-                    } else {
-                        let Unit::Text(block) = self.construct_unit(group_index, index, context)?
-                        else {
-                            unreachable!("declared text group")
-                        };
-                        block
-                    };
-                    qwen::routed_layer_parallel_parameter_groups(&block, &self.args.text, index)
-                }
-                .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
+    /// Borrows canonical invocation, parameter, transport and state ownership.
+    pub const fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
-    /// Returns replicated or planner-derived decoder state geometry.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(
-                || super::state_layout(&self.args).map_err(Error::backend),
-                Ok,
-            )
+        Ok(self.definition.state_layout().clone())
     }
 
     /// Applies the architecture-owned tensor-parallel target output boundary.
@@ -2437,68 +2324,33 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            }
-        } else {
-            crate::transport::decoder()
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated Qwen3-VL group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        TEXT_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(1, layout)
+        self.definition.state_partition_plan().clone()
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        match group {
-            0 => Ok(self.args.vision.layer_count()),
-            1 => usize::try_from(self.args.text.num_hidden_layers).map_err(Error::backend),
-            _ => Err(Error::backend("Qwen3-VL has two execution groups")),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        let count = match group {
-            0 => self.args.vision.layer_count(),
-            1 => usize::try_from(self.args.text.num_hidden_layers).map_err(Error::backend)?,
-            _ => return Err(Error::backend("Qwen3-VL has two execution groups")),
-        };
-        if index >= count {
-            return Err(Error::backend("Qwen3-VL unit is outside its group"));
-        }
-        match group {
-            0 => Ok(format!("model.visual.blocks.{index}")),
-            1 => Ok(format!("{}.layers.{index}", self.args.text.parameter_root)),
-            _ => unreachable!(),
-        }
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
@@ -2732,11 +2584,11 @@ where
     }
 
     fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
-        match group {
-            0 => 0,
-            1 => index,
-            _ => index,
-        }
+        self.definition
+            .unit(group, index)
+            .expect("validated Qwen3-VL unit")
+            .state
+            .start
     }
 
     fn forward_unit(

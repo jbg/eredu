@@ -9067,6 +9067,17 @@ source and the admitted tasks. They never reconstruct source geometry from
 packed target slots. GGUF's learned per-head Q/K norm gains appear as replicated
 architecture parameters; the Hugging Face convention remains weightless there.
 
+Qwen3-VL declares parameters without native modules by composing the ordinary
+Qwen text topology and shared vision specifications. Text execution owners map
+to the composite decoder group; canonical targets, tied storage roles, encoded
+companions and placement rules retain checkpoint-global geometry. Complete and
+tensor-parallel construction validate and retain one `ComponentDefinition`
+before allocating modules. Graphs, logical paths, transport, parameter catalogs
+and complete state reports project that definition. Vision invocations declare
+no decoder state slots; text slots include the persisted mRoPE position delta.
+Target and transform-source partition preparation derive layout from the same
+cold parameter declaration.
+
 Qwen3-VL's text traversal uses the ordinary Qwen decoder's component driver,
 including resident and independently supplied experts, rotary embeddings and
 local mutable state. Its architecture wrapper adds the assembled embedding and
