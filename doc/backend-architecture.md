@@ -9047,6 +9047,12 @@ authoritative parameter on each invocation. It does not retain a separate gain
 tensor across parameter replacement or unloading, so overlays and residency
 transitions cannot reuse a stale derived parameter.
 
+Component kernels declare the meaning of an invocation's complete output.
+Context activations and media features report no prediction-score kind, so the
+shared session driver bypasses its model-score observation seam for those
+outputs. Causal scores retain the existing default; refinement kernels declare
+their own score kind from request-local invocation context.
+
 Shared component adapters validate group identities and dependency cardinality
 before serial or parallel group ingress. Parallel kernels can place token lookup
 or another collective at the group's declared wave; the default uses the ordinary

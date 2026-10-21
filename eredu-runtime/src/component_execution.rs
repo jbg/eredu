@@ -377,6 +377,13 @@ pub trait ComponentKernel<B: NeuralBackend> {
         state: &PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<ModelStateIdentity, Self::Error>;
+    /// Meaning of this invocation's complete output. Context or feature-only
+    /// operations return `None` and bypass the model-score observation seam.
+    fn output_score_kind(
+        _forward: &Self::ForwardContext,
+    ) -> Option<eredu_core::refinement::PredictionScoreKind> {
+        Some(eredu_core::refinement::PredictionScoreKind::CausalConditional)
+    }
     /// Borrows the exact target activation retained for an external prediction operation.
     fn prediction_target_capture(_forward: &Self::ForwardContext) -> Option<&B::Tensor> {
         None
@@ -1113,6 +1120,11 @@ where
     S: RuntimeState<B>,
     K: ComponentEquations<B, S> + 'static,
 {
+    fn output_score_kind(
+        forward: &Self::ForwardContext,
+    ) -> Option<eredu_core::refinement::PredictionScoreKind> {
+        K::output_score_kind(forward)
+    }
     fn observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
         self.kernel.observation_hooks()
     }
