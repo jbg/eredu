@@ -4505,23 +4505,13 @@ pub(crate) fn diffusion_execution_requirements(
     let owner =
         eredu_runtime::ExecutionGroupId::new(crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP)
             .map_err(|error| invalid(error.to_string()))?;
-    let mut specs = BTreeMap::new();
-    for (layer, policy) in config.text.layer_schedule.iter().enumerate() {
-        if policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
-            let spec = crate::gemma4::text::expert_bank_spec_at(
-                &config.text,
-                &format!("model.decoder.layers.{layer}.experts.switch_glu"),
-            )
-            .map_err(|error| invalid(error.to_string()))?;
-            specs.insert((owner.clone(), layer), spec);
-        }
-    }
-    let plan = crate::ExpertRealizationPlan::balanced(
-        config.text.num_experts.unwrap_or_default() as usize,
+    let plan = crate::diffusion_gemma::model::expert_realization_plan(
+        config,
+        None,
         replicated_expert_topology().map_err(invalid)?,
-        specs,
     )
-    .map_err(|error| invalid(error.to_string()))?;
+    .map_err(|error| invalid(error.to_string()))?
+    .ok_or_else(|| invalid("selected shared stack has no routed bank".into()))?;
     let catalog = crate::diffusion_gemma::expert_residency_catalog(source.as_ref(), config)
         .map_err(invalid)?;
     crate::routed_text::gated_routed_text_requirements(
@@ -7605,29 +7595,19 @@ fn composite_routed_requirements(
             .map_err(|error| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
             })?;
-            let mut specs = BTreeMap::new();
-            for (layer, policy) in args.text.layer_schedule.iter().enumerate() {
-                if policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
-                    specs.insert(
-                        (owner.clone(), layer),
-                        crate::gemma4::text::expert_bank_spec_at(
-                            &args.text,
-                            &format!("model.decoder.layers.{layer}.experts.switch_glu"),
-                        )
-                        .map_err(|error| {
-                            ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                        })?,
-                    );
-                }
-            }
-            let plan = crate::ExpertRealizationPlan::balanced(
-                args.text.num_experts.unwrap() as usize,
+            let plan = crate::diffusion_gemma::model::expert_realization_plan(
+                args,
+                None,
                 replicated_expert_topology()
                     .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
-                specs,
             )
             .map_err(|error| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "selected shared stack has no routed bank".into(),
+                )
             })?;
             let catalog =
                 crate::diffusion_gemma::expert_residency_catalog(recipe_source.as_ref(), args)

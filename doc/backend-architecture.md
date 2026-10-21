@@ -11703,3 +11703,10 @@ same `TargetRefinement` contract as independent drafting. Entropy feedback uses
 full batch/canvas/vocabulary geometry and the context output's conditioning
 precision; masked unmasking keeps its selected-token and pinned-prefix semantics.
 All numerical continuation values settle before a paused advancement is exposed.
+
+DiffusionGemma derives compact expert ownership from family configuration, optional
+rank-local block geometry, and the admitted Cartesian topology. Cold text and
+composite requirements, selected target construction, and transform-source
+construction consume the same source-free declaration. Expert ownership never
+requires native parameter modules; materialization retains the resulting plan
+without reconstructing group identities or expert widths.

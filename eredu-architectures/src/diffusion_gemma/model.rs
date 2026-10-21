@@ -33,6 +33,74 @@ pub(crate) fn text_transport() -> eredu_runtime::ArchitectureGroupTransport {
     }
 }
 
+/// Derives ownership of the shared routed banks for an admitted rank topology.
+pub fn expert_realization_plan(
+    config: &FamilyConfig,
+    geometry: Option<&super::parallel::LocalGeometry>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, Error> {
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(config)
+            .map_err(Error::backend_source)?;
+    }
+    let Some(count) = config.text.num_experts else {
+        return Ok(None);
+    };
+    let global = usize::try_from(count).map_err(Error::backend)?;
+    let local = eredu_core::balanced_contiguous_range(
+        global,
+        topology.expert_parallel_size(),
+        topology.expert_parallel_rank(),
+        false,
+    )
+    .map_err(Error::backend)?;
+    let owner =
+        eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP).map_err(Error::backend)?;
+    let mut specs = std::collections::BTreeMap::new();
+    for (index, policy) in config.text.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
+            continue;
+        }
+        let args = geometry
+            .as_ref()
+            .and_then(|g| g.block_args(index))
+            .unwrap_or(&config.text);
+        let width = if geometry
+            .as_ref()
+            .is_some_and(|g| g.block_args(index).is_none())
+        {
+            let global_width = config
+                .text
+                .moe_intermediate_size
+                .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?;
+            let owned = eredu_core::balanced_contiguous_range(
+                global_width as usize,
+                topology.tensor_parallel_size(),
+                topology.tensor_parallel_rank(),
+                false,
+            )
+            .map_err(Error::backend)?;
+            i32::try_from(owned.len()).map_err(Error::backend)?
+        } else {
+            args.moe_intermediate_size
+                .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?
+        };
+        let spec = crate::gemma4::text::expert_bank_spec_at(
+            &config.text,
+            &format!("model.decoder.layers.{index}.experts.switch_glu"),
+        )?
+        .with_group_geometry(i32::try_from(local.len()).map_err(Error::backend)?, width)?;
+        specs.insert((owner.clone(), index), spec);
+    }
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    crate::ExpertRealizationPlan::balanced(global, topology, specs)
+        .map(Some)
+        .map_err(Error::backend)
+}
+
 /// One architecture invocation; refinement reads the context owned by the state.
 pub enum TextInput<'a, T> {
     /// Authoritative tokens whose projections are appended to context.
@@ -257,72 +325,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
             geometry: Some(geometry),
             experts: None,
         })
-    }
-
-    /// Derives ownership of the shared routed banks for an admitted rank topology.
-    pub fn expert_realization_plan(
-        &self,
-        topology: eredu_core::ParallelRankTopology,
-    ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, Error>
-    {
-        let Some(count) = self.config.text.num_experts else {
-            return Ok(None);
-        };
-        let global = usize::try_from(count).map_err(Error::backend)?;
-        let local = eredu_core::balanced_contiguous_range(
-            global,
-            topology.expert_parallel_size(),
-            topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(Error::backend)?;
-        let owner =
-            eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP).map_err(Error::backend)?;
-        let mut specs = std::collections::BTreeMap::new();
-        for (index, policy) in self.config.text.layer_schedule.iter().enumerate() {
-            if policy.feed_forward != crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
-                continue;
-            }
-            let args = self
-                .geometry
-                .as_ref()
-                .and_then(|g| g.block_args(index))
-                .unwrap_or(&self.config.text);
-            let width = if self
-                .geometry
-                .as_ref()
-                .is_some_and(|g| g.block_args(index).is_none())
-            {
-                let global_width = self
-                    .config
-                    .text
-                    .moe_intermediate_size
-                    .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?;
-                let owned = eredu_core::balanced_contiguous_range(
-                    global_width as usize,
-                    topology.tensor_parallel_size(),
-                    topology.tensor_parallel_rank(),
-                    false,
-                )
-                .map_err(Error::backend)?;
-                i32::try_from(owned.len()).map_err(Error::backend)?
-            } else {
-                args.moe_intermediate_size
-                    .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?
-            };
-            let spec = crate::gemma4::text::expert_bank_spec_at(
-                &self.config.text,
-                &format!("model.decoder.layers.{index}.experts.switch_glu"),
-            )?
-            .with_group_geometry(i32::try_from(local.len()).map_err(Error::backend)?, width)?;
-            specs.insert((owner.clone(), index), spec);
-        }
-        if specs.is_empty() {
-            return Ok(None);
-        }
-        crate::ExpertRealizationPlan::balanced(global, topology, specs)
-            .map(Some)
-            .map_err(Error::backend)
     }
 
     /// Retains exact shared-bank ownership for native or neutral routed providers.

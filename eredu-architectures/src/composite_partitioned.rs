@@ -1869,28 +1869,31 @@ where
                 vision_units: vision_units.clone(),
                 complete_state,
             };
+            let realization = if routed {
+                Some(
+                    crate::diffusion_gemma::model::expert_realization_plan(
+                        &args,
+                        Some(&geometry.text),
+                        rank,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "selected routed shared stack has no expert realization".into(),
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
             let mut architecture = crate::diffusion_gemma::composite::Model::<B>::new_parallel(
                 args.clone(),
                 geometry.clone(),
                 context,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let realization = if routed {
-                Some(
-                    architecture
-                        .expert_realization_plan(rank)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?
-                        .ok_or_else(|| {
-                            CompositePartitionPreparationError::Architecture(
-                                "selected routed shared stack has no expert realization".into(),
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
             if let Some(realization) = &realization {
                 architecture = architecture
                     .with_expert_realization(realization.clone())
@@ -1973,6 +1976,25 @@ where
                         vision_units,
                         complete_state: geometry.complete_state.clone(),
                     };
+                    let source_plan = if routed {
+                        Some(
+                            crate::diffusion_gemma::model::expert_realization_plan(
+                                source,
+                                Some(&source_geometry.text),
+                                rank,
+                            )
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?
+                            .ok_or_else(|| {
+                                CompositePartitionPreparationError::Architecture(
+                                    "source shared stack has no routed realization".into(),
+                                )
+                            })?,
+                        )
+                    } else {
+                        None
+                    };
                     let mut source_model =
                         crate::diffusion_gemma::composite::Model::<B>::new_parallel(
                             source.clone(),
@@ -1982,17 +2004,7 @@ where
                         .map_err(|error| {
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?;
-                    if routed {
-                        let source_plan = source_model
-                            .expert_realization_plan(rank)
-                            .map_err(|error| {
-                                CompositePartitionPreparationError::Architecture(error.to_string())
-                            })?
-                            .ok_or_else(|| {
-                                CompositePartitionPreparationError::Architecture(
-                                    "source shared stack has no routed realization".into(),
-                                )
-                            })?;
+                    if let Some(source_plan) = source_plan {
                         source_model =
                             source_model
                                 .with_expert_realization(source_plan)

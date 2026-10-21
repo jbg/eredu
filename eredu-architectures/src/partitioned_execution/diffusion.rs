@@ -42,13 +42,11 @@ where
     let geometry =
         crate::diffusion_gemma::parallel::local_geometry(&selected_args, &layout, owned.units())
             .map_err(architecture)?;
-    let plan = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
-        selected_args.clone(),
-        geometry.clone(),
-        context,
+    let plan = crate::diffusion_gemma::model::expert_realization_plan(
+        &selected_args,
+        Some(&geometry),
+        rank,
     )
-    .map_err(architecture)?
-    .expert_realization_plan(rank)
     .map_err(architecture)?
     .ok_or_else(|| architecture("selected shared stack has no routed bank"))?;
     let complete_state = geometry.state_layout().clone();
@@ -82,13 +80,11 @@ where
                 "shared iterative transform source changed state geometry",
             ));
         }
-        let source_plan = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
-            args.clone(),
-            source_geometry.clone(),
-            context,
+        let source_plan = crate::diffusion_gemma::model::expert_realization_plan(
+            args,
+            Some(&source_geometry),
+            rank,
         )
-        .map_err(architecture)?
-        .expert_realization_plan(rank)
         .map_err(architecture)?
         .ok_or_else(|| architecture("source shared stack has no routed bank"))?;
         let source_partition = crate::diffusion_gemma::parallel::partition(

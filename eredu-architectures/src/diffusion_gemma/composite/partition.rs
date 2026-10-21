@@ -73,14 +73,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
             geometry: Some(geometry),
         })
     }
-    /// Derives ordinary routed provider ownership from the shared parameter stack.
-    pub fn expert_realization_plan(
-        &self,
-        rank: eredu_core::ParallelRankTopology,
-    ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, Error>
-    {
-        self.statics.text.expert_realization_plan(rank)
-    }
+
     /// Retains the admitted compact expert realization without changing invocation geometry.
     pub fn with_expert_realization(
         mut self,
