@@ -530,7 +530,13 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
                 "expert realization includes another execution unit",
             ));
         }
+        let definition = if self.definition.parameters().partition_layout().is_some() {
+            local.definition_with_parameters(self.definition.parameters().clone())?
+        } else {
+            local.definition()?
+        };
         self.spec = local;
+        self.definition = std::sync::Arc::new(definition);
         Ok(())
     }
 }

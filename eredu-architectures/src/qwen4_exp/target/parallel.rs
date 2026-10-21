@@ -213,7 +213,7 @@ where
         P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.execute_parallel(
             index,
             unit,
@@ -248,7 +248,7 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let path = format!("model.layers.{}", self.spec.units[index].layer());
         self.execute_parallel(

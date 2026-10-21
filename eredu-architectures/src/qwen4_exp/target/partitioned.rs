@@ -48,7 +48,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
         let end = start
             .checked_add(state.layout().len())
             .ok_or_else(|| Error::backend("target partition state range overflow"))?;
-        let global = self.spec.state_layout()?;
+        let global = self.definition.state_layout();
         if state.layout().is_empty()
             || end > global.len()
             || global.slice(start..end).map_err(Error::backend)? != *state.layout()

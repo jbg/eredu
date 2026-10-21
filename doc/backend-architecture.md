@@ -10801,8 +10801,9 @@ parallel plans live in `eredu-architectures::qwen4_exp`. MLX binds generic opera
 state, sources and selected execution contracts. Current supported paths and verification
 coverage are described in the [family validation report](qwen4-exp-validation.md).
 
-`TargetSpec` and `TargetModel` implement the shared architecture, layered and routed
-contracts. Execution alternates decoder blocks with independently owned lexical units.
+`TargetSpec` declares target geometry, and `TargetModel` implements the shared
+architecture, layered and routed contracts. Execution alternates decoder blocks
+with independently owned lexical units.
 Each decoder unit contains a recurrent or indexed mixer and a shared/routed feed-forward
 sublayer. Checkpoint layer numbers and execution ordinals remain distinct, including
 expert/table owners. The target uses `HybridDecoder` vocabulary handling and the shared
@@ -10817,6 +10818,15 @@ admitted providers. Target inspection and global partition/transform-source
 planning consume this declaration without constructing temporary global models.
 Parameter-member declarations retain neutral encoding relationships through
 `ParameterMemberSpec::with_parameter_metadata`.
+
+`TargetSpec::definition` validates the target's graph, canonical storage, semantic
+unit paths, one-to-one context slots and decoder transport before materialization.
+`TargetModel` retains this `ComponentDefinition` in an `Arc`. Parameter inspection,
+serial and parallel address checks, group discovery and context geometry use the
+retained authority. Expert placement updates validate a new declaration before
+publishing the changed specs; partition construction retains canonical global
+parameter placement with the actual tensor-local context geometry. Each lexical
+invocation keeps its own slot independently of the following decoder layer.
 
 `DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse;
 the shared shell owns vocabulary parameters, collectives, execution groups and readout

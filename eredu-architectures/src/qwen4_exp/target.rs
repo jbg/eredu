@@ -537,7 +537,7 @@ pub struct TargetModel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     state_fingerprint: String,
     tensor_partition: Option<TargetTensorPartition>,
     partition_state: eredu_runtime::PartitionState,
-    global_parameters: Option<std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>>,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     pub(crate) decoder: HybridDecoder<B, (), ResidualBoundary<B>>,
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B> {
@@ -548,7 +548,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B
             state_fingerprint: self.state_fingerprint.clone(),
             tensor_partition: self.tensor_partition.clone(),
             partition_state: self.partition_state.clone(),
-            global_parameters: self.global_parameters.clone(),
+            definition: self.definition.clone(),
             decoder: self.decoder.clone(),
         }
     }
@@ -564,30 +564,17 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
             hashes,
             state_fingerprint,
         } = bound;
-        spec.state_layout()?;
-        spec.limits.validate_for_config(&spec.config)?;
-        for (ordinal, unit) in spec.units.iter().enumerate() {
-            match unit {
-                UnitSpec::Lexical { spec: lexical, .. } => lexical.validate()?,
-                UnitSpec::Decoder {
-                    mixer,
-                    feed_forward,
-                    ..
-                } => {
-                    feed_forward.validate()?;
-                    if feed_forward.feed_forward.layer != ordinal {
-                        return Err(Error::backend("expert owner differs from target unit"));
-                    }
-                    match mixer {
-                        MixerSpec::Recurrent(r) => r.validate()?,
-                        MixerSpec::Indexed(a) => {
-                            a.validate().map_err(Error::backend_source)?;
-                            a.limits
-                                .validate::<B::Tensor>(a.state)
-                                .map_err(Error::backend_source)?;
-                        }
-                    }
-                }
+        let definition = std::sync::Arc::new(spec.definition()?);
+        for unit in &spec.units {
+            if let UnitSpec::Decoder {
+                mixer: MixerSpec::Indexed(indexed),
+                ..
+            } = unit
+            {
+                indexed
+                    .limits
+                    .validate::<B::Tensor>(indexed.state)
+                    .map_err(Error::backend_source)?;
             }
         }
         B::require_operator_capabilities("qwen4_exp target", spec.required_operators())?;
@@ -600,14 +587,15 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
         )?;
         let decoder = HybridDecoder::new(modules, "model.units", spec.units.len())?;
         let partition_state =
-            eredu_runtime::PartitionState::new(spec.state_layout()?, 0).map_err(Error::backend)?;
+            eredu_runtime::PartitionState::new(definition.state_layout().clone(), 0)
+                .map_err(Error::backend)?;
         Ok(Self {
             spec,
             hashes,
             state_fingerprint,
             tensor_partition: None,
             partition_state,
-            global_parameters: None,
+            definition,
             decoder,
         })
     }
@@ -634,8 +622,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
     pub(crate) fn retain_global_parameters(
         &mut self,
         parameters: eredu_runtime::ArchitectureParameterDescription,
-    ) {
-        self.global_parameters = Some(std::sync::Arc::new(parameters));
+    ) -> Result<(), Error> {
+        self.definition = std::sync::Arc::new(self.spec.definition_with_parameters(parameters)?);
+        Ok(())
+    }
+
+    /// Validated invocation, storage and state authority retained before allocation.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Literal-aware state identity retained at construction.

@@ -162,14 +162,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
 {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.spec.state_layout()
+        Ok(self.definition.state_layout().clone())
     }
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        let global = self.spec.state_layout()?;
+        let global = self.definition.state_layout();
         let begin = state.global_layer_offset();
         if begin
             .checked_add(state.layout().len())
@@ -204,10 +204,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        if let Some(parameters) = &self.global_parameters {
-            return Ok((**parameters).clone());
-        }
-        self.spec.parameter_description()
+        Ok(self.definition.parameters().clone())
     }
     fn static_parameter_recipes(
         &self,
@@ -266,27 +263,29 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
     }
-    fn group_transport(&self, _: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::transport::decoder()
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        self.definition
+            .group_transport(group)
+            .expect("validated target group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
+        self.definition.primary_group()
     }
     fn state_partition_plan(
         &self,
-        layout: &StateLayout,
+        _layout: &StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(0, layout)
+        self.definition.state_partition_plan().clone()
     }
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        self.decoder.execution_graph()
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.decoder.group_unit_count(group)
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.decoder.unit_path(group, index)?;
-        Ok(self.spec.units[index].path())
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
         self.decoder.static_modules()
@@ -300,7 +299,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.construct_unit(index, context)
     }
     fn begin_forward<'a>(
@@ -349,7 +348,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.execute(
             index,
             unit,
@@ -398,7 +397,7 @@ where
         forward: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.group_unit_count(group)?;
+        self.definition.unit_count(group)?;
         forward.target_hidden = Some(hidden.clone());
         Ok(hidden.clone())
     }
@@ -484,7 +483,7 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         self.execute(
             index,
             unit,
@@ -516,7 +515,7 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.decoder.unit_path(group, index)?;
+        self.definition.unit(group, index)?;
         let mut b = eredu_runtime::BorrowedActivationObserver(observer);
         // Lexical component observations use the original decoder layer prefix.
         let path = format!("model.layers.{}", self.spec.units[index].layer());

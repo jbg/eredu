@@ -104,7 +104,9 @@ impl PreparedTargetPartition {
             .state()
             .ok_or_else(|| invalid("Flash-Next target partition has no state"))?;
         model.set_partition_state(state).map_err(invalid)?;
-        model.retain_global_parameters(parameters.clone());
+        model
+            .retain_global_parameters(parameters.clone())
+            .map_err(invalid)?;
 
         let source_architecture =
             if crate::replicated_text::selected_uses_transform(selected.base().text()) {
@@ -150,11 +152,13 @@ impl PreparedTargetPartition {
                     ));
                 }
                 source_model.set_partition_state(state).map_err(invalid)?;
-                source_model.retain_global_parameters(
-                    source_parameters
-                        .with_partition_layout(rank, source_layout.clone())
-                        .map_err(invalid)?,
-                );
+                source_model
+                    .retain_global_parameters(
+                        source_parameters
+                            .with_partition_layout(rank, source_layout.clone())
+                            .map_err(invalid)?,
+                    )
+                    .map_err(invalid)?;
                 Some((source_model, source_layout))
             } else {
                 None
