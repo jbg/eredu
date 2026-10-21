@@ -160,6 +160,33 @@ where
     pub fn static_modules_mut(&mut self) -> &mut M {
         self.base.static_modules_mut()
     }
+    /// Borrows the selected embedding owner for composite token assembly.
+    pub(super) fn embed_tokens(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        let embedding = self
+            .base
+            .static_modules_mut()
+            .decoder_resources_mut()
+            .embedding
+            .ok_or_else(|| Error::backend("decoder does not own input embedding"))?;
+        match parallel {
+            Some(parallel) => B::vocabulary_parallel_lookup(
+                embedding,
+                tokens,
+                eredu_nn::EmbeddingLookupPolicy::Strict,
+                parallel,
+                context,
+            ),
+            None => eredu_nn::EmbeddingOperator::forward(embedding, tokens, context),
+        }
+    }
     /// Starts a text invocation from already assembled media/text embeddings.
     /// Cache visibility and write authority are identical to token ingress.
     pub(crate) fn begin_embedded<S>(

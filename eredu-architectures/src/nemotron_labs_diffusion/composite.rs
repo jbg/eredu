@@ -18,12 +18,11 @@ use crate::{
 };
 use eredu_core::decoding::AttentionInvocation;
 use eredu_nn::{
-    DistributedNeuralBackend, EmbeddingLookupPolicy, Error, Index, Parameterized,
-    ReadOnlyAttentionCache, Tensor,
+    DistributedNeuralBackend, Error, Index, Parameterized, ReadOnlyAttentionCache, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameters, ComponentEquations as _, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, ParallelLayeredArchitecture,
+    ComponentEquations as _, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
+    ParallelLayeredArchitecture,
 };
 
 /// Pinned roles have distinct first/last pipeline owners.
@@ -34,6 +33,48 @@ pub struct StaticModules<B: DistributedNeuralBackend> {
     pub text: TextKernel<B>,
     /// First image-owner parameters.
     pub image_embedding: ImageEmbedding<B>,
+}
+/// Typed access to physically retained composite text and image resources.
+pub trait CompositeResources<B: DistributedNeuralBackend>:
+    Parameterized<B::Tensor> + Sized + 'static
+{
+    /// Internal observation coverage of ordinary low-level parallel readout.
+    const OBSERVED_PARALLEL_READOUT: bool;
+    /// Selected decoder pinned storage.
+    type TextModules: crate::decoder::DecoderStaticResources<B>;
+    /// Selected decoder invocation/state geometry.
+    type TextGeometry: crate::decoder::DecoderGeometry<FamilyConfig>;
+    /// Text resources, absent on stateless media owners.
+    fn text(&self) -> Option<&CompositeTextKernel<B, Self>>;
+    /// Mutable access to those same resources.
+    fn text_mut(&mut self) -> Option<&mut CompositeTextKernel<B, Self>>;
+    /// Image ingress, only on its physical owner.
+    fn image(&self) -> Option<&ImageEmbedding<B>>;
+    /// Mutable access to the retained image ingress.
+    fn image_mut(&mut self) -> Option<&mut ImageEmbedding<B>>;
+}
+/// Text equation specialization selected by the composite's physical aggregate.
+pub type CompositeTextKernel<B, R> = TextKernel<
+    B,
+    <R as CompositeResources<B>>::TextModules,
+    <R as CompositeResources<B>>::TextGeometry,
+>;
+impl<B: DistributedNeuralBackend> CompositeResources<B> for StaticModules<B> {
+    const OBSERVED_PARALLEL_READOUT: bool = true;
+    type TextModules = crate::decoder::StaticModules<B>;
+    type TextGeometry = crate::decoder::CompleteDecoderGeometry<FamilyConfig>;
+    fn text(&self) -> Option<&CompositeTextKernel<B, Self>> {
+        Some(&self.text)
+    }
+    fn text_mut(&mut self) -> Option<&mut CompositeTextKernel<B, Self>> {
+        Some(&mut self.text)
+    }
+    fn image(&self) -> Option<&ImageEmbedding<B>> {
+        Some(&self.image_embedding)
+    }
+    fn image_mut(&mut self) -> Option<&mut ImageEmbedding<B>> {
+        Some(&mut self.image_embedding)
+    }
 }
 /// Each bounded unit contains exactly one image or text residual block.
 #[derive(Parameterized)]
@@ -70,86 +111,98 @@ pub type Model<B> = eredu_runtime::ComponentAdapter<
 /// Family-owned media assembly and context/refinement equations.
 #[derive(Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct CompositeKernel<B: DistributedNeuralBackend> {
+pub struct CompositeKernel<B: DistributedNeuralBackend, R: CompositeResources<B> = StaticModules<B>>
+{
     #[parameter(skip)]
     config: FamilyConfig,
     #[parameter(skip)]
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
-    statics: StaticModules<B>,
+    statics: R,
     #[parameter(skip)]
     local_layout: Option<eredu_runtime::LocalModelLayout>,
+    #[parameter(skip)]
+    geometry: Option<partition::Geometry>,
+    #[parameter(skip)]
+    backend: std::marker::PhantomData<fn() -> B>,
 }
-impl<B: DistributedNeuralBackend> CompositeKernel<B> {
+impl<B: DistributedNeuralBackend, R: CompositeResources<B>> CompositeKernel<B, R> {
     /// Retained semantic declaration used by execution and inspection.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
         &self.definition
     }
 
-    /// Declares each pinned role and no resident residual layers.
-    pub fn new(
-        config: FamilyConfig,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Model<B>, Error> {
-        let definition = std::sync::Arc::new(super::definition::composite(&config, None)?);
-        let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text = TextKernel::new(config.clone(), context)?.into_parts().1;
-        let kernel = Self {
-            config,
-            definition: definition.clone(),
-            statics: StaticModules {
-                text,
-                image_embedding,
-            },
-            local_layout: None,
-        };
-        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
-            .map_err(Error::from)
-    }
-    /// Declares exact text vocabulary/cache shards and Pixtral head/channel shards.
-    pub fn new_parallel(
-        config: FamilyConfig,
-        layout: eredu_runtime::LocalModelLayout,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Model<B>, Error> {
-        let geometry = crate::decoder::local_geometry(&config, &layout, |config, index, layout| {
-            config
-                .local_block_config(index, layout)
-                .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
-        })
-        .map_err(Error::backend)?;
-        let definition =
-            std::sync::Arc::new(super::definition::composite(&config, Some(&geometry))?);
-        let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text = TextKernel::new_parallel(config.clone(), geometry, context)?
-            .into_parts()
-            .1;
-        let kernel = Self {
-            config,
-            definition: definition.clone(),
-            statics: StaticModules {
-                text,
-                image_embedding,
-            },
-            local_layout: Some(layout),
-        };
-        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
-            .map_err(Error::from)
-    }
     /// Shared family and checkpoint identity.
     pub fn config(&self) -> &FamilyConfig {
         &self.config
     }
 
     /// Borrows all independently bound pinned roles.
-    pub fn static_modules(&self) -> &StaticModules<B> {
+    pub fn static_modules(&self) -> &R {
         &self.statics
     }
 
     /// Binds the same pinned roles before execution or reload.
-    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
+    pub fn static_modules_mut(&mut self) -> &mut R {
         &mut self.statics
     }
 
+    fn text(&mut self) -> Result<&mut CompositeTextKernel<B, R>, Error> {
+        self.statics
+            .text_mut()
+            .ok_or_else(|| Error::backend("partition owns no shared text stack"))
+    }
+    /// Constructs one declared resource within the retained local ownership.
+    pub fn construct_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error> {
+        self.definition.unit_address(group, index)?;
+        if let Some(g) = &self.geometry {
+            let owned = match group {
+                0 => g.vision.contains(&index),
+                1 => g.projection && index == 0,
+                2 => g
+                    .text
+                    .as_ref()
+                    .is_some_and(|g| g.owned_units().contains(&index)),
+                _ => false,
+            };
+            if !owned {
+                return Err(Error::backend(
+                    "partition attempted an unowned image/text unit",
+                ));
+            }
+        }
+        let layout = self
+            .geometry
+            .as_ref()
+            .map(|g| &g.layout)
+            .or(self.local_layout.as_ref());
+        Ok(match group {
+            0 => Unit::Vision(match layout {
+                Some(layout) => ImageLayer::new_parallel(
+                    self.config.vision.as_ref().expect("validated tower"),
+                    index,
+                    layout,
+                    context,
+                )?,
+                None => ImageLayer::new(
+                    self.config.vision.as_ref().expect("validated tower"),
+                    index,
+                    context,
+                )?,
+            }),
+            1 => Unit::Projector(ImageProjector::new(&self.config, context)?),
+            _ => Unit::Text(
+                self.statics
+                    .text()
+                    .ok_or_else(|| Error::backend("partition owns no text layers"))?
+                    .construct_unit(index, context)?,
+            ),
+        })
+    }
     fn prepare(
         &mut self,
         input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
@@ -164,9 +217,9 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
         } = prepare_segments(&self.config, input, context)?;
         let (image_initial, image_state) = if patches.is_empty() {
             (None, None)
-        } else {
+        } else if let Some(embedding) = self.statics.image_mut() {
             let patches = B::Tensor::concatenate(&patches, 0, context)?;
-            let (hidden, state) = self.statics.image_embedding.begin(
+            let (hidden, state) = embedding.begin(
                 ImageInput {
                     patches: &patches,
                     grids: &grids,
@@ -174,6 +227,11 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
                 context,
             )?;
             (Some(hidden), Some(state))
+        } else {
+            (
+                None,
+                Some(ImageState::prepare(&self.config, &grids, context)?),
+            )
         };
         let hidden =
             B::Tensor::full_f32(0.0, &[1, tokens.dim(1), self.config.hidden_size()], context)?;
@@ -226,19 +284,23 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
                 context,
                 observer,
             ),
-            (2, Unit::Text(layer)) => self.statics.text.run_unit(
-                self.statics.text.definition().unit_address(0, index)?,
-                layer,
-                hidden,
-                state,
-                forward
-                    .text
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("text ingress has not completed"))?,
-                parallel,
-                context,
-                observer,
-            ),
+            (2, Unit::Text(layer)) => {
+                let text = self.text()?;
+                let unit_address = text.definition().unit_address(0, index)?;
+                text.run_unit(
+                    unit_address,
+                    layer,
+                    hidden,
+                    state,
+                    forward
+                        .text
+                        .as_mut()
+                        .ok_or_else(|| Error::backend("text ingress has not completed"))?,
+                    parallel,
+                    context,
+                    observer,
+                )
+            }
             _ => Err(Error::backend("unit has a different execution group")),
         }
     }
@@ -266,21 +328,11 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
                 if let Some(output) = dependencies.first() {
                     forward.image_output = Some((*output).clone());
                 }
-                let embedded = match parallel {
-                    Some(parallel) => self.statics.text.static_modules_mut().embed_parallel(
-                        &forward.tokens,
-                        EmbeddingLookupPolicy::Strict,
-                        parallel,
-                        context,
-                    )?,
-                    None => self
-                        .statics
-                        .text
-                        .static_modules_mut()
-                        .embed(&forward.tokens, context)?,
-                };
+                let embedded = self
+                    .text()?
+                    .embed_tokens(&forward.tokens, parallel, context)?;
                 let hidden = assemble_embeddings(forward, &embedded, context)?;
-                let prepared = self.statics.text.begin_embedded(
+                let prepared = self.text()?.begin_embedded(
                     hidden,
                     None,
                     forward.invocation,
@@ -297,10 +349,10 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
         }
     }
 }
-impl<B: DistributedNeuralBackend> eredu_runtime::ComponentPinnedResources<B>
-    for CompositeKernel<B>
+impl<B: DistributedNeuralBackend, R: CompositeResources<B>>
+    eredu_runtime::ComponentPinnedResources<B> for CompositeKernel<B, R>
 {
-    type Modules = StaticModules<B>;
+    type Modules = R;
     fn pinned_modules(&self) -> &Self::Modules {
         &self.statics
     }
@@ -311,18 +363,30 @@ impl<B: DistributedNeuralBackend> eredu_runtime::ComponentPinnedResources<B>
         &self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.statics.text.visit_pinned(visitor)?;
-        visitor.visit("vision_embedding", &self.statics.image_embedding)
+        if let Some(text) = self.statics.text() {
+            text.visit_pinned(visitor)?;
+        }
+        if let Some(image) = self.statics.image() {
+            visitor.visit("vision_embedding", image)?;
+        }
+        Ok(())
     }
     fn visit_pinned_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.statics.text.visit_pinned_mut(visitor)?;
-        visitor.visit_mut("vision_embedding", &mut self.statics.image_embedding)
+        if let Some(text) = self.statics.text_mut() {
+            text.visit_pinned_mut(visitor)?;
+        }
+        if let Some(image) = self.statics.image_mut() {
+            visitor.visit_mut("vision_embedding", image)?;
+        }
+        Ok(())
     }
 }
-impl<B: DistributedNeuralBackend> eredu_runtime::ComponentKernel<B> for CompositeKernel<B> {
+impl<B: DistributedNeuralBackend, R: CompositeResources<B>> eredu_runtime::ComponentKernel<B>
+    for CompositeKernel<B, R>
+{
     type Input<'a>
         = PreparedCompositeInput<'a, B::Tensor, InputPartPlan>
     where
@@ -340,7 +404,10 @@ impl<B: DistributedNeuralBackend> eredu_runtime::ComponentKernel<B> for Composit
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.statics.text.state_identity(state, topology)
+        self.statics
+            .text()
+            .ok_or_else(|| Error::backend("stateless vision owner has no text cache identity"))?
+            .state_identity(state, topology)
     }
     fn static_parameter_recipes(
         &self,
@@ -361,23 +428,7 @@ impl<B: DistributedNeuralBackend> eredu_runtime::ComponentKernel<B> for Composit
         address: eredu_runtime::ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        let group = address.group();
-        let index = address.index();
-        Ok(if group == 0 {
-            Unit::Vision(match &self.local_layout {
-                Some(layout) => ImageLayer::new_parallel(
-                    self.config.vision.as_ref().unwrap(),
-                    index,
-                    layout,
-                    context,
-                )?,
-                None => ImageLayer::new(self.config.vision.as_ref().unwrap(), index, context)?,
-            })
-        } else if group == 1 {
-            Unit::Projector(ImageProjector::new(&self.config, context)?)
-        } else {
-            Unit::Text(self.statics.text.construct_unit(index, context)?)
-        })
+        self.construct_unit(address.group(), address.index(), context)
     }
     fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
         group == 2 || ((group == 0 || group == 1) && forward.image_state.is_some())
@@ -403,16 +454,15 @@ impl<B: DistributedNeuralBackend> eredu_runtime::ComponentKernel<B> for Composit
         values.into_iter()
     }
 }
-impl<B, S> eredu_runtime::ComponentEquations<B, S> for CompositeKernel<B>
+impl<B, S, R> eredu_runtime::ComponentEquations<B, S> for CompositeKernel<B, R>
 where
+    R: CompositeResources<B>,
     B: DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        <TextKernel<B> as eredu_runtime::ComponentEquations<B, S>>::observation_hooks(
-            &self.statics.text,
-        )
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
     fn begin<'a>(
         &mut self,
@@ -457,7 +507,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if group == 1 && forward.image_state.is_some() {
+        if group == 1 && (self.geometry.is_some() || forward.image_state.is_some()) {
             forward.image_output = Some(hidden.clone());
         }
         let _ = context;
@@ -470,7 +520,7 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish(
+        self.text()?.finish(
             hidden,
             state,
             forward
@@ -488,7 +538,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_observed(
+        self.text()?.finish_observed(
             hidden,
             state,
             forward
@@ -534,8 +584,9 @@ where
         )
     }
 }
-impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for CompositeKernel<B>
+impl<B, S, R> eredu_runtime::ParallelComponentKernel<B, S> for CompositeKernel<B, R>
 where
+    R: CompositeResources<B>,
     B: DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
@@ -580,7 +631,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_parallel(
+        self.text()?.finish_parallel(
             hidden,
             state,
             forward
@@ -600,7 +651,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_parallel_observed(
+        if !R::OBSERVED_PARALLEL_READOUT {
+            return self.finish_parallel(hidden, state, forward, parallel, context);
+        }
+        self.text()?.finish_parallel_observed(
             hidden,
             state,
             forward
@@ -1256,8 +1310,9 @@ fn resolve_group_boundary(
         .map_err(Error::backend)
 }
 
-impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for CompositeKernel<B>
+impl<B, S, R> eredu_runtime::RoutedComponentKernel<B, S> for CompositeKernel<B, R>
 where
+    R: CompositeResources<B>,
     B: eredu_nn::GroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
@@ -1278,5 +1333,62 @@ where
         P::Error: std::fmt::Display,
     {
         self.execute(address, unit, hidden, state, forward, context)
+    }
+}
+
+impl<B: DistributedNeuralBackend> CompositeKernel<B> {
+    /// Materializes declared complete composite resources.
+    pub fn new(
+        config: FamilyConfig,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        let definition = std::sync::Arc::new(super::definition::composite(&config, None)?);
+        let image_embedding = ImageEmbedding::new(&config, context)?;
+        let text = TextKernel::new(config.clone(), context)?.into_parts().1;
+        let kernel = Self {
+            config,
+            definition: definition.clone(),
+            statics: StaticModules {
+                text,
+                image_embedding,
+            },
+            local_layout: None,
+            geometry: None,
+            backend: std::marker::PhantomData,
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
+    }
+    /// Materializes declared complete composite resources.
+    pub fn new_parallel(
+        config: FamilyConfig,
+        layout: eredu_runtime::LocalModelLayout,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        let geometry = crate::decoder::local_geometry(&config, &layout, |config, index, layout| {
+            config
+                .local_block_config(index, layout)
+                .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
+        })
+        .map_err(Error::backend)?;
+        let definition =
+            std::sync::Arc::new(super::definition::composite(&config, Some(&geometry))?);
+        let image_embedding = ImageEmbedding::new(&config, context)?;
+        let text = TextKernel::new_parallel(config.clone(), geometry, context)?
+            .into_parts()
+            .1;
+        let kernel = Self {
+            config,
+            definition: definition.clone(),
+            statics: StaticModules {
+                text,
+                image_embedding,
+            },
+            local_layout: Some(layout),
+            geometry: None,
+            backend: std::marker::PhantomData,
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
     }
 }

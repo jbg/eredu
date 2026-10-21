@@ -11831,3 +11831,19 @@ collective schedules and image transport semantics. Serial and parallel ingress
 assembly and unit execution share equations with an optional neutral parallel
 context. Constructors live on `CompositeKernel`; direct module access uses
 `kernel()` and `kernel_mut()`.
+
+Complete and selected Nemotron Pixtral composites use one `CompositeKernel<B, R>`.
+`CompositeResources` exposes the actual text storage/state geometry and optional
+image ingress without creating absent modules. Image-only owners prepare request
+geometry with no mutable context layout. Selected construction validates canonical
+bindings, transport width and local ownership before materialization; target and
+transform-source construction use that same path. Global text identities retain
+their local cache mapping, and typed decoder resume validates its global origin.
+Both views share media preparation, assembly, independently leased unit equations,
+readout and retained request roots under the runtime adapter. The selected view
+adds typed partition and parallel provider capabilities without a second driver.
+
+Observation coverage remains specific to the invoked operation. Selected typed
+partition readout emits internal readout hooks; its ordinary low-level parallel
+readout leaves the observer unused. Complete ordinary parallel readout emits those
+hooks. Composite observed ingress retains its explicit image-embedding seam.

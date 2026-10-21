@@ -1624,8 +1624,13 @@ where
             "constructed shared-backbone partition state differs from cold admission".into(),
         ));
     }
-    let architecture = partition::Model::<B>::new(args.clone(), &parameters, &partition, context)
-        .map_err(|e| error(e.to_string()))?;
+    let architecture = partition::SelectedCompositeKernel::<B>::from_partition(
+        args.clone(),
+        &parameters,
+        &partition,
+        context,
+    )
+    .map_err(|e| error(e.to_string()))?;
     let source_architecture =
         if crate::replicated_text::selected_uses_transform(selected.base().execution()) {
             let source_args = source
@@ -1633,8 +1638,13 @@ where
                     selected.requirements().execution().execution(),
                 ))
                 .map_err(|e| error(e.to_string()))?;
-            let model = partition::Model::<B>::new(source_args, &parameters, &partition, context)
-                .map_err(|e| error(e.to_string()))?;
+            let model = partition::SelectedCompositeKernel::<B>::from_partition(
+                source_args,
+                &parameters,
+                &partition,
+                context,
+            )
+            .map_err(|e| error(e.to_string()))?;
             Some((Box::new(model), layout.clone()))
         } else {
             None
