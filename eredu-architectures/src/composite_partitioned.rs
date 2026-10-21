@@ -2238,16 +2238,53 @@ where
             } else {
                 None
             };
+            let definition =
+                crate::muse::component_definition(&args, Some(&local)).map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let partition = ArchitecturePartition::from_description(
+                definition.parameters(),
+                group_ranges
+                    .iter()
+                    .map(|(group, units)| (group.as_str(), units.clone())),
+                ownership.clone(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
+                geometry.clone(),
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            if selected.requirements().state() != partition.state() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "constructed Muse partition state differs from cold admission".into(),
+                ));
+            }
+            crate::muse::PartitionLocalFoundation::from_partition(&args, &partition).map_err(
+                |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+            )?;
+            if let Some(realization) = &realization {
+                routed_muse_partition_foundation(
+                    &args,
+                    &layout,
+                    group_ranges
+                        .iter()
+                        .map(|(group, units)| (group.as_str(), units.clone())),
+                    &ownership,
+                    rank,
+                    realization,
+                )
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            }
             let mut architecture =
                 crate::muse::LayeredModel::<B>::new_parallel(args.clone(), local, context)
                     .and_then(|architecture| {
-                        architecture.with_partition_state(
-                            selected.requirements().state().cloned().ok_or_else(|| {
+                        architecture.with_partition_state(partition.state().cloned().ok_or_else(
+                            || {
                                 eredu_nn::Error::backend(
                                     "Muse selected partition has no state ownership",
                                 )
-                            })?,
-                        )
+                            },
+                        )?)
                     })
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
@@ -2285,7 +2322,7 @@ where
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let source_architecture =
-                muse_transform_source::<B, S>(source, &selected, &parameters, &geometry, context)
+                muse_transform_source::<B>(source, &selected, &parameters, &geometry, context)
                     .map_err(CompositePartitionPreparationError::Architecture)?;
             let effective = args.identity.text_model_type().to_owned();
             prepare!(
@@ -2317,7 +2354,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::QwenVl(source) => {
@@ -2993,7 +3030,7 @@ where
     Ok(Some((Box::new(architecture), layout)))
 }
 
-fn muse_transform_source<B, S>(
+fn muse_transform_source<B>(
     source: &crate::muse::DecoderConfig,
     selected: &SelectedPartitionedAdmission<
         SelectedCompositeTextRealization,
@@ -3005,10 +3042,6 @@ fn muse_transform_source<B, S>(
 ) -> Result<Option<(Box<crate::muse::LayeredModel<B>>, LocalModelLayout)>, String>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>
-        + RuntimeStateComponents<B>
-        + AuxiliaryConvolutionState<B::Tensor>,
 {
     if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
         return Ok(None);
@@ -3065,37 +3098,34 @@ where
     if let Some(realization) = &realization {
         routed_muse_partition_foundation(source, &layout, ranges(), ownership, rank, realization)?;
     }
-    let mut architecture =
-        crate::muse::LayeredModel::<B>::new_parallel(source.clone(), local, context)
-            .and_then(|architecture| {
-                architecture.with_partition_state(
-                    selected.requirements().state().cloned().ok_or_else(|| {
-                        eredu_nn::Error::backend("Muse selected partition has no state ownership")
-                    })?,
-                )
-            })
-            .map_err(|error| error.to_string())?;
-    if let Some(realization) = realization {
-        architecture = architecture
-            .with_expert_realization(realization)
-            .map_err(|error| error.to_string())?;
-    }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+    let definition = crate::muse::component_definition(source, Some(&local))
         .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
+    let partition = ArchitecturePartition::from_description(
+        definition.parameters(),
         ranges(),
         ownership.clone(),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry,
-        boundary,
-        &parameters,
+        eredu_runtime::NoAuxiliaryBoundarySchema::new(source.hidden_size),
     )
     .map_err(|error| error.to_string())?;
     if selected.requirements().state() != partition.state() {
         return Err("Muse-Glimmer transform source changed selected state".into());
     }
-    if !source.is_moe() {
-        crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
+    crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
+        .map_err(|error| error.to_string())?;
+    let mut architecture =
+        crate::muse::LayeredModel::<B>::new_parallel(source.clone(), local, context)
+            .and_then(|architecture| {
+                architecture.with_partition_state(partition.state().cloned().ok_or_else(|| {
+                    eredu_nn::Error::backend("Muse selected partition has no state ownership")
+                })?)
+            })
+            .map_err(|error| error.to_string())?;
+    if let Some(realization) = realization {
+        architecture = architecture
+            .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
     Ok(Some((Box::new(architecture), layout)))

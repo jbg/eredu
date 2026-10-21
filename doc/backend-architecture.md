@@ -4505,12 +4505,18 @@ Muse vision groups declare semantic block owners and independently materialized
 patch/position, static-normalization, adapter and projection resources. Full,
 static and per-block parameter reports project these identities. Cold
 `VisionStaticSelection` resolves canonical bindings through runtime
-`select_pinned_groups`; each group includes its encoded companions. Native
-materialization allocates only the retained modules, and ingress, adaptation and
+`select_pinned_groups`; each group includes its encoded companions. `VisionStatic::from_selection`
+allocates only the retained modules, and ingress, adaptation and
 readout validate their required resources before equations or observation hooks.
 The current vision ownership retains patch/position and static norms on every
 vision owner, and retains the language adapter and projection on the final owner.
 Request-local permutation and rotary tensors keep the same completion lifetime.
+Muse target and transform-source preparation construct the authoritative
+`ArchitecturePartition` from the component definition before native construction.
+They validate selected state ownership and dense/routed local geometry there.
+Native construction receives the partition's state projection; shared preparation
+consumes the retained partition and canonical bindings. Decoder KV and waveform histories retain independent global slots and
+explicit stateless gaps across pipeline cuts.
 Distinct registered identities select typed attention,
 normalization, residual, feed-forward and media policies. The backend binds the
 retained declarations through ordinary native mechanisms and selects no family
