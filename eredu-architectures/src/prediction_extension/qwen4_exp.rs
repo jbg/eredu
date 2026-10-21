@@ -1,6 +1,6 @@
 //! Flash-Next operations plugged into the shared prediction lifecycle.
 use super::*;
-use crate::qwen4_exp::{mtp, target::TargetModel};
+use crate::qwen4_exp::{mtp, target::TargetKernel};
 use eredu_nn::{residual_streams::ResidualStreamGeometry, EmbeddingOperator};
 use eredu_runtime::{RuntimeState, TensorParallelParameterProvider};
 
@@ -22,14 +22,14 @@ pub trait Qwen4PredictionTarget<B: GroupedNeuralBackend + DistributedNeuralBacke
     ) -> Result<B::Tensor, eredu_nn::Error>;
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Qwen4PredictionTarget<B>
-    for TargetModel<B>
+    for TargetKernel<B>
 {
     fn prediction_embedding(
         &mut self,
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.statics.embeddings.forward(tokens, context)
+        self.statics.embedding_mut()?.forward(tokens, context)
     }
     fn prediction_logits(
         &mut self,
@@ -39,6 +39,30 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Qwen4PredictionTarget<B
     ) -> Result<B::Tensor, eredu_nn::Error> {
         self.statics
             .project_instrumented(hidden, None, context, instrumentation)
+    }
+}
+
+impl<B, D, K, R> Qwen4PredictionTarget<B> for eredu_runtime::ComponentAdapter<D, K, R>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
+    D: std::borrow::Borrow<eredu_runtime::ComponentDefinition>,
+    K: Qwen4PredictionTarget<B>,
+{
+    fn prediction_embedding(
+        &mut self,
+        tokens: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        self.kernel_mut().prediction_embedding(tokens, context)
+    }
+    fn prediction_logits(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        self.kernel_mut()
+            .prediction_logits(hidden, context, instrumentation)
     }
 }
 

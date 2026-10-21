@@ -9,6 +9,8 @@ use std::ops::Range;
 pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 
 pub(crate) mod attention_partition;
+mod boundary_modules;
+pub use boundary_modules::BoundaryModules;
 /// Shared-weight repeated stacks with independent state for each invocation.
 pub(crate) mod repeated;
 pub(crate) mod topology;

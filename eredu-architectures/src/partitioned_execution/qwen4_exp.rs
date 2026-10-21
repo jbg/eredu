@@ -1,7 +1,9 @@
 //! Flash-Next binds retained canonical tasks to exact authored rank placement.
 use super::*;
-use crate::qwen4_exp::{prepared::PreparedTargetPartition, target::TargetModel};
-use eredu_runtime::ArchitectureParameters;
+use crate::qwen4_exp::{
+    prepared::PreparedTargetPartition,
+    target::{TargetKernel, TargetModel},
+};
 
 fn invalid<E>(error: impl std::fmt::Display) -> DenseDecoderPartitionedDispatchError<E> {
     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
@@ -66,19 +68,19 @@ impl PreparedTargetPartition {
             .tensor_partition(rank.tensor_parallel_rank(), rank.tensor_parallel_size())
             .map_err(invalid)?;
         let mut parameters = bound.geometry().parameter_description().map_err(invalid)?;
-        let mut model = TargetModel::<B>::new_tensor_parallel(bound, tensor.clone(), context)
+        let mut model = TargetKernel::<B>::new_tensor_parallel(bound, tensor.clone(), context)
             .map_err(invalid)?;
-        let local_parameters = model.parameter_description(context).map_err(invalid)?;
+        let local_parameters = model.definition().parameters().clone();
         let experts = tensor
             .local_spec()
             .expert_realization(rank)
             .map_err(invalid)?;
-        model.set_expert_realization(&experts).map_err(invalid)?;
+        model = model.with_expert_realization(&experts).map_err(invalid)?;
         let layout = tensor
             .local_expert_layout(
                 &parameters,
                 &local_parameters,
-                &model.parameter_description(context).map_err(invalid)?,
+                &model.definition().parameters().clone(),
                 rank.expert_parallel_rank(),
                 rank.expert_parallel_size(),
             )
@@ -87,7 +89,7 @@ impl PreparedTargetPartition {
         parameters = parameters
             .with_partition_layout(rank, layout.clone())
             .map_err(invalid)?;
-        let complete_state = model.state_layout().map_err(invalid)?;
+        let complete_state = model.definition().state_layout().clone();
         let state_plan = crate::transport::pipeline_state(0, &complete_state);
         let partition = ArchitecturePartition::from_description(
             &parameters,
@@ -103,9 +105,9 @@ impl PreparedTargetPartition {
         let state = partition
             .state()
             .ok_or_else(|| invalid("Flash-Next target partition has no state"))?;
-        model.set_partition_state(state).map_err(invalid)?;
-        model
-            .retain_global_parameters(parameters.clone())
+        model = model.with_partition_state(state).map_err(invalid)?;
+        model = model
+            .with_global_parameters(parameters.clone())
             .map_err(invalid)?;
 
         let source_architecture =
@@ -117,49 +119,45 @@ impl PreparedTargetPartition {
                     .map_err(invalid)?;
                 validate_transform_parameter_space(&source_parameters, &parameters)
                     .map_err(invalid)?;
-                let mut source_model = TargetModel::<B>::new_tensor_parallel(
+                let mut source_model = TargetKernel::<B>::new_tensor_parallel(
                     source_bound,
                     source_partition.partition().clone(),
                     context,
                 )
                 .map_err(invalid)?;
-                let source_tensor_parameters = source_model
-                    .parameter_description(context)
-                    .map_err(invalid)?;
+                let source_tensor_parameters = source_model.definition().parameters().clone();
                 let source_experts = source_partition
                     .partition()
                     .local_spec()
                     .expert_realization(rank)
                     .map_err(invalid)?;
-                source_model
-                    .set_expert_realization(&source_experts)
+                source_model = source_model
+                    .with_expert_realization(&source_experts)
                     .map_err(invalid)?;
                 let source_layout = source_partition
                     .partition()
                     .local_expert_layout(
                         &source_parameters,
                         &source_tensor_parameters,
-                        &source_model
-                            .parameter_description(context)
-                            .map_err(invalid)?,
+                        &source_model.definition().parameters().clone(),
                         rank.expert_parallel_rank(),
                         rank.expert_parallel_size(),
                     )
                     .map_err(invalid)?;
-                if source_model.state_layout().map_err(invalid)? != complete_state {
+                if source_model.definition().state_layout().clone() != complete_state {
                     return Err(invalid(
                         "Flash-Next transform source changed local state geometry",
                     ));
                 }
-                source_model.set_partition_state(state).map_err(invalid)?;
-                source_model
-                    .retain_global_parameters(
+                source_model = source_model.with_partition_state(state).map_err(invalid)?;
+                source_model = source_model
+                    .with_global_parameters(
                         source_parameters
                             .with_partition_layout(rank, source_layout.clone())
                             .map_err(invalid)?,
                     )
                     .map_err(invalid)?;
-                Some((source_model, source_layout))
+                Some((source_model.into_model().map_err(invalid)?, source_layout))
             } else {
                 None
             };
@@ -197,6 +195,7 @@ impl PreparedTargetPartition {
         .map_err(invalid)?;
         // Tasks contain global canonical recipes; the native loader applies the
         // retained layout once. Passing already sliced recipes here would select twice.
+        let model = model.into_partition_model(&partition).map_err(invalid)?;
         prepare_family_routed_partition::<B, S, _, _, _, _>(
             model,
             source_architecture,

@@ -201,7 +201,10 @@ impl ParameterGroupOwner {
         }
     }
 
-    pub(crate) fn static_storage_role(&self) -> Option<&str> {
+    /// Returns the canonical static storage role, independently of its consumers.
+    /// Shared static groups use their first declared role as the storage owner.
+    /// Execution-unit storage has no static role.
+    pub fn static_storage_role(&self) -> Option<&str> {
         match self {
             Self::StaticRole(role) => Some(role),
             Self::StaticAnyOf(roles) => roles.first().map(String::as_str),

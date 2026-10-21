@@ -532,14 +532,14 @@ impl TargetSpec {
     }
 }
 
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
     /// Binds the selected local expert operators without changing global router
     /// identities, ordinary shared projections, state or checkpoint coordinates.
     /// Call during partition construction, before any execution units are built.
-    pub fn set_expert_realization(
-        &mut self,
+    pub fn with_expert_realization(
+        mut self,
         realization: &crate::ExpertRealizationPlan<GroupedGatedProductSpec>,
-    ) -> Result<(), Error> {
+    ) -> Result<Self, Error> {
         let local = self.spec.clone().with_expert_realization(realization)?;
         let definition = if self.definition.parameters().partition_layout().is_some() {
             local.definition_with_parameters(self.definition.parameters().clone())?
@@ -548,6 +548,6 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
         };
         self.spec = local;
         self.definition = std::sync::Arc::new(definition);
-        Ok(())
+        Ok(self)
     }
 }

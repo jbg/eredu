@@ -149,8 +149,8 @@ impl PreparedConditionalPartition {
             context,
         )
         .map_err(invalid)?;
-        architecture
-            .set_expert_realization(&experts)
+        architecture = architecture
+            .with_expert_realization(&experts)
             .map_err(invalid)?;
         let boundary =
             <ConditionalModel<B> as PartitionedLayeredArchitecture<B, S>>::boundary_schema(
@@ -204,8 +204,8 @@ impl PreparedConditionalPartition {
                     context,
                 )
                 .map_err(invalid)?;
-                source
-                    .set_expert_realization(&source_experts)
+                source = source
+                    .with_expert_realization(&source_experts)
                     .map_err(invalid)?;
                 if source.state_layout().map_err(invalid)?
                     != architecture.state_layout().map_err(invalid)?

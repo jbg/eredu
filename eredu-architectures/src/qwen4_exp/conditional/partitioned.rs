@@ -40,8 +40,8 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             .collect::<Result<Vec<_>, _>>()?;
         let mergers = crate::qwen::vision::local_merger_widths(&vision, "model.visual", layout)
             .map_err(Error::backend)?;
-        let mut target = TargetModel::new_tensor_parallel(spec, target, context)?;
-        target.set_partition_state(state)?;
+        let target = TargetKernel::new_tensor_parallel(spec, target, context)?
+            .with_partition_state(state)?;
         let modules = ConditionalStatic {
             target,
             vision: VisionStatic::new_parallel_with_root(
@@ -63,11 +63,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
     }
 
     /// Binds local routed operators while preserving global router identities.
-    pub fn set_expert_realization(
-        &mut self,
+    pub fn with_expert_realization(
+        mut self,
         realization: &crate::ExpertRealizationPlan<GroupedGatedProductSpec>,
-    ) -> Result<(), Error> {
-        self.modules.target.set_expert_realization(realization)
+    ) -> Result<Self, Error> {
+        self.modules.target = self.modules.target.with_expert_realization(realization)?;
+        Ok(self)
     }
 
     fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), Error> {
@@ -319,12 +320,9 @@ where
                     context,
                 )
             }
-            (TARGET_INDEX, ConditionalUnit::Target(unit)) => self
-                .modules
-                .target
-                .forward_unit_parallel_observed_with_provider(
-                    0,
-                    index,
+            (TARGET_INDEX, ConditionalUnit::Target(unit)) => {
+                self.modules.target.execute_parallel_routed_observed(
+                    self.modules.target.definition().unit_address(0, index)?,
                     unit,
                     hidden,
                     state,
@@ -337,7 +335,8 @@ where
                     parallel,
                     context,
                     observer,
-                ),
+                )
+            }
             _ => Err(Error::backend("conditional unit/group mismatch")),
         }
     }
@@ -392,7 +391,17 @@ where
         // target already owns this exact local view and indexes it from zero.
         self.modules
             .target
-            .begin_partition(input, mask, state, expected, 0, context)
+            .begin_partition(
+                input,
+                mask,
+                state,
+                ComponentPartitionContext {
+                    expected: Some(expected),
+                    first_state_ordinal: 0,
+                    parallel: None,
+                    native: context,
+                },
+            )
             .map(Self::wrap_target)
     }
     fn begin_partition_parallel<'a>(
@@ -409,7 +418,17 @@ where
         self.validate_partition_state_origin(global_state_offset)?;
         self.modules
             .target
-            .begin_partition_parallel(input, mask, state, expected, 0, parallel, context)
+            .begin_partition(
+                input,
+                mask,
+                state,
+                ComponentPartitionContext {
+                    expected: Some(expected),
+                    first_state_ordinal: 0,
+                    parallel: Some(parallel),
+                    native: context,
+                },
+            )
             .map(Self::wrap_target)
     }
     fn enter_partition_group(
@@ -432,15 +451,17 @@ where
                 auxiliary,
             };
             let expected = state.layout().clone();
-            let next = match parallel {
-                Some(parallel) => self.modules.target.begin_partition_parallel(
-                    input, None, state, &expected, 0, parallel, context,
-                )?,
-                None => self
-                    .modules
-                    .target
-                    .begin_partition(input, None, state, &expected, 0, context)?,
-            };
+            let next = self.modules.target.begin_partition(
+                input,
+                None,
+                state,
+                ComponentPartitionContext {
+                    expected: Some(&expected),
+                    first_state_ordinal: 0,
+                    parallel,
+                    native: context,
+                },
+            )?;
             forward.target = Some(next.context);
             return Ok(next.hidden);
         }

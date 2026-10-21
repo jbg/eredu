@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     capability::CapabilityEstimate,
-    qwen4_exp::target::TargetModel,
+    qwen4_exp::target::{TargetKernel, TargetModel},
     routed_text::{
         prepare_routed_architecture_handoff, select_routed_text_realization,
         validate_selected_routed_handoff, RoutedTextArchitectureVisitor, RoutedTextDispatchError,
@@ -265,13 +265,14 @@ impl SelectedTargetExecution {
         construction_started();
         let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
             .then(|| {
-                plan.target
-                    .bound_spec()
-                    .and_then(|bound| TargetModel::<B>::new(bound, context))
+                plan.target.bound_spec().and_then(|bound| {
+                    TargetKernel::<B>::new(bound, context).and_then(TargetKernel::into_model)
+                })
             })
             .transpose()
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
-        let architecture = TargetModel::<B>::new(spec, context)
+        let architecture = TargetKernel::<B>::new(spec, context)
+            .and_then(TargetKernel::into_model)
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
         let prepared = prepare_routed_architecture_handoff::<B, S, _>(
             architecture,

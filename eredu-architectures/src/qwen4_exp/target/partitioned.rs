@@ -2,12 +2,12 @@
 use super::super::input::RequestBoundary;
 use super::*;
 use eredu_runtime::{
-    ActivationObserver, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    LayeredPartitionInput, LayeredPartitionOutput, ParallelLayeredArchitecture, PartitionState,
-    PartitionedLayeredArchitecture, ReplicatedTextArchitecture,
+    ActivationObserver, ComponentEquations, ComponentPartitionContext, LayerRuntimeState,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, ParallelComponentKernel,
+    PartitionComponentKernel, PartitionState, PipelineComponentKernel, TextComponentKernel,
 };
 
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
     /// Exact collective sequence shared by text and media partition adapters.
     pub fn routed_tensor_reductions(
         &self,
@@ -43,7 +43,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
     }
 
     /// Retains exact pipeline state ownership without changing global unit addresses.
-    pub fn set_partition_state(&mut self, state: &PartitionState) -> Result<(), Error> {
+    pub fn with_partition_state(mut self, state: &PartitionState) -> Result<Self, Error> {
         let start = state.global_layer_offset();
         let end = start
             .checked_add(state.layout().len())
@@ -58,7 +58,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
             ));
         }
         self.partition_state = state.clone();
-        Ok(())
+        Ok(self)
     }
 
     pub(super) fn state_index(&self, index: usize) -> Result<usize, Error> {
@@ -128,14 +128,13 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
     }
 }
 
-impl<B, S> PartitionedLayeredArchitecture<B, S> for TargetModel<B>
+impl<B, S> PartitionComponentKernel<B, S> for TargetKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
 {
     type Boundary = RequestBoundarySchema;
-
     fn partition_observation_hooks(
         &self,
         _: bool,
@@ -143,72 +142,45 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
     }
-
     fn boundary_schema(&self) -> Result<Self::Boundary, Error> {
         self.spec.boundary_schema()
     }
-
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, RequestBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, RequestBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         self.begin_partition_observed(
             input,
             mask,
             state,
-            expected,
-            first_state_ordinal,
-            None,
-            context,
+            selected,
             &mut eredu_runtime::NoopObserver,
         )
     }
-
-    fn begin_partition_parallel<'a>(
+    fn begin_partition_observed<O>(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, RequestBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, RequestBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_partition_observed(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            Some(parallel),
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-
-    fn begin_partition_observed<'a, O>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, RequestBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
         observer: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
     where
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let expected = selected.expected.ok_or_else(|| {
+            Error::backend("this pipeline architecture requires selected state geometry")
+        })?;
+        let first_state_ordinal = selected.first_state_ordinal;
+        let parallel = selected.parallel;
+        let context = selected.native;
         self.validate_partition_entry(state, expected, first_state_ordinal, parallel)?;
         match input {
-            LayeredPartitionInput::Tokens(tokens) => self.begin_forward_observed(
-                <Self as ReplicatedTextArchitecture<B, S>>::text_input(tokens, mask),
+            LayeredPartitionInput::Tokens(tokens) => self.begin_observed(
+                <Self as TextComponentKernel<B>>::text_input(tokens, mask),
                 state,
                 context,
                 observer,
@@ -219,27 +191,6 @@ where
             }
         }
     }
-
-    fn finish_partition(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredPartitionOutput<B::Tensor, RequestBoundary<B::Tensor>>, Error> {
-        self.finish_partition_observed(
-            hidden,
-            state,
-            forward,
-            owns_output,
-            parallel,
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-
     fn finish_partition_observed<O>(
         &mut self,
         hidden: &B::Tensor,
@@ -260,25 +211,43 @@ where
             });
         }
         let output = match parallel {
-            Some(parallel) => self.finish_forward_parallel_observed(
-                hidden, state, forward, parallel, context, observer,
-            )?,
-            None => self.finish_forward_observed(hidden, state, forward, context, observer)?,
+            Some(parallel) => {
+                self.finish_parallel_observed(hidden, state, forward, parallel, context, observer)?
+            }
+            None => self.finish_observed(hidden, state, forward, context, observer)?,
         };
         Ok(LayeredPartitionOutput::Final {
             output,
             retained: Some(hidden.clone()),
         })
     }
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, RequestBoundary<B::Tensor>>, Error> {
+        self.finish_partition_observed(
+            hidden,
+            state,
+            forward,
+            owns_output,
+            parallel,
+            context,
+            &mut eredu_runtime::NoopObserver,
+        )
+    }
 }
-
-impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for TargetModel<B>
+impl<B, S> PipelineComponentKernel<B, S> for TargetKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
 {
-    fn partition_input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         if input.batch <= 0 || input.tokens <= 0 {
             return Err(Error::backend(
                 "target partition requires positive input dimensions",
@@ -286,21 +255,21 @@ where
         }
         Ok((input.batch, input.tokens))
     }
-
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, RequestBoundary<B::Tensor>)>,
         state: &mut S,
-        expected: Option<&StateLayout>,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
         observer: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
     where
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let expected = selected.expected;
+        let first_state_ordinal = selected.first_state_ordinal;
+        let parallel = selected.parallel;
+        let context = selected.native;
         let expected = expected.ok_or_else(|| {
             eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
         })?;
@@ -315,23 +284,20 @@ where
                 let offset = self.partition_offset(state)?;
                 self.resume_request(hidden, boundary, offset, context)
             }
-            None => self.begin_forward_observed(input, state, context, observer),
+            None => self.begin_observed(input, state, context, observer),
         }
     }
-
-    fn partition_output_width(&self) -> i32 {
+    fn output_width(&self) -> i32 {
         self.spec.config.vocabulary
     }
-
-    fn partition_tensor_vocabulary_sharded(&self) -> bool {
+    fn tensor_vocabulary_sharded(&self) -> bool {
         false
     }
-
-    fn partition_routed_tensor_reductions(
+    fn routed_tensor_reductions(
         &self,
-        unit: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         routed: bool,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
-        self.routed_tensor_reductions(unit, routed)
+        self.routed_tensor_reductions(address.index(), routed)
     }
 }

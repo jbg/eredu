@@ -10801,8 +10801,10 @@ parallel plans live in `eredu-architectures::qwen4_exp`. MLX binds generic opera
 state, sources and selected execution contracts. Current supported paths and verification
 coverage are described in the [family validation report](qwen4-exp-validation.md).
 
-`TargetSpec` declares target geometry, and `TargetModel` implements the shared
-architecture, layered and routed contracts. Execution alternates decoder blocks
+`TargetSpec` declares target geometry. `TargetModel` is a `ComponentAdapter` over
+`TargetKernel`, an `Arc<ComponentDefinition>` and `KernelParameterModules`. Runtime
+implements architecture, layered, parallel, routed, text, typed-partition and
+pipeline contracts from that declaration and the kernel's explicit capabilities. Execution alternates decoder blocks
 with independently owned lexical units.
 Each decoder unit contains a recurrent or indexed mixer and a shared/routed feed-forward
 sublayer. Checkpoint layer numbers and execution ordinals remain distinct, including
@@ -10822,12 +10824,28 @@ Parameter-member declarations retain neutral encoding relationships through
 
 `TargetSpec::definition` validates the target's graph, canonical storage, semantic
 unit paths, one-to-one context slots and decoder transport before materialization.
-`TargetModel` retains this `ComponentDefinition` in an `Arc`. Parameter inspection,
-serial and parallel address checks, group discovery and context geometry use the
-retained authority. Expert placement updates validate a new declaration before
+The adapter retains this `ComponentDefinition` in an `Arc`. Parameter inspection,
+serial and parallel address checks, group discovery, context projections and
+selected ownership use the retained authority. Expert placement updates validate a new declaration before
 publishing the changed specs; partition construction retains canonical global
 parameter placement with the actual tensor-local context geometry. Each lexical
 invocation keeps its own slot independently of the following decoder layer.
+
+`TargetKernel` owns request preparation, original-ID and visibility provenance,
+recurrent/QSA/lexical equations, provider access, observation seams, residual
+readout and target capture. Serial, observed, parallel and routed hooks use the
+same equations with the appropriate instrumentation and collective context.
+`new` and `new_tensor_parallel` construct kernel resources; geometry selection
+consumes the kernel through `with_expert_realization` and `with_partition_state`.
+`into_model` assembles the standalone adapter, and selected construction retains
+its exact partition ownership on that same adapter. Consuming geometry updates
+keep a borrowed execution kernel aligned with its retained definition.
+
+Conditional media composition owns a raw `TargetKernel` under its enclosing
+runtime lifecycle and invokes those typed hooks directly. Its expert selection
+also consumes the composition. External prediction borrows target vocabulary
+resources through the ordinary component adapter or the enclosing composite;
+base-width lookup and prediction projection preserve their own equations.
 
 `conditional::parameter_description` composes retained target storage with vision
 parameter geometry without a native context. Tensor/expert placement uses global,
@@ -10840,7 +10858,12 @@ placement, then constructs the tensor-local target and vision modules directly.
 
 `DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse.
 Shared `StaticModules` owns vocabulary parameters, collectives and readout
-instrumentation. `ComponentPinnedResources` exposes the target's actual pinned
+instrumentation. `BoundaryModules` retains optional embedding, residual readout
+and untied projection resources for selected owners. Selection uses canonical
+static storage roles from parameter bindings, including tied vocabulary storage
+and explicitly declared prediction replicas. Parameter-free residual expansion
+uses the declared geometry without retaining an unowned readout.
+`ComponentPinnedResources` exposes the target's actual pinned
 aggregate and canonical role traversal to binding and completion owners. Target,
 media composition and external prediction borrow those same modules. Runtime's
 `ComponentDefinition::validate_group_dependencies` checks invocation dependencies

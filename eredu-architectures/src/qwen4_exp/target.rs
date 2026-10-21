@@ -10,7 +10,7 @@ use super::{
     recurrent::{RecurrentSublayer, RecurrentSublayerSpec},
     residual::{mixer_spec, ResidualBoundary},
 };
-use crate::decoder::{ComponentInstrumentation, StaticModules};
+use crate::decoder::{BoundaryModules, ComponentInstrumentation, StaticModules};
 use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, EmbeddingSpec, Error, GroupedGatedProductSpec,
@@ -526,18 +526,25 @@ impl BoundTargetSpec {
         &self.state_fingerprint
     }
 }
-/// Target-only layered composition. Prediction and media encoders attach in total
-/// prepared construction; this type does not register a family or facade load path.
-pub struct TargetModel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
+/// Target execution through the shared validated runtime adapter.
+pub type TargetModel<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    TargetKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Family equations and construction geometry for independently leased target units.
+/// Standalone execution and media composition borrow the same typed kernel.
+pub struct TargetKernel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     pub(crate) spec: TargetSpec,
     hashes: BTreeMap<usize, NGramHashSpec>,
     state_fingerprint: String,
     tensor_partition: Option<TargetTensorPartition>,
     partition_state: eredu_runtime::PartitionState,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
-    pub(crate) statics: StaticModules<B, ResidualBoundary<B>>,
+    pub(crate) statics: BoundaryModules<B, ResidualBoundary<B>>,
 }
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetKernel<B> {
     fn clone(&self) -> Self {
         Self {
             spec: self.spec.clone(),
@@ -550,7 +557,29 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B
         }
     }
 }
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
+    /// Consumes finalized geometry and resources into the shared execution adapter.
+    pub fn into_model(self) -> Result<TargetModel<B>, Error> {
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
+            .map_err(Error::from)
+    }
+    /// Retains exact selected ownership on the same runtime adapter.
+    pub fn into_partition_model<G, A>(
+        mut self,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+    ) -> Result<TargetModel<B>, Error> {
+        let state = partition
+            .state()
+            .ok_or_else(|| Error::backend("target partition requires selected state geometry"))?;
+        self = self.with_partition_state(state)?;
+        self.statics = self.statics.select(partition.parameter_bindings());
+        eredu_runtime::ComponentAdapter::with_partition_resources::<B, G, A>(
+            self.definition.clone(),
+            self,
+            partition,
+        )
+        .map_err(Error::from)
+    }
     /// Allocates pinned parameters only; layer residency constructs units on demand.
     pub fn new(
         bound: BoundTargetSpec,
@@ -592,7 +621,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
             tensor_partition: None,
             partition_state,
             definition,
-            statics,
+            statics: statics.into(),
         })
     }
     /// Constructs rank-local units while retaining replicated vocabulary and residual mixers.
@@ -615,12 +644,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
         self.tensor_partition.as_ref()
     }
 
-    pub(crate) fn retain_global_parameters(
-        &mut self,
+    pub(crate) fn with_global_parameters(
+        mut self,
         parameters: eredu_runtime::ArchitectureParameterDescription,
-    ) -> Result<(), Error> {
+    ) -> Result<Self, Error> {
         self.definition = std::sync::Arc::new(self.spec.definition_with_parameters(parameters)?);
-        Ok(())
+        Ok(self)
     }
 
     /// Validated invocation, storage and state authority retained before allocation.
@@ -660,7 +689,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
             }),
         }
     }
-    pub(crate) fn execute<P, S>(
+    pub(crate) fn run_equation<P, S>(
         &self,
         index: usize,
         unit: &mut Unit<B>,

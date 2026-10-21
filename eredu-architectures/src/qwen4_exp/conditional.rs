@@ -1,7 +1,7 @@
 //! Shared graph traversal of retained vision blocks and the ordinary Flash-Next target.
 use super::{
     media::{MediaIngress, PreparedMediaInput},
-    target::{BoundTargetSpec, TargetForward, TargetInput, TargetModel, Unit as TargetUnit},
+    target::{BoundTargetSpec, TargetForward, TargetInput, TargetKernel, Unit as TargetUnit},
 };
 use crate::qwen::vision::{VisionBlock, VisionConfig, VisionState, VisionStatic};
 use eredu_nn::{
@@ -107,7 +107,7 @@ pub(crate) fn validate_ingress(
 
 /// Pinned modules. The target owns the single vocabulary and residual readout.
 pub struct ConditionalStatic<B: GroupedNeuralBackend + DistributedNeuralBackend> {
-    target: TargetModel<B>,
+    target: TargetKernel<B>,
     vision: VisionStatic<B>,
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend + Clone> Clone for ConditionalStatic<B> {
@@ -237,7 +237,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
         validate_ingress(spec.geometry(), &ingress, &vision)?;
         Ok(Self {
             modules: ConditionalStatic {
-                target: TargetModel::new(spec, context)?,
+                target: TargetKernel::new(spec, context)?,
                 vision: VisionStatic::new_with_root(vision.clone(), "model.visual", context)?,
             },
             ingress,
@@ -379,12 +379,18 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             .assemble(
                 range,
                 projected,
-                |ids| self.modules.target.statics.embeddings.forward(ids, context),
+                |ids| {
+                    self.modules
+                        .target
+                        .statics
+                        .embedding_mut()?
+                        .forward(ids, context)
+                },
                 context,
             )
             .map_err(Error::backend_source)?;
-        let next = media
-            .with_target_input(|input| self.modules.target.begin_forward(input, state, context))?;
+        let next =
+            media.with_target_input(|input| self.modules.target.begin(input, state, context))?;
         Ok(LayeredForwardState {
             hidden: next.hidden,
             context: ConditionalForward {
@@ -435,7 +441,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
 {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.modules.target.state_layout()
+        Ok(self.modules.target.definition().state_layout().clone())
     }
     fn state_identity(
         &self,
@@ -481,14 +487,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.modules.target.visit_static_parameters(visitor)?;
+        self.modules.target.visit_pinned(visitor)?;
         visitor.visit("vision", &self.modules.vision)
     }
     fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        self.modules.target.visit_static_parameters_mut(visitor)?;
+        self.modules.target.visit_pinned_mut(visitor)?;
         visitor.visit_mut("vision", &mut self.modules.vision)
     }
 }
@@ -557,7 +563,7 @@ where
     where
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.modules.target.finish_forward_observed(
+        self.modules.target.finish_observed(
             hidden,
             state,
             forward
@@ -706,7 +712,7 @@ where
                         },
                     });
                 }
-                let next = self.modules.target.begin_forward(input, state, context)?;
+                let next = self.modules.target.begin(input, state, context)?;
                 Ok(LayeredForwardState {
                     hidden: next.hidden,
                     context: empty(next.context),
@@ -747,13 +753,18 @@ where
                         .clone()
                         .ok_or_else(|| Error::backend("missing media span"))?,
                     projected,
-                    |ids| self.modules.target.statics.embeddings.forward(ids, context),
+                    |ids| {
+                        self.modules
+                            .target
+                            .statics
+                            .embedding_mut()?
+                            .forward(ids, context)
+                    },
                     context,
                 )
                 .map_err(Error::backend_source)?;
-            let next = input.with_target_input(|input| {
-                self.modules.target.begin_forward(input, state, context)
-            })?;
+            let next = input
+                .with_target_input(|input| self.modules.target.begin(input, state, context))?;
             forward.target = Some(next.context);
             return Ok(next.hidden);
         }
@@ -797,7 +808,7 @@ where
             forward.projected = Some(output.embeddings.clone());
             Ok(output.embeddings)
         } else {
-            self.modules.target.complete_execution_group(
+            self.modules.target.complete_group(
                 0,
                 hidden,
                 state,
@@ -816,7 +827,7 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.modules.target.finish_forward(
+        self.modules.target.finish(
             hidden,
             state,
             forward
@@ -836,7 +847,7 @@ where
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.modules.target.finish_text_forward(
+        self.modules.target.finish_text(
             hidden,
             state,
             forward
@@ -850,7 +861,7 @@ where
         forward
             .target
             .as_ref()
-            .and_then(<TargetModel<B> as LayeredArchitecture<B, S>>::prediction_target_capture)
+            .and_then(<TargetKernel<B> as ComponentKernel<B>>::prediction_target_capture)
     }
     fn retained_context_values<'a>(
         &'a self,
@@ -861,14 +872,15 @@ where
         let mut values = vec![];
         values.extend(forward.encoder_storage_values().map(|(_, value)| value));
         if let Some(target) = &forward.target {
-            values.extend(
-                <TargetModel<B> as LayeredArchitecture<B, S>>::retained_context_values(
-                    &self.modules.target,
-                    target,
-                    0,
-                    0,
-                ),
-            );
+            values.extend(<TargetKernel<B> as ComponentKernel<B>>::retained_values(
+                &self.modules.target,
+                target,
+                self.modules
+                    .target
+                    .definition()
+                    .unit_address(0, 0)
+                    .expect("target invocation"),
+            ));
         }
         values.into_iter()
     }
@@ -916,9 +928,8 @@ where
                 context,
             ),
             (TARGET_INDEX, ConditionalUnit::Target(unit)) => {
-                self.modules.target.forward_unit_observed_with_provider(
-                    0,
-                    index,
+                self.modules.target.execute_routed_observed(
+                    self.modules.target.definition().unit_address(0, index)?,
                     unit,
                     hidden,
                     state,
@@ -962,22 +973,19 @@ where
                     .vision
                     .forward_block(block, index, hidden, vision, context)
             }
-            (TARGET_INDEX, ConditionalUnit::Target(unit)) => {
-                self.modules.target.forward_unit_with_provider(
-                    0,
-                    index,
-                    unit,
-                    hidden,
-                    state,
-                    forward
-                        .target
-                        .as_mut()
-                        .ok_or_else(|| Error::backend("missing target context"))?,
-                    pass,
-                    provider,
-                    context,
-                )
-            }
+            (TARGET_INDEX, ConditionalUnit::Target(unit)) => self.modules.target.execute_routed(
+                self.modules.target.definition().unit_address(0, index)?,
+                unit,
+                hidden,
+                state,
+                forward
+                    .target
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("missing target context"))?,
+                pass,
+                provider,
+                context,
+            ),
             _ => Err(Error::backend("conditional unit/group mismatch")),
         }
     }
@@ -989,9 +997,9 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
 {
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        ConditionalInput::Target(
-            <TargetModel<B> as ReplicatedTextArchitecture<B, S>>::text_input(tokens, mask),
-        )
+        ConditionalInput::Target(<TargetKernel<B> as TextComponentKernel<B>>::text_input(
+            tokens, mask,
+        ))
     }
     fn supports_chunked_prefill() -> bool {
         true
