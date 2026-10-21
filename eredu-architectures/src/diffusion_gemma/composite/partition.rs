@@ -5,13 +5,10 @@ use eredu_nn::TensorParallelGroupedNeuralBackend;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
     BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype, BoundaryTensorSpec,
-    LayeredPartitionInput, LayeredPartitionOutput, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture,
+    LayeredPartitionInput, LayeredPartitionOutput,
 };
 
-use eredu_runtime::{
-    ParallelComponentKernel as _, ParallelRoutedComponentKernel as _, PartitionComponentKernel as _,
-};
+use eredu_runtime::PartitionComponentKernel as _;
 
 /// Shared text activation plus invocation and semantic image spans.
 pub struct Boundary<T> {
@@ -62,7 +59,7 @@ impl ArchitectureBoundary for BoundarySchema {
     }
 }
 
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
     /// Materializes the exact resources selected by an authoritative composite partition.
     pub fn from_partition(
         config: FamilyConfig,
@@ -71,10 +68,10 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
             BoundarySchema,
         >,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<Model<B>, Error> {
         let geometry = partition.local_geometry();
         let definition = std::sync::Arc::new(component_definition(&config, Some(geometry))?);
-        let selection = definition.select_partition(partition)?;
+        definition.select_partition(partition)?;
         if partition.boundary_schema() != &BoundarySchema::new(config.text.hidden_size) {
             return Err(eredu_runtime::ComponentDefinitionError::Invalid {
                 component: definition.id().to_owned(),
@@ -115,264 +112,27 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
             roles.contains("vision_projection"),
             context,
         )?;
-        Ok(Self {
+        let kernel = Self {
             config,
-            definition,
-            selection: Some(selection),
+            definition: std::sync::Arc::clone(&definition),
             statics: StaticModules { text, image },
             geometry: Some(geometry),
-        })
+        };
+        eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
+            definition, kernel, partition,
+        )
+        .map_err(Error::from)
     }
 
     /// Retains the admitted compact expert realization without changing invocation geometry.
-    pub fn with_expert_realization(
-        mut self,
+    pub fn set_expert_realization(
+        &mut self,
         plan: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-    ) -> Result<Self, Error> {
-        self.statics.text.set_expert_realization(plan)?;
-        Ok(self)
+    ) -> Result<(), Error> {
+        self.statics.text.set_expert_realization(plan)
     }
 }
 
-impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
-where
-    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        <TextKernel<B> as eredu_runtime::ParallelComponentKernel<B, S>>::parallel_observation_hooks(
-            &self.statics.text,
-        )
-    }
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        _parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_input(input, state, true, context)
-    }
-    fn begin_execution_group_parallel(
-        &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if group != 1 {
-            return self.begin_execution_group(
-                group,
-                initial,
-                dependencies,
-                state,
-                forward,
-                context,
-            );
-        }
-        if let Some(output) = dependencies.first() {
-            forward.vision_output = Some((*output).clone());
-        }
-        if !forward.deferred {
-            return Ok(initial.clone());
-        }
-        forward.deferred = false;
-        if let Some(feedback) = &forward.feedback {
-            let prepared = self.statics.text.begin_parallel(
-                TextInput::Refinement {
-                    tokens: &forward.tokens,
-                    feedback: feedback.as_ref(),
-                    mask: None,
-                },
-                state,
-                parallel,
-                context,
-            )?;
-            forward.text = prepared.context;
-            return Ok(prepared.hidden);
-        }
-        let embeddings =
-            self.statics
-                .text
-                .encode_context_tokens_parallel(&forward.tokens, parallel, context)?;
-        self.assemble_embeddings(forward, &embeddings, context)
-    }
-    fn forward_unit_parallel(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.forward_unit_parallel_with_provider(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            eredu_runtime::ExpertPass::Prefill,
-            &mut ResidentExpertProvider,
-            parallel,
-            context,
-        )
-    }
-    fn forward_unit_parallel_observed<
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    >(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error> {
-        self.forward_unit_parallel_observed_with_provider(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            eredu_runtime::ExpertPass::Prefill,
-            &mut ResidentExpertProvider,
-            parallel,
-            context,
-            observer,
-        )
-    }
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.statics
-            .text
-            .finish_parallel(hidden, state, &forward.text, parallel, context)
-    }
-    fn finish_forward_parallel_observed<
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    >(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_parallel_observed(
-            hidden,
-            state,
-            &forward.text,
-            parallel,
-            context,
-            observer,
-        )
-    }
-}
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
-where
-    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    fn parallel_routed_unit_observations(&self) -> bool {
-        true
-    }
-    fn parallel_routed_sparse_observations(&self) -> bool {
-        true
-    }
-    fn forward_unit_parallel_with_provider<P: eredu_runtime::TensorParallelParameterProvider<B>>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        P::Error: std::fmt::Display,
-    {
-        self.forward_unit_parallel_observed_with_provider(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            pass,
-            provider,
-            parallel,
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn forward_unit_parallel_observed_with_provider<P, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        P: eredu_runtime::TensorParallelParameterProvider<B>,
-        P::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        match (group, unit) {
-            (0, Unit::Vision(unit)) => self.statics.image.forward_layer(
-                unit,
-                hidden,
-                forward
-                    .vision
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("missing image invocation"))?,
-                context,
-            ),
-            (1, Unit::Text(unit)) => self.statics.text.execute_parallel_routed_observed(
-                self.statics.text.definition().unit_address(0, index)?,
-                unit,
-                hidden,
-                state,
-                &mut forward.text,
-                pass,
-                provider,
-                parallel,
-                context,
-                observer,
-            ),
-            _ => Err(Error::backend("unit/group mismatch")),
-        }
-    }
-}
 impl<B, S> ParallelCompositeArchitecture<B, S> for Model<B>
 where
     B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
@@ -389,137 +149,8 @@ where
         self.begin_forward_parallel(input, state, parallel, context)
     }
 }
-
-impl<B, S> PartitionedLayeredArchitecture<B, S> for Model<B>
-where
-    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    type Boundary = BoundarySchema;
-    fn boundary_schema(&self) -> Result<BoundarySchema, Error> {
-        Ok(BoundarySchema {
-            hidden: self.config.text.hidden_size,
-        })
-    }
-    fn partition_observation_hooks(
-        &self,
-        parallel: bool,
-    ) -> eredu_runtime::inspection::ObservationHookSupport {
-        <TextKernel<B> as eredu_runtime::PartitionComponentKernel<B, S>>::partition_observation_hooks(
-            &self.statics.text,
-            parallel,
-        )
-    }
-    fn begin_partition<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, Boundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.resume(input, mask, state, expected, first, None, context)
-    }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, Boundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.resume(input, mask, state, expected, first, Some(parallel), context)
-    }
-    fn enter_partition_group(
-        &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if let Some(auxiliary) = forward.pending_text_boundary.take() {
-            if group != 1 {
-                return Err(Error::backend(
-                    "text continuation entered another execution group",
-                ));
-            }
-            let geometry = self
-                .geometry
-                .as_ref()
-                .ok_or_else(|| Error::backend("text continuation has no retained ownership"))?;
-            let expected = geometry
-                .text
-                .state_layout()
-                .ok_or_else(|| Error::backend("text continuation has no owned context slots"))?
-                .clone();
-            let first = geometry.text.units().start;
-            let resumed = self.resume(
-                LayeredPartitionInput::Hidden {
-                    hidden: initial.clone(),
-                    auxiliary,
-                },
-                None,
-                state,
-                &expected,
-                first,
-                parallel,
-                context,
-            )?;
-            *forward = resumed.context;
-            return Ok(resumed.hidden);
-        }
-        Ok(initial.clone())
-    }
-    fn finish_partition(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredPartitionOutput<B::Tensor, Boundary<B::Tensor>>, Error> {
-        self.finish_cut(
-            hidden,
-            state,
-            forward,
-            owns_output,
-            parallel,
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn finish_partition_observed<
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    >(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredPartitionOutput<B::Tensor, Boundary<B::Tensor>>, Error> {
-        self.finish_cut(
-            hidden,
-            state,
-            forward,
-            owns_output,
-            parallel,
-            context,
-            observer,
-        )
-    }
-}
-impl<B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
-    fn resume<S>(
+impl<B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
+    pub(super) fn resume<S>(
         &mut self,
         input: LayeredPartitionInput<'_, B::Tensor, Boundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
@@ -643,7 +274,7 @@ impl<B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend> Model<B> 
             },
         })
     }
-    fn finish_cut<S, O>(
+    pub(super) fn finish_cut<S, O>(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,

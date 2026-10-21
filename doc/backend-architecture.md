@@ -11773,3 +11773,13 @@ A composite owner with no text invocations has no local context layout. Its
 parameter-free image ingress validates a stateless runtime view, while text
 continuations require their selected context slots. Global invocation ordinals
 and context-slot identities remain unchanged on owners with text layers.
+
+DiffusionGemma composite execution uses `ComponentAdapter` over `CompositeKernel`
+and the same kernel-owned pinned aggregate for binding, execution and completion
+roots. The shared runtime implements ordinary, provider-backed, observed,
+parallel and typed partition contracts. Family hooks retain media assembly,
+context/refinement equations, image-span visibility, collective semantics and
+invocation phase/frontier transport. Composite request admission and media
+continuation planning remain architecture-owned. Constructors live on
+`CompositeKernel`; low-level equations and expert realization use `kernel()` and
+`kernel_mut()` without an additional execution adapter or resource owner.

@@ -8226,7 +8226,7 @@ where
         let source = self
             .has_transform
             .then(|| {
-                crate::diffusion_gemma::composite::Model::<B>::new(
+                crate::diffusion_gemma::composite::CompositeKernel::<B>::new(
                     args.with_checkpoint_formats(self.source_formats.clone()),
                     self.context,
                 )
@@ -8235,8 +8235,9 @@ where
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = args.with_checkpoint_formats(self.target_formats.clone());
         let identity = target.architecture_fingerprint();
-        let architecture = crate::diffusion_gemma::composite::Model::<B>::new(target, self.context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture =
+            crate::diffusion_gemma::composite::CompositeKernel::<B>::new(target, self.context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,

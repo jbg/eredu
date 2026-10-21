@@ -1906,15 +1906,19 @@ where
                     "constructed composite partition state differs from cold admission".into(),
                 ));
             }
-            let mut architecture = crate::diffusion_gemma::composite::Model::<B>::from_partition(
-                args.clone(),
-                &partition,
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let mut architecture =
+                crate::diffusion_gemma::composite::CompositeKernel::<B>::from_partition(
+                    args.clone(),
+                    &partition,
+                    context,
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             if let Some(realization) = &realization {
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
+                architecture
+                    .kernel_mut()
+                    .set_expert_realization(realization.clone())
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
@@ -2033,7 +2037,7 @@ where
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
                     let mut source_model =
-                        crate::diffusion_gemma::composite::Model::<B>::from_partition(
+                        crate::diffusion_gemma::composite::CompositeKernel::<B>::from_partition(
                             source.clone(),
                             &source_partition,
                             context,
@@ -2042,14 +2046,12 @@ where
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?;
                     if let Some(source_plan) = source_plan {
-                        source_model =
-                            source_model
-                                .with_expert_realization(source_plan)
-                                .map_err(|error| {
-                                    CompositePartitionPreparationError::Architecture(
-                                        error.to_string(),
-                                    )
-                                })?;
+                        source_model
+                            .kernel_mut()
+                            .set_expert_realization(source_plan)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?;
                     }
                     Some((Box::new(source_model), source_layout))
                 } else {
