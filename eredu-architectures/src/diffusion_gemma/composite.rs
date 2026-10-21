@@ -72,6 +72,7 @@ pub struct ForwardContext<T> {
 /// Architecture-owned composition; native adapters remain model independent.
 pub struct Model<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     config: FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     statics: StaticModules<B>,
     geometry: Option<super::parallel::CompositeGeometry>,
 }
@@ -188,6 +189,69 @@ pub fn parameter_description(
     .map_err(Error::backend_source)
 }
 
+/// Validates image invocations and shared text state before materialization.
+pub fn component_definition(
+    config: &FamilyConfig,
+    geometry: Option<&super::parallel::CompositeGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    let layers = config.text.num_hidden_layers();
+    let vision_layers = config
+        .vision
+        .as_ref()
+        .ok_or_else(|| Error::backend("composite requires an image tower"))?
+        .num_hidden_layers as usize;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry
+                .text
+                .validate_for(config)
+                .map_err(Error::backend_source)?;
+            let range = geometry.text.units();
+            if geometry.vision_units.start > geometry.vision_units.end
+                || geometry.vision_units.end > vision_layers
+                || geometry.complete_state.len() != layers
+                || range.start > range.end
+                || range.end > layers
+                || range.len() != geometry.text.state_layout().len()
+                || range
+                    .clone()
+                    .zip(geometry.text.state_layout().layers().iter())
+                    .any(|(global, local)| {
+                        geometry.complete_state.layers().get(global) != Some(local)
+                    })
+            {
+                return Err(Error::backend(
+                    "composite local geometry changes declared unit or state ownership",
+                ));
+            }
+            geometry.complete_state.clone()
+        }
+        None => super::state_layout(config).map_err(Error::backend_source)?,
+    };
+    eredu_runtime::ComponentDefinition::new(
+        "diffusion_gemma_composite",
+        parameter_description(config)?,
+        (0..vision_layers)
+            .map(|index| eredu_runtime::ComponentUnit {
+                path: format!("model.encoder.vision_tower.encoder.layers.{index}"),
+                state: 0..0,
+            })
+            .chain((0..layers).map(|index| eredu_runtime::ComponentUnit {
+                path: format!("model.decoder.layers.{index}"),
+                state: index..index + 1,
+            }))
+            .collect(),
+        vec![vision_transport(), super::model::text_transport()],
+        super::model::TEXT_EXECUTION_GROUP,
+        vec![],
+        state,
+        eredu_runtime::ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::group_units(1, 0..layers),
+        ]),
+    )
+    .map_err(Error::from)
+}
+
 /// Image parameters are replicated within a tensor group and cut per layer by PP.
 pub fn vision_transport() -> ArchitectureGroupTransport {
     use eredu_runtime::*;
@@ -208,7 +272,9 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
         config: FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = std::sync::Arc::new(component_definition(&config, None)?);
         Ok(Self {
+            definition,
             statics: StaticModules {
                 text: TextKernel::materialize(config.clone(), None, context)?,
                 image: ImageStatic::new(&config, context)?,
@@ -216,6 +282,11 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
             config,
             geometry: None,
         })
+    }
+
+    /// Retained source-free declaration used by execution and inspection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     fn begin_input<S>(
@@ -474,11 +545,9 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<B> for Model<B> {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.geometry
-            .as_ref()
-            .map(|geometry| Ok(geometry.complete_state.clone()))
-            .unwrap_or_else(|| super::state_layout(&self.config).map_err(Error::backend))
+        Ok(self.definition.state_layout().clone())
     }
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -490,7 +559,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        parameter_description(&self.config)
+        Ok(self.definition.parameters().clone())
     }
 
     fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
@@ -541,42 +610,28 @@ where
         <TextKernel<B> as eredu_runtime::ComponentKernel<B>>::output_score_kind(&forward.text)
     }
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
-        if group == 0 {
-            vision_transport()
-        } else {
-            super::model::text_transport()
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated execution group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        super::model::TEXT_EXECUTION_GROUP
+        self.definition.primary_group()
     }
     fn state_partition_plan(
         &self,
-        layout: &StateLayout,
+        _layout: &StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(1, 0..layout.len()),
-        ])
+        self.definition.state_partition_plan().clone()
     }
     fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        Ok(graph(&self.config)?.0)
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self.config.vision.as_ref().unwrap().num_hidden_layers as usize),
-            1 => Ok(self.config.text.num_hidden_layers()),
-            _ => Err(Error::backend("invalid image/text group")),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend("unit outside image/text stack"));
-        }
-        Ok(if group == 0 {
-            format!("model.encoder.vision_tower.encoder.layers.{index}")
-        } else {
-            format!("model.decoder.layers.{index}")
-        })
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
         &self.statics

@@ -11753,3 +11753,10 @@ Ordinary format expansion supplies exact packed weights and companion metadata.
 Composite target and transform-source planning consume these declarations without
 constructing image modules or traversing native placeholders. Text storage retains
 its canonical shared owners when projected into the composite execution graph.
+
+Complete and rank-local DiffusionGemma composite construction retains a validated
+`ComponentDefinition` before materializing parameters. Its image units have no
+persistent state; each text unit references its authoritative global context
+slot. Retained local geometry agrees with the owned portion of the complete
+state schedule. Graph, unit paths, canonical storage, transport and state
+partition rules project the same definition for execution and inspection.

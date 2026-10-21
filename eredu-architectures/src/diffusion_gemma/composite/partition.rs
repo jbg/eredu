@@ -69,10 +69,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
         geometry: super::super::parallel::CompositeGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = std::sync::Arc::new(component_definition(&config, Some(&geometry))?);
         let text = TextKernel::materialize(config.clone(), Some(geometry.text.clone()), context)?;
         let image = ImageStatic::new(&config, context)?;
         Ok(Self {
             config,
+            definition,
             statics: StaticModules { text, image },
             geometry: Some(geometry),
         })
