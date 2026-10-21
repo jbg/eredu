@@ -9058,6 +9058,17 @@ before serial or parallel group ingress. Parallel kernels can place token lookup
 or another collective at the group's declared wave; the default uses the ordinary
 group equation. Invalid ingress cannot advance kernel state or issue a collective.
 
+The standalone Muse waveform tower uses `AudioKernel` with the same shared
+component adapter. Its validated definition declares each patch operation,
+convolution block, and output projection as an independently leased unit, with
+one state slot per invocation and explicit stateless slots between histories.
+The adapter supplies addressing, parameter traversal, state projections, and
+serial/parallel runtime contracts; empty pinned resources use the shared empty
+module. Audio equations retain cadence, clip reset/continuation boundaries,
+request-local advancement, and independent convolution frontiers. Waveform
+features report no prediction-score kind. Composite Muse execution borrows these
+same audio equations and continuation geometry.
+
 Muse construction returns the shared `ComponentAdapter` over `MuseKernel` and
 its kernel-owned pinned resources. The adapter supplies graph, address, parameter,
 state, provider, observation, and typed partition contracts from the retained

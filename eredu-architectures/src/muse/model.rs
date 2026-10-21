@@ -495,9 +495,11 @@ where
                 .audio_config
                 .as_ref()
                 .ok_or("Muse audio continuation has no admitted tower")?;
-            return super::audio::execution::AudioArchitecture::<B>::new(config.clone())
+            return super::audio::execution::AudioKernel::<B>::new(config.clone())
                 .and_then(|audio| {
-                    audio.continuation_geometry(i32::try_from(samples).map_err(Error::backend)?)
+                    audio
+                        .kernel()
+                        .continuation_geometry(i32::try_from(samples).map_err(Error::backend)?)
                 })
                 .map(Some)
                 .map_err(|error| error.to_string());
