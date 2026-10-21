@@ -699,6 +699,61 @@ impl<T> VisionState<T> {
     }
 }
 
+impl<T: Tensor> VisionState<T> {
+    /// Prepares parameter-free rotary positions and visibility for any image-stack owner.
+    pub fn prepare(
+        config: &VisionConfig,
+        input: VisionInput<'_, T>,
+        context: &T::Context,
+    ) -> Result<Self, Error> {
+        config.validate().map_err(Error::backend_source)?;
+        validate_input(config, &input)?;
+        let (cosine, sine) = multi_axis_rotary_embeddings(
+            input.position_ids,
+            &MultiAxisRotarySpec {
+                axes: vec![
+                    RotaryAxisSpec {
+                        dimensions: config.head_dim / 2,
+                        position_offset: 0,
+                    },
+                    RotaryAxisSpec {
+                        dimensions: config.head_dim / 2,
+                        position_offset: 0,
+                    },
+                ],
+                base: config.rope_theta(),
+                minimum_position: 0,
+                layout: MultiAxisRotaryLayout::IndependentAxes,
+            },
+            context,
+        )?;
+        Ok(VisionState {
+            key_mask: input.key_mask.clone(),
+            cosine,
+            sine,
+            grid_extents: input.grid_extents.to_vec(),
+        })
+    }
+
+    /// Executes a leased image layer with the request-local rotary and mask state.
+    pub fn forward_layer<B: NeuralBackend<Tensor = T> + eredu_nn::DistributedNeuralBackend>(
+        &self,
+        layer: &mut VisionLayer<B>,
+        epsilon: f32,
+        hidden: &T,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        layer.forward(
+            hidden,
+            &self.key_mask,
+            &self.cosine,
+            &self.sine,
+            epsilon,
+            context,
+        )
+    }
+}
+
 /// Pinned patch, position, pooling, and standardization modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -769,32 +824,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         input: VisionInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<VisionState<B::Tensor>, Error> {
-        validate_input(&self.config, &input)?;
-        let (cosine, sine) = multi_axis_rotary_embeddings(
-            input.position_ids,
-            &MultiAxisRotarySpec {
-                axes: vec![
-                    RotaryAxisSpec {
-                        dimensions: self.config.head_dim / 2,
-                        position_offset: 0,
-                    },
-                    RotaryAxisSpec {
-                        dimensions: self.config.head_dim / 2,
-                        position_offset: 0,
-                    },
-                ],
-                base: self.config.rope_theta(),
-                minimum_position: 0,
-                layout: MultiAxisRotaryLayout::IndependentAxes,
-            },
-            context,
-        )?;
-        Ok(VisionState {
-            key_mask: input.key_mask.clone(),
-            cosine,
-            sine,
-            grid_extents: input.grid_extents.to_vec(),
-        })
+        VisionState::prepare(&self.config, input, context)
     }
 
     /// Applies one streamed image block with retained position state.
@@ -805,14 +835,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        layer.forward(
-            hidden,
-            &state.key_mask,
-            &state.cosine,
-            &state.sine,
-            self.config.rms_norm_eps,
-            context,
-        )
+        state.forward_layer(layer, self.config.rms_norm_eps, hidden, context)
     }
 
     /// Pools spatial patches and applies optional learned standardization.

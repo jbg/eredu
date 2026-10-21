@@ -1884,9 +1884,31 @@ where
             } else {
                 None
             };
-            let mut architecture = crate::diffusion_gemma::composite::Model::<B>::new_parallel(
-                args.clone(),
+            let definition =
+                crate::diffusion_gemma::composite::component_definition(&args, Some(&geometry))
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let partition = ArchitecturePartition::from_description(
+                &parameters,
+                groups
+                    .iter()
+                    .map(|group| (group.group().as_str(), group.units())),
+                selected.requirements().ownership().clone(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
                 geometry.clone(),
+                crate::diffusion_gemma::composite::BoundarySchema::new(args.text.hidden_size),
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            if selected.requirements().state() != partition.state() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "constructed composite partition state differs from cold admission".into(),
+                ));
+            }
+            let mut architecture = crate::diffusion_gemma::composite::Model::<B>::from_partition(
+                args.clone(),
+                &partition,
                 context,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
@@ -1986,10 +2008,34 @@ where
                     } else {
                         None
                     };
+                    let source_definition =
+                        crate::diffusion_gemma::composite::component_definition(
+                            source,
+                            Some(&source_geometry),
+                        )
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?;
+                    let source_partition = ArchitecturePartition::from_description(
+                        &source_parameters,
+                        groups
+                            .iter()
+                            .map(|group| (group.group().as_str(), group.units())),
+                        partition.ownership().clone(),
+                        source_definition.state_layout(),
+                        source_definition.state_partition_plan(),
+                        source_geometry,
+                        crate::diffusion_gemma::composite::BoundarySchema::new(
+                            source.text.hidden_size,
+                        ),
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
                     let mut source_model =
-                        crate::diffusion_gemma::composite::Model::<B>::new_parallel(
+                        crate::diffusion_gemma::composite::Model::<B>::from_partition(
                             source.clone(),
-                            source_geometry,
+                            &source_partition,
                             context,
                         )
                         .map_err(|error| {
@@ -2022,7 +2068,7 @@ where
                 args.text.vocab_size,
                 |_| Ok::<(), String>(()),
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::Gemma4(source) => {

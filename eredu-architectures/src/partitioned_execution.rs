@@ -6458,7 +6458,7 @@ fn direct_partitioned_state_layout(
             &layout,
             0..config.text.num_hidden_layers(),
         )
-        .map(|geometry| Some(geometry.state_layout().clone()))
+        .map(|geometry| geometry.state_layout().cloned())
         .map_err(|error| error.to_string());
     }
     match (

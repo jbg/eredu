@@ -49,7 +49,10 @@ where
     )
     .map_err(architecture)?
     .ok_or_else(|| architecture("selected shared stack has no routed bank"))?;
-    let complete_state = geometry.state_layout().clone();
+    let complete_state = geometry
+        .state_layout()
+        .cloned()
+        .ok_or_else(|| architecture("shared iterative partition has no context slots"))?;
     let partition = crate::diffusion_gemma::parallel::partition(
         &selected_args,
         &parameters,
@@ -75,7 +78,7 @@ where
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
                 .map_err(architecture)?;
-        if source_geometry.state_layout() != &complete_state {
+        if source_geometry.state_layout() != Some(&complete_state) {
             return Err(architecture(
                 "shared iterative transform source changed state geometry",
             ));
@@ -185,7 +188,10 @@ where
     let geometry =
         crate::diffusion_gemma::parallel::local_geometry(&selected_args, &layout, owned.units())
             .map_err(architecture)?;
-    let complete_state = geometry.state_layout().clone();
+    let complete_state = geometry
+        .state_layout()
+        .cloned()
+        .ok_or_else(|| architecture("shared iterative partition has no context slots"))?;
     let partition = crate::diffusion_gemma::parallel::partition(
         &selected_args,
         &parameters,
@@ -211,7 +217,7 @@ where
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
                 .map_err(architecture)?;
-        if source_geometry.state_layout() != &complete_state {
+        if source_geometry.state_layout() != Some(&complete_state) {
             return Err(architecture(
                 "shared iterative transform source changed state geometry",
             ));

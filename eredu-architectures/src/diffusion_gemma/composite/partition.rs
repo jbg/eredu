@@ -21,7 +21,7 @@ pub struct Boundary<T> {
     pub vision_spans: T,
 }
 /// Exact composite decoder transport, independent of native tensors.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BoundarySchema {
     hidden: i32,
 }
@@ -63,18 +63,62 @@ impl ArchitectureBoundary for BoundarySchema {
 }
 
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
-    /// Declares only locally owned shared text parameters and replicated image equations.
-    pub fn new_parallel(
+    /// Materializes the exact resources selected by an authoritative composite partition.
+    pub fn from_partition(
         config: FamilyConfig,
-        geometry: super::super::parallel::CompositeGeometry,
+        partition: &eredu_runtime::ArchitecturePartition<
+            super::super::parallel::CompositeGeometry,
+            BoundarySchema,
+        >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = std::sync::Arc::new(component_definition(&config, Some(&geometry))?);
+        let geometry = partition.local_geometry();
+        let definition = std::sync::Arc::new(component_definition(&config, Some(geometry))?);
+        let selection = definition.select_partition(partition)?;
+        if partition.boundary_schema() != &BoundarySchema::new(config.text.hidden_size) {
+            return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+                component: definition.id().to_owned(),
+                resource: "partition boundary geometry".into(),
+            }
+            .into());
+        }
+        for (group, expected) in [
+            (0, geometry.vision_units.clone()),
+            (1, geometry.text.units()),
+        ] {
+            let selected = partition
+                .groups()
+                .iter()
+                .find(|g| g.group_index() == group)
+                .map(|g| g.global_units())
+                .unwrap_or(0..0);
+            if selected != expected {
+                return Err(Error::backend(
+                    "composite partition differs from retained local units",
+                ));
+            }
+        }
+        let roles = definition.select_complete_pinned_roles(
+            partition.parameter_bindings(),
+            &["vision", "vision_projection"],
+        )?;
+        let mut geometry = geometry.clone();
+        geometry.text = geometry.text.select_pinned_resources(
+            &config,
+            &definition,
+            partition.parameter_bindings(),
+        )?;
         let text = TextKernel::materialize(config.clone(), Some(geometry.text.clone()), context)?;
-        let image = ImageStatic::new(&config, context)?;
+        let image = ImageStatic::materialize(
+            &config,
+            roles.contains("vision"),
+            roles.contains("vision_projection"),
+            context,
+        )?;
         Ok(Self {
             config,
             definition,
+            selection: Some(selection),
             statics: StaticModules { text, image },
             geometry: Some(geometry),
         })
@@ -304,7 +348,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         match (group, unit) {
-            (0, Unit::Vision(unit)) => self.statics.image.tower.forward_layer(
+            (0, Unit::Vision(unit)) => self.statics.image.forward_layer(
                 unit,
                 hidden,
                 forward
@@ -409,7 +453,11 @@ where
                 .geometry
                 .as_ref()
                 .ok_or_else(|| Error::backend("text continuation has no retained ownership"))?;
-            let expected = geometry.text.state_layout().clone();
+            let expected = geometry
+                .text
+                .state_layout()
+                .ok_or_else(|| Error::backend("text continuation has no owned context slots"))?
+                .clone();
             let first = geometry.text.units().start;
             let resumed = self.resume(
                 LayeredPartitionInput::Hidden {

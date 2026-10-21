@@ -553,6 +553,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextKernel<B>
         S: LayerRuntimeState<B>,
         S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
     {
+        if self
+            .geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.units().is_empty())
+        {
+            if state.optional_layout().is_some() {
+                return Err(Error::backend(
+                    "stateless image partition retains text cache slots",
+                ));
+            }
+            return Ok(0);
+        }
         let expected = self.local_state_layout()?;
         if state.layout() != &expected {
             return Err(Error::backend(

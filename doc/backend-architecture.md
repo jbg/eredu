@@ -11760,3 +11760,16 @@ persistent state; each text unit references its authoritative global context
 slot. Retained local geometry agrees with the owned portion of the complete
 state schedule. Graph, unit paths, canonical storage, transport and state
 partition rules project the same definition for execution and inspection.
+
+Gemma vision request state prepares rotary positions and visibility without pinned
+modules and executes independently leased layers. DiffusionGemma image storage
+selects its tower and projection roles separately; ranks with no such roles retain
+only neutral image geometry and request-local tensors. Composite partitions
+validate canonical bindings, unit ranges, state mappings and boundary geometry
+before materialization. The same selected bindings restrict text pinned resources
+and image roles for target and transform-source construction. Unit factories reject
+unowned invocations; tied readout storage remains independent of ingress ownership.
+A composite owner with no text invocations has no local context layout. Its
+parameter-free image ingress validates a stateless runtime view, while text
+continuations require their selected context slots. Global invocation ordinals
+and context-slot identities remain unchanged on owners with text layers.

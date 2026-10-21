@@ -99,7 +99,7 @@ pub struct LocalGeometry {
     output: Option<VocabularyParallelRange>,
     conditioning_width: Option<i32>,
     norm: bool,
-    state: StateLayout,
+    state: Option<StateLayout>,
     fingerprint: String,
 }
 
@@ -109,8 +109,8 @@ impl LocalGeometry {
         self.units.clone()
     }
     /// Local state geometry in the same order as owned stack units.
-    pub fn state_layout(&self) -> &StateLayout {
-        &self.state
+    pub fn state_layout(&self) -> Option<&StateLayout> {
+        self.state.as_ref()
     }
     /// Complete global slot schedule with this coordinate's owned heads localized.
     /// Unowned slots retain global geometry and are excluded by partition selection.
@@ -125,7 +125,10 @@ impl LocalGeometry {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        for (global, policy) in self.units().zip(self.state.layers().iter()) {
+        for (global, policy) in self
+            .units()
+            .zip(self.state.iter().flat_map(|state| state.layers().iter()))
+        {
             schedule[global] = policy.clone();
         }
         StateLayout::new(
@@ -244,7 +247,7 @@ pub fn local_geometry(
 ) -> Result<LocalGeometry, ParallelPlanError> {
     if units.start > units.end || units.end > config.text.num_hidden_layers() {
         return Err(invalid(
-            "diffusion local stack range is empty or out of bounds",
+            "diffusion local stack range is reversed or out of bounds",
         ));
     }
     let blocks = units
@@ -273,11 +276,17 @@ pub fn local_geometry(
             .map_err(|error| invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let state = StateLayout::new(
-        eredu_core::LayerSchedule::new(policies.len(), policies)
+    let state = if policies.is_empty() {
+        None
+    } else {
+        Some(
+            StateLayout::new(
+                eredu_core::LayerSchedule::new(policies.len(), policies)
+                    .map_err(|error| invalid(error.to_string()))?,
+            )
             .map_err(|error| invalid(error.to_string()))?,
-    )
-    .map_err(|error| invalid(error.to_string()))?;
+        )
+    };
     let conditioning_width = layout
         .tensor("model.decoder.self_conditioning.gate_proj.weight")
         .map(|tensor| {

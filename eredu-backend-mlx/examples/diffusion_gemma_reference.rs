@@ -1,7 +1,7 @@
 //! Validates released shared-stack execution against a pinned independent reference.
 use eredu_architectures::diffusion_gemma::{
     self,
-    model::{TextInput, TextModel},
+    model::{TextInput, TextKernel, TextModel},
     FamilyConfig,
 };
 use eredu_backend_mlx::{
@@ -182,9 +182,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for index in 0..config.vision.as_ref().unwrap().num_hidden_layers as usize {
             let mut layer = ImageStatic::<Backend>::build_layer(&config, index, stream)?;
             load(&mut layer, source.as_ref(), &mut BTreeMap::new(), stream)?;
-            hidden = image
-                .tower
-                .forward_layer(&mut layer, &hidden, &state, stream)?;
+            hidden = image.forward_layer(&mut layer, &hidden, &state, stream)?;
             compare(
                 &format!("vision.layer.{index}"),
                 &hidden,
@@ -192,14 +190,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 stream,
             )?;
         }
-        let pooled = image.tower.finish(&hidden, &state, stream)?;
+        let pooled = image
+            .tower
+            .as_ref()
+            .ok_or("image tower is not retained")?
+            .finish(&hidden, &state, stream)?;
         compare(
             "vision.pooled",
             &pooled.reshape(&[pooled.dim(0) * pooled.dim(1), pooled.dim(2)], stream)?,
             &reference["vision.pooled"],
             stream,
         )?;
-        let projected = image.projector.forward(&pooled, stream)?;
+        let projected = image
+            .projector
+            .as_mut()
+            .ok_or("image projector is not retained")?
+            .forward(&pooled, stream)?;
         compare(
             "vision.projected",
             &projected.reshape(
@@ -211,8 +217,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         return Ok(());
     }
-    let mut resident =
-        ResidentRuntime::<Model, Backend, State>::new(Model::new(config.clone(), stream)?, stream)?;
+    let mut resident = ResidentRuntime::<Model, Backend, State>::new(
+        TextKernel::<Backend>::new(config.clone(), stream)?,
+        stream,
+    )?;
     load(
         <Model as LayeredArchitecture<Backend, State>>::static_modules_mut(
             resident.architecture_mut(),

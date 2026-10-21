@@ -73,6 +73,7 @@ pub struct ForwardContext<T> {
 pub struct Model<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     config: FamilyConfig,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    selection: Option<eredu_runtime::ComponentSelection>,
     statics: StaticModules<B>,
     geometry: Option<super::parallel::CompositeGeometry>,
 }
@@ -212,10 +213,16 @@ pub fn component_definition(
                 || geometry.complete_state.len() != layers
                 || range.start > range.end
                 || range.end > layers
-                || range.len() != geometry.text.state_layout().len()
+                || range.len() != geometry.text.state_layout().map_or(0, StateLayout::len)
                 || range
                     .clone()
-                    .zip(geometry.text.state_layout().layers().iter())
+                    .zip(
+                        geometry
+                            .text
+                            .state_layout()
+                            .into_iter()
+                            .flat_map(|state| state.layers().iter()),
+                    )
                     .any(|(global, local)| {
                         geometry.complete_state.layers().get(global) != Some(local)
                     })
@@ -275,6 +282,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
         let definition = std::sync::Arc::new(component_definition(&config, None)?);
         Ok(Self {
             definition,
+            selection: None,
             statics: StaticModules {
                 text: TextKernel::materialize(config.clone(), None, context)?,
                 image: ImageStatic::new(&config, context)?,
@@ -366,7 +374,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
             } else {
                 self.statics.text.encode_context_tokens(&tokens, context)?
             };
-            let frontier = if state.layout().is_empty() {
+            let frontier = if state.optional_layout().is_none() {
                 0
             } else {
                 state.layer(0).map_err(Error::backend)?.offset()
@@ -442,11 +450,9 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
             ingress
                 .vision_input()
                 .map(|input| {
-                    if self
-                        .geometry
-                        .as_ref()
-                        .is_none_or(|geometry| geometry.vision_units.start == 0)
-                    {
+                    if self.geometry.as_ref().is_none_or(|geometry| {
+                        !geometry.vision_units.is_empty() && geometry.vision_units.start == 0
+                    }) {
                         self.statics.image.begin(input, context)
                     } else {
                         Ok((
@@ -459,7 +465,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Model<B> {
                                 ],
                                 context,
                             )?,
-                            self.statics.image.tower.prepare_state(input, context)?,
+                            self.statics.image.prepare_state(input, context)?,
                         ))
                     }
                 })
@@ -567,16 +573,26 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         visitor: &mut V,
     ) -> Result<(), V::Error> {
         self.statics.text.visit_pinned(visitor)?;
-        visitor.visit("vision", &self.statics.image.tower)?;
-        visitor.visit("vision_projection", &self.statics.image.projector)
+        if let Some(tower) = &self.statics.image.tower {
+            visitor.visit("vision", tower)?;
+        }
+        if let Some(projector) = &self.statics.image.projector {
+            visitor.visit("vision_projection", projector)?;
+        }
+        Ok(())
     }
     fn visit_static_parameters_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
         self.statics.text.visit_pinned_mut(visitor)?;
-        visitor.visit_mut("vision", &mut self.statics.image.tower)?;
-        visitor.visit_mut("vision_projection", &mut self.statics.image.projector)
+        if let Some(tower) = &mut self.statics.image.tower {
+            visitor.visit_mut("vision", tower)?;
+        }
+        if let Some(projector) = &mut self.statics.image.projector {
+            visitor.visit_mut("vision_projection", projector)?;
+        }
+        Ok(())
     }
 }
 
@@ -645,6 +661,14 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
+        match &self.selection {
+            Some(selection) => {
+                selection.address(group, index)?;
+            }
+            None => {
+                self.definition.unit(group, index)?;
+            }
+        }
         if group == 0 {
             Ok(Unit::Vision(ImageStatic::<B>::build_layer(
                 &self.config,
@@ -923,7 +947,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         match (group, unit) {
-            (0, Unit::Vision(unit)) => self.statics.image.tower.forward_layer(
+            (0, Unit::Vision(unit)) => self.statics.image.forward_layer(
                 unit,
                 hidden,
                 forward
