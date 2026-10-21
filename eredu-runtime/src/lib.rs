@@ -25,8 +25,8 @@ pub mod component;
 pub mod component_execution;
 pub use component_execution::{
     ComponentAdapter, ComponentDefinition, ComponentDefinitionError, ComponentEquations,
-    ComponentKernel, ComponentUnit, EmptyParameterModule, ParallelComponentKernel,
-    ParameterStorageId, StateSlotId, StatelessComponentState,
+    ComponentKernel, ComponentSelection, ComponentUnit, EmptyParameterModule,
+    ParallelComponentKernel, ParameterStorageId, StateSlotId, StatelessComponentState,
 };
 mod component_text;
 pub use component_text::TextComponentKernel;

@@ -640,11 +640,116 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
     ) -> Result<B::Tensor, Self::Error>;
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct ComponentSelection {
+/// Validated owned invocations and independent mutable-state projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentSelection {
+    component: String,
+    layout: crate::ExecutionUnitLayout,
     units: std::collections::BTreeSet<(usize, usize)>,
     state: Option<PartitionState>,
     owns_output: bool,
+}
+
+impl ComponentSelection {
+    /// Selected mutable state, including explicit global-ordinal gaps.
+    pub fn state(&self) -> Option<&PartitionState> {
+        self.state.as_ref()
+    }
+    /// Resolves a retained owned invocation to its architecture-global address.
+    pub fn address(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
+        if !self.units.contains(&(group, index)) {
+            return Err(ComponentDefinitionError::Address {
+                component: self.component.clone(),
+                group,
+                index,
+            });
+        }
+        Ok(self
+            .layout
+            .address(self.layout.ordinal(group, index).expect("selected unit"))
+            .expect("selected ordinal"))
+    }
+}
+
+impl ComponentDefinition {
+    /// Validates canonical parameter, unit and mutable-state ownership before materialization.
+    pub fn select_partition<G, A>(
+        &self,
+        partition: &crate::ArchitecturePartition<G, A>,
+    ) -> Result<ComponentSelection, ComponentDefinitionError> {
+        let definition = self;
+        let invalid = |resource: &str| ComponentDefinitionError::Invalid {
+            component: definition.id.clone(),
+            resource: resource.into(),
+        };
+        if partition.graph() != definition.parameters.graph()
+            || partition.unit_layout() != definition.parameters.unit_layout()
+            || partition.parameter_bindings() != definition.parameters.select_owned(partition)
+        {
+            return Err(invalid("partition parameter ownership"));
+        }
+        let expected = definition
+            .state_partition
+            .resolve_partition(
+                &definition.state,
+                definition.parameters.unit_layout(),
+                |group| {
+                    partition
+                        .groups()
+                        .iter()
+                        .find(|owned| owned.group_index() == group)
+                        .map(|owned| owned.global_units())
+                },
+                partition.ownership().owns_output(),
+            )
+            .map_err(|source| ComponentDefinitionError::StatePartition {
+                component: definition.id.clone(),
+                source,
+            })?;
+        if partition.state() != expected.as_ref() {
+            return Err(invalid("partition state ownership"));
+        }
+        let mut units = std::collections::BTreeSet::new();
+        for group in partition.groups() {
+            for index in group.global_units() {
+                let unit = definition.unit(group.group_index(), index)?;
+                if !unit.state.is_empty()
+                    && expected.as_ref().is_none_or(|state| {
+                        unit.state
+                            .clone()
+                            .any(|slot| !state.owns_global_layer(slot))
+                    })
+                {
+                    return Err(invalid("partition unit state references"));
+                }
+                units.insert((group.group_index(), index));
+            }
+        }
+        let selected = ComponentSelection {
+            component: self.id.clone(),
+            layout: self.parameters.unit_layout().clone(),
+            units,
+            state: expected,
+            owns_output: partition.ownership().owns_output(),
+        };
+        Ok(selected)
+    }
+    /// Resolves one canonical global invocation without projecting its identity to a local ordinal.
+    pub fn unit_address(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
+        self.unit(group, index)?;
+        let layout = self.parameters.unit_layout();
+        Ok(layout
+            .address(layout.ordinal(group, index).expect("validated unit"))
+            .expect("validated ordinal"))
+    }
 }
 
 /// Shared driver-facing contracts over one declaration and typed family kernel.
@@ -725,59 +830,11 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         mut self,
         partition: &crate::ArchitecturePartition<G, A>,
     ) -> Result<Self, ComponentDefinitionError> {
-        let definition = self.definition();
-        let invalid = |resource: &str| ComponentDefinitionError::Invalid {
-            component: definition.id.clone(),
-            resource: resource.into(),
-        };
-        if partition.graph() != definition.parameters.graph()
-            || partition.unit_layout() != definition.parameters.unit_layout()
-            || partition.parameter_bindings() != definition.parameters.select_owned(partition)
-        {
-            return Err(invalid("partition parameter ownership"));
-        }
+        let selected = self.definition().select_partition(partition)?;
         self.validate_resource_roles(partition.parameter_bindings())?;
-        let expected = definition
-            .state_partition
-            .resolve_partition(
-                &definition.state,
-                definition.parameters.unit_layout(),
-                |group| {
-                    partition
-                        .groups()
-                        .iter()
-                        .find(|owned| owned.group_index() == group)
-                        .map(|owned| owned.global_units())
-                },
-                partition.ownership().owns_output(),
-            )
-            .map_err(|source| ComponentDefinitionError::StatePartition {
-                component: definition.id.clone(),
-                source,
-            })?;
-        if partition.state() != expected.as_ref() {
-            return Err(invalid("partition state ownership"));
-        }
-        let mut units = std::collections::BTreeSet::new();
-        for group in partition.groups() {
-            for index in group.global_units() {
-                let unit = definition.unit(group.group_index(), index)?;
-                if !unit.state.is_empty()
-                    && expected.as_ref().is_none_or(|state| {
-                        unit.state
-                            .clone()
-                            .any(|slot| !state.owns_global_layer(slot))
-                    })
-                {
-                    return Err(invalid("partition unit state references"));
-                }
-                units.insert((group.group_index(), index));
-            }
-        }
-        let selected = ComponentSelection {
-            units,
-            state: expected,
-            owns_output: partition.ownership().owns_output(),
+        let invalid = |resource: &str| ComponentDefinitionError::Invalid {
+            component: self.definition().id.clone(),
+            resource: resource.into(),
         };
         if self
             .selection
@@ -964,23 +1021,10 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         group: usize,
         index: usize,
     ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
-        let definition = self.definition();
-        definition.unit(group, index)?;
-        if self
-            .selection
-            .as_ref()
-            .is_some_and(|selection| !selection.units.contains(&(group, index)))
-        {
-            return Err(ComponentDefinitionError::Address {
-                component: definition.id.clone(),
-                group,
-                index,
-            });
+        match &self.selection {
+            Some(selection) => selection.address(group, index),
+            None => self.definition().unit_address(group, index),
         }
-        let layout = definition.parameters.unit_layout();
-        Ok(layout
-            .address(layout.ordinal(group, index).expect("validated unit"))
-            .expect("validated ordinal"))
     }
 }
 impl<B, D, K, R> ArchitectureParameters<B> for ComponentAdapter<D, K, R>

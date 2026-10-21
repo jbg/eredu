@@ -744,6 +744,11 @@ selected projection.
 execution graph with logical unit paths, state references, group transport and
 primary/prediction identities. Construction validates addresses, paths, state
 ranges, partition rules and optional group semantics without native allocation.
+`ComponentDefinition::select_partition` validates canonical bindings, selected unit
+state references and exact state ownership before materialization. Its retained
+`ComponentSelection` resolves only owned global invocation addresses and preserves
+state gaps. The shared adapter consumes that same selection and additionally checks
+actual pinned roles and compatible retained ownership.
 `ParameterStorageId` and `StateSlotId` distinguish physical parameter ownership
 from invocation addresses and mutable state. `ComponentAdapter` implements the
 ordinary architecture and layered contracts for independently leased components;
