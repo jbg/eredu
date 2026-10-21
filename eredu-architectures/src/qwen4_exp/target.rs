@@ -10,10 +10,7 @@ use super::{
     recurrent::{RecurrentSublayer, RecurrentSublayerSpec},
     residual::{mixer_spec, ResidualBoundary},
 };
-use crate::{
-    decoder::{ComponentInstrumentation, StaticModules},
-    hybrid_decoder::HybridDecoder,
-};
+use crate::decoder::{ComponentInstrumentation, StaticModules};
 use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, EmbeddingSpec, Error, GroupedGatedProductSpec,
@@ -538,7 +535,7 @@ pub struct TargetModel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     tensor_partition: Option<TargetTensorPartition>,
     partition_state: eredu_runtime::PartitionState,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
-    pub(crate) decoder: HybridDecoder<B, (), ResidualBoundary<B>>,
+    pub(crate) statics: StaticModules<B, ResidualBoundary<B>>,
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B> {
     fn clone(&self) -> Self {
@@ -549,7 +546,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B
             tensor_partition: self.tensor_partition.clone(),
             partition_state: self.partition_state.clone(),
             definition: self.definition.clone(),
-            decoder: self.decoder.clone(),
+            statics: self.statics.clone(),
         }
     }
 }
@@ -579,13 +576,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
         }
         B::require_operator_capabilities("qwen4_exp target", spec.required_operators())?;
         let boundary = ResidualBoundary::new(spec.boundary.clone(), context)?;
-        let modules = StaticModules::from_boundary(
+        let statics = StaticModules::from_boundary(
             spec.embedding.clone(),
             spec.head.clone(),
             boundary,
             context,
         )?;
-        let decoder = HybridDecoder::new(modules, "model.units", spec.units.len())?;
         let partition_state =
             eredu_runtime::PartitionState::new(definition.state_layout().clone(), 0)
                 .map_err(Error::backend)?;
@@ -596,7 +592,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
             tensor_partition: None,
             partition_state,
             definition,
-            decoder,
+            statics,
         })
     }
     /// Constructs rank-local units while retaining replicated vocabulary and residual mixers.

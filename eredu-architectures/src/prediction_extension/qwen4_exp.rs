@@ -29,10 +29,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Qwen4PredictionTarget<B
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.decoder
-            .static_modules_mut()
-            .embeddings
-            .forward(tokens, context)
+        self.statics.embeddings.forward(tokens, context)
     }
     fn prediction_logits(
         &mut self,
@@ -40,12 +37,8 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Qwen4PredictionTarget<B
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.decoder.static_modules_mut().project_instrumented(
-            hidden,
-            None,
-            context,
-            instrumentation,
-        )
+        self.statics
+            .project_instrumented(hidden, None, context, instrumentation)
     }
 }
 

@@ -65,27 +65,18 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Parameterized<B::Tensor
         &'a self,
         visitor: &mut V,
     ) {
-        self.target
-            .decoder
-            .static_modules()
-            .visit_parameters(visitor);
+        self.target.statics.visit_parameters(visitor);
         self.vision.visit_parameters(visitor);
     }
     fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>>(
         &'a mut self,
         visitor: &mut V,
     ) {
-        self.target
-            .decoder
-            .static_modules_mut()
-            .visit_parameters_mut(visitor);
+        self.target.statics.visit_parameters_mut(visitor);
         self.vision.visit_parameters_mut(visitor);
     }
     fn set_trainable(&mut self, trainable: bool) {
-        self.target
-            .decoder
-            .static_modules_mut()
-            .set_trainable(trainable);
+        self.target.statics.set_trainable(trainable);
         self.vision.set_trainable(trainable);
     }
 }
@@ -339,14 +330,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             .assemble(
                 range,
                 projected,
-                |ids| {
-                    self.modules
-                        .target
-                        .decoder
-                        .static_modules_mut()
-                        .embeddings
-                        .forward(ids, context)
-                },
+                |ids| self.modules.target.statics.embeddings.forward(ids, context),
                 context,
             )
             .map_err(Error::backend_source)?;
@@ -751,14 +735,7 @@ where
                         .clone()
                         .ok_or_else(|| Error::backend("missing media span"))?,
                     projected,
-                    |ids| {
-                        self.modules
-                            .target
-                            .decoder
-                            .static_modules_mut()
-                            .embeddings
-                            .forward(ids, context)
-                    },
+                    |ids| self.modules.target.statics.embeddings.forward(ids, context),
                     context,
                 )
                 .map_err(Error::backend_source)?;

@@ -384,14 +384,7 @@ where
             .assemble(
                 0..prepared.token_ids().dim(1),
                 None,
-                |ids| {
-                    self.modules
-                        .target
-                        .decoder
-                        .static_modules_mut()
-                        .embeddings
-                        .forward(ids, context)
-                },
+                |ids| self.modules.target.statics.embeddings.forward(ids, context),
                 context,
             )
             .map_err(Error::backend_source)?;

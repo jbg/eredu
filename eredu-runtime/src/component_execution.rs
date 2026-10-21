@@ -203,6 +203,25 @@ impl ComponentDefinition {
                 index: 0,
             })
     }
+    /// Validates a group invocation against the retained dependency declaration.
+    pub fn validate_group_dependencies(
+        &self,
+        group: usize,
+        count: usize,
+    ) -> Result<(), ComponentDefinitionError> {
+        if self
+            .parameters
+            .graph()
+            .dependencies(group)
+            .is_none_or(|declared| declared.len() != count)
+        {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.id.clone(),
+                resource: format!("dependencies for group {group}"),
+            });
+        }
+        Ok(())
+    }
     /// Stable identity of the primary semantic group.
     pub fn primary_group(&self) -> &str {
         &self.primary
@@ -882,25 +901,6 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         }
         Ok(())
     }
-    fn validate_group_dependencies(
-        &self,
-        group: usize,
-        count: usize,
-    ) -> Result<(), ComponentDefinitionError> {
-        if self
-            .definition()
-            .parameters
-            .graph()
-            .dependencies(group)
-            .is_none_or(|declared| declared.len() != count)
-        {
-            return Err(ComponentDefinitionError::Invalid {
-                component: self.definition().id.clone(),
-                resource: format!("dependencies for group {group}"),
-            });
-        }
-        Ok(())
-    }
     fn group_has_state_geometry(&self, group: usize) -> bool {
         let definition = self.definition();
         if definition.state_partition.rules().iter().any(|rule| {
@@ -1293,7 +1293,8 @@ where
         forward: &mut K::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
-        self.validate_group_dependencies(group, dependencies.len())?;
+        self.definition()
+            .validate_group_dependencies(group, dependencies.len())?;
         self.kernel
             .begin_group(group, initial, dependencies, state, forward, context)
     }
@@ -1490,7 +1491,8 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, K::Error> {
-        self.validate_group_dependencies(group, dependencies.len())?;
+        self.definition()
+            .validate_group_dependencies(group, dependencies.len())?;
         self.kernel.begin_group_parallel(
             group,
             initial,

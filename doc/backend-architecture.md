@@ -10806,8 +10806,9 @@ architecture, layered and routed contracts. Execution alternates decoder blocks
 with independently owned lexical units.
 Each decoder unit contains a recurrent or indexed mixer and a shared/routed feed-forward
 sublayer. Checkpoint layer numbers and execution ordinals remain distinct, including
-expert/table owners. The target uses `HybridDecoder` vocabulary handling and the shared
-resident, host-layerwise and disk-streamed execution machinery.
+expert/table owners. The target owns its pinned `StaticModules` directly and uses
+shared resident, host-layerwise and disk-streamed execution machinery. Its retained
+component definition supplies graph and dependency validation for those modules.
 
 `TargetSpec::parameter_description` declares canonical parameter ownership and
 physical shapes without a device or native module. It uses the exact selected
@@ -10828,9 +10829,13 @@ publishing the changed specs; partition construction retains canonical global
 parameter placement with the actual tensor-local context geometry. Each lexical
 invocation keeps its own slot independently of the following decoder layer.
 
-`DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse;
-the shared shell owns vocabulary parameters, collectives, execution groups and readout
-instrumentation. `NormalizedBoundary` supplies ordinary normalization. Flash-Next's
+`DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse.
+Shared `StaticModules` owns vocabulary parameters, collectives and readout
+instrumentation. `ComponentPinnedResources` exposes the target's actual pinned
+aggregate and canonical role traversal to binding and completion owners. Target,
+media composition and external prediction borrow those same modules. Runtime's
+`ComponentDefinition::validate_group_dependencies` checks invocation dependencies
+for both shared adapters and declaration-backed family hooks. `NormalizedBoundary` supplies ordinary normalization. Flash-Next's
 `ResidualBoundary` expands text/media embeddings and applies the released gated collapse.
 Residual observation and prediction capture retain all streams before collapse; normalized
 and projection-input observations consume the actual collapsed value. Final-token

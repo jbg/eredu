@@ -2,9 +2,9 @@
 use super::*;
 use eredu_nn::RotaryPosition;
 use eredu_runtime::{
-    ArchitectureParameterDescription, ArchitectureParameters, LayerRuntimeState,
-    LayeredArchitecture, LayeredForwardState, ResidentExpertProvider, RoutedLayeredArchitecture,
-    StaticParameterVisitor, StaticParameterVisitorMut,
+    ArchitectureParameterDescription, ArchitectureParameters, ComponentPinnedResources,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ResidentExpertProvider,
+    RoutedLayeredArchitecture, StaticParameterVisitor, StaticParameterVisitorMut,
 };
 
 /// Original IDs plus optional already-replaced media embeddings for one target pass.
@@ -92,19 +92,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
                 if embeddings.shape()
                     == [input.batch, input.tokens, self.spec.config.hidden_size] =>
             {
-                self.decoder
-                    .static_modules()
-                    .expand_embeddings(embeddings, context)?
+                self.statics.expand_embeddings(embeddings, context)?
             }
             Some(_) => {
                 return Err(Error::backend(
                     "target supplied embedding geometry mismatch",
                 ));
             }
-            None => self
-                .decoder
-                .static_modules_mut()
-                .embed(&request.boundary().ids, context)?,
+            None => self.statics.embed(&request.boundary().ids, context)?,
         };
         Ok(LayeredForwardState {
             hidden,
@@ -211,7 +206,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         source: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, String> {
         crate::static_parameters::module_recipes(
-            self.decoder.static_modules(),
+            &self.statics,
             super::super::checkpoint::recipes::parameter_recipes(
                 source.source_keys(),
                 &self.spec.config,
@@ -223,7 +218,27 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         &self,
         v: &mut V,
     ) -> Result<(), V::Error> {
-        let m = self.decoder.static_modules();
+        self.visit_pinned(v)
+    }
+    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
+        &mut self,
+        v: &mut V,
+    ) -> Result<(), V::Error> {
+        self.visit_pinned_mut(v)
+    }
+}
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ComponentPinnedResources<B>
+    for TargetModel<B>
+{
+    type Modules = StaticModules<B, ResidualBoundary<B>>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.statics
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.statics
+    }
+    fn visit_pinned<V: StaticParameterVisitor<B>>(&self, v: &mut V) -> Result<(), V::Error> {
+        let m = &self.statics;
         v.visit("embedding", &m.embeddings)?;
         v.visit("norm", &m.boundary)?;
         if let Some(head) = &m.lm_head {
@@ -231,11 +246,11 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         }
         Ok(())
     }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
+    fn visit_pinned_mut<V: StaticParameterVisitorMut<B>>(
         &mut self,
         v: &mut V,
     ) -> Result<(), V::Error> {
-        let m = self.decoder.static_modules_mut();
+        let m = &mut self.statics;
         v.visit_mut("embedding", &mut m.embeddings)?;
         v.visit_mut("norm", &mut m.boundary)?;
         if let Some(head) = &mut m.lm_head {
@@ -288,10 +303,10 @@ where
         Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
-        self.decoder.static_modules()
+        self.pinned_modules()
     }
     fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        self.decoder.static_modules_mut()
+        self.pinned_modules_mut()
     }
     fn build_unit(
         &self,
@@ -336,7 +351,9 @@ where
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.begin_group(group, initial, dependencies)
+        self.definition
+            .validate_group_dependencies(group, dependencies.len())?;
+        Ok(initial.clone())
     }
     fn forward_unit(
         &mut self,
@@ -411,7 +428,8 @@ where
         _: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.finish_logits(hidden, context)
+        self.statics
+            .finish_instrumented(hidden, context, &mut ComponentInstrumentation::disabled())
     }
     fn projects_final_text_position() -> bool {
         true
@@ -423,7 +441,11 @@ where
         _: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.finish_text_logits(hidden, context)
+        self.statics.finish_instrumented(
+            &crate::decoder::final_hidden_position(hidden, context)?,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
     fn finish_forward_observed<O>(
         &mut self,
@@ -437,7 +459,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let mut b = eredu_runtime::BorrowedActivationObserver(observer);
-        self.decoder.finish_logits_instrumented(
+        self.statics.finish_instrumented(
             hidden,
             context,
             &mut ComponentInstrumentation::new("readout", &mut b),
