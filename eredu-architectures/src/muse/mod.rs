@@ -42,7 +42,7 @@ pub use equations::{
 pub use graph::{component_graph, state_layout};
 pub use model::{
     component_definition, prepare_composite_ingress, DecoderInputPart, ForwardContext,
-    LayeredModel, ModelInput, PreparedCompositeIngress, TextPartitionInput, Unit,
+    LayeredModel, ModelInput, MuseKernel, PreparedCompositeIngress, TextPartitionInput, Unit,
     TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{

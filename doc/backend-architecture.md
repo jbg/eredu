@@ -9052,6 +9052,19 @@ before serial or parallel group ingress. Parallel kernels can place token lookup
 or another collective at the group's declared wave; the default uses the ordinary
 group equation. Invalid ingress cannot advance kernel state or issue a collective.
 
+Muse construction returns the shared `ComponentAdapter` over `MuseKernel` and
+its kernel-owned pinned resources. The adapter supplies graph, address, parameter,
+state, provider, observation, and typed partition contracts from the retained
+validated definition. Complete and selected partitions use the same equations;
+selected ownership restricts unit acquisition and pinned traversal before execution.
+Low-level Muse operations borrow the kernel through `kernel()` or `kernel_mut()`.
+Muse retains media assembly, waveform clocks and histories, text cache geometry,
+routed expert specifications, and assistant target operations. Parallel decoder
+ingress resolves pending token lookups at its declared collective wave before
+running the ordinary group assembly equation. Serial and parallel media calls
+share the same vision and waveform equations; ordinary text calls use the same
+provider-aware block driver with resident expert access.
+
 Muse component execution uses a single architecture-owned block driver for
 ordinary, provider-backed, tensor-parallel, and observed calls. Its hooks expose
 the actual gated attention channels and FFN units before their selected output

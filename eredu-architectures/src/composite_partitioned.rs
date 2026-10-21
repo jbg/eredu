@@ -2275,7 +2275,7 @@ where
                 )
                 .map_err(CompositePartitionPreparationError::Architecture)?;
             }
-            let mut architecture = crate::muse::LayeredModel::<B>::from_partition(
+            let mut architecture = crate::muse::MuseKernel::<B>::from_partition(
                 args.clone(),
                 local,
                 &partition,
@@ -2283,8 +2283,9 @@ where
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if let Some(realization) = &realization {
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
+                architecture
+                    .kernel_mut()
+                    .set_expert_realization(realization.clone())
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
@@ -3109,11 +3110,12 @@ where
     crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
         .map_err(|error| error.to_string())?;
     let mut architecture =
-        crate::muse::LayeredModel::<B>::from_partition(source.clone(), local, &partition, context)
+        crate::muse::MuseKernel::<B>::from_partition(source.clone(), local, &partition, context)
             .map_err(|error| error.to_string())?;
     if let Some(realization) = realization {
-        architecture = architecture
-            .with_expert_realization(realization)
+        architecture
+            .kernel_mut()
+            .set_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
     Ok(Some((Box::new(architecture), layout)))

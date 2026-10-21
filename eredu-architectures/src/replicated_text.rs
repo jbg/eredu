@@ -8327,14 +8327,14 @@ where
             .then(|| crate::muse::with_checkpoint_formats(args, self.source_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::muse::LayeredModel::<B>::new(args, self.context))
+            .map(|args| crate::muse::MuseKernel::<B>::new(args, self.context))
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = crate::muse::with_checkpoint_formats(args, self.target_formats.clone())
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.identity.text_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::muse::LayeredModel::<B>::new(target, self.context)
+        let architecture = crate::muse::MuseKernel::<B>::new(target, self.context)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,

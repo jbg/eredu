@@ -2,7 +2,7 @@
 use super::*;
 use crate::muse::audio::execution::{prepare_audio_forward, AudioInput};
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B> {
     pub(super) fn begin_media<S>(
         &mut self,
         vision_input: Option<VisionInput<'_, B::Tensor>>,

@@ -8,17 +8,16 @@ mod waveform;
 use prefill::DecoderPrefill;
 
 use crate::decoder::DecoderStaticResources;
+use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
     Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ParameterProvider,
-    PartitionedLayeredArchitecture, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, OwnedParameterGroupSpec,
+    ParameterGroupOwner, ParameterProvider, RuntimeStateComponents, StateLayout,
 };
 
 use crate::{
@@ -316,10 +315,11 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if let Some(resumed) = self.resume_prefill(input.decoder_chunk(), state, context)? {
+        let model = self.kernel_mut();
+        if let Some(resumed) = model.resume_prefill(input.decoder_chunk(), state, context)? {
             return Ok(resumed);
         }
-        self.validate_partition_state(state)?;
+        model.validate_partition_state(state)?;
         let chunk = input.decoder_chunk();
         let positions = chunk
             .as_ref()
@@ -327,16 +327,16 @@ where
             .transpose()?;
         let prepared = prepare_composite_ingress::<B>(input, context)?;
         let decoder_parts = prepared.decoder_parts();
-        if self.parallel_geometry.is_none() {
+        if model.parallel_geometry.is_none() {
             return Err(Error::backend("Muse model has no rank-local geometry"));
         }
-        let parts = self.prepare_parts_parallel(
+        let parts = model.prepare_parts_parallel(
             &decoder_parts,
             prepared.vision_input().is_some() || prepared.audio_input().is_some(),
             parallel,
             context,
         )?;
-        let mut forward = self.begin_media(
+        let mut forward = model.begin_media(
             prepared.vision_input(),
             prepared.audio_input(),
             None,
@@ -384,7 +384,8 @@ where
     type AdmissionConfig = DecoderConfig;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        self.args.clone()
+        let model = self.kernel();
+        model.args.clone()
     }
 
     fn external_assistant_target_profile(
@@ -474,6 +475,7 @@ where
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
     ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
+        let model = self.kernel();
         if group == 2 {
             let samples = input
                 .admitted()
@@ -488,7 +490,7 @@ where
             if samples == 0 {
                 return Ok(None);
             }
-            let config = self
+            let config = model
                 .args
                 .audio_config
                 .as_ref()
@@ -528,7 +530,7 @@ where
         }
         let patches = i32::try_from(patches)
             .map_err(|_| "Muse continuation patch count exceeds i32".to_owned())?;
-        let width = self
+        let width = model
             .args
             .vision_config
             .as_ref()
@@ -551,10 +553,11 @@ where
         _group_sequences: &[i32],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
+        let model = self.kernel();
         if source_group == 2 && matches!(destination_group, 1 | 2) {
             use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
             let (sequence, width) =
-                continuation.unwrap_or((source_sequence, self.args.hidden_size));
+                continuation.unwrap_or((source_sequence, model.args.hidden_size));
             return eredu_runtime::BoundaryWireSchema::new(
                 if destination_group == 2 {
                     "muse.audio_continuation"
@@ -576,7 +579,7 @@ where
             return Ok(None);
         }
         let sequence = continuation.map_or(source_sequence, |(sequence, _)| sequence);
-        vision_partition_boundary_schema(&self.args, source_group == destination_group)?
+        vision_partition_boundary_schema(&model.args, source_group == destination_group)?
             .resolve(batch, sequence)
             .map(Some)
             .map_err(Error::backend)
@@ -630,8 +633,10 @@ where
         _unit: usize,
         routed: bool,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Self::Error> {
+        let model = self.kernel();
         Ok(super::parallel::routed_tensor_reductions(
-            &self.args, routed,
+            &model.args,
+            routed,
         ))
     }
 
@@ -640,6 +645,7 @@ where
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
+        let model = self.kernel();
         if input
             .decoder_chunk()
             .is_some_and(|chunk| chunk.range.start > 0)
@@ -655,7 +661,7 @@ where
                     MuseInputPartPlan::TextTokens { positions } => Some(*positions),
                     MuseInputPartPlan::Vision { .. } | MuseInputPartPlan::Audio { .. } => None,
                 }),
-            self.args.hidden_size,
+            model.args.hidden_size,
             tensor_partitions,
         )
     }
@@ -716,7 +722,8 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
-        let text = &mut self.static_modules.text;
+        let model = self.kernel_mut();
+        let text = &mut model.static_modules.text;
         match operation {
             ExternalPredictionTargetOperation::TokenEmbeddings(tokens)
             | ExternalPredictionTargetOperation::RawTokenEmbeddings(tokens) => {
@@ -739,7 +746,8 @@ where
         combined: B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
-        let text = &self.static_modules.text;
+        let model = self.kernel();
+        let text = &model.static_modules.text;
         match operation {
             ExternalPredictionTargetOperation::TokenEmbeddings(_) => {
                 text.normalize_embeddings(&combined, context).map(Some)
@@ -758,10 +766,11 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if let Some(resumed) = self.resume_prefill(input.decoder_chunk(), state, context)? {
+        let model = self.kernel_mut();
+        if let Some(resumed) = model.resume_prefill(input.decoder_chunk(), state, context)? {
             return Ok(resumed);
         }
-        self.validate_partition_state(state)?;
+        model.validate_partition_state(state)?;
         let chunk = input.decoder_chunk();
         let positions = chunk
             .as_ref()
@@ -769,8 +778,8 @@ where
             .transpose()?;
         let prepared = prepare_composite_ingress::<B>(input, context)?;
         let decoder_parts = prepared.decoder_parts();
-        let parts = self.prepare_parts(&decoder_parts, context)?;
-        let mut forward = self.begin_media(
+        let parts = model.prepare_parts(&decoder_parts, context)?;
+        let mut forward = model.begin_media(
             prepared.vision_input(),
             prepared.audio_input(),
             None,
@@ -836,7 +845,7 @@ pub enum Unit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     Audio(super::AudioUnit<B>),
 }
 
-impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for MuseKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -849,13 +858,12 @@ where
         true
     }
 
-    fn routed_observation_points(
+    fn routing_points(
         &self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
     ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Error> {
-        self.execution_address(group, index)?;
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let (group, index) = (address.group(), address.index());
+        let path = &self.definition.unit(group, index)?.path;
         if group != 1 || !self.args.is_moe() {
             return Ok(None);
         }
@@ -867,10 +875,9 @@ where
         )))
     }
 
-    fn forward_unit_observed_with_provider<P, O>(
+    fn execute_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -886,14 +893,13 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.forward_text_observed(
-            group, index, unit, hidden, state, forward, pass, provider, context, observer,
+            address, unit, hidden, state, forward, pass, provider, context, observer,
         )
     }
 
-    fn forward_unit_with_provider<P>(
+    fn execute_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -906,18 +912,19 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
+        let (group, index) = (address.group(), address.index());
         match (group, unit) {
             (1, Unit::Text(unit)) => self.forward_text_unit_with_provider(
                 index, unit, hidden, state, forward, pass, provider, context,
             ),
-            (_, unit) => <Self as LayeredArchitecture<B, S>>::forward_unit(
-                self, group, index, unit, hidden, state, forward, context,
+            (_, unit) => <Self as eredu_runtime::ComponentEquations<B, S>>::execute(
+                self, address, unit, hidden, state, forward, context,
             ),
         }
     }
 }
 
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for MuseKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -930,10 +937,9 @@ where
         true
     }
 
-    fn forward_unit_parallel_observed_with_provider<P, O>(
+    fn execute_parallel_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -950,14 +956,13 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.forward_text_parallel_observed(
-            group, index, unit, hidden, state, forward, pass, provider, parallel, context, observer,
+            address, unit, hidden, state, forward, pass, provider, parallel, context, observer,
         )
     }
 
-    fn forward_unit_parallel_with_provider<P>(
+    fn execute_parallel_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -971,19 +976,27 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
+        let (group, index) = (address.group(), address.index());
         match (group, unit) {
             (1, Unit::Text(unit)) => self.forward_text_unit_parallel_with_provider(
                 index, unit, hidden, state, forward, pass, provider, parallel, context,
             ),
-            (_, unit) => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
-                self, group, index, unit, hidden, state, forward, parallel, context,
+            (_, unit) => <Self as eredu_runtime::ParallelComponentKernel<B, S>>::execute_parallel(
+                self, address, unit, hidden, state, forward, parallel, context,
             ),
         }
     }
 }
 
-/// The same architecture object used by resident and bounded runtimes.
-pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+/// Shared execution contracts over Muse's typed equations and exact pinned resources.
+pub type LayeredModel<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    MuseKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Muse equations, selected geometry, and native-independent resource construction.
+pub struct MuseKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: DecoderConfig,
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     static_modules: StaticModules<B>,
@@ -994,20 +1007,23 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
         Option<std::sync::Arc<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>>,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
+impl<B> eredu_runtime::ComponentKernel<B> for MuseKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
-
+    type Input<'a> = ModelInput<'a, B::Tensor>;
+    type Unit = Unit<B>;
+    type ForwardContext = ForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::Error> {
         if state
             .selected_layout(&self.state_layout_impl()?)
             .map_err(Error::backend)?
@@ -1023,16 +1039,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
             state.global_layer_offset(),
             topology,
         )
-        .map_err(|error| Error::backend(error.to_string()))
+        .map_err(Error::backend_source)
     }
-
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        Ok(self.definition.parameters().clone())
-    }
-
     fn static_parameter_recipes(
         &self,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -1045,42 +1053,108 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
             super::static_safetensors_recipes(&self.args, source)?,
         )
     }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitor<B>,
-    {
-        if let Some(vision) = self
-            .static_modules
-            .vision
-            .as_ref()
-            .filter(|vision| vision.has_parameters())
-        {
-            visitor.visit("vision", vision)?;
+    fn build_unit(
+        &self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, Self::Error> {
+        let (group, index) = (address.group(), address.index());
+        match group {
+            2 => {
+                let audio = self
+                    .args
+                    .audio_config
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("Muse has no audio tower"))?;
+                let kind = audio
+                    .execution_units()?
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| Error::backend("Muse audio unit exceeds its group"))?;
+                Ok(Unit::Audio(super::AudioUnit::new(audio, kind, context)?))
+            }
+            0 => Ok(Unit::Vision(VisionBlock::new(
+                self.args
+                    .vision_config
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?,
+                index,
+                context,
+            )?)),
+            1 => {
+                let args = self
+                    .parallel_geometry
+                    .as_ref()
+                    .map(|geometry| {
+                        geometry.text_block(index).ok_or_else(|| {
+                            Error::backend(format!(
+                                "Muse-Glimmer text unit {index} has no rank-local geometry"
+                            ))
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(&self.args);
+                let routed_spec = self
+                    .expert_realization
+                    .as_ref()
+                    .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
+                    .cloned();
+                if self.expert_realization.is_some() && routed_spec.is_none() {
+                    return Err(Error::backend(format!(
+                        "Muse-Glimmer expert realization omits text unit {index}"
+                    )));
+                }
+                Ok(Unit::Text(TransformerBlock::new_with_routed_spec(
+                    args,
+                    index,
+                    routed_spec,
+                    context,
+                )?))
+            }
+            _ => Err(Error::backend(
+                "Muse execution group is outside its admitted graph",
+            )),
         }
-        self.static_modules.text.decoder_resources().visit(visitor)
     }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitorMut<B>,
-    {
-        if let Some(vision) = self
-            .static_modules
-            .vision
-            .as_mut()
-            .filter(|vision| vision.has_parameters())
-        {
-            visitor.visit_mut("vision", vision)?;
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        match group {
+            0 => forward.vision_active,
+            2 => forward.audio.is_some(),
+            _ => true,
         }
-        self.static_modules
-            .text
-            .decoder_resources_mut()
-            .visit(visitor)
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut values = Vec::new();
+        values.extend(forward.mask.iter());
+        values.extend(forward.waveform.iter());
+        values.extend(
+            forward
+                .prefill
+                .as_ref()
+                .and_then(|prefill| prefill.assembled.as_ref()),
+        );
+        for part in &forward.parts {
+            match part {
+                PreparedPart::Text { tokens, embeddings } => {
+                    values.extend([tokens, embeddings]);
+                }
+                PreparedPart::Media { tokens }
+                | PreparedPart::Audio { tokens }
+                | PreparedPart::PendingText { tokens } => values.push(tokens),
+            }
+        }
+        if let Some(vision) = &forward.vision {
+            values.extend(vision.retained_values());
+        }
+        values.into_iter()
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B> {
     #[allow(clippy::too_many_arguments)]
     fn begin_text_partition<S>(
         &mut self,
@@ -1133,7 +1207,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     pub fn new(
         args: DecoderConfig,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
         Self::materialize(args, None, None, context)
     }
 
@@ -1142,7 +1216,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         args: DecoderConfig,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
         Self::materialize(args, Some(geometry), None, context)
     }
 
@@ -1155,7 +1229,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             eredu_runtime::NoAuxiliaryBoundarySchema,
         >,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
         Self::materialize(args, Some(geometry), Some(partition), context)
     }
 
@@ -1169,7 +1243,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             >,
         >,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
         let definition = std::sync::Arc::new(component_definition(&args, geometry.as_ref())?);
         let selection = partition
             .map(|partition| {
@@ -1216,15 +1290,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             }
             None => None,
         };
-        Ok(Self {
+        let kernel = Self {
             args,
-            definition,
+            definition: std::sync::Arc::clone(&definition),
             static_modules: StaticModules { text, vision },
             parallel_geometry: geometry.map(std::sync::Arc::new),
             selection,
             owns_input: partition.is_none_or(|partition| partition.ownership().owns_input()),
             expert_realization: None,
-        })
+        };
+        match partition {
+            Some(partition) => {
+                eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
+                    definition, kernel, partition,
+                )
+            }
+            None => eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel),
+        }
+        .map_err(Error::from)
     }
 
     fn selected_state(&self) -> Option<&eredu_runtime::PartitionState> {
@@ -1271,17 +1354,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     /// Binds the exact selected compact expert banks used by partition-local units.
-    pub fn with_expert_realization(
-        mut self,
+    pub fn set_expert_realization(
+        &mut self,
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-    ) -> Result<Self, Error> {
+    ) -> Result<(), Error> {
         if !self.args.is_moe() {
             return Err(Error::backend(
                 "dense Muse-Glimmer cannot bind an expert realization",
             ));
         }
         self.expert_realization = Some(std::sync::Arc::new(realization));
-        Ok(self)
+        Ok(())
     }
 
     /// Returns normalized configuration.
@@ -1809,7 +1892,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 }
 
-impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::ComponentEquations<B, S> for MuseKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -1819,13 +1902,12 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
     }
-    fn observes_unit_boundaries(&self, group: usize, _index: usize) -> bool {
-        group == 1
+    fn observes_unit_boundaries(&self, address: eredu_runtime::ExecutionUnitAddress) -> bool {
+        address.group() == 1
     }
-    fn forward_unit_observed<O>(
+    fn execute_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -1836,12 +1918,11 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
-            self, group, index, hidden, forward,
+        let pass = <Self as eredu_runtime::RoutedComponentKernel<B, S>>::expert_pass(
+            self, address, hidden, forward,
         );
         self.forward_text_observed(
-            group,
-            index,
+            address,
             unit,
             hidden,
             state,
@@ -1852,8 +1933,7 @@ where
             observer,
         )
     }
-
-    fn finish_forward_observed<O>(
+    fn finish_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -1866,146 +1946,13 @@ where
     {
         self.finish_text_observed(hidden, None, context, observer)
     }
-
-    type Input<'a> = ModelInput<'a, B::Tensor>;
-    type StaticModules = StaticModules<B>;
-    type Unit = Unit<B>;
-    type ForwardContext = ForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        self.definition
-            .group_transport(group)
-            .cloned()
-            .unwrap_or_else(|_| crate::transport::decoder())
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        self.definition.primary_group()
-    }
-
-    fn state_partition_plan(
-        &self,
-        _layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        self.definition.state_partition_plan().clone()
-    }
-
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        Ok(self.definition.parameters().graph().clone())
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.definition.unit_count(group).map_err(Error::from)
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        Ok(self.definition.unit(group, index)?.path.clone())
-    }
-
     fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
         Ok((group == 0).then(|| eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()))
     }
-
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
         Ok((group == 1).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
     }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Self::Error> {
-        self.execution_address(group, index)?;
-        match group {
-            2 => {
-                let audio = self
-                    .args
-                    .audio_config
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("Muse has no audio tower"))?;
-                let kind = audio
-                    .execution_units()?
-                    .get(index)
-                    .copied()
-                    .ok_or_else(|| Error::backend("Muse audio unit exceeds its group"))?;
-                Ok(Unit::Audio(super::AudioUnit::new(audio, kind, context)?))
-            }
-            0 => Ok(Unit::Vision(VisionBlock::new(
-                self.args
-                    .vision_config
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?,
-                index,
-                context,
-            )?)),
-            1 => {
-                let args = self
-                    .parallel_geometry
-                    .as_ref()
-                    .map(|geometry| {
-                        geometry.text_block(index).ok_or_else(|| {
-                            Error::backend(format!(
-                                "Muse-Glimmer text unit {index} has no rank-local geometry"
-                            ))
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or(&self.args);
-                let routed_spec = self
-                    .expert_realization
-                    .as_ref()
-                    .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
-                    .cloned();
-                if self.expert_realization.is_some() && routed_spec.is_none() {
-                    return Err(Error::backend(format!(
-                        "Muse-Glimmer expert realization omits text unit {index}"
-                    )));
-                }
-                Ok(Unit::Text(TransformerBlock::new_with_routed_spec(
-                    args,
-                    index,
-                    routed_spec,
-                    context,
-                )?))
-            }
-            _ => Err(Error::backend(
-                "Muse execution group is outside its admitted graph",
-            )),
-        }
-    }
-
-    fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
-        self.definition
-            .unit(group, index)
-            .map_or(index, |unit| unit.state.start)
-    }
-
-    fn retained_state_ordinals(
-        &self,
-        group: usize,
-        index: usize,
-        _ordinal: usize,
-    ) -> std::ops::Range<usize> {
-        self.definition
-            .unit(group, index)
-            .map_or(0..0, |unit| unit.state.clone())
-    }
-
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -2023,8 +1970,7 @@ where
             context,
         )
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
@@ -2099,26 +2045,16 @@ where
         })()?;
         self.retain_prefill_ingress(group, hidden, forward, context)
     }
-
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        match group {
-            0 => forward.vision_active,
-            2 => forward.audio.is_some(),
-            _ => true,
-        }
-    }
-
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.execution_address(group, index)?;
+        let (group, index) = (address.group(), address.index());
         match (group, unit) {
             (2, Unit::Audio(unit)) => {
                 let audio = self
@@ -2158,21 +2094,25 @@ where
                     .ok_or_else(|| Error::backend("Muse-Glimmer vision state is missing"))?,
                 context,
             ),
-            (1, Unit::Text(unit)) => unit.forward(
-                hidden,
-                forward.mask.as_ref(),
-                Some(
-                    state
-                        .layer(self.local_state_ordinal(index)?)
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            ),
+            (1, Unit::Text(unit)) => {
+                let pass = <Self as eredu_runtime::RoutedComponentKernel<B, S>>::expert_pass(
+                    self, address, hidden, forward,
+                );
+                self.forward_text_unit_with_provider(
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    pass,
+                    &mut eredu_runtime::ResidentExpertProvider,
+                    context,
+                )
+            }
             _ => Err(Error::backend("Muse-Glimmer unit/group mismatch")),
         }
     }
-
-    fn complete_execution_group(
+    fn complete_group(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -2211,8 +2151,7 @@ where
             _ => Err(Error::backend("invalid Muse-Glimmer execution group")),
         }
     }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -2221,40 +2160,9 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         self.static_modules.text.logits(hidden, context)
     }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut values = Vec::new();
-        values.extend(forward.mask.iter());
-        values.extend(forward.waveform.iter());
-        values.extend(
-            forward
-                .prefill
-                .as_ref()
-                .and_then(|prefill| prefill.assembled.as_ref()),
-        );
-        for part in &forward.parts {
-            match part {
-                PreparedPart::Text { tokens, embeddings } => {
-                    values.extend([tokens, embeddings]);
-                }
-                PreparedPart::Media { tokens }
-                | PreparedPart::Audio { tokens }
-                | PreparedPart::PendingText { tokens } => values.push(tokens),
-            }
-        }
-        if let Some(vision) = &forward.vision {
-            values.extend(vision.retained_values());
-        }
-        values.into_iter()
-    }
 }
 
-impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for MuseKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -2264,10 +2172,9 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
     }
-    fn forward_unit_parallel_observed<O>(
+    fn execute_parallel_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -2279,12 +2186,11 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
-            self, group, index, hidden, forward,
+        let pass = <Self as eredu_runtime::RoutedComponentKernel<B, S>>::expert_pass(
+            self, address, hidden, forward,
         );
         self.forward_text_parallel_observed(
-            group,
-            index,
+            address,
             unit,
             hidden,
             state,
@@ -2296,8 +2202,7 @@ where
             observer,
         )
     }
-
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -2311,8 +2216,7 @@ where
     {
         self.finish_text_observed(hidden, Some(parallel), context, observer)
     }
-
-    fn begin_execution_group_parallel(
+    fn begin_group_parallel(
         &mut self,
         group: usize,
         initial: &B::Tensor,
@@ -2342,10 +2246,9 @@ where
                 }
             }
         }
-        self.begin_execution_group(group, initial, dependencies, state, forward, context)
+        self.begin_group(group, initial, dependencies, state, forward, context)
     }
-
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -2377,11 +2280,9 @@ where
             context,
         )
     }
-
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -2389,53 +2290,28 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.execution_address(group, index)?;
+        let (group, index) = (address.group(), address.index());
         match (group, unit) {
-            (2, Unit::Audio(unit)) => {
-                let audio = self
-                    .args
-                    .audio_config
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("Muse has no audio configuration"))?;
-                let kind = audio.execution_units()?[index];
-                let layer = state
-                    .layer(self.local_state_ordinal(self.args.num_hidden_layers as usize + index)?)
-                    .map_err(Error::backend)?;
-                super::audio::execution::execute_audio_unit::<B, _>(
-                    audio,
-                    kind,
+            (1, Unit::Text(unit)) => {
+                let pass = <Self as eredu_runtime::RoutedComponentKernel<B, S>>::expert_pass(
+                    self, address, hidden, forward,
+                );
+                self.forward_text_unit_parallel_with_provider(
                     index,
                     unit,
                     hidden,
-                    layer,
-                    forward
-                        .audio
-                        .as_mut()
-                        .ok_or_else(|| Error::backend("Muse waveform context is missing"))?,
-                    forward.decoder_positions,
+                    state,
+                    forward,
+                    pass,
+                    &mut eredu_runtime::ResidentExpertProvider,
+                    parallel,
                     context,
                 )
             }
-            (0, Unit::Vision(unit)) => unit.forward_scheduled(
-                hidden,
-                self.args
-                    .vision_config
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
-                    .schedule[index],
-                forward
-                    .vision
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("Muse-Glimmer vision state is missing"))?,
-                context,
-            ),
-            (1, Unit::Text(unit)) => self
-                .forward_text_unit_parallel(index, unit, hidden, state, forward, parallel, context),
-            _ => Err(Error::backend("Muse-Glimmer parallel unit/group mismatch")),
+            (_, unit) => self.execute(address, unit, hidden, state, forward, context),
         }
     }
-
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -2457,7 +2333,7 @@ where
     }
 }
 
-impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for MuseKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -2506,39 +2382,19 @@ where
         input: LayeredPartitionInput<'a, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = selected
+            .expected
+            .ok_or_else(|| Error::backend("Muse text partition has no selected state geometry"))?;
         self.begin_text_partition(
             input,
             mask,
             state,
             expected,
-            first_state_ordinal,
-            None,
-            context,
-        )
-    }
-
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.begin_text_partition(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            Some(parallel),
-            context,
+            selected.first_state_ordinal,
+            selected.parallel,
+            selected.native,
         )
     }
 
@@ -2566,9 +2422,9 @@ where
         if owns_output {
             let output = match parallel {
                 Some(parallel) => {
-                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                    self.finish_parallel(hidden, state, forward, parallel, context)?
                 }
-                None => self.finish_forward(hidden, state, forward, context)?,
+                None => self.finish(hidden, state, forward, context)?,
             };
             Ok(LayeredPartitionOutput::Final {
                 output,
@@ -2580,5 +2436,49 @@ where
                 auxiliary: eredu_runtime::NoAuxiliaryBoundary,
             })
         }
+    }
+}
+
+impl<B> eredu_runtime::ComponentPinnedResources<B> for MuseKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    type Modules = StaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitor<B>,
+    {
+        if let Some(vision) = self
+            .static_modules
+            .vision
+            .as_ref()
+            .filter(|vision| vision.has_parameters())
+        {
+            visitor.visit("vision", vision)?;
+        }
+        self.static_modules.text.decoder_resources().visit(visitor)
+    }
+    fn visit_pinned_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
+    {
+        if let Some(vision) = self
+            .static_modules
+            .vision
+            .as_mut()
+            .filter(|vision| vision.has_parameters())
+        {
+            visitor.visit_mut("vision", vision)?;
+        }
+        self.static_modules
+            .text
+            .decoder_resources_mut()
+            .visit(visitor)
     }
 }

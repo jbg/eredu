@@ -8,7 +8,7 @@ pub(super) struct DecoderPrefill<T> {
     pub assembled: Option<T>,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B> {
     pub(super) fn resume_prefill<S>(
         &self,
         chunk: Option<DecoderPrefillChunk<'_, B::Tensor>>,
