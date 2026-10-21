@@ -5,8 +5,8 @@ use crate::nemotron_labs_diffusion::partitioned::{
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ArchitecturePartition, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, LayeredPartitionInput, LayeredPartitionOutput,
-    LocalModelLayout, PartitionOwnership, PartitionedLayeredArchitecture, StateLayout,
+    LayeredPartitionInput, LayeredPartitionOutput, LocalModelLayout, PartitionOwnership,
+    PartitionedLayeredArchitecture, StateLayout,
 };
 use std::ops::Range;
 
@@ -20,6 +20,11 @@ pub struct Geometry {
     complete_state: StateLayout,
 }
 impl Geometry {
+    /// Exact source-free rank-local parameter placement retained by this geometry.
+    pub fn local_layout(&self) -> &LocalModelLayout {
+        &self.layout
+    }
+
     /// Complete tensor-local decoder state before pipeline slicing.
     pub fn complete_state(&self) -> &StateLayout {
         &self.complete_state
@@ -80,10 +85,15 @@ pub struct StaticModules<B: DistributedNeuralBackend> {
 pub struct Model<B: DistributedNeuralBackend> {
     config: FamilyConfig,
     geometry: Geometry,
-    parameters: ArchitectureParameterDescription,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     statics: StaticModules<B>,
 }
 impl<B: DistributedNeuralBackend> Model<B> {
+    /// Retained semantic declaration used by execution and inspection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
+    }
+
     /// Consumes an exact neutral partition and creates no unowned static storage.
     pub fn new(
         config: FamilyConfig,
@@ -91,18 +101,20 @@ impl<B: DistributedNeuralBackend> Model<B> {
         partition: &ArchitecturePartition<Geometry, TextBoundarySchema>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let expected =
-            crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&config)
-                .map_err(Error::backend)?;
-        if parameters.graph() != expected.graph()
-            || parameters.unit_layout() != expected.unit_layout()
-            || parameters.groups() != expected.groups()
-            || partition.graph() != parameters.graph()
-            || partition.unit_layout() != parameters.unit_layout()
-        {
-            return Err(Error::backend(
-                "composite partition differs from the admitted parameter topology",
-            ));
+        let definition = std::sync::Arc::new(
+            crate::nemotron_labs_diffusion::definition::composite_partition(
+                &config,
+                parameters,
+                partition.local_geometry(),
+            )?,
+        );
+        definition.select_partition(partition)?;
+        if partition.boundary_schema() != &TextBoundarySchema::new(config.hidden_size()) {
+            return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+                component: definition.id().to_owned(),
+                resource: "partition boundary geometry".into(),
+            }
+            .into());
         }
         let geometry = partition.local_geometry().clone();
         let vision = partition
@@ -165,6 +177,11 @@ impl<B: DistributedNeuralBackend> Model<B> {
                     .cloned(),
             )
             .map_err(Error::backend)?;
+            let text_definition = crate::nemotron_labs_diffusion::definition::text_partition(
+                &config,
+                &description,
+                local,
+            )?;
             let text_partition = ArchitecturePartition::from_description(
                 &description,
                 [(
@@ -172,13 +189,8 @@ impl<B: DistributedNeuralBackend> Model<B> {
                     local.owned_units(),
                 )],
                 text_ownership,
-                &geometry.complete_state,
-                &ArchitectureStatePartitionPlan::new([
-                    ArchitectureStatePartitionRule::group_units(
-                        0,
-                        0..geometry.complete_state.len(),
-                    ),
-                ]),
+                text_definition.state_layout(),
+                text_definition.state_partition_plan(),
                 local.clone(),
                 TextBoundarySchema::new(config.hidden_size()),
             )
@@ -213,7 +225,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
         Ok(Self {
             config,
             geometry,
-            parameters: parameters.clone(),
+            definition,
             statics: StaticModules {
                 text,
                 image_embedding,
@@ -315,7 +327,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
 impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for Model<B> {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<StateLayout, Error> {
-        Ok(self.geometry.complete_state.clone())
+        Ok(self.definition.state_layout().clone())
     }
     fn state_identity(
         &self,
@@ -332,7 +344,7 @@ impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for Model<B> {
         &self,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        Ok(self.parameters.clone())
+        Ok(self.definition.parameters().clone())
     }
     fn static_parameter_recipes(
         &self,
@@ -449,42 +461,25 @@ where
         Some(forward.invocation.scores)
     }
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::nemotron_labs_diffusion::parallel::group_transport(group)
+        self.definition
+            .group_transport(group)
+            .expect("validated execution group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TEXT_DECODER_EXECUTION_GROUP
+        self.definition.primary_group()
     }
-    fn state_partition_plan(&self, layout: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
-            2,
-            0..layout.len(),
-        )])
+    fn state_partition_plan(&self, _layout: &StateLayout) -> ArchitectureStatePartitionPlan {
+        self.definition.state_partition_plan().clone()
     }
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        Ok(self.parameters.graph().clone())
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self
-                .config
-                .vision
-                .as_ref()
-                .expect("validated tower")
-                .num_hidden_layers as usize),
-            1 => Ok(1),
-            2 => Ok(self.config.num_hidden_layers() as usize),
-            _ => Err(Error::backend("invalid composite group")),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend("unit exceeds composite stack"));
-        }
-        Ok(match group {
-            0 => format!("model.vision_tower.transformer.layers.{index}"),
-            1 => "model.multi_modal_projector".into(),
-            _ => format!("model.layers.{index}"),
-        })
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
         &self.statics

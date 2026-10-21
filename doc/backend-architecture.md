@@ -11783,3 +11783,15 @@ invocation phase/frontier transport. Composite request admission and media
 continuation planning remain architecture-owned. Constructors live on
 `CompositeKernel`; low-level equations and expert realization use `kernel()` and
 `kernel_mut()` without an additional execution adapter or resource owner.
+
+Nemotron Labs Diffusion retains source-free validated component definitions for
+complete, tensor-local and partitioned text and Pixtral composite construction.
+Causal, masked-refinement and draft invocations reference the same canonical text
+parameters and authoritative context slots. Draft LoRA matrices belong to their
+participating layer's resource owner; they do not duplicate base storage or
+context state. Vision and projector invocations have no persistent state.
+Graph, unit paths, transport, parameter catalogs and state partition rules project
+the retained definition. Selected definitions preserve admitted physical placement
+and validate canonical bindings, context geometry and typed boundary width before
+native allocation. Complete state schedules retain global slot ordinals while
+selected partitions project their actual local context ownership.

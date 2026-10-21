@@ -4,6 +4,7 @@ pub mod adapter;
 mod checkpoint;
 pub mod composite;
 mod config;
+pub mod definition;
 pub mod generation;
 pub mod gguf;
 pub mod input;

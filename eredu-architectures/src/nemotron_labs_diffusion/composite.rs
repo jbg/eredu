@@ -64,19 +64,27 @@ pub struct ForwardContext<T, C = TextForward<T>> {
 /// Backend-neutral composite using the ordinary layered residency lifecycle.
 pub struct Model<B: DistributedNeuralBackend> {
     config: FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     statics: StaticModules<B>,
     local_layout: Option<eredu_runtime::LocalModelLayout>,
 }
 impl<B: DistributedNeuralBackend> Model<B> {
+    /// Retained semantic declaration used by execution and inspection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
+    }
+
     /// Declares each pinned role and no resident residual layers.
     pub fn new(
         config: FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = std::sync::Arc::new(super::definition::composite(&config, None)?);
         let image_embedding = ImageEmbedding::new(&config, context)?;
         let text = TextModel::new(config.clone(), context)?;
         Ok(Self {
             config,
+            definition,
             statics: StaticModules {
                 text,
                 image_embedding,
@@ -96,10 +104,13 @@ impl<B: DistributedNeuralBackend> Model<B> {
                 .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
         })
         .map_err(Error::backend)?;
+        let definition =
+            std::sync::Arc::new(super::definition::composite(&config, Some(&geometry))?);
         let image_embedding = ImageEmbedding::new(&config, context)?;
         let text = TextModel::new_parallel(config.clone(), geometry, context)?;
         Ok(Self {
             config,
+            definition,
             statics: StaticModules {
                 text,
                 image_embedding,
@@ -166,7 +177,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
 impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for Model<B> {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        self.statics.text.state_layout()
+        Ok(self.definition.state_layout().clone())
     }
     fn state_identity(
         &self,
@@ -179,7 +190,7 @@ impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for Model<B> {
         &self,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::ArchitectureParameterDescription, Error> {
-        super::parallel::composite_parameter_description(&self.config).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
     fn static_parameter_recipes(
         &self,
@@ -233,43 +244,28 @@ where
         Some(forward.invocation.scores)
     }
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::nemotron_labs_diffusion::parallel::group_transport(group)
+        self.definition
+            .group_transport(group)
+            .expect("validated execution group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TEXT_DECODER_EXECUTION_GROUP
+        self.definition.primary_group()
     }
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(2, 0..layout.len()),
-        ])
+        self.definition.state_partition_plan().clone()
     }
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        Ok(super::parallel::composite_graph(&self.config)
-            .map_err(Error::backend)?
-            .0)
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self.config.vision.as_ref().unwrap().num_hidden_layers as usize),
-            1 => Ok(1),
-            2 => Ok(self.config.num_hidden_layers() as usize),
-            _ => Err(Error::backend("invalid image/text group")),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend("unit outside image/text stack"));
-        }
-        Ok(if group == 0 {
-            format!("model.vision_tower.transformer.layers.{index}")
-        } else if group == 1 {
-            "model.multi_modal_projector".to_owned()
-        } else {
-            format!("model.layers.{index}")
-        })
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
         &self.statics

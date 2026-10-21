@@ -384,17 +384,14 @@ pub fn partition(
         ));
     }
     let geometry = decoder::partition_local_geometry(config, layout, units.clone())?;
+    let definition = super::definition::text_partition(config, parameters, &geometry)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     eredu_runtime::ArchitecturePartition::from_description(
         parameters,
         [(decoder::TEXT_DECODER_EXECUTION_GROUP, units)],
         ownership,
-        geometry.complete_state_layout(),
-        &eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(
-                0,
-                0..config.num_hidden_layers() as usize,
-            ),
-        ]),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry.clone(),
         super::partitioned::TextBoundarySchema::new(config.hidden_size()),
     )

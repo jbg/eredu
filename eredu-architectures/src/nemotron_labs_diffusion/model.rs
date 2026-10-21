@@ -37,6 +37,7 @@ pub struct ForwardContext<T> {
 /// layers are bound once and reused by every invocation.
 #[derive(Clone)]
 pub struct TextModel<B: NeuralBackend> {
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     base: LayeredModel<B, FamilyConfig>,
 }
 
@@ -120,12 +121,19 @@ impl<B: NeuralBackend> TextLayer<B> {
 }
 
 impl<B: NeuralBackend> TextModel<B> {
+    /// Retained semantic declaration used by execution and inspection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
+    }
+
     /// Declares one shared base without allocating any second invocation stack.
     pub fn new(
         config: FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = std::sync::Arc::new(super::definition::text(&config, None)?);
         Ok(Self {
+            definition,
             base: decoder::CompleteDecoderKernel::new(config, context)?,
         })
     }
@@ -138,7 +146,9 @@ impl<B: NeuralBackend> TextModel<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
+        let definition = std::sync::Arc::new(super::definition::text(&config, Some(&geometry))?);
         Ok(Self {
+            definition,
             base: decoder::CompleteDecoderKernel::new_parallel(config, geometry, context)?,
         })
     }
@@ -267,7 +277,7 @@ impl<B: NeuralBackend> TextModel<B> {
 impl<B: NeuralBackend> ArchitectureParameters<B> for TextModel<B> {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        self.base.state_layout()
+        Ok(self.definition.state_layout().clone())
     }
     fn state_identity(
         &self,
@@ -280,7 +290,7 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for TextModel<B> {
         &self,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::ArchitectureParameterDescription, Error> {
-        super::parallel::parameter_description(self.config()).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
     fn static_parameter_recipes(
         &self,
@@ -325,33 +335,28 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        <LayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::group_transport(
-            &self.base, group,
-        )
+        self.definition
+            .group_transport(group)
+            .expect("validated execution group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        decoder::TEXT_DECODER_EXECUTION_GROUP
+        self.definition.primary_group()
     }
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        _layout: &eredu_runtime::StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        <LayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::state_partition_plan(
-            &self.base, layout,
-        )
+        self.definition.state_partition_plan().clone()
     }
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        <LayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::execution_graph(&self.base)
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        <LayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::group_unit_count(
-            &self.base, group,
-        )
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        <LayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::unit_path(
-            &self.base, group, index,
-        )
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
         self.base.kernel().static_modules()

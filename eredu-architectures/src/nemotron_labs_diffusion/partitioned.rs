@@ -23,7 +23,7 @@ pub struct TextBoundary<T> {
     pub invocation: T,
 }
 /// Checked mode/frontier wire geometry over full residual activations.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextBoundarySchema {
     hidden: i32,
 }
@@ -136,6 +136,7 @@ pub struct PreparedPartitionInvocation<T: 'static> {
 }
 /// One retained neutral text partition, with no unowned embedding or readout storage.
 pub struct PartitionedTextModel<B: NeuralBackend> {
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     base: PartitionedLayeredModel<B, FamilyConfig>,
 }
 impl<B: DistributedNeuralBackend> eredu_nn::Parameterized<B::Tensor> for PartitionedTextModel<B> {
@@ -166,6 +167,11 @@ impl<B: DistributedNeuralBackend> eredu_nn::Parameterized<B::Tensor> for Partiti
 }
 
 impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
+    /// Retained semantic declaration used by execution and inspection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
+    }
+
     /// Builds only statics and units authorized by the selected neutral partition.
     pub fn new(
         config: FamilyConfig,
@@ -176,7 +182,21 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let definition = std::sync::Arc::new(super::definition::text_partition(
+            &config,
+            parameters,
+            partition.local_geometry(),
+        )?);
+        definition.select_partition(partition)?;
+        if partition.boundary_schema() != &TextBoundarySchema::new(config.hidden_size()) {
+            return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+                component: definition.id().to_owned(),
+                resource: "partition boundary geometry".into(),
+            }
+            .into());
+        }
         Ok(Self {
+            definition,
             base: decoder::DecoderKernel::from_partition(config, parameters, partition, context)?,
         })
     }
@@ -421,7 +441,7 @@ impl<B: DistributedNeuralBackend> PartitionedTextModel<B> {
 impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for PartitionedTextModel<B> {
     type DefinitionError = Error;
     fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.base.state_layout()
+        Ok(self.definition.state_layout().clone())
     }
     fn state_identity(
         &self,
@@ -432,9 +452,9 @@ impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for PartitionedTextM
     }
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::ArchitectureParameterDescription, Error> {
-        self.base.parameter_description(context)
+        Ok(self.definition.parameters().clone())
     }
     fn static_parameter_recipes(
         &self,
@@ -477,33 +497,28 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        <PartitionedLayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::group_transport(
-            &self.base, group,
-        )
+        self.definition
+            .group_transport(group)
+            .expect("validated execution group")
+            .clone()
     }
     fn primary_execution_group(&self) -> &str {
-        decoder::TEXT_DECODER_EXECUTION_GROUP
+        self.definition.primary_group()
     }
     fn state_partition_plan(
         &self,
-        layout: &StateLayout,
+        _layout: &StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        <PartitionedLayeredModel<B,FamilyConfig> as LayeredArchitecture<B,S>>::state_partition_plan(&self.base,layout)
+        self.definition.state_partition_plan().clone()
     }
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        <PartitionedLayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::execution_graph(
-            &self.base,
-        )
+        Ok(self.definition.parameters().graph().clone())
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        <PartitionedLayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::group_unit_count(
-            &self.base, group,
-        )
+        self.definition.unit_count(group).map_err(Error::from)
     }
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        <PartitionedLayeredModel<B, FamilyConfig> as LayeredArchitecture<B, S>>::unit_path(
-            &self.base, group, index,
-        )
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
     fn static_modules(&self) -> &Self::StaticModules {
         self.base.kernel().static_modules()

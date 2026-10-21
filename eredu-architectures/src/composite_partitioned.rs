@@ -1599,6 +1599,12 @@ where
         range(crate::decoder::TEXT_DECODER_EXECUTION_GROUP),
     )
     .map_err(|e| error(e.to_string()))?;
+    let definition = crate::nemotron_labs_diffusion::definition::composite_partition(
+        &args,
+        &parameters,
+        &geometry,
+    )
+    .map_err(|e| error(e.to_string()))?;
     let partition = ArchitecturePartition::from_description(
         &parameters,
         selected
@@ -1607,13 +1613,8 @@ where
             .iter()
             .map(|group| (group.group().as_str(), group.units())),
         selected.requirements().ownership().clone(),
-        geometry.complete_state(),
-        &eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(
-                2,
-                0..args.num_hidden_layers() as usize,
-            ),
-        ]),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry.clone(),
         TextBoundarySchema::new(args.hidden_size()),
     )
