@@ -3908,7 +3908,15 @@ impl EligibleConfig<'_> {
                 if args.is_moe() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
-                        &muse_replicated_expert_realization_plan(args)?,
+                        &crate::muse::expert_realization_plan(
+                            args,
+                            None,
+                            replicated_expert_topology()?,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            "Muse routed parameters have no expert realization".to_owned()
+                        })?,
                     )?;
                 }
                 Ok(shapes)
@@ -7533,24 +7541,6 @@ fn gemma4_replicated_expert_realization_plan(
         .map_err(|error| error.to_string())
 }
 
-fn muse_replicated_expert_realization_plan(
-    args: &crate::muse::DecoderConfig,
-) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, String> {
-    let global_experts = usize::try_from(args.num_experts).map_err(|error| error.to_string())?;
-    let owner_group =
-        eredu_runtime::ExecutionGroupId::new(crate::muse::model::TEXT_EXECUTION_GROUP)
-            .map_err(|error| error.to_string())?;
-    let mut specs = BTreeMap::new();
-    for layer in 0..usize::try_from(args.num_hidden_layers).map_err(|error| error.to_string())? {
-        specs.insert(
-            (owner_group.clone(), layer),
-            crate::muse::text::expert_bank_spec(args, layer).map_err(|error| error.to_string())?,
-        );
-    }
-    crate::ExpertRealizationPlan::balanced(global_experts, replicated_expert_topology()?, specs)
-        .map_err(|error| error.to_string())
-}
-
 fn inkling_replicated_expert_realization_plan(
     args: &crate::inkling::ModelArgs,
 ) -> Result<
@@ -7710,8 +7700,19 @@ fn composite_routed_requirements(
                     .map_err(|error| {
                         ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
                     })?;
-            let plan = muse_replicated_expert_realization_plan(args).map_err(|error| {
+            let plan = crate::muse::expert_realization_plan(
+                args,
+                None,
+                replicated_expert_topology()
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+            )
+            .map_err(|error| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?
+            .ok_or_else(|| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "Muse routed requirements have no expert realization".into(),
+                )
             })?;
             let catalog = crate::muse::expert_residency_catalog(recipe_source.as_ref(), args)
                 .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;

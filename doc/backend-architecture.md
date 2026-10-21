@@ -4498,7 +4498,11 @@ retained declarations through ordinary native mechanisms and selects no family
 semantics. Spark preserves its exact released attention schedule and FP32
 compressed-expert/residual equations. An expert operation exposes complete
 unweighted outputs so TP reduction precedes nonlinear per-expert normalization;
-weighting and accumulation follow it.
+weighting and accumulation follow it. `muse::expert_realization_plan` consumes
+configuration, validated optional local geometry and TP/EP coordinates. Replicated
+requirements and partition preparation share its canonical bank owners and local
+matrix dimensions; expert selection and transform-source inspection require no
+native model or parameter allocation.
 
 Vision, waveform and decoder units use the same resident, host-layerwise and
 disk-streamed providers. The waveform pyramid retains convolution and incomplete

@@ -2224,6 +2224,20 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let realization = if routed {
+                let realization = crate::muse::expert_realization_plan(&args, Some(&local), rank)
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "routed Muse-Glimmer has no expert realization".into(),
+                        )
+                    })?;
+                Some(realization)
+            } else {
+                None
+            };
             let mut architecture =
                 crate::muse::LayeredModel::<B>::new_parallel(args.clone(), local, context)
                     .and_then(|architecture| {
@@ -2238,25 +2252,13 @@ where
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
-            let realization = if routed {
-                let realization = crate::muse::expert_realization_plan(&architecture, rank)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?
-                    .ok_or_else(|| {
-                        CompositePartitionPreparationError::Architecture(
-                            "routed Muse-Glimmer has no expert realization".into(),
-                        )
-                    })?;
+            if let Some(realization) = &realization {
                 architecture = architecture
                     .with_expert_realization(realization.clone())
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
-                Some(realization)
-            } else {
-                None
-            };
+            }
             let routed_execution = realization
                 .clone()
                 .map(|plan| {
@@ -3018,11 +3020,10 @@ where
         ),
     )?;
     let source = &source_args;
-    let description = crate::muse::LayeredModel::<B>::new(source.clone(), context)
-        .map_err(|error| error.to_string())?;
-    let parameters = description
-        .parameter_description(context)
-        .map_err(|error| error.to_string())?;
+    let parameters = crate::muse::component_definition(source, None)
+        .map_err(|error| error.to_string())?
+        .parameters()
+        .clone();
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()
     {
@@ -3059,6 +3060,11 @@ where
     {
         return Err("Muse-Glimmer transform source changed partition state or ownership".into());
     }
+    let realization = crate::muse::expert_realization_plan(source, Some(&local), rank)
+        .map_err(|error| error.to_string())?;
+    if let Some(realization) = &realization {
+        routed_muse_partition_foundation(source, &layout, ranges(), ownership, rank, realization)?;
+    }
     let mut architecture =
         crate::muse::LayeredModel::<B>::new_parallel(source.clone(), local, context)
             .and_then(|architecture| {
@@ -3069,11 +3075,7 @@ where
                 )
             })
             .map_err(|error| error.to_string())?;
-    if source.is_moe() {
-        let realization = crate::muse::expert_realization_plan(&architecture, rank)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "Muse-Glimmer transform source has no expert realization".to_owned())?;
-        routed_muse_partition_foundation(source, &layout, ranges(), ownership, rank, &realization)?;
+    if let Some(realization) = realization {
         architecture = architecture
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
