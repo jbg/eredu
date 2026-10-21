@@ -4,7 +4,7 @@ pub mod partition;
 
 use super::{
     input::{admit_input, InputPartPlan},
-    model::{ForwardContext as TextForward, TextLayer, TextModel},
+    model::{ForwardContext as TextForward, TextKernel, TextLayer, TextModel},
     vision::{ImageEmbedding, ImageInput, ImageLayer, ImageProjector, ImageState},
     FamilyConfig,
 };
@@ -81,7 +81,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
     ) -> Result<Self, Error> {
         let definition = std::sync::Arc::new(super::definition::composite(&config, None)?);
         let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text = TextModel::new(config.clone(), context)?;
+        let text = TextKernel::new(config.clone(), context)?;
         Ok(Self {
             config,
             definition,
@@ -107,7 +107,7 @@ impl<B: DistributedNeuralBackend> Model<B> {
         let definition =
             std::sync::Arc::new(super::definition::composite(&config, Some(&geometry))?);
         let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text = TextModel::new_parallel(config.clone(), geometry, context)?;
+        let text = TextKernel::new_parallel(config.clone(), geometry, context)?;
         Ok(Self {
             config,
             definition,
@@ -293,7 +293,7 @@ where
         } else if group == 1 {
             Unit::Projector(ImageProjector::new(&self.config, context)?)
         } else {
-            Unit::Text(self.statics.text.construct_unit(index, context)?)
+            Unit::Text(self.statics.text.kernel().construct_unit(index, context)?)
         })
     }
     fn begin_forward<'a>(
@@ -345,10 +345,11 @@ where
                 let embedded = self
                     .statics
                     .text
+                    .kernel_mut()
                     .static_modules_mut()
                     .embed(&forward.tokens, context)?;
                 let hidden = assemble_embeddings(forward, &embedded, context)?;
-                let prepared = self.statics.text.begin_embedded(
+                let prepared = self.statics.text.kernel_mut().begin_embedded(
                     hidden,
                     None,
                     forward.invocation,
@@ -564,17 +565,25 @@ where
         if let Some(output) = dependencies.first() {
             forward.image_output = Some((*output).clone());
         }
-        let embedded = self.statics.text.static_modules_mut().embed_parallel(
-            &forward.tokens,
-            EmbeddingLookupPolicy::Strict,
-            parallel,
+        let embedded = self
+            .statics
+            .text
+            .kernel_mut()
+            .static_modules_mut()
+            .embed_parallel(
+                &forward.tokens,
+                EmbeddingLookupPolicy::Strict,
+                parallel,
+                context,
+            )?;
+        let hidden = assemble_embeddings(forward, &embedded, context)?;
+        let prepared = self.statics.text.kernel_mut().begin_embedded(
+            hidden,
+            None,
+            forward.invocation,
+            state,
             context,
         )?;
-        let hidden = assemble_embeddings(forward, &embedded, context)?;
-        let prepared =
-            self.statics
-                .text
-                .begin_embedded(hidden, None, forward.invocation, state, context)?;
         forward.text = Some(prepared.context);
         Ok(prepared.hidden)
     }

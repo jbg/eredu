@@ -2326,7 +2326,7 @@ where
         visitor.construction_started();
         let source = selected_uses_transform(&selected)
             .then(|| {
-                crate::nemotron_labs_diffusion::model::TextModel::<B>::new(config.clone(), context)
+                crate::nemotron_labs_diffusion::model::TextKernel::<B>::new(config.clone(), context)
             })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -2338,7 +2338,7 @@ where
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let effective_model_type = target.model_identity().to_owned();
         let architecture =
-            crate::nemotron_labs_diffusion::model::TextModel::<B>::new(target, context)
+            crate::nemotron_labs_diffusion::model::TextKernel::<B>::new(target, context)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let prepared = prepare_architecture_handoff::<B, S, _>(
             architecture,

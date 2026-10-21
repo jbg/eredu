@@ -11795,3 +11795,14 @@ the retained definition. Selected definitions preserve admitted physical placeme
 and validate canonical bindings, context geometry and typed boundary width before
 native allocation. Complete state schedules retain global slot ordinals while
 selected partitions project their actual local context ownership.
+
+Complete Nemotron Labs Diffusion text execution uses `ComponentAdapter` over
+`TextKernel` and one kernel-owned pinned aggregate. The kernel borrows the shared
+decoder's physical construction and readout mechanisms directly. Runtime owns
+parameter traversal, graph and address checks, retained state projections, and
+ordinary, observed, parallel, text and refinement driver contracts. Family hooks
+retain the causal/transient attention equation, optional draft delta, full-canvas
+visibility and final-position projection. Serial and parallel unit execution use
+one equation with an optional neutral parallel context and instrumentation.
+Constructors live on `TextKernel` and return the shared adapter; low-level module
+and equation access uses `kernel()` and `kernel_mut()`.
