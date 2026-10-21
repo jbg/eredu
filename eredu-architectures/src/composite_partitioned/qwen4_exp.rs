@@ -4,7 +4,7 @@ use crate::qwen4_exp::{
     conditional::ConditionalModel,
     media::MediaIngress,
     prepared::PreparedConditionalPartition,
-    target::{BoundTargetSpec, TargetModel, TargetTensorPartition},
+    target::{BoundTargetSpec, TargetTensorPartition},
 };
 use eredu_runtime::ArchitectureParameters;
 
@@ -17,12 +17,11 @@ fn invalid<E>(error: impl std::fmt::Display) -> CompositePartitionPreparationErr
 /// The target authors exact recurrent/GQA/expert selections; shared vision
 /// placement supplies its independent heads and merger channels. The resulting
 /// description retains this authority rather than reconstructing it at binding.
-fn local_geometry<B>(
+fn local_geometry(
     bound: &BoundTargetSpec,
     ingress: &MediaIngress,
     vision: &crate::qwen::vision::VisionConfig,
     rank: eredu_core::ParallelRankTopology,
-    context: &<B::Tensor as Tensor>::Context,
 ) -> Result<
     (
         TargetTensorPartition,
@@ -31,38 +30,35 @@ fn local_geometry<B>(
         GatedPlan,
     ),
     String,
->
-where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-{
+> {
     let error = |error: eredu_nn::Error| error.to_string();
     let tensor = bound
         .geometry()
         .tensor_partition(rank.tensor_parallel_rank(), rank.tensor_parallel_size())
         .map_err(error)?;
-    let global = TargetModel::<B>::new(bound.clone(), context).map_err(error)?;
-    let target_parameters = global.parameter_description(context).map_err(error)?;
-    let mut local = TargetModel::<B>::new_tensor_parallel(bound.clone(), tensor.clone(), context)
+    let definition = bound.geometry().definition().map_err(error)?;
+    let target_parameters = definition.parameters();
+    let local = tensor.local_spec();
+    let tensor_parameters = local.parameter_description().map_err(error)?;
+    let experts = local.expert_realization(rank).map_err(error)?;
+    let expert_parameters = local
+        .clone()
+        .with_expert_realization(&experts)
+        .and_then(|spec| spec.parameter_description())
         .map_err(error)?;
-    let tensor_parameters = local.parameter_description(context).map_err(error)?;
-    let experts = tensor
-        .local_spec()
-        .expert_realization(rank)
-        .map_err(error)?;
-    local.set_expert_realization(&experts).map_err(error)?;
     let target_layout = tensor
         .local_expert_layout(
-            &target_parameters,
+            target_parameters,
             &tensor_parameters,
-            &local.parameter_description(context).map_err(error)?,
+            &expert_parameters,
             rank.expert_parallel_rank(),
             rank.expert_parallel_size(),
         )
         .map_err(error)?;
-    let global =
-        ConditionalModel::<B>::new(bound.clone(), ingress.clone(), vision.clone(), context)
-            .map_err(error)?;
-    let parameters = global.parameter_description(context).map_err(error)?;
+    crate::qwen4_exp::conditional::validate_ingress(bound.geometry(), ingress, vision)
+        .map_err(error)?;
+    let parameters =
+        crate::qwen4_exp::conditional::parameter_description(&definition, vision).map_err(error)?;
     let mut layout = derive_partitioned_local_layout(&parameters, rank)?;
     for (name, placement) in target_layout.tensors() {
         layout.insert(name.to_owned(), placement.clone());
@@ -137,7 +133,7 @@ impl PreparedConditionalPartition {
             }
         }
         let (tensor, parameters, layout, experts) =
-            local_geometry::<B>(&bound, &ingress, &vision, rank, context).map_err(invalid)?;
+            local_geometry(&bound, &ingress, &vision, rank).map_err(invalid)?;
         let state = selected
             .requirements()
             .state()
@@ -183,7 +179,7 @@ impl PreparedConditionalPartition {
             if crate::replicated_text::selected_uses_transform(execution.text()) {
                 let source_vision = ingress.vision().config().clone();
                 let (source_tensor, source_parameters, source_layout, source_experts) =
-                    local_geometry::<B>(&source_bound, &ingress, &source_vision, rank, context)
+                    local_geometry(&source_bound, &ingress, &source_vision, rank)
                         .map_err(invalid)?;
                 if crate::partitioned_execution::derive_partitioned_transform_source_layout(
                     &source_parameters,

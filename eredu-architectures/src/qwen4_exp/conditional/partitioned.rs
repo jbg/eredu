@@ -28,9 +28,8 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
                 "conditional retained topology differs from target tensor placement",
             ));
         }
-        let mut model = Self::new(spec.clone(), ingress, vision.clone(), context)?;
-        let parameters = model
-            .parameter_description(context)?
+        validate_ingress(spec.geometry(), &ingress, &vision)?;
+        let parameters = parameter_description(&spec.geometry().definition()?, &vision)?
             .with_partition_layout(topology, layout.clone())
             .map_err(Error::backend)?;
         let blocks = (0..vision.layer_count())
@@ -41,15 +40,26 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             .collect::<Result<Vec<_>, _>>()?;
         let mergers = crate::qwen::vision::local_merger_widths(&vision, "model.visual", layout)
             .map_err(Error::backend)?;
-        model.modules.target = TargetModel::new_tensor_parallel(spec, target, context)?;
-        model.modules.target.set_partition_state(state)?;
-        model.modules.vision =
-            VisionStatic::new_parallel_with_root(vision, "model.visual", &mergers, context)?;
-        model.vision_local = Some(blocks);
-        model.vision_input_owner = topology.pipeline_parallel_rank() == 0;
-        model.partition_state = Some(state.clone());
-        model.global_parameters = Some(parameters);
-        Ok(model)
+        let mut target = TargetModel::new_tensor_parallel(spec, target, context)?;
+        target.set_partition_state(state)?;
+        let modules = ConditionalStatic {
+            target,
+            vision: VisionStatic::new_parallel_with_root(
+                vision.clone(),
+                "model.visual",
+                &mergers,
+                context,
+            )?,
+        };
+        Ok(Self {
+            modules,
+            ingress,
+            vision,
+            vision_local: Some(blocks),
+            vision_input_owner: topology.pipeline_parallel_rank() == 0,
+            partition_state: Some(state.clone()),
+            global_parameters: Some(parameters),
+        })
     }
 
     /// Binds local routed operators while preserving global router identities.

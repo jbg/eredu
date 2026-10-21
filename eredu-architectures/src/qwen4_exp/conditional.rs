@@ -33,6 +33,46 @@ pub(crate) fn graph() -> Result<ExecutionGraph, Error> {
     )
     .map_err(Error::backend)
 }
+/// Composes retained target storage and vision geometry without native resources.
+pub fn parameter_description(
+    target: &ComponentDefinition,
+    vision: &VisionConfig,
+) -> Result<ArchitectureParameterDescription, Error> {
+    let graph = graph()?;
+    let layout = ExecutionUnitLayout::new(
+        &graph,
+        [target.unit_count(TARGET_INDEX)?, vision.layer_count()],
+    )
+    .map_err(Error::backend)?;
+    let mut groups = target.parameters().groups().to_vec();
+    for group in crate::qwen::vision::static_parallel_parameter_groups(vision, "model.visual")
+        .map_err(Error::backend)?
+    {
+        groups.push(OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_role("vision"),
+            group,
+        ));
+    }
+    for index in 0..vision.layer_count() {
+        for group in
+            crate::qwen::vision::block_parallel_parameter_groups(vision, "model.visual", index)
+                .map_err(Error::backend)?
+        {
+            groups.push(OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(layout.group_id(1).unwrap().clone(), index),
+                group,
+            ));
+        }
+    }
+    ArchitectureParameterDescription::new(
+        &graph,
+        &layout,
+        groups.iter().map(|g| g.group().clone()),
+        groups.clone(),
+    )
+    .map_err(Error::backend)
+}
+
 pub(crate) fn vision_transport() -> ArchitectureGroupTransport {
     ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
@@ -43,6 +83,26 @@ pub(crate) fn vision_transport() -> ArchitectureGroupTransport {
         parallel_subgroup: Some(ArchitectureParallelSubgroup::TensorSharded),
         request_optional: true,
     }
+}
+
+pub(crate) fn validate_ingress(
+    spec: &super::target::TargetSpec,
+    ingress: &MediaIngress,
+    vision: &VisionConfig,
+) -> Result<(), Error> {
+    // Formats may change at selection; semantic geometry must match the retained role.
+    let mut expected = ingress.vision().config().clone();
+    let mut actual = vision.clone();
+    expected.linear_formats.clear();
+    actual.linear_formats.clear();
+    if expected != actual || vision.out_hidden_size != spec.configuration().hidden_size {
+        return Err(Error::backend(
+            "conditional vision geometry differs from retained ingress",
+        ));
+    }
+    super::media::MediaIngress::new(spec, ingress.vision().clone())
+        .map_err(Error::backend_source)?;
+    Ok(())
 }
 
 /// Pinned modules. The target owns the single vocabulary and residual readout.
@@ -174,18 +234,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
         vision: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        // Formats may change at selection; semantic geometry must match the retained role.
-        let mut expected = ingress.vision().config().clone();
-        let mut actual = vision.clone();
-        expected.linear_formats.clear();
-        actual.linear_formats.clear();
-        if expected != actual || vision.out_hidden_size != spec.geometry().config.hidden_size {
-            return Err(Error::backend(
-                "conditional vision geometry differs from retained ingress",
-            ));
-        }
-        super::media::MediaIngress::new(spec.geometry(), ingress.vision().clone())
-            .map_err(Error::backend_source)?;
+        validate_ingress(spec.geometry(), &ingress, &vision)?;
         Ok(Self {
             modules: ConditionalStatic {
                 target: TargetModel::new(spec, context)?,
@@ -409,51 +458,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
     }
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
         if let Some(parameters) = &self.global_parameters {
             return Ok(parameters.clone());
         }
-        let graph = graph()?;
-        let layout = ExecutionUnitLayout::new(&graph, [self.unit_count(0)?, self.unit_count(1)?])
-            .map_err(Error::backend)?;
-        let mut groups = self
-            .modules
-            .target
-            .parameter_description(context)?
-            .groups()
-            .to_vec();
-        for group in
-            crate::qwen::vision::static_parallel_parameter_groups(&self.vision, "model.visual")
-                .map_err(Error::backend)?
-        {
-            groups.push(OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::static_role("vision"),
-                group,
-            ));
-        }
-        for index in 0..self.vision.layer_count() {
-            for group in crate::qwen::vision::block_parallel_parameter_groups(
-                &self.vision,
-                "model.visual",
-                index,
-            )
-            .map_err(Error::backend)?
-            {
-                groups.push(OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(layout.group_id(1).unwrap().clone(), index),
-                    group,
-                ));
-            }
-        }
-        ArchitectureParameterDescription::new(
-            &graph,
-            &layout,
-            groups.iter().map(|g| g.group().clone()),
-            groups.clone(),
-        )
-        .map_err(Error::backend)
+        parameter_description(self.modules.target.definition(), &self.vision)
     }
+
     fn static_parameter_recipes(
         &self,
         source: &dyn eredu_checkpoint::store::CheckpointSource,

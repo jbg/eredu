@@ -10829,6 +10829,15 @@ publishing the changed specs; partition construction retains canonical global
 parameter placement with the actual tensor-local context geometry. Each lexical
 invocation keeps its own slot independently of the following decoder layer.
 
+`conditional::parameter_description` composes retained target storage with vision
+parameter geometry without a native context. Tensor/expert placement uses global,
+tensor-local and expert-local declarations; `TargetSpec::with_expert_realization`
+consumes geometry and validates the exact admitted expert identities before
+returning the local specification. Native target updates use the same selection
+operation. Conditional target and transform-source planning derives placement
+from these declarations. Selected conditional construction validates ingress and
+placement, then constructs the tensor-local target and vision modules directly.
+
 `DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse.
 Shared `StaticModules` owns vocabulary parameters, collectives and readout
 instrumentation. `ComponentPinnedResources` exposes the target's actual pinned
