@@ -9078,6 +9078,25 @@ no decoder state slots; text slots include the persisted mRoPE position delta.
 Target and transform-source partition preparation derive layout from the same
 cold parameter declaration.
 
+Complete and selected Qwen3-VL use one resource materializer. Selected construction
+consumes a cold partition and validates its canonical parameters, state, boundary,
+vision geometry and exact normalized local text policy before native allocation.
+Text roots retain only physical embedding, normalization and readout owners;
+tied output retains its embedding replica. Vision roots follow canonical ingress
+and merger-bank consumers. Static visitation and derived recipes follow those
+actual resources. Expert ownership is derived from cold configuration and local
+geometry. Target and transform-source composition consume the same cold partition
+used for materialization. Low-level unit/state views validate exact local policy
+and retain pinned resource ownership independently; identical retained views are
+accepted and incompatible reselection fails.
+
+One ingress equation serves serial and tensor-parallel requests. Receiving ranks
+retain explicit unavailable text products and parameter-free vision geometry;
+assembly rejects unavailable products until transport installs them. Completion
+roots retain original prepared products, rotary values, position delta and
+DeepStack values. One readout equation over borrowed decoder resources serves
+ordinary, parallel, observed and low-level output operations.
+
 Qwen3-VL's text traversal uses the ordinary Qwen decoder's component driver,
 including resident and independently supplied experts, rotary embeddings and
 local mutable state. Its architecture wrapper adds the assembled embedding and

@@ -36,14 +36,12 @@ pub use positions::{
 };
 
 /// Derives complete expert ownership and rank-local text-bank geometry from Qwen3-VL.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
-    let args = architecture.args();
     if !args.text.is_moe() {
         return Ok(None);
     }
@@ -62,13 +60,11 @@ pub fn expert_realization_plan<
     .map_err(eredu_nn::Error::backend)?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
         .map_err(eredu_nn::Error::backend)?;
-    let geometry = architecture.shared_parallel_geometry();
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in
         0..usize::try_from(args.text.num_hidden_layers).map_err(eredu_nn::Error::backend)?
     {
         let local = geometry
-            .as_deref()
             .and_then(|geometry| geometry.text().block(layer))
             .unwrap_or(&args.text);
         unit_specs.insert(

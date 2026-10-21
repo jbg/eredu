@@ -2341,14 +2341,9 @@ where
                 .collect::<Vec<_>>();
             let ownership = selected.requirements().ownership().clone();
             let rank = selected.requirements().topology();
-            let architecture =
-                crate::qwen::vl::LayeredModel::<B>::new_parallel(args.clone(), local, context)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
             let realization = if routed {
                 Some(
-                    crate::qwen::vl::expert_realization_plan(&architecture, rank)
+                    crate::qwen::vl::expert_realization_plan(&args, Some(&local), rank)
                         .map_err(|error| {
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?
@@ -2382,7 +2377,29 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let architecture = architecture.with_partition_geometry(geometry.clone());
+            let definition =
+                crate::qwen::vl::component_definition(&args, Some(&local)).map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let partition = ArchitecturePartition::from_description(
+                definition.parameters(),
+                group_ranges
+                    .iter()
+                    .map(|(group, units)| (group.as_str(), units.clone())),
+                ownership.clone(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
+                geometry.clone(),
+                crate::qwen::vl::PipelineBoundarySchema::from_args(&args),
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let architecture = crate::qwen::vl::LayeredModel::<B>::from_partition(
+                args.clone(),
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let routed_execution = realization
                 .clone()
                 .map(|plan| {
@@ -2429,7 +2446,7 @@ where
                     crate::qwen::vl::PartitionLocalFoundation::from_partition(&args, partition)
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::QwenHybrid(source) => {
@@ -2798,9 +2815,6 @@ where
         rank,
     )?;
     let local = crate::qwen::vl::local_geometry(&source, &layout).map_err(|e| e.to_string())?;
-    let mut architecture =
-        crate::qwen::vl::LayeredModel::<B>::new_parallel(source.clone(), local, context)
-            .map_err(|e| e.to_string())?;
     let ranges = || {
         selected
             .requirements()
@@ -2809,8 +2823,8 @@ where
             .map(|g| (g.group().as_str(), g.units()))
     };
     let ownership = selected.requirements().ownership();
-    let realization =
-        crate::qwen::vl::expert_realization_plan(&architecture, rank).map_err(|e| e.to_string())?;
+    let realization = crate::qwen::vl::expert_realization_plan(&source, Some(&local), rank)
+        .map_err(|e| e.to_string())?;
     let geometry = match &realization {
         Some(realization) => crate::qwen::vl::partition_local_routed_geometry(
             &source,
@@ -2831,23 +2845,26 @@ where
     {
         return Err("Qwen3-VL transform source changed partition state or ownership".into());
     }
-    architecture = architecture.with_partition_geometry(geometry.clone());
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
-        .map_err(|e| e.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
+    let definition = crate::qwen::vl::component_definition(&source, Some(&local))
+        .map_err(|error| error.to_string())?;
+    let partition = ArchitecturePartition::from_description(
+        definition.parameters(),
         ranges(),
         ownership.clone(),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry,
-        boundary,
-        &parameters,
+        crate::qwen::vl::PipelineBoundarySchema::from_args(&source),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|error| error.to_string())?;
     if selected.requirements().state() != partition.state() {
         return Err("Qwen3-VL transform source changed selected state".into());
     }
     crate::qwen::vl::PartitionLocalFoundation::from_partition(&source, &partition)
         .map_err(|e| e.to_string())?;
+    let architecture =
+        crate::qwen::vl::LayeredModel::<B>::from_partition(source, local, &partition, context)
+            .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 

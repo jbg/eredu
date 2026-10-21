@@ -5086,7 +5086,7 @@ impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
 }
 
 /// Backend-neutral geometry retained by one genuinely pipeline-local decoder.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PartitionLocalGeometry<C> {
     owned_units: Range<usize>,
     blocks: Vec<C>,
