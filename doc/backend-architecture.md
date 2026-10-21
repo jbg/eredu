@@ -10847,9 +10847,13 @@ consumes the kernel through `with_expert_realization` and `with_partition_state`
 its exact partition ownership on that same adapter. Consuming geometry updates
 keep a borrowed execution kernel aligned with its retained definition.
 
-Conditional media composition owns a raw `TargetKernel` under its enclosing
-runtime lifecycle and invokes those typed hooks directly. Its expert selection
-also consumes the composition. External prediction borrows target vocabulary
+`ConditionalModel` uses the same `ComponentAdapter` with a `ConditionalKernel`
+and `KernelParameterModules`. The kernel owns a raw `TargetKernel`, vision resources
+and request assembly under the enclosing runtime lifecycle. Typed ordinary,
+parallel, routed and partition hooks invoke those same target and vision equations.
+The adapter supplies discovery, validated addresses, ownership and state projections,
+parameter traversal and retained roots. Expert selection consumes the kernel before
+adapter assembly. External prediction borrows target vocabulary
 resources through the ordinary component adapter or the enclosing composite;
 base-width lookup and prediction projection preserve their own equations.
 `ComponentPinnedResources` exposes the conditional composition's target and vision
@@ -11043,8 +11047,8 @@ embeds only the current target span and supports cuts inside raw or projected me
 Released video framing supplies one frame per media part with processor-owned timestamps.
 Media ingress accepts initial batch-one, unpadded requests with the declared rotary policy.
 
-`ConditionalModel` composes shared vision and target under the ordinary layered/routed
-drivers. The target is canonical group zero and vision group one; graph dependencies run
+Architecture-owned composite and retained-prefill policy borrows `ConditionalKernel`
+through the shared adapter. The target is canonical group zero and vision group one; graph dependencies run
 vision before target ingress. Text/projected continuation does not acquire encoder blocks.
 Optional pass-through groups do not publish projector observations. Vision-unit, target
 internal and ingress observations use the shared traversal.

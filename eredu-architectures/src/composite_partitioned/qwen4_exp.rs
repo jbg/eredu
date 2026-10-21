@@ -1,12 +1,11 @@
 //! Flash-Next binds retained media sources to exact target and encoder placement.
 use super::*;
 use crate::qwen4_exp::{
-    conditional::ConditionalModel,
+    conditional::{ConditionalKernel, ConditionalModel},
     media::MediaIngress,
     prepared::PreparedConditionalPartition,
     target::{BoundTargetSpec, TargetTensorPartition},
 };
-use eredu_runtime::ArchitectureParameters;
 
 type GatedPlan = crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>;
 
@@ -138,7 +137,7 @@ impl PreparedConditionalPartition {
             .requirements()
             .state()
             .ok_or_else(|| invalid("Flash-Next conditional partition has no target state"))?;
-        let mut architecture = ConditionalModel::<B>::new_partitioned(
+        let mut architecture = ConditionalKernel::<B>::new_partitioned(
             bound,
             tensor.clone(),
             ingress.clone(),
@@ -152,22 +151,19 @@ impl PreparedConditionalPartition {
         architecture = architecture
             .with_expert_realization(&experts)
             .map_err(invalid)?;
-        let boundary =
-            <ConditionalModel<B> as PartitionedLayeredArchitecture<B, S>>::boundary_schema(
-                &architecture,
-            )
-            .map_err(invalid)?;
-        let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-            &architecture,
+        let boundary = architecture.target_boundary_schema().map_err(invalid)?;
+        let partition = ArchitecturePartition::from_description(
+            &parameters,
             selected
                 .requirements()
                 .groups()
                 .iter()
                 .map(|group| (group.group().as_str(), group.units())),
             selected.requirements().ownership().clone(),
+            architecture.definition().state_layout(),
+            architecture.definition().state_partition_plan(),
             tensor,
             boundary,
-            &parameters,
         )
         .map_err(invalid)?;
         if partition.state() != selected.requirements().state() {
@@ -193,7 +189,7 @@ impl PreparedConditionalPartition {
                         "Flash-Next conditional transform changed exact source placement",
                     ));
                 }
-                let mut source = ConditionalModel::<B>::new_partitioned(
+                let mut source = ConditionalKernel::<B>::new_partitioned(
                     source_bound,
                     source_tensor,
                     ingress,
@@ -207,14 +203,15 @@ impl PreparedConditionalPartition {
                 source = source
                     .with_expert_realization(&source_experts)
                     .map_err(invalid)?;
-                if source.state_layout().map_err(invalid)?
-                    != architecture.state_layout().map_err(invalid)?
-                {
+                if source.definition().state_layout() != architecture.definition().state_layout() {
                     return Err(invalid(
                         "Flash-Next conditional transform source changed local state geometry",
                     ));
                 }
-                Some((Box::new(source), source_layout))
+                Some((
+                    Box::new(source.into_model().map_err(invalid)?),
+                    source_layout,
+                ))
             } else {
                 None
             };
@@ -256,6 +253,9 @@ impl PreparedConditionalPartition {
             .keys()
             .map(|(_, unit)| (*unit, *unit))
             .collect();
+        let architecture = architecture
+            .into_partition_model(&partition)
+            .map_err(invalid)?;
         let routed = prepared_gated_composite_execution::<B, S, _>(
             &selected,
             &architecture,
@@ -276,9 +276,6 @@ impl PreparedConditionalPartition {
             target.spec().configuration().vocabulary,
         )
         .map_err(invalid)?;
-        let architecture = architecture
-            .select_partition_resources(&partition)
-            .map_err(invalid)?;
         prepare_composite_partition::<B, S, _, _, _>(
             architecture,
             source_architecture,

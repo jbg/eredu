@@ -2,7 +2,7 @@
 use super::requirements::ParameterRequirements;
 use super::*;
 use crate::qwen4_exp::{
-    conditional::{self, ConditionalModel},
+    conditional::{self, ConditionalKernel, ConditionalModel},
     media::MediaIngress,
 };
 use eredu_runtime::{ReplicatedTextParameterOwner as Owner, ReplicatedTextRequirements};
@@ -551,16 +551,18 @@ impl SelectedConditionalExecution {
             .bind_spec(plan.target.selected_spec(&selected)?)?;
         let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
             .then(|| {
-                ConditionalModel::<B>::new(
+                ConditionalKernel::<B>::new(
                     plan.target.bound_spec()?,
                     self.ingress.clone(),
                     source_vision,
                     context,
-                )
+                )?
+                .into_model()
             })
             .transpose()?;
-        let architecture = ConditionalModel::<B>::new(spec, self.ingress, vision, context)?;
-        let identity = architecture.state_fingerprint();
+        let architecture =
+            ConditionalKernel::<B>::new(spec, self.ingress, vision, context)?.into_model()?;
+        let identity = architecture.kernel().state_fingerprint();
         let prepared = crate::routed_text::prepare_routed_architecture_handoff::<B, S, _>(
             adapt(architecture),
             source_architecture.map(adapt),

@@ -9,7 +9,7 @@ use crate::composite_execution::{
 };
 use eredu_nn::{GroupedGatedProductSpec, TensorParallelGroupedNeuralBackend};
 
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
     /// Constructs modules from the exact retained target, vision and state placement.
     pub fn new_partitioned(
         spec: BoundTargetSpec,
@@ -169,7 +169,25 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
     }
 }
 
-impl<B, S> ParallelLayeredArchitecture<B, S> for ConditionalModel<B>
+impl<B, S> ParallelCompositeArchitecture<B, S> for ConditionalModel<B>
+where
+    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
+{
+    fn begin_composite_forward_parallel<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+        self.kernel().validate_parallel(parallel)?;
+        self.begin_composite_forward(input, state, context)
+    }
+}
+
+impl<B, S> ParallelComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -179,7 +197,7 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
     }
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -188,12 +206,11 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         self.validate_parallel(parallel)?;
         // Patch embeddings, vocabulary and residual ingress are replicated.
-        self.begin_forward(input, state, context)
+        self.begin(input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -201,9 +218,8 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_unit_parallel_with_provider(
-            group,
-            index,
+        self.execute_parallel_routed(
+            address,
             unit,
             hidden,
             state,
@@ -214,10 +230,9 @@ where
             context,
         )
     }
-    fn forward_unit_parallel_observed<O>(
+    fn execute_parallel_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -229,9 +244,8 @@ where
     where
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.forward_unit_parallel_observed_with_provider(
-            group,
-            index,
+        self.execute_parallel_routed_observed(
+            address,
             unit,
             hidden,
             state,
@@ -243,7 +257,7 @@ where
             observer,
         )
     }
-    fn complete_execution_group_parallel(
+    fn complete_group_parallel(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -264,10 +278,10 @@ where
             forward.projected = Some(output.embeddings.clone());
             Ok(output.embeddings)
         } else {
-            self.complete_execution_group(group, hidden, state, forward, context)
+            self.complete_group(group, hidden, state, forward, context)
         }
     }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -276,9 +290,9 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.validate_parallel(parallel)?;
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -291,11 +305,10 @@ where
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.validate_parallel(parallel)?;
-        self.finish_forward_observed(hidden, state, forward, context, observer)
+        self.finish_observed(hidden, state, forward, context, observer)
     }
 }
-
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for ConditionalModel<B>
+impl<B, S> ParallelRoutedComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -307,10 +320,9 @@ where
     fn parallel_routed_sparse_observations(&self) -> bool {
         true
     }
-    fn forward_unit_parallel_with_provider<P>(
+    fn execute_parallel_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -324,9 +336,8 @@ where
         P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.forward_unit_parallel_observed_with_provider(
-            group,
-            index,
+        self.execute_parallel_routed_observed(
+            address,
             unit,
             hidden,
             state,
@@ -338,10 +349,9 @@ where
             &mut NoopObserver,
         )
     }
-    fn forward_unit_parallel_observed_with_provider<P, O>(
+    fn execute_parallel_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -357,8 +367,9 @@ where
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let group = address.group();
+        let index = address.index();
         self.validate_parallel(parallel)?;
-        self.check_unit(group, index)?;
         match (group, unit) {
             (VISION_INDEX, ConditionalUnit::Vision(block)) => {
                 self.modules.vision.forward_block_parallel(
@@ -394,26 +405,7 @@ where
         }
     }
 }
-
-impl<B, S> ParallelCompositeArchitecture<B, S> for ConditionalModel<B>
-where
-    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
-{
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.validate_parallel(parallel)?;
-        self.begin_composite_forward(input, state, context)
-    }
-}
-
-impl<B, S> PartitionedLayeredArchitecture<B, S> for ConditionalModel<B>
+impl<B, S> PartitionComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -421,7 +413,7 @@ where
 {
     type Boundary = RequestBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, Error> {
-        self.modules.target.spec.boundary_schema()
+        self.target_boundary_schema()
     }
     fn partition_observation_hooks(
         &self,
@@ -430,18 +422,17 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
     }
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, RequestBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, RequestBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        global_state_offset: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.validate_partition_state_origin(global_state_offset)?;
-        // Composite entry identifies the global state origin. The retained
-        // target already owns this exact local view and indexes it from zero.
+        if let Some(parallel) = selected.parallel {
+            self.validate_parallel(parallel)?;
+        }
+        self.validate_partition_state_origin(selected.first_state_ordinal)?;
         self.modules
             .target
             .begin_partition(
@@ -449,37 +440,10 @@ where
                 mask,
                 state,
                 ComponentPartitionContext {
-                    expected: Some(expected),
+                    expected: selected.expected,
                     first_state_ordinal: 0,
-                    parallel: None,
-                    native: context,
-                },
-            )
-            .map(Self::wrap_target)
-    }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, RequestBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        global_state_offset: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.validate_parallel(parallel)?;
-        self.validate_partition_state_origin(global_state_offset)?;
-        self.modules
-            .target
-            .begin_partition(
-                input,
-                mask,
-                state,
-                ComponentPartitionContext {
-                    expected: Some(expected),
-                    first_state_ordinal: 0,
-                    parallel: Some(parallel),
-                    native: context,
+                    parallel: selected.parallel,
+                    native: selected.native,
                 },
             )
             .map(Self::wrap_target)
