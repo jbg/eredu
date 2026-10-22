@@ -87,7 +87,7 @@ impl PreparedDecoderPipelineBindings {
         eredu_runtime::validate_component_pipeline(
             &description,
             &partition,
-            bindings.unit_bindings().iter().map(|(address, _)| *address),
+            bindings.unit_bindings().map(|(address, _)| address),
             partition.state().map(|state| state.layout()),
             bindings.local_layout(),
             &manifest,

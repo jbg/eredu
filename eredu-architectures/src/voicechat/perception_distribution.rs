@@ -68,7 +68,7 @@ impl PreparedPerceptionPipelineBindings {
         eredu_runtime::validate_component_pipeline(
             &description,
             &partition,
-            bindings.unit_bindings().iter().map(|(address, _)| *address),
+            bindings.unit_bindings().map(|(address, _)| address),
             bindings.state_layout(),
             bindings.local_layout(),
             &manifest,

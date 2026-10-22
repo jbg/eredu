@@ -196,7 +196,6 @@ impl PreparedPerceptionRnntPipelineBindings {
         let layers = perception
             .bindings()
             .unit_bindings()
-            .iter()
             .filter(|(address, _)| address.group() == 1)
             .count() as u64;
         let perception_cache_bytes = (dimensions.block.left_context as u64)
@@ -210,7 +209,6 @@ impl PreparedPerceptionRnntPipelineBindings {
                 perception
                     .bindings()
                     .unit_bindings()
-                    .iter()
                     .flat_map(|(_, unit)| unit),
             )?,
             predictor_parameter_bytes: parameter_bytes(

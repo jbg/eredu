@@ -821,9 +821,11 @@ precision policy, special recipes and additional geometry constraints.
 RVQ, PRVQ, RNNT, RNNT projection, perception, conditioning, MoG, the TTS transformer
 and EAR encoder/decoder preparation use this shared container. Function-head
 preparation retains its primary parameter accounting alongside the same container.
-RNNT projection selects declared canonical targets and ownership. EAR, perception and TTS
-transformer stage preparation use shared global-address selection while retaining
-their family state and boundary geometry.
+RNNT projection selects declared canonical targets and ownership. EAR, perception
+and TTS transformer stages retain the selected `PreparedComponent` through the
+native handoff. Inspection and consuming transfer use its shared addressed
+binding views, restricted source and retained placement. Family stage structures
+supply configuration, precision, namespaces, local state and boundary geometry.
 
 `PreparedPerceptionBindings` validates symbolic parameter geometry against the
 admitted recipes without reading payloads or allocating native resources. It

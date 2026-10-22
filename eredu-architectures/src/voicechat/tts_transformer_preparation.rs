@@ -215,22 +215,9 @@ impl PreparedTtsTransformerBindings {
             partition,
         )?;
         let prepared = self.prepared.select_units(partition.units())?;
-        let (local_layout, layout, source, bindings) = prepared.into_unit_parts()?;
-        let units = bindings
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, bindings)| {
-                (
-                    layout.address(ordinal).expect("selected unit address"),
-                    bindings,
-                )
-            })
-            .collect();
         Ok(PreparedTtsTransformerPartitionBindings {
             config: self.config,
-            local_layout,
-            source,
-            units,
+            prepared,
             state_layout: partition.state().map(|state| state.layout().clone()),
         })
     }
@@ -271,9 +258,7 @@ impl PreparedTtsTransformerBindings {
 /// A normalization-only stage has no state and owns only its normalization recipe.
 pub struct PreparedTtsTransformerPartitionBindings {
     config: TransformerConfig,
-    local_layout: Option<LocalModelLayout>,
-    source: SharedCheckpointSource,
-    units: Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
+    prepared: PreparedComponent,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedTtsTransformerPartitionBindings {
@@ -283,15 +268,18 @@ impl PreparedTtsTransformerPartitionBindings {
     }
     /// Exact selected physical layout when tensor parallelism is also selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
     /// Source authority limited to the actual selected unit recipes.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
     /// Canonical addresses and their exact resident/bounded materialization recipes.
-    pub fn unit_bindings(&self) -> &[(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)] {
-        &self.units
+    pub fn unit_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (eredu_runtime::ExecutionUnitAddress, &[WeightBinding])>
+    {
+        self.prepared.addressed_unit_bindings()
     }
     /// Selected block cache schedule; absent for a standalone normalization stage.
     pub fn state_layout(&self) -> Option<&eredu_runtime::StateLayout> {
@@ -307,12 +295,10 @@ impl PreparedTtsTransformerPartitionBindings {
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        (
-            self.config,
-            self.local_layout,
-            self.source,
-            self.units,
-            self.state_layout,
-        )
+        let (local_layout, _, source, units) = self
+            .prepared
+            .into_addressed_unit_parts()
+            .expect("partition declares only independently leased units");
+        (self.config, local_layout, source, units, self.state_layout)
     }
 }

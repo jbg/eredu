@@ -154,23 +154,10 @@ impl PreparedEncoderBindings {
             partition,
         )?;
         let prepared = self.prepared.select_units(partition.units())?;
-        let (local_layout, layout, source, bindings) = prepared.into_unit_parts()?;
-        let units = bindings
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, bindings)| {
-                (
-                    layout.address(ordinal).expect("selected unit address"),
-                    bindings,
-                )
-            })
-            .collect();
         Ok(PreparedEncoderPartitionBindings {
             config: self.config,
             prefix: self.prefix,
-            local_layout,
-            source,
-            units,
+            prepared,
         })
     }
 
@@ -222,9 +209,7 @@ impl PreparedEncoderBindings {
 pub struct PreparedEncoderPartitionBindings {
     config: EncoderConfig,
     prefix: String,
-    local_layout: Option<LocalModelLayout>,
-    source: SharedCheckpointSource,
-    units: Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
+    prepared: PreparedComponent,
 }
 impl PreparedEncoderPartitionBindings {
     /// Global finite encoder geometry.
@@ -237,15 +222,18 @@ impl PreparedEncoderPartitionBindings {
     }
     /// Global TP declaration retained independently of selected pipeline units.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
     /// Source authority limited to owned recipes.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
     /// Global unit addresses and exact materialization recipes.
-    pub fn unit_bindings(&self) -> &[(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)] {
-        &self.units
+    pub fn unit_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (eredu_runtime::ExecutionUnitAddress, &[WeightBinding])>
+    {
+        self.prepared.addressed_unit_bindings()
     }
     /// Consumes the retained stage selection without reopening artifacts.
     #[allow(clippy::type_complexity)]
@@ -258,12 +246,10 @@ impl PreparedEncoderPartitionBindings {
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
-        (
-            self.config,
-            self.prefix,
-            self.local_layout,
-            self.source,
-            self.units,
-        )
+        let (local_layout, _, source, units) = self
+            .prepared
+            .into_addressed_unit_parts()
+            .expect("partition declares only independently leased units");
+        (self.config, self.prefix, local_layout, source, units)
     }
 }
