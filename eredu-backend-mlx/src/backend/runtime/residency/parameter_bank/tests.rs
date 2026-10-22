@@ -194,7 +194,7 @@ fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
         .collect();
-    let selected = SelectedAddressableEntries {
+    let selected = AddressableBankCatalog {
         parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
@@ -241,7 +241,7 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
         .collect();
-    let selected = SelectedAddressableEntries {
+    let selected = AddressableBankCatalog {
         parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
@@ -286,7 +286,7 @@ fn residency_report_retains_exact_selected_entry_placement() {
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
         .collect();
-    let selected = SelectedAddressableEntries {
+    let selected = AddressableBankCatalog {
         parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),

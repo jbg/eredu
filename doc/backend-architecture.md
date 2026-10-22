@@ -3479,6 +3479,15 @@ preparation consumes these entries and rebinding returns the same validated
 entry type; the backend retains native storage separately. Selected geometry,
 duplicate catalog ownership and combined budgets remain separate admissions.
 
+`AddressableBankCatalog::from_binding_plans` consumes the canonical member plans
+into the selected entries, logical destinations, transformations, executable
+extents and placements used by construction. Duplicate member ownership fails
+with the global key before materialization. Backend composition supplies native
+checkpoint recipe lowering to the shared binding planner and receives this
+neutral catalog; it does not separately assemble or maintain these projections.
+Raw catalog declarations still pass source, capability and residency preflight
+before execution.
+
 `addressable_projection_bytes` supplies the common packed payload arithmetic for
 selected member admission, backend preflight and bounded transformation sizing.
 It accounts for the declared companion precision, affine biases and MXFP4 scale

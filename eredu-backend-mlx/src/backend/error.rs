@@ -33,6 +33,9 @@ pub enum Error {
     /// Explicit prepared-input transfer exceeded portable logical limits.
     #[error(transparent)]
     InputTransfer(#[from] eredu_runtime::input_transfer::InputTransferError),
+    /// Neutral selected bank catalog construction failed.
+    #[error(transparent)]
+    AddressableBankCatalog(#[from] eredu_runtime::AddressableBankCatalogError),
     /// A portable independent bank entry declaration is invalid.
     #[error(transparent)]
     AddressableBankEntry(#[from] eredu_runtime::AddressableBankEntryError),

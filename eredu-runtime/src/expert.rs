@@ -23,7 +23,10 @@ pub use agreement::{
     AgreeingAddressableExpertProvider, AgreeingParameterProvider, ProviderAgreementRejected,
 };
 pub use banks::{RoutedBankProviderError, RoutedBankProviders};
-pub use catalog::{AddressableBankEntry, AddressableBankEntryError};
+pub use catalog::{
+    AddressableBankCatalog, AddressableBankCatalogError, AddressableBankEntry,
+    AddressableBankEntryError,
+};
 pub use quantization::{
     prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
     AddressableBankQuantizationError, AddressableBankTransformGroup, AddressableBankTransformPlan,

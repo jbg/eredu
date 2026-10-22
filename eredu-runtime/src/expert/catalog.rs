@@ -71,3 +71,82 @@ impl AddressableBankEntry {
         (self.key, self.unit, self.bytes)
     }
 }
+
+/// Failure assembling selected independent storage from canonical binding plans.
+#[derive(Debug, thiserror::Error)]
+pub enum AddressableBankCatalogError {
+    /// Multiple plans claim the same independently leased physical member.
+    #[error("selected bank catalog repeats member {key:?}")]
+    DuplicateMember {
+        /// Repeated global member identity.
+        key: ParameterBankKey,
+    },
+    /// A binding plan cannot form a valid residency unit.
+    #[error(transparent)]
+    Declaration(#[from] crate::ResidencyDeclarationError),
+    /// A selected independent entry declaration is invalid.
+    #[error(transparent)]
+    Entry(#[from] AddressableBankEntryError),
+}
+
+/// Neutral selected bank declarations for construction and parameter operations.
+/// Source, native capability, namespace and residency-budget admission consume
+/// these declarations before execution; the catalog itself owns no native value.
+#[derive(Debug, Clone)]
+pub struct AddressableBankCatalog {
+    /// Canonical destinations for local bindings and generated companions.
+    pub parameter_targets: std::collections::BTreeMap<(ParameterBankKey, String), String>,
+    /// Independent source-backed entries before selected load-time conversion.
+    pub entries: Vec<AddressableBankEntry>,
+    /// Exact selected encoding and precision for each transforming binding.
+    pub transformations:
+        std::collections::BTreeMap<(ParameterBankKey, String), super::AddressableBindingTransform>,
+    /// Selected executable byte extent of each independent member.
+    pub expected_bytes: std::collections::BTreeMap<ParameterBankKey, u64>,
+    /// Selected ownership, distribution and actual rank of each member.
+    pub placements:
+        std::collections::BTreeMap<ParameterBankKey, super::AddressableBankMemberPlacement>,
+}
+
+impl AddressableBankCatalog {
+    /// Consumes exact member plans, rejecting duplicate physical ownership and
+    /// retaining entry order, canonical destinations, transforms and byte geometry.
+    pub fn from_binding_plans(
+        plans: impl IntoIterator<Item = super::AddressableBankBindingPlan>,
+    ) -> Result<Self, AddressableBankCatalogError> {
+        let plans = plans.into_iter();
+        let mut catalog = Self {
+            parameter_targets: Default::default(),
+            entries: Vec::with_capacity(plans.size_hint().0),
+            transformations: Default::default(),
+            expected_bytes: Default::default(),
+            placements: Default::default(),
+        };
+        for plan in plans {
+            let (key, bindings, transforms, footprint, placement, targets) = plan.into_parts();
+            if catalog.expected_bytes.contains_key(&key) {
+                return Err(AddressableBankCatalogError::DuplicateMember { key });
+            }
+            catalog.parameter_targets.extend(
+                targets
+                    .into_iter()
+                    .map(|(local, target)| ((key, local), target)),
+            );
+            catalog.transformations.extend(
+                transforms
+                    .into_iter()
+                    .map(|(binding, transform)| ((key, binding), transform)),
+            );
+            catalog.entries.push(AddressableBankEntry::new(
+                key,
+                OffloadUnit::new(key.unit_id(), bindings)?,
+                footprint.source_bytes(),
+            )?);
+            catalog
+                .expected_bytes
+                .insert(key, footprint.selected_bytes());
+            catalog.placements.insert(key, placement);
+        }
+        Ok(catalog)
+    }
+}

@@ -8,10 +8,12 @@ use eredu_checkpoint::WeightQuantization;
 #[cfg(test)]
 use eredu_checkpoint::store::TensorSelection;
 use eredu_nn::GroupedNeuralBackend;
-pub use eredu_runtime::AddressableBankEntry;
+pub use eredu_runtime::{AddressableBankCatalog, AddressableBankEntry};
+#[cfg(test)]
+use eredu_runtime::OffloadUnit;
 use eredu_runtime::{
-    AddressableGroupedBank, IndexedMovement, OffloadUnit, ParameterBankAccess,
-    ParameterBankAcquisition, ResidencyReport, WeightBinding, WeightMaterializationReport,
+    AddressableGroupedBank, IndexedMovement, ParameterBankAccess, ParameterBankAcquisition,
+    ResidencyReport, WeightBinding, WeightMaterializationReport,
 };
 
 use std::{
@@ -47,7 +49,7 @@ pub(crate) use catalog::quantize_entry_catalog;
 pub(crate) use catalog::QuantizedParameterBankCatalog;
 pub use catalog::{
     entries_from_selected_members, BankAccessClass, ParameterBankKey, ParameterBankOptions,
-    ParameterBankOptionsError, SelectedAddressableEntries,
+    ParameterBankOptionsError,
 };
 use catalog::quantize_selected_entry_catalog;
 

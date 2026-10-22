@@ -86,64 +86,19 @@ pub enum ParameterBankOptionsError {
     },
 }
 
-/// Lowers generic selected storage members into MLX residency entries.
-/// MLX entry bindings paired with exact per-binding transformation selections.
-pub struct SelectedAddressableEntries {
-    /// Exact logical destinations, including companions created by selected transforms.
-    pub parameter_targets: BTreeMap<(ParameterBankKey, String), String>,
-    /// Source-backed entry catalog, before selected load-time transformations.
-    pub entries: Vec<AddressableBankEntry>,
-    /// Packed format keyed by the exact entry and local binding to transform.
-    pub transformations:
-        BTreeMap<(ParameterBankKey, String), eredu_runtime::AddressableBindingTransform>,
-    /// Neutral selected byte total for each exact member.
-    pub expected_bytes: BTreeMap<ParameterBankKey, u64>,
-    /// Exact architecture ownership retained for every selected entry.
-    pub placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
-}
-
 /// Validates and lowers exact neutral bank tasks without collapsing mechanisms.
 pub fn entries_from_selected_members(
     members: &[eredu_runtime::AddressableBankMember],
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<SelectedAddressableEntries, Error> {
+) -> Result<AddressableBankCatalog, Error> {
     let plans =
         eredu_runtime::plan_addressable_bank_bindings(members, store, |_task, recipe, source| {
             crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
         })
         .map_err(|error| Error::Other(Box::new(error)))?;
-    let mut parameter_targets = BTreeMap::new();
-    let mut entries = Vec::with_capacity(plans.len());
-    let mut transformations = BTreeMap::new();
-    let mut expected_bytes = BTreeMap::new();
-    let mut placements = BTreeMap::new();
-    for plan in plans {
-        let (key, bindings, transforms, footprint, placement, targets) = plan.into_parts();
-        parameter_targets.extend(
-            targets
-                .into_iter()
-                .map(|(local, target)| ((key, local), target)),
-        );
-        transformations.extend(
-            transforms
-                .into_iter()
-                .map(|(binding, transform)| ((key, binding), transform)),
-        );
-        entries.push(AddressableBankEntry::new(
-            key,
-            OffloadUnit::new(key.unit_id(), bindings)?,
-            footprint.source_bytes(),
-        )?);
-        expected_bytes.insert(key, footprint.selected_bytes());
-        placements.insert(key, placement);
-    }
-    Ok(SelectedAddressableEntries {
-        parameter_targets,
-        entries,
-        transformations,
-        expected_bytes,
-        placements,
-    })
+    Ok(eredu_runtime::AddressableBankCatalog::from_binding_plans(
+        plans,
+    )?)
 }
 /// Result of replacing dense entry bindings with a disk-backed packed overlay.
 pub(crate) struct QuantizedParameterBankCatalog {

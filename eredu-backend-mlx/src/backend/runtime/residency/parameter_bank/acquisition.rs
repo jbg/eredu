@@ -156,7 +156,7 @@ impl AddressableParameterBank {
     /// Creates a cache from exact per-binding selected transformation tasks.
     pub fn new_selected_shared(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        selected: SelectedAddressableEntries,
+        selected: AddressableBankCatalog,
         rows: &eredu_runtime::SelectedRowLookups,
         source_stream: Stream,
         device_stream: Stream,

@@ -751,60 +751,24 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
             Some("weight")
         );
     }
-    let targets = plans
-        .iter()
-        .flat_map(|plan| {
-            plan.parameter_targets()
-                .iter()
-                .map(move |(binding, target)| ((plan.key(), binding.clone()), target.clone()))
-        })
-        .collect();
-    let entries = plans
-        .iter()
-        .map(|plan| {
-            eredu_runtime::AddressableBankEntry::new(
-                plan.key(),
-                eredu_runtime::OffloadUnit::new(
-                    plan.key().unit_id(),
-                    plan.bindings().iter().cloned(),
-                )
-                .unwrap(),
-                plan.source_bytes(),
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let placements = plans
-        .iter()
-        .map(|plan| (plan.key(), plan.placement().clone()))
-        .collect();
-    let expected_bytes = plans
-        .iter()
-        .map(|plan| (plan.key(), plan.selected_bytes()))
-        .collect();
-    let transforms = plans
-        .iter()
-        .flat_map(|plan| {
-            plan.transformations()
-                .iter()
-                .map(move |(binding, transform)| ((plan.key(), binding.clone()), transform.clone()))
-        })
-        .collect();
+    let catalog = eredu_runtime::AddressableBankCatalog::from_binding_plans(plans).unwrap();
     eredu_runtime::validate_addressable_bank_selection(
-        entries
+        catalog
+            .entries
             .iter()
             .map(|entry| (entry.key(), entry.unit().bindings())),
-        &placements,
-        &expected_bytes,
-        &transforms,
+        &catalog.placements,
+        &catalog.expected_bytes,
+        &catalog.transformations,
         &source as &dyn CheckpointSource,
     )
     .unwrap();
     let prepared = eredu_runtime::parameter_operations::prepare_bank_parameter_members(
-        entries
+        catalog
+            .entries
             .iter()
             .map(|entry| (entry.key(), entry.unit().bindings())),
-        &targets,
+        &catalog.parameter_targets,
         &source as &dyn CheckpointSource,
     )
     .unwrap();

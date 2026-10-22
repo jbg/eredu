@@ -564,7 +564,7 @@ fn verify_prepared_row_pool(budget: u64, parallel: bool) {
     assert_eq!(prepared.requirements().scalar_bytes, 4);
     let key = ParameterBankKey::new(0, 0, 0);
     let binding = WeightBinding::new("weight", "group", TensorSelection::Full, 16).unwrap();
-    let selected = || SelectedAddressableEntries {
+    let selected = || AddressableBankCatalog {
         parameter_targets: BTreeMap::from([((key, "weight".into()), "logical.group".into())]),
         entries: vec![AddressableBankEntry::new(
             key,
@@ -630,7 +630,7 @@ fn verify_prepared_row_pool(budget: u64, parallel: bool) {
     );
     // Resident grouped operators can still share the common mechanism with a
     // row-only independent pool; no fake grouped catalog entry is required.
-    let empty = SelectedAddressableEntries {
+    let empty = AddressableBankCatalog {
         parameter_targets: BTreeMap::new(),
         entries: vec![],
         transformations: BTreeMap::new(),
