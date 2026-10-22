@@ -304,134 +304,24 @@ fn quantize_selected_entry_catalog_once(
     max_working_set_bytes: u64,
     source_stream: &Stream,
 ) -> Result<QuantizedParameterBankCatalog, Error> {
-    let mut units = Vec::with_capacity(entries.len());
-    let mut targets = Vec::new();
-    let mut target_by_binding = BTreeMap::new();
-    let mut packed_catalog_bytes = 0u64;
-    for entry in entries {
-        let (identity, unit) = entry.into_parts();
-        for binding in unit.bindings() {
-            let Some(companions) = binding.quantization_companions() else {
-                continue;
-            };
-            if !selected.contains(&(identity, binding.name().to_owned())) {
-                continue;
-            }
-            let recipe = binding.source_recipe();
-            let metadata = recipe.infer(source.as_ref())?;
-            let target_name = format!(
-                "__eredu.entry.bank.{:05}.unit.{:05}.global.{:05}.{}.weight",
-                identity.bank(),
-                identity.unit(),
-                identity.member(),
-                binding.name()
-            );
-            let target_prefix = target_name
-                .strip_suffix(".weight")
-                .expect("synthetic entry target has a weight suffix");
-            let target = BoundedQuantizationTarget::from_recipe(
-                target_name.clone(),
-                format!("{target_prefix}.scales"),
-                companions
-                    .affine_bias()
-                    .map(|_| format!("{target_prefix}.biases")),
-                recipe,
-            )?
-            .with_affine_companion_dtype(companion_dtype.clone())?;
-            packed_catalog_bytes = packed_catalog_bytes
-                .checked_add(
-                    eredu_runtime::addressable_projection_bytes(
-                        binding.name(),
-                        metadata.shape(),
-                        quantization,
-                        companion_dtype,
-                    )
-                    .map_err(|error| Error::Other(Box::new(error)))?,
-                )
-                .ok_or_else(|| {
-                    Error::Quantization("packed entry catalog size overflowed".into())
-                })?;
-            target_by_binding.insert(
-                (identity, binding.name().to_string()),
-                (
-                    target.clone(),
-                    companions.scale().to_owned(),
-                    companions.affine_bias().map(str::to_owned),
-                ),
-            );
-            targets.push(target);
-        }
-        units.push((identity, unit));
-    }
-    if targets.is_empty() {
-        return Err(Error::Quantization(
-            "entry catalog contains no floating projection bindings to quantize".into(),
-        ));
-    }
-    let plan = BoundedQuantizationPlan::new(
-        quantization,
-        max_working_set_bytes.min(packed_catalog_bytes),
-        targets,
-    )?;
+    let (plan, bindings) = eredu_runtime::prepare_addressable_bank_quantization(
+        source.as_ref(),
+        entries.into_iter().map(ParameterBankEntry::into_parts),
+        eredu_runtime::AddressableBindingTransform::new(quantization, companion_dtype.clone()),
+        selected,
+        max_working_set_bytes,
+    )
+    .map_err(|error| Error::Other(Box::new(error)))?;
     let (store, report) = prepare_quantized_source(source, plan, source_stream)?;
-    let mut rebuilt = Vec::with_capacity(units.len());
-    for (identity, unit) in units {
-        let mut bindings = Vec::new();
-        for binding in unit.bindings() {
-            let Some((target, scales_name, biases_name)) =
-                target_by_binding.get(&(identity, binding.name().to_string()))
-            else {
-                bindings.push(binding.clone());
-                continue;
-            };
-            bindings.push(packed_binding(
-                binding.name(),
-                target.weight_name(),
-                store.as_ref(),
-            )?);
-            bindings.push(packed_binding(
-                scales_name,
-                target.scales_name(),
-                store.as_ref(),
-            )?);
-            if let Some(biases_name) = biases_name {
-                bindings.push(packed_binding(
-                    biases_name,
-                    target
-                        .biases_name()
-                        .expect("affine entry target declared a bias identity"),
-                    store.as_ref(),
-                )?);
-            }
-        }
-        let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                Error::Quantization("quantized entry catalog byte total overflowed".into())
-            })
-        })?;
-        rebuilt.push(ParameterBankEntry::new(
-            identity,
-            OffloadUnit::new(identity.unit_id(), bindings)?,
-            bytes,
-        )?);
-    }
+    let rebuilt = bindings
+        .bind(store.as_ref())
+        .map_err(|error| Error::Other(Box::new(error)))?
+        .into_iter()
+        .map(|(identity, unit, bytes)| ParameterBankEntry::new(identity, unit, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(QuantizedParameterBankCatalog {
         store,
         entries: rebuilt,
         report,
     })
-}
-
-fn packed_binding(
-    local_name: &str,
-    checkpoint_key: &str,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<WeightBinding, Error> {
-    let metadata = store.source_metadata(checkpoint_key)?;
-    Ok(WeightBinding::new(
-        local_name,
-        checkpoint_key,
-        TensorSelection::Full,
-        metadata.encoded_byte_len,
-    )?)
 }

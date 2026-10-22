@@ -4,7 +4,9 @@
 //! inspected once per grouped block, validated before acquisition, coalesced in
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
-use eredu_checkpoint::{store::TensorSelection, WeightQuantization};
+use eredu_checkpoint::WeightQuantization;
+#[cfg(test)]
+use eredu_checkpoint::store::TensorSelection;
 use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
     AddressableGroupedBank, IndexedMovement, OffloadUnit, ParameterBankAccess,
@@ -29,9 +31,7 @@ use crate::MlxTensor;
 use crate::{
     backend::error::Error,
     backend::nn::shared::MlxNeuralBackend,
-    backend::runtime::checkpoint::bounded_quantization::{
-        prepare_quantized_source, BoundedQuantizationPlan, BoundedQuantizationTarget,
-    },
+    backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source,
     backend::runtime::residency::manager::{ResidencyError, ResidencyManager, ResidentTransfer},
 };
 use eredu_core::residency::{

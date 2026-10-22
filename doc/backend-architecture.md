@@ -3456,6 +3456,15 @@ companion precision, and materialization consumes those same values. Backend
 code supplies the native converter without maintaining a second transformation
 description or reselecting precision.
 
+`prepare_addressable_bank_quantization` constructs bounded checkpoint targets
+from the selected independent units and transformation choice. Runtime namespaces
+synthetic packed outputs by global bank identity and retains a consuming
+`AddressableBankQuantizationBindings` rewrite. Native materialization executes the
+returned checkpoint plan; the rewrite then binds final packed source metadata,
+preserving unselected recipes and independent residency units. Catalog sizing and
+binding reconstruction use shared checked geometry; native code owns conversion,
+source publication, streams and completion.
+
 `addressable_projection_bytes` supplies the common packed payload arithmetic for
 selected member admission, backend preflight and bounded transformation sizing.
 It accounts for the declared companion precision, affine biases and MXFP4 scale

@@ -275,6 +275,10 @@ pub use expert::{
 };
 pub use expert::{validate_addressable_bank_selection, AddressableBankSelectionError};
 pub use expert::{
+    prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
+    AddressableBankQuantizationError,
+};
+pub use expert::{
     select_routes_with_observer, select_routes_with_provider, with_exchanged_unit_observer,
     with_partition_unit_observer, RoutedUnitOrigin, RoutedUnitOrigins,
 };
