@@ -1,6 +1,10 @@
 //! Backend-neutral checkpoint materialization and parameter binding.
 
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use eredu_checkpoint::{
     recipe::{
@@ -974,6 +978,67 @@ impl PreparedParameterRecipes {
         Ok(Self { source, recipes })
     }
 
+    /// Transforms recipes without changing canonical parameter identities or
+    /// borrowing physical inputs outside this retained owner's authority.
+    /// Family hooks receive only metadata and supply equations such as exact
+    /// rank-local range selection; they cannot acquire payloads through this view.
+    /// The result validates transformed outputs and narrows source authority to
+    /// their actual inputs without reading payloads or allocating native values.
+    pub fn map_recipes<E>(
+        self,
+        scope: impl Into<String>,
+        mut transform: impl FnMut(
+            &str,
+            &DerivedWeightRecipe,
+            &dyn RecipeCatalog,
+        ) -> Result<DerivedWeightRecipe, E>,
+    ) -> Result<Self, E>
+    where
+        E: From<RecipeBindingError>,
+    {
+        struct MetadataView<'a>(&'a dyn CheckpointSource);
+        impl RecipeCatalog for MetadataView<'_> {
+            fn tensor_metadata(
+                &self,
+                key: &str,
+            ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
+                self.0.source_metadata(key)
+            }
+            fn recipe_cache(&self) -> Option<&eredu_checkpoint::recipe::RecipeInferenceCache> {
+                self.0.recipe_cache()
+            }
+        }
+        let catalog = MetadataView(self.source.as_ref());
+        let recipes = self
+            .recipes
+            .into_iter()
+            .map(|(name, recipe)| transform(&name, &recipe, &catalog).map(|recipe| (name, recipe)))
+            .collect::<Result<_, E>>()?;
+        Self::new(scope, self.source, recipes).map_err(E::from)
+    }
+
+    /// Projects retained canonical parameter identities without transforming their
+    /// recipes. Empty selections are valid; unknown identities fail explicitly.
+    /// Deferred reads retain the original exact metadata and provenance guards.
+    pub fn project(
+        mut self,
+        scope: impl Into<String>,
+        targets: &BTreeSet<String>,
+    ) -> Result<Self, RecipeBindingError> {
+        let recipes = targets
+            .iter()
+            .map(|target| {
+                self.recipes
+                    .remove(target)
+                    .map(|recipe| (target.clone(), recipe))
+                    .ok_or_else(|| RecipeBindingError::UnknownParameter {
+                        target: target.clone(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        Self::new(scope, self.source, recipes)
+    }
+
     /// Exact restricted metadata and provenance authority for deferred binding.
     pub fn source(&self) -> &SharedCheckpointSource {
         &self.source
@@ -1044,6 +1109,12 @@ pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
 /// Failure preparing exact source authority or lowering atomic recipe bindings.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeBindingError {
+    /// An identity projection names a parameter outside the retained owner.
+    #[error("parameter {target:?} is absent from the prepared recipe owner")]
+    UnknownParameter {
+        /// Canonical parameter identity requested by the projection.
+        target: String,
+    },
     /// Exact physical source authority cannot be restricted.
     #[error(transparent)]
     Source(#[from] StoreError),

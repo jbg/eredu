@@ -35,11 +35,18 @@ impl PreparedTarget {
     ) -> Result<PreparedTensorTarget, PreparationError> {
         let source_bound = self.bound_spec()?;
         let bound = source_bound.tensor_partition(&partition)?;
-        let static_parameters = partition_owner(&self.static_parameters, &partition)?;
+        let partition_owner = |owner: &PreparedParameterRecipes| {
+            owner
+                .clone()
+                .map_recipes("qwen4_exp prepared owner", |name, recipe, source| {
+                    partition_recipe(source, name, recipe, partition.parameter_selections(name))
+                })
+        };
+        let static_parameters = partition_owner(&self.static_parameters)?;
         let units = self
             .units
             .iter()
-            .map(|owner| partition_owner(owner, &partition))
+            .map(partition_owner)
             .collect::<Result<_, _>>()?;
         let expert_banks = self
             .expert_banks
@@ -150,28 +157,6 @@ impl PreparedTensorTarget {
     ) -> Result<PreparedRowLookup, PreparationError> {
         self.source.row_lookup(layer, limits, policy)
     }
-}
-fn partition_owner(
-    owner: &PreparedParameterRecipes,
-    partition: &TargetTensorPartition,
-) -> Result<PreparedParameterRecipes, PreparationError> {
-    let recipes = owner
-        .recipes()
-        .iter()
-        .map(|(name, recipe)| {
-            Ok((
-                name.clone(),
-                partition_recipe(
-                    owner.source().as_ref(),
-                    name,
-                    recipe,
-                    partition.parameter_selections(name),
-                )?,
-            ))
-        })
-        .collect::<Result<_, PreparationError>>()?;
-    PreparedParameterRecipes::new("qwen4_exp prepared owner", owner.source().clone(), recipes)
-        .map_err(PreparationError::from)
 }
 pub(super) fn partition_recipe<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
     catalog: &C,

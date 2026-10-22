@@ -647,7 +647,7 @@ mod component_preparation {
     #[test]
     fn resource_preparation_keeps_independent_materializations_and_scopes_aliases() {
         use super::{AtomicUsize, Ordering, Source};
-        use eredu_checkpoint::recipe::RecipeAlias;
+        use eredu_checkpoint::{recipe::RecipeAlias, store::CheckpointSource};
         use eredu_runtime::{
             prepare_resource_bindings, ParameterResourceRecipes, PreparedParameterRecipes,
             WeightBindingPlan,
@@ -671,6 +671,74 @@ mod component_preparation {
         .unwrap();
         assert_eq!(owner.source().source_keys(), ["shared"]);
         assert!(owner.source().source_metadata("neighbor").is_err());
+        let targets = ["owner".to_owned()].into_iter().collect();
+        let projected = owner.clone().project("same owner", &targets).unwrap();
+        assert_eq!(projected.recipes(), owner.recipes());
+        assert_eq!(projected.source().source_keys(), ["shared"]);
+        assert!(matches!(
+            owner.clone().project("foreign", &["peer".into()].into_iter().collect()),
+            Err(eredu_runtime::RecipeBindingError::UnknownParameter { target }) if target == "peer"
+        ));
+        assert!(owner
+            .clone()
+            .map_recipes("foreign input", |_, _, _| {
+                Ok::<_, eredu_runtime::RecipeBindingError>(DerivedWeightRecipe::source(
+                    "neighbor",
+                    TensorSelection::Full,
+                ))
+            })
+            .is_err());
+        let both = PreparedParameterRecipes::new(
+            "two sources",
+            original.clone(),
+            BTreeMap::from([
+                ("owner".into(), recipe()),
+                (
+                    "peer".into(),
+                    DerivedWeightRecipe::source("neighbor", TensorSelection::Full),
+                ),
+            ]),
+        )
+        .unwrap();
+        let selected = both
+            .map_recipes("local recipes", |_, recipe, source| {
+                Ok::<_, eredu_runtime::RecipeBindingError>(recipe.select_bounded(
+                    source,
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 2,
+                        end: 4,
+                    },
+                )?)
+            })
+            .unwrap()
+            .project("peer only", &["peer".into()].into_iter().collect())
+            .unwrap();
+        assert_eq!(selected.source().source_keys(), ["neighbor"]);
+        assert_eq!(
+            selected.source().source_provenance("neighbor").unwrap(),
+            original.source_provenance("neighbor").unwrap()
+        );
+        assert_eq!(
+            selected.recipes()["peer"]
+                .infer(selected.source().as_ref())
+                .unwrap()
+                .shape(),
+            [2, 2]
+        );
+        let recipes = selected.recipes().clone();
+        let selected = selected
+            .project(
+                "same local selection",
+                &["peer".into()].into_iter().collect(),
+            )
+            .unwrap();
+        assert_eq!(selected.recipes(), &recipes);
+        let empty_projection = selected
+            .project("empty projection", &Default::default())
+            .unwrap();
+        assert!(empty_projection.source().source_keys().is_empty());
+        assert!(empty_projection.recipes().is_empty());
         let empty = PreparedParameterRecipes::new("empty owner", original.clone(), BTreeMap::new())
             .unwrap();
         assert!(empty.source().source_keys().is_empty());

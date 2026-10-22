@@ -817,7 +817,14 @@ projection ingress captures the raw encoder result alongside its projected outpu
 exact metadata and provenance before deferred payload access. Runtime's
 `PreparedParameterRecipes` couples this authority with validated family-resolved
 recipes for one ordinary, expert or pinned owner. Empty owners retain an empty
-source. Shared resource binding preparation uses the same checkpoint snapshot
+source. Consuming `map_recipes` applies family-authored transformations while
+preserving canonical targets, validating outputs and narrowing authority to the
+transformed recipes' physical inputs. It cannot introduce a neighboring owner's
+sources. Consuming `project` selects existing canonical parameter identities,
+keeps their recipes and exact source guards, and rejects unknown targets. Qwen4
+target and prediction tensor partitions use the shared transformation traversal;
+prediction vocabulary derives from the retained target owner through identity
+projection. Shared resource binding preparation uses the same checkpoint snapshot
 primitive while keeping aliases local to each independently leased resource.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
 retention primitive. The family checks admitted table headers and provenance

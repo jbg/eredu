@@ -27,27 +27,11 @@ impl PreparedPrediction {
             .units
             .iter()
             .map(|owner| {
-                let recipes = owner
-                    .recipes()
-                    .iter()
-                    .map(|(name, recipe)| {
-                        Ok((
-                            name.clone(),
-                            partition_recipe(
-                                owner.source().as_ref(),
-                                name,
-                                recipe,
-                                partition.parameter_selections(name),
-                            )?,
-                        ))
+                owner
+                    .clone()
+                    .map_recipes("qwen4_exp prepared owner", |name, recipe, source| {
+                        partition_recipe(source, name, recipe, partition.parameter_selections(name))
                     })
-                    .collect::<Result<_, PreparationError>>()?;
-                PreparedParameterRecipes::new(
-                    "qwen4_exp prepared owner",
-                    owner.source().clone(),
-                    recipes,
-                )
-                .map_err(PreparationError::from)
             })
             .collect::<Result<_, PreparationError>>()?;
         let expert_banks = self

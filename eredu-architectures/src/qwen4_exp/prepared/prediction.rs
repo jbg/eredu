@@ -54,7 +54,7 @@ impl PreparedTarget {
                 name.starts_with("model.embed_tokens.")
                     || (self.spec.head.is_some() && name.starts_with("lm_head."))
             })
-            .map(|(name, recipe)| (name.clone(), recipe.clone()))
+            .map(|(name, _)| name.clone())
             .collect();
         let units = recipes
             .iter()
@@ -74,11 +74,10 @@ impl PreparedTarget {
                 self.artifact.clone(),
                 shared.clone(),
             )?,
-            vocabulary: PreparedParameterRecipes::new(
-                "qwen4_exp prepared owner",
-                self.artifact.clone(),
-                vocabulary,
-            )?,
+            vocabulary: self
+                .static_parameters
+                .clone()
+                .project("qwen4_exp prepared owner", &vocabulary)?,
             units,
             artifact: self.artifact.clone(),
             expert_banks: self
