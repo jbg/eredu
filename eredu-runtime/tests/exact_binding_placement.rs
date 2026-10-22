@@ -237,6 +237,71 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
         groups.clone(),
     )
     .unwrap();
+    // Parameter lookup uses canonical aliases and companions independently of
+    // rank-local task order or checkpoint source sharing.
+    let aliased = |aliases| {
+        let first = &tasks[0];
+        ReplicatedTextMaterializationTask::from_exact_source(
+            first.name(),
+            first.physical_sources()[0].clone(),
+            aliases,
+            first.logical_shape().to_vec(),
+            first.physical_shape().to_vec(),
+            first.role(),
+            first.owner().clone(),
+            first.executable(),
+            first.lowering(),
+            first.lowering_descriptor().clone(),
+        )
+        .unwrap()
+    };
+    let mut lookup_tasks = tasks.clone();
+    lookup_tasks[0] = aliased(vec!["first-consumer".into()]);
+    let index = eredu_runtime::ParameterMemberIndex::new(
+        &lookup_tasks,
+        std::sync::Arc::new(description.clone()),
+    );
+    for (query, canonical) in [
+        ("first-consumer", "first"),
+        ("first", "first"),
+        ("encoded.scales", "encoded.scales"),
+        ("encoded.biases", "encoded.biases"),
+        ("third", "third"),
+    ] {
+        let retained = index.resolve(query).unwrap();
+        let borrowed =
+            eredu_runtime::resolve_parameter_member(&lookup_tasks, &description, query).unwrap();
+        assert_eq!(retained.member.target(), canonical);
+        assert_eq!(retained.group.owner(), borrowed.group.owner());
+        assert_eq!(retained.member, borrowed.member);
+    }
+    assert!(matches!(
+        index.resolve("missing"),
+        Err(eredu_core::parameters::ParameterError::Missing(_))
+    ));
+    lookup_tasks.clear();
+    assert_eq!(
+        index.resolve("first-consumer").unwrap().member.target(),
+        "first"
+    );
+    let duplicate = vec![tasks[0].clone(), tasks[0].clone()];
+    let ambiguous = eredu_runtime::ParameterMemberIndex::new(
+        &duplicate,
+        std::sync::Arc::new(description.clone()),
+    );
+    assert!(matches!(
+        ambiguous.resolve("first"),
+        Err(eredu_core::parameters::ParameterError::Invalid(_))
+    ));
+    let ambiguous_alias = vec![aliased(vec!["third".into()])];
+    let ambiguous = eredu_runtime::ParameterMemberIndex::new(
+        &ambiguous_alias,
+        std::sync::Arc::new(description.clone()),
+    );
+    assert!(matches!(
+        ambiguous.resolve("first"),
+        Err(eredu_core::parameters::ParameterError::Invalid(_))
+    ));
     let rank = eredu_core::ParallelRankTopology::new(
         eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
         1,

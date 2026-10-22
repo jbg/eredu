@@ -286,9 +286,9 @@ impl CompatibleExternalAssistantPreparation {
             .map_err(invalid_assistant)?
             .parameters()
             .clone();
-        let index = crate::parameter_partition::ParameterMemberIndex::new(
+        let index = eredu_runtime::ParameterMemberIndex::new(
             execution.text_realization().materialization_tasks(),
-            &parameters,
+            std::sync::Arc::new(parameters.clone()),
         );
         let description = super::static_placement::TargetStaticDescription::muse(&args);
         for (kind, shape) in invocations {

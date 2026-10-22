@@ -360,7 +360,7 @@ impl SelectedExecution {
         parameters: &eredu_runtime::ArchitectureParameterDescription,
         parameter: &str,
         global_rank: usize,
-        index: Option<&crate::parameter_partition::ParameterMemberIndex>,
+        index: Option<&eredu_runtime::ParameterMemberIndex>,
         reservation: &mut impl eredu_core::capture::CaptureReservation,
     ) -> Result<
         Option<crate::parameter_partition::ParameterPartitionLayout>,

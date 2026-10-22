@@ -528,6 +528,8 @@ pub mod workspace_resources;
 
 mod parameter_bank;
 mod parameter_acquisition;
+mod parameter_members;
+pub use parameter_members::{resolve_parameter_member, ParameterMemberIndex, ResolvedParameterMember};
 pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};
 
 /// Bounded row-addressable parameter lookup.

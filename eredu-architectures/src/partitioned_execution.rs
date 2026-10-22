@@ -8462,93 +8462,8 @@ pub(crate) trait TextRequirements {
     fn text(&self) -> &eredu_runtime::ReplicatedTextRequirements;
 }
 
-/// Parameter coordinates use the same group layout and pipeline ownership
-/// compiler as construction. Only the requested atomic parameter group is lowered.
-struct ResolvedParameterMember<'a> {
-    task: &'a eredu_runtime::ReplicatedTextMaterializationTask,
-    companion: Option<&'a eredu_runtime::ReplicatedTextOutputCompanion>,
-    group: &'a eredu_runtime::OwnedParameterGroupSpec,
-    member: &'a eredu_runtime::ParameterMemberSpec,
-}
-
-fn resolve_parameter_member<'a>(
-    tasks: &'a [eredu_runtime::ReplicatedTextMaterializationTask],
-    parameters: &'a eredu_runtime::ArchitectureParameterDescription,
-    parameter: &str,
-    index: Option<&crate::parameter_partition::ParameterMemberIndex>,
-) -> Result<ResolvedParameterMember<'a>, eredu_core::parameters::ParameterError> {
-    use crate::parameter_partition::invalid;
-    use eredu_core::parameters::ParameterError;
-    let (task, companion) = if let Some(index) = index {
-        index.output(tasks, parameter)?
-    } else {
-        let mut matching = tasks
-            .iter()
-            .flat_map(|task| {
-                std::iter::once((task, None)).chain(
-                    task.output_companions()
-                        .iter()
-                        .map(move |companion| (task, Some(companion))),
-                )
-            })
-            .filter(|(task, companion)| match companion {
-                Some(companion) => companion.name() == parameter,
-                None => {
-                    task.name() == parameter
-                        || task.aliases().iter().any(|alias| alias == parameter)
-                }
-            });
-        let (task, companion) = matching
-            .next()
-            .ok_or_else(|| ParameterError::Missing(parameter.into()))?;
-        if matching.next().is_some() {
-            return Err(invalid(
-                "parameter identity resolves to multiple selected tasks",
-            ));
-        }
-        (task, companion)
-    };
-    let logical = companion.map_or_else(
-        || task.logical_shape(),
-        |companion| companion.logical_shape(),
-    );
-    if logical.len() > 32 || logical.contains(&0) {
-        return Err(invalid("selected effective parameter geometry is invalid"));
-    }
-    let (group, member) = if let Some(index) = index {
-        index.member(parameters, task, companion, parameter)?
-    } else {
-        let mut matching = parameters
-            .groups()
-            .iter()
-            .flat_map(|group| group.members().iter().map(move |member| (group, member)))
-            .filter(|(_, member)| match companion {
-                Some(companion) => member.target() == companion.name(),
-                None => {
-                    member.target() == task.name()
-                        || task.aliases().iter().any(|alias| alias == member.target())
-                }
-            });
-        let (group, member) = matching
-            .next()
-            .ok_or_else(|| ParameterError::Missing(parameter.into()))?;
-        if matching.next().is_some() {
-            return Err(invalid(
-                "selected parameter aliases resolve to multiple module slots",
-            ));
-        }
-        (group, member)
-    };
-    Ok(ResolvedParameterMember {
-        task,
-        companion,
-        group,
-        member,
-    })
-}
-
 fn parameter_member_layout(
-    resolved: ResolvedParameterMember<'_>,
+    resolved: eredu_runtime::ResolvedParameterMember<'_>,
     topology: ParallelRankTopology,
     placement: ParallelRankTopology,
     owns: bool,
@@ -8563,7 +8478,7 @@ fn parameter_member_layout(
         ParameterPartitionLayout,
     };
     use eredu_core::parameters::ParameterError;
-    let ResolvedParameterMember {
+    let eredu_runtime::ResolvedParameterMember {
         task,
         companion,
         group,
@@ -8660,7 +8575,7 @@ pub(crate) fn prediction_parameter_layout_for_rank(
             "prepared prediction has no parameter placement compiler".into(),
         )
     })?;
-    let resolved = resolve_parameter_member(tasks, parameters, parameter, None)?;
+    let resolved = eredu_runtime::resolve_parameter_member(tasks, parameters, parameter)?;
     let tensor = eredu_core::ParallelTopology::new(topology.tensor_parallel_size(), 1, 1, 1)
         .map_err(|error| invalid(&error.to_string()))?;
     let placement = ParallelRankTopology::new(tensor, topology.tensor_parallel_rank())
@@ -8693,7 +8608,7 @@ pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
     parameters: &eredu_runtime::ArchitectureParameterDescription,
     parameter: &str,
     global_rank: usize,
-    index: Option<&crate::parameter_partition::ParameterMemberIndex>,
+    index: Option<&eredu_runtime::ParameterMemberIndex>,
     authored: Option<&eredu_runtime::LocalModelLayout>,
     reservation: &mut impl eredu_core::capture::CaptureReservation,
 ) -> Result<
@@ -8711,7 +8626,10 @@ pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
             "parameter declaration differs from retained execution",
         ));
     }
-    let resolved = resolve_parameter_member(tasks, parameters, parameter, index)?;
+    let resolved = match index {
+        Some(index) => index.resolve(parameter)?,
+        None => eredu_runtime::resolve_parameter_member(tasks, parameters, parameter)?,
+    };
     let group = resolved.group;
     let member = resolved.member;
     let text = admission.execution.text();

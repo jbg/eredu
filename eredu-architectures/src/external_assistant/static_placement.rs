@@ -215,7 +215,7 @@ impl PreparedTargetStaticPlacement {
     pub(super) fn prepare_cold(
         selected: &crate::SelectedExecution,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
-        index: &crate::parameter_partition::ParameterMemberIndex,
+        index: &eredu_runtime::ParameterMemberIndex,
         description: &TargetStaticDescription,
         kind: Kind,
     ) -> Result<Option<Self>, Error> {

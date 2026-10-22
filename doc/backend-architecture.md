@@ -859,6 +859,15 @@ duplicate canonical destinations are rejected.
 GPT-OSS rank-local expert preparation uses this shared projection. Shared resource
 binding preparation uses the same checkpoint snapshot primitive while keeping
 aliases local to each independently leased resource.
+Runtime's `resolve_parameter_member` resolves selected primary outputs, aliases
+and companions to their canonical parameter groups and module slots, rejecting
+ambiguous identities and invalid effective geometry. `ParameterMemberIndex`
+retains immutable selected tasks and the validated parameter declaration for
+repeated lookup; callers cannot supply replacement slices to that index.
+Partitioned discovery and assistant static admission consume this shared
+resolution. Architectures retain effective coordinate derivation, semantic
+placement and pipeline ownership policy. Resolution inspects metadata and grants
+no parameter value, editing, checkpoint or native resource authority.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
 retention primitive. The family checks admitted table headers and provenance
 before bounded literal reads; controls and scales retain separate exact source

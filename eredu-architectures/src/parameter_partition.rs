@@ -1,7 +1,6 @@
 //! Effective parameter coordinates derived from the actual selected layout.
 //!
 //! These declarations contain no loaded-session, epoch or communication authority.
-mod index;
 use eredu_core::{
     capture::{CaptureReservation, CaptureUsage},
     component::ComponentCoordinateMap,
@@ -9,7 +8,6 @@ use eredu_core::{
     ParallelRankTopology,
 };
 use eredu_runtime::{LocalTensorLayout, ReplicatedTextMaterializationTask, TensorPlacement};
-pub(crate) use index::ParameterMemberIndex;
 
 /// One rank's parameter ownership, including nonlocal pipeline stages.
 #[derive(Debug, Clone, PartialEq, Eq)]
