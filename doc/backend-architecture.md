@@ -11203,6 +11203,13 @@ rejects duplicate physical bindings and repeated canonical ownership within a me
 Metadata retains source order; replacement rows follow global member-key order, matching
 full parameter assembly for sparse or unsorted selections. Native compact access consumes
 these addresses and checks its indexing width before slicing a replacement tensor.
+`BankParameterReadPlan` resolves all requested canonical identities against exact
+bank/unit ownership before native work. Its shared traversal supplies replacement
+values or copies members sequentially in prepared order, assembles each full parameter,
+and retains completed values through the ordinary slot operation. Callers admit output
+and workspace budgets first; native copy hooks retain source loans through safe
+completion, and native assembly hooks supply completed values. Selection errors retain
+the canonical identity and required owner. Reading slots publishes no parameter handles.
 
 `prepare_bank_parameter_replacements` consumes backend-observed replacement facts
 and retained canonical member metadata to validate floating member geometry and

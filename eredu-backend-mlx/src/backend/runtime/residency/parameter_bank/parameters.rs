@@ -1,7 +1,7 @@
 //! Parameter work over retained members, independent of routing and cache eviction.
 use super::*;
 use eredu_runtime::parameter_operations::{
-    ParameterSlotOperation, PreparedBankParameter, PreparedParameterLocation,
+    BankParameterReadPlan, ParameterSlotOperation, PreparedBankParameter,
 };
 use std::collections::BTreeSet;
 
@@ -24,21 +24,8 @@ impl SharedAddressableParameterBank {
         if !self.owns_parameter_bank(bank) {
             return Ok(false);
         }
-        let location = PreparedParameterLocation::Bank { bank, unit };
-        let parameters = selected
-            .iter()
-            .map(|id| {
-                parameters
-                    .iter()
-                    .find(|parameter| {
-                        parameter.slot.parameter.id.as_str() == id
-                            && parameter.slot.location == location
-                    })
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel("selected bank parameter owner differs".into())
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let plan = BankParameterReadPlan::new(bank, unit, parameters, selected)
+            .map_err(|source| Error::Other(Box::new(source)))?;
         let (manager, replacements) = {
             let bank = self.inner.lock().map_err(|_| {
                 Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
@@ -53,17 +40,12 @@ impl SharedAddressableParameterBank {
                 .collect::<BTreeMap<_, _>>();
             (bank.manager.clone(), replacements)
         };
-        let mut values = Vec::with_capacity(parameters.len());
-        for parameter in parameters {
-            if let Some(value) = replacements.get(parameter.slot.parameter.id.as_str()) {
-                values.push((parameter.slot.parameter.clone(), value.clone()));
-                continue;
-            }
-            let mut copies = Vec::with_capacity(parameter.members.len());
-            for member in &parameter.members {
+        plan.with_slots(
+            |parameter| replacements.get(parameter).cloned(),
+            |member| {
                 let transfer = manager
                     .acquire_many_with_transfer(&[(member.key.unit_id(), 1)], MemoryTier::Device)?;
-                let value = crate::backend::runtime::execution::generic::with_parameter_transfer(
+                crate::backend::runtime::execution::generic::with_parameter_transfer(
                     transfer,
                     stream,
                     |lease| {
@@ -73,21 +55,15 @@ impl SharedAddressableParameterBank {
                         value.evaluated()?;
                         Ok(value)
                     },
-                )?;
-                copies.push(value);
-            }
-            let value = concatenate_axis(&copies, 0, stream)?;
-            value.evaluated()?;
-            values.push((
-                parameter.slot.parameter.clone(),
-                MlxTensor::from_array(value),
-            ));
-        }
-        operation(&mut |visitor| {
-            for (metadata, value) in &mut values {
-                visitor.visit_slot(metadata.clone(), value);
-            }
-        })?;
+                )
+            },
+            |copies| {
+                let value = concatenate_axis(&copies, 0, stream)?;
+                value.evaluated()?;
+                Ok(MlxTensor::from_array(value))
+            },
+            operation,
+        )?;
         Ok(true)
     }
 }

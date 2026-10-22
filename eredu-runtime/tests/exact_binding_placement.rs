@@ -793,6 +793,33 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
         [2, 3]
     );
 
+    // Full reads follow canonical member order through the shared slot driver.
+    struct ReadSlots(Vec<(String, Vec<usize>)>);
+    impl eredu_nn::ParameterSlotVisitor<Vec<usize>> for ReadSlots {
+        fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut Vec<usize>) {
+            self.0
+                .push((metadata.id.as_str().to_owned(), value.clone()));
+        }
+    }
+    let read = eredu_runtime::parameter_operations::BankParameterReadPlan::new(
+        1,
+        7,
+        &parameters,
+        &BTreeSet::from(["weight".to_owned()]),
+    )
+    .unwrap();
+    let mut slots = ReadSlots(Vec::new());
+    read.with_slots(
+        |_| None,
+        |member| Ok::<_, Infallible>(member.key.member()),
+        |copies| Ok(copies),
+        &mut |traversal| {
+            traversal(&mut slots);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(slots.0, [("weight".to_owned(), vec![2, 3])]);
     // Final independently leased inputs enter the ordinary controller with their
     // sparse global identities and shared checkpoint authority intact.
     let (members, definitions, rows, plan) = residency.into_parts();
