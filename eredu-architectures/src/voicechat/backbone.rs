@@ -34,6 +34,9 @@ pub enum BackbonePreparationError {
     /// Retained recipe metadata cannot be evaluated.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
+    /// Shared canonical component preparation failed.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentPreparationError),
     /// Exact source restriction failed.
     #[error(transparent)]
     Source(#[from] StoreError),

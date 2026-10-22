@@ -1110,10 +1110,16 @@ backbone source, projects names through Nemotron's common naming contract and
 separates static and per-layer recipes. Canonical VoiceChat transformations are
 preserved, including exactly one reconstruction of split-GGUF Mamba `A_log`.
 No backend detects source layout or reopens a checkpoint to make this projection.
-Its construction driver validates retained static and per-layer recipes against
-the ordinary Nemotron `LayeredModel`. The native adapter supplies the shared
-`LayerwiseRuntime` and parameter policy for all three residency selections. Parameter
-selection precedes materialization, and each binding receives only the physical
+Its cold `prepare_bindings` projects the source-free Nemotron parameter declaration
+into `PreparedComponent`, retaining canonical pinned storage and independently
+leased blocks. Residency inspection consumes those same bindings. The shared
+storage-preference pass checks invocation geometry and applies native immutable
+layout choices without changing checkpoint recipes, source authority or charges.
+Resident binding borrows preferences from its existing modules. Pinned and unit
+source views expose only their actual physical inputs; selected unit views use
+global addresses even when local storage ordinals are compact. The native adapter
+supplies the shared `LayerwiseRuntime` and parameter policy for all three residency
+selections. Parameter selection precedes materialization, and each binding receives only the physical
 inputs named by its retained recipe. The shared realtime loader supplies the
 complete speech-graph residency selection.
 `voicechat::components::PreparedVoiceChatConstruction` admits the full retained

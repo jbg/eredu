@@ -466,8 +466,15 @@ mod component_preparation {
     fn sparse_component_selection_retains_global_address_and_only_owned_sources() {
         let prepared = prepared();
         let address = prepared.description().unit_layout().address(2).unwrap();
+        let unselected = prepared.description().unit_layout().address(0).unwrap();
         let selected = prepared.select_units([address]).unwrap();
         assert_eq!(selected.source().source_keys(), ["physical.2"]);
+        assert_eq!(
+            selected.unit_source(address).unwrap().source_keys(),
+            ["physical.2"]
+        );
+        assert!(selected.unit_source(unselected).is_err());
+        assert!(selected.pinned_source().unwrap().source_keys().is_empty());
         let (_, layout, source, units) = selected.into_unit_parts().unwrap();
         assert_eq!(layout.address(0), Some(address));
         assert_eq!(layout.ordinal(0, 2), Some(0));

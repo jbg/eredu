@@ -55,6 +55,9 @@ pub enum ComponentPreparationError {
     /// A retained placement disagrees with the requested selection.
     #[error("component {0:?} already retains a different placement")]
     SelectionMismatch(String),
+    /// Native storage preferences describe a different invocation graph.
+    #[error("component {0:?} storage preferences use a different architecture")]
+    ArchitectureMismatch(String),
     /// A requested projection is not a subset of the retained definition.
     #[error("component {component:?} projection changes parameter {target:?}")]
     InvalidProjection {
@@ -63,6 +66,12 @@ pub enum ComponentPreparationError {
         /// Missing or altered canonical parameter.
         target: String,
     },
+}
+
+impl From<ComponentPreparationError> for eredu_nn::Error {
+    fn from(error: ComponentPreparationError) -> Self {
+        Self::backend_source(error)
+    }
 }
 
 /// Family-resolved physical recipe or logical alias within a leased resource.
@@ -238,6 +247,94 @@ impl PreparedComponent {
     /// Retained exact placement, when selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
         self.local_layout.as_ref()
+    }
+
+    /// Selected canonical unit addresses, independent of dense local storage order.
+    pub fn unit_layout(&self) -> &ExecutionUnitLayout {
+        &self.unit_layout
+    }
+
+    /// Restricts authority to one selected invocation's actual physical inputs.
+    pub fn unit_source(
+        &self,
+        address: ExecutionUnitAddress,
+    ) -> Result<SharedCheckpointSource, ComponentPreparationError> {
+        let ordinal = self
+            .unit_layout
+            .ordinal(address.group(), address.index())
+            .ok_or(crate::ExecutionUnitLayoutError::UnknownSelectedAddress {
+                group: address.group(),
+                index: address.index(),
+            })?;
+        self.restrict_bindings(self.units[ordinal].iter())
+    }
+
+    /// Exact authority for the retained pinned aggregate, excluding leased units.
+    pub fn pinned_source(&self) -> Result<SharedCheckpointSource, ComponentPreparationError> {
+        self.restrict_bindings(self.pinned.values().flatten())
+    }
+
+    fn restrict_bindings<'a>(
+        &self,
+        bindings: impl Iterator<Item = &'a WeightBinding>,
+    ) -> Result<SharedCheckpointSource, ComponentPreparationError> {
+        let inputs = bindings
+            .flat_map(|binding| {
+                binding
+                    .checkpoint_keys()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Ok(Arc::new(RestrictedCheckpointSource::including(
+            self.source.clone(),
+            &self.id,
+            inputs,
+        )?))
+    }
+
+    /// Applies native immutable storage preferences to the same cold bindings.
+    /// This changes neither recipes, source authority, placement nor physical bytes.
+    /// Modules supply preferences only; they do not select checkpoint parameters.
+    pub fn with_storage_preferences<B, S, A>(
+        mut self,
+        architecture: &A,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self, A::Error>
+    where
+        B: eredu_nn::NeuralBackend,
+        S: crate::RuntimeState<B>,
+        A: crate::LayeredArchitecture<B, S>,
+        A::Error: From<ComponentPreparationError>,
+    {
+        if architecture.execution_graph()? != *self.description.graph() {
+            return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
+        }
+        for group in 0..self.description.graph().groups().len() {
+            if architecture.group_unit_count(group)?
+                != self
+                    .description
+                    .unit_layout()
+                    .group_range(group)
+                    .expect("declared group")
+                    .len()
+            {
+                return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
+            }
+        }
+        for bindings in self.pinned.values_mut() {
+            *bindings = crate::apply_parameter_storage_layouts(
+                architecture.static_modules(),
+                std::mem::take(bindings),
+            );
+        }
+        for (ordinal, bindings) in self.units.iter_mut().enumerate() {
+            let address = self.unit_layout.address(ordinal).expect("selected unit");
+            let unit = architecture.build_unit(address.group(), address.index(), context)?;
+            *bindings = crate::apply_parameter_storage_layouts(&unit, std::mem::take(bindings));
+        }
+        Ok(self)
     }
 
     /// Applies placement once. Reusing the same selection retains the recipes;
@@ -489,6 +586,25 @@ impl PreparedComponent {
             inputs,
         )?);
         Ok(self)
+    }
+
+    /// Transfers exact retained placement, addresses, sources and canonical resources.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<LocalModelLayout>,
+        ExecutionUnitLayout,
+        SharedCheckpointSource,
+        Vec<Vec<WeightBinding>>,
+        BTreeMap<ParameterStorageId, Vec<WeightBinding>>,
+    ) {
+        (
+            self.local_layout,
+            self.unit_layout,
+            self.source,
+            self.units,
+            self.pinned,
+        )
     }
 
     /// Transfers exact unit-only authority to existing materialization drivers.

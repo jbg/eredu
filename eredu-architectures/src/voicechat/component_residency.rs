@@ -4,12 +4,7 @@
 //! coexist. These bounds describe logical parameter tiers and materialization
 //! scratch, excluding activations, recurrent state, and checkpoint source caches.
 
-use std::collections::BTreeMap;
-
-use eredu_checkpoint::recipe::RecipeError;
-use eredu_runtime::{
-    prepare_resource_bindings, LayerWeightResidency, ParameterResourceRecipes, RecipeBindingError,
-};
+use eredu_runtime::LayerWeightResidency;
 
 use super::{
     backbone::{BackbonePreparationError, PreparedBackboneParameters},
@@ -45,53 +40,17 @@ impl BackboneResources {
     pub fn from_prepared(
         prepared: &PreparedBackboneParameters,
     ) -> Result<Self, VoiceChatResidencyError> {
-        // A tied Nemotron readout calls the embedding projection directly; it
-        // declares no second output slot. An extra head is an invalid retained
-        // catalog, rather than an alias that may silently be charged or ignored.
-        if prepared.args().tie_word_embeddings
-            && prepared
-                .parameters()
-                .keys()
-                .any(|key| key.starts_with("lm_head."))
-        {
-            return Err(VoiceChatResidencyError::UnexpectedTiedHead);
-        }
-        let mut recipes = vec![prepared.static_recipes()];
-        for index in 0..prepared.args().num_hidden_layers as usize {
-            recipes.push(prepared.layer_recipes(index)?);
-        }
-        let selected = recipes.iter().map(|unit| unit.len()).sum::<usize>();
-        if selected != prepared.parameters().len() {
-            return Err(VoiceChatResidencyError::BackboneCatalog);
-        }
-        let resources = recipes
-            .into_iter()
-            .enumerate()
-            .map(|(index, outputs)| {
-                (
-                    index,
-                    ParameterResourceRecipes {
-                        outputs,
-                        aliases: vec![],
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let (source, resources) = prepare_resource_bindings(
-            prepared.source().clone(),
-            "voicechat/backbone/residency",
-            resources,
-        )?;
-        let units = resources.into_values().collect::<Vec<_>>();
+        let bindings = prepared.prepare_bindings()?;
+        let (source, _, statics, units) = bindings.into_parts();
         let statics =
-            SpeechProviderResources::from_bindings(&source, &units[..1], prepared.parameters())?;
+            SpeechProviderResources::from_bindings(&source, &[statics], prepared.parameters())?;
         let layers =
-            SpeechProviderResources::from_bindings(&source, &units[1..], prepared.parameters())?;
+            SpeechProviderResources::from_bindings(&source, &units, prepared.parameters())?;
         Ok(Self {
             parameter_bytes: add(statics.parameter_bytes, layers.parameter_bytes)?,
             static_parameter_bytes: statics.parameter_bytes,
             layer_parameter_bytes: layers.parameter_bytes,
-            layer_unit_bytes: units[1..]
+            layer_unit_bytes: units
                 .iter()
                 .map(|unit| {
                     unit.iter()
@@ -152,18 +111,6 @@ pub enum VoiceChatResidencyError {
     /// The retained backbone cannot supply the selected target units.
     #[error(transparent)]
     Backbone(#[from] BackbonePreparationError),
-    /// Exact recipe metadata cannot be evaluated.
-    #[error(transparent)]
-    Recipe(#[from] RecipeError),
-    /// Exact physical bindings cannot be declared.
-    #[error(transparent)]
-    Binding(#[from] RecipeBindingError),
-    /// Tied readout has only its embedding owner and no separate head slot.
-    #[error("VoiceChat tied backbone retains an unexpected separate output head")]
-    UnexpectedTiedHead,
-    /// Retained parameters lie outside the selected static and target units.
-    #[error("VoiceChat backbone parameter catalog differs from its target schedule")]
-    BackboneCatalog,
     /// A bounded backbone needs finite device and host allowances.
     #[error("VoiceChat backbone has no finite {tier} parameter limit")]
     BackboneUnbounded {
