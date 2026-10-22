@@ -828,8 +828,10 @@ projection. Runtime's source-free `ParameterBankRecipes` validates canonical
 bank recipes and their declared member counts, then projects every parameter to
 bounded leading-axis member recipes with singleton axes. Its `map_recipes`
 transforms complete banks before deriving members and retains the declared member
-count. Qwen4 target, prediction and inspection consume this shared catalog; families retain bank namespaces,
-formats and expert selection policy. Member projection retains bank-global IDs
+count. Qwen4 target, prediction and inspection consume this shared catalog.
+GPT-OSS uses it to prepare one independently leased unit per global expert,
+including packed weights, scales and biases. Families
+retain bank namespaces, formats and expert selection policy. Member projection retains bank-global IDs
 and allocates no parameter payload or native resource. Shared resource binding
 preparation uses the same checkpoint snapshot primitive while keeping aliases
 local to each independently leased resource.

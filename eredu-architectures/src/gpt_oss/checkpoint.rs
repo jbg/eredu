@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use eredu_checkpoint::store::TensorSelection;
 use eredu_checkpoint::{
     expert::{
         canonical_gated_expert_projection_family_recipes, ExpertProjectionFamilyNames,
@@ -437,15 +436,12 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
         let canonical = expert_recipes(catalog, args, layer)?
             .into_outputs()
             .into_outputs();
+        let bank = eredu_runtime::ParameterBankRecipes::new(catalog, canonical, experts)
+            .map_err(|error| error.to_string())?;
         for expert in 0..experts {
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert
-                    .checked_add(1)
-                    .ok_or_else(|| "GPT-OSS expert index overflowed".to_string())?,
-            };
-            let parameters = canonical
+            let parameters = bank
+                .member(expert)
+                .expect("validated expert bank member")
                 .iter()
                 .map(|(target, recipe)| {
                     let binding = target
@@ -456,14 +452,10 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                                 "GPT-OSS expert target {target:?} is outside bank {expert_root:?}"
                             )
                         })?;
-                    let recipe = recipe
-                        .clone()
-                        .select_bounded(catalog, selection.clone())
-                        .map_err(|error| error.to_string())?;
                     crate::ExpertParameterRecipe::new(
                         binding,
                         target,
-                        recipe,
+                        recipe.clone(),
                         crate::ExpertParameterRole::Preserved,
                     )
                     .map_err(|error| error.to_string())
