@@ -38,10 +38,8 @@ use crate::{
     backend::runtime::residency::manager::{ResidencyError, ResidencyManager, ResidentTransfer},
 };
 #[cfg(test)]
-use eredu_core::residency::OffloadPlan;
-use eredu_core::residency::{
-    MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError, ResidencyPolicy,
-};
+use eredu_core::residency::{OffloadPlan, ResidencyPolicy};
+use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
 
 mod catalog;
 #[cfg(test)]

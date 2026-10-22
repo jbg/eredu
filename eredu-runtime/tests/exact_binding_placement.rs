@@ -752,26 +752,19 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
         );
     }
     let catalog = eredu_runtime::AddressableBankCatalog::from_binding_plans(plans).unwrap();
-    eredu_runtime::validate_addressable_bank_selection(
-        catalog
-            .entries
-            .iter()
-            .map(|entry| (entry.key(), entry.unit().bindings())),
-        &catalog.placements,
-        &catalog.expected_bytes,
-        &catalog.transformations,
-        &source as &dyn CheckpointSource,
-    )
-    .unwrap();
-    let prepared = eredu_runtime::parameter_operations::prepare_bank_parameter_members(
-        catalog
-            .entries
-            .iter()
-            .map(|entry| (entry.key(), entry.unit().bindings())),
-        &catalog.parameter_targets,
-        &source as &dyn CheckpointSource,
-    )
-    .unwrap();
+    use eredu_core::residency::{MemoryTier, OffloadConfig};
+    let (entries, _transformations, preparation) =
+        eredu_runtime::AddressableBankPreparation::admit(
+            catalog,
+            Vec::new(),
+            OffloadConfig::new(Some(32), Some(32), 1).unwrap(),
+            &source as &dyn CheckpointSource,
+        )
+        .unwrap();
+    let (residency, prepared, _placements) = preparation
+        .bind(entries, &source as &dyn CheckpointSource)
+        .unwrap()
+        .into_parts();
     let declaration =
         ParameterMetadata::from_spec(&ParameterSpec::trainable("weight").unwrap(), true);
     let parameters =
@@ -796,16 +789,7 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
 
     // Final independently leased inputs enter the ordinary controller with their
     // sparse global identities and shared checkpoint authority intact.
-    use eredu_core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy};
-    let (members, definitions, rows, plan) = eredu_runtime::PreparedAddressableBankResidency::new(
-        catalog.entries,
-        Vec::new(),
-        OffloadConfig::new(Some(32), Some(32), 1).unwrap(),
-        ResidencyPolicy::Cacheable,
-        MemoryTier::Disk,
-    )
-    .unwrap()
-    .into_parts();
+    let (members, definitions, rows, plan) = residency.into_parts();
     let ids: Vec<_> = members.keys().map(|key| key.unit_id()).collect();
     let mut controller = eredu_runtime::ResidencyController::new_with_row_ranges(
         |_| &source as &dyn CheckpointSource,

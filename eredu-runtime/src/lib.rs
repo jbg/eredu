@@ -273,7 +273,10 @@ pub use expert::{
     RoutedObservationPoints, RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver,
     TensorParallelParameterProvider,
 };
-pub use expert::{validate_addressable_bank_selection, AddressableBankSelectionError};
+pub use expert::{
+    validate_addressable_bank_selection, AddressableBankSelectionError, AddressableBankPreparation,
+    AddressableBankPreparationError, PreparedSelectedAddressableBank,
+};
 pub use expert::{
     plan_addressable_bank_residency, AddressableBankResidencyError,
     PreparedAddressableBankResidency, AddressableBankCatalog, AddressableBankCatalogError,

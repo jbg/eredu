@@ -23,6 +23,10 @@ pub use agreement::{
     AgreeingAddressableExpertProvider, AgreeingParameterProvider, ProviderAgreementRejected,
 };
 pub use banks::{RoutedBankProviderError, RoutedBankProviders};
+mod preparation;
+pub use preparation::{
+    AddressableBankPreparation, AddressableBankPreparationError, PreparedSelectedAddressableBank,
+};
 pub use catalog::{
     plan_addressable_bank_residency, AddressableBankResidencyError,
     PreparedAddressableBankResidency, AddressableBankCatalog, AddressableBankCatalogError,

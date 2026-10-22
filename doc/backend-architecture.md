@@ -11190,6 +11190,14 @@ chunks native acquisitions and keeps source/residency leases through completion.
 `plan_addressable_bank_residency` admits independent member extents and compact row
 namespaces in runtime, rejecting duplicate ownership, empty pools, namespace overlap
 and insufficient budgets before selected transformations read payloads.
+`AddressableBankPreparation` consumes a selected catalog after native binding preflight,
+retains canonical destinations, ownership, row sources and selected extents, and returns
+source entries with their conversion plan. Its consuming `bind` admits direct and
+converted results through the same exact member-coverage, extent and parameter-metadata
+checks. A materializer cannot silently drop or add an independently selected member.
+`PreparedSelectedAddressableBank` supplies admitted residency inputs and parameter
+metadata to one native cache assembly path.
+
 `PreparedAddressableBankResidency` consumes final entries and retained row sources,
 rechecks their actual extents and moves the catalog, bindings, rows and admitted plan
 into the backend residency manager. Native cache initialization and completion remain
