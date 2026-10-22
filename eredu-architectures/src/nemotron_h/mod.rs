@@ -11,6 +11,7 @@ pub mod mtp;
 pub mod parallel;
 mod parameters;
 mod partitioned;
+pub(crate) use parameters::component_definition;
 pub use parameters::parameter_description;
 
 pub use attention::{new_attention, new_attention_at};

@@ -34,9 +34,9 @@ use crate::{
     configuration::{GgufModelConfig, SafetensorsModelConfig},
     processor_plan::ArtifactArchitecturePlan,
     replicated_model::{
-        AttentionState, CompressedReplicatedFamily, CompressedReplicatedModel,
-        FixedReplicatedFamily, FixedReplicatedModel, FixedState, MixedState,
-        ReplicatedForwardContext, Stateless,
+        AttentionState, CompressedReplicatedFamily, CompressedReplicatedKernel,
+        CompressedReplicatedModel, FixedReplicatedFamily, FixedReplicatedKernel,
+        FixedReplicatedModel, FixedState, MixedState, ReplicatedForwardContext, Stateless,
     },
     GgufArchitecture,
 };
@@ -61,28 +61,15 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn definition(
+        config: &Self::Config,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        crate::lfm2::component_definition(config)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        let embedding = "model.embed_tokens.weight";
-        crate::decoder::StaticModuleSpec {
-            normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.embedding_norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: config.vocab_size,
-            hidden_size: config.hidden_size,
-            normalization_epsilon: config.norm_eps,
-            normalization_offset: 0.0,
-            embedding_quantization: config.weight_quantization_for(embedding),
-            head_format: config.weight_quantization_for("lm_head.weight").into(),
-            tied_head: config.tie_word_embeddings,
-        }
+        crate::lfm2::static_spec(config)
     }
-    fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
-        crate::lfm2::state_layout(config).map_err(eredu_nn::Error::backend)
-    }
+
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -161,28 +148,15 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn definition(
+        config: &Self::Config,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        crate::kimi_linear::component_definition(config)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        let embedding = "model.embed_tokens.weight";
-        crate::decoder::StaticModuleSpec {
-            normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: config.vocab_size,
-            hidden_size: config.hidden_size,
-            normalization_epsilon: config.rms_norm_eps,
-            normalization_offset: 0.0,
-            embedding_quantization: config.weight_quantization_for(embedding),
-            head_format: config.weight_quantization_for("lm_head.weight").into(),
-            tied_head: config.tie_word_embeddings,
-        }
+        crate::kimi_linear::static_spec(config)
     }
-    fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
-        crate::kimi_linear::state_layout(config).map_err(eredu_nn::Error::backend)
-    }
+
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -260,15 +234,15 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn definition(
+        config: &Self::Config,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        crate::deepseek::v3::component_definition(config, None)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         crate::deepseek::v3::static_spec(config)
     }
-    fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
-        crate::deepseek::v3::state_layout(config)
-    }
+
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -340,28 +314,15 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn definition(
+        config: &Self::Config,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        crate::kimi_linear::component_definition(config)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        let embedding = "model.embed_tokens.weight";
-        crate::decoder::StaticModuleSpec {
-            normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: config.vocab_size,
-            hidden_size: config.hidden_size,
-            normalization_epsilon: config.rms_norm_eps,
-            normalization_offset: 0.0,
-            embedding_quantization: config.weight_quantization_for(embedding),
-            head_format: config.weight_quantization_for("lm_head.weight").into(),
-            tied_head: config.tie_word_embeddings,
-        }
+        crate::kimi_linear::static_spec(config)
     }
-    fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
-        crate::kimi_linear::state_layout(config).map_err(eredu_nn::Error::backend)
-    }
+
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -433,8 +394,13 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn definition(
+        config: &Self::Config,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        crate::nemotron_h::component_definition(
+            crate::nemotron_h::parameter_description(config).map_err(eredu_nn::Error::backend)?,
+            crate::nemotron_h::state_layout(config).map_err(eredu_nn::Error::backend)?,
+        )
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         let embedding = "model.embeddings.weight";
@@ -452,9 +418,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
             tied_head: config.tie_word_embeddings,
         }
     }
-    fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
-        crate::nemotron_h::state_layout(config).map_err(eredu_nn::Error::backend)
-    }
+
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -526,8 +490,10 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn definition(
+        config: &Self::Config,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        crate::qwen::hybrid::component_definition(config, None)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         crate::decoder::StaticModuleSpec {
@@ -546,9 +512,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
             tied_head: config.tie_word_embeddings,
         }
     }
-    fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
-        crate::qwen::hybrid::state_layout(config).map_err(eredu_nn::Error::backend)
-    }
+
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -1703,7 +1667,7 @@ where
         config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedModel::new(config, context)
+        FixedReplicatedKernel::new(config, context)?.into_model()
     }
 }
 
@@ -1719,7 +1683,7 @@ where
         config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedModel::new(config, context)
+        FixedReplicatedKernel::new(config, context)?.into_model()
     }
 }
 
@@ -1735,7 +1699,7 @@ where
         config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedModel::new(config, context)
+        FixedReplicatedKernel::new(config, context)?.into_model()
     }
 }
 
@@ -1750,7 +1714,7 @@ where
         config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedModel::new(config, context)
+        FixedReplicatedKernel::new(config, context)?.into_model()
     }
 }
 
@@ -2021,7 +1985,7 @@ where
         config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        CompressedReplicatedModel::new(config, context)
+        CompressedReplicatedKernel::new(config, context)?.into_model()
     }
 }
 
@@ -2037,7 +2001,7 @@ where
         config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        CompressedReplicatedModel::new(config, context)
+        CompressedReplicatedKernel::new(config, context)?.into_model()
     }
 }
 
@@ -2587,10 +2551,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
-            let architecture =
+            let mut architecture =
                 <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new(args, context)
-                    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
-                    .with_prediction_capture();
+                    .map_err(|error| {
+                        ReplicatedTextDispatchError::Architecture(error.to_string())
+                    })?;
+            architecture.kernel_mut().enable_prediction_capture();
             let prepared = prepare_architecture_handoff::<B, D::State, _>(
                 architecture,
                 source_architecture,
@@ -2628,10 +2594,10 @@ where
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     let prompt_cache_architecture_identity =
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
-    let architecture =
+    let mut architecture =
         <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(args, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
-            .with_prediction_capture();
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    architecture.kernel_mut().enable_prediction_capture();
     let prepared = prepare_architecture_handoff::<B, D::State, _>(
         architecture,
         source_architecture,

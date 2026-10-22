@@ -36,10 +36,7 @@ use eredu_runtime::{
 };
 
 /// Narrows a causal decoder's position-independent readout before projection.
-pub(crate) fn final_hidden_position<T: Tensor>(
-    hidden: &T,
-    context: &T::Context,
-) -> Result<T, Error> {
+pub fn final_hidden_position<T: Tensor>(hidden: &T, context: &T::Context) -> Result<T, Error> {
     if hidden.shape().len() < 3 || hidden.dim(1) <= 0 {
         return Err(Error::backend(
             "decoder readout requires nonempty batch/sequence/features",
@@ -4175,7 +4172,8 @@ impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules
         }
     }
 
-    pub(crate) fn finish_parallel_instrumented(
+    /// Applies the declared readout boundary and vocabulary collective with instrumentation.
+    pub fn finish_parallel_instrumented(
         &mut self,
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
@@ -4203,7 +4201,7 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
     }
 
     /// Applies the actual residual, normalization and affine readout boundaries.
-    pub(crate) fn finish_instrumented(
+    pub fn finish_instrumented(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,

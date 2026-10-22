@@ -3862,7 +3862,7 @@ sealed_prediction_target!(
 sealed_prediction_target!(crate::qwen::hybrid::ConditionalLayeredModel<B>);
 sealed_prediction_target!(crate::qwen::hybrid::LayeredModel<B>);
 
-impl<B, P> pairing_sealed::Sealed
+impl<B, P: 'static> pairing_sealed::Sealed
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::NemotronHReplicated,
@@ -3876,7 +3876,7 @@ where
 {
 }
 
-impl<B, P> pairing_sealed::Sealed
+impl<B, P: 'static> pairing_sealed::Sealed
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::QwenHybridReplicated,
@@ -4017,7 +4017,7 @@ where
     }
 }
 
-impl<B, P> MaterializedPredictionTarget<B>
+impl<B, P: 'static> MaterializedPredictionTarget<B>
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::NemotronHReplicated,
@@ -4230,7 +4230,7 @@ where
     }
 }
 
-impl<B, P> MaterializedPredictionTarget<B>
+impl<B, P: 'static> MaterializedPredictionTarget<B>
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::QwenHybridReplicated,

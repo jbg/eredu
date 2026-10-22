@@ -8791,8 +8791,7 @@ partitioned execution. Local construction retains checkpoint-global parameter
 geometry with planner-derived mutable state and validates exact unit/state
 ownership. Low-level equations and consuming module extraction live on the kernel;
 extraction rejects selected ownership that lacks required complete-model roots.
-The target-only `HybridDecoder` shell retains one sequential group for its remaining
-consumers. Conditional Qwen materializes its declared text and prediction roots
+Conditional Qwen materializes its declared text and prediction roots
 directly from the shared construction specs. Its serial, parallel, observed and
 partition readout entry points share one equation over borrowed decoder resources;
 target readout normalizes once and prediction readout consumes normalized hidden
@@ -8805,6 +8804,22 @@ the declaration's invocation mapping and rejects slots outside selected pipeline
 ownership. Low-level state-view restriction validates the exact declared slice
 and global offset independently of retained parameters; identical selection is
 valid and an incompatible retained selection fails.
+
+Replicated dense LFM2, Kimi Linear, Nemotron-H, Qwen hybrid and DeepSeek V3
+construction retains the same source-free family definitions used by their other
+execution paths. Fixed-state and compressed-state kernels supply family equations
+to the shared `ComponentAdapter`; addressing, graph and parameter descriptions,
+pinned-role traversal, text projection and completion contracts use that adapter.
+Typed profiles adapt attention-only, fixed-only, mixed, compressed and stateless
+cache views without requiring unrelated backend state capabilities. Each invocation
+keeps its own declared layer state and independent residency unit. The shared
+decoder resource aggregate owns embedding and tied or untied readout. Its public
+instrumented serial/parallel finalization and `final_hidden_position` helper also
+preserve low-level readout operations independently of a complete model. Readout
+preserves full projection, final-position text projection and observation timing;
+Nemotron-H and Qwen targets retain their external prediction captures and ordinary
+shared prediction resources. Family precision recipes and checkpoint admission
+remain inputs to the existing preparation driver.
 
 Conditional target and external-prediction partition construction consume a cold
 `ArchitecturePartition` before native allocation. One materializer builds complete
