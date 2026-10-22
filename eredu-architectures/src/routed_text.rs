@@ -239,6 +239,9 @@ pub enum RoutedTextPreparationError {
     /// Primary and independently materialized companion identities overlap.
     #[error(transparent)]
     Materialization(#[from] eredu_runtime::MaterializationTaskIndexError),
+    /// Selected member geometry or payload accounting disagrees.
+    #[error(transparent)]
+    BankGeometry(#[from] eredu_runtime::AddressableBankMemberError),
     /// Requirements, artifact provenance, selected formats, or modules disagreed.
     #[error("invalid replicated routed text preparation: {0}")]
     Invalid(String),
@@ -247,71 +250,67 @@ pub enum RoutedTextPreparationError {
 fn selected_member_geometry(
     unit: &crate::ExpertResidencyUnit,
     tasks: &eredu_runtime::MaterializationTaskIndex<'_>,
-) -> Result<(u64, u64), String> {
-    let mut source_bytes = 0u64;
-    let mut selected_bytes = 0u64;
-    for parameter in unit.parameters() {
-        let metadata = parameter.metadata().ok_or_else(|| {
-            format!(
-                "addressable member {:?} omitted admitted recipe metadata",
-                unit.identity()
-            )
-        })?;
-        source_bytes = source_bytes
-            .checked_add(metadata.byte_len())
-            .ok_or_else(|| "addressable source byte geometry overflowed".to_owned())?;
-        let task = tasks.get(parameter.logical_target()).ok_or_else(|| {
-            format!(
-                "addressable target {:?} has no selected parameter realization",
-                parameter.logical_target()
-            )
-        })?;
-        let parameter_bytes = if matches!(
-            task.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        ) {
-            if metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
-                && !matches!(
-                    parameter.role(),
-                    crate::ExpertParameterRole::QuantizableProjection { .. }
-                )
-            {
-                return Err(format!(
-                    "addressable transform target {:?} is not a quantizable projection",
-                    parameter.logical_target()
-                ));
-            }
-            let quantization = task.executable().weight_quantization().ok_or_else(|| {
-                format!(
-                    "addressable transform target {:?} has no packed realization",
-                    parameter.logical_target()
-                )
+) -> Result<eredu_runtime::AddressableBankFootprint, RoutedTextPreparationError> {
+    let invalid = RoutedTextPreparationError::Invalid;
+    let footprint = eredu_runtime::AddressableBankFootprint::try_from_parameters(
+        unit.identity(),
+        unit.parameters().iter().map(|parameter| {
+            let metadata = parameter.metadata().ok_or_else(|| {
+                invalid(format!(
+                    "addressable member {:?} omitted admitted recipe metadata",
+                    unit.identity()
+                ))
             })?;
-            if matches!(
-                quantization,
-                eredu_checkpoint::WeightQuantization::GgufIQuant { .. }
+            let task = tasks.get(parameter.logical_target()).ok_or_else(|| {
+                invalid(format!(
+                    "addressable target {:?} has no selected parameter realization",
+                    parameter.logical_target()
+                ))
+            })?;
+            let parameter_bytes = if matches!(
+                task.lowering(),
+                eredu_runtime::WeightLoweringKind::Transform
+                    | eredu_runtime::WeightLoweringKind::DerivedTransform
             ) {
-                return Err(
-                    "load-time addressable transformation cannot select GGUF IQuant".into(),
-                );
-            }
-            eredu_runtime::selected_addressable_parameter_bytes(task, metadata)
-                .map_err(|error| error.to_string())?
-        } else {
-            metadata.byte_len()
-        };
-        selected_bytes = selected_bytes
-            .checked_add(parameter_bytes)
-            .ok_or_else(|| "addressable selected byte geometry overflowed".to_owned())?;
-    }
-    if unit.byte_len() != Some(source_bytes) {
-        return Err(format!(
+                if metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
+                    && !matches!(
+                        parameter.role(),
+                        crate::ExpertParameterRole::QuantizableProjection { .. }
+                    )
+                {
+                    return Err(invalid(format!(
+                        "addressable transform target {:?} is not a quantizable projection",
+                        parameter.logical_target()
+                    )));
+                }
+                let quantization = task.executable().weight_quantization().ok_or_else(|| {
+                    invalid(format!(
+                        "addressable transform target {:?} has no packed realization",
+                        parameter.logical_target()
+                    ))
+                })?;
+                if matches!(
+                    quantization,
+                    eredu_checkpoint::WeightQuantization::GgufIQuant { .. }
+                ) {
+                    return Err(invalid(
+                        "load-time addressable transformation cannot select GGUF IQuant".into(),
+                    ));
+                }
+                eredu_runtime::selected_addressable_parameter_bytes(task, metadata)?
+            } else {
+                metadata.byte_len()
+            };
+            Ok((metadata.byte_len(), parameter_bytes))
+        }),
+    )?;
+    if unit.byte_len() != Some(footprint.source_bytes()) {
+        return Err(invalid(format!(
             "addressable member {:?} source bytes differ from its admitted catalog",
             unit.identity()
-        ));
+        )));
     }
-    Ok((source_bytes, selected_bytes))
+    Ok(footprint)
 }
 
 pub(crate) fn project_addressable_members(
@@ -377,8 +376,7 @@ fn project_bank_members_with_tasks(
                 unit.parameters().len()
             )));
         }
-        let (source_bytes, _selected_bytes) = selected_member_geometry(unit, &selected_tasks)
-            .map_err(RoutedTextPreparationError::Invalid)?;
+        let source_bytes = selected_member_geometry(unit, &selected_tasks)?.source_bytes();
         let mut parameters = Vec::with_capacity(unit.parameters().len());
         for parameter in unit.parameters() {
             let metadata = parameter.metadata().ok_or_else(|| {
@@ -2632,7 +2630,9 @@ fn maximum_selected_compact_bytes(
     .map_err(|error| error.to_string())?;
     let mut by_unit = BTreeMap::<(String, usize), Vec<u64>>::new();
     for unit in requirements.catalog().units() {
-        let (_, selected_bytes) = selected_member_geometry(unit, &tasks)?;
+        let selected_bytes = selected_member_geometry(unit, &tasks)
+            .map_err(|error| error.to_string())?
+            .selected_bytes();
         by_unit
             .entry((
                 unit.owner_group().as_str().to_owned(),

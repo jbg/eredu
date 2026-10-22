@@ -406,32 +406,29 @@ impl AddressableBankMember {
         }
         let mut bindings = std::collections::BTreeSet::new();
         let mut targets = std::collections::BTreeSet::new();
-        let mut source_bytes = 0u64;
-        let mut selected_bytes = 0u64;
-        for parameter in &parameters {
-            if !bindings.insert(parameter.binding_name())
-                || !targets.insert(parameter.task().name())
-            {
-                return Err(AddressableBankMemberError::DuplicateParameter { key });
-            }
-            if !matches!(
-                parameter.task().owner(),
-                ReplicatedTextParameterOwner::ExecutionUnit { group, unit }
-                    if *unit == placement.owner_unit()
-                        && group == placement.owner_group().as_str()
-            ) {
-                return Err(AddressableBankMemberError::InvalidParameter {
-                    parameter: parameter.task().name().to_owned(),
-                    detail: "selected task has a non-bank owner".into(),
-                });
-            }
-            source_bytes = source_bytes
-                .checked_add(parameter.source_bytes())
-                .ok_or(AddressableBankMemberError::SourceByteOverflow { key })?;
-            selected_bytes = selected_bytes
-                .checked_add(parameter.selected_bytes())
-                .ok_or(AddressableBankMemberError::SelectedByteOverflow { key })?;
-        }
+        let footprint = AddressableBankFootprint::try_from_parameters(
+            key,
+            parameters.iter().map(|parameter| {
+                if !bindings.insert(parameter.binding_name())
+                    || !targets.insert(parameter.task().name())
+                {
+                    return Err(AddressableBankMemberError::DuplicateParameter { key });
+                }
+                if !matches!(
+                    parameter.task().owner(),
+                    ReplicatedTextParameterOwner::ExecutionUnit { group, unit }
+                        if *unit == placement.owner_unit()
+                            && group == placement.owner_group().as_str()
+                ) {
+                    return Err(AddressableBankMemberError::InvalidParameter {
+                        parameter: parameter.task().name().to_owned(),
+                        detail: "selected task has a non-bank owner".into(),
+                    });
+                }
+                Ok((parameter.source_bytes(), parameter.selected_bytes()))
+            }),
+        )?;
+        let (source_bytes, selected_bytes) = footprint.into_parts();
         Ok(Self {
             key,
             placement,
@@ -684,6 +681,54 @@ where
         });
     }
     Ok(plans)
+}
+
+/// Checked source and executable payload totals for one independently leased member.
+/// Each declared parameter contributes once; source equality does not imply shared
+/// storage. This describes payload only, without scratch, state or lease authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressableBankFootprint {
+    source_bytes: u64,
+    selected_bytes: u64,
+}
+impl AddressableBankFootprint {
+    /// Accumulates admitted per-parameter extents while preserving the caller's
+    /// validation failures and typed overflow errors identifying the bank member.
+    pub fn try_from_parameters<E: From<AddressableBankMemberError>>(
+        key: ParameterBankKey,
+        parameters: impl IntoIterator<Item = Result<(u64, u64), E>>,
+    ) -> Result<Self, E> {
+        let mut footprint = Self {
+            source_bytes: 0,
+            selected_bytes: 0,
+        };
+        for parameter in parameters {
+            let (source_bytes, selected_bytes) = parameter?;
+            footprint.source_bytes = footprint
+                .source_bytes
+                .checked_add(source_bytes)
+                .ok_or(AddressableBankMemberError::SourceByteOverflow { key })
+                .map_err(E::from)?;
+            footprint.selected_bytes = footprint
+                .selected_bytes
+                .checked_add(selected_bytes)
+                .ok_or(AddressableBankMemberError::SelectedByteOverflow { key })
+                .map_err(E::from)?;
+        }
+        Ok(footprint)
+    }
+    /// Admitted source payload before optional lowering.
+    pub const fn source_bytes(self) -> u64 {
+        self.source_bytes
+    }
+    /// Exact selected executable payload, including generated companions.
+    pub const fn selected_bytes(self) -> u64 {
+        self.selected_bytes
+    }
+    /// Consumes the totals for retained member construction.
+    pub const fn into_parts(self) -> (u64, u64) {
+        (self.source_bytes, self.selected_bytes)
+    }
 }
 
 /// Computes executable storage bytes for one admitted member-local task output.

@@ -3412,6 +3412,13 @@ transform and is therefore the geometry used for capacity checks, acquisition,
 and telemetry. A backend adapter consumes these generic records; it does not
 receive the architecture catalog or interpret family recipe policy.
 
+Runtime-owned `AddressableBankFootprint` supplies the same checked source and
+selected payload totals to routed preflight sizing and retained member
+construction. Every declared parameter contributes independently, including
+parameters that read the same physical source. Overflow errors identify the bank
+member. Architecture code admits transform roles and formats; runtime accounts
+for the resulting payload without selecting policy, scratch or state geometry.
+
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
 streams, indexed tensor operations, generic addressable member storage,
