@@ -339,7 +339,8 @@ pub use parameter::{
 };
 pub use parameter_acquisition::{
     local_parameter_acquisition_units, order_parameter_acquisition_units,
-    parameter_acquisition_units, ParameterAcquisitionError, ParameterAcquisitionUnit,
+    parameter_acquisition_units, partition_parameter_acquisition_bindings,
+    ParameterAcquisitionError, ParameterAcquisitionUnit,
 };
 pub use parameter_layout::{
     derive_partitioned_group_layout, derive_partitioned_local_layout,

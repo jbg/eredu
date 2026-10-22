@@ -824,6 +824,13 @@ retention primitive. The family checks admitted table headers and provenance
 before bounded literal reads; controls and scales retain separate exact source
 projections.
 
+Runtime partitions destination bindings by retained
+`ParameterAcquisitionUnit` output identities, preserving binding order within
+independently leased resources. It rejects missing, repeated or foreign
+canonical destinations and verifies each unit's non-alias payload against its
+selected byte count before native materialization. Native module paths use the
+binding's canonical logical target for this projection.
+
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
 source authority to the recipes' physical inputs. Before recipe preparation,

@@ -291,41 +291,8 @@ pub(super) fn prepare_external_assistant_parameters<
     // Validate the complete destination partition before any payload is read.
     // Architecture-declared units include every packed companion; native code
     // neither parses checkpoint names nor chooses an assistant's boundaries.
-    let mut units = vec![Vec::new(); parameter_units.len()];
-    let mut assigned = std::collections::BTreeSet::new();
-    for binding in bindings {
-        let name = binding.logical_target().unwrap_or_else(|| binding.name());
-        let index = parameter_units
-            .iter()
-            .position(|unit| unit.outputs().contains(name))
-            .ok_or_else(|| {
-                Error::ArchitectureModel(format!(
-                    "assistant binding {name:?} has no acquisition unit"
-                ))
-            })?;
-        if !assigned.insert(name.to_owned()) {
-            return Err(Error::ArchitectureModel(format!(
-                "assistant binding {name:?} has duplicate destinations"
-            )));
-        }
-        units[index].push(binding);
-    }
-    if parameter_units
-        .iter()
-        .any(|unit| !unit.outputs().is_subset(&assigned))
-    {
-        return Err(Error::ArchitectureModel(
-            "assistant acquisition units have missing destinations".into(),
-        ));
-    }
-    for (definition, bindings) in parameter_units.iter().zip(&units) {
-        let actual = crate::backend::runtime::checkpoint::binding::binding_bytes(bindings)?;
-        if actual != definition.parameter_bytes() {
-            return Err(Error::ArchitectureModel(
-                "assistant native parameter extent differs from the retained cold unit".into(),
-            ));
-        }
-    }
+    let units =
+        eredu_runtime::partition_parameter_acquisition_bindings(&parameter_units, bindings)?;
     Ok(PreparedAssistantParameters {
         store,
         config,

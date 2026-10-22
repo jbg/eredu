@@ -122,6 +122,10 @@ pub enum Error {
     #[error(transparent)]
     ReplicatedTextContract(#[from] eredu_runtime::ReplicatedTextContractError),
 
+    /// Exact bindings disagree with retained parameter acquisition ownership.
+    #[error(transparent)]
+    ParameterAcquisition(#[from] eredu_runtime::ParameterAcquisitionError),
+
     /// Invalid logical-to-local execution-unit mapping or invocation.
     #[error(transparent)]
     ExecutionUnitAddressMap(#[from] eredu_runtime::ExecutionUnitAddressMapError),

@@ -55,6 +55,16 @@ pub enum ParameterAcquisitionError {
         /// Exact ownership failure.
         reason: &'static str,
     },
+    /// Materialized bindings disagree with the selected resource footprint.
+    #[error("parameter owner {owner:?} binds {actual} bytes; selected {expected}")]
+    Extent {
+        /// Independent acquisition owner.
+        owner: ReplicatedTextParameterOwner,
+        /// Retained cold parameter payload.
+        expected: u64,
+        /// Exact payload in the destination bindings.
+        actual: u64,
+    },
     /// Selected physical tensors differ from the admitted task outputs.
     #[error("parameter placement omits {missing:?} and adds {unexpected:?}")]
     Selection {
@@ -329,4 +339,81 @@ pub fn local_parameter_acquisition_units(
         }
     }
     Ok(units)
+}
+
+/// Partitions exact destination bindings by retained canonical resource ownership.
+///
+/// Binding names may be local module paths; logical targets select the canonical
+/// outputs. Every output occurs exactly once, and each resource's non-alias bytes
+/// must equal its selected footprint. Input order is preserved within each unit.
+/// No source payload is read and independent resources remain separately leased.
+pub fn partition_parameter_acquisition_bindings(
+    units: &[ParameterAcquisitionUnit],
+    bindings: Vec<crate::WeightBinding>,
+) -> Result<Vec<Vec<crate::WeightBinding>>, ParameterAcquisitionError> {
+    let mut owners = std::collections::BTreeMap::new();
+    for (index, unit) in units.iter().enumerate() {
+        for target in unit.outputs() {
+            if owners.insert(target.as_str(), index).is_some() {
+                return Err(ParameterAcquisitionError::Output {
+                    target: target.clone(),
+                    reason: "multiple acquisition owners",
+                });
+            }
+        }
+    }
+    let mut partitioned = vec![Vec::new(); units.len()];
+    let mut assigned = BTreeSet::new();
+    for binding in bindings {
+        let target = binding.logical_target().unwrap_or_else(|| binding.name());
+        let index = owners
+            .get(target)
+            .ok_or_else(|| ParameterAcquisitionError::Output {
+                target: target.into(),
+                reason: "binding has no acquisition owner",
+            })?;
+        if !assigned.insert(target.to_owned()) {
+            return Err(ParameterAcquisitionError::Output {
+                target: target.into(),
+                reason: "binding has duplicate destinations",
+            });
+        }
+        partitioned[*index].push(binding);
+    }
+    let missing = owners
+        .keys()
+        .filter(|target| !assigned.contains(**target))
+        .map(|target| (*target).to_owned())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(ParameterAcquisitionError::Selection {
+            missing,
+            unexpected: Vec::new(),
+        });
+    }
+    for (unit, bindings) in units.iter().zip(&partitioned) {
+        let actual = bindings
+            .iter()
+            .filter(|binding| !binding.is_alias())
+            .try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    ParameterAcquisitionError::Accounting {
+                        target: binding
+                            .logical_target()
+                            .unwrap_or_else(|| binding.name())
+                            .into(),
+                        owner: unit.owner().clone(),
+                        reason: "binding bytes overflow",
+                    }
+                })
+            })?;
+        if actual != unit.parameter_bytes() {
+            return Err(ParameterAcquisitionError::Extent {
+                owner: unit.owner().clone(),
+                expected: unit.parameter_bytes(),
+                actual,
+            });
+        }
+    }
+    Ok(partitioned)
 }

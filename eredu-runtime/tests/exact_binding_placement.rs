@@ -136,10 +136,10 @@ fn owned_task(
 fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_order() {
     use eredu_runtime::{
         local_parameter_acquisition_units, order_parameter_acquisition_units,
-        parameter_acquisition_units, ArchitectureParameterDescription, ExecutionGraph,
-        ExecutionGroupSpec, ExecutionUnitLayout, MemberSharding, OwnedParameterGroupSpec,
-        ParameterAcquisitionError, ParameterGroupSpec, ParameterMemberSpec,
-        ReplicatedTextOutputCompanion,
+        parameter_acquisition_units, partition_parameter_acquisition_bindings,
+        ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
+        MemberSharding, OwnedParameterGroupSpec, ParameterAcquisitionError, ParameterGroupSpec,
+        ParameterMemberSpec, ReplicatedTextOutputCompanion,
     };
     let owner = |unit| ReplicatedTextParameterOwner::ExecutionUnit {
         group: "decoder".into(),
@@ -265,6 +265,66 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
         ["encoded", "encoded.biases", "encoded.scales"]
     );
     assert_eq!(local[1].task_indices(), [0, 2]);
+    // Module paths differ from canonical destinations, and source sharing does
+    // not merge independent acquisition owners or change packed-companion costs.
+    let binding = |target: &str, bytes| {
+        eredu_runtime::WeightBinding::new(
+            format!("native.{target}"),
+            "checkpoint.weight",
+            TensorSelection::Full,
+            bytes,
+        )
+        .unwrap()
+        .with_logical_target(target)
+        .unwrap()
+    };
+    let bindings = vec![
+        binding("first", 1024),
+        binding("encoded.scales", 16),
+        binding("third", 1024),
+        binding("encoded", 128),
+        binding("encoded.biases", 16),
+    ];
+    let projected = partition_parameter_acquisition_bindings(&local, bindings.clone()).unwrap();
+    assert_eq!(
+        projected
+            .iter()
+            .map(|unit| unit
+                .iter()
+                .map(|binding| binding.logical_target().unwrap())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [
+            vec!["encoded.scales", "encoded", "encoded.biases"],
+            vec!["first", "third"]
+        ]
+    );
+    let mut missing = bindings.clone();
+    missing.pop();
+    assert!(matches!(
+        partition_parameter_acquisition_bindings(&local, missing),
+        Err(ParameterAcquisitionError::Selection { missing, .. })
+            if missing == ["encoded.biases"]
+    ));
+    let mut duplicate = bindings.clone();
+    duplicate.push(bindings[0].clone());
+    assert!(matches!(
+        partition_parameter_acquisition_bindings(&local, duplicate),
+        Err(ParameterAcquisitionError::Output { target, .. }) if target == "first"
+    ));
+    let mut foreign = bindings.clone();
+    foreign.push(binding("neighbor", 1024));
+    assert!(matches!(
+        partition_parameter_acquisition_bindings(&local, foreign),
+        Err(ParameterAcquisitionError::Output { target, .. }) if target == "neighbor"
+    ));
+    let mut wrong_extent = bindings;
+    wrong_extent[0] = binding("first", 2048);
+    assert!(matches!(
+        partition_parameter_acquisition_bindings(&local, wrong_extent),
+        Err(ParameterAcquisitionError::Extent { owner: actual_owner, expected: 2048, actual: 3072 })
+            if actual_owner == owner(4)
+    ));
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
     assert!(matches!(
         order_parameter_acquisition_units(units, &complete),
