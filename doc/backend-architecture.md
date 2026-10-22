@@ -830,8 +830,10 @@ bounded leading-axis member recipes with singleton axes. Its `map_recipes`
 transforms complete banks before deriving members and retains the declared member
 count. Qwen4 target, prediction and inspection consume this shared catalog.
 GPT-OSS uses it to prepare one independently leased unit per global expert,
-including packed weights, scales and biases. Families
-retain bank namespaces, formats and expert selection policy. Member projection retains bank-global IDs
+including packed weights, scales and biases. Muse uses the same member projection
+while retaining its declared parameter order and format-dependent quantization
+roles. Families retain bank namespaces, formats and expert selection policy.
+Member projection retains bank-global IDs
 and allocates no parameter payload or native resource. Shared resource binding
 preparation uses the same checkpoint snapshot primitive while keeping aliases
 local to each independently leased resource.
