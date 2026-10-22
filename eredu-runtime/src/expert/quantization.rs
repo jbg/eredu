@@ -8,6 +8,80 @@ use eredu_checkpoint::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+/// One conversion batch sharing the exact selected encoding and companion
+/// precision. The selected members remain independently leased storage units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressableBankTransformGroup {
+    transform: AddressableBindingTransform,
+    selected: BTreeSet<(ParameterBankKey, String)>,
+}
+
+impl AddressableBankTransformGroup {
+    /// Exact encoding and precision retained for this conversion batch.
+    pub const fn transform(&self) -> &AddressableBindingTransform {
+        &self.transform
+    }
+    /// Independently identified member-local bindings in canonical key order.
+    pub const fn selected(&self) -> &BTreeSet<(ParameterBankKey, String)> {
+        &self.selected
+    }
+    /// Consumes the conversion selection without rebuilding its resource mapping.
+    pub fn into_parts(
+        self,
+    ) -> (
+        AddressableBindingTransform,
+        BTreeSet<(ParameterBankKey, String)>,
+    ) {
+        (self.transform, self.selected)
+    }
+}
+
+/// Ordered conversion batches and format reporting from the same retained
+/// selection. Groups follow first use in canonical bank-key and binding order;
+/// equal encodings with different companion precision remain separate groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressableBankTransformPlan {
+    groups: Vec<AddressableBankTransformGroup>,
+    formats: Vec<eredu_checkpoint::WeightQuantization>,
+}
+
+impl AddressableBankTransformPlan {
+    /// Projects selected transformations without selecting mechanisms or granting
+    /// format support. Task admission and bounded plan validation remain separate.
+    pub fn new(
+        transformations: BTreeMap<(ParameterBankKey, String), AddressableBindingTransform>,
+    ) -> Self {
+        let mut groups = Vec::<AddressableBankTransformGroup>::new();
+        let mut formats = Vec::new();
+        for (binding, transform) in transformations {
+            if !formats.contains(&transform.quantization()) {
+                formats.push(transform.quantization());
+            }
+            if let Some(group) = groups.iter_mut().find(|group| group.transform == transform) {
+                group.selected.insert(binding);
+            } else {
+                groups.push(AddressableBankTransformGroup {
+                    transform,
+                    selected: std::iter::once(binding).collect(),
+                });
+            }
+        }
+        Self { groups, formats }
+    }
+    /// Ordered encoding/precision groups used by materialization.
+    pub fn groups(&self) -> &[AddressableBankTransformGroup] {
+        &self.groups
+    }
+    /// Distinct encodings in first-use order, independent of precision grouping.
+    pub fn formats(&self) -> &[eredu_checkpoint::WeightQuantization] {
+        &self.formats
+    }
+    /// Consumes the exact conversion batches.
+    pub fn into_groups(self) -> Vec<AddressableBankTransformGroup> {
+        self.groups
+    }
+}
+
 /// Failure preparing or binding a selected bank transformation.
 #[derive(Debug, thiserror::Error)]
 pub enum AddressableBankQuantizationError {

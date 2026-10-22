@@ -232,47 +232,16 @@ pub(crate) fn quantize_entry_catalog(
     )
 }
 
-pub(super) fn selected_transformation_formats(
-    transformations: &BTreeMap<
-        (ParameterBankKey, String),
-        eredu_runtime::AddressableBindingTransform,
-    >,
-) -> Vec<WeightQuantization> {
-    let mut formats = Vec::new();
-    for transform in transformations.values() {
-        if !formats.contains(&transform.quantization()) {
-            formats.push(transform.quantization());
-        }
-    }
-    formats
-}
-
 pub(super) fn quantize_selected_entry_catalog(
     mut source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     mut entries: Vec<ParameterBankEntry>,
-    transformations: BTreeMap<
-        (ParameterBankKey, String),
-        eredu_runtime::AddressableBindingTransform,
-    >,
+    transformations: eredu_runtime::AddressableBankTransformPlan,
     max_working_set_bytes: u64,
     source_stream: &Stream,
 ) -> Result<QuantizedParameterBankCatalog, Error> {
-    let mut by_format = Vec::<(
-        eredu_runtime::AddressableBindingTransform,
-        std::collections::BTreeSet<_>,
-    )>::new();
-    for (binding, transform) in transformations {
-        if let Some((_, selected)) = by_format
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == transform)
-        {
-            selected.insert(binding);
-        } else {
-            by_format.push((transform, std::iter::once(binding).collect()));
-        }
-    }
     let mut report = WeightMaterializationReport::default();
-    for (transform, selected) in by_format {
+    for group in transformations.into_groups() {
+        let (transform, selected) = group.into_parts();
         let transformed = quantize_selected_entry_catalog_once(
             source,
             entries,

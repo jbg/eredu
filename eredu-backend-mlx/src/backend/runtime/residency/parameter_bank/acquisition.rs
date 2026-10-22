@@ -236,11 +236,13 @@ impl AddressableParameterBank {
             bank.parameter_members = parameter_members;
             return Ok(bank);
         }
-        let telemetry_formats = selected_transformation_formats(&selected.transformations);
+        let transformations =
+            eredu_runtime::AddressableBankTransformPlan::new(selected.transformations);
+        let telemetry_formats = transformations.formats().to_vec();
         let transformed = quantize_selected_entry_catalog(
             store,
             selected.entries,
-            selected.transformations,
+            transformations,
             options.compact_bank_scratch_bytes,
             &source_stream,
         )

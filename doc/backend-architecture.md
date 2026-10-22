@@ -3465,6 +3465,13 @@ preserving unselected recipes and independent residency units. Catalog sizing an
 binding reconstruction use shared checked geometry; native code owns conversion,
 source publication, streams and completion.
 
+`AddressableBankTransformPlan` derives ordered conversion batches and distinct
+format reporting from one selected transformation map. Batches preserve first
+use in canonical bank-key and binding order; companion precision remains part of
+each batch identity. The backend executes these retained batches and reports the
+plan's formats. Conversion batching does not combine independent residency units
+or alter their resource charges.
+
 `addressable_projection_bytes` supplies the common packed payload arithmetic for
 selected member admission, backend preflight and bounded transformation sizing.
 It accounts for the declared companion precision, affine biases and MXFP4 scale
