@@ -314,30 +314,6 @@ fn residency_report_retains_exact_selected_entry_placement() {
     );
 }
 
-#[test]
-fn affine_selected_bytes_use_the_exact_non_f32_companion_dtype() {
-    let affine =
-        WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
-    assert_eq!(
-        packed_projection_bytes(
-            &[2, 64],
-            affine,
-            &eredu_checkpoint::recipe::RecipeDtype::F16,
-        )
-        .unwrap(),
-        72
-    );
-    assert_eq!(
-        packed_projection_bytes(
-            &[2, 64],
-            affine,
-            &eredu_checkpoint::recipe::RecipeDtype::F32,
-        )
-        .unwrap(),
-        80
-    );
-}
-
 fn cache(
     store: Arc<SafetensorsWeightStore>,
     device: u64,

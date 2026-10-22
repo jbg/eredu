@@ -211,11 +211,13 @@ impl AddressableParameterBank {
                         .get(&(entry.identity, binding.name().to_owned()))
                     {
                         let metadata = binding.source_recipe().infer(store.as_ref())?;
-                        packed_projection_bytes(
+                        eredu_runtime::addressable_projection_bytes(
+                            binding.name(),
                             metadata.shape(),
                             transform.quantization(),
                             transform.companion_dtype(),
-                        )?
+                        )
+                        .map_err(|error| Error::Other(Box::new(error)))?
                     } else {
                         binding.expected_bytes()
                     };

@@ -3456,6 +3456,12 @@ companion precision, and materialization consumes those same values. Backend
 code supplies the native converter without maintaining a second transformation
 description or reselecting precision.
 
+`addressable_projection_bytes` supplies the common packed payload arithmetic for
+selected member admission, backend preflight and bounded transformation sizing.
+It accounts for the declared companion precision, affine biases and MXFP4 scale
+encoding. Selected tasks retain source-format, packed-axis and group-alignment
+admission; the arithmetic helper does not imply native transformation support.
+
 `prepare_bank_parameter_members` joins final physical binding recipes to the
 retained canonical destinations for parameter inspection and editing. It infers
 geometry against the selected post-transformation source, preserves global member

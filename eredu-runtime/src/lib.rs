@@ -256,7 +256,7 @@ pub use execution_plan::{
     ResidencyDiagnostics,
 };
 pub use expert::{
-    place_addressable_bank_members, AddressableBankPlacementError,
+    addressable_projection_bytes, place_addressable_bank_members, AddressableBankPlacementError,
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
     plan_addressable_bank_bindings, reduce_routed_expert_tensor_parallel,
     reduce_tensor_parallel_expert_output, selected_addressable_parameter_bytes,

@@ -48,9 +48,7 @@ pub use catalog::{
     entries_from_selected_members, BankAccessClass, ParameterBankEntry, ParameterBankKey,
     ParameterBankOptions, ParameterBankOptionsError, SelectedAddressableEntries,
 };
-use catalog::{
-    packed_projection_bytes, quantize_selected_entry_catalog, selected_transformation_formats,
-};
+use catalog::{quantize_selected_entry_catalog, selected_transformation_formats};
 
 mod telemetry;
 use telemetry::ParameterBankStatistics;

@@ -339,11 +339,15 @@ fn quantize_selected_entry_catalog_once(
             )?
             .with_affine_companion_dtype(companion_dtype.clone())?;
             packed_catalog_bytes = packed_catalog_bytes
-                .checked_add(packed_projection_bytes(
-                    metadata.shape(),
-                    quantization,
-                    companion_dtype,
-                )?)
+                .checked_add(
+                    eredu_runtime::addressable_projection_bytes(
+                        binding.name(),
+                        metadata.shape(),
+                        quantization,
+                        companion_dtype,
+                    )
+                    .map_err(|error| Error::Other(Box::new(error)))?,
+                )
                 .ok_or_else(|| {
                     Error::Quantization("packed entry catalog size overflowed".into())
                 })?;
@@ -416,53 +420,6 @@ fn quantize_selected_entry_catalog_once(
         entries: rebuilt,
         report,
     })
-}
-
-pub(super) fn packed_projection_bytes(
-    shape: &[usize],
-    quantization: WeightQuantization,
-    companion_dtype: &eredu_checkpoint::recipe::RecipeDtype,
-) -> Result<u64, Error> {
-    let (&columns, rows) = shape
-        .split_last()
-        .ok_or_else(|| Error::Quantization("entry projection has no input dimension".into()))?;
-    let rows = rows.iter().try_fold(1u64, |count, dimension| {
-        count
-            .checked_mul(*dimension as u64)
-            .ok_or_else(|| Error::Quantization("entry projection row count overflowed".into()))
-    })?;
-    let packed = (columns as u64)
-        .checked_mul(quantization.bits() as u64)
-        .and_then(|bits| bits.checked_div(8))
-        .ok_or_else(|| Error::Quantization("packed entry row size overflowed".into()))?;
-    let groups = columns
-        .checked_div(quantization.group_size() as usize)
-        .ok_or_else(|| Error::Quantization("entry group geometry is invalid".into()))?
-        as u64;
-    let scalar_bytes = companion_dtype
-        .bit_width()
-        .map_err(|error| Error::Quantization(error.to_string()))?
-        / 8;
-    let scale_bytes = if matches!(quantization, WeightQuantization::MxFp4) {
-        groups
-    } else {
-        groups
-            .checked_mul(scalar_bytes)
-            .ok_or_else(|| Error::Quantization("entry scale row size overflowed".into()))?
-    };
-    let bias_bytes = if quantization.has_biases() {
-        groups
-            .checked_mul(scalar_bytes)
-            .ok_or_else(|| Error::Quantization("entry bias row size overflowed".into()))?
-    } else {
-        0
-    };
-    let row_bytes = packed
-        .checked_add(scale_bytes)
-        .and_then(|bytes| bytes.checked_add(bias_bytes))
-        .ok_or_else(|| Error::Quantization("packed entry row total overflowed".into()))?;
-    rows.checked_mul(row_bytes)
-        .ok_or_else(|| Error::Quantization("packed entry projection size overflowed".into()))
 }
 
 fn packed_binding(

@@ -908,21 +908,11 @@ pub fn selected_addressable_parameter_bytes(
         });
     }
     let shape = metadata.shape();
-    let (&columns, row_shape) =
-        shape
-            .split_last()
-            .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
-                parameter: task.name().to_owned(),
-                detail: "transform target is not a matrix".into(),
-            })?;
-    let rows = row_shape
-        .iter()
-        .try_fold(1u64, |total, dimension| {
-            total.checked_mul(*dimension as u64)
-        })
+    let columns = *shape
+        .last()
         .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
             parameter: task.name().to_owned(),
-            detail: "transform row geometry overflowed".into(),
+            detail: "transform target is not a matrix".into(),
         })?;
     let group = usize::try_from(quantization.group_size()).map_err(|_| {
         AddressableBankMemberError::InvalidParameter {
@@ -936,48 +926,62 @@ pub fn selected_addressable_parameter_bytes(
             detail: "transform geometry is incompatible with its packed format".into(),
         });
     }
-    let groups = (columns / group) as u64;
+    addressable_projection_bytes(task.name(), shape, quantization, metadata.dtype())
+}
+
+/// Computes packed payload bytes for already admitted addressable projection
+/// geometry, including the selected companion precision and format-specific
+/// scales. Source-format support, packed-axis and alignment admission remain
+/// the selected task's responsibility; this function grants no capability.
+pub fn addressable_projection_bytes(
+    parameter: &str,
+    shape: &[usize],
+    quantization: eredu_checkpoint::WeightQuantization,
+    companion_dtype: &eredu_checkpoint::recipe::RecipeDtype,
+) -> Result<u64, AddressableBankMemberError> {
+    let invalid = |detail: String| AddressableBankMemberError::InvalidParameter {
+        parameter: parameter.to_owned(),
+        detail,
+    };
+    let (&columns, rows) = shape
+        .split_last()
+        .ok_or_else(|| invalid("entry projection has no input dimension".into()))?;
+    let rows = rows.iter().try_fold(1u64, |count, dimension| {
+        count
+            .checked_mul(*dimension as u64)
+            .ok_or_else(|| invalid("entry projection row count overflowed".into()))
+    })?;
     let packed = (columns as u64)
         .checked_mul(quantization.bits() as u64)
         .and_then(|bits| bits.checked_div(8))
-        .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
-            parameter: task.name().to_owned(),
-            detail: "packed row byte geometry overflowed".into(),
-        })?;
-    let scalar_bytes = metadata.dtype().bit_width().map_err(|error| {
-        AddressableBankMemberError::InvalidParameter {
-            parameter: task.name().to_owned(),
-            detail: error.to_string(),
-        }
-    })? / 8;
-    let companion = if matches!(quantization, eredu_checkpoint::WeightQuantization::MxFp4) {
+        .ok_or_else(|| invalid("packed entry row size overflowed".into()))?;
+    let groups = columns
+        .checked_div(quantization.group_size() as usize)
+        .ok_or_else(|| invalid("entry group geometry is invalid".into()))? as u64;
+    let scalar_bytes = companion_dtype
+        .bit_width()
+        .map_err(|error| invalid(error.to_string()))?
+        / 8;
+    let scale_bytes = if matches!(quantization, eredu_checkpoint::WeightQuantization::MxFp4) {
         groups
     } else {
-        groups.checked_mul(scalar_bytes).ok_or_else(|| {
-            AddressableBankMemberError::InvalidParameter {
-                parameter: task.name().to_owned(),
-                detail: "scale byte geometry overflowed".into(),
-            }
-        })?
+        groups
+            .checked_mul(scalar_bytes)
+            .ok_or_else(|| invalid("entry scale row size overflowed".into()))?
     };
-    let bias = if quantization.has_biases() {
-        companion
+    let bias_bytes = if quantization.has_biases() {
+        groups
+            .checked_mul(scalar_bytes)
+            .ok_or_else(|| invalid("entry bias row size overflowed".into()))?
     } else {
         0
     };
-    rows.checked_mul(
-        packed
-            .checked_add(companion)
-            .and_then(|bytes| bytes.checked_add(bias))
-            .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
-                parameter: task.name().to_owned(),
-                detail: "selected row byte geometry overflowed".into(),
-            })?,
-    )
-    .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
-        parameter: task.name().to_owned(),
-        detail: "selected byte geometry overflowed".into(),
-    })
+    let row_bytes = packed
+        .checked_add(scale_bytes)
+        .and_then(|bytes| bytes.checked_add(bias_bytes))
+        .ok_or_else(|| invalid("packed entry row total overflowed".into()))?;
+    rows.checked_mul(row_bytes)
+        .ok_or_else(|| invalid("packed entry projection size overflowed".into()))
 }
 
 /// Invalid generic addressable-bank member projection.
