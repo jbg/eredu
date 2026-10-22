@@ -813,6 +813,13 @@ and selected pipeline execution share `PerceptionKernel`. A parameter-only ingre
 or projection stage owns no cache slots. Typed boundaries retain frame frontiers;
 projection ingress captures the raw encoder result alongside its projected output.
 
+`PreparedCheckpointSource::retain` restricts physical inputs and snapshots their
+exact metadata and provenance before deferred payload access. Runtime's
+`PreparedParameterRecipes` couples this authority with validated family-resolved
+recipes for one ordinary, expert or pinned owner. Empty owners retain an empty
+source. Shared resource binding preparation uses the same checkpoint snapshot
+primitive while keeping aliases local to each independently leased resource.
+
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
 source authority to the recipes' physical inputs. Before recipe preparation,
@@ -11039,6 +11046,13 @@ admitted providers. Target inspection and global partition/transform-source
 planning consume this declaration without constructing temporary global models.
 Parameter-member declarations retain neutral encoding relationships through
 `ParameterMemberSpec::with_parameter_metadata`.
+
+Qwen4 target, prediction, tensor-partition and vision preparation expose runtime
+`PreparedParameterRecipes` for ordinary parameters and bounded expert selections.
+Family code retains naming, format admission, expert recipes and exceptional
+partition transforms; checkpoint code retains exact source snapshots and runtime
+owns recipe-resource preparation. Recipe failures preserve their typed causes
+through the family preparation error.
 
 `TargetSpec::definition` validates the target's graph, canonical storage, semantic
 unit paths, one-to-one context slots and decoder transport before materialization.

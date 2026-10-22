@@ -36,15 +36,16 @@ impl TargetExecutionPlan {
         vision: PreparedVision,
     ) -> Result<ConditionalExecutionPlan, PreparationError> {
         let ingress = self.target.media_ingress(vision.clone()).map_err(invalid)?;
-        let target_source = retain(
+        let target_source: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
             self.target.artifact.clone(),
+            "qwen4_exp prepared owner",
             self.target
                 .artifact
                 .source_keys()
                 .into_iter()
                 .filter(|key| !key.starts_with("model.visual."))
                 .collect(),
-        )?;
+        )?);
         let source: SharedCheckpointSource =
             Arc::new(eredu_checkpoint::store::CompositeCheckpointSource::new([
                 target_source,

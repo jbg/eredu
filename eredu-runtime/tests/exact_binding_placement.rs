@@ -423,7 +423,8 @@ mod component_preparation {
         use super::{AtomicUsize, Ordering, Source};
         use eredu_checkpoint::recipe::RecipeAlias;
         use eredu_runtime::{
-            prepare_resource_bindings, ParameterResourceRecipes, WeightBindingPlan,
+            prepare_resource_bindings, ParameterResourceRecipes, PreparedParameterRecipes,
+            WeightBindingPlan,
         };
         use std::collections::BTreeMap;
         let original = Arc::new(Source {
@@ -436,11 +437,22 @@ mod component_preparation {
             leases: AtomicUsize::new(0),
         });
         let recipe = || DerivedWeightRecipe::source("shared", TensorSelection::Full);
+        let owner = PreparedParameterRecipes::new(
+            "ordinary owner",
+            original.clone(),
+            BTreeMap::from([("owner".into(), recipe())]),
+        )
+        .unwrap();
+        assert_eq!(owner.source().source_keys(), ["shared"]);
+        assert!(owner.source().source_metadata("neighbor").is_err());
+        let empty = PreparedParameterRecipes::new("empty owner", original.clone(), BTreeMap::new())
+            .unwrap();
+        assert!(empty.source().source_keys().is_empty());
         let resources = BTreeMap::from([
             (
                 "first",
                 ParameterResourceRecipes {
-                    outputs: BTreeMap::from([("owner".into(), recipe())]),
+                    outputs: owner.recipes().clone(),
                     aliases: vec![RecipeAlias::new("consumer", "owner")],
                 },
             ),

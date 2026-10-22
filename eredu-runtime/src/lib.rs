@@ -334,8 +334,8 @@ pub use parameter::{
     materialize_bindings, materialize_selected_bindings, preflight_bindings,
     prepare_resource_bindings, select_bindings, BindingPlan, BindingPlanError, MaterializedUnit,
     ModuleBindingPlan, ModuleBindingPlanError, ParameterBatchBudget, ParameterBindingTarget,
-    ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding, RecipeBindingError,
-    SelectedBindingPlan,
+    ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding,
+    PreparedParameterRecipes, RecipeBindingError, SelectedBindingPlan,
 };
 pub use parameter_layout::{
     derive_partitioned_group_layout, derive_partitioned_local_layout,

@@ -293,13 +293,23 @@ impl VisionPlan {
             source,
             self.declaration.expected.clone(),
         )?);
-        let static_parameters =
-            PreparedParameters::new(source.clone(), self.declaration.static_recipes.clone())?;
+        let static_parameters = PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
+            source.clone(),
+            self.declaration.static_recipes.clone(),
+        )?;
         let blocks = self
             .declaration
             .blocks
             .iter()
-            .map(|recipes| PreparedParameters::new(source.clone(), recipes.clone()))
+            .map(|recipes| {
+                PreparedParameterRecipes::new(
+                    "qwen4_exp prepared owner",
+                    source.clone(),
+                    recipes.clone(),
+                )
+                .map_err(PreparationError::from)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(PreparedVision {
             plan: Arc::new(self),

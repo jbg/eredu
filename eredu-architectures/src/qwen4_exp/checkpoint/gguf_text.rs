@@ -3,7 +3,7 @@
 use super::recipes::ParameterScope;
 use crate::qwen4_exp::{
     config::{Config, LayerKind},
-    prepared::{PreparationError, PreparedParameters},
+    prepared::PreparationError,
 };
 use eredu_checkpoint::{
     gguf_store::GgufCatalog,
@@ -19,6 +19,7 @@ use eredu_checkpoint::{
     LinearFormat,
 };
 use eredu_gguf::{Checkpoint, QuantizedTensorRepresentation};
+use eredu_runtime::PreparedParameterRecipes;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -903,18 +904,25 @@ impl GgufTextWeights {
     pub fn parameters(
         &self,
         scope: ParameterScope,
-    ) -> Result<PreparedParameters, PreparationError> {
-        PreparedParameters::new(self.source.clone(), self.plan.parameter_recipes(scope)?)
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
+            self.source.clone(),
+            self.plan.parameter_recipes(scope)?,
+        )
+        .map_err(PreparationError::from)
     }
     /// One bounded expert selection with all exact companions.
     pub fn expert(
         &self,
         layer: usize,
         expert: usize,
-    ) -> Result<PreparedParameters, PreparationError> {
-        PreparedParameters::new(
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
             self.source.clone(),
             self.plan.expert_recipes(layer, expert)?,
         )
+        .map_err(PreparationError::from)
     }
 }

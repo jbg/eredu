@@ -12,8 +12,8 @@ pub struct PreparedTensorTarget {
     source_bound: BoundTargetSpec,
     bound: BoundTargetSpec,
     partition: TargetTensorPartition,
-    static_parameters: PreparedParameters,
-    units: Vec<PreparedParameters>,
+    static_parameters: PreparedParameterRecipes,
+    units: Vec<PreparedParameterRecipes>,
     expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
 }
 impl PreparedTarget {
@@ -97,11 +97,11 @@ impl PreparedTensorTarget {
         self.bound.geometry()
     }
     /// Replicated vocabulary and final residual collapse parameters.
-    pub fn static_parameters(&self) -> &PreparedParameters {
+    pub fn static_parameters(&self) -> &PreparedParameterRecipes {
         &self.static_parameters
     }
     /// Exact rank-local ordinary recipes for one execution ordinal.
-    pub fn unit(&self, ordinal: usize) -> Result<&PreparedParameters, PreparationError> {
+    pub fn unit(&self, ordinal: usize) -> Result<&PreparedParameterRecipes, PreparationError> {
         self.units.get(ordinal).ok_or_else(|| {
             PreparationError::Contract("execution owner is outside tensor target".into())
         })
@@ -111,7 +111,7 @@ impl PreparedTensorTarget {
         &self,
         ordinal: usize,
         expert: usize,
-    ) -> Result<PreparedParameters, PreparationError> {
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
         let Some(UnitSpec::Decoder { layer, .. }) = self.spec().units.get(ordinal) else {
             return Err(PreparationError::Contract(
                 "expert owner is not a decoder".into(),
@@ -119,13 +119,15 @@ impl PreparedTensorTarget {
         };
         let root = format!("model.layers.{layer}.mlp.experts");
         let recipes = select_expert(&self.expert_banks, &root, expert)?;
-        PreparedParameters::new(
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
             self.source.artifact.clone(),
             recipes
                 .into_iter()
                 .map(|(name, recipe)| (format!("{root}.{name}"), recipe))
                 .collect(),
         )
+        .map_err(PreparationError::from)
     }
     /// Original compact tables and exact hash controls; no row storage is replicated here.
     pub fn tables(&self) -> &BTreeMap<usize, PreparedNGramTable> {
@@ -150,17 +152,17 @@ impl PreparedTensorTarget {
     }
 }
 fn partition_owner(
-    owner: &PreparedParameters,
+    owner: &PreparedParameterRecipes,
     partition: &TargetTensorPartition,
-) -> Result<PreparedParameters, PreparationError> {
+) -> Result<PreparedParameterRecipes, PreparationError> {
     let recipes = owner
-        .recipes
+        .recipes()
         .iter()
         .map(|(name, recipe)| {
             Ok((
                 name.clone(),
                 partition_recipe(
-                    owner.source.as_ref(),
+                    owner.source().as_ref(),
                     name,
                     recipe,
                     partition.parameter_selections(name),
@@ -168,7 +170,8 @@ fn partition_owner(
             ))
         })
         .collect::<Result<_, PreparationError>>()?;
-    PreparedParameters::new(owner.source.clone(), recipes)
+    PreparedParameterRecipes::new("qwen4_exp prepared owner", owner.source().clone(), recipes)
+        .map_err(PreparationError::from)
 }
 pub(super) fn partition_recipe<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
     catalog: &C,
@@ -202,7 +205,7 @@ pub(super) fn partition_recipe<C: eredu_checkpoint::recipe::RecipeCatalog + ?Siz
             inputs: pieces,
         }
     };
-    // Check the composed output before publishing the owner. PreparedParameters
+    // Check the composed output before publishing the owner. PreparedParameterRecipes
     // retains the same exact metadata/provenance authority after selection pushdown.
     recipe.infer(catalog).map_err(invalid)?;
     Ok(recipe)

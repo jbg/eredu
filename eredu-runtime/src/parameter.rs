@@ -7,8 +7,8 @@ use eredu_checkpoint::{
         AtomicRecipeSet, DerivedWeightRecipe, RecipeAlias, RecipeCatalog, RecipeDtype, RecipeError,
     },
     store::{
-        CheckpointSource, ReadPolicy, RestrictedCheckpointSource, SharedCheckpointSource,
-        StoreError, TensorReadRequest, TensorSelection,
+        CheckpointSource, PreparedCheckpointSource, ReadPolicy, SharedCheckpointSource, StoreError,
+        TensorReadRequest, TensorSelection,
     },
 };
 use eredu_nn::{
@@ -945,6 +945,46 @@ pub struct ParameterResourceRecipes {
     pub aliases: Vec<RecipeAlias>,
 }
 
+/// Exact recipes and immutable physical source authority for one parameter owner.
+/// Empty owners are valid. This retains no native tensor or execution state and
+/// does not merge separately leased ordinary units, experts or pinned resources.
+#[derive(Clone)]
+pub struct PreparedParameterRecipes {
+    source: SharedCheckpointSource,
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
+}
+
+impl PreparedParameterRecipes {
+    /// Retains only the recipes' physical inputs and validates their outputs
+    /// against the exact metadata snapshot, without acquiring payloads.
+    pub fn new(
+        scope: impl Into<String>,
+        source: SharedCheckpointSource,
+        recipes: BTreeMap<String, DerivedWeightRecipe>,
+    ) -> Result<Self, RecipeBindingError> {
+        let keys = recipes
+            .values()
+            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+            .collect();
+        let source: SharedCheckpointSource =
+            Arc::new(PreparedCheckpointSource::retain(source, scope, keys)?);
+        for recipe in recipes.values() {
+            recipe.infer(source.as_ref())?;
+        }
+        Ok(Self { source, recipes })
+    }
+
+    /// Exact restricted metadata and provenance authority for deferred binding.
+    pub fn source(&self) -> &SharedCheckpointSource {
+        &self.source
+    }
+
+    /// Canonical parameter identities mapped to family-admitted physical recipes.
+    pub fn recipes(&self) -> &BTreeMap<String, DerivedWeightRecipe> {
+        &self.recipes
+    }
+}
+
 /// Prepares independent resources against one exact restricted source authority.
 ///
 /// The keys retain canonical storage ownership; their order does not define logical
@@ -960,9 +1000,8 @@ pub fn prepare_resource_bindings<K: Ord>(
         .flat_map(|resource| resource.outputs.values())
         .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
         .collect();
-    let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-        source, scope, inputs,
-    )?);
+    let source: SharedCheckpointSource =
+        Arc::new(PreparedCheckpointSource::retain(source, scope, inputs)?);
     let bindings = resources
         .into_iter()
         .map(|(owner, resource)| {

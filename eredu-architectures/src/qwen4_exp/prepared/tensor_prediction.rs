@@ -9,7 +9,7 @@ use crate::qwen4_exp::prepared::tensor_partition::partition_recipe;
 pub struct PreparedTensorPrediction {
     source: PreparedPrediction,
     partition: PredictionTensorPartition,
-    units: Vec<PreparedParameters>,
+    units: Vec<PreparedParameterRecipes>,
     expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
 }
 
@@ -28,13 +28,13 @@ impl PreparedPrediction {
             .iter()
             .map(|owner| {
                 let recipes = owner
-                    .recipes
+                    .recipes()
                     .iter()
                     .map(|(name, recipe)| {
                         Ok((
                             name.clone(),
                             partition_recipe(
-                                owner.source.as_ref(),
+                                owner.source().as_ref(),
                                 name,
                                 recipe,
                                 partition.parameter_selections(name),
@@ -42,7 +42,12 @@ impl PreparedPrediction {
                         ))
                     })
                     .collect::<Result<_, PreparationError>>()?;
-                PreparedParameters::new(owner.source.clone(), recipes)
+                PreparedParameterRecipes::new(
+                    "qwen4_exp prepared owner",
+                    owner.source().clone(),
+                    recipes,
+                )
+                .map_err(PreparationError::from)
             })
             .collect::<Result<_, PreparationError>>()?;
         let expert_banks = self
@@ -96,17 +101,17 @@ impl PreparedTensorPrediction {
     }
 
     /// Replicated fusion and readout from the original prepared owner.
-    pub fn shared(&self) -> &PreparedParameters {
+    pub fn shared(&self) -> &PreparedParameterRecipes {
         self.source.shared()
     }
 
     /// Original target embedding/output references, without target collapse.
-    pub fn vocabulary(&self) -> &PreparedParameters {
+    pub fn vocabulary(&self) -> &PreparedParameterRecipes {
         self.source.vocabulary()
     }
 
     /// Tensor-local ordinary parameters for one independently acquired depth.
-    pub fn unit(&self, depth: usize) -> Result<&PreparedParameters, PreparationError> {
+    pub fn unit(&self, depth: usize) -> Result<&PreparedParameterRecipes, PreparationError> {
         self.units.get(depth).ok_or_else(|| {
             PreparationError::Contract("prediction depth is outside tensor partition".into())
         })
@@ -117,16 +122,18 @@ impl PreparedTensorPrediction {
         &self,
         depth: usize,
         expert: usize,
-    ) -> Result<PreparedParameters, PreparationError> {
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
         self.unit(depth)?;
         let root = format!("mtp.layers.{depth}.mlp.experts");
         let recipes = select_expert(&self.expert_banks, &root, expert)?;
-        PreparedParameters::new(
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
             self.source.artifact.clone(),
             recipes
                 .into_iter()
                 .map(|(name, recipe)| (format!("{root}.{name}"), recipe))
                 .collect(),
         )
+        .map_err(PreparationError::from)
     }
 }

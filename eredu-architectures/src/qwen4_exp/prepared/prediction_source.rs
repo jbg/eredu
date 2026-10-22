@@ -212,7 +212,11 @@ impl SafetensorsPredictionPlan {
                 "prediction source set differs from admitted headers".into(),
             ));
         }
-        let artifact = retain(source, self.resolution.source_keys().clone())?;
+        let artifact: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
+            source,
+            "qwen4_exp prepared owner",
+            self.resolution.source_keys().clone(),
+        )?);
         for key in self.resolution.source_keys() {
             let metadata = artifact.source_metadata(key)?;
             let admitted = &self.catalog.0[key];

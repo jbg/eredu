@@ -206,7 +206,11 @@ impl TargetArtifactDeclaration {
                 "source set differs from admitted target headers".into(),
             ));
         }
-        let source = retain(source, keys)?;
+        let source: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
+            source,
+            "qwen4_exp prepared owner",
+            keys,
+        )?);
         for key in source.source_keys() {
             let expected = self.normalized.catalog().tensor_metadata(&key)?;
             let actual = source.source_metadata(&key)?;
@@ -230,7 +234,11 @@ impl TargetArtifactDeclaration {
                 )));
             }
         }
-        let source = retain(source, self.binding_keys.clone())?;
+        let source: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
+            source,
+            "qwen4_exp prepared owner",
+            self.binding_keys.clone(),
+        )?);
         let spec = self.target_spec(limits, None)?;
         let mut tables = BTreeMap::new();
         for (ordinal, unit) in spec.units.iter().enumerate() {
@@ -260,14 +268,22 @@ impl TargetArtifactDeclaration {
             expert_banks: self.banks.clone(),
             spec,
             tables,
-            static_parameters: PreparedParameters::new(
+            static_parameters: PreparedParameterRecipes::new(
+                "qwen4_exp prepared owner",
                 source.clone(),
                 self.static_recipes.clone(),
             )?,
             units: self
                 .unit_recipes
                 .iter()
-                .map(|recipes| PreparedParameters::new(source.clone(), recipes.clone()))
+                .map(|recipes| {
+                    PreparedParameterRecipes::new(
+                        "qwen4_exp prepared owner",
+                        source.clone(),
+                        recipes.clone(),
+                    )
+                    .map_err(PreparationError::from)
+                })
                 .collect::<Result<_, _>>()?,
         })
     }

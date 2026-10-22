@@ -8,8 +8,8 @@ use crate::qwen4_exp::config::MediaTokens;
 pub struct PreparedVision {
     pub(super) plan: Arc<VisionPlan>,
     pub(super) source: SharedCheckpointSource,
-    pub(super) static_parameters: PreparedParameters,
-    pub(super) blocks: Vec<PreparedParameters>,
+    pub(super) static_parameters: PreparedParameterRecipes,
+    pub(super) blocks: Vec<PreparedParameterRecipes>,
 }
 impl PreparedTarget {
     /// Couples shared media ingress to retained target geometry and a prepared tower.
@@ -90,11 +90,11 @@ impl PreparedVision {
         &self.source
     }
     /// Patch/position ingress and output merger parameters.
-    pub fn static_parameters(&self) -> &PreparedParameters {
+    pub fn static_parameters(&self) -> &PreparedParameterRecipes {
         &self.static_parameters
     }
     /// One independently materializable shared vision transformer block.
-    pub fn block(&self, layer: usize) -> Result<&PreparedParameters, PreparationError> {
+    pub fn block(&self, layer: usize) -> Result<&PreparedParameterRecipes, PreparationError> {
         self.blocks.get(layer).ok_or_else(|| {
             PreparationError::Contract("vision block outside declared schedule".into())
         })
