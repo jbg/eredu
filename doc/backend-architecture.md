@@ -2131,7 +2131,13 @@ pipeline placement; it does not impose decoder semantics on an encoder. Text
 task requirements and prediction-group constraints retain their existing owners.
 
 Selected execution layouts retain canonical group/unit addresses while compacting
-local storage ordinals. MLX materializes those addressed bindings through the
+local storage ordinals. Runtime's `ExecutionUnitAddressMap` validates the selected
+logical addresses against each local policy slot before acquisition or parameter
+inspection. It requires unique invocations and matching execution groups, retains
+nonzero global indices, and supplies the same local slots for completion and abort.
+Cloned native policy handles share this immutable mapping. Parameter-storage and
+mutable-state ownership remain independent of this invocation address translation.
+MLX materializes those addressed bindings through the
 ordinary resident, host-layerwise and disk-streamed providers; unowned groups
 have no residency or transfer declarations. Its TTS stage adapter consumes the
 prepared partition and invokes the shared local-stage runtime, with optional

@@ -118,6 +118,10 @@ pub enum Error {
     #[error(transparent)]
     ExecutionGraph(#[from] eredu_runtime::ExecutionGraphError),
 
+    /// Invalid logical-to-local execution-unit mapping or invocation.
+    #[error(transparent)]
+    ExecutionUnitAddressMap(#[from] eredu_runtime::ExecutionUnitAddressMapError),
+
     /// Invalid backend-neutral pipeline execution-group lifecycle.
     #[error(transparent)]
     LayeredPipelineSchedule(#[from] eredu_runtime::LayeredPipelineScheduleError),

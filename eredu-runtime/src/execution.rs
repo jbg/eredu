@@ -104,6 +104,124 @@ impl ExecutionUnitAddress {
     }
 }
 
+/// Validated pairing of logical invocation addresses with policy-local addresses.
+/// Pipeline selections may start at a nonzero global index while their local
+/// policy starts at zero. This map changes neither parameter nor state ownership.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExecutionUnitAddressMap {
+    addresses: std::sync::Arc<[(ExecutionUnitAddress, ExecutionUnitAddress)]>,
+}
+
+impl ExecutionUnitAddressMap {
+    /// Pairs each local policy slot with its selected global invocation.
+    /// Logical addresses must be unique and retain the local execution group.
+    pub fn new(
+        local: &ExecutionUnitLayout,
+        logical: &[ExecutionUnitAddress],
+    ) -> Result<Self, ExecutionUnitAddressMapError> {
+        if local.len() != logical.len() {
+            return Err(ExecutionUnitAddressMapError::CountMismatch {
+                local: local.len(),
+                logical: logical.len(),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        let mut addresses = Vec::with_capacity(logical.len());
+        for (ordinal, &logical) in logical.iter().enumerate() {
+            let local = local.address(ordinal).expect("validated local layout");
+            if local.group() != logical.group() {
+                return Err(ExecutionUnitAddressMapError::GroupMismatch {
+                    ordinal,
+                    local: local.group(),
+                    logical: logical.group(),
+                });
+            }
+            if !seen.insert((logical.group(), logical.index())) {
+                return Err(ExecutionUnitAddressMapError::DuplicateAddress {
+                    group: logical.group(),
+                    index: logical.index(),
+                });
+            }
+            addresses.push((logical, local));
+        }
+        Ok(Self {
+            addresses: addresses.into(),
+        })
+    }
+
+    /// Resolves an invocation only when its logical address matches its slot.
+    pub fn resolve(
+        &self,
+        ordinal: usize,
+        logical: ExecutionUnitAddress,
+    ) -> Result<ExecutionUnitAddress, ExecutionUnitAddressMapError> {
+        let &(expected, local) = self
+            .addresses
+            .get(ordinal)
+            .ok_or(ExecutionUnitAddressMapError::UnknownOrdinal { ordinal })?;
+        if logical != expected {
+            return Err(ExecutionUnitAddressMapError::AddressMismatch {
+                ordinal,
+                expected,
+                actual: logical,
+            });
+        }
+        Ok(local)
+    }
+
+    /// Returns a retained local slot for completion or abort of an existing lease.
+    pub fn local_address(&self, ordinal: usize) -> Option<ExecutionUnitAddress> {
+        self.addresses.get(ordinal).map(|&(_, local)| local)
+    }
+}
+
+/// An invalid logical-to-local execution address mapping or invocation.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ExecutionUnitAddressMapError {
+    /// Logical invocations and local policy slots differ in number.
+    #[error("{logical} logical execution addresses differ from {local} local policy slots")]
+    CountMismatch {
+        /// Number of selected logical invocations.
+        logical: usize,
+        /// Number of local policy slots.
+        local: usize,
+    },
+    /// A logical invocation names a different execution group from its local slot.
+    #[error("execution slot {ordinal} maps logical group {logical} to local group {local}")]
+    GroupMismatch {
+        /// Policy-local slot.
+        ordinal: usize,
+        /// Logical execution group.
+        logical: usize,
+        /// Local execution group.
+        local: usize,
+    },
+    /// Two policy slots refer to one logical invocation.
+    #[error("logical execution address {group}:{index} occurs more than once")]
+    DuplicateAddress {
+        /// Logical execution group.
+        group: usize,
+        /// Global group-local invocation index.
+        index: usize,
+    },
+    /// An invocation names a slot outside the selected policy.
+    #[error("execution slot {ordinal} is outside the selected policy")]
+    UnknownOrdinal {
+        /// Requested local slot.
+        ordinal: usize,
+    },
+    /// The caller's logical address does not match its selected policy slot.
+    #[error("execution slot {ordinal} expects {expected:?}, received {actual:?}")]
+    AddressMismatch {
+        /// Requested local slot.
+        ordinal: usize,
+        /// Retained logical invocation address.
+        expected: ExecutionUnitAddress,
+        /// Supplied logical invocation address.
+        actual: ExecutionUnitAddress,
+    },
+}
+
 /// Validated mapping between architecture groups and the flat residency-unit order.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionUnitLayout {

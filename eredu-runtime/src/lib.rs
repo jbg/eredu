@@ -248,8 +248,8 @@ pub use dense_sampling::{
 pub use draft::{execute_draft_group, DraftGroupExecutionError, DraftStateTransaction};
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupSchedule,
-    ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress, ExecutionUnitLayout,
-    ExecutionUnitLayoutError, ReadyGroupState,
+    ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress, ExecutionUnitAddressMap,
+    ExecutionUnitAddressMapError, ExecutionUnitLayout, ExecutionUnitLayoutError, ReadyGroupState,
 };
 pub use execution_plan::{
     execution_plan_layer_residency, execution_plan_quantization, ExecutionPlanLoadError,

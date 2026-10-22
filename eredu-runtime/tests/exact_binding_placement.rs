@@ -859,6 +859,34 @@ mod component_preparation {
         let (placement, layout, source, units) = projected.into_addressed_unit_parts().unwrap();
         assert_eq!(placement, Some(retained));
         assert_eq!(layout.address(0), Some(selected[0]));
+        let local_graph =
+            ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
+        let local = ExecutionUnitLayout::new(&local_graph, [2]).unwrap();
+        let addresses = eredu_runtime::ExecutionUnitAddressMap::new(&local, &selected).unwrap();
+        for (ordinal, address) in selected.into_iter().enumerate() {
+            assert_eq!(
+                addresses.resolve(ordinal, address).unwrap(),
+                local.address(ordinal).unwrap()
+            );
+            assert_eq!(addresses.local_address(ordinal), local.address(ordinal));
+        }
+        assert!(matches!(
+            addresses.resolve(0, selected[1]),
+            Err(eredu_runtime::ExecutionUnitAddressMapError::AddressMismatch { .. })
+        ));
+        assert!(matches!(
+            addresses.resolve(2, selected[1]),
+            Err(eredu_runtime::ExecutionUnitAddressMapError::UnknownOrdinal { .. })
+        ));
+        assert_eq!(addresses.local_address(2), None);
+        assert!(matches!(
+            eredu_runtime::ExecutionUnitAddressMap::new(&local, &selected[..1]),
+            Err(eredu_runtime::ExecutionUnitAddressMapError::CountMismatch { .. })
+        ));
+        assert!(matches!(
+            eredu_runtime::ExecutionUnitAddressMap::new(&local, &[selected[0]; 2]),
+            Err(eredu_runtime::ExecutionUnitAddressMapError::DuplicateAddress { .. })
+        ));
         assert_eq!(
             units
                 .into_iter()
