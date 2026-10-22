@@ -13,10 +13,9 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
-    TensorPlacement,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -56,39 +55,11 @@ pub fn rvq_local_dimensions(
         .tensor("tts_model.tts_model.rvq_embs")
         .ok_or(TtsError::Configuration("RVQ layout omits codebook bank"))?
         .expanded_logical_range(dimensions.latent as usize)?;
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        for member in group.members() {
-            let MemberSharding::Partitioned { axis } = member.sharding() else {
-                return Err(TtsError::Configuration("unknown RVQ partition declaration"));
-            };
-            let mut shape = member.global_shape().to_vec();
-            shape[*axis] = range.len();
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: range.start,
-                        end: range.end,
-                    },
-                    group.partition_units(),
-                    Some(range.clone()),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(TtsError::Configuration(
-            "RVQ physical layout differs from its declared partition",
-        ));
-    }
+    eredu_runtime::validate_logical_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |_| Ok::<_, TtsError>(Some(range.clone())),
+    )?;
     let local = RvqLocalDimensions {
         latent_start: range.start as i32,
         latent: range.len() as i32,

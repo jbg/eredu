@@ -12,9 +12,9 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
-    LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, RuntimeState, StateError, StateLayout, SubmissionBackend, TensorPlacement,
+    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, RuntimeState,
+    StateError, StateLayout, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -46,63 +46,33 @@ pub fn decoder_local_dimensions(
     layout: &LocalModelLayout,
 ) -> Result<DecoderLocalDimensions, Error> {
     let description = decoder_parameter_description(config, prefix)?;
-    let mut expected = LocalModelLayout::default();
     let mut units = Vec::new();
-    for owned in description.groups() {
-        let group = owned.group();
-        let first = group
-            .members()
-            .iter()
-            .find(|member| matches!(member.sharding(), MemberSharding::Partitioned { .. }))
-            .ok_or_else(|| invalid("decoder unit has no partition declaration"))?;
-        let size = group
-            .partition_units()
-            .ok_or_else(|| invalid("decoder unit omits partition units"))?;
-        let range = layout
-            .tensor(first.target())
-            .ok_or_else(|| invalid("decoder layout omits partitioned parameter"))?
-            .expanded_logical_range(size)?;
-        if range.is_empty() || range.end > size {
-            return Err(invalid("invalid decoder partition range"));
-        }
-        units.push(DecoderUnitLocalDimensions {
-            start: range.start as i32,
-            width: range.len() as i32,
-        });
-        for member in group.members() {
-            let mut shape = member.global_shape().to_vec();
-            let placement = match member.sharding() {
-                MemberSharding::Replicated => TensorPlacement::Replicated,
-                MemberSharding::Partitioned { axis } => {
-                    shape[*axis] = range.len();
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: range.start,
-                        end: range.end,
-                    }
-                }
-                _ => return Err(invalid("unknown decoder partition declaration")),
-            };
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    placement,
-                    group.partition_units(),
-                    Some(range.clone()),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(invalid(
-            "decoder physical layout differs from declared partitions",
-        ));
-    }
+    eredu_runtime::validate_logical_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |group| -> Result<_, Error> {
+            let first = group
+                .members()
+                .iter()
+                .find(|member| matches!(member.sharding(), MemberSharding::Partitioned { .. }))
+                .ok_or_else(|| invalid("decoder unit has no partition declaration"))?;
+            let size = group
+                .partition_units()
+                .ok_or_else(|| invalid("decoder unit omits partition units"))?;
+            let range = layout
+                .tensor(first.target())
+                .ok_or_else(|| invalid("decoder layout omits partitioned parameter"))?
+                .expanded_logical_range(size)?;
+            if range.is_empty() || range.end > size {
+                return Err(invalid("invalid decoder partition range"));
+            }
+            units.push(DecoderUnitLocalDimensions {
+                start: range.start as i32,
+                width: range.len() as i32,
+            });
+            Ok(Some(range))
+        },
+    )?;
     Ok(DecoderLocalDimensions { units })
 }
 /// Portable decoder execution; complete-stream and controlled steps share one transition.

@@ -17,10 +17,9 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
-    LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, ResidentRuntime, StateLayout, StatelessComponentState, SubmissionBackend,
-    TensorPlacement,
+    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ResidentRuntime,
+    StateLayout, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -110,51 +109,19 @@ pub fn conditioning_local_dimensions(
             "empty conditioning feature partition",
         ));
     }
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        let logical = group.partition_units().map(|_| {
-            if group.logical_name() == format!("{CHARACTER}.tokens") {
-                character.clone()
-            } else {
-                output.clone()
-            }
-        });
-        for member in group.members() {
-            let mut shape = member.global_shape().to_vec();
-            let placement = match member.sharding() {
-                MemberSharding::Replicated => TensorPlacement::Replicated,
-                MemberSharding::Partitioned { axis } => {
-                    let selected = logical.as_ref().expect("declared partition");
-                    shape[*axis] = selected.len();
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: selected.start,
-                        end: selected.end,
-                    }
+    eredu_runtime::validate_logical_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |group| {
+            Ok::<_, TtsError>(group.partition_units().map(|_| {
+                if group.logical_name() == format!("{CHARACTER}.tokens") {
+                    character.clone()
+                } else {
+                    output.clone()
                 }
-                _ => return Err(TtsError::Configuration("unknown conditioning partition")),
-            };
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    placement,
-                    group.partition_units(),
-                    logical.clone(),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(TtsError::Configuration(
-            "conditioning physical layout differs from declared partitions",
-        ));
-    }
+            }))
+        },
+    )?;
     Ok(ConditioningLocalDimensions {
         character_start: character.start as i32,
         character: character.len() as i32,

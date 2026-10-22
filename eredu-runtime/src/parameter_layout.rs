@@ -56,6 +56,55 @@ pub fn derive_partitioned_group_layout<'a>(
     )
 }
 
+/// Validates exact physical tensors against family-selected logical group ranges.
+///
+/// Families select coupled semantic ranges; the shared lowering checks uniform
+/// and chunked partitions, fused segments, replicas, shapes and companion metadata.
+/// The supplied layout contains exactly these groups, including replicated groups
+/// whose selection is `None`. No topology is inferred from a tensor's shape.
+/// Independent axis shards and expert placement use their rank-aware lowering.
+pub fn validate_logical_parameter_layout<'a, E>(
+    groups: impl IntoIterator<Item = &'a crate::ParameterGroupSpec>,
+    layout: &crate::LocalModelLayout,
+    mut select: impl FnMut(&crate::ParameterGroupSpec) -> Result<Option<Range<usize>>, E>,
+) -> Result<(), E>
+where
+    E: From<crate::ParallelPlanError>,
+{
+    let mut targets = std::collections::BTreeSet::new();
+    for group in groups {
+        let logical = select(group)?;
+        for member in group.members() {
+            let (placement, shape) =
+                resolve_logical_member(member, group.partition_units(), logical.as_ref())
+                    .map_err(crate::ParallelPlanError::InvalidTensor)?;
+            let expected = local_tensor(group, member, shape, placement, logical.clone());
+            if !targets.insert(member.target()) {
+                return Err(crate::ParallelPlanError::InvalidTensor(format!(
+                    "parameter {:?} has duplicate physical ownership",
+                    member.target(),
+                ))
+                .into());
+            }
+            if layout.tensor(member.target()) != Some(&expected) {
+                return Err(crate::ParallelPlanError::InvalidTensor(format!(
+                    "parameter {:?} differs from declared group {:?} placement",
+                    member.target(),
+                    group.logical_name(),
+                ))
+                .into());
+            }
+        }
+    }
+    if let Some((target, _)) = layout.tensors().find(|(name, _)| !targets.contains(name)) {
+        return Err(crate::ParallelPlanError::InvalidTensor(format!(
+            "parameter {target:?} has no declared physical owner",
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 fn local_layout(
     description: &crate::ArchitectureParameterDescription,
     tensor_rank: usize,
@@ -171,23 +220,8 @@ fn local_layout_groups<'a>(
             } else {
                 resolve_member(member, group.partition_units(), member_rank, member_parts)?
             };
-            let mut tensor = crate::LocalTensorLayout::new(
-                group.logical_name(),
-                group.role(),
-                member.global_shape().to_vec(),
-                local_shape,
-                placement,
-                group.partition_units(),
-                logical_range.clone(),
-                false,
-            )
-            .with_partition_chunk_size(match member.sharding() {
-                crate::MemberSharding::PartitionedChunks { chunk_size, .. }
-                | crate::MemberSharding::PartitionedChunkSegments { chunk_size, .. } => {
-                    Some(*chunk_size)
-                }
-                _ => None,
-            });
+            let mut tensor =
+                local_tensor(group, member, local_shape, placement, logical_range.clone());
             if tensor_parts > 1 {
                 if let Some(range) = &packed_expert_range {
                     tensor = tensor.with_additional_placement(crate::TensorPlacement::Range {
@@ -203,6 +237,30 @@ fn local_layout_groups<'a>(
     Ok(layout)
 }
 
+fn local_tensor(
+    group: &crate::ParameterGroupSpec,
+    member: &crate::ParameterMemberSpec,
+    shape: Vec<usize>,
+    placement: crate::TensorPlacement,
+    logical: Option<Range<usize>>,
+) -> crate::LocalTensorLayout {
+    crate::LocalTensorLayout::new(
+        group.logical_name(),
+        group.role(),
+        member.global_shape().to_vec(),
+        shape,
+        placement,
+        group.partition_units(),
+        logical,
+        false,
+    )
+    .with_partition_chunk_size(match member.sharding() {
+        crate::MemberSharding::PartitionedChunks { chunk_size, .. }
+        | crate::MemberSharding::PartitionedChunkSegments { chunk_size, .. } => Some(*chunk_size),
+        _ => None,
+    })
+}
+
 fn resolve_member(
     member: &crate::ParameterMemberSpec,
     partition_units: Option<usize>,
@@ -213,18 +271,6 @@ fn resolve_member(
     if parts == 0 || rank >= parts {
         return Err(format!("invalid tensor-parallel coordinate {rank}/{parts}"));
     }
-    let ranged = |axis: usize, range: Range<usize>| {
-        let mut shape = member.global_shape().to_vec();
-        shape[axis] = range.len();
-        (
-            TensorPlacement::Range {
-                axis,
-                start: range.start,
-                end: range.end,
-            },
-            shape,
-        )
-    };
     match member.sharding() {
         MemberSharding::Replicated => {
             Ok((TensorPlacement::Replicated, member.global_shape().to_vec()))
@@ -253,11 +299,71 @@ fn resolve_member(
             let dimension = member_axis(member, *axis)?;
             let range = eredu_core::balanced_contiguous_range(dimension, parts, rank, false)
                 .map_err(|error| error.to_string())?;
-            Ok(ranged(*axis, range))
+            Ok(ranged(member, *axis, range))
         }
-        MemberSharding::Partitioned { axis } => {
+        MemberSharding::Partitioned { .. }
+        | MemberSharding::PartitionedChunks { .. }
+        | MemberSharding::PartitionedSegments { .. }
+        | MemberSharding::PartitionedChunkSegments { .. } => {
             let units = partition_units
                 .ok_or_else(|| format!("tensor {:?} has no logical partition", member.target()))?;
+            let logical = eredu_core::balanced_contiguous_range(units, parts, rank, false)
+                .map_err(|error| error.to_string())?;
+            resolve_logical_member(member, Some(units), Some(&logical))
+        }
+        MemberSharding::Segmented { axis, segments } => {
+            let indices = segmented_indices(member, *axis, segments, |segment| {
+                let local =
+                    eredu_core::balanced_contiguous_range(segment.len(), parts, rank, false)
+                        .map_err(|error| error.to_string())?;
+                Ok(segment.start + local.start..segment.start + local.end)
+            })?;
+            indexed(member, *axis, indices)
+        }
+    }
+}
+
+fn ranged(
+    member: &crate::ParameterMemberSpec,
+    axis: usize,
+    range: Range<usize>,
+) -> (crate::TensorPlacement, Vec<usize>) {
+    let mut shape = member.global_shape().to_vec();
+    shape[axis] = range.len();
+    (
+        crate::TensorPlacement::Range {
+            axis,
+            start: range.start,
+            end: range.end,
+        },
+        shape,
+    )
+}
+
+fn resolve_logical_member(
+    member: &crate::ParameterMemberSpec,
+    units: Option<usize>,
+    logical: Option<&Range<usize>>,
+) -> Result<(crate::TensorPlacement, Vec<usize>), String> {
+    use crate::MemberSharding;
+    match (units, logical) {
+        (Some(units), Some(range)) if units > 0 && !range.is_empty() && range.end <= units => {}
+        (None, None) if matches!(member.sharding(), MemberSharding::Replicated) => {}
+        _ => {
+            return Err(format!(
+                "tensor {:?} has an invalid logical partition range",
+                member.target()
+            ))
+        }
+    }
+    match member.sharding() {
+        MemberSharding::Replicated => Ok((
+            crate::TensorPlacement::Replicated,
+            member.global_shape().to_vec(),
+        )),
+        MemberSharding::Partitioned { axis } => {
+            let units = units.expect("validated logical partition");
+            let logical = logical.expect("validated logical selection");
             let dimension = member_axis(member, *axis)?;
             if !dimension.is_multiple_of(units) {
                 return Err(format!(
@@ -265,14 +371,16 @@ fn resolve_member(
                     member.target()
                 ));
             }
-            let logical = eredu_core::balanced_contiguous_range(units, parts, rank, false)
-                .map_err(|error| error.to_string())?;
             let width = dimension / units;
-            Ok(ranged(*axis, logical.start * width..logical.end * width))
+            Ok(ranged(
+                member,
+                *axis,
+                logical.start * width..logical.end * width,
+            ))
         }
         MemberSharding::PartitionedChunks { axis, chunk_size } => {
-            let units = partition_units
-                .ok_or_else(|| format!("tensor {:?} has no logical partition", member.target()))?;
+            let units = units.expect("validated logical partition");
+            let logical = logical.expect("validated logical selection");
             let dimension = member_axis(member, *axis)?;
             if *chunk_size == 0 || dimension.div_ceil(*chunk_size) != units {
                 return Err(format!(
@@ -280,21 +388,17 @@ fn resolve_member(
                     member.target()
                 ));
             }
-            let logical = eredu_core::balanced_contiguous_range(units, parts, rank, false)
+            let range = crate::partition_chunk_range(dimension, *chunk_size, logical.clone())
                 .map_err(|error| error.to_string())?;
-            let range = crate::partition_chunk_range(dimension, *chunk_size, logical)
-                .map_err(|error| error.to_string())?;
-            Ok(ranged(*axis, range))
+            Ok(ranged(member, *axis, range))
         }
         MemberSharding::PartitionedChunkSegments {
             axis,
             segments,
             chunk_size,
         } => {
-            let units = partition_units
-                .ok_or_else(|| format!("tensor {:?} has no logical partition", member.target()))?;
-            let logical = eredu_core::balanced_contiguous_range(units, parts, rank, false)
-                .map_err(|error| error.to_string())?;
+            let units = units.expect("validated logical partition");
+            let logical = logical.expect("validated logical selection");
             let indices = segmented_indices(member, *axis, segments, |segment| {
                 if *chunk_size == 0 || segment.len().div_ceil(*chunk_size) != units {
                     return Err(format!(
@@ -309,10 +413,8 @@ fn resolve_member(
             indexed(member, *axis, indices)
         }
         MemberSharding::PartitionedSegments { axis, segments } => {
-            let units = partition_units
-                .ok_or_else(|| format!("tensor {:?} has no logical partition", member.target()))?;
-            let logical = eredu_core::balanced_contiguous_range(units, parts, rank, false)
-                .map_err(|error| error.to_string())?;
+            let units = units.expect("validated logical partition");
+            let logical = logical.expect("validated logical selection");
             let indices = segmented_indices(member, *axis, segments, |segment| {
                 if !segment.len().is_multiple_of(units) {
                     return Err(format!(
@@ -324,15 +426,10 @@ fn resolve_member(
             })?;
             indexed(member, *axis, indices)
         }
-        MemberSharding::Segmented { axis, segments } => {
-            let indices = segmented_indices(member, *axis, segments, |segment| {
-                let local =
-                    eredu_core::balanced_contiguous_range(segment.len(), parts, rank, false)
-                        .map_err(|error| error.to_string())?;
-                Ok(segment.start + local.start..segment.start + local.end)
-            })?;
-            indexed(member, *axis, indices)
-        }
+        _ => Err(format!(
+            "tensor {:?} does not declare a logical partition",
+            member.target()
+        )),
     }
 }
 

@@ -11,9 +11,9 @@ use eredu_runtime::{
     ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel, ComponentUnit,
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    StatelessComponentState, SubmissionBackend, TensorPlacement,
+    MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StatelessComponentState,
+    SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -40,79 +40,39 @@ pub fn encoder_local_dimensions(
     layout: &LocalModelLayout,
 ) -> Result<EncoderLocalDimensions, Error> {
     let description = encoder_parameter_description(config, prefix)?;
-    let mut expected = LocalModelLayout::default();
     let mut units = Vec::new();
-    for owned in description.groups() {
-        let group = owned.group();
-        let first = group
-            .members()
-            .iter()
-            .find(|member| {
-                matches!(
-                    member.sharding(),
-                    MemberSharding::Partitioned { .. } | MemberSharding::PartitionedSegments { .. }
-                )
-            })
-            .ok_or_else(|| invalid("encoder unit has no partition declaration"))?;
-        let size = group
-            .partition_units()
-            .ok_or_else(|| invalid("encoder unit omits partition units"))?;
-        let range = layout
-            .tensor(first.target())
-            .ok_or_else(|| invalid("encoder layout omits partitioned parameter"))?
-            .expanded_logical_range(size)?;
-        if range.is_empty() || range.end > size {
-            return Err(invalid("invalid encoder partition range"));
-        }
-        units.push(EncoderUnitLocalDimensions {
-            start: range.start as i32,
-            width: range.len() as i32,
-        });
-        for member in group.members() {
-            let mut shape = member.global_shape().to_vec();
-            let placement = match member.sharding() {
-                MemberSharding::Replicated => TensorPlacement::Replicated,
-                MemberSharding::Partitioned { axis } => {
-                    shape[*axis] = range.len();
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: range.start,
-                        end: range.end,
-                    }
-                }
-                MemberSharding::PartitionedSegments { axis, segments } => {
-                    let indices: Vec<_> = segments
-                        .iter()
-                        .flat_map(|segment| segment.start + range.start..segment.start + range.end)
-                        .collect();
-                    shape[*axis] = indices.len();
-                    TensorPlacement::Indices {
-                        axis: *axis,
-                        indices,
-                    }
-                }
-                _ => return Err(invalid("unknown encoder partition declaration")),
-            };
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    placement,
-                    group.partition_units(),
-                    Some(range.clone()),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(invalid(
-            "encoder physical layout differs from declared partitions",
-        ));
-    }
+    eredu_runtime::validate_logical_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |group| -> Result<_, Error> {
+            let first = group
+                .members()
+                .iter()
+                .find(|member| {
+                    matches!(
+                        member.sharding(),
+                        MemberSharding::Partitioned { .. }
+                            | MemberSharding::PartitionedSegments { .. }
+                    )
+                })
+                .ok_or_else(|| invalid("encoder unit has no partition declaration"))?;
+            let size = group
+                .partition_units()
+                .ok_or_else(|| invalid("encoder unit omits partition units"))?;
+            let range = layout
+                .tensor(first.target())
+                .ok_or_else(|| invalid("encoder layout omits partitioned parameter"))?
+                .expanded_logical_range(size)?;
+            if range.is_empty() || range.end > size {
+                return Err(invalid("invalid encoder partition range"));
+            }
+            units.push(EncoderUnitLocalDimensions {
+                start: range.start as i32,
+                width: range.len() as i32,
+            });
+            Ok(Some(range))
+        },
+    )?;
     Ok(EncoderLocalDimensions { units })
 }
 /// Portable finite encoder execution without persistent streaming carry.

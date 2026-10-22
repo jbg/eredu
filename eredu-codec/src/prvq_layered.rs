@@ -14,10 +14,9 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
-    TensorPlacement,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -45,43 +44,11 @@ pub fn quantizer_local_dimensions(
     if range.is_empty() || range.end > geometry.channels as usize {
         return Err(invalid("invalid quantizer channel partition"));
     }
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        for member in group.members() {
-            let mut shape = member.global_shape().to_vec();
-            let placement = match member.sharding() {
-                MemberSharding::Replicated => TensorPlacement::Replicated,
-                MemberSharding::Partitioned { axis } => {
-                    shape[*axis] = range.len();
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: range.start,
-                        end: range.end,
-                    }
-                }
-                _ => return Err(invalid("unknown quantizer channel partition")),
-            };
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    placement,
-                    group.partition_units(),
-                    Some(range.clone()),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(invalid(
-            "quantizer physical layout differs from declared channel partition",
-        ));
-    }
+    eredu_runtime::validate_logical_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |_| Ok::<_, Error>(Some(range.clone())),
+    )?;
     Ok(QuantizerLocalDimensions {
         channels_start: range.start as i32,
         channels: range.len() as i32,

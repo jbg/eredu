@@ -490,6 +490,89 @@ mod component_preparation {
     }
 
     #[test]
+    fn logical_layout_admission_preserves_exact_selection_and_resource_authority() {
+        use eredu_runtime::{
+            validate_logical_parameter_layout, LocalModelLayout, LocalTensorLayout,
+            ParallelPlanError, TensorPlacement,
+        };
+        let prepared = prepared();
+        let description = prepared.description();
+        let groups = || description.groups().iter().map(|owned| owned.group());
+        // A caller selects an explicit interval; it need not be a balanced rank cut.
+        let selected = 1..4;
+        let mut layout = LocalModelLayout::default();
+        for group in groups() {
+            for member in group.members() {
+                layout.insert(
+                    member.target().into(),
+                    LocalTensorLayout::new(
+                        group.logical_name(),
+                        group.role(),
+                        member.global_shape().to_vec(),
+                        vec![3, 2],
+                        TensorPlacement::Range {
+                            axis: 0,
+                            start: 1,
+                            end: 4,
+                        },
+                        Some(4),
+                        Some(selected.clone()),
+                        false,
+                    ),
+                );
+            }
+        }
+        let validate = |layout: &LocalModelLayout, range: Option<std::ops::Range<usize>>| {
+            validate_logical_parameter_layout(groups(), layout, |_| {
+                Ok::<_, ParallelPlanError>(range.clone())
+            })
+        };
+        validate(&layout, Some(selected.clone())).unwrap();
+        assert!(validate(&layout, Some(3..5)).is_err());
+        assert!(validate(&layout, None).is_err());
+        let mut foreign = layout.clone();
+        foreign.insert(
+            "neighbor".into(),
+            layout.tensor("weight.0").unwrap().clone(),
+        );
+        assert!(validate(&foreign, Some(selected.clone())).is_err());
+        let mut incomplete = LocalModelLayout::default();
+        incomplete.insert(
+            "weight.0".into(),
+            layout.tensor("weight.0").unwrap().clone(),
+        );
+        assert!(validate(&incomplete, Some(selected)).is_err());
+
+        let selected = prepared.select(&layout).unwrap();
+        assert_eq!(
+            selected.source().source_keys(),
+            ["physical.0", "physical.1", "physical.2"]
+        );
+        let bindings = selected
+            .unit_bindings()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.expected_bytes())
+                .sum::<u64>(),
+            72
+        );
+        for binding in bindings {
+            assert_eq!(
+                binding
+                    .source_recipe()
+                    .infer(selected.source().as_ref())
+                    .unwrap()
+                    .shape(),
+                [3, 2]
+            );
+        }
+    }
+
+    #[test]
     fn component_projection_preserves_placement_without_transforming_twice() {
         let prepared = prepared();
         let topology = eredu_core::ParallelRankTopology::new(

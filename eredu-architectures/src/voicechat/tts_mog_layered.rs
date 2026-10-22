@@ -12,10 +12,9 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
-    TensorPlacement,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -53,65 +52,19 @@ pub fn mog_local_dimensions(
         dimensions.intermediate,
     )?;
     let rank = range("tts_model.tts_model.mog_head.low_mat", dimensions.rank)?;
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        let logical = group.partition_units().map(|_| {
-            if group.logical_name() == format!("{COMPONENTS}.low_rank") {
-                rank.clone()
-            } else {
-                intermediate.clone()
-            }
-        });
-        for member in group.members() {
-            let mut shape = member.global_shape().to_vec();
-            let placement = match member.sharding() {
-                MemberSharding::Replicated => TensorPlacement::Replicated,
-                MemberSharding::Partitioned { axis } => {
-                    let selected = logical.as_ref().expect("declared partition");
-                    shape[*axis] = selected.len();
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: selected.start,
-                        end: selected.end,
-                    }
+    eredu_runtime::validate_logical_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |group| {
+            Ok::<_, TtsError>(group.partition_units().map(|_| {
+                if group.logical_name() == format!("{COMPONENTS}.low_rank") {
+                    rank.clone()
+                } else {
+                    intermediate.clone()
                 }
-                MemberSharding::PartitionedSegments { axis, segments } => {
-                    let selected = logical.as_ref().expect("declared partition");
-                    let indices: Vec<_> = segments
-                        .iter()
-                        .flat_map(|segment| {
-                            segment.start + selected.start..segment.start + selected.end
-                        })
-                        .collect();
-                    shape[*axis] = indices.len();
-                    TensorPlacement::Indices {
-                        axis: *axis,
-                        indices,
-                    }
-                }
-                _ => return Err(TtsError::Configuration("unknown MoG partition declaration")),
-            };
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    placement,
-                    group.partition_units(),
-                    logical.clone(),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(TtsError::Configuration(
-            "MoG physical layout differs from its declared partitions",
-        ));
-    }
+            }))
+        },
+    )?;
     Ok(MogLocalDimensions {
         intermediate: intermediate.len() as i32,
         rank: rank.len() as i32,
