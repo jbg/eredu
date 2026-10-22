@@ -819,6 +819,10 @@ exact metadata and provenance before deferred payload access. Runtime's
 recipes for one ordinary, expert or pinned owner. Empty owners retain an empty
 source. Shared resource binding preparation uses the same checkpoint snapshot
 primitive while keeping aliases local to each independently leased resource.
+Qwen4 n-gram tables, integer hash controls and scalar scales use this same
+retention primitive. The family checks admitted table headers and provenance
+before bounded literal reads; controls and scales retain separate exact source
+projections.
 
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint

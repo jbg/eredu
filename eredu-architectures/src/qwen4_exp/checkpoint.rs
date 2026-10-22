@@ -17,8 +17,8 @@ use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
     rows::{PreparedRowSource, RowReadError},
     store::{
-        CheckpointSource, EncodedTensorLease, PreparedCheckpointSource, PreparedTensorSource,
-        ReadPolicy, RestrictedCheckpointSource, SharedCheckpointSource, StoreError,
+        CheckpointSource, EncodedTensorLease, PreparedCheckpointSource, ReadPolicy,
+        SharedCheckpointSource, StoreError,
         TensorReadRequest, TensorSelection,
     },
     StoredDtype,
@@ -164,30 +164,6 @@ pub(in crate::qwen4_exp) fn table_row_range(
 }
 fn invalid(message: impl Into<String>) -> NGramArtifactError {
     NGramArtifactError::Layout(message.into())
-}
-fn retain(
-    source: SharedCheckpointSource,
-    keys: Vec<String>,
-) -> Result<SharedCheckpointSource, NGramArtifactError> {
-    let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-        source,
-        "qwen4_exp n-gram companions",
-        keys.into_iter().collect(),
-    )?);
-    let catalog = source
-        .source_keys()
-        .into_iter()
-        .map(|key| {
-            Ok((
-                key.clone(),
-                PreparedTensorSource {
-                    metadata: source.source_metadata(&key)?,
-                    provenance: source.source_provenance(&key)?,
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-    Ok(Arc::new(PreparedCheckpointSource::new(source, catalog)?))
 }
 fn integers(
     source: &dyn CheckpointSource,
