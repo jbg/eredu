@@ -1085,8 +1085,14 @@ where
                 eredu_runtime::LayeredArchitecture::group_transport(&self.architecture, group)
             })
             .collect::<Vec<_>>();
-        let owners = pipeline_group_owners(&graph, &layout, &transports, self.pipeline_stages)
-            .map_err(eredu_nn::Error::backend)?;
+        let placement = eredu_runtime::PipelinePlacementPlan::new(
+            &graph,
+            &layout,
+            &transports,
+            self.pipeline_stages,
+        )
+        .map_err(eredu_nn::Error::backend_source)?;
+        let owners = placement.owners();
         let group_collective_waves = (0..self.units.len())
             .map(|group| {
                 let waves = self
@@ -4558,7 +4564,8 @@ impl RoutedExpertCollectiveWaveSchedule {
         {
             return Err("invalid routed block wave geometry".into());
         }
-        let ranges = balanced_ranges(blocks.len(), 0..pipeline_stages);
+        let ranges = eredu_runtime::balanced_pipeline_ranges(blocks.len(), 0..pipeline_stages)
+            .map_err(|error| error.to_string())?;
         let stages = ranges
             .into_iter()
             .map(|(_, range)| blocks[range].iter().flatten().cloned().collect())
@@ -4805,7 +4812,8 @@ where
     if tensor_rank >= tensor_partitions || vocabulary_width == 0 {
         return Err("routed tensor collective wave geometry is invalid".into());
     }
-    let owners = balanced_ranges(unit_count, 0..pipeline_stages);
+    let owners = eredu_runtime::balanced_pipeline_ranges(unit_count, 0..pipeline_stages)
+        .map_err(|error| error.to_string())?;
     if owners.len() != pipeline_stages {
         return Err("every routed pipeline stage must own at least one execution unit".into());
     }
@@ -7220,15 +7228,16 @@ fn pipeline_routes(
     };
 
     let pp_size = topology.pipeline();
-    let semantic_routes = semantic_pipeline_routes(
+    let placement = eredu_runtime::PipelinePlacementPlan::new(
         execution.execution_graph(),
         execution.execution_units(),
         execution.group_transports(),
         pp_size,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let mut routes = Vec::new();
     let mut selected = Vec::new();
-    for semantic in semantic_routes {
+    for semantic in placement.routes() {
         let decoder_continuation = semantic.source_group == semantic.destination_group
             && execution.group_transports()[semantic.source_group].kind
                 == ArchitectureGroupKind::Decoder;
@@ -7322,55 +7331,6 @@ fn pipeline_routes(
     Ok((routes, selected))
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct SemanticPipelineRoute {
-    source_group: usize,
-    destination_group: usize,
-    source_pipeline: usize,
-    destination_pipeline: usize,
-    source_unit_end: usize,
-}
-
-fn semantic_pipeline_routes(
-    graph: &eredu_runtime::ExecutionGraph,
-    unit_layout: &eredu_runtime::ExecutionUnitLayout,
-    transports: &[eredu_runtime::ArchitectureGroupTransport],
-    pp_size: usize,
-) -> Result<Vec<SemanticPipelineRoute>, String> {
-    let owners = pipeline_group_owners(graph, unit_layout, transports, pp_size)?;
-    let mut semantic_routes = Vec::new();
-    for (group, group_owners) in owners.iter().enumerate() {
-        for pair in group_owners.windows(2) {
-            semantic_routes.push(SemanticPipelineRoute {
-                source_group: group,
-                destination_group: group,
-                source_pipeline: pair[0].0,
-                destination_pipeline: pair[1].0,
-                source_unit_end: pair[0].1.end,
-            });
-        }
-        let destination = group_owners.first().map_or(0, |owner| owner.0);
-        for dependency in graph.dependencies(group).into_iter().flatten() {
-            let source_owners = &owners[*dependency];
-            // A dependency value exists where its final unit executed.  The
-            // merge-destination policy names where that value is consumed; it
-            // never relocates the value by itself.  Preserve the terminal
-            // producer endpoint here so the selected route performs that move.
-            let source = source_owners.last().map_or(0, |owner| owner.0);
-            if source != destination {
-                semantic_routes.push(SemanticPipelineRoute {
-                    source_group: *dependency,
-                    destination_group: group,
-                    source_pipeline: source,
-                    destination_pipeline: destination,
-                    source_unit_end: source_owners.last().map_or(0, |owner| owner.1.end),
-                });
-            }
-        }
-    }
-    Ok(semantic_routes)
-}
-
 fn tensor_elements(shape: &[i32]) -> Result<usize, String> {
     shape.iter().try_fold(1usize, |elements, dimension| {
         let dimension = usize::try_from(*dimension)
@@ -7460,12 +7420,13 @@ fn rank_requirements_inner(
     let mut output_pipeline = None;
     let mut decoder_state_offset = 0usize;
     let mut local_state_ranges = Vec::new();
-    let placements = pipeline_group_owners(
+    let placements = eredu_runtime::PipelinePlacementPlan::new(
         execution.execution_graph(),
         execution.execution_units(),
         execution.group_transports(),
         pp_size,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
 
     for (group_index, transport) in execution.group_transports().iter().enumerate() {
         if transport.kind == ArchitectureGroupKind::Prediction {
@@ -7476,7 +7437,7 @@ fn rank_requirements_inner(
             .group_range(group_index)
             .ok_or_else(|| format!("execution group {group_index} has no unit geometry"))?
             .len();
-        let owners = &placements[group_index];
+        let owners = &placements.owners()[group_index];
         let first_owner = owners.first().map_or(
             if transport.placement == ArchitectureGroupPlacement::OutputOwner {
                 pp_size - 1
@@ -7626,103 +7587,6 @@ fn rank_requirements_inner(
         state,
         parameter_targets,
     })
-}
-
-/// One retained placement drives both route endpoints and rank-local parameter/state ownership.
-fn pipeline_group_owners(
-    graph: &eredu_runtime::ExecutionGraph,
-    layout: &eredu_runtime::ExecutionUnitLayout,
-    transports: &[eredu_runtime::ArchitectureGroupTransport],
-    stages: usize,
-) -> Result<Vec<Vec<(usize, Range<usize>)>>, String> {
-    if stages == 0 || transports.len() != graph.groups().len() {
-        return Err("pipeline placement differs from its declared groups".into());
-    }
-    let mut owners = vec![Vec::new(); transports.len()];
-    let sequence = graph
-        .execution_order()
-        .iter()
-        .copied()
-        .filter(|&group| {
-            transports[group].placement == ArchitectureGroupPlacement::PipelineSequence
-        })
-        .collect::<Vec<_>>();
-    let mut total = 0usize;
-    let mut spans = Vec::new();
-    for (index, &group) in sequence.iter().enumerate() {
-        let dependencies = graph
-            .dependencies(group)
-            .ok_or("pipeline sequence group is absent")?;
-        if (index == 0 && !dependencies.is_empty())
-            || (index > 0 && dependencies != [sequence[index - 1]])
-        {
-            return Err("pipeline sequence groups must form an ordered dependency chain".into());
-        }
-        let count = layout
-            .group_range(group)
-            .ok_or("pipeline sequence has no unit geometry")?
-            .len();
-        if count == 0 {
-            return Err("pipeline sequence contains an empty group".into());
-        }
-        let end = total
-            .checked_add(count)
-            .ok_or("pipeline sequence unit count overflowed")?;
-        spans.push((group, total..end));
-        total = end;
-    }
-    if !sequence.is_empty() {
-        if total < stages {
-            return Err("pipeline sequence has fewer execution units than stages".into());
-        }
-        let balanced = balanced_ranges(total, 0..stages);
-        for (group, span) in spans {
-            owners[group] = balanced
-                .iter()
-                .filter_map(|(owner, range)| {
-                    let start = range.start.max(span.start);
-                    let end = range.end.min(span.end);
-                    (start < end).then(|| (*owner, start - span.start..end - span.start))
-                })
-                .collect();
-        }
-    }
-    for (group, transport) in transports.iter().enumerate() {
-        let count = layout
-            .group_range(group)
-            .ok_or("execution group has no unit geometry")?
-            .len();
-        match transport.placement {
-            ArchitectureGroupPlacement::PipelineSequence => {}
-            ArchitectureGroupPlacement::Pipeline => {
-                owners[group] = balanced_ranges(count, 0..stages)
-            }
-            ArchitectureGroupPlacement::OutputOwner => {
-                owners[group] = balanced_ranges(count, stages - 1..stages)
-            }
-        }
-    }
-    Ok(owners)
-}
-
-fn balanced_ranges(unit_count: usize, ranks: Range<usize>) -> Vec<(usize, Range<usize>)> {
-    if unit_count == 0 {
-        return Vec::new();
-    }
-    let active = ranks.len().min(unit_count);
-    let base = unit_count / active;
-    let remainder = unit_count % active;
-    let mut start = 0;
-    ranks
-        .take(active)
-        .enumerate()
-        .map(|(index, rank)| {
-            let end = start + base + usize::from(index < remainder);
-            let value = (rank, start..end);
-            start = end;
-            value
-        })
-        .collect()
 }
 
 /// Capability-checked admission retaining one already selected base realization.

@@ -873,6 +873,15 @@ encoding blocks into effective scalar coordinates and prepays metadata budgets;
 companions use their own scalar geometry. Architectures retain semantic placement
 and pipeline ownership policy. Resolution inspects metadata and grants
 no parameter value, editing, checkpoint or native resource authority.
+Runtime's `PipelinePlacementPlan` validates complete canonical graph/layout
+identities and declared transport coverage before projecting pipeline owners.
+Sequential groups share one balanced invocation sequence; ordinary groups balance
+independently and output-owner groups remain on the terminal stage. Route
+projection uses this same owner table and the graph's terminal producers, including
+cross-group dependencies and intra-group continuations. Merge destinations do not
+relocate a producer. Ownership-only queries allocate no route metadata. Families
+retain boundary schemas and collective semantics; native composition realizes the
+declared endpoints. Invalid placement returns typed group and geometry errors.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
 retention primitive. The family checks admitted table headers and provenance
 before bounded literal reads; controls and scales retain separate exact source

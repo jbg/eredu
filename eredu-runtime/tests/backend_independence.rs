@@ -7911,6 +7911,30 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     let parameters = architecture
         .parameter_description(&())
         .expect("fixture parameter description");
+    let transports = (0..parameters.graph().groups().len())
+        .map(|group| {
+            <GroupedFixture as LayeredArchitecture<FakeBackend, FixtureState>>::group_transport(
+                &architecture,
+                group,
+            )
+        })
+        .collect::<Vec<_>>();
+    let placement = eredu_runtime::PipelinePlacementPlan::new(
+        parameters.graph(),
+        parameters.unit_layout(),
+        &transports,
+        2,
+    )
+    .unwrap();
+    // Global ownership must not rebase an already selected nonzero invocation.
+    let selected = parameters
+        .unit_layout()
+        .select([parameters.unit_layout().address(3).unwrap()])
+        .unwrap();
+    assert!(matches!(
+        eredu_runtime::PipelinePlacementPlan::new(parameters.graph(), &selected, &transports, 2),
+        Err(eredu_runtime::PipelinePlacementError::NonCanonicalLayout { group: 2 })
+    ));
     let partitions = [
         ArchitecturePartition::<(), NoAuxiliaryBoundarySchema>::from_architecture::<
             FakeBackend,
@@ -7919,7 +7943,7 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             _,
         >(
             &architecture,
-            [("text", 0..1)],
+            [("text", placement.owners()[2][0].1.clone())],
             PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
             (),
             NoAuxiliaryBoundarySchema::new(8),
@@ -7932,7 +7956,7 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             _,
         >(
             &architecture,
-            [("text", 1..2)],
+            [("text", placement.owners()[2][1].1.clone())],
             PartitionOwnership::new(false, true, std::iter::empty::<String>()).unwrap(),
             (),
             NoAuxiliaryBoundarySchema::new(8),

@@ -532,6 +532,10 @@ mod parameter_coordinates;
 pub use parameter_coordinates::{
     derive_parameter_coordinates, derive_parameter_member_layout, ParameterPartitionLayout,
 };
+mod pipeline_placement;
+pub use pipeline_placement::{
+    balanced_pipeline_ranges, PipelinePlacementError, PipelinePlacementPlan, PipelineRoute,
+};
 mod parameter_members;
 pub use parameter_members::{resolve_parameter_member, ParameterMemberIndex, ResolvedParameterMember};
 pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};
