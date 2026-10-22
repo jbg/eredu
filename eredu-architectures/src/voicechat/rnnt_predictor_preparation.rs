@@ -56,11 +56,7 @@ impl PreparedRnntPredictorBindings {
                 "predictor replica selection requires a tensor-only topology".into(),
             ));
         }
-        let layout = eredu_runtime::derive_partitioned_local_layout(
-            &rnnt_predictor_parameter_description(self.dimensions)?,
-            topology,
-        )
-        .map_err(RnntPreparationError::Parallel)?;
+        let layout = self.prepared.parallel_layout(topology)?;
         self.prepared = self.prepared.select(&layout)?;
         Ok((self, layout))
     }

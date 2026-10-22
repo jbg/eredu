@@ -157,17 +157,7 @@ impl PreparedConditioningBindings {
                 "conditioning component selection requires a tensor-only topology".into(),
             ));
         }
-        let description = conditioning_parameter_description(self.dimensions)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(ConditioningPreparationError::Parallel)?;
-        if let Some(selected) = self.prepared.local_layout() {
-            if selected != &layout {
-                return Err(ConditioningPreparationError::Parallel(
-                    "retained conditioning placement differs from the tensor topology".into(),
-                ));
-            }
-            return Ok((self, layout));
-        }
+        let layout = self.prepared.parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

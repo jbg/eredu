@@ -749,15 +749,22 @@ mod component_preparation {
             1,
         )
         .unwrap();
-        let layout =
-            eredu_runtime::derive_partitioned_local_layout(prepared.description(), topology)
-                .unwrap();
+        let layout = prepared.parallel_layout(topology).unwrap();
         let prepared = prepared.select(&layout).unwrap();
         let before = prepared.unit_bindings()[2][0].source_recipe();
         let projected = prepared.project("projected", description(&[2])).unwrap();
         assert_eq!(projected.source().source_keys(), ["physical.2"]);
         assert_eq!(projected.local_layout().unwrap().len(), 1);
-        let retained = projected.local_layout().unwrap().clone();
+        let retained = projected.parallel_layout(topology).unwrap();
+        let other_rank = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            projected.parallel_layout(other_rank),
+            Err(ComponentPreparationError::SelectionMismatch(_))
+        ));
         let projected = projected.select(&retained).unwrap();
         let after = projected.unit_bindings()[2][0].source_recipe();
         assert_eq!(before, after);
@@ -821,7 +828,7 @@ mod component_preparation {
             .unwrap()
             .select_units(selected)
             .unwrap();
-        let retained = projected.local_layout().unwrap().clone();
+        let retained = projected.parallel_layout(topology).unwrap();
         let projected = projected.select(&retained).unwrap();
         assert_eq!(
             projected.source().source_keys(),

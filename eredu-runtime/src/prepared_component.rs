@@ -38,6 +38,14 @@ pub enum ComponentPreparationError {
         /// Canonical materialization target.
         owner: String,
     },
+    /// The retained declaration cannot project the requested parallel topology.
+    #[error("component {component:?} cannot derive parallel placement: {reason}")]
+    ParallelLayout {
+        /// Component identity.
+        component: String,
+        /// Exact neutral planner failure.
+        reason: String,
+    },
     /// A selected placement cannot be applied.
     #[error(transparent)]
     Placement(#[from] BindingPlacementError),
@@ -412,6 +420,31 @@ impl PreparedComponent {
             *bindings = crate::apply_parameter_storage_layouts(&unit, std::mem::take(bindings));
         }
         Ok(self)
+    }
+
+    /// Projects parallel placement from this preparation's retained declaration.
+    /// A retained selection must match exactly; no recipe is transformed here.
+    /// Family topology restrictions and additional geometry checks remain separate.
+    pub fn parallel_layout(
+        &self,
+        topology: eredu_core::ParallelRankTopology,
+    ) -> Result<LocalModelLayout, ComponentPreparationError> {
+        let layout = crate::derive_partitioned_local_layout(&self.description, topology).map_err(
+            |reason| ComponentPreparationError::ParallelLayout {
+                component: self.id.clone(),
+                reason,
+            },
+        )?;
+        if self
+            .local_layout
+            .as_ref()
+            .is_some_and(|retained| retained != &layout)
+        {
+            return Err(ComponentPreparationError::SelectionMismatch(
+                self.id.clone(),
+            ));
+        }
+        Ok(layout)
     }
 
     /// Applies placement once. Reusing the same selection retains the recipes;

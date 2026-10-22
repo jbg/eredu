@@ -158,9 +158,7 @@ impl PreparedPerceptionBindings {
                 "complete-stack perception selection requires a tensor-only topology".into(),
             ));
         }
-        let description = perception_parameter_description(self.dimensions)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(PerceptionPreparationError::Parallel)?;
+        let layout = self.prepared.parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
     /// Applies exact selected tensor placements without changing retained source authority.

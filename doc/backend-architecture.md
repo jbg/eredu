@@ -822,8 +822,12 @@ recipes already producing that dtype unchanged, applies an explicitly allowed ca
 once, and rejects other representations with a typed component/parameter error.
 EAR encoder, decoder, PRVQ and RNNT declare their F32 execution requirement and
 allow F16/BF16 conversion through this contract. Ordinary recipe inference supplies
-the conversion workspace and binding-byte bounds. Consuming placement selection
-retains the exact local layout; identical reselection validates it without
+the conversion workspace and binding-byte bounds. `parallel_layout` projects the
+requested topology from the retained parameter declaration and checks any retained
+selection. Speech and codec selectors use this projection rather than reconstruct
+parameter catalogs from configuration. Families retain their topology limits and
+additional local-geometry validation. Consuming placement selection retains the
+exact local layout; identical reselection validates it without
 transforming recipes again, and incompatible selection fails. Recipe policy
 transforms preserve targets, shapes and source authority. Identity-based
 projections retain transformed bindings and project local placement; sparse unit

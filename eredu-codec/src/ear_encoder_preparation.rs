@@ -102,17 +102,7 @@ impl PreparedEncoderBindings {
                 "EAR encoder component selection requires a tensor-only topology".into(),
             ));
         }
-        let description = encoder_parameter_description(&self.config, &self.prefix)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(EncoderPreparationError::Parallel)?;
-        if let Some(selected) = self.prepared.local_layout() {
-            if selected != &layout {
-                return Err(EncoderPreparationError::Parallel(
-                    "retained EAR encoder placement differs from the tensor topology".into(),
-                ));
-            }
-            return Ok((self, layout));
-        }
+        let layout = self.prepared.parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

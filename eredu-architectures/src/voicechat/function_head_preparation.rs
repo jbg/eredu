@@ -180,18 +180,7 @@ impl PreparedFunctionHeadBindings {
                 "function-head component selection requires a tensor-only topology".into(),
             ));
         }
-        let format = self.format.clone();
-        let description = function_head_parameter_description(self.dimensions, &format)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(FunctionHeadPreparationError::Parallel)?;
-        if let Some(selected) = self.prepared.local_layout() {
-            if selected != &layout {
-                return Err(FunctionHeadPreparationError::Parallel(
-                    "retained function-head placement differs from the tensor topology".into(),
-                ));
-            }
-            return Ok((self, layout));
-        }
+        let layout = self.prepared.parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

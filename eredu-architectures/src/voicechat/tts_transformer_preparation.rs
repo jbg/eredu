@@ -181,9 +181,7 @@ impl PreparedTtsTransformerBindings {
                 "complete-stack component selection requires a tensor-only topology".into(),
             ));
         }
-        let description = tts_transformer_parameter_description(&self.config)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(TtsTransformerPreparationError::Parallel)?;
+        let layout = self.prepared.parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

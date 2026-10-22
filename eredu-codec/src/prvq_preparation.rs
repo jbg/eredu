@@ -109,17 +109,7 @@ impl PreparedQuantizerBindings {
                 "PRVQ component selection requires a tensor-only topology".into(),
             ));
         }
-        let description = quantizer_parameter_description(self.geometry, &self.prefix)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(QuantizerPreparationError::Parallel)?;
-        if let Some(selected) = self.prepared.local_layout() {
-            if selected != &layout {
-                return Err(QuantizerPreparationError::Parallel(
-                    "retained PRVQ placement differs from the tensor topology".into(),
-                ));
-            }
-            return Ok((self, layout));
-        }
+        let layout = self.prepared.parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 
