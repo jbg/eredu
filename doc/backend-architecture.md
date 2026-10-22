@@ -7832,6 +7832,17 @@ that definition; source recipes and encoding policy remain family-owned. Static
 resources declare their storage roles alongside their parameter groups, including
 shared target/prediction embedding authority and V4 DSpark's pinned resources.
 
+DeepSeek V3's public model is the shared `ComponentAdapter` over `V3Kernel`.
+The kernel owns latent-attention, routed-expert, and MTP equations; typed hooks
+supply ordinary, observed, parallel, provider-aware, and partition execution.
+Serial and parallel ingress share request preparation and cache-mask construction.
+The shared decoder resource aggregate holds selected embedding, normalization, and
+vocabulary modules. Consuming partition construction retains only declared canonical
+storage roles and derives the local state origin from selected ownership. Downstream
+owners resume transported token IDs and effective embeddings without re-embedding;
+MTP depths keep separate cache slots. Standalone prediction operations borrow the
+kernel through the ordinary invocation and completion lifecycle.
+
 DeepSeek execution metadata reads the retained definition. Group ingress uses its
 validated dependencies, and unit construction validates global invocation addresses.
 V3 latent/rotary caches, V4 local-key and pooling streams, and independent prediction

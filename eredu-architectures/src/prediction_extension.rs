@@ -1687,28 +1687,32 @@ where
         M::invoke_module(self.unit, context, |unit| {
             let outcome = (|| {
                 if let Some(observer) = self.observer {
-                    return architecture.pipeline_forward_prediction_observed(
-                        unit,
-                        self.depth,
-                        self.hidden,
-                        self.tokens,
-                        self.cache,
-                        self.pass,
-                        parallel,
-                        context,
-                        observer,
-                    );
+                    return architecture
+                        .kernel_mut()
+                        .pipeline_forward_prediction_observed(
+                            unit,
+                            self.depth,
+                            self.hidden,
+                            self.tokens,
+                            self.cache,
+                            self.pass,
+                            parallel,
+                            context,
+                            observer,
+                        );
                 }
                 match parallel {
-                    Some(parallel) => architecture.pipeline_forward_prediction_neutral_parallel(
-                        unit,
-                        self.hidden,
-                        self.tokens,
-                        self.cache,
-                        parallel,
-                        context,
-                    ),
-                    None => architecture.pipeline_forward_prediction(
+                    Some(parallel) => architecture
+                        .kernel_mut()
+                        .pipeline_forward_prediction_neutral_parallel(
+                            unit,
+                            self.hidden,
+                            self.tokens,
+                            self.cache,
+                            parallel,
+                            context,
+                        ),
+                    None => architecture.kernel_mut().pipeline_forward_prediction(
                         unit,
                         self.hidden,
                         self.tokens,
@@ -4695,13 +4699,13 @@ where
                 None
             };
             let source = match &source_layout {
-                Some(layout) => crate::deepseek::v3::Model::<B>::new_parallel(
+                Some(layout) => crate::deepseek::v3::V3Kernel::<B>::new_parallel(
                     args.clone(),
                     crate::deepseek::parallel::v3_local_geometry(args, layout)
                         .map_err(|error| invalid(error.to_string()))?,
                     source_context,
                 ),
-                None => crate::deepseek::v3::Model::<B>::new(args.clone(), source_context),
+                None => crate::deepseek::v3::V3Kernel::<B>::new(args.clone(), source_context),
             }
             .map_err(|error| invalid(error.to_string()))?;
             let target_layers = usize::try_from(args.num_hidden_layers)
@@ -4710,7 +4714,7 @@ where
                 .state_layout()
                 .slice(target_layers..target_layers + extension.depth())
                 .map_err(|error| invalid(error.to_string()))?;
-            let local = crate::deepseek::v3::Model::<B>::new_parallel(
+            let local = crate::deepseek::v3::V3Kernel::<B>::new_parallel(
                 target_args,
                 geometry,
                 execution_context,

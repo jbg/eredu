@@ -4910,6 +4910,16 @@ pub struct PartitionStaticModules<B: NeuralBackend> {
     pub lm_head: Option<B::Linear>,
 }
 
+impl<B: NeuralBackend> From<StaticModules<B>> for PartitionStaticModules<B> {
+    fn from(modules: StaticModules<B>) -> Self {
+        Self {
+            embeddings: Some(modules.embeddings),
+            norm: Some(modules.boundary.norm),
+            lm_head: modules.lm_head,
+        }
+    }
+}
+
 impl<B: NeuralBackend> Clone for PartitionStaticModules<B> {
     fn clone(&self) -> Self {
         Self {

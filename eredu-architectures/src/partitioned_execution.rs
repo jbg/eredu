@@ -11892,13 +11892,10 @@ where
             "DeepSeek-V3 selected a non-gated expert equation".into(),
         ));
     }
-    let description = crate::deepseek::v3::Model::<B>::new(selected_args.clone(), context)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let parameters =
-        eredu_runtime::ArchitectureParameters::parameter_description(&description, context)
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
+    let parameters = crate::deepseek::v3::component_definition(&selected_args, None)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
+        .parameters()
+        .clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -12001,20 +11998,24 @@ where
             ));
         }
         let mut source =
-            crate::deepseek::v3::Model::<B>::new_parallel(source_args, source_local, context)
+            crate::deepseek::v3::V3Kernel::<B>::new_parallel(source_args, source_local, context)
                 .map_err(|e| error(e.to_string()))?;
-        source.set_partition_target_start(owned.units().start);
         source.install_expert_realization(source_plan);
+        let source = source
+            .into_partition_model(&source_partition)
+            .map_err(|e| error(e.to_string()))?;
         Some((source, source_layout))
     } else {
         None
     };
     let mut architecture =
-        crate::deepseek::v3::Model::<B>::new_parallel(selected_args, local, context).map_err(
+        crate::deepseek::v3::V3Kernel::<B>::new_parallel(selected_args, local, context).map_err(
             |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
         )?;
-    architecture.set_partition_target_start(owned.units().start);
     architecture.install_expert_realization(plan.clone());
+    let architecture = architecture
+        .into_partition_model(&partition)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         architecture,
         source_architecture,

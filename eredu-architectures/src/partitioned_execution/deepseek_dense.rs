@@ -43,7 +43,6 @@ where
             "dense V3 admission names another execution group",
         ));
     }
-    let start = owned.units().start;
     let geometry = crate::deepseek::parallel::v3_local_geometry(&selected_args, &layout)
         .map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
@@ -106,10 +105,12 @@ where
                 "dense V3 transform source changed local unit addresses",
             ));
         }
-        let mut model =
-            crate::deepseek::v3::Model::<B>::new_parallel(source_args, source_geometry, context)
+        let model =
+            crate::deepseek::v3::V3Kernel::<B>::new_parallel(source_args, source_geometry, context)
                 .map_err(architecture)?;
-        model.set_partition_target_start(start);
+        let model = model
+            .into_partition_model(&source_partition)
+            .map_err(architecture)?;
         Some((model, source_layout))
     } else {
         None
@@ -117,9 +118,11 @@ where
     let capability_estimate =
         crate::capability::deepseek_v3(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let mut model = crate::deepseek::v3::Model::<B>::new_parallel(selected_args, geometry, context)
+    let model = crate::deepseek::v3::V3Kernel::<B>::new_parallel(selected_args, geometry, context)
         .map_err(architecture)?;
-    model.set_partition_target_start(start);
+    let model = model
+        .into_partition_model(&partition)
+        .map_err(architecture)?;
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition)
         .map_err(architecture)?;
     visitor
