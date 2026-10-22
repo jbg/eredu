@@ -47,7 +47,7 @@ use eredu_nn::{
     BlockwiseAttentionBackend, DistributedNeuralBackend, GroupedNeuralBackend, HyperNeuralBackend,
     Parameterized, Tensor,
 };
-use eredu_runtime::{ArchitectureParameters, LocalModelLayout, StateLayout};
+use eredu_runtime::{LocalModelLayout, StateLayout};
 use eredu_runtime::{
     ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion, RuntimeStateComponents,
 };
@@ -1836,7 +1836,7 @@ where
         Self: Sized;
 }
 
-impl<B> InklingPredictionTarget<B> for crate::inkling::LayeredModel<B>
+impl<B> InklingPredictionTarget<B> for crate::inkling::InklingKernel<B>
 where
     B: BlockwiseAttentionBackend
         + DistributedNeuralBackend
@@ -1895,6 +1895,36 @@ where
             capture: output.hidden,
             tokens: output.tokens,
         })
+    }
+}
+
+impl<B, D, K, R> InklingPredictionTarget<B> for eredu_runtime::ComponentAdapter<D, K, R>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    D: std::borrow::Borrow<eredu_runtime::ComponentDefinition>,
+    K: InklingPredictionTarget<B>,
+{
+    fn prediction_step<M>(
+        &mut self,
+        unit: &mut crate::inkling::MtpDepth<B>,
+        shared: Option<&mut crate::inkling::MtpShared<B>>,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        depth: usize,
+        state: &mut M::ModelState,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<crate::speculative_execution::EmbeddedPredictionOutput<B::Tensor>, eredu_nn::Error>
+    where
+        M: PredictionExtensionMaterializer<B>,
+    {
+        self.kernel_mut().prediction_step::<M>(
+            unit, shared, hidden, tokens, depth, state, observer, parallel, context,
+        )
     }
 }
 
@@ -4917,10 +4947,8 @@ where
             }
             let target_args =
                 crate::inkling::with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let parameters =
-                crate::inkling::LayeredModel::<B>::new(target_args.clone(), execution_context)
-                    .and_then(|model| model.parameter_description(execution_context))
-                    .map_err(|error| invalid(error.to_string()))?;
+            let parameters = crate::inkling::parameter_description(&target_args)
+                .map_err(|error| invalid(error.to_string()))?;
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
                 .map_err(invalid)?;
             let source = crate::inkling::MtpModel::<B>::new(args, source_context)

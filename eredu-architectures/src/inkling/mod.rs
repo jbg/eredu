@@ -29,9 +29,9 @@ pub use graph::{
 };
 pub use model::{
     component_definition, parameter_description, prepare_input, state_identity, DecoderInputPart,
-    ForwardContext, InklingStateLayouts, LayeredModel, ModelInput, PartitionMtpOutput,
-    PreparedInput, StaticModules, TextPartitionInput, Unit, AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE,
-    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    ForwardContext, InklingKernel, InklingStateLayouts, LayeredModel, ModelInput,
+    PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput, Unit,
+    AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub(crate) use mtp::mtp_text_args;
 pub use mtp::{MtpDepth, MtpModel, MtpOutput, MtpShared};
@@ -59,7 +59,7 @@ pub struct ExpertBankRealization {
 pub fn expert_realization_plan<
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 >(
-    architecture: &LayeredModel<B>,
+    architecture: &InklingKernel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<ExpertBankRealization>>, eredu_nn::Error> {
     let args = architecture.args();

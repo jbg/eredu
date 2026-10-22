@@ -8340,14 +8340,18 @@ where
             .then(|| crate::inkling::with_checkpoint_formats(args, self.source_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::inkling::LayeredModel::<B>::new(args, self.context))
+            .map(|args| {
+                crate::inkling::InklingKernel::<B>::new(args, self.context)
+                    .and_then(crate::inkling::InklingKernel::into_model)
+            })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = crate::inkling::with_checkpoint_formats(args, self.target_formats.clone())
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.model_type.clone();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::inkling::LayeredModel::<B>::new(target, self.context)
+        let architecture = crate::inkling::InklingKernel::<B>::new(target, self.context)
+            .and_then(crate::inkling::InklingKernel::into_model)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
@@ -8482,14 +8486,18 @@ where
                 .then(|| crate::inkling::with_checkpoint_formats(args, source_formats))
                 .transpose()
                 .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::inkling::LayeredModel::<B>::new(args, context))
+                .map(|args| {
+                    crate::inkling::InklingKernel::<B>::new(args, context)
+                        .and_then(crate::inkling::InklingKernel::into_model)
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let target = crate::inkling::with_checkpoint_formats(args, target_formats)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let effective_model_type = target.model_type.clone();
             let cache_identity = target.architecture_fingerprint();
-            let architecture = crate::inkling::LayeredModel::<B>::new(target, context)
+            let architecture = crate::inkling::InklingKernel::<B>::new(target, context)
+                .and_then(crate::inkling::InklingKernel::into_model)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             visit_constructed_prediction_target!(
                 architecture,

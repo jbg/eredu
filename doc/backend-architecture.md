@@ -8593,6 +8593,20 @@ encoded companions derive from the hMLP fold specifications through shared
 linear-format expansion. Parameter inspection and partition source planning do
 not construct native modules to discover their storage. Rank-local construction
 validates the same canonical parameters against selected state geometry.
+`LayeredModel` is the shared `ComponentAdapter` over `InklingKernel` and its
+typed pinned-resource aggregate. The runtime supplies parameter traversal,
+address and dependency checks, retained state mappings and ordinary, parallel,
+routed and partition driver contracts. The kernel supplies equations and
+observation/intervention seams, explicit collective algorithms and partition
+boundaries. Family composite admission uses that same adapter. Specialized MTP
+operations borrow the kernel's target embeddings and readout through the
+ordinary parameter and completion lifecycle; they retain independent prediction
+state. Raw kernel operations remain available through typed kernel access.
+Partition construction consumes the exact declared selection, derives its cache
+offset from selected state and retains only canonical pinned roles owned there.
+Source-format and execution-format partitions retain their own selected modules
+and parameter authority. Unowned factories and pinned-resource operations reject
+through typed errors; repeated selection retains the same geometry and ownership.
 
 Inkling component instrumentation shares its ordinary decoder equations, including
 relative attention and all four causal convolution histories. Unit/channel hooks

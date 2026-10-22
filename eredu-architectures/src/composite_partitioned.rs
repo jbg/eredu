@@ -2763,14 +2763,11 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::LayeredModel::<B>::new_parallel(
+            let mut architecture = crate::inkling::InklingKernel::<B>::new_parallel(
                 args.clone(),
                 std::sync::Arc::new(local),
                 context,
             )
-            .and_then(|architecture| {
-                architecture.with_partition_state_offset(geometry.text_units().start)
-            })
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 let realization = crate::inkling::expert_realization_plan(&architecture, rank)
@@ -2791,6 +2788,23 @@ where
             } else {
                 None
             };
+            let partition = ArchitecturePartition::from_description(
+                &parameters,
+                group_ranges
+                    .iter()
+                    .map(|(group, units)| (group.as_str(), units.clone())),
+                ownership.clone(),
+                architecture.definition().state_layout(),
+                architecture.definition().state_partition_plan(),
+                geometry.clone(),
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let architecture = architecture
+                .into_partition_model(&partition)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let routed_execution = realization
                 .as_ref()
                 .map(|realization| {
@@ -2859,7 +2873,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
     }
@@ -3251,12 +3265,11 @@ where
     {
         return Err("Inkling transform source changed partition state or ownership".into());
     }
-    let mut architecture = crate::inkling::LayeredModel::<B>::new_parallel(
+    let mut architecture = crate::inkling::InklingKernel::<B>::new_parallel(
         source.clone(),
         std::sync::Arc::new(local),
         context,
     )
-    .and_then(|architecture| architecture.with_partition_state_offset(geometry.text_units().start))
     .map_err(|error| error.to_string())?;
     if source.text_config.has_sparse_moe_layers() {
         let realization = crate::inkling::expert_realization_plan(&architecture, rank)
@@ -3274,15 +3287,14 @@ where
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
-        .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
+    let partition = ArchitecturePartition::from_description(
+        &parameters,
         ranges(),
         ownership.clone(),
+        architecture.definition().state_layout(),
+        architecture.definition().state_partition_plan(),
         geometry,
-        boundary,
-        &parameters,
+        eredu_runtime::NoAuxiliaryBoundarySchema::new(source.text_config.hidden_size),
     )
     .map_err(|error| error.to_string())?;
     if selected.requirements().state() != partition.state() {
@@ -3292,6 +3304,9 @@ where
         crate::inkling::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
     }
+    let architecture = architecture
+        .into_partition_model(&partition)
+        .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 
@@ -3652,14 +3667,11 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::LayeredModel::<B>::new_parallel(
+            let mut architecture = crate::inkling::InklingKernel::<B>::new_parallel(
                 args.clone(),
                 std::sync::Arc::new(local),
                 context,
             )
-            .and_then(|architecture| {
-                architecture.with_partition_state_offset(geometry.text_units().start)
-            })
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 let realization = crate::inkling::expert_realization_plan(&architecture, rank)
@@ -3680,6 +3692,23 @@ where
             } else {
                 None
             };
+            let partition = ArchitecturePartition::from_description(
+                &parameters,
+                group_ranges
+                    .iter()
+                    .map(|(group, units)| (group.as_str(), units.clone())),
+                ownership.clone(),
+                architecture.definition().state_layout(),
+                architecture.definition().state_partition_plan(),
+                geometry.clone(),
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let architecture = architecture
+                .into_partition_model(&partition)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let routed_execution = realization
                 .as_ref()
                 .map(|realization| {
@@ -3749,7 +3778,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::NemotronLabsDiffusion(_)
