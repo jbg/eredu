@@ -3443,6 +3443,13 @@ each independent member. The backend consumes these projected records and
 preserves typed projection causes through its ordinary error boundary; it does
 not reconstruct local parameter geometry.
 
+Each `AddressableBankBindingPlan` retains canonical destinations for its local
+bindings and generated companions, together with a checked source/executable
+footprint. Source accounting uses the final prepared binding recipes, including
+checkpoint-format lowering, rather than the earlier admitted member byte count.
+Backend entry construction consumes these destinations and totals directly;
+parameter editing uses the same retained logical destinations as materialization.
+
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
 streams, indexed tensor operations, generic addressable member storage,

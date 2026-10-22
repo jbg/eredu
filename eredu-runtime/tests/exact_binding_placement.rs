@@ -735,6 +735,22 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
             global.parameters()[0].task()
         ));
     }
+    let plans = eredu_runtime::plan_addressable_bank_bindings(
+        &local,
+        &source,
+        |_, _, _| -> Result<_, String> {
+            panic!("dense member requires no checkpoint-format lowering")
+        },
+    )
+    .unwrap();
+    assert_eq!(plans.iter().map(|p| p.source_bytes()).sum::<u64>(), 64);
+    assert_eq!(plans.iter().map(|p| p.selected_bytes()).sum::<u64>(), 64);
+    for plan in plans {
+        assert_eq!(
+            plan.parameter_targets().get("weight").map(String::as_str),
+            Some("weight")
+        );
+    }
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
 }
 

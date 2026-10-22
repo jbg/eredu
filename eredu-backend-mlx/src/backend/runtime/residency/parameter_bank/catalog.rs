@@ -163,55 +163,23 @@ pub fn entries_from_selected_members(
     members: &[eredu_runtime::AddressableBankMember],
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<SelectedAddressableEntries, Error> {
-    let mut parameter_targets = BTreeMap::new();
-    for member in members {
-        for parameter in member.parameters() {
-            parameter_targets.insert(
-                (member.key(), parameter.binding_name().to_owned()),
-                parameter.task().name().to_owned(),
-            );
-            if let Some(bindings) = parameter.quantization_companions() {
-                for companion in parameter.task().output_companions() {
-                    let name = match companion.role() {
-                        eredu_nn::LinearCompanionRole::GlobalScale => {
-                            return Err(Error::Quantization(
-                                "load-time NVFP4 encoding is unavailable".into(),
-                            ))
-                        }
-                        eredu_nn::LinearCompanionRole::Scale => bindings.scale(),
-                        eredu_nn::LinearCompanionRole::AffineBias => {
-                            bindings.affine_bias().ok_or_else(|| {
-                                Error::ArchitectureModel(
-                                    "missing selected companion binding".into(),
-                                )
-                            })?
-                        }
-                    };
-                    parameter_targets
-                        .insert((member.key(), name.to_owned()), companion.name().to_owned());
-                }
-            }
-        }
-    }
     let plans =
         eredu_runtime::plan_addressable_bank_bindings(members, store, |_task, recipe, source| {
             crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
         })
         .map_err(|error| Error::Other(Box::new(error)))?;
+    let mut parameter_targets = BTreeMap::new();
     let mut entries = Vec::with_capacity(plans.len());
     let mut transformations = BTreeMap::new();
     let mut expected_bytes = BTreeMap::new();
     let mut placements = BTreeMap::new();
     for plan in plans {
-        let (key, bindings, transforms, selected_bytes, placement) = plan.into_parts();
-
-        let source_bytes = bindings.iter().try_fold(0u64, |total, binding| {
-            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                Error::ArchitectureModel(format!(
-                    "addressable member {key:?} source byte total overflowed"
-                ))
-            })
-        })?;
+        let (key, bindings, transforms, footprint, placement, targets) = plan.into_parts();
+        parameter_targets.extend(
+            targets
+                .into_iter()
+                .map(|(local, target)| ((key, local), target)),
+        );
         for (binding, transform) in transforms {
             transformations.insert(
                 (key, binding),
@@ -224,9 +192,9 @@ pub fn entries_from_selected_members(
         entries.push(ParameterBankEntry::new(
             key,
             OffloadUnit::new(key.unit_id(), bindings)?,
-            source_bytes,
+            footprint.source_bytes(),
         )?);
-        expected_bytes.insert(key, selected_bytes);
+        expected_bytes.insert(key, footprint.selected_bytes());
         placements.insert(key, placement);
     }
     Ok(SelectedAddressableEntries {

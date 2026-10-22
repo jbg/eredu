@@ -574,7 +574,8 @@ pub struct AddressableBankBindingPlan {
     key: ParameterBankKey,
     bindings: Vec<crate::WeightBinding>,
     transformations: std::collections::BTreeMap<String, AddressableBindingTransform>,
-    selected_bytes: u64,
+    footprint: AddressableBankFootprint,
+    parameter_targets: std::collections::BTreeMap<String, String>,
     placement: AddressableBankMemberPlacement,
 }
 
@@ -593,9 +594,18 @@ impl AddressableBankBindingPlan {
     ) -> &std::collections::BTreeMap<String, AddressableBindingTransform> {
         &self.transformations
     }
+    /// Local binding destinations, including generated transform companions.
+    pub const fn parameter_targets(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.parameter_targets
+    }
+    /// Bytes consumed by the final source recipes, including checkpoint-format
+    /// recipe lowering, before selected load-time transformations.
+    pub const fn source_bytes(&self) -> u64 {
+        self.footprint.source_bytes()
+    }
     /// Exact executable bytes after all transforms.
     pub const fn selected_bytes(&self) -> u64 {
-        self.selected_bytes
+        self.footprint.selected_bytes()
     }
     /// Exact rank-local architecture placement.
     pub const fn placement(&self) -> &AddressableBankMemberPlacement {
@@ -609,15 +619,17 @@ impl AddressableBankBindingPlan {
         ParameterBankKey,
         Vec<crate::WeightBinding>,
         std::collections::BTreeMap<String, AddressableBindingTransform>,
-        u64,
+        AddressableBankFootprint,
         AddressableBankMemberPlacement,
+        std::collections::BTreeMap<String, String>,
     ) {
         (
             self.key,
             self.bindings,
             self.transformations,
-            self.selected_bytes,
+            self.footprint,
             self.placement,
+            self.parameter_targets,
         )
     }
 }
@@ -643,8 +655,30 @@ where
     for member in members {
         let mut bindings = Vec::with_capacity(member.parameters().len());
         let mut transformations = std::collections::BTreeMap::new();
+        let mut parameter_targets = std::collections::BTreeMap::new();
         for parameter in member.parameters() {
             let task = parameter.task();
+            parameter_targets.insert(parameter.binding_name().to_owned(), task.name().to_owned());
+            if let Some(companions) = parameter.quantization_companions() {
+                for companion in task.output_companions() {
+                    let local = match companion.role() {
+                        eredu_nn::LinearCompanionRole::Scale => companions.scale(),
+                        eredu_nn::LinearCompanionRole::AffineBias => companions
+                            .affine_bias()
+                            .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
+                                parameter: task.name().to_owned(),
+                                detail: "missing selected companion binding".into(),
+                            })?,
+                        eredu_nn::LinearCompanionRole::GlobalScale => {
+                            return Err(AddressableBankMemberError::InvalidParameter {
+                                parameter: task.name().to_owned(),
+                                detail: "load-time NVFP4 encoding is unavailable".into(),
+                            });
+                        }
+                    };
+                    parameter_targets.insert(local.to_owned(), companion.name().to_owned());
+                }
+            }
             if bound_tasks.insert(std::ptr::from_ref(task)) {
                 for admitted in task.physical_sources() {
                     let actual =
@@ -752,11 +786,24 @@ where
                 detail: error.to_string(),
             }
         })?;
+        let footprint = AddressableBankFootprint::try_from_parameters(
+            member.key(),
+            bindings
+                .iter()
+                .zip(member.parameters())
+                .map(|(binding, parameter)| {
+                    Ok::<_, AddressableBankMemberError>((
+                        binding.expected_bytes(),
+                        parameter.selected_bytes(),
+                    ))
+                }),
+        )?;
         plans.push(AddressableBankBindingPlan {
             key: member.key(),
             bindings,
             transformations,
-            selected_bytes: member.selected_bytes(),
+            footprint,
+            parameter_targets,
             placement: member.placement().clone(),
         });
     }
@@ -797,7 +844,7 @@ impl AddressableBankFootprint {
         }
         Ok(footprint)
     }
-    /// Admitted source payload before optional lowering.
+    /// Source payload at the retained preparation stage.
     pub const fn source_bytes(self) -> u64 {
         self.source_bytes
     }
