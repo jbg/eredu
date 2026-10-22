@@ -2073,12 +2073,17 @@ where
         let (unit, path, recipes) = entry?;
         let outputs =
             eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, &recipes)?;
+        let selected_outputs = [&recipes.target_gate_up, &recipes.target_down]
+            .into_iter()
+            .flat_map(|target| ["", "_scales", "_biases"].map(|suffix| format!("{target}{suffix}")))
+            .filter_map(|target| outputs.get(&target).cloned().map(|recipe| (target, recipe)))
+            .collect();
+        let members = eredu_runtime::ParameterBankRecipes::new(catalog, selected_outputs, experts)
+            .map_err(|error| error.to_string())?;
         for expert in 0..experts {
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert.checked_add(1).ok_or("expert index overflow")?,
-            };
+            let selected = members
+                .member(expert)
+                .expect("validated expert bank member");
             let mut parameters = Vec::new();
             for (binding, target) in [
                 ("gate_up_proj", &recipes.target_gate_up),
@@ -2089,12 +2094,9 @@ where
                     .any(|suffix| outputs.contains_key(&format!("{target}{suffix}")));
                 for suffix in ["", "_scales", "_biases"] {
                     let name = format!("{target}{suffix}");
-                    let Some(recipe) = outputs.get(&name) else {
+                    let Some(recipe) = selected.get(&name) else {
                         continue;
                     };
-                    let recipe = recipe
-                        .select_bounded(catalog, selection.clone())
-                        .map_err(|error| error.to_string())?;
                     let role = if suffix.is_empty() && !has_companions {
                         ExpertParameterRole::quantizable_projection(
                             format!("{binding}_scales"),
@@ -2107,7 +2109,7 @@ where
                         ExpertParameterRecipe::new(
                             format!("{binding}{suffix}"),
                             name,
-                            recipe,
+                            recipe.clone(),
                             role,
                         )
                         .map_err(|error| error.to_string())?,

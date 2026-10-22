@@ -835,8 +835,10 @@ while retaining its declared parameter order and format-dependent quantization
 roles. Inkling projects routed and replicated shared-expert banks through the
 same catalog while retaining distinct bank cache identities, distribution policies
 and declared parameter order. Families retain bank namespaces, formats and expert
-selection policy. Member projection retains bank-global IDs and allocates no
-parameter payload or native resource. Shared resource binding
+selection policy. The gated-product residency builder used by Gemma4 and diffusion
+Gemma projects its selected weight, scale and bias outputs through the same bank
+catalog while preserving per-expert leases. Member projection retains bank-global
+IDs and allocates no parameter payload or native resource. Shared resource binding
 preparation uses the same checkpoint snapshot primitive while keeping aliases
 local to each independently leased resource.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
