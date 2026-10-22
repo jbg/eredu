@@ -3427,6 +3427,14 @@ runtime checks group alignment and derives parameter ownership. Complete output
 role validation uses the task's ordinary companion attachment contract. Stored
 companions retain their declared source and output descriptions.
 
+Runtime-owned `AddressableBankTaskCache` retains one immutable exact task index
+and shares validated cold tasks by canonical output, selected member shape and
+local companion bindings. Architecture callbacks declare missing generated
+outputs; they cannot substitute source authority, owner or lowering. Existing
+output declarations remain authoritative, and failed preparation is not cached.
+Sharing task metadata does not combine physical storage, parameter charges,
+leases or mutable state across independently addressed bank members.
+
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
 streams, indexed tensor operations, generic addressable member storage,

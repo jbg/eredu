@@ -95,6 +95,84 @@ impl AddressableBankTask {
     }
 }
 
+/// Preparation-local sharing of validated bank tasks from one immutable exact
+/// task index. This shares cold task descriptions, never native modules, leases,
+/// mutable state, or the accounting of distinct parameters.
+#[derive(Debug)]
+pub struct AddressableBankTaskCache<'a> {
+    tasks: &'a crate::MaterializationTaskIndex<'a>,
+    prepared: std::collections::BTreeMap<AddressableBankTaskSelection, AddressableBankTask>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AddressableBankTaskSelection {
+    target: String,
+    shape: Vec<usize>,
+    companions: Option<(String, Option<String>)>,
+}
+
+impl<'a> AddressableBankTaskCache<'a> {
+    /// Retains exact selected task authority for all subsequent member projections.
+    pub fn new(tasks: &'a crate::MaterializationTaskIndex<'a>) -> Self {
+        Self {
+            tasks,
+            prepared: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Resolves a canonical output and validates its task only once per selected
+    /// shape and local companion binding set. Existing declared output companions
+    /// remain authoritative. The callback supplies missing generated outputs; it
+    /// cannot replace the selected source, owner, executable, or lowering.
+    ///
+    /// The callback runs only on a cache miss that requires generated companions.
+    /// Its declarations must be deterministic for the given selection. Failed
+    /// declarations or validation are never cached.
+    pub fn resolve<E>(
+        &mut self,
+        target: &str,
+        shape: &[usize],
+        companions: Option<&crate::QuantizationCompanionBindings>,
+        declare_outputs: impl FnOnce(
+            &ReplicatedTextMaterializationTask,
+            &crate::QuantizationCompanionBindings,
+        ) -> Result<Vec<crate::ReplicatedTextOutputCompanion>, E>,
+    ) -> Result<AddressableBankTask, E>
+    where
+        E: From<AddressableBankMemberError> + From<crate::ReplicatedTextContractError>,
+    {
+        let selection = AddressableBankTaskSelection {
+            target: target.to_owned(),
+            shape: shape.to_vec(),
+            companions: companions.map(|bindings| {
+                (
+                    bindings.scale().to_owned(),
+                    bindings.affine_bias().map(str::to_owned),
+                )
+            }),
+        };
+        if let Some(prepared) = self.prepared.get(&selection) {
+            return Ok(prepared.clone());
+        }
+        let task = self.tasks.get(target).ok_or_else(|| {
+            E::from(AddressableBankMemberError::InvalidParameter {
+                parameter: target.to_owned(),
+                detail: "no exact selected materialization task".into(),
+            })
+        })?;
+        let mut task = task.clone();
+        if task.output_companions().is_empty() {
+            if let Some(companions) = companions {
+                let outputs = declare_outputs(&task, companions)?;
+                task = task.with_output_companions(outputs).map_err(E::from)?;
+            }
+        }
+        let prepared = AddressableBankTask::new(task).map_err(E::from)?;
+        self.prepared.insert(selection, prepared.clone());
+        Ok(prepared)
+    }
+}
+
 /// One exact selected parameter in an independently addressable bank member.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AddressableBankParameter {

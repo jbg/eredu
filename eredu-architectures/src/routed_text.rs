@@ -356,7 +356,7 @@ fn project_bank_members_with_tasks(
             .chain(selected.auxiliary_materialization_tasks()),
     )?;
     let exact_tasks = eredu_runtime::MaterializationTaskIndex::new(tasks)?;
-    let mut shared_tasks = BTreeMap::new();
+    let mut shared_tasks = eredu_runtime::AddressableBankTaskCache::new(&exact_tasks);
     let mut members = Vec::with_capacity(catalog.units().len());
     for unit in catalog.units() {
         if !include_replicated
@@ -434,49 +434,32 @@ fn project_bank_members_with_tasks(
                 } else {
                     None
                 };
-            let shared_key = (
+            let shared_task = shared_tasks.resolve(
                 parameter.logical_target(),
                 metadata.shape(),
-                companions.as_ref().map(|bindings| {
-                    (
-                        bindings.scale().to_owned(),
-                        bindings.affine_bias().map(str::to_owned),
-                    )
-                }),
-            );
-            let shared_task = if let Some(shared) = shared_tasks.get(&shared_key) {
-                eredu_runtime::AddressableBankTask::clone(shared)
-            } else {
-                let mut task = task.clone();
-                if task.output_companions().is_empty() {
-                    if let Some(companions) = companions.as_ref() {
-                        let prefix = parameter
-                            .logical_target()
-                            .strip_suffix(parameter.binding_name())
-                            .ok_or_else(|| {
-                                RoutedTextPreparationError::Invalid(format!(
+                companions.as_ref(),
+                |task, companions| -> Result<_, RoutedTextPreparationError> {
+                    let prefix = parameter
+                        .logical_target()
+                        .strip_suffix(parameter.binding_name())
+                        .ok_or_else(|| {
+                            RoutedTextPreparationError::Invalid(format!(
                                 "addressable target {:?} does not end in its local binding {:?}",
                                 parameter.logical_target(),
                                 parameter.binding_name()
                             ))
-                            })?;
-                        let scale = format!("{prefix}{}", companions.scale());
-                        let affine_bias = companions
-                            .affine_bias()
-                            .map(|name| format!("{prefix}{name}"));
-                        let outputs = task.transform_output_companions(
-                            metadata.shape(),
-                            &scale,
-                            affine_bias.as_deref(),
-                        )?;
-                        task = task.with_output_companions(outputs)?;
-                    }
-                }
-                let shared = eredu_runtime::AddressableBankTask::new(task)
-                    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-                shared_tasks.insert(shared_key, shared.clone());
-                shared
-            };
+                        })?;
+                    let scale = format!("{prefix}{}", companions.scale());
+                    let affine_bias = companions
+                        .affine_bias()
+                        .map(|name| format!("{prefix}{name}"));
+                    Ok(task.transform_output_companions(
+                        metadata.shape(),
+                        &scale,
+                        affine_bias.as_deref(),
+                    )?)
+                },
+            )?;
             parameters.push(
                 eredu_runtime::AddressableBankParameter::from_shared_task(
                     parameter.binding_name(),
