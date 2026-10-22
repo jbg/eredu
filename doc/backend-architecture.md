@@ -832,9 +832,11 @@ count. Qwen4 target, prediction and inspection consume this shared catalog.
 GPT-OSS uses it to prepare one independently leased unit per global expert,
 including packed weights, scales and biases. Muse uses the same member projection
 while retaining its declared parameter order and format-dependent quantization
-roles. Families retain bank namespaces, formats and expert selection policy.
-Member projection retains bank-global IDs
-and allocates no parameter payload or native resource. Shared resource binding
+roles. Inkling projects routed and replicated shared-expert banks through the
+same catalog while retaining distinct bank cache identities, distribution policies
+and declared parameter order. Families retain bank namespaces, formats and expert
+selection policy. Member projection retains bank-global IDs and allocates no
+parameter payload or native resource. Shared resource binding
 preparation uses the same checkpoint snapshot primitive while keeping aliases
 local to each independently leased resource.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
