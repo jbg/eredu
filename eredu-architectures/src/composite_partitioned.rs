@@ -2106,12 +2106,7 @@ where
                         .into(),
                 ));
             }
-            let description = crate::gemma4::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
+            let parameters = crate::gemma4::parameter_description(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let layout =
@@ -3006,10 +3001,7 @@ where
         source.text.layer_schedule.iter().any(|policy| {
             policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe
         });
-    let description = crate::gemma4::LayeredModel::<B>::new(source.clone(), context)
-        .map_err(|error| error.to_string())?;
-    let parameters = description
-        .parameter_description(context)
+    let parameters = crate::gemma4::parameter_description(source)
         .map_err(|error| error.to_string())?;
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()

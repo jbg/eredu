@@ -9329,6 +9329,22 @@ Gemma flattens its padded media batch into the admitted sequence dimension and
 restores the encoder batch from the retained request geometry. Native backends
 perform ordinary tensor reshaping and transfer, without interpreting media parts.
 
+Gemma 4 constructs a validated, source-free `ComponentDefinition` before native
+modules. It retains the execution graph, canonical parameter ownership, invocation
+paths, state references, and transport contracts for the complete or TP-local
+geometry. Execution metadata projects this retained definition. Cold partition
+and transform-source preparation read the same catalog without constructing
+native media layers. Pinned text resources declare their storage roles alongside
+their parameter groups, including the tied embedding/readout owner.
+
+Gemma audio checkpoint admission and resource declarations share logical parameter
+geometry. Resource catalogs retain only the configured output bias and expand each
+matrix's configured native encoding through runtime's ordinary format projection.
+Checkpoint admission retains its optional output-bias contract. Vision declarations
+use the shared source-free vision topology; both media towers retain independently
+leased encoder layers and their existing pinned resource boundaries. Shared KV
+receiver state and per-layer input transport keep their family-defined geometry.
+
 Gemma's cold and constructed media transport use one architecture-owned phase
 ownership declaration. Encoder input parameters belong to the first encoder
 stage and output projectors to the last. The current atomic vision static group

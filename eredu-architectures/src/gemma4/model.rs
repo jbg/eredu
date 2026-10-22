@@ -1,6 +1,8 @@
 //! Backend-neutral Gemma 4 multimodal model and layered runtime lifecycle.
 
 mod observation;
+mod parameters;
+pub use parameters::{component_definition, parameter_description};
 
 use std::collections::HashMap;
 
@@ -10,20 +12,17 @@ use eredu_nn::{
     LinearOperator, NormalizationOperator, PadMode, Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelPlanError, ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ParameterProvider,
+    ArchitectureParameterDescription, ExecutionGraph, ExpertPass, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterProvider,
     PartitionedLayeredArchitecture, RoutedLayeredArchitecture, StateLayout,
 };
 
 use super::{
-    audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
-    modality_projection_parameter_groups, state_layout, static_parameter_groups,
-    vision_layer_parameter_groups, vision_static_parameter_groups, AudioIngressBatchPlan,
-    AudioIngressPartPlan, AudioInput, AudioLayer, AudioStatic, BlockInput, DenseBlock,
-    FamilyConfig, LocalGeometry, ModalityProjector, SharedAttentionStates, VisionIngressBatchPlan,
-    VisionIngressPartPlan, VisionInput, VisionLayer, VisionState, VisionStatic,
+    AudioIngressBatchPlan, AudioIngressPartPlan, AudioInput, AudioLayer, AudioStatic, BlockInput,
+    DenseBlock, FamilyConfig, LocalGeometry, ModalityProjector, SharedAttentionStates,
+    VisionIngressBatchPlan, VisionIngressPartPlan, VisionInput, VisionLayer, VisionState,
+    VisionStatic,
 };
 use crate::{
     composite_execution::{
@@ -56,43 +55,6 @@ pub fn external_assistant_capture_request(
     Ok(ExternalPredictionCaptureRequest::Gemma4SharedAttention {
         final_hidden_path: format!("model.language_model.layers.{last}.output"),
     })
-}
-
-fn text_static_parameter_ownership(
-    args: &super::ModelArgs,
-) -> Result<Vec<OwnedParameterGroupSpec>, ParallelPlanError> {
-    let text_static = static_parameter_groups(args)?;
-    let mut text_roles = vec!["embedding"];
-    if args.hidden_size_per_layer_input > 0 {
-        text_roles.extend([
-            "per_layer_embedding",
-            "per_layer_projection",
-            "per_layer_norm",
-        ]);
-    }
-    text_roles.push("norm");
-    if !args.tie_word_embeddings {
-        text_roles.push("output");
-    }
-    if text_static.len() != text_roles.len() {
-        return Err(ParallelPlanError::InvalidGroup(format!(
-            "Gemma text static ownership declared {} groups for {} roles",
-            text_static.len(),
-            text_roles.len()
-        )));
-    }
-    Ok(text_static
-        .into_iter()
-        .zip(text_roles)
-        .map(|(group, role)| {
-            let owner = if role == "embedding" && args.tie_word_embeddings {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role(role)
-            };
-            OwnedParameterGroupSpec::new(owner, group)
-        })
-        .collect())
 }
 
 impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
@@ -1396,6 +1358,7 @@ impl<T> TextBoundary<T> {
 /// One Gemma architecture used by resident, layerwise, and streamed runtimes.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<LocalGeometry>,
     partition_state_offset: usize,
@@ -1429,9 +1392,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
+        Ok(self.definition.parameters().clone())
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -1650,8 +1613,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             "Gemma 4",
             crate::operator_requirements::GEMMA4,
         )?;
+        let definition = std::sync::Arc::new(component_definition(&args, None)?);
         let text = model_text::StaticTextModules::new(&args.text, context)?;
-        Self::with_text(args, text, None, context)
+        Self::with_text(args, definition, text, None, context)
     }
 
     /// Builds the same multimodal graph with planner-derived text geometry.
@@ -1664,14 +1628,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             "Gemma 4",
             crate::operator_requirements::GEMMA4,
         )?;
-        args.validate().map_err(Error::backend)?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = std::sync::Arc::new(component_definition(&args, Some(&geometry))?);
         let text = model_text::StaticTextModules::new_parallel(&args.text, &geometry, context)?;
-        Self::with_text(args, text, Some(geometry), context)
+        Self::with_text(args, definition, text, Some(geometry), context)
     }
 
     fn with_text(
         args: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         text: model_text::StaticTextModules<B>,
         parallel_geometry: Option<LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
@@ -1722,6 +1686,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             .transpose()?;
         Ok(Self {
             args,
+            definition,
             static_modules: StaticModules {
                 text,
                 vision,
@@ -2037,121 +2002,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Describes every pinned/media/text parameter with explicit canonical
     /// execution ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)?;
-        let counts = [
-            self.args
-                .vision
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize),
-            self.args
-                .audio
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize),
-            self.args.text.num_hidden_layers(),
-        ];
-        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
-        let mut owned = text_static_parameter_ownership(&self.args.text).map_err(Error::backend)?;
-        let mut expected = owned
-            .iter()
-            .map(|owned| owned.group().clone())
-            .collect::<Vec<_>>();
-        {
-            let mut add_static = |role: &'static str, groups: Vec<_>| {
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role(role), group)
-                }));
-            };
-            if let Some(vision) = &self.static_modules.vision {
-                add_static(
-                    "vision",
-                    vision_static_parameter_groups(vision).map_err(Error::backend)?,
-                );
-            }
-            if let Some(projector) = &self.static_modules.vision_projection {
-                add_static(
-                    "vision_projection",
-                    modality_projection_parameter_groups("model.vision_projector", projector)
-                        .map_err(Error::backend)?,
-                );
-            }
-            if let Some(audio) = &self.static_modules.audio {
-                add_static(
-                    "audio",
-                    audio_static_parameter_groups(audio).map_err(Error::backend)?,
-                );
-            }
-            if let Some(projector) = &self.static_modules.audio_projection {
-                add_static(
-                    "audio_projection",
-                    modality_projection_parameter_groups("model.audio_projector", projector)
-                        .map_err(Error::backend)?,
-                );
-            }
-        }
-        for (group_index, &count) in counts.iter().enumerate() {
-            let owner_group = layout
-                .group_id(group_index)
-                .expect("Gemma layout group")
-                .clone();
-            for index in 0..count {
-                let groups = match group_index {
-                    0 => vision_layer_parameter_groups(
-                        &VisionLayer::<B>::new(
-                            self.args.vision.as_ref().expect("vision group configured"),
-                            index,
-                            context,
-                        )?,
-                        index,
-                    ),
-                    1 => audio_layer_parameter_groups(
-                        &AudioLayer::<B>::new(
-                            self.args.audio.as_ref().expect("audio group configured"),
-                            index,
-                            context,
-                        )?,
-                        index,
-                    ),
-                    _ => layer_parameter_groups(&self.args.text, index),
-                }
-                .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
-    }
 
     /// Returns the replicated or rank-local mutable-state layout.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
         if let Some(state) = &self.partition_state {
             return Ok(state.clone());
         }
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| state_layout(&self.args.text).map_err(Error::backend), Ok)
+        Ok(self.definition.state_layout().clone())
+    }
+
+    /// Returns the validated semantic definition retained before native construction.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Returns planner-derived geometry for a rank-local realization.
@@ -2898,96 +2760,33 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        match group {
-            0 | 1 => super::pipeline::media_transport(&self.args, group),
-            _ => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::Decoder,
-                first_owner_static_roles: vec![
-                    "embedding".into(),
-                    "per_layer_embedding".into(),
-                    "per_layer_projection".into(),
-                    "per_layer_norm".into(),
-                ],
-                last_owner_static_roles: if self.args.text.tie_word_embeddings {
-                    vec!["norm".into(), "embedding".into()]
-                } else {
-                    vec!["norm".into(), "output".into()]
-                },
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::LastOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::Decoder),
-                request_optional: false,
-            },
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated Gemma group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        TEXT_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        layout: &StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(2, layout)
+        parameters::state_partition_plan(layout)
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        match group {
-            0 => Ok(self
-                .args
-                .vision
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize)),
-            1 => Ok(self
-                .args
-                .audio
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize)),
-            2 => Ok(self.args.text.num_hidden_layers()),
-            _ => Err(Error::backend("Gemma 4 has three execution groups")),
-        }
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        let count = match group {
-            0 => self
-                .args
-                .vision
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize),
-            1 => self
-                .args
-                .audio
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize),
-            2 => self.args.text.num_hidden_layers(),
-            _ => return Err(Error::backend("Gemma 4 has three execution groups")),
-        };
-        if index >= count {
-            return Err(Error::backend("Gemma 4 unit is outside its group"));
-        }
-        match group {
-            0 => Ok(format!("model.vision_tower.encoder.layers.{index}")),
-            1 => Ok(format!("model.audio_tower.layers.{index}")),
-            2 => Ok(format!("model.language_model.layers.{index}")),
-            _ => unreachable!(),
-        }
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
@@ -3008,17 +2807,23 @@ where
         index: usize,
         _ordinal: usize,
     ) -> std::ops::Range<usize> {
-        match group {
-            2 => index..index + 1,
-            _ => 0..0,
-        }
+        self.definition
+            .unit(group, index)
+            .expect("validated Gemma unit")
+            .state
+            .clone()
     }
 
     fn state_ordinal(&self, group: usize, index: usize, ordinal: usize) -> usize {
-        if group == 2 {
-            index
-        } else {
+        let state = &self
+            .definition
+            .unit(group, index)
+            .expect("validated Gemma unit")
+            .state;
+        if state.is_empty() {
             ordinal
+        } else {
+            state.start
         }
     }
 
