@@ -135,12 +135,38 @@ mod tests {
             ResidencyController::new_with_row_ranges(|_| source.as_ref(), plan.clone(), [], vec![]),
             Err(ResidencyControllerError::RangeCatalogMismatch)
         ));
+        let table_metadata = table.metadata().clone();
         let rows = RowResidencyRange::new(range.clone(), table, "value").unwrap();
         let mut controller =
             ResidencyController::new_with_row_ranges(|_| source.as_ref(), plan, [], vec![rows])
                 .unwrap();
         assert_eq!(controller.units().len(), 0);
-        let id = range.member_id(13).unwrap();
+        let descriptor = crate::RowLookupDescriptor::new(
+            range.clone(),
+            table_metadata,
+            crate::RowLookupSpec {
+                parameter: eredu_nn::ParameterId::new("table").unwrap(),
+                bank: 4,
+                unit: 7,
+                rows: 8,
+                dimensions: 2,
+                encoding: crate::RowEncoding::Dense,
+                output_type: eredu_nn::TensorElementType::F32,
+            },
+            None,
+            crate::RowLookupLimits {
+                requests: 8,
+                rows_per_acquisition: 2,
+                acquisition_bytes: 16,
+                host_bytes: 4096,
+                output_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let entries = [(crate::ParameterBankKey::new(4, 7, 3), 2)];
+        let demand = descriptor.plan_demand(&entries).unwrap();
+        let id = demand.requests()[0].0.clone();
+        assert_eq!(id, range.member_id(13).unwrap());
         let invalid = OffloadUnitId::new("rows.999").unwrap();
         assert!(controller.prepare_units(&[id.clone(), invalid]).is_err());
         assert_eq!(

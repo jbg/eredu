@@ -11191,8 +11191,17 @@ incompatible bindings and inadequate budgets produce typed errors before constru
 
 `MlxRowLookups::bind` consumes the selected parameter pool and retained row declarations.
 It validates decoder availability, scratch, scalar budget and exact source ownership
-before materializing companions. Binding reads no table rows. Native `MlxRowBank` supports
-dense, shared-scalar E4M3 and GGML block rows; shared scalar FP8 uses its declared parameter
+before materializing companions. Binding reads no table rows.
+
+`RowLookupDescriptor::plan_demand` validates exact bank/unit/row ownership, nonzero
+use counts and unique members, then projects logical rows through the retained
+residency namespace offset. `RowBankDemand` preserves caller order and exact use
+counts for both source acquisitions and returned logical identities. Descriptor
+member extents and demand projections require no payload reads or row catalog
+expansion. Native row banks retain this descriptor for addressing and specification
+agreement; native decoder workspace admission and completion remain backend-owned.
+
+Native `MlxRowBank` supports dense, shared-scalar E4M3 and GGML block rows; shared scalar FP8 uses its declared parameter
 identity rather than expert block-scale equations. Lookup retains exact host integer IDs,
 chunks native acquisitions and keeps source/residency leases through completion.
 

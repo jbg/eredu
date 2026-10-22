@@ -564,11 +564,11 @@ pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};
 pub mod row_lookup;
 pub use row_lookup::{
     BoundedRowLookup, NoRowLookups, PreparedRowLookup, PreparedRowLookups, PreparedRowScale,
-    RowEncoding, RowLookupBank, RowLookupDescriptor, RowLookupDescriptors, RowLookupError,
-    RowLookupLimits, RowLookupMechanismSupport, RowLookupProvider, RowLookupProviders,
-    RowLookupRequirements, RowLookupSelectionError, RowLookupSpec, RowLookupWorkspace,
-    RowScaleDescriptor, RowScaleSource, SelectedRowLookupPlans, SelectedRowLookupRequirements,
-    SelectedRowLookups, TensorParallelRowLookup,
+    RowBankDemand, RowEncoding, RowLookupBank, RowLookupDescriptor, RowLookupDescriptors,
+    RowLookupError, RowLookupLimits, RowLookupMechanismSupport, RowLookupProvider,
+    RowLookupProviders, RowLookupRequirements, RowLookupSelectionError, RowLookupSpec,
+    RowLookupWorkspace, RowScaleDescriptor, RowScaleSource, SelectedRowLookupPlans,
+    SelectedRowLookupRequirements, SelectedRowLookups, TensorParallelRowLookup,
 };
 
 mod parameter_providers;
