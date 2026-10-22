@@ -7,8 +7,8 @@ use crate::{
     ParameterStorageId, RecipeBindingError, WeightBinding, WeightBindingPlan,
 };
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeAlias, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
+    store::{CheckpointSource, RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -49,6 +49,20 @@ pub enum ComponentPreparationError {
         /// Canonical parameter target.
         target: String,
     },
+    /// A family-selected output dtype cannot be reached through its allowed casts.
+    #[error(
+        "component {component:?} parameter {target:?} produces {actual:?}, expected {expected:?}"
+    )]
+    Dtype {
+        /// Component identity.
+        component: String,
+        /// Canonical parameter target.
+        target: String,
+        /// Inferred recipe output before conversion.
+        actual: RecipeDtype,
+        /// Family-selected execution representation.
+        expected: RecipeDtype,
+    },
     /// The caller requests unit-only parts for a component with pinned parameters.
     #[error("component {0:?} has pinned resources")]
     PinnedResources(String),
@@ -74,16 +88,60 @@ impl From<ComponentPreparationError> for eredu_nn::Error {
     }
 }
 
+/// Family-selected output dtype and explicitly admitted source conversions.
+/// The target representation is retained without adding a redundant cast.
+#[derive(Debug, Clone)]
+pub struct ComponentRecipeConversion {
+    /// Required output of initial recipe normalization.
+    pub dtype: RecipeDtype,
+    /// Other admitted recipe output dtypes that may be cast to the target.
+    pub from: &'static [RecipeDtype],
+}
+impl ComponentRecipeConversion {
+    fn apply(
+        self,
+        recipe: DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+        component: &str,
+        target: &str,
+    ) -> Result<DerivedWeightRecipe, ComponentPreparationError> {
+        let actual = recipe.infer(source)?.dtype;
+        if actual == self.dtype {
+            return Ok(recipe);
+        }
+        if !self.from.contains(&actual) {
+            return Err(ComponentPreparationError::Dtype {
+                component: component.into(),
+                target: target.into(),
+                actual,
+                expected: self.dtype,
+            });
+        }
+        Ok(DerivedWeightRecipe::Cast {
+            input: Box::new(recipe),
+            dtype: self.dtype,
+        })
+    }
+}
+
 /// Family-resolved physical recipe or logical alias within a leased resource.
 pub enum ComponentRecipe {
-    /// One canonical materialization.
-    Physical(DerivedWeightRecipe),
+    /// One canonical materialization with an optional family-selected conversion.
+    Physical {
+        /// Admitted source recipe before execution conversion.
+        recipe: DerivedWeightRecipe,
+        /// Exact output requirement and allowed casts, when selected by the family.
+        conversion: Option<ComponentRecipeConversion>,
+    },
     /// A logical parameter shares the named canonical target's materialization.
     Alias(String),
 }
 impl From<DerivedWeightRecipe> for ComponentRecipe {
     fn from(recipe: DerivedWeightRecipe) -> Self {
-        Self::Physical(recipe)
+        Self::Physical {
+            recipe,
+            conversion: None,
+        }
     }
 }
 
@@ -123,7 +181,13 @@ impl PreparedComponent {
             let owner = ParameterStorageId(owned.owner().clone());
             for member in owned.members() {
                 match resolve(member)?.into() {
-                    ComponentRecipe::Physical(recipe) => {
+                    ComponentRecipe::Physical { recipe, conversion } => {
+                        let recipe = match conversion {
+                            Some(conversion) => {
+                                conversion.apply(recipe, source.as_ref(), &id, member.target())?
+                            }
+                            None => recipe,
+                        };
                         recipes
                             .entry(owner.clone())
                             .or_default()

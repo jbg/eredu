@@ -3,12 +3,12 @@
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{RecipeDtype, RecipeError},
+    recipe::RecipeDtype,
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
-    PreparedComponent, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
+    ExecutionUnitLayout, LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use crate::{ear_decoder::DecoderConfig, ear_decoder_layered::decoder_parameter_description};
@@ -28,9 +28,6 @@ pub enum DecoderPreparationError {
     /// Source restriction failed.
     #[error(transparent)]
     Source(#[from] StoreError),
-    /// A recipe disagrees with its exact source metadata.
-    #[error(transparent)]
-    Recipe(#[from] RecipeError),
     /// Exact recipe binding cannot be represented.
     #[error(transparent)]
     Binding(#[from] RecipeBindingError),
@@ -40,9 +37,6 @@ pub enum DecoderPreparationError {
     /// Tensor topology or retained placement is inconsistent.
     #[error("invalid EAR decoder tensor partition: {0}")]
     Parallel(String),
-    /// An admitted parameter disagrees with architecture or recipe geometry.
-    #[error("EAR decoder parameter {0} has inconsistent geometry")]
-    Geometry(String),
 }
 
 /// Cold bindings for each upsampling, ConvNeXt and output-projection unit.
@@ -71,27 +65,20 @@ impl PreparedDecoderBindings {
         let prepared = PreparedComponent::prepare(
             "ear/decoder/leased-units",
             description,
-            source.clone(),
+            source,
             |member| {
                 let name = member.target();
-                let mut recipe = parameters
+                let recipe = parameters
                     .get(name)
                     .cloned()
                     .ok_or_else(|| DecoderPreparationError::MissingParameter(name.into()))?;
-                let metadata = recipe.infer(source.as_ref())?;
-                if metadata.shape != member.global_shape() {
-                    return Err(DecoderPreparationError::Geometry(name.into()));
-                }
-                if matches!(metadata.dtype, RecipeDtype::F16 | RecipeDtype::BF16) {
-                    recipe = eredu_checkpoint::recipe::DerivedWeightRecipe::Cast {
-                        input: Box::new(recipe),
+                Ok::<_, DecoderPreparationError>(ComponentRecipe::Physical {
+                    recipe,
+                    conversion: Some(ComponentRecipeConversion {
                         dtype: RecipeDtype::F32,
-                    };
-                }
-                if recipe.infer(source.as_ref())?.dtype != RecipeDtype::F32 {
-                    return Err(DecoderPreparationError::Geometry(name.into()));
-                }
-                Ok::<_, DecoderPreparationError>(recipe)
+                        from: &[RecipeDtype::F16, RecipeDtype::BF16],
+                    }),
+                })
             },
         )?;
         Ok(Self {

@@ -42,7 +42,9 @@ pub use component_partition::{
 };
 /// Exact cold component preparation and consuming placement.
 pub mod prepared_component;
-pub use prepared_component::{ComponentPreparationError, ComponentRecipe, PreparedComponent};
+pub use prepared_component::{
+    ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion, PreparedComponent,
+};
 mod component_pipeline;
 /// Mechanism-only selection contracts for composite model input.
 pub mod composite;

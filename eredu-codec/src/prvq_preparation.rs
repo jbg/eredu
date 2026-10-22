@@ -3,12 +3,12 @@
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{RecipeDtype, RecipeError},
+    recipe::RecipeDtype,
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
-    PreparedComponent, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
+    ExecutionUnitLayout, LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use crate::{prvq::Geometry, prvq_layered::quantizer_parameter_description};
@@ -35,9 +35,6 @@ pub enum QuantizerPreparationError {
     /// Source restriction failed.
     #[error(transparent)]
     Source(#[from] StoreError),
-    /// A recipe disagrees with its exact source metadata.
-    #[error(transparent)]
-    Recipe(#[from] RecipeError),
     /// Exact recipe binding cannot be represented.
     #[error(transparent)]
     Binding(#[from] RecipeBindingError),
@@ -47,9 +44,6 @@ pub enum QuantizerPreparationError {
     /// Tensor topology or retained placement is inconsistent.
     #[error("invalid PRVQ tensor partition: {0}")]
     Parallel(String),
-    /// An admitted parameter disagrees with architecture or recipe geometry.
-    #[error("PRVQ parameter {0} has inconsistent geometry")]
-    Geometry(String),
 }
 
 /// Cold bindings for each canonical codebook mean table and retained variance.
@@ -78,27 +72,20 @@ impl PreparedQuantizerBindings {
         let prepared = PreparedComponent::prepare(
             "prvq/codebooks/leased-units",
             description,
-            source.clone(),
+            source,
             |member| {
                 let name = member.target();
-                let mut recipe = parameters
+                let recipe = parameters
                     .get(name)
                     .cloned()
                     .ok_or_else(|| QuantizerPreparationError::MissingParameter(name.into()))?;
-                let metadata = recipe.infer(source.as_ref())?;
-                if metadata.shape != member.global_shape() {
-                    return Err(QuantizerPreparationError::Geometry(name.into()));
-                }
-                if matches!(metadata.dtype, RecipeDtype::F16 | RecipeDtype::BF16) {
-                    recipe = eredu_checkpoint::recipe::DerivedWeightRecipe::Cast {
-                        input: Box::new(recipe),
+                Ok::<_, QuantizerPreparationError>(ComponentRecipe::Physical {
+                    recipe,
+                    conversion: Some(ComponentRecipeConversion {
                         dtype: RecipeDtype::F32,
-                    };
-                }
-                if recipe.infer(source.as_ref())?.dtype != RecipeDtype::F32 {
-                    return Err(QuantizerPreparationError::Geometry(name.into()));
-                }
-                Ok::<_, QuantizerPreparationError>(recipe)
+                        from: &[RecipeDtype::F16, RecipeDtype::BF16],
+                    }),
+                })
             },
         )?;
         Ok(Self {

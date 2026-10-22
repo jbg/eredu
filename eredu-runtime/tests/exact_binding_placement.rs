@@ -871,7 +871,9 @@ mod component_preparation {
     #[test]
     fn shared_component_storage_keeps_aliases_coherent_through_placement_and_precision() {
         use eredu_checkpoint::recipe::RecipeDtype;
-        use eredu_runtime::{ComponentRecipe, RecipeBindingError, WeightBindingPlan};
+        use eredu_runtime::{
+            ComponentRecipe, ComponentRecipeConversion, RecipeBindingError, WeightBindingPlan,
+        };
         let graph =
             ExecutionGraph::new(vec![ExecutionGroupSpec::root("shared")], "shared").unwrap();
         let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
@@ -897,23 +899,33 @@ mod component_preparation {
         let source: SharedCheckpointSource = Arc::new(
             MemoryWeightStore::from_safetensors([(
                 "physical".into(),
-                safetensors::Dtype::F32,
+                safetensors::Dtype::BF16,
                 vec![4, 2],
-                vec![0; 32],
+                vec![0; 16],
             )])
             .unwrap(),
         );
         let prepared = PreparedComponent::prepare("shared", description, source, |member| {
             Ok::<_, ComponentPreparationError>(if member.target() == "owner" {
-                ComponentRecipe::Physical(DerivedWeightRecipe::source(
-                    "physical",
-                    TensorSelection::Full,
-                ))
+                ComponentRecipe::Physical {
+                    recipe: DerivedWeightRecipe::source("physical", TensorSelection::Full),
+                    conversion: Some(ComponentRecipeConversion {
+                        dtype: RecipeDtype::F32,
+                        from: &[RecipeDtype::F16, RecipeDtype::BF16],
+                    }),
+                }
             } else {
                 ComponentRecipe::Alias("owner".into())
             })
         })
         .unwrap();
+        let plan = WeightBindingPlan::new(&prepared.unit_bindings()[0]).unwrap();
+        assert_eq!(
+            plan.owners()
+                .map(|binding| binding.expected_bytes())
+                .sum::<u64>(),
+            32
+        );
         let topology = eredu_core::ParallelRankTopology::new(
             eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
             0,

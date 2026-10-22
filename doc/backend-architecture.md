@@ -815,7 +815,14 @@ projection ingress captures the raw encoder result alongside its projected outpu
 
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
-source authority to the recipes' physical inputs. Consuming placement selection
+source authority to the recipes' physical inputs. Physical `ComponentRecipe`
+declarations may include a `ComponentRecipeConversion`: the family selects the
+required output dtype and exact source dtypes admitted for casting. Runtime keeps
+recipes already producing that dtype unchanged, applies an explicitly allowed cast
+once, and rejects other representations with a typed component/parameter error.
+EAR encoder, decoder, PRVQ and RNNT declare their F32 execution requirement and
+allow F16/BF16 conversion through this contract. Ordinary recipe inference supplies
+the conversion workspace and binding-byte bounds. Consuming placement selection
 retains the exact local layout; identical reselection validates it without
 transforming recipes again, and incompatible selection fails. Recipe policy
 transforms preserve targets, shapes and source authority. Identity-based

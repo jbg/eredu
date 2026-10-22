@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
-    PreparedComponent, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
+    ExecutionUnitLayout, LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use super::{
@@ -123,27 +123,20 @@ impl PreparedRnntBindings {
         let prepared = PreparedComponent::prepare(
             "voicechat/rnnt/leased-units",
             description,
-            source.clone(),
+            source,
             |member| {
                 let name = member.target();
-                let mut recipe = parameters
+                let recipe = parameters
                     .get(name)
                     .cloned()
                     .ok_or_else(|| RnntPreparationError::MissingParameter(name.into()))?;
-                let metadata = recipe.infer(source.as_ref())?;
-                if metadata.shape != member.global_shape() {
-                    return Err(RnntPreparationError::Geometry(name.into()));
-                }
-                if matches!(metadata.dtype, RecipeDtype::F16 | RecipeDtype::BF16) {
-                    recipe = DerivedWeightRecipe::Cast {
-                        input: Box::new(recipe),
+                Ok::<_, RnntPreparationError>(ComponentRecipe::Physical {
+                    recipe,
+                    conversion: Some(ComponentRecipeConversion {
                         dtype: RecipeDtype::F32,
-                    };
-                }
-                if recipe.infer(source.as_ref())?.dtype != RecipeDtype::F32 {
-                    return Err(RnntPreparationError::Geometry(name.into()));
-                }
-                Ok::<_, RnntPreparationError>(recipe)
+                        from: &[RecipeDtype::F16, RecipeDtype::BF16],
+                    }),
+                })
             },
         )?;
         Ok(Self {
