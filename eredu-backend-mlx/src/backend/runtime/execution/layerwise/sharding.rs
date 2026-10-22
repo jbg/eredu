@@ -12,20 +12,6 @@ pub fn shard_layer_bindings(
         .map_err(|error| Error::Parallel(error.to_string()))
 }
 
-/// Applies only the primary physical placement to already member-selected bindings.
-///
-/// Independently addressable catalogs have already selected their expert member
-/// axis. Their remaining primary placement is the ordinary tensor-parallel
-/// projection selected by the architecture layout.
-pub fn shard_addressable_member_bindings(
-    bindings: Vec<WeightBinding>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layout: &eredu_runtime::LocalModelLayout,
-) -> Result<Vec<WeightBinding>, Error> {
-    eredu_runtime::place_addressable_member_bindings(bindings, store, layout)
-        .map_err(|error| Error::Parallel(error.to_string()))
-}
-
 #[cfg(test)]
 mod shard_layer_bindings_tests {
     use super::*;

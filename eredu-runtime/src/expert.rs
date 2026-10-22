@@ -9,6 +9,7 @@ use crate::ExpertPass;
 
 mod agreement;
 mod banks;
+mod placement;
 mod route_intervention;
 mod units;
 use crate::{
@@ -20,6 +21,7 @@ pub use agreement::{
     AgreeingAddressableExpertProvider, AgreeingParameterProvider, ProviderAgreementRejected,
 };
 pub use banks::{RoutedBankProviderError, RoutedBankProviders};
+pub use placement::{place_addressable_bank_members, AddressableBankPlacementError};
 pub use route_intervention::{select_routes_with_observer, select_routes_with_provider};
 pub use units::{
     with_exchanged_unit_observer, with_partition_unit_observer, with_provider_unit_observer,

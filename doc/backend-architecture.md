@@ -3435,6 +3435,14 @@ output declarations remain authoritative, and failed preparation is not cached.
 Sharing task metadata does not combine physical storage, parameter charges,
 leases or mutable state across independently addressed bank members.
 
+`place_addressable_bank_members` owns cold rank-local member projection. It applies
+the retained non-member placements through the shared binding mechanism, infers
+local recipe metadata and recomputes selected executable bytes. Global bank keys,
+parameter task roots, companion bindings and rank ownership remain attached to
+each independent member. The backend consumes these projected records and
+preserves typed projection causes through its ordinary error boundary; it does
+not reconstruct local parameter geometry.
+
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
 streams, indexed tensor operations, generic addressable member storage,

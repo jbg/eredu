@@ -666,6 +666,75 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
         [2, 4, 2]
     );
     assert_eq!(bindings[0].expected_bytes(), 64);
+    // Independently selected members consume their bank axis before the same
+    // tensor placement, retaining separate payload charges and global identity.
+    let bank_tasks = [owned_task(
+        "weight",
+        ReplicatedTextParameterOwner::ExecutionUnit {
+            group: "decoder".into(),
+            unit: 7,
+        },
+        &[4, 8, 2],
+        WeightLoweringKind::Direct,
+        LinearFormat::Dense,
+    )];
+    let index = eredu_runtime::MaterializationTaskIndex::new(&bank_tasks).unwrap();
+    let mut cache = eredu_runtime::AddressableBankTaskCache::new(&index);
+    let shared = cache
+        .resolve::<Box<dyn std::error::Error>>("weight", &[1, 8, 2], None, |_, _| {
+            panic!("direct task has no generated outputs")
+        })
+        .unwrap();
+    let members = [2, 3].map(|member| {
+        let recipe = eredu_checkpoint::recipe::DerivedWeightRecipe::source(
+            "checkpoint.weight",
+            TensorSelection::Range {
+                axis: 0,
+                start: member,
+                end: member + 1,
+            },
+        );
+        let metadata = recipe.infer(&source as &dyn CheckpointSource).unwrap();
+        let parameter = eredu_runtime::AddressableBankParameter::from_shared_task(
+            "weight",
+            shared.clone(),
+            recipe,
+            metadata.clone(),
+            metadata.byte_len(),
+            None,
+        )
+        .unwrap();
+        eredu_runtime::AddressableBankMember::new(
+            eredu_runtime::ParameterBankKey::new(1, 7, member),
+            eredu_runtime::AddressableBankMemberPlacement::new(
+                eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
+                7,
+                "decoder.7",
+                eredu_runtime::AddressableBankDistribution::ExpertParallel,
+            )
+            .unwrap()
+            .with_owner_rank(11),
+            [parameter],
+        )
+        .unwrap()
+    });
+    let local = eredu_runtime::place_addressable_bank_members(
+        &members,
+        &source as &dyn CheckpointSource,
+        &layout,
+    )
+    .unwrap();
+    assert_eq!(local.iter().map(|m| m.selected_bytes()).sum::<u64>(), 64);
+    assert_eq!(local.iter().map(|m| m.source_bytes()).sum::<u64>(), 64);
+    for (global, local) in members.iter().zip(&local) {
+        assert_eq!(local.key(), global.key());
+        assert_eq!(local.placement(), global.placement());
+        assert_eq!(local.parameters()[0].source_output().shape(), [1, 4, 2]);
+        assert!(std::ptr::eq(
+            local.parameters()[0].task(),
+            global.parameters()[0].task()
+        ));
+    }
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
 }
 

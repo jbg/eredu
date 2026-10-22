@@ -140,62 +140,6 @@ pub(super) fn selected_parameter_providers(
     Ok((grouped, row_provider))
 }
 
-pub(super) fn shard_addressable_members(
-    members: &[eredu_runtime::AddressableBankMember],
-    store: &dyn CheckpointSource,
-    layout: &eredu_runtime::LocalModelLayout,
-) -> Result<Vec<eredu_runtime::AddressableBankMember>, Error> {
-    members
-        .iter()
-        .map(|member| {
-            let source_bindings = member
-                .parameters()
-                .iter()
-                .map(|parameter| {
-                    eredu_runtime::WeightBinding::from_recipe(
-                        parameter.binding_name(),
-                        parameter.recipe().clone(),
-                        parameter.source_bytes(),
-                    )?
-                    .with_logical_target(parameter.task().name())
-                    .map_err(Into::into)
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            let bindings = shard_addressable_member_bindings(source_bindings, store, layout)?;
-            let parameters = member
-                .parameters()
-                .iter()
-                .zip(bindings)
-                .map(|(parameter, binding)| {
-                    let recipe = binding.source_recipe();
-                    let metadata = recipe.infer(store)?;
-                    let selected_bytes = eredu_runtime::selected_addressable_parameter_bytes(
-                        parameter.task(),
-                        &metadata,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    let companions = parameter.quantization_companions().cloned();
-                    eredu_runtime::AddressableBankParameter::from_shared_task(
-                        parameter.binding_name(),
-                        parameter.shared_task().clone(),
-                        recipe,
-                        metadata,
-                        selected_bytes,
-                        companions,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            eredu_runtime::AddressableBankMember::new(
-                member.key(),
-                member.placement().clone(),
-                parameters,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn selected_addressable_partition_bank(
     members: &[eredu_runtime::AddressableBankMember],
@@ -212,7 +156,7 @@ pub(super) fn selected_addressable_partition_bank(
     ),
     Error,
 > {
-    let members = shard_addressable_members(members, store.as_ref(), layout)?;
+    let members = eredu_runtime::place_addressable_bank_members(members, store.as_ref(), layout)?;
     let empty_rows = eredu_runtime::SelectedRowLookups::select(
         Default::default(),
         options,

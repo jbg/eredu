@@ -55,7 +55,7 @@ pub use quantization::{
     quantize_exact_replicated_text_tasks, quantize_module_store_with_bindings,
 };
 mod sharding;
-pub use sharding::{shard_addressable_member_bindings, shard_layer_bindings};
+pub use sharding::shard_layer_bindings;
 mod validation;
 pub use validation::{
     validate_device_budget, validate_host_budget, validate_unused, LayerwiseModelError,

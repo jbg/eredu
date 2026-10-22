@@ -33,6 +33,9 @@ pub enum Error {
     /// Explicit prepared-input transfer exceeded portable logical limits.
     #[error(transparent)]
     InputTransfer(#[from] eredu_runtime::input_transfer::InputTransferError),
+    /// Portable rank-local addressable parameter projection failed.
+    #[error(transparent)]
+    AddressableBankPlacement(#[from] eredu_runtime::AddressableBankPlacementError),
     /// Portable row lookup admission or specification failure.
     #[error(transparent)]
     RowLookup(#[from] eredu_runtime::RowLookupError),
