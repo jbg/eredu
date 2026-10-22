@@ -20,10 +20,7 @@ use eredu_core::decoding::AttentionInvocation;
 use eredu_nn::{
     DistributedNeuralBackend, Error, Index, Parameterized, ReadOnlyAttentionCache, Tensor,
 };
-use eredu_runtime::{
-    ComponentEquations as _, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    ParallelLayeredArchitecture,
-};
+use eredu_runtime::{ComponentEquations as _, LayerRuntimeState, LayeredForwardState};
 
 /// Pinned roles have distinct first/last pipeline owners.
 #[derive(Clone, Parameterized)]
@@ -603,6 +600,20 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         self.prepare(input, context)
     }
+    fn begin_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        _: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.begin_observed(input, state, context, observer)
+    }
+
     fn begin_group_parallel(
         &mut self,
         group: usize,
@@ -718,6 +729,19 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        input
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        Some(*input)
+    }
+
     type InputPartPlan = InputPartPlan;
     type PrefillRequest = SingleCompositePrefillRequest<B::Tensor, InputPartPlan>;
     type AdmissionConfig = FamilyConfig;
@@ -786,26 +810,7 @@ where
                     .iter()
                     .any(|part| matches!(part, InputPartPlan::Image { native: true, .. })))
     }
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward(input, state, context)
-    }
-    fn begin_composite_forward_observed<'a, O>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.begin_forward_observed(input, state, context, observer)
-    }
+
     fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
         forward.text.is_none()
     }
@@ -1002,28 +1007,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward_parallel(input, state, parallel, context)
-    }
-    fn begin_composite_forward_parallel_observed<'a, O>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.begin_forward_observed(input, state, context, observer)
-    }
 }
 fn native_patch_positions<T: eredu_nn::Tensor>(
     input: PreparedCompositeInput<'_, T, InputPartPlan>,

@@ -3,9 +3,9 @@ use super::*;
 fn finish_routed_composite_session<A, D, F>(
     (stream, finalizer): (&Stream, F),
     session: ReplicatedTextSession<
-        PreparedCompositeArchitecture<A>,
+        A,
         MlxNeuralBackend,
-        MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxReplicatedTextMechanisms<A, MlxHybridState>,
         D,
     >,
     facts: eredu_architectures::prepared_execution::PreparedCompositeSessionFacts<
@@ -18,11 +18,11 @@ where
     A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
         > + MlxParameterBankTelemetry
         + 'static,
     F: super::partitioned::CompositeExecutableFinalizer<A>,
@@ -53,15 +53,15 @@ where
     A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
         > + MlxParameterBankTelemetry
         + 'static,
     P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
@@ -71,20 +71,13 @@ where
         values: &BTreeMap<String, MlxTensor>,
         active: bool,
     ) {
-        super::super::prediction::parameters::publish::<PreparedCompositeArchitecture<A>, P>(
-            &mut self.extension,
-            values,
-            active,
-        );
+        super::super::prediction::parameters::publish::<A, P>(&mut self.extension, values, active);
     }
     fn visit_parameter_slots(
         &mut self,
         visitor: &mut dyn eredu_nn::ParameterSlotVisitor<MlxTensor>,
     ) {
-        super::super::prediction::parameters::visit::<PreparedCompositeArchitecture<A>, P>(
-            &mut self.extension,
-            visitor,
-        );
+        super::super::prediction::parameters::visit::<A, P>(&mut self.extension, visitor);
     }
     fn with_parameter_slots(
         &mut self,
@@ -95,7 +88,7 @@ where
             Error,
         >,
     ) -> Result<bool, Error> {
-        super::super::prediction::parameters::with_slots::<PreparedCompositeArchitecture<A>, P>(
+        super::super::prediction::parameters::with_slots::<A, P>(
             &mut self.extension,
             module,
             operation,
@@ -118,10 +111,10 @@ where
         };
         let mut strategy =
             eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy::<
-                PreparedCompositeArchitecture<A>,
+                A,
                 MlxNeuralBackend,
                 MlxHybridState,
-                MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxReplicatedTextMechanisms<A, MlxHybridState>,
                 D,
                 P,
                 MlxCompositePredictionInput<'_, A>,
@@ -167,7 +160,9 @@ impl
     fn visit<A>(
         self,
         prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
-        extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<MlxNeuralBackend>>::Extension<MlxEmbeddedPredictionMaterializer>,
+        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >>::Extension<MlxEmbeddedPredictionMaterializer>,
         store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -177,19 +172,16 @@ impl
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
-        PreparedCompositeArchitecture<A>:
-            eredu_architectures::prediction_extension::MaterializedPredictionTarget<
-                MlxNeuralBackend,
-            >,
+        A: eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >,
     {
         let mut prediction = SelectedPrediction {
             extension,
             selected: self.selected,
         };
-        let residency = super::super::prediction::parameters::residency::<
-            PreparedCompositeArchitecture<A>,
-            _,
-        >(&mut prediction.extension)?;
+        let residency =
+            super::super::prediction::parameters::residency::<A, _>(&mut prediction.extension)?;
         CompletedComposite::new_with_residency(
             prepared,
             store,
@@ -204,7 +196,9 @@ impl
     fn visit_routed<A>(
         self,
         prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
-        extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<MlxNeuralBackend>>::Extension<MlxEmbeddedPredictionMaterializer>,
+        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >>::Extension<MlxEmbeddedPredictionMaterializer>,
         store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -214,23 +208,22 @@ impl
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
-        PreparedCompositeArchitecture<A>:
-            eredu_architectures::prediction_extension::MaterializedPredictionTarget<
-                MlxNeuralBackend,
-            >,
+        A: eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >,
     {
-        let mut mechanisms = MlxReplicatedTextMechanisms::<
-            PreparedCompositeArchitecture<A>,
-            MlxHybridState,
-        >::new(Arc::clone(&store), self.stream, self.weights_stream);
+        let mut mechanisms = MlxReplicatedTextMechanisms::<A, MlxHybridState>::new(
+            Arc::clone(&store),
+            self.stream,
+            self.weights_stream,
+        );
         let mut prediction = SelectedPrediction {
             extension,
             selected: self.selected,
         };
-        mechanisms.set_prediction_residency(super::super::prediction::parameters::residency::<
-            PreparedCompositeArchitecture<A>,
-            _,
-        >(&mut prediction.extension)?);
+        mechanisms.set_prediction_residency(
+            super::super::prediction::parameters::residency::<A, _>(&mut prediction.extension)?,
+        );
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
         eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
@@ -289,10 +282,7 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
             + 'static,
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
-        W: eredu_architectures::prediction_extension::PreparedRoutedPrediction<
-            MlxNeuralBackend,
-            PreparedCompositeArchitecture<A>,
-        >,
+        W: eredu_architectures::prediction_extension::PreparedRoutedPrediction<MlxNeuralBackend, A>,
     {
         bind_retained_composite_prediction(
             prepared,
@@ -335,10 +325,8 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        let mechanisms: MlxReplicatedTextMechanisms<
-            PreparedCompositeArchitecture<A>,
-            MlxHybridState,
-        > = MlxReplicatedTextMechanisms::new(Arc::clone(&store), self.stream, self.weights_stream);
+        let mechanisms: MlxReplicatedTextMechanisms<A, MlxHybridState> =
+            MlxReplicatedTextMechanisms::new(Arc::clone(&store), self.stream, self.weights_stream);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
         eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
@@ -380,10 +368,7 @@ where
         + 'static,
     A::InputPartPlan: 'static,
     A::StaticModules: Clone,
-    W: eredu_architectures::prediction_extension::PreparedRoutedPrediction<
-        MlxNeuralBackend,
-        PreparedCompositeArchitecture<A>,
-    >,
+    W: eredu_architectures::prediction_extension::PreparedRoutedPrediction<MlxNeuralBackend, A>,
 {
     use crate::composition::mlx::replicated_text::prediction::MlxPredictionMaterializationContext;
     let auxiliary = prediction.banks();
@@ -397,12 +382,13 @@ where
             MlxHybridState::realize(selected, None, 0)
         })
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let mut mechanisms = MlxReplicatedTextMechanisms::<
-        PreparedCompositeArchitecture<A>,
-        MlxHybridState,
-    >::new(target_source, stream, weights_stream);
+    let mut mechanisms = MlxReplicatedTextMechanisms::<A, MlxHybridState>::new(
+        target_source,
+        stream,
+        weights_stream,
+    );
     mechanisms.set_prediction_residency(super::super::super::prediction::parameters::residency::<
-        PreparedCompositeArchitecture<A>,
+        A,
         _,
     >(&mut extension)?);
     let (prepared, processor, admission) = prepared.into_parts();

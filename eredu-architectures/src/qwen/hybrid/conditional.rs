@@ -8,9 +8,9 @@ use eredu_nn::{
     Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    LayeredPartitionInput, LayeredPartitionOutput, ParallelLayeredArchitecture, ParameterProvider,
-    ResidentExpertProvider, RuntimeStateComponents, StateLayout,
+    ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ParameterProvider, ResidentExpertProvider, RuntimeStateComponents,
+    StateLayout,
 };
 
 use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
@@ -190,6 +190,8 @@ where
 
 /// Target media input or one embedded prediction request.
 pub enum ConditionalInput<'a, T> {
+    /// Admitted prepared input using the same target/media equations.
+    Prepared(crate::composite_execution::PreparedCompositeInput<'a, T, QwenInputPartPlan>),
     /// Ordered text/media target input.
     Target {
         /// Ordered semantic segments.
@@ -217,26 +219,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, ProjectedTokenPolicy::Placeholder(0), context)?.with_parts(
-            |parts, pixels| {
-                let input = ConditionalInput::Target {
-                    parts,
-                    pixels,
-                    mask: None,
-                };
-                <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-                    self, input, state, parallel, context,
-                )
-            },
-        )
-    }
 }
 
 impl<B, S> CompositeArchitecture<B, S> for ConditionalLayeredModel<B>
@@ -247,6 +229,26 @@ where
 {
     fn supports_chunked_text_prefill() -> bool {
         super::CHUNKED_TEXT_PREFILL
+    }
+
+    fn prepared_input<'a>(
+        input: crate::composite_execution::PreparedCompositeInput<
+            'a,
+            B::Tensor,
+            Self::InputPartPlan,
+        >,
+    ) -> Self::Input<'a> {
+        ConditionalInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            ConditionalInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
     }
 
     type InputPartPlan = QwenInputPartPlan;
@@ -665,40 +667,6 @@ where
             forward.vision_output = Some(hidden.clone());
         }
         Ok(Some(hidden))
-    }
-
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        <ConditionalKernel<B> as eredu_runtime::ComponentKernel<B>>::prediction_target_capture(
-            forward,
-        )
-    }
-
-    fn prediction_target_placeholder_shape(
-        &self,
-        forward: &Self::ForwardContext,
-    ) -> Result<Option<Vec<i32>>, Self::Error> {
-        eredu_runtime::ComponentKernel::<B>::prediction_target_placeholder_shape(
-            self.kernel(),
-            forward,
-        )
-    }
-
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, ProjectedTokenPolicy::Placeholder(0), context)?.with_parts(
-            |parts, pixels| {
-                let input = ConditionalInput::Target {
-                    parts,
-                    pixels,
-                    mask: None,
-                };
-                <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
-            },
-        )
     }
 }
 
@@ -1589,6 +1557,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
             return Err(Error::backend("conditional Qwen3.5 state layout mismatch"));
         }
         match input {
+            ConditionalInput::Prepared(input) => {
+                self.begin_prepared(input, state, parallel, context)
+            }
             ConditionalInput::Draft {
                 tokens,
                 hidden,
@@ -2883,4 +2854,29 @@ fn hidden_embedding_placeholder<T: Clone>(parts: &[PreparedPart<T>]) -> T {
             PreparedPart::Media { .. } => None,
         })
         .unwrap_or_else(|| hidden_token_placeholder(parts))
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKernel<B> {
+    fn begin_prepared<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, QwenInputPartPlan>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ConditionalForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        prepare_input(input, ProjectedTokenPolicy::Placeholder(0), context)?.with_parts(
+            |parts, pixels| {
+                let input = ConditionalInput::Target {
+                    parts,
+                    pixels,
+                    mask: None,
+                };
+                self.begin_request(input, state, parallel, context)
+            },
+        )
+    }
 }

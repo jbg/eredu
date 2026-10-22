@@ -16,9 +16,8 @@ mod qwen4_exp;
 
 use eredu_nn::{AttentionCache, AuxiliaryConvolutionState, Tensor};
 use eredu_runtime::{
-    derive_partitioned_local_layout, ArchitectureParameters, ArchitecturePartition,
-    LocalModelLayout, PartitionedLayeredArchitecture, ReplicatedTextMaterializationTask,
-    RuntimeStateComponents,
+    derive_partitioned_local_layout, ArchitecturePartition, LocalModelLayout,
+    PartitionedLayeredArchitecture, ReplicatedTextMaterializationTask, RuntimeStateComponents,
 };
 
 use crate::partitioned_execution::{
@@ -1051,15 +1050,8 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
         F: FnOnce(
-            eredu_runtime::PartitionedSessionFactoryInput<
-                crate::composite_execution::PreparedCompositeArchitecture<A>,
-                G,
-                W,
-            >,
-            Option<(
-                Box<crate::composite_execution::PreparedCompositeArchitecture<A>>,
-                LocalModelLayout,
-            )>,
+            eredu_runtime::PartitionedSessionFactoryInput<A, G, W>,
+            Option<(Box<A>, LocalModelLayout)>,
             LocalModelLayout,
             PreparedCompositeExecutorPlan,
             &eredu_runtime::SelectedReplicatedTextRealization,
@@ -1093,8 +1085,7 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
         let (architecture, selected) = prepared.into_parts();
         let topology_rank = selected.topology();
         let (base, partition, communication) = selected.into_parts();
-        let architecture =
-            crate::composite_execution::PreparedCompositeArchitecture::new(architecture);
+        let architecture = architecture;
         let parameters = architecture
             .parameter_description(context)
             .map_err(|error| {
@@ -1110,9 +1101,7 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
         }
         let source_architecture = source_architecture
             .map(|(source, source_layout)| {
-                let source = Box::new(
-                    crate::composite_execution::PreparedCompositeArchitecture::new(*source),
-                );
+                let source = Box::new(*source);
                 let source_parameters = source.parameter_description(context).map_err(|error| {
                     eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
                 })?;
@@ -1190,10 +1179,7 @@ where
             + 'static,
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
-        P: crate::prediction_extension::PreparedRoutedPrediction<
-            B,
-            crate::composite_execution::PreparedCompositeArchitecture<A>,
-        >,
+        P: crate::prediction_extension::PreparedRoutedPrediction<B, A>,
     {
         Err(CompositePartitionPreparationError::Architecture(
             "retained composite partition prediction binding is unavailable".into(),
@@ -1233,7 +1219,9 @@ where
     fn visit<A, G, W>(
         self,
         prepared: PreparedCompositePartition<A, G, W>,
-        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::ParallelCompositeArchitecture<B, S, Error = eredu_nn::Error>
@@ -1241,8 +1229,7 @@ where
             + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
             + 'static,
         A::Error: std::fmt::Display,
-        crate::composite_execution::PreparedCompositeArchitecture<A>:
-            crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A: crate::prediction_extension::MaterializedPredictionTarget<B>,
         W: eredu_runtime::ArchitectureBoundary;
 }
 
@@ -3426,7 +3413,7 @@ where
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
-            let extension = <crate::composite_execution::PreparedCompositeArchitecture<$target> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+            let extension = <$target as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;

@@ -308,49 +308,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let model = self.kernel_mut();
-        if let Some(resumed) = model.resume_prefill(input.decoder_chunk(), state, context)? {
-            return Ok(resumed);
-        }
-        model.validate_partition_state(state)?;
-        let chunk = input.decoder_chunk();
-        let positions = chunk
-            .as_ref()
-            .map(|chunk| i32::try_from(chunk.range.len()).map_err(Error::backend))
-            .transpose()?;
-        let prepared = prepare_composite_ingress::<B>(input, context)?;
-        let decoder_parts = prepared.decoder_parts();
-        if model.parallel_geometry.is_none() {
-            return Err(Error::backend("Muse model has no rank-local geometry"));
-        }
-        let parts = model.prepare_parts_parallel(
-            &decoder_parts,
-            prepared.vision_input().is_some() || prepared.audio_input().is_some(),
-            parallel,
-            context,
-        )?;
-        let mut forward = model.begin_media(
-            prepared.vision_input(),
-            prepared.audio_input(),
-            None,
-            parts,
-            positions,
-            state,
-            context,
-        )?;
-        forward.context.prefill = chunk.map(|chunk| DecoderPrefill {
-            range: chunk.range,
-            assembled: None,
-        });
-        Ok(forward)
-    }
 }
 
 impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
@@ -368,6 +325,22 @@ where
             .prefill
             .as_ref()
             .and_then(|prefill| prefill.assembled.as_ref())
+    }
+
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        crate::composite_execution::CompositeModelInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            crate::composite_execution::CompositeModelInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
     }
 
     type InputPartPlan = MuseInputPartPlan;
@@ -761,41 +734,6 @@ where
             | ExternalPredictionTargetOperation::RawVocabularyProjection(_) => Ok(Some(combined)),
         }
     }
-
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let model = self.kernel_mut();
-        if let Some(resumed) = model.resume_prefill(input.decoder_chunk(), state, context)? {
-            return Ok(resumed);
-        }
-        model.validate_partition_state(state)?;
-        let chunk = input.decoder_chunk();
-        let positions = chunk
-            .as_ref()
-            .map(|chunk| i32::try_from(chunk.range.len()).map_err(Error::backend))
-            .transpose()?;
-        let prepared = prepare_composite_ingress::<B>(input, context)?;
-        let decoder_parts = prepared.decoder_parts();
-        let parts = model.prepare_parts(&decoder_parts, context)?;
-        let mut forward = model.begin_media(
-            prepared.vision_input(),
-            prepared.audio_input(),
-            None,
-            parts,
-            positions,
-            state,
-            context,
-        )?;
-        forward.context.prefill = chunk.map(|chunk| DecoderPrefill {
-            range: chunk.range,
-            assembled: None,
-        });
-        Ok(forward)
-    }
 }
 
 /// Typed decoder input for one pipeline partition.
@@ -1013,7 +951,12 @@ impl<B> eredu_runtime::ComponentKernel<B> for MuseKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-    type Input<'a> = ModelInput<'a, B::Tensor>;
+    type Input<'a> = crate::composite_execution::CompositeModelInput<
+        'a,
+        B::Tensor,
+        MuseInputPartPlan,
+        ModelInput<'a, B::Tensor>,
+    >;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
@@ -1960,17 +1903,14 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.validate_partition_state(state)?;
-        let parts = self.prepare_parts(input.parts, context)?;
-        self.begin_media(
-            input.vision,
-            input.audio,
-            input.mask,
-            parts,
-            None,
-            state,
-            context,
-        )
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_native(input, state, context)
+            }
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared(input, state, context)
+            }
+        }
     }
     fn begin_group(
         &mut self,
@@ -2257,30 +2197,14 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if self.parallel_geometry.is_none() {
-            return Err(Error::backend(
-                "Muse-Glimmer model was not built with rank-local geometry",
-            ));
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_native_parallel(input, state, parallel, context)
+            }
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared_parallel(input, state, parallel, context)
+            }
         }
-        self.validate_partition_state(state)?;
-        // Text lookup reductions belong to the primary decoder wave, after the
-        // replicated vision equations. Other pipeline ranks can then enter the
-        // same exact segmented sums before the decoder's routed collectives.
-        let parts = self.prepare_parts_parallel(
-            input.parts,
-            input.vision.is_some() || input.audio.is_some(),
-            parallel,
-            context,
-        )?;
-        self.begin_media(
-            input.vision,
-            input.audio,
-            input.mask,
-            parts,
-            None,
-            state,
-            context,
-        )
     }
     fn execute_parallel(
         &mut self,
@@ -2482,5 +2406,153 @@ where
             .text
             .decoder_resources_mut()
             .visit(visitor)
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B> {
+    fn begin_prepared<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, MuseInputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let model = self;
+        if let Some(resumed) = model.resume_prefill(input.decoder_chunk(), state, context)? {
+            return Ok(resumed);
+        }
+        model.validate_partition_state(state)?;
+        let chunk = input.decoder_chunk();
+        let positions = chunk
+            .as_ref()
+            .map(|chunk| i32::try_from(chunk.range.len()).map_err(Error::backend))
+            .transpose()?;
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        let parts = model.prepare_parts(&decoder_parts, context)?;
+        let mut forward = model.begin_media(
+            prepared.vision_input(),
+            prepared.audio_input(),
+            None,
+            parts,
+            positions,
+            state,
+            context,
+        )?;
+        forward.context.prefill = chunk.map(|chunk| DecoderPrefill {
+            range: chunk.range,
+            assembled: None,
+        });
+        Ok(forward)
+    }
+    fn begin_prepared_parallel<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, MuseInputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        let model = self;
+        if let Some(resumed) = model.resume_prefill(input.decoder_chunk(), state, context)? {
+            return Ok(resumed);
+        }
+        model.validate_partition_state(state)?;
+        let chunk = input.decoder_chunk();
+        let positions = chunk
+            .as_ref()
+            .map(|chunk| i32::try_from(chunk.range.len()).map_err(Error::backend))
+            .transpose()?;
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        if model.parallel_geometry.is_none() {
+            return Err(Error::backend("Muse model has no rank-local geometry"));
+        }
+        let parts = model.prepare_parts_parallel(
+            &decoder_parts,
+            prepared.vision_input().is_some() || prepared.audio_input().is_some(),
+            parallel,
+            context,
+        )?;
+        let mut forward = model.begin_media(
+            prepared.vision_input(),
+            prepared.audio_input(),
+            None,
+            parts,
+            positions,
+            state,
+            context,
+        )?;
+        forward.context.prefill = chunk.map(|chunk| DecoderPrefill {
+            range: chunk.range,
+            assembled: None,
+        });
+        Ok(forward)
+    }
+    fn begin_native<'a, S>(
+        &mut self,
+        input: ModelInput<'a, B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        self.validate_partition_state(state)?;
+        let parts = self.prepare_parts(input.parts, context)?;
+        self.begin_media(
+            input.vision,
+            input.audio,
+            input.mask,
+            parts,
+            None,
+            state,
+            context,
+        )
+    }
+    fn begin_native_parallel<'a, S>(
+        &mut self,
+        input: ModelInput<'a, B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Muse-Glimmer model was not built with rank-local geometry",
+            ));
+        }
+        self.validate_partition_state(state)?;
+        // Text lookup reductions belong to the primary decoder wave, after the
+        // replicated vision equations. Other pipeline ranks can then enter the
+        // same exact segmented sums before the decoder's routed collectives.
+        let parts = self.prepare_parts_parallel(
+            input.parts,
+            input.vision.is_some() || input.audio.is_some(),
+            parallel,
+            context,
+        )?;
+        self.begin_media(
+            input.vision,
+            input.audio,
+            input.mask,
+            parts,
+            None,
+            state,
+            context,
+        )
     }
 }

@@ -6468,8 +6468,8 @@ pub fn select_composite_text_realization_with_processor(
 
 /// Checked composite architecture passed to a backend-generic session constructor.
 pub struct PreparedCompositeTextArchitecture<A, C> {
-    architecture: crate::composite_execution::PreparedCompositeArchitecture<A>,
-    source_architecture: Option<crate::composite_execution::PreparedCompositeArchitecture<A>>,
+    architecture: A,
+    source_architecture: Option<A>,
     requirements: CompositeTextRequirements,
     contract: eredu_runtime::PreparedReplicatedTextContract,
     processor: eredu_runtime::SelectedProcessorExecution,
@@ -6499,9 +6499,7 @@ impl RoutedCompositeRequirements {
 
 /// Checked composite architecture whose target decoder uses grouped providers.
 pub struct PreparedRoutedCompositeTextArchitecture<A, C> {
-    routed: crate::PreparedRoutedTextArchitecture<
-        crate::composite_execution::PreparedCompositeArchitecture<A>,
-    >,
+    routed: crate::PreparedRoutedTextArchitecture<A>,
     requirements: RoutedCompositeRequirements,
     processor: eredu_runtime::SelectedProcessorExecution,
     admission: C,
@@ -6514,9 +6512,7 @@ impl<A, C> PreparedRoutedCompositeTextArchitecture<A, C> {
     /// The selected authority is supplied explicitly so every bank, row provider,
     /// state and materialization choice must agree before a visitor receives it.
     pub(crate) fn from_routed_declared(
-        routed: crate::PreparedRoutedTextArchitecture<
-            crate::composite_execution::PreparedCompositeArchitecture<A>,
-        >,
+        routed: crate::PreparedRoutedTextArchitecture<A>,
         requirements: crate::RoutedTextRequirements,
         selected: &crate::SelectedRoutedTextRealization,
         processor: eredu_runtime::SelectedProcessorExecution,
@@ -6561,11 +6557,7 @@ impl<A, C> PreparedRoutedCompositeTextArchitecture<A, C> {
     }
 
     /// Selected routed text, state, weight, and bank realization.
-    pub const fn routed(
-        &self,
-    ) -> &crate::PreparedRoutedTextArchitecture<
-        crate::composite_execution::PreparedCompositeArchitecture<A>,
-    > {
+    pub const fn routed(&self) -> &crate::PreparedRoutedTextArchitecture<A> {
         &self.routed
     }
 
@@ -6583,9 +6575,7 @@ impl<A, C> PreparedRoutedCompositeTextArchitecture<A, C> {
     pub fn into_parts(
         self,
     ) -> (
-        crate::PreparedRoutedTextArchitecture<
-            crate::composite_execution::PreparedCompositeArchitecture<A>,
-        >,
+        crate::PreparedRoutedTextArchitecture<A>,
         eredu_runtime::SelectedProcessorExecution,
         C,
     ) {
@@ -6628,8 +6618,8 @@ impl<A, C> PreparedCompositeTextArchitecture<A, C> {
     pub fn into_parts(
         self,
     ) -> (
-        crate::composite_execution::PreparedCompositeArchitecture<A>,
-        Option<crate::composite_execution::PreparedCompositeArchitecture<A>>,
+        A,
+        Option<A>,
         eredu_runtime::PreparedReplicatedTextContract,
         eredu_runtime::SelectedProcessorExecution,
         C,
@@ -6678,10 +6668,7 @@ where
             + 'static,
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
-        W: crate::prediction_extension::PreparedRoutedPrediction<
-            B,
-            crate::composite_execution::PreparedCompositeArchitecture<A>,
-        >,
+        W: crate::prediction_extension::PreparedRoutedPrediction<B, A>,
     {
         Err(crate::prepared_execution::PreparedExecutionError::UnavailablePrediction)
     }
@@ -6747,15 +6734,16 @@ where
             A,
             <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
         >,
-        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
         store: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
             + eredu_runtime::RoutedLayeredArchitecture<B, S>
             + 'static,
-        crate::composite_execution::PreparedCompositeArchitecture<A>:
-            crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A: crate::prediction_extension::MaterializedPredictionTarget<B>,
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
         A::Error: std::fmt::Display;
@@ -6767,15 +6755,16 @@ where
             A,
             <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
         >,
-        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
         store: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
             + eredu_runtime::RoutedLayeredArchitecture<B, S>
             + 'static,
-        crate::composite_execution::PreparedCompositeArchitecture<A>:
-            crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A: crate::prediction_extension::MaterializedPredictionTarget<B>,
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
         A::Error: std::fmt::Display;
@@ -6802,14 +6791,13 @@ where
     A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
         + eredu_runtime::RoutedLayeredArchitecture<B, S>
         + 'static,
-    crate::composite_execution::PreparedCompositeArchitecture<A>:
-        crate::prediction_extension::MaterializedPredictionTarget<B>,
+    A: crate::prediction_extension::MaterializedPredictionTarget<B>,
     A::InputPartPlan: 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
     V: CompositePredictionTargetVisitor<B, S, M>,
 {
-    type Target<A> = crate::composite_execution::PreparedCompositeArchitecture<A>;
+    type Target<A> = A;
     let extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
         B,
     >>::pair_prediction_extension(extension)
@@ -6840,14 +6828,13 @@ where
     A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
         + eredu_runtime::RoutedLayeredArchitecture<B, S>
         + 'static,
-    crate::composite_execution::PreparedCompositeArchitecture<A>:
-        crate::prediction_extension::MaterializedPredictionTarget<B>,
+    A: crate::prediction_extension::MaterializedPredictionTarget<B>,
     A::InputPartPlan: 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
     V: CompositePredictionTargetVisitor<B, S, M>,
 {
-    type Target<A> = crate::composite_execution::PreparedCompositeArchitecture<A>;
+    type Target<A> = A;
     let extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
         B,
     >>::pair_prediction_extension(extension)
@@ -7883,9 +7870,6 @@ where
         return Err("selected composite processor differs from exact requirements".into());
     }
     let admission = architecture.admission_config();
-    let architecture = crate::composite_execution::PreparedCompositeArchitecture::new(architecture);
-    let source_architecture =
-        source_architecture.map(crate::composite_execution::PreparedCompositeArchitecture::new);
     let contract = eredu_runtime::prepare_layered_text_contract::<_, B, S>(
         &architecture,
         source_architecture.as_ref(),
@@ -7945,9 +7929,6 @@ where
         .cloned()
         .ok_or_else(|| "routed composite selection has no grouped-bank requirements".to_owned())?;
     let admission = architecture.admission_config();
-    let architecture = crate::composite_execution::PreparedCompositeArchitecture::new(architecture);
-    let source_architecture =
-        source_architecture.map(crate::composite_execution::PreparedCompositeArchitecture::new);
     let routed = crate::routed_text::prepare_routed_architecture_handoff::<B, S, _>(
         architecture,
         source_architecture,

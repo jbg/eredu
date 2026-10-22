@@ -1,7 +1,5 @@
 //! Shared target-static equation composition inside the existing session transaction.
-use crate::composite_execution::{
-    CompositeArchitecture, ExternalPredictionTargetOperation, PreparedCompositeArchitecture,
-};
+use crate::composite_execution::{CompositeArchitecture, ExternalPredictionTargetOperation};
 use eredu_nn::{Error, NeuralBackend, Tensor};
 use eredu_runtime::{
     PredictionTargetOperation, PredictionTargetTransport, PredictionTensorAssemblyPlan,
@@ -26,8 +24,7 @@ impl<'a, T> PreparedExternalTargetOperation<'a, T> {
         }
     }
 }
-impl<A, B, S> PredictionTargetOperation<PreparedCompositeArchitecture<A>, B, S>
-    for PreparedExternalTargetOperation<'_, B::Tensor>
+impl<A, B, S> PredictionTargetOperation<A, B, S> for PreparedExternalTargetOperation<'_, B::Tensor>
 where
     B: NeuralBackend,
     S: RuntimeState<B>,
@@ -37,14 +34,13 @@ where
     type Output = B::Tensor;
     fn apply(
         self,
-        architecture: &mut PreparedCompositeArchitecture<A>,
+        architecture: &mut A,
         _state: &mut S,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Output, Error> {
         self.assembly?;
         architecture
-            .inner_mut()
             .external_prediction_target_operation(self.operation, parallel, context)?
             .ok_or_else(|| {
                 Error::backend(
@@ -54,7 +50,7 @@ where
     }
     fn apply_with_transport<X: PredictionTargetTransport<B>>(
         self,
-        architecture: &mut PreparedCompositeArchitecture<A>,
+        architecture: &mut A,
         _state: &mut S,
         _parallel: Option<&B::ParallelContext>,
         transport: &mut X,
@@ -80,7 +76,6 @@ where
             .any(|source| source.owner() == transport.rank())
         {
             architecture
-                .inner_mut()
                 .external_prediction_target_contribution(self.operation, None, context)
                 .and_then(|value| {
                     value.ok_or_else(|| {
@@ -93,7 +88,6 @@ where
         };
         let complete = plan.assemble::<B, _>(local, transport, context)?;
         let result = architecture
-            .inner()
             .finish_external_prediction_target_operation(self.operation, complete, context)?
             .ok_or_else(|| {
                 Error::backend("architecture has no selected static finishing equation")

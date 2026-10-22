@@ -50,7 +50,7 @@ where
     F: PartitionTensorAllocator<B>,
     B::ParallelContext: Sized,
 {
-    type Architecture = crate::composite_execution::PreparedCompositeArchitecture<A>;
+    type Architecture = A;
     type Policy = P;
     fn parameter_parts(&mut self) -> Option<(&mut Self::Architecture, &mut P)> {
         Some((&mut self.architecture, &mut self.policy))

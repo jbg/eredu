@@ -26,9 +26,8 @@ use eredu_nn::{
     ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, ModelStateIdentity, ParallelLayeredArchitecture, ParameterProvider,
-    PartitionState, StateLayout,
+    ExpertPass, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ModelStateIdentity, ParameterProvider, PartitionState, StateLayout,
 };
 
 use super::{
@@ -388,19 +387,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, context)?.with_model_input(|input| {
-            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-                self, input, state, parallel, context,
-            )
-        })
-    }
 }
 
 impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
@@ -409,6 +395,22 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        crate::composite_execution::CompositeModelInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            crate::composite_execution::CompositeModelInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
+    }
+
     type InputPartPlan = InklingInputPartPlan;
     type PrefillRequest =
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
@@ -515,33 +517,6 @@ where
         usize::try_from(self.kernel().args.text_config.vocab_size)
             .map(Some)
             .map_err(|_| Error::backend("Inkling physical vocabulary width exceeds usize"))
-    }
-
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        forward.target_hidden()
-    }
-
-    fn prediction_target_placeholder_shape(
-        &self,
-        forward: &Self::ForwardContext,
-    ) -> Result<Option<Vec<i32>>, Self::Error> {
-        Ok(Some(vec![
-            forward.tokens().dim(0),
-            forward.tokens().dim(1),
-            self.kernel().args.text_config.hidden_size,
-        ]))
-    }
-
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let prepared = prepare_input(input, context)?;
-        prepared.with_model_input(|input| {
-            <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
-        })
     }
 }
 
@@ -1763,7 +1738,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
     for InklingKernel<B>
 {
     type Input<'a>
-        = ModelInput<'a, B::Tensor>
+        = crate::composite_execution::CompositeModelInput<
+        'a,
+        B::Tensor,
+        InklingInputPartPlan,
+        ModelInput<'a, B::Tensor>,
+    >
     where
         Self: 'a;
     type Unit = Unit<B>;
@@ -1865,6 +1845,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
             _ => true,
         }
     }
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward.target_hidden()
+    }
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        Ok(Some(vec![
+            forward.tokens().dim(0),
+            forward.tokens().dim(1),
+            self.args.text_config.hidden_size,
+        ]))
+    }
     fn retained_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
@@ -1914,37 +1907,14 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if !self.accepts_execution_state(state.layout())? {
-            return Err(Error::backend("Inkling runtime state layout mismatch"));
-        }
-        let parts = self.prepare_parts(input.parts, context)?;
-        let tokens = ordered_tokens(&parts, context)?;
-        let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
-        let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
-        let has_vision = input.vision_patches.is_some();
-        let hidden = match input.vision_patches {
-            Some(patches) => {
-                if patches.shape().len() != 5 || patches.shape()[1..] != [2, 40, 40, 3] {
-                    return Err(Error::backend("invalid Inkling hMLP patch geometry"));
-                }
-                patches.clone()
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_native(input, state, context)
             }
-            None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
-            None => self.assemble(&parts, None, None, context)?,
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                parts,
-                tokens,
-                audio_input,
-                audio_valid_frames,
-                audio_output: None,
-                vision_output: None,
-                has_vision,
-                target_hidden: None,
-            },
-        })
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared(input, state, context)
+            }
+        }
     }
     fn begin_group(
         &mut self,
@@ -2125,42 +2095,14 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if self.parallel_geometry.is_none() {
-            return Err(Error::backend(
-                "Inkling model was not built with local geometry",
-            ));
-        }
-        if !self.accepts_execution_state(state.layout())? {
-            return Err(Error::backend("Inkling rank-local state layout mismatch"));
-        }
-        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
-        let tokens = ordered_tokens(&parts, context)?;
-        let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
-        let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
-        let has_vision = input.vision_patches.is_some();
-        let hidden = match input.vision_patches {
-            Some(patches) => {
-                if patches.shape().len() != 5 || patches.shape()[1..] != [2, 40, 40, 3] {
-                    return Err(Error::backend("invalid Inkling hMLP patch geometry"));
-                }
-                patches.clone()
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_native_parallel(input, state, parallel, context)
             }
-            None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
-            None => self.assemble(&parts, None, None, context)?,
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                parts,
-                tokens,
-                audio_input,
-                audio_valid_frames,
-                audio_output: None,
-                vision_output: None,
-                has_vision,
-                target_hidden: None,
-            },
-        })
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared_parallel(input, state, parallel, context)
+            }
+        }
     }
     fn execute_parallel(
         &mut self,
@@ -2555,6 +2497,128 @@ where
         Ok(LayeredPartitionOutput::Final {
             output,
             retained: Some(hidden.clone()),
+        })
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel<B> {
+    fn begin_prepared<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, InklingInputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+    {
+        let prepared = prepare_input(input, context)?;
+        prepared.with_model_input(|input| self.begin_native(input, state, context))
+    }
+    fn begin_prepared_parallel<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, InklingInputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        prepare_input(input, context)?
+            .with_model_input(|input| self.begin_native_parallel(input, state, parallel, context))
+    }
+    fn begin_native<'a, S>(
+        &mut self,
+        input: ModelInput<'a, B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+    {
+        if !self.accepts_execution_state(state.layout())? {
+            return Err(Error::backend("Inkling runtime state layout mismatch"));
+        }
+        let parts = self.prepare_parts(input.parts, context)?;
+        let tokens = ordered_tokens(&parts, context)?;
+        let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
+        let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
+        let has_vision = input.vision_patches.is_some();
+        let hidden = match input.vision_patches {
+            Some(patches) => {
+                if patches.shape().len() != 5 || patches.shape()[1..] != [2, 40, 40, 3] {
+                    return Err(Error::backend("invalid Inkling hMLP patch geometry"));
+                }
+                patches.clone()
+            }
+            None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
+            None => self.assemble(&parts, None, None, context)?,
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                parts,
+                tokens,
+                audio_input,
+                audio_valid_frames,
+                audio_output: None,
+                vision_output: None,
+                has_vision,
+                target_hidden: None,
+            },
+        })
+    }
+    fn begin_native_parallel<'a, S>(
+        &mut self,
+        input: ModelInput<'a, B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
+        }
+        if !self.accepts_execution_state(state.layout())? {
+            return Err(Error::backend("Inkling rank-local state layout mismatch"));
+        }
+        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
+        let tokens = ordered_tokens(&parts, context)?;
+        let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
+        let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
+        let has_vision = input.vision_patches.is_some();
+        let hidden = match input.vision_patches {
+            Some(patches) => {
+                if patches.shape().len() != 5 || patches.shape()[1..] != [2, 40, 40, 3] {
+                    return Err(Error::backend("invalid Inkling hMLP patch geometry"));
+                }
+                patches.clone()
+            }
+            None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
+            None => self.assemble(&parts, None, None, context)?,
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                parts,
+                tokens,
+                audio_input,
+                audio_valid_frames,
+                audio_output: None,
+                vision_output: None,
+                has_vision,
+                target_hidden: None,
+            },
         })
     }
 }

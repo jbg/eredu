@@ -4836,11 +4836,19 @@ classes.
 `PreparedModelInput` retains the ordered payload and metadata tensors together
 with its exact descriptor identity. Architecture admission derives one ordered
 part plan from that value, and `PreparedCompositeInput` couples the native
-tensors to that admission before the graph can execute. Architecture-owned
-composite adapters build embeddings, placeholders, masks, positions, optional
-encoder roots, projectors, merge inputs, and per-layer visual contributions,
-then enter the ordinary layered driver. Direct and routed composite execution
-therefore use the same replicated session for prefill, decode, transactions,
+tensors to that admission before the graph can execute. Family kernels accept
+native or admitted prepared input through the same
+`ComponentAdapter`. `CompositeModelInput` and conditional input variants retain
+these typed ingress choices; `prepared_input` and `prepared_view` preserve the
+admission proof and request metadata when prefill or partition transport needs
+the prepared view. The kernels build embeddings, placeholders, masks, positions,
+optional encoder roots, projectors, merge inputs, and per-layer visual
+contributions, then enter the ordinary layered driver. Composite preparation
+adds no forwarding architecture or second ownership view. Chunked prefill,
+prediction, parameter editing and capture use the adapter and its retained
+component definition directly. Qwen4 prefill retains admitted encoder output and
+original request roots across decoder chunks. Direct and routed composite
+execution therefore use the same replicated session for prefill, decode, transactions,
 state reset, cache persistence, observation, reports, and exact completion. An
 admitted composite never falls back to a family pipeline implementation:
 unsupported prediction or artifact forms fail during architecture selection,
@@ -6941,8 +6949,8 @@ Operator seams alone do not establish public partitioned component support.
 The parallel layered contract has an internal-observation unit entry. The
 ordinary parallel residency traversal supplies its shared observer to that entry,
 retains forward resources for completion, and keeps group/unit boundaries in the
-existing traversal hook. Shared full/local decoders and transparent composite
-wrappers forward it, and the direct partition executor consumes that traversal.
+existing traversal hook. Shared full/local decoders and composite kernels use the same adapter entry,
+and the direct partition executor consumes that traversal.
 Parallel layered traversal also invokes architecture-owned observed ingress and
 readout when an observer is present. Shared decoders expose embedding, residual,
 normalization, actual projection input and complete linear logits, with the
@@ -6955,8 +6963,8 @@ propagation and transport support in addition to the operator hooks.
 
 Direct pipeline and composite unit strategies forward the supplied observer
 to the selected architecture's serial or tensor-parallel internal-unit entry.
-Prepared composite adapters also forward observed serial and tensor-parallel
-ingress. Nemotron image ingress exposes the normalized patch embeddings before
+Composite kernel capabilities supply observed serial and tensor-parallel
+ingress through the same adapter. Nemotron image ingress exposes the normalized patch embeddings before
 the first vision layer through this contract.
 The partition executor retains its existing boundary, residency and completion
 sequence. Local shared decoder blocks validate ownership and index local state

@@ -31,10 +31,10 @@ use eredu_runtime::{
     CommunicationCapabilities, CommunicationCompletionPolicy, CommunicationGroupRequirements,
     CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
     CommunicationRouteDescriptor, CommunicationRouteId, CommunicationTensorLimits,
-    PartitionOwnership, PartitionState, PartitionTensorAllocator,
-    PartitionedLayeredArchitecture as _, PipelineActivationDtype, PipelinePartitionArchitecture,
-    PipelinePartitionUnitStrategy, ResolvedBoundaryWireSchema, RoleExactBoundaryContract,
-    RoutedTensorReduction, RoutedTensorReductions, TopologyCommunicationPlan,
+    PartitionOwnership, PartitionState, PartitionTensorAllocator, PipelineActivationDtype,
+    PipelinePartitionArchitecture, PipelinePartitionUnitStrategy, ResolvedBoundaryWireSchema,
+    RoleExactBoundaryContract, RoutedTensorReduction, RoutedTensorReductions,
+    TopologyCommunicationPlan,
 };
 
 /// Architecture-owned multi-group executor for a prepared composite partition.
@@ -624,7 +624,7 @@ where
     F: PartitionTensorAllocator<B>,
     B::ParallelContext: Sized,
 {
-    architecture: crate::composite_execution::PreparedCompositeArchitecture<A>,
+    architecture: A,
     policy: P,
     units: Vec<Vec<(usize, eredu_runtime::ExecutionUnitAddress)>>,
     primary_group: usize,
@@ -804,9 +804,7 @@ where
             ));
         }
         Ok(Self {
-            architecture: crate::composite_execution::PreparedCompositeArchitecture::new(
-                architecture,
-            ),
+            architecture,
             policy,
             units: prepared.units,
             primary_group: prepared.primary_group,
@@ -871,9 +869,7 @@ where
             .state()
             .map_or(0, eredu_runtime::PartitionState::global_layer_offset);
         Ok(Self {
-            architecture: crate::composite_execution::PreparedCompositeArchitecture::new(
-                architecture,
-            ),
+            architecture,
             policy,
             units,
             primary_group,
@@ -988,15 +984,8 @@ fn validate_composite_invocation_schema(
     Ok(())
 }
 
-impl<A, B, S, P, F, U, G, R, I>
-    eredu_runtime::PartitionedGroupExecutor<
-        crate::composite_execution::PreparedCompositeArchitecture<A>,
-        B,
-        S,
-        G,
-        R,
-        I,
-    > for CompositePartitionExecutor<A, B, S, P, F, U>
+impl<A, B, S, P, F, U, G, R, I> eredu_runtime::PartitionedGroupExecutor<A, B, S, G, R, I>
+    for CompositePartitionExecutor<A, B, S, P, F, U>
 where
     B: eredu_runtime::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
@@ -1020,7 +1009,7 @@ where
     B::ParallelContext: Sized,
 {
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let architecture = self.architecture.inner();
+        let architecture = &self.architecture;
         let tensor_parallel = self.parallel.is_some();
         let hooks = architecture.partition_observation_hooks(tensor_parallel);
         hooks
@@ -1040,22 +1029,25 @@ where
 
     fn begin<'a>(
         &mut self,
-        input: <crate::composite_execution::PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<B, S>>::Input<'a>,
+        input: <A as eredu_runtime::LayeredArchitecture<B, S>>::Input<'a>,
         _state: &mut S,
         expert_pass: eredu_runtime::ExpertPass,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Pass<'a>, eredu_nn::Error> {
+        let input =
+            <A as crate::composite_execution::CompositeArchitecture<B, S>>::prepared_view(&input)
+                .ok_or_else(|| {
+                eredu_nn::Error::backend("composite partition requires admitted prepared input")
+            })?;
         let group_activity: Vec<bool> = (0..self.units.len())
             .map(|group| {
                 self.architecture
-                    .inner()
                     .should_execute_prepared_group(group, input)
             })
             .collect();
         let group_boundary_sequences = (0..self.units.len())
             .map(|group| {
                 self.architecture
-                    .inner()
                     .prepared_group_boundary_sequence(group, input)
                     .map_err(eredu_nn::Error::backend)
             })
@@ -1066,7 +1058,6 @@ where
                     return Ok(None);
                 }
                 self.architecture
-                    .inner()
                     .prepared_group_continuation_geometry(group, input)
                     .map_err(eredu_nn::Error::backend)
             })
@@ -1100,7 +1091,6 @@ where
             .map(|group| {
                 let waves = self
                     .architecture
-                    .inner()
                     .prepared_group_collective_waves(
                         group,
                         input,
@@ -1120,7 +1110,7 @@ where
                     && tensor_partitions > 1
                     && self.pipeline_stages > 1
                     && eredu_runtime::LayeredArchitecture::group_transport(
-                        self.architecture.inner(),
+                        &self.architecture,
                         group,
                     )
                     .parallel_subgroup
@@ -1147,7 +1137,6 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let primary_ingress_collectives = self
             .architecture
-            .inner()
             .prepared_primary_ingress_collectives(input, tensor_partitions)
             .map_err(eredu_nn::Error::backend)?;
         if primary_ingress_collectives
@@ -1179,7 +1168,6 @@ where
             })?;
         let width = self
             .architecture
-            .inner()
             .prepared_publication_width(input)
             .map_err(eredu_nn::Error::backend)?
             .unwrap_or(self.publication.output_width());
@@ -1437,7 +1425,6 @@ where
             wave,
             pass.forward.as_ref().is_none_or(|forward| {
                 self.architecture
-                    .inner()
                     .primary_ingress_collectives_pending(&forward.context)
             }),
             pass.primary_ingress_collectives.as_deref(),
@@ -1461,11 +1448,6 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
         observer: &mut O,
     ) -> Result<(), eredu_nn::Error> {
-        use eredu_runtime::{
-            LayeredArchitecture as _, ParallelLayeredArchitecture as _,
-            PartitionedLayeredArchitecture as _,
-        };
-
         let group = driver.group_index();
         let selected_units = self.units.get(group).ok_or_else(|| {
             eredu_nn::Error::backend("composite driver referenced an unknown execution group")
@@ -1532,6 +1514,10 @@ where
                     "composite continuation has no prepared input or typed decoder boundary",
                 )
             })?;
+            let input =
+                <A as crate::composite_execution::CompositeArchitecture<B, S>>::prepared_input(
+                    input,
+                );
             let forward = match self.parallel.as_ref() {
                 Some(parallel) => self
                     .architecture
@@ -1572,7 +1558,6 @@ where
                 values.extend(auxiliary);
                 let installed = self
                     .architecture
-                    .inner_mut()
                     .accept_partition_boundary(
                         source_group,
                         destination,
@@ -1590,17 +1575,13 @@ where
             .flatten()
             .map(|hidden| {
                 let hidden = if pass.group_continuation_geometry[group].is_some()
-                    && self
-                        .architecture
-                        .inner()
-                        .prepared_group_continuation_batched(group)
+                    && self.architecture.prepared_group_continuation_batched(group)
                 {
                     hidden.squeeze_axes(&[0], context)?
                 } else {
                     hidden
                 };
                 self.architecture
-                    .inner()
                     .decode_group_continuation(
                         group,
                         hidden,
@@ -1788,7 +1769,7 @@ where
             hidden = self
                 .unit_strategy
                 .forward_unit_observed(
-                    self.architecture.inner_mut(),
+                    &mut self.architecture,
                     address,
                     lease,
                     &hidden,
@@ -1979,7 +1960,6 @@ where
                 && pass.group_continuation_geometry[route.source_group].is_some()
                 && self
                     .architecture
-                    .inner()
                     .prepared_group_continuation_batched(route.source_group)
             {
                 hidden = hidden.expand_dims(0, context)?;
@@ -1987,7 +1967,6 @@ where
             if route.source_group == route.destination_group {
                 hidden = self
                     .architecture
-                    .inner()
                     .encode_group_continuation(route.source_group, hidden, context)
                     .map_err(eredu_nn::Error::backend_source)?;
             }
@@ -1996,7 +1975,6 @@ where
             })?;
             if let Some(values) = self
                 .architecture
-                .inner()
                 .partition_boundary_values(
                     route.source_group,
                     route.destination_group,
@@ -2082,7 +2060,6 @@ where
         };
         let family_schema = self
             .architecture
-            .inner()
             .partition_boundary_schema(
                 route.source_group,
                 route.destination_group,
@@ -2151,7 +2128,6 @@ where
             if let Some(forward) = pass.forward.as_mut() {
                 let installed = self
                     .architecture
-                    .inner_mut()
                     .accept_partition_boundary(
                         route.source_group,
                         route.destination_group,
@@ -2222,6 +2198,10 @@ where
                 let input = pass.input.take().ok_or_else(|| {
                     eredu_nn::Error::backend("inactive composite partition has no invocation input")
                 })?;
+                let input =
+                    <A as crate::composite_execution::CompositeArchitecture<B, S>>::prepared_input(
+                        input,
+                    );
                 match self.parallel.as_ref() {
                     Some(parallel) => {
                         eredu_runtime::ParallelLayeredArchitecture::begin_forward_parallel(
@@ -2264,10 +2244,12 @@ where
 
     fn prediction_target_capture(
         &mut self,
-        forward: &<crate::composite_execution::PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<B, S>>::ForwardContext,
+        forward: &<A as eredu_runtime::LayeredArchitecture<B, S>>::ForwardContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, eredu_nn::Error> {
-        if let Some(capture) = <crate::composite_execution::PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<B, S>>::prediction_target_capture(forward) {
+        if let Some(capture) =
+            <A as eredu_runtime::LayeredArchitecture<B, S>>::prediction_target_capture(forward)
+        {
             return Ok(Some(capture.clone()));
         }
         let address = self.units[self.primary_group]
@@ -2310,11 +2292,7 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<O::Output>, eredu_nn::Error>
     where
-        O: eredu_runtime::PredictionTargetOperation<
-            crate::composite_execution::PreparedCompositeArchitecture<A>,
-            B,
-            S,
-        >,
+        O: eredu_runtime::PredictionTargetOperation<A, B, S>,
         X: eredu_runtime::PredictionTargetTransport<B>,
     {
         operation

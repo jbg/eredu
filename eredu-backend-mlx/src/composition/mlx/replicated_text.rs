@@ -56,7 +56,7 @@ use super::MlxModelInput;
 use crate::composition::mlx::{distributed, prepared_speculative};
 use eredu_architectures::composite_execution::{
     CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
-    ExternalPredictionTargetOperation, PreparedCompositeArchitecture, PreparedCompositeInput,
+    ExternalPredictionTargetOperation, PreparedCompositeInput,
 };
 use eredu_architectures::replicated_text::{
     CompositeTextArchitectureVisitor, PreparedCompositeTextArchitecture,

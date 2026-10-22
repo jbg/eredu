@@ -1,7 +1,7 @@
 //! One prepared request, shared encoder output and ordinary target chunk inputs.
 use super::*;
 use crate::{
-    composite_execution::{PreparedCompositeArchitecture, PreparedCompositeInput},
+    composite_execution::PreparedCompositeInput,
     media_plan::AdmittedCompositeInput,
     qwen4_exp::media::{admission::MediaPrefillChunk, MediaInputError, MediaInputPartPlan},
 };
@@ -85,6 +85,7 @@ impl<T: Tensor> MediaPrefillRequest<T> {
         Ok(range.start as i32..range.end as i32)
     }
 }
+
 impl<B, S> ChunkedPrefillRequest<ConditionalModel<B>, B, S> for MediaPrefillRequest<B::Tensor>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
@@ -105,52 +106,6 @@ where
         operation: impl for<'a> FnOnce(ConditionalInput<'a, B::Tensor>) -> R,
     ) -> Result<R, Error> {
         let range = self.checked_range(range)?;
-        Ok(operation(ConditionalInput::MediaChunk {
-            prepared: &self.prepared,
-            range,
-            projected: continuation.and_then(Option::as_ref),
-        }))
-    }
-    fn request_values(&self) -> Vec<&B::Tensor> {
-        let request = MediaInputPartPlan::request(self.admitted.parts())
-            .expect("prepared request retains its admitted input");
-        request
-            .input()
-            .storage_values()
-            .map(|(_, value)| value)
-            .chain(self.prepared.storage_values().map(|(_, value)| value))
-            .collect()
-    }
-    fn continuation(&self, completed: &ConditionalForward<B::Tensor>) -> Self::Continuation {
-        completed.projected.clone()
-    }
-    fn retained_values<'a>(&self, continuation: &'a Self::Continuation) -> Vec<&'a B::Tensor> {
-        continuation.iter().collect()
-    }
-}
-impl<B, S> ChunkedPrefillRequest<PreparedCompositeArchitecture<ConditionalModel<B>>, B, S>
-    for MediaPrefillRequest<B::Tensor>
-where
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
-{
-    type Continuation = Option<B::Tensor>;
-    fn token_count(&self) -> usize {
-        self.prepared.token_ids().dim(1) as usize
-    }
-    fn maximum_chunk_tokens(&self) -> usize {
-        self.maximum_chunk
-    }
-    fn with_chunk<R>(
-        &self,
-        range: Range<usize>,
-        continuation: Option<&Self::Continuation>,
-        operation: impl for<'a> FnOnce(
-            PreparedCompositeInput<'a, B::Tensor, MediaInputPartPlan<B::Tensor>>,
-        ) -> R,
-    ) -> Result<R, Error> {
-        let range = self.checked_range(range)?;
         let chunk = Arc::new(MediaPrefillChunk {
             prepared: self.prepared.clone(),
             range,
@@ -165,7 +120,9 @@ where
             MediaInputPartPlan::request(admitted.parts()).map_err(Error::backend_source)?;
         let paired =
             PreparedCompositeInput::new(request.input(), &admitted).map_err(Error::backend)?;
-        Ok(operation(paired))
+        Ok(operation(
+            <ConditionalModel<B> as crate::composite_execution::CompositeArchitecture<B, S>>::prepared_input(paired),
+        ))
     }
     fn request_values(&self) -> Vec<&B::Tensor> {
         let request = MediaInputPartPlan::request(self.admitted.parts())

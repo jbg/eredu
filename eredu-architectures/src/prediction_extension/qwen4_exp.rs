@@ -66,29 +66,6 @@ where
     }
 }
 
-impl<A, B> Qwen4PredictionTarget<B> for crate::composite_execution::PreparedCompositeArchitecture<A>
-where
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-    A: Qwen4PredictionTarget<B>,
-{
-    fn prediction_embedding(
-        &mut self,
-        tokens: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut().prediction_embedding(tokens, context)
-    }
-    fn prediction_logits(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut()
-            .prediction_logits(hidden, context, instrumentation)
-    }
-}
-
 /// Typed prediction strategy for the common speculative driver. Vocabulary stays
 /// with the target; providers and module owners are independent of lane snapshots.
 /// Construction of selected owners and public family admission are separate steps.

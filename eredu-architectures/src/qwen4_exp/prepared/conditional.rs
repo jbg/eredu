@@ -377,9 +377,7 @@ impl SelectedConditionalExecution {
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<
         (
-            crate::routed_text::PreparedRoutedTextArchitecture<
-                crate::composite_execution::PreparedCompositeArchitecture<ConditionalModel<B>>,
-            >,
+            crate::routed_text::PreparedRoutedTextArchitecture<ConditionalModel<B>>,
             SharedCheckpointSource,
             crate::qwen4_exp::media::processor::SelectedMediaProcessor,
         ),
@@ -393,10 +391,7 @@ impl SelectedConditionalExecution {
             + eredu_runtime::RuntimeAppendStreams<B>,
     {
         let processor = self.processor.clone();
-        let (prepared, source) = self.prepare_with::<B, S, _>(
-            context,
-            crate::composite_execution::PreparedCompositeArchitecture::new,
-        )?;
+        let (prepared, source) = self.prepare_with::<B, S, _>(context, std::convert::identity)?;
         Ok((prepared, source, processor))
     }
 

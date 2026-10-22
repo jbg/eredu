@@ -25,8 +25,8 @@ use eredu_nn::{
     LinearOperator, NormalizationOperator, PadMode, Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, ParallelLayeredArchitecture, ParameterProvider, StateLayout,
+    ExpertPass, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ParameterProvider, StateLayout,
 };
 
 use super::{
@@ -442,29 +442,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let prepared = prepare_composite_ingress::<B>(input, context)?;
-        let decoder_parts = prepared.decoder_parts();
-        <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-            self,
-            ModelInput {
-                parts: &decoder_parts,
-                vision: prepared.vision_input(),
-                audio: prepared.audio_input(),
-                per_layer_tokens: None,
-                mask: None,
-            },
-            state,
-            parallel,
-            context,
-        )
-    }
 }
 
 impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
@@ -473,6 +450,22 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        crate::composite_execution::CompositeModelInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            crate::composite_execution::CompositeModelInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
+    }
+
     type InputPartPlan = Gemma4InputPartPlan;
     type PrefillRequest =
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
@@ -819,28 +812,6 @@ where
             | ExternalPredictionTargetOperation::RawTokenEmbeddings(_)
             | ExternalPredictionTargetOperation::RawVocabularyProjection(_) => Ok(None),
         }
-    }
-
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let prepared = prepare_composite_ingress::<B>(input, context)?;
-        let decoder_parts = prepared.decoder_parts();
-        <Self as LayeredArchitecture<B, S>>::begin_forward(
-            self,
-            ModelInput {
-                parts: &decoder_parts,
-                vision: prepared.vision_input(),
-                audio: prepared.audio_input(),
-                per_layer_tokens: None,
-                mask: None,
-            },
-            state,
-            context,
-        )
     }
 }
 
@@ -2768,7 +2739,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ComponentKern
     for GemmaKernel<B>
 {
     type Input<'a>
-        = ModelInput<'a, B::Tensor>
+        = crate::composite_execution::CompositeModelInput<
+        'a,
+        B::Tensor,
+        Gemma4InputPartPlan,
+        ModelInput<'a, B::Tensor>,
+    >
     where
         Self: 'a;
     type Unit = Unit<B>;
@@ -3031,57 +3007,14 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.validate_partition_state(state)?;
-        let parts = self.prepare_parts(input.parts, context)?;
-        let (vision_initial, vision_state) = match input.vision {
-            Some(vision) => {
-                let (hidden, state) = self.begin_partition_vision(vision, context)?;
-                (Some(hidden), Some(state))
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_native(input, state, context)
             }
-            None => (None, None),
-        };
-        let (audio_initial, audio_valid) = match input.audio {
-            Some(audio) => {
-                let (hidden, valid) = self.begin_partition_audio(audio, context)?;
-                (Some(hidden), Some(valid))
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared(input, state, context)
             }
-            None => (None, None),
-        };
-        let assembled = self.assemble(&parts, None, None, context);
-        let hidden = vision_initial
-            .as_ref()
-            .or(audio_initial.as_ref())
-            .cloned()
-            .or_else(|| {
-                assembled
-                    .as_ref()
-                    .ok()
-                    .map(|assembled| assembled.embeddings.clone())
-            })
-            .ok_or_else(|| {
-                assembled
-                    .err()
-                    .unwrap_or_else(|| Error::backend("empty Gemma input"))
-            })?;
-        let position_offset = self.partition_position_offset(state)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask: input.mask.cloned(),
-                position_offset,
-                parts,
-                per_layer_token_override: input.per_layer_tokens.cloned(),
-                per_layer_inputs: None,
-                shared: HashMap::new(),
-                shared_pending: false,
-                vision_state,
-                vision_initial,
-                vision_output: None,
-                audio_valid,
-                audio_initial,
-                audio_output: None,
-            },
-        })
+        }
     }
     fn begin_group(
         &mut self,
@@ -3311,60 +3244,14 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.parallel_geometry
-            .as_ref()
-            .ok_or_else(|| Error::backend("Gemma 4 model was not built with local geometry"))?;
-        self.validate_partition_state(state)?;
-        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
-        let (vision_initial, vision_state) = match input.vision {
-            Some(vision) => {
-                let (hidden, state) = self.begin_partition_vision(vision, context)?;
-                (Some(hidden), Some(state))
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_native_parallel(input, state, parallel, context)
             }
-            None => (None, None),
-        };
-        let (audio_initial, audio_valid) = match input.audio {
-            Some(audio) => {
-                let (hidden, valid) = self.begin_partition_audio(audio, context)?;
-                (Some(hidden), Some(valid))
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared_parallel(input, state, parallel, context)
             }
-            None => (None, None),
-        };
-        let assembled = self.assemble(&parts, None, None, context);
-        let hidden = vision_initial
-            .as_ref()
-            .or(audio_initial.as_ref())
-            .cloned()
-            .or_else(|| {
-                assembled
-                    .as_ref()
-                    .ok()
-                    .map(|assembled| assembled.embeddings.clone())
-            })
-            .ok_or_else(|| {
-                assembled
-                    .err()
-                    .unwrap_or_else(|| Error::backend("empty Gemma input"))
-            })?;
-        let position_offset = self.partition_position_offset(state)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask: input.mask.cloned(),
-                position_offset,
-                parts,
-                per_layer_token_override: input.per_layer_tokens.cloned(),
-                per_layer_inputs: None,
-                shared: HashMap::new(),
-                shared_pending: false,
-                vision_state,
-                vision_initial,
-                vision_output: None,
-                audio_valid,
-                audio_initial,
-                audio_output: None,
-            },
-        })
+        }
     }
     fn execute_parallel(
         &mut self,
@@ -3672,5 +3559,188 @@ where
                 selected.native,
             ),
         }
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B> {
+    fn begin_prepared<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Gemma4InputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        self.begin_native(
+            ModelInput {
+                parts: &decoder_parts,
+                vision: prepared.vision_input(),
+                audio: prepared.audio_input(),
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            context,
+        )
+    }
+    fn begin_prepared_parallel<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Gemma4InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        self.begin_native_parallel(
+            ModelInput {
+                parts: &decoder_parts,
+                vision: prepared.vision_input(),
+                audio: prepared.audio_input(),
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            parallel,
+            context,
+        )
+    }
+    fn begin_native<'a, S>(
+        &mut self,
+        input: ModelInput<'a, B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        self.validate_partition_state(state)?;
+        let parts = self.prepare_parts(input.parts, context)?;
+        let (vision_initial, vision_state) = match input.vision {
+            Some(vision) => {
+                let (hidden, state) = self.begin_partition_vision(vision, context)?;
+                (Some(hidden), Some(state))
+            }
+            None => (None, None),
+        };
+        let (audio_initial, audio_valid) = match input.audio {
+            Some(audio) => {
+                let (hidden, valid) = self.begin_partition_audio(audio, context)?;
+                (Some(hidden), Some(valid))
+            }
+            None => (None, None),
+        };
+        let assembled = self.assemble(&parts, None, None, context);
+        let hidden = vision_initial
+            .as_ref()
+            .or(audio_initial.as_ref())
+            .cloned()
+            .or_else(|| {
+                assembled
+                    .as_ref()
+                    .ok()
+                    .map(|assembled| assembled.embeddings.clone())
+            })
+            .ok_or_else(|| {
+                assembled
+                    .err()
+                    .unwrap_or_else(|| Error::backend("empty Gemma input"))
+            })?;
+        let position_offset = self.partition_position_offset(state)?;
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                mask: input.mask.cloned(),
+                position_offset,
+                parts,
+                per_layer_token_override: input.per_layer_tokens.cloned(),
+                per_layer_inputs: None,
+                shared: HashMap::new(),
+                shared_pending: false,
+                vision_state,
+                vision_initial,
+                vision_output: None,
+                audio_valid,
+                audio_initial,
+                audio_output: None,
+            },
+        })
+    }
+    fn begin_native_parallel<'a, S>(
+        &mut self,
+        input: ModelInput<'a, B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        self.parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("Gemma 4 model was not built with local geometry"))?;
+        self.validate_partition_state(state)?;
+        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
+        let (vision_initial, vision_state) = match input.vision {
+            Some(vision) => {
+                let (hidden, state) = self.begin_partition_vision(vision, context)?;
+                (Some(hidden), Some(state))
+            }
+            None => (None, None),
+        };
+        let (audio_initial, audio_valid) = match input.audio {
+            Some(audio) => {
+                let (hidden, valid) = self.begin_partition_audio(audio, context)?;
+                (Some(hidden), Some(valid))
+            }
+            None => (None, None),
+        };
+        let assembled = self.assemble(&parts, None, None, context);
+        let hidden = vision_initial
+            .as_ref()
+            .or(audio_initial.as_ref())
+            .cloned()
+            .or_else(|| {
+                assembled
+                    .as_ref()
+                    .ok()
+                    .map(|assembled| assembled.embeddings.clone())
+            })
+            .ok_or_else(|| {
+                assembled
+                    .err()
+                    .unwrap_or_else(|| Error::backend("empty Gemma input"))
+            })?;
+        let position_offset = self.partition_position_offset(state)?;
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                mask: input.mask.cloned(),
+                position_offset,
+                parts,
+                per_layer_token_override: input.per_layer_tokens.cloned(),
+                per_layer_inputs: None,
+                shared: HashMap::new(),
+                shared_pending: false,
+                vision_state,
+                vision_initial,
+                vision_output: None,
+                audio_valid,
+                audio_initial,
+                audio_output: None,
+            },
+        })
     }
 }

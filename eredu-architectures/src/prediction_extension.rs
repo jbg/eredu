@@ -1938,35 +1938,6 @@ where
     }
 }
 
-impl<B> InklingPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<crate::inkling::LayeredModel<B>>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    fn prediction_step<M>(
-        &mut self,
-        unit: &mut crate::inkling::MtpDepth<B>,
-        shared: Option<&mut crate::inkling::MtpShared<B>>,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        depth: usize,
-        state: &mut M::ModelState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<crate::speculative_execution::EmbeddedPredictionOutput<B::Tensor>, eredu_nn::Error>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        self.inner_mut().prediction_step::<M>(
-            unit, shared, hidden, tokens, depth, state, observer, parallel, context,
-        )
-    }
-}
-
 struct InklingPredictionOperation<'a, 'o, B, M>
 where
     B: BlockwiseAttentionBackend
@@ -2213,36 +2184,6 @@ where
             context,
             instrumentation,
         )
-    }
-}
-
-impl<B> QwenHybridPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<
-        crate::qwen::hybrid::ConditionalLayeredModel<B>,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    fn embed_prediction(
-        &mut self,
-        tokens: &B::Tensor,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut().embed_prediction(tokens, parallel, context)
-    }
-    fn project_prediction(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut()
-            .project_prediction(hidden, parallel, context, instrumentation)
     }
 }
 
@@ -3850,15 +3791,7 @@ sealed_prediction_target!(crate::deepseek::v3::Model<B>);
 sealed_prediction_target!(crate::deepseek::v4::Model<B>);
 sealed_prediction_target!(crate::nemotron_h::PartitionedLayeredModel<B>);
 sealed_prediction_target!(crate::nemotron_h::LayeredModel<B>);
-sealed_prediction_target!(
-    crate::composite_execution::PreparedCompositeArchitecture<crate::inkling::LayeredModel<B>>
-);
 sealed_prediction_target!(crate::inkling::LayeredModel<B>);
-sealed_prediction_target!(
-    crate::composite_execution::PreparedCompositeArchitecture<
-        crate::qwen::hybrid::ConditionalLayeredModel<B>,
-    >
-);
 sealed_prediction_target!(crate::qwen::hybrid::ConditionalLayeredModel<B>);
 sealed_prediction_target!(crate::qwen::hybrid::LayeredModel<B>);
 
@@ -4051,42 +3984,6 @@ where
     }
 }
 
-impl<B> MaterializedPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<crate::inkling::LayeredModel<B>>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedInklingPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::Inkling {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedInklingPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Inkling target",
-            )),
-        }
-    }
-}
-
 impl<B> MaterializedPredictionTarget<B> for crate::inkling::LayeredModel<B>
 where
     B: BlockwiseAttentionBackend
@@ -4117,44 +4014,6 @@ where
             }),
             _ => Err(invalid(
                 "materialized prediction extension does not match the Inkling target",
-            )),
-        }
-    }
-}
-
-impl<B> MaterializedPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<
-        crate::qwen::hybrid::ConditionalLayeredModel<B>,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedQwenHybridPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Qwen-hybrid target",
             )),
         }
     }

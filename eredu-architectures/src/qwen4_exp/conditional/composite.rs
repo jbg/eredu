@@ -12,6 +12,26 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
 {
+    fn prepared_input<'a>(
+        input: crate::composite_execution::PreparedCompositeInput<
+            'a,
+            B::Tensor,
+            Self::InputPartPlan,
+        >,
+    ) -> Self::Input<'a> {
+        ConditionalInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            ConditionalInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
+    }
+
     type InputPartPlan = MediaInputPartPlan<B::Tensor>;
     type AdmissionConfig = MediaAdmissionConfig;
     fn supports_retained_prefill() -> bool {
@@ -330,13 +350,22 @@ where
         }
         Ok(Some(hidden))
     }
-    fn begin_composite_forward<'a>(
+}
+
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
+    pub(super) fn begin_prepared<'a, S>(
         &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        input: PreparedCompositeInput<'a, B::Tensor, MediaInputPartPlan<B::Tensor>>,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let this = self.kernel_mut();
+    ) -> Result<LayeredForwardState<B::Tensor, ConditionalForward<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>
+            + RuntimeStateComponents<B>
+            + eredu_runtime::RuntimeAppendStreams<B>,
+    {
+        let this = self;
         let request =
             MediaInputPartPlan::request(input.admitted().parts()).map_err(Error::backend_source)?;
         request
@@ -382,8 +411,7 @@ where
         {
             // Only the input owner embeds text. The receiving owner restores
             // original IDs and the media-derived rotary delta from its boundary.
-            let input =
-                <Self as ReplicatedTextArchitecture<B, S>>::text_input(prepared.token_ids(), None);
+            let input = <Self as TextComponentKernel<B>>::text_input(prepared.token_ids(), None);
             return this.begin(input, state, context);
         }
         // Ordinary token/projected-text continuation derives rotary positions from
@@ -407,8 +435,5 @@ where
             input.position_delta = None;
             this.begin(ConditionalInput::Target(input), state, context)
         })
-    }
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        <Self as LayeredArchitecture<B, S>>::prediction_target_capture(forward)
     }
 }

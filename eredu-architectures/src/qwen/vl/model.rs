@@ -9,9 +9,8 @@ use eredu_nn::{
     Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, ParallelLayeredArchitecture, ParameterProvider, RuntimeStateComponents,
-    StateLayout,
+    ExpertPass, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ParameterProvider, RuntimeStateComponents, StateLayout,
 };
 
 use crate::decoder::DecoderStaticResources;
@@ -213,19 +212,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, context)?.with_model_input(|input| {
-            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-                self, input, state, parallel, context,
-            )
-        })
-    }
 }
 
 impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
@@ -234,6 +220,22 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        crate::composite_execution::CompositeModelInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            crate::composite_execution::CompositeModelInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
+    }
+
     type InputPartPlan = QwenVlInputPartPlan;
     type PrefillRequest =
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
@@ -619,17 +621,6 @@ where
             forward.vision_output = Some(hidden.clone());
         }
         Ok(Some(hidden))
-    }
-
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, context)?.with_model_input(|input| {
-            <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
-        })
     }
 }
 
@@ -1104,7 +1095,12 @@ pub struct VlKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ComponentKernel<B>
     for VlKernel<B>
 {
-    type Input<'a> = ModelInput<'a, B::Tensor>;
+    type Input<'a> = crate::composite_execution::CompositeModelInput<
+        'a,
+        B::Tensor,
+        QwenVlInputPartPlan,
+        ModelInput<'a, B::Tensor>,
+    >;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
@@ -2639,7 +2635,14 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.begin_request(input, state, None, context)
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_request(input, state, None, context)
+            }
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared(input, state, context)
+            }
+        }
     }
 
     fn begin_group(
@@ -2817,7 +2820,14 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.begin_request(input, state, Some(parallel), context)
+        match input {
+            crate::composite_execution::CompositeModelInput::Native(input) => {
+                self.begin_request(input, state, Some(parallel), context)
+            }
+            crate::composite_execution::CompositeModelInput::Prepared(input) => {
+                self.begin_prepared_parallel(input, state, parallel, context)
+            }
+        }
     }
 
     fn execute_parallel(
@@ -3037,5 +3047,36 @@ where
                 },
             })
         }
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
+    fn begin_prepared<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, QwenVlInputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        prepare_input(input, context)?
+            .with_model_input(|input| self.begin_request(input, state, None, context))
+    }
+    fn begin_prepared_parallel<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, QwenVlInputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        prepare_input(input, context)?
+            .with_model_input(|input| self.begin_request(input, state, Some(parallel), context))
     }
 }

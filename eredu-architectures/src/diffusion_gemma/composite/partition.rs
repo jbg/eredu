@@ -139,15 +139,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Gemma4InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward_parallel(input, state, parallel, context)
-    }
 }
 impl<B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
     pub(super) fn resume<S>(

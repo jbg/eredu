@@ -2,8 +2,6 @@
 mod partition;
 pub use partition::{Boundary, BoundarySchema};
 
-use eredu_runtime::ParallelLayeredArchitecture as _;
-
 use super::{
     model::{ForwardContext as TextForward, TextInput, TextKernel},
     text::TextLayer,
@@ -26,9 +24,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     ArchitectureGroupTransport, ArchitectureParameterDescription, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterProvider,
-    ResidentExpertProvider, StateLayout,
+    ExecutionGroupSpec, ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState,
+    OwnedParameterGroupSpec, ParameterGroupOwner, ParameterProvider, ResidentExpertProvider,
+    StateLayout,
 };
 
 use eredu_runtime::{
@@ -752,6 +750,19 @@ where
     fn supports_chunked_text_prefill() -> bool {
         true
     }
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        input
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        Some(*input)
+    }
+
     type InputPartPlan = Gemma4InputPartPlan;
     type PrefillRequest = SingleCompositePrefillRequest<B::Tensor, Gemma4InputPartPlan>;
     type AdmissionConfig = FamilyConfig;
@@ -795,14 +806,6 @@ where
                     .parts()
                     .iter()
                     .any(|part| matches!(part, Gemma4InputPartPlan::Vision { .. })))
-    }
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Gemma4InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward(input, state, context)
     }
 }
 

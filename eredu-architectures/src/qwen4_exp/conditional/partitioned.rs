@@ -4,9 +4,7 @@ use super::super::{
     target::TargetTensorPartition,
 };
 use super::*;
-use crate::composite_execution::{
-    CompositeArchitecture, ParallelCompositeArchitecture, PreparedCompositeInput,
-};
+use crate::composite_execution::ParallelCompositeArchitecture;
 use eredu_nn::{GroupedGatedProductSpec, TensorParallelGroupedNeuralBackend};
 
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
@@ -175,16 +173,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.kernel().validate_parallel(parallel)?;
-        self.begin_composite_forward(input, state, context)
-    }
 }
 
 impl<B, S> ParallelComponentKernel<B, S> for ConditionalKernel<B>

@@ -261,6 +261,19 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        input
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        Some(*input)
+    }
+
     type InputPartPlan = InputPartPlan;
     type PrefillRequest = SingleCompositePrefillRequest<B::Tensor, InputPartPlan>;
     type AdmissionConfig = FamilyConfig;
@@ -318,26 +331,7 @@ where
                     .iter()
                     .any(|part| matches!(part, InputPartPlan::Image { native: true, .. })))
     }
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward(input, state, context)
-    }
-    fn begin_composite_forward_observed<'a, O>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.begin_forward_observed(input, state, context, observer)
-    }
+
     fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
         self.kernel().statics.text.is_some() && forward.text.is_none()
     }
@@ -540,28 +534,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward_parallel(input, state, parallel, context)
-    }
-    fn begin_composite_forward_parallel_observed<'a, O>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.begin_forward_observed(input, state, context, observer)
-    }
 }
 impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for SelectedCompositeKernel<B>
 where

@@ -4,7 +4,7 @@ type CompositeRequestContinuation<A> = <<A as CompositeArchitecture<
     MlxNeuralBackend,
     MlxHybridState,
 >>::PrefillRequest as eredu_runtime::prefill::ChunkedPrefillRequest<
-    PreparedCompositeArchitecture<A>,
+    A,
     MlxNeuralBackend,
     MlxHybridState,
 >>::Continuation;
@@ -58,11 +58,11 @@ where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-        PreparedCompositeArchitecture<A>,
+        A,
         MlxNeuralBackend,
         MlxHybridState,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
     >,
 {
     fn lend(
@@ -104,11 +104,11 @@ where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-        PreparedCompositeArchitecture<A>,
+        A,
         MlxNeuralBackend,
         MlxHybridState,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
     >,
 {
     fn lend(
@@ -130,17 +130,17 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedComposite<
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-        PreparedCompositeArchitecture<A>,
+        A,
         MlxNeuralBackend,
         MlxHybridState,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
     >,
 {
     pub(super) session: ReplicatedTextSession<
-        PreparedCompositeArchitecture<A>,
+        A,
         MlxNeuralBackend,
-        MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxReplicatedTextMechanisms<A, MlxHybridState>,
         D,
     >,
     pub(super) admission: A::AdmissionConfig,
@@ -316,7 +316,7 @@ where
 
 impl<A>
     eredu_architectures::speculative_execution::ReplicatedPredictionInput<
-        PreparedCompositeArchitecture<A>,
+        A,
         MlxNeuralBackend,
         MlxHybridState,
         Exception,
@@ -333,12 +333,9 @@ where
         maximum_chunk_tokens: usize,
         context: &Stream,
         mut operation: impl for<'a> FnMut(
-            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Input<'a>,
+            <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Input<'a>,
             MlxTensor,
-            Option<&'a eredu_runtime::PreparedInputCacheIdentity>,
+            Option<&eredu_runtime::PreparedInputCacheIdentity>,
         ) -> Result<A::ForwardContext, Exception>,
     ) -> Result<(), Exception> {
         input.with_borrowed(|input| {
@@ -405,10 +402,7 @@ where
         tokens: &MlxTensor,
         _context: &Stream,
         operation: impl for<'a> FnOnce(
-            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Input<'a>,
+            <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Input<'a>,
         ) -> Result<R, Exception>,
     ) -> Result<R, Exception> {
         let part = input::token_ids_part(tokens.as_array()).map_err(Exception::from_source)?;
@@ -418,7 +412,7 @@ where
                 .map_err(Exception::from_source)?;
         let paired =
             PreparedCompositeInput::new(&prepared, &admitted).map_err(Exception::custom)?;
-        operation(paired)
+        operation(A::prepared_input(paired))
     }
 }
 
@@ -467,11 +461,11 @@ where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-        PreparedCompositeArchitecture<A>,
+        A,
         MlxNeuralBackend,
         MlxHybridState,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
     >,
 {
     fn with_native_prediction_target_state<T>(
@@ -479,9 +473,9 @@ where
         cache: &mut MlxPredictionTargetState,
         operation: impl FnOnce(
             &mut ReplicatedTextSession<
-                PreparedCompositeArchitecture<A>,
+                A,
                 MlxNeuralBackend,
-                MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxReplicatedTextMechanisms<A, MlxHybridState>,
                 D,
             >,
         ) -> Result<T, Error>,
@@ -559,7 +553,7 @@ where
     ) -> Result<CompletedComposite<A, D, SelectedPrediction<Q>>, Error>
     where
         Q: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxEmbeddedPredictionMaterializer,
         >,
@@ -569,12 +563,11 @@ where
                 "prediction extension contract is missing executable draft depth".into(),
             ));
         }
-        let materialization =
-            super::super::prediction::parameters::collect::<PreparedCompositeArchitecture<A>, Q>(
-                &mut prediction.extension,
-                &mut self.prepared_parameters,
-                &mut self.parameter_tasks,
-            )?;
+        let materialization = super::super::prediction::parameters::collect::<A, Q>(
+            &mut prediction.extension,
+            &mut self.prepared_parameters,
+            &mut self.parameter_tasks,
+        )?;
         if materialization.transformed_weights > 0 {
             self.session
                 .record_auxiliary_materialization(materialization);
@@ -607,9 +600,9 @@ where
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_session(
         session: ReplicatedTextSession<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
-            MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxReplicatedTextMechanisms<A, MlxHybridState>,
             D,
         >,
         admission: A::AdmissionConfig,
@@ -694,11 +687,11 @@ where
     A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
         > + MlxParameterBankTelemetry
         + 'static,
     P: CompositePredictionCapability<A, D> + 'static,
@@ -767,7 +760,11 @@ where
         let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
-            .prefill_input_final_position_with_identity(paired, identity, stream)
+            .prefill_input_final_position_with_identity(
+                paired.map(A::prepared_input),
+                identity,
+                stream,
+            )
             .map(MlxTensor::into_array)
             .map_err(|error| {
                 Error::after_replicated_model_call(
@@ -1054,7 +1051,7 @@ where
         let output = self.with_native_prediction_target_state(cache, |session| {
             session
                 .sequence_output_with_observer(
-                    paired,
+                    A::prepared_input(paired),
                     eredu_runtime::ExpertPass::Prefill,
                     stream,
                     &mut crate::composition::NeutralActivationObserver::new(observer),
@@ -1109,7 +1106,12 @@ where
         let mut execute = |session: &mut ReplicatedTextSession<_, _, _, _>| {
             let before = session.successful_state_restoration_generation();
             session
-                .sequence_output_with_observer(paired, pass, stream, &mut observer)
+                .sequence_output_with_observer(
+                    A::prepared_input(paired),
+                    pass,
+                    stream,
+                    &mut observer,
+                )
                 .map_err(|error| {
                     Error::after_replicated_model_call(
                         error,
@@ -1717,7 +1719,12 @@ where
         let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
-            .prefill_input_result_with_observer(paired, cache_identity, stream, &mut observer)
+            .prefill_input_result_with_observer(
+                paired.map(A::prepared_input),
+                cache_identity,
+                stream,
+                &mut observer,
+            )
             .map(MlxTensor::into_array)
             .map_err(|error| {
                 Error::after_replicated_model_call(
@@ -1750,7 +1757,7 @@ where
         let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
-            .decode_input_result_with_observer(paired, stream, &mut observer)
+            .decode_input_result_with_observer(paired.map(A::prepared_input), stream, &mut observer)
             .map(MlxTensor::into_array)
             .map_err(|error| {
                 Error::after_replicated_model_call(
@@ -1770,11 +1777,11 @@ where
     A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
         > + MlxParameterBankTelemetry
         + 'static,
     P: 'static,
@@ -1815,11 +1822,11 @@ where
     A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxHybridState,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
         > + MlxParameterBankTelemetry
         + 'static,
     P: 'static,
@@ -1910,7 +1917,7 @@ where
                 let values = observer.values.clone();
                 session
                     .prefill_input_with_capture(
-                        input,
+                        input.map(A::prepared_input),
                         &stream,
                         observer,
                         bundle,
@@ -1959,7 +1966,7 @@ where
                 let values = observer.values.clone();
                 session
                     .decode_input_with_capture(
-                        input,
+                        input.map(A::prepared_input),
                         &stream,
                         observer,
                         bundle,

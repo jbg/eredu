@@ -179,6 +179,14 @@ pub enum ConditionalUnit<B: GroupedNeuralBackend + DistributedNeuralBackend> {
 }
 /// One ordinary target pass, or an initial admitted media prompt.
 pub enum ConditionalInput<'a, T> {
+    /// Admitted prepared input using the same target/media equations.
+    Prepared(
+        crate::composite_execution::PreparedCompositeInput<
+            'a,
+            T,
+            super::media::MediaInputPartPlan<T>,
+        >,
+    ),
     /// Text decode or already assembled bounded target input.
     Target(TargetInput<'a, T>),
     /// Prepared media context; the shared graph runs only required encoder blocks.
@@ -718,6 +726,7 @@ where
             incoming_target: None,
         };
         match input {
+            ConditionalInput::Prepared(input) => self.begin_prepared(input, state, context),
             ConditionalInput::Target(input) => {
                 if let Some(partition) = self
                     .partition_state
