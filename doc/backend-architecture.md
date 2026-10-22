@@ -831,6 +831,13 @@ canonical destinations and verifies each unit's non-alias payload against its
 selected byte count before native materialization. Native module paths use the
 binding's canonical logical target for this projection.
 
+Runtime's `physical_binding_bytes` supplies exact executable payload accounting
+for residency-controller and acquisition validation, and native resident,
+bounded, assistant and loading reports. Logical aliases add no storage; independent
+physical owners count separately even when they read the same checkpoint tensor. Checked overflow
+identifies the canonical destination. Alias topology validation, source payload,
+loading workspace and backend host-buffer capacity remain separate contracts.
+
 MLX ordinary text, prediction and assistant construction apply runtime-selected
 transform groups through one bounded materialization sequence. Each successful
 group replaces the retained source with its completed overlay and contributes to

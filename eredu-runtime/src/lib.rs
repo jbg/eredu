@@ -483,9 +483,9 @@ pub use replicated_text::{
     WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
-    DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings, ResidencyAcquisition,
-    ResidencyController, ResidencyControllerError, ResidencyDeclarationError, ResidencyLease,
-    ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
+    physical_binding_bytes, DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings,
+    ResidencyAcquisition, ResidencyController, ResidencyControllerError, ResidencyDeclarationError,
+    ResidencyLease, ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
     ResidencyTransferOwner, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
     ResidentLayerGroupReport, ResidentParameterConversion, ResidentParameterConversionBinding,
     RowResidencyRange, WeightBinding, WeightBindingPlan, WeightBindingSelectionError,

@@ -392,21 +392,7 @@ pub fn partition_parameter_acquisition_bindings(
         });
     }
     for (unit, bindings) in units.iter().zip(&partitioned) {
-        let actual = bindings
-            .iter()
-            .filter(|binding| !binding.is_alias())
-            .try_fold(0u64, |total, binding| {
-                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                    ParameterAcquisitionError::Accounting {
-                        target: binding
-                            .logical_target()
-                            .unwrap_or_else(|| binding.name())
-                            .into(),
-                        owner: unit.owner().clone(),
-                        reason: "binding bytes overflow",
-                    }
-                })
-            })?;
+        let actual = crate::physical_binding_bytes(bindings)?;
         if actual != unit.parameter_bytes() {
             return Err(ParameterAcquisitionError::Extent {
                 owner: unit.owner().clone(),

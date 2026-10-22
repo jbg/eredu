@@ -332,16 +332,14 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     // Query exact binding extents and the native host-buffer capacity mechanism
     // before units are consumed. No artifact reopening or payload materialization.
     let parameter_memory_bounds = if prepared.layout.is_some() {
-        use crate::backend::runtime::{
-            checkpoint::binding::binding_bytes,
-            residency::manager::host_capacity_upper_bound_for_bindings,
-        };
+        use crate::backend::runtime::residency::manager::host_capacity_upper_bound_for_bindings;
+        use eredu_runtime::physical_binding_bytes;
         let capacities = prepared
             .units
             .iter()
             .map(|bindings| {
                 Ok((
-                    binding_bytes(bindings)?,
+                    physical_binding_bytes(bindings)?,
                     host_capacity_upper_bound_for_bindings(bindings)?,
                 ))
             })

@@ -477,20 +477,6 @@ where
     .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
-/// Returns the checked total byte count of a binding collection.
-pub fn binding_bytes(bindings: &[WeightBinding]) -> Result<u64, ModuleBindingError> {
-    bindings.iter().try_fold(0u64, |total, binding| {
-        if binding.is_alias() {
-            return Ok(total);
-        }
-        total
-            .checked_add(binding.expected_bytes())
-            .ok_or(ModuleBindingError::ArithmeticOverflow {
-                context: "module binding byte total",
-            })
-    })
-}
-
 /// Structured module-to-checkpoint binding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingError {
@@ -512,12 +498,6 @@ pub enum ModuleBindingError {
         first: String,
         /// Second module parameter.
         second: String,
-    },
-    /// Checked accounting overflowed.
-    #[error("module binding arithmetic overflow: {context}")]
-    ArithmeticOverflow {
-        /// Failed calculation.
-        context: &'static str,
     },
     /// Backend-neutral checkpoint inspection or lease acquisition failed.
     #[error(transparent)]

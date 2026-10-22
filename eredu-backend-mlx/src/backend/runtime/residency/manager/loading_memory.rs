@@ -12,9 +12,8 @@ pub(crate) fn parameter_loading_memory_profile(
     units: &[Vec<WeightBinding>],
     residency: eredu_runtime::LayerWeightResidency,
 ) -> Result<ParameterLoadingMemoryProfile, crate::backend::error::Error> {
-    use crate::backend::runtime::checkpoint::{
-        binding::binding_bytes, recipe::native_recipe_workspace,
-    };
+    use crate::backend::runtime::checkpoint::recipe::native_recipe_workspace;
+    use eredu_runtime::physical_binding_bytes;
     let source_payload = match source.retained_payload_bytes_upper_bound() {
         Some(0) => MemoryBytes::exact(0),
         Some(bytes) => MemoryBytes::estimated(0, bytes, "retained checkpoint-source payload backing; shared child owners can be conservatively counted more than once"),
@@ -56,7 +55,7 @@ pub(crate) fn parameter_loading_memory_profile(
             })?;
         }
         workspaces.push((
-            binding_bytes(bindings)?,
+            physical_binding_bytes(bindings)?,
             host_capacity_upper_bound_for_bindings(bindings)?,
             workspace,
             workspace,

@@ -98,7 +98,7 @@ where
     let mut consumed = BTreeSet::new();
 
     let static_bindings = static_bindings(architecture.static_modules(), store.as_ref())?;
-    let static_bytes = binding_bytes(&static_bindings)?;
+    let static_bytes = physical_binding_bytes(&static_bindings)?;
     let static_parameters = static_bindings
         .iter()
         .map(|binding| binding.name().to_owned())
@@ -140,7 +140,7 @@ where
             .build_unit(address.group(), address.index(), stream)
             .map_err(|error| Error::Other(Box::new(error)))?;
         let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
-        let bytes = binding_bytes(&bindings)?;
+        let bytes = physical_binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
             .checked_add(bytes)
             .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
@@ -443,7 +443,7 @@ where
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
 
-    let static_bytes = binding_bytes(&static_bindings)?;
+    let static_bytes = physical_binding_bytes(&static_bindings)?;
     let static_parameters = static_bindings
         .iter()
         .map(|binding| binding.name().to_owned())
@@ -478,7 +478,7 @@ where
         let address = layout
             .address(index)
             .expect("validated layout covers every flat unit");
-        let bytes = binding_bytes(&bindings)?;
+        let bytes = physical_binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
             .checked_add(bytes)
             .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
@@ -525,7 +525,7 @@ where
     let mut extra = eredu_runtime::AuxiliaryWeightRequirements::default();
     let mut sources = std::collections::BTreeMap::new();
     for unit in supplementary {
-        let bytes = binding_bytes(unit.definition.bindings())?;
+        let bytes = physical_binding_bytes(unit.definition.bindings())?;
         let host = host_capacity_upper_bound_for_bindings(unit.definition.bindings())?;
         extra = extra
             .checked_add_module(bytes, host, unit.shared)

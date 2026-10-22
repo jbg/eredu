@@ -602,6 +602,30 @@ impl WeightBinding {
     }
 }
 
+/// Checked executable parameter payload for a binding selection.
+///
+/// Logical aliases add no storage. Distinct physical owners remain separately
+/// charged even when their checkpoint keys or recipes are equal. Source payload,
+/// loading scratch and native host capacity are separate estimates. This does not
+/// validate alias topology; a selection may include aliases to another resource.
+pub fn physical_binding_bytes(
+    bindings: &[WeightBinding],
+) -> Result<u64, ResidencyDeclarationError> {
+    bindings
+        .iter()
+        .filter(|binding| !binding.is_alias())
+        .try_fold(0u64, |total, binding| {
+            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                ResidencyDeclarationError::BindingBytesOverflow {
+                    target: binding
+                        .logical_target()
+                        .unwrap_or_else(|| binding.name())
+                        .into(),
+                }
+            })
+        })
+}
+
 /// Validated owner/alias partition for one atomic binding unit.
 #[derive(Debug)]
 pub struct WeightBindingPlan<'a> {
@@ -1136,30 +1160,23 @@ impl ResidencyController {
                 .get(spec.id())
                 .expect("definition identity validated above");
             let catalog = catalog_for_unit(unit.id());
-            let mut total = 0u64;
+            let total = physical_binding_bytes(unit.bindings())?;
             for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
-                total = total.checked_add(binding.expected_bytes()).ok_or(
-                    ResidencyControllerError::ArithmeticOverflow {
-                        context: "unit binding byte total",
-                    },
-                )?;
-                if !binding.is_alias() {
-                    let actual = binding
-                        .source_recipe()
-                        .infer(catalog)
-                        .map_err(|source| ResidencyControllerError::Recipe {
-                            binding: binding.name().to_owned(),
-                            source,
-                        })?
-                        .byte_len();
-                    if actual != binding.expected_bytes() {
-                        return Err(ResidencyControllerError::BindingByteMismatch {
-                            id: unit.id().clone(),
-                            binding: binding.name().to_owned(),
-                            expected_bytes: binding.expected_bytes(),
-                            actual_bytes: actual,
-                        });
-                    }
+                let actual = binding
+                    .source_recipe()
+                    .infer(catalog)
+                    .map_err(|source| ResidencyControllerError::Recipe {
+                        binding: binding.name().to_owned(),
+                        source,
+                    })?
+                    .byte_len();
+                if actual != binding.expected_bytes() {
+                    return Err(ResidencyControllerError::BindingByteMismatch {
+                        id: unit.id().clone(),
+                        binding: binding.name().to_owned(),
+                        expected_bytes: binding.expected_bytes(),
+                        actual_bytes: actual,
+                    });
                 }
             }
             if total != spec.bytes() {
@@ -1544,7 +1561,7 @@ pub enum ResidencyControllerError {
     /// Bounded row planning failed before native materialization.
     #[error(transparent)]
     RowRead(#[from] eredu_checkpoint::rows::RowReadError),
-    /// A binding alias graph was invalid.
+    /// Binding declarations, alias topology or physical byte accounting are invalid.
     #[error(transparent)]
     Declaration(#[from] ResidencyDeclarationError),
     /// More than one definition used the same plan identifier.
@@ -1599,12 +1616,6 @@ pub enum ResidencyControllerError {
         /// Invalid recipe.
         #[source]
         source: RecipeError,
-    },
-    /// Checked byte arithmetic overflowed.
-    #[error("residency arithmetic overflow: {context}")]
-    ArithmeticOverflow {
-        /// Calculation that overflowed.
-        context: &'static str,
     },
 }
 
@@ -2016,6 +2027,12 @@ pub enum ResidencyDeclarationError {
     ZeroSizedBinding {
         /// Invalid local name.
         name: String,
+    },
+    /// Executable payload accounting exceeded its representable byte count.
+    #[error("physical binding byte total overflows at parameter {target:?}")]
+    BindingBytesOverflow {
+        /// Canonical destination when present, otherwise the module-local name.
+        target: String,
     },
     /// A unit had no bindings.
     #[error("residency unit {id} must contain at least one binding")]

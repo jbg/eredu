@@ -1922,9 +1922,22 @@ fn aliases_share_one_fake_backend_materialization() {
         WeightBinding::alias("alias-a", "owner", 16).unwrap(),
         WeightBinding::alias("alias-b", "alias-a", 16).unwrap(),
     ];
+    assert_eq!(
+        eredu_runtime::physical_binding_bytes(&bindings).unwrap(),
+        16
+    );
     let unit = materialize_bindings::<FakeBackend>(&source, &bindings, &()).unwrap();
     assert_eq!(unit.len(), 3);
     assert_eq!(leases.load(Ordering::SeqCst), 1);
+    let independent = ["replica-a", "replica-b"]
+        .map(|name| WeightBinding::new(name, "owner", TensorSelection::Full, 16).unwrap());
+    assert_eq!(
+        eredu_runtime::physical_binding_bytes(&independent).unwrap(),
+        32
+    );
+    let replicas = materialize_bindings::<FakeBackend>(&source, &independent, &()).unwrap();
+    assert_eq!(replicas.len(), 2);
+    assert_eq!(leases.load(Ordering::SeqCst), 3);
 }
 
 #[test]

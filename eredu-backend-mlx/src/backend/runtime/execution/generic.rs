@@ -2,8 +2,8 @@
 
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{
-    DenseDiskStreamReport, ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency,
-    LayerwiseModelMetadata, ResidentLayerGroup, ResidentLayerGroupReport,
+    physical_binding_bytes, DenseDiskStreamReport, ExecutionUnitAddress, ExecutionUnitLayout,
+    LayerWeightResidency, LayerwiseModelMetadata, ResidentLayerGroup, ResidentLayerGroupReport,
 };
 
 use std::{
@@ -24,8 +24,7 @@ use crate::backend::{
     ordinary_retirement::OrdinaryRetirement,
     runtime::{
         checkpoint::binding::{
-            binding_bytes, build_module_bindings, populate_module_from_lease,
-            populate_module_from_lease_excluding,
+            build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
         },
         execution::layerwise::{
             validate_device_budget, validate_host_budget, validate_unused, DensePreparedTransfer,
