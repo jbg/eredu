@@ -120,7 +120,7 @@ pub(crate) fn publish_bank_parameter_replacements(
     for bank in &guards {
         let (parameters, bytes) =
             eredu_runtime::parameter_operations::prepare_bank_parameter_replacements(
-                &bank.parameter_members,
+                bank.parameter_members.members(),
                 &bank.catalog,
                 active,
                 |parameter| {
@@ -169,24 +169,21 @@ impl AddressableParameterBank {
         {
             let replacement = self
                 .parameter_members
-                .iter()
-                .find(|member| member.key == *key && member.binding == binding)
-                .and_then(|member| {
+                .binding(*key, binding)
+                .and_then(|address| {
                     self.parameter_replacements
-                        .get(&member.parameter)
-                        .map(|value| (member, value))
+                        .get(&address.member().parameter)
+                        .map(|value| (address, value))
                 });
-            let value = if let Some((member, value)) = replacement {
-                let row = self
-                    .parameter_members
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.parameter == member.parameter && candidate.key < *key
-                    })
-                    .count() as i32;
-                value
-                    .as_array()
-                    .try_index_device((row..row + 1, ..), stream)?
+            let value = if let Some((address, value)) = replacement {
+                let end = i32::try_from(address.row() + 1).map_err(|_| {
+                    AddressableParameterBankError::ReplacementRowOverflow {
+                        identity: *key,
+                        row: address.row(),
+                    }
+                })?;
+                let row = end - 1;
+                value.as_array().try_index_device((row..end, ..), stream)?
             } else {
                 lease.device_value(binding)?.clone()
             };

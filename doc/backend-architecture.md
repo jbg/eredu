@@ -11197,6 +11197,12 @@ converted results through the same exact member-coverage, extent and parameter-m
 checks. A materializer cannot silently drop or add an independently selected member.
 `PreparedSelectedAddressableBank` supplies admitted residency inputs and parameter
 metadata to one native cache assembly path.
+`PreparedBankParameterIndex` owns the final member metadata and resolves physical
+member/binding pairs to canonical destinations and dense replacement rows. Construction
+rejects duplicate physical bindings and repeated canonical ownership within a member.
+Metadata retains source order; replacement rows follow global member-key order, matching
+full parameter assembly for sparse or unsorted selections. Native compact access consumes
+these addresses and checks its indexing width before slicing a replacement tensor.
 
 `prepare_bank_parameter_replacements` consumes backend-observed replacement facts
 and retained canonical member metadata to validate floating member geometry and

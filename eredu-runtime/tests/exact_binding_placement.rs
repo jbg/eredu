@@ -685,7 +685,7 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
             panic!("direct task has no generated outputs")
         })
         .unwrap();
-    let members = [2, 3].map(|member| {
+    let members = [3, 2].map(|member| {
         let recipe = eredu_checkpoint::recipe::DerivedWeightRecipe::source(
             "checkpoint.weight",
             TensorSelection::Range {
@@ -765,11 +765,17 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
         .bind(entries, &source as &dyn CheckpointSource)
         .unwrap()
         .into_parts();
+    for member in prepared.members() {
+        let address = prepared.binding(member.key, &member.binding).unwrap();
+        assert_eq!(address.row(), member.key.member() - 2);
+    }
     let declaration =
         ParameterMetadata::from_spec(&ParameterSpec::trainable("weight").unwrap(), true);
-    let parameters =
-        eredu_runtime::parameter_operations::prepare_bank_parameter_slots(&[declaration], prepared)
-            .unwrap();
+    let parameters = eredu_runtime::parameter_operations::prepare_bank_parameter_slots(
+        &[declaration],
+        prepared.into_members(),
+    )
+    .unwrap();
     assert_eq!(parameters.len(), 1);
     assert_eq!(
         parameters[0].slot.materialized,

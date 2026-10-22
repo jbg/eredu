@@ -118,6 +118,14 @@ pub enum AddressableParameterBankError {
         /// Required global entry span.
         global_span: usize,
     },
+    /// A dense replacement row cannot be represented by the native indexing mechanism.
+    #[error("replacement row {row} for bank member {identity:?} exceeds MLX i32 indexing")]
+    ReplacementRowOverflow {
+        /// Original global physical storage identity.
+        identity: ParameterBankKey,
+        /// Dense row within the canonical replacement parameter.
+        row: usize,
+    },
     /// Device-side validation found one or more out-of-range selections.
     #[error("namespace {namespace} contains {invalid_count} grouped ids outside 0..{global_span}")]
     InvalidSelectionSet {

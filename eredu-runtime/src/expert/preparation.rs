@@ -7,7 +7,8 @@ use super::{
 };
 use crate::{ParameterBankKey, RowResidencyRange};
 use crate::parameter_operations::{
-    BankParameterPreparationError, PreparedBankParameterMember, prepare_bank_parameter_members,
+    BankParameterPreparationError, BankParameterIndexError, PreparedBankParameterIndex,
+    prepare_bank_parameter_members,
 };
 use eredu_checkpoint::recipe::RecipeCatalog;
 use eredu_core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy};
@@ -25,6 +26,9 @@ pub enum AddressableBankPreparationError {
     /// Final bindings cannot be joined to their canonical parameter identities.
     #[error(transparent)]
     Parameter(#[from] BankParameterPreparationError),
+    /// Final physical bindings have ambiguous canonical ownership.
+    #[error(transparent)]
+    Index(#[from] BankParameterIndexError),
     /// The materializer returned a different set of physical members.
     #[error("materialized bank omits {missing:?} and unexpectedly returns {unexpected:?}")]
     MemberCoverage {
@@ -142,6 +146,7 @@ impl AddressableBankPreparation {
             &self.targets,
             source,
         )?;
+        let members = PreparedBankParameterIndex::new(members)?;
         let residency = PreparedAddressableBankResidency::new(
             entries,
             self.rows,
@@ -160,7 +165,7 @@ impl AddressableBankPreparation {
 /// Final neutral resources shared by direct and converted selected bank execution.
 pub struct PreparedSelectedAddressableBank {
     residency: PreparedAddressableBankResidency,
-    members: Vec<PreparedBankParameterMember>,
+    members: PreparedBankParameterIndex,
     placements: BTreeMap<ParameterBankKey, AddressableBankMemberPlacement>,
 }
 impl PreparedSelectedAddressableBank {
@@ -169,7 +174,7 @@ impl PreparedSelectedAddressableBank {
         self,
     ) -> (
         PreparedAddressableBankResidency,
-        Vec<PreparedBankParameterMember>,
+        PreparedBankParameterIndex,
         BTreeMap<ParameterBankKey, AddressableBankMemberPlacement>,
     ) {
         (self.residency, self.members, self.placements)

@@ -4,8 +4,7 @@ use super::*;
 
 /// Shared entry catalog, scheduler, residency manager, and telemetry.
 pub struct AddressableParameterBank {
-    pub(super) parameter_members:
-        Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
+    pub(super) parameter_members: eredu_runtime::parameter_operations::PreparedBankParameterIndex,
     pub(super) parameter_replacements: BTreeMap<String, MlxTensor>,
     pub(super) effective_member_bytes: BTreeMap<ParameterBankKey, u64>,
     pub(super) pool_id: u64,
@@ -65,6 +64,7 @@ impl SharedAddressableParameterBank {
         })?;
         Ok(bank
             .parameter_members
+            .members()
             .iter()
             .filter(|member| self.scope.is_none_or(|scope| member.key.bank() == scope))
             .cloned()
@@ -326,7 +326,7 @@ impl AddressableParameterBank {
         manager.initialize()?;
         static NEXT_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
-            parameter_members: Vec::new(),
+            parameter_members: Default::default(),
             parameter_replacements: BTreeMap::new(),
             effective_member_bytes: catalog.clone(),
             pool_id: NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
