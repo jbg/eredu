@@ -33,6 +33,9 @@ pub enum Error {
     /// Explicit prepared-input transfer exceeded portable logical limits.
     #[error(transparent)]
     InputTransfer(#[from] eredu_runtime::input_transfer::InputTransferError),
+    /// A portable independent bank entry declaration is invalid.
+    #[error(transparent)]
+    AddressableBankEntry(#[from] eredu_runtime::AddressableBankEntryError),
     /// Portable rank-local addressable parameter projection failed.
     #[error(transparent)]
     AddressableBankPlacement(#[from] eredu_runtime::AddressableBankPlacementError),

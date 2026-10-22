@@ -46,7 +46,7 @@ fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     (dir, store)
 }
 
-fn entries() -> Vec<ParameterBankEntry> {
+fn entries() -> Vec<AddressableBankEntry> {
     (0..3)
         .map(|entry| {
             let identity = ParameterBankKey::new(0, 2, entry);
@@ -57,7 +57,7 @@ fn entries() -> Vec<ParameterBankEntry> {
                     .unwrap(),
             ];
             let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
-            ParameterBankEntry::new(identity, unit, 16).unwrap()
+            AddressableBankEntry::new(identity, unit, 16).unwrap()
         })
         .collect()
 }
@@ -69,12 +69,11 @@ fn independent_bank_scopes_share_one_budget_and_reacquire_exact_companions() {
     let entries = (0..2)
         .flat_map(|bank| {
             entries().into_iter().map(move |entry| {
-                let key =
-                    ParameterBankKey::new(bank, entry.identity.unit(), entry.identity.member());
-                ParameterBankEntry::new(
+                let key = ParameterBankKey::new(bank, entry.key().unit(), entry.key().member());
+                AddressableBankEntry::new(
                     key,
-                    OffloadUnit::new(key.unit_id(), entry.unit.bindings().to_vec()).unwrap(),
-                    entry.bytes,
+                    OffloadUnit::new(key.unit_id(), entry.unit().bindings().to_vec()).unwrap(),
+                    entry.bytes(),
                 )
                 .unwrap()
             })
@@ -176,7 +175,7 @@ fn bank_preflight_rejects_every_entry_before_payload_reads_or_transforms() {
         [WeightBinding::new("weight", "unsupported", TensorSelection::Full, 2).unwrap()],
     )
     .unwrap();
-    let entry = ParameterBankEntry::new(key, unit, 2).unwrap();
+    let entry = AddressableBankEntry::new(key, unit, 2).unwrap();
     assert!(matches!(
         preflight_selected_entry_bindings(&store, &[entry]),
         Err(AddressableParameterBankError::Transformation { .. })
@@ -188,9 +187,9 @@ fn bank_preflight_rejects_every_entry_before_payload_reads_or_transforms() {
 fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
-    let identity = entry.identity;
+    let identity = entry.key();
     let parameter_targets = entry
-        .unit
+        .unit()
         .bindings()
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
@@ -235,9 +234,9 @@ fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
 fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
-    let identity = entry.identity;
+    let identity = entry.key();
     let parameter_targets = entry
-        .unit
+        .unit()
         .bindings()
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
@@ -273,7 +272,7 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
 fn residency_report_retains_exact_selected_entry_placement() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
-    let identity = entry.identity;
+    let identity = entry.key();
     let placement = eredu_runtime::AddressableBankMemberPlacement::new(
         eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
         identity.unit(),
@@ -282,7 +281,7 @@ fn residency_report_retains_exact_selected_entry_placement() {
     )
     .unwrap();
     let parameter_targets = entry
-        .unit
+        .unit()
         .bindings()
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
@@ -409,7 +408,7 @@ fn quantized_cache_materializes_only_rank_local_entry_and_tp_recipes() {
                     .unwrap()
             });
             let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
-            ParameterBankEntry::new(identity, unit, 1_024).unwrap()
+            AddressableBankEntry::new(identity, unit, 1_024).unwrap()
         })
         .collect::<Vec<_>>();
     let options =
@@ -522,7 +521,7 @@ fn entry_quantization_uses_only_declared_roles_and_companion_names() {
         bytes.len() as u64,
     )
     .unwrap();
-    let entry = ParameterBankEntry::new(
+    let entry = AddressableBankEntry::new(
         identity,
         OffloadUnit::new(identity.unit_id(), [quantized, preserved]).unwrap(),
         (bytes.len() * 2) as u64,
@@ -541,7 +540,7 @@ fn entry_quantization_uses_only_declared_roles_and_companion_names() {
     assert_eq!(transformed.report.transformed_weights, 1);
     assert_eq!(
         transformed.entries[0]
-            .unit
+            .unit()
             .bindings()
             .iter()
             .map(WeightBinding::name)

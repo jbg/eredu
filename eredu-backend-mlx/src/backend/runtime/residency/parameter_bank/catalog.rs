@@ -86,61 +86,13 @@ pub enum ParameterBankOptionsError {
     },
 }
 
-/// One atomic entry definition supplied by a caller.
-#[derive(Clone)]
-pub struct ParameterBankEntry {
-    pub(super) identity: ParameterBankKey,
-    pub(super) unit: OffloadUnit,
-    pub(super) bytes: u64,
-}
-
-impl ParameterBankEntry {
-    /// Creates one catalog entry and verifies its stable unit identity.
-    pub fn new(
-        identity: ParameterBankKey,
-        unit: OffloadUnit,
-        bytes: u64,
-    ) -> Result<Self, AddressableParameterBankError> {
-        if bytes == 0 {
-            return Err(AddressableParameterBankError::ZeroSizedEntry { identity });
-        }
-        let expected = identity.unit_id();
-        if unit.id() != &expected {
-            return Err(AddressableParameterBankError::UnitIdentityMismatch {
-                identity,
-                expected,
-                actual: unit.id().clone(),
-            });
-        }
-        Ok(Self {
-            identity,
-            unit,
-            bytes,
-        })
-    }
-
-    /// Returns the logical identity.
-    pub const fn identity(&self) -> ParameterBankKey {
-        self.identity
-    }
-
-    /// Returns the atomic materialized byte length.
-    pub const fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    fn into_parts(self) -> (ParameterBankKey, OffloadUnit) {
-        (self.identity, self.unit)
-    }
-}
-
 /// Lowers generic selected storage members into MLX residency entries.
 /// MLX entry bindings paired with exact per-binding transformation selections.
 pub struct SelectedAddressableEntries {
     /// Exact logical destinations, including companions created by selected transforms.
     pub parameter_targets: BTreeMap<(ParameterBankKey, String), String>,
     /// Source-backed entry catalog, before selected load-time transformations.
-    pub entries: Vec<ParameterBankEntry>,
+    pub entries: Vec<AddressableBankEntry>,
     /// Packed format keyed by the exact entry and local binding to transform.
     pub transformations:
         BTreeMap<(ParameterBankKey, String), eredu_runtime::AddressableBindingTransform>,
@@ -177,7 +129,7 @@ pub fn entries_from_selected_members(
                 .into_iter()
                 .map(|(binding, transform)| ((key, binding), transform)),
         );
-        entries.push(ParameterBankEntry::new(
+        entries.push(AddressableBankEntry::new(
             key,
             OffloadUnit::new(key.unit_id(), bindings)?,
             footprint.source_bytes(),
@@ -198,7 +150,7 @@ pub(crate) struct QuantizedParameterBankCatalog {
     /// Store supplying synthetic packed bindings and delegating all other keys.
     pub(crate) store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     /// Entry units rebuilt against the packed store.
-    pub(crate) entries: Vec<ParameterBankEntry>,
+    pub(crate) entries: Vec<AddressableBankEntry>,
     /// Deterministic bounded-materialisation telemetry.
     pub(crate) report: WeightMaterializationReport,
 }
@@ -206,7 +158,7 @@ pub(crate) struct QuantizedParameterBankCatalog {
 #[cfg(test)]
 pub(crate) fn quantize_entry_catalog(
     source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    entries: Vec<ParameterBankEntry>,
+    entries: Vec<AddressableBankEntry>,
     quantization: WeightQuantization,
     max_working_set_bytes: u64,
     source_stream: &Stream,
@@ -214,10 +166,10 @@ pub(crate) fn quantize_entry_catalog(
     let selected = entries
         .iter()
         .flat_map(|entry| {
-            entry.unit.bindings().iter().filter_map(move |binding| {
+            entry.unit().bindings().iter().filter_map(move |binding| {
                 binding
                     .quantization_companions()
-                    .map(|_| (entry.identity, binding.name().to_owned()))
+                    .map(|_| (entry.key(), binding.name().to_owned()))
             })
         })
         .collect();
@@ -234,7 +186,7 @@ pub(crate) fn quantize_entry_catalog(
 
 pub(super) fn quantize_selected_entry_catalog(
     mut source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    mut entries: Vec<ParameterBankEntry>,
+    mut entries: Vec<AddressableBankEntry>,
     transformations: eredu_runtime::AddressableBankTransformPlan,
     max_working_set_bytes: u64,
     source_stream: &Stream,
@@ -266,7 +218,7 @@ pub(super) fn quantize_selected_entry_catalog(
 /// rank-local semantic recipe and rebuilds the catalog against packed keys.
 fn quantize_selected_entry_catalog_once(
     source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    entries: Vec<ParameterBankEntry>,
+    entries: Vec<AddressableBankEntry>,
     quantization: WeightQuantization,
     companion_dtype: &eredu_checkpoint::recipe::RecipeDtype,
     selected: &std::collections::BTreeSet<(ParameterBankKey, String)>,
@@ -275,7 +227,7 @@ fn quantize_selected_entry_catalog_once(
 ) -> Result<QuantizedParameterBankCatalog, Error> {
     let (plan, bindings) = eredu_runtime::prepare_addressable_bank_quantization(
         source.as_ref(),
-        entries.into_iter().map(ParameterBankEntry::into_parts),
+        entries,
         eredu_runtime::AddressableBindingTransform::new(quantization, companion_dtype.clone()),
         selected,
         max_working_set_bytes,
@@ -284,10 +236,7 @@ fn quantize_selected_entry_catalog_once(
     let (store, report) = prepare_quantized_source(source, plan, source_stream)?;
     let rebuilt = bindings
         .bind(store.as_ref())
-        .map_err(|error| Error::Other(Box::new(error)))?
-        .into_iter()
-        .map(|(identity, unit, bytes)| ParameterBankEntry::new(identity, unit, bytes))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map_err(|error| Error::Other(Box::new(error)))?;
     Ok(QuantizedParameterBankCatalog {
         store,
         entries: rebuilt,

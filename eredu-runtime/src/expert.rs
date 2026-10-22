@@ -9,6 +9,7 @@ use crate::ExpertPass;
 
 mod agreement;
 mod banks;
+mod catalog;
 mod placement;
 mod quantization;
 mod route_intervention;
@@ -22,6 +23,7 @@ pub use agreement::{
     AgreeingAddressableExpertProvider, AgreeingParameterProvider, ProviderAgreementRejected,
 };
 pub use banks::{RoutedBankProviderError, RoutedBankProviders};
+pub use catalog::{AddressableBankEntry, AddressableBankEntryError};
 pub use quantization::{
     prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
     AddressableBankQuantizationError, AddressableBankTransformGroup, AddressableBankTransformPlan,

@@ -8,6 +8,7 @@ use eredu_checkpoint::WeightQuantization;
 #[cfg(test)]
 use eredu_checkpoint::store::TensorSelection;
 use eredu_nn::GroupedNeuralBackend;
+pub use eredu_runtime::AddressableBankEntry;
 use eredu_runtime::{
     AddressableGroupedBank, IndexedMovement, OffloadUnit, ParameterBankAccess,
     ParameterBankAcquisition, ResidencyReport, WeightBinding, WeightMaterializationReport,
@@ -45,8 +46,8 @@ pub(crate) use catalog::quantize_entry_catalog;
 #[allow(unused_imports)]
 pub(crate) use catalog::QuantizedParameterBankCatalog;
 pub use catalog::{
-    entries_from_selected_members, BankAccessClass, ParameterBankEntry, ParameterBankKey,
-    ParameterBankOptions, ParameterBankOptionsError, SelectedAddressableEntries,
+    entries_from_selected_members, BankAccessClass, ParameterBankKey, ParameterBankOptions,
+    ParameterBankOptionsError, SelectedAddressableEntries,
 };
 use catalog::quantize_selected_entry_catalog;
 
@@ -102,27 +103,11 @@ pub enum AddressableParameterBankError {
         /// Repeated entry.
         identity: ParameterBankKey,
     },
-    /// One logical entry declared no materialized bytes.
-    #[error("entry {identity:?} must contain at least one byte")]
-    ZeroSizedEntry {
-        /// Invalid logical identity.
-        identity: ParameterBankKey,
-    },
     /// Two catalog entries used the same namespace/global identity.
     #[error("duplicate sparse entry catalog entry {identity:?}")]
     DuplicateEntry {
         /// Duplicated logical identity.
         identity: ParameterBankKey,
-    },
-    /// The caller used a noncanonical residency unit id.
-    #[error("entry {identity:?} requires unit id {expected}, got {actual}")]
-    UnitIdentityMismatch {
-        /// Logical catalog identity.
-        identity: ParameterBankKey,
-        /// Required stable unit id.
-        expected: OffloadUnitId,
-        /// Adapter-supplied unit id.
-        actual: OffloadUnitId,
     },
     /// No owned entry catalog exists for this namespace.
     #[error("sparse entry cache has no catalog for namespace {namespace}")]

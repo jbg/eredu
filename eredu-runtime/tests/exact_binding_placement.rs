@@ -759,6 +759,21 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
                 .map(move |(binding, target)| ((plan.key(), binding.clone()), target.clone()))
         })
         .collect();
+    let entries = plans
+        .iter()
+        .map(|plan| {
+            eredu_runtime::AddressableBankEntry::new(
+                plan.key(),
+                eredu_runtime::OffloadUnit::new(
+                    plan.key().unit_id(),
+                    plan.bindings().iter().cloned(),
+                )
+                .unwrap(),
+                plan.source_bytes(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
     let placements = plans
         .iter()
         .map(|plan| (plan.key(), plan.placement().clone()))
@@ -776,7 +791,9 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
         })
         .collect();
     eredu_runtime::validate_addressable_bank_selection(
-        plans.iter().map(|plan| (plan.key(), plan.bindings())),
+        entries
+            .iter()
+            .map(|entry| (entry.key(), entry.unit().bindings())),
         &placements,
         &expected_bytes,
         &transforms,
@@ -784,7 +801,9 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
     )
     .unwrap();
     let prepared = eredu_runtime::parameter_operations::prepare_bank_parameter_members(
-        plans.iter().map(|plan| (plan.key(), plan.bindings())),
+        entries
+            .iter()
+            .map(|entry| (entry.key(), entry.unit().bindings())),
         &targets,
         &source as &dyn CheckpointSource,
     )

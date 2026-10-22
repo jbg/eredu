@@ -274,6 +274,7 @@ pub use expert::{
     TensorParallelParameterProvider,
 };
 pub use expert::{validate_addressable_bank_selection, AddressableBankSelectionError};
+pub use expert::{AddressableBankEntry, AddressableBankEntryError};
 pub use expert::{
     prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
     AddressableBankQuantizationError, AddressableBankTransformGroup, AddressableBankTransformPlan,

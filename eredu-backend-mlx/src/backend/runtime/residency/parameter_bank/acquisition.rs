@@ -41,12 +41,12 @@ pub struct SharedAddressableParameterBank {
 
 pub(super) fn preflight_selected_entry_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-    entries: &[ParameterBankEntry],
+    entries: &[AddressableBankEntry],
 ) -> Result<(), AddressableParameterBankError> {
     for entry in entries {
         eredu_runtime::preflight_bindings::<crate::backend::nn::shared::MlxNeuralBackend>(
             store,
-            entry.unit.bindings(),
+            entry.unit().bindings(),
         )
         .map_err(|error| AddressableParameterBankError::Transformation {
             source: Box::new(Error::Other(Box::new(error))),
@@ -113,7 +113,7 @@ impl AddressableParameterBank {
     #[cfg(test)]
     pub(crate) fn new<S, O>(
         store: Arc<S>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         options: O,
         source_stream: Stream,
         device_stream: Stream,
@@ -130,7 +130,7 @@ impl AddressableParameterBank {
     #[cfg(test)]
     pub(crate) fn new_shared<O>(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         options: O,
         source_stream: Stream,
         device_stream: Stream,
@@ -167,7 +167,7 @@ impl AddressableParameterBank {
             })?;
         let options: ParameterBankOptions = rows.options().into();
         let rows = rows.prepared();
-        rows.validate_other_banks(selected.entries.iter().map(|entry| entry.identity.bank()))
+        rows.validate_other_banks(selected.entries.iter().map(|entry| entry.key().bank()))
             .map_err(|source| AddressableParameterBankError::Transformation {
                 source: Box::new(source.into()),
             })?;
@@ -177,7 +177,7 @@ impl AddressableParameterBank {
             selected
                 .entries
                 .iter()
-                .map(|entry| (entry.identity, entry.unit.bindings())),
+                .map(|entry| (entry.key(), entry.unit().bindings())),
             &selected.placements,
             &selected.expected_bytes,
             &selected.transformations,
@@ -193,8 +193,8 @@ impl AddressableParameterBank {
             .iter()
             .map(|entry| {
                 OffloadUnitSpec::new(
-                    entry.identity.unit_id(),
-                    selected.expected_bytes[&entry.identity],
+                    entry.key().unit_id(),
+                    selected.expected_bytes[&entry.key()],
                     ResidencyPolicy::Cacheable,
                     MemoryTier::Disk,
                 )
@@ -211,7 +211,7 @@ impl AddressableParameterBank {
                     selected
                         .entries
                         .iter()
-                        .map(|entry| (entry.identity, entry.unit.bindings())),
+                        .map(|entry| (entry.key(), entry.unit().bindings())),
                     &selected.parameter_targets,
                     store.as_ref(),
                 )
@@ -250,11 +250,11 @@ impl AddressableParameterBank {
             source: Box::new(source),
         })?;
         for entry in &transformed.entries {
-            if selected.expected_bytes.get(&entry.identity) != Some(&entry.bytes) {
+            if selected.expected_bytes.get(&entry.key()) != Some(&entry.bytes()) {
                 return Err(AddressableParameterBankError::Transformation {
                     source: Box::new(Error::ArchitectureModel(format!(
                         "materialized addressable entry {:?} differs from its neutral selected bytes",
-                        entry.identity
+                        entry.key()
                     ))),
                 });
             }
@@ -264,7 +264,7 @@ impl AddressableParameterBank {
                 transformed
                     .entries
                     .iter()
-                    .map(|entry| (entry.identity, entry.unit.bindings())),
+                    .map(|entry| (entry.key(), entry.unit().bindings())),
                 &selected.parameter_targets,
                 transformed.store.as_ref(),
             )
@@ -297,7 +297,7 @@ impl AddressableParameterBank {
     #[cfg(test)]
     pub(crate) fn new_resident_shared(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, AddressableParameterBankError> {
@@ -319,7 +319,7 @@ impl AddressableParameterBank {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_shared_with_policy(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         row_ranges: Vec<eredu_runtime::RowResidencyRange>,
         options: ParameterBankOptions,
         policy: ResidencyPolicy,
@@ -339,31 +339,32 @@ impl AddressableParameterBank {
         #[cfg(test)]
         let mut namespace_global_spans = BTreeMap::new();
         for entry in entries {
-            if catalog.insert(entry.identity, entry.bytes).is_some() {
+            if catalog.insert(entry.key(), entry.bytes()).is_some() {
                 return Err(AddressableParameterBankError::DuplicateEntry {
-                    identity: entry.identity,
+                    identity: entry.key(),
                 });
             }
             #[cfg(test)]
             {
                 *namespace_entry_counts
-                    .entry(entry.identity.unit())
+                    .entry(entry.key().unit())
                     .or_insert(0) += 1;
             }
             #[cfg(test)]
             {
                 namespace_global_spans
-                    .entry(entry.identity.unit())
-                    .and_modify(|span: &mut usize| *span = (*span).max(entry.identity.member() + 1))
-                    .or_insert(entry.identity.member() + 1);
+                    .entry(entry.key().unit())
+                    .and_modify(|span: &mut usize| *span = (*span).max(entry.key().member() + 1))
+                    .or_insert(entry.key().member() + 1);
             }
             specs.push(OffloadUnitSpec::new(
-                entry.identity.unit_id(),
-                entry.bytes,
+                entry.key().unit_id(),
+                entry.bytes(),
                 policy,
                 initial_tier,
             )?);
-            definitions.push(entry.unit);
+            let (_, unit, _) = entry.into_parts();
+            definitions.push(unit);
         }
         if catalog.is_empty() && row_ranges.is_empty() {
             return Err(AddressableParameterBankError::EmptyCatalog);

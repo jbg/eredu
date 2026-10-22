@@ -1,5 +1,8 @@
 //! Bounded addressable-bank transformation plans and consuming binding rewrites.
-use super::{AddressableBankMemberError, AddressableBindingTransform};
+use super::{
+    AddressableBankEntry, AddressableBankEntryError, AddressableBankMemberError,
+    AddressableBindingTransform,
+};
 use crate::{OffloadUnit, ParameterBankKey, ResidencyDeclarationError, WeightBinding};
 use eredu_checkpoint::{
     quantization::{BoundedQuantizationPlan, BoundedQuantizationTarget},
@@ -88,16 +91,9 @@ pub enum AddressableBankQuantizationError {
     /// No selected floating binding has local transform companions.
     #[error("entry catalog contains no floating projection bindings to quantize")]
     EmptySelection,
-    /// A supplied independent unit belongs to another global storage identity.
-    #[error("bank member {key:?} requires unit {expected:?}, got {actual:?}")]
-    UnitIdentityMismatch {
-        /// Declared global member.
-        key: ParameterBankKey,
-        /// Required independently leased unit identity.
-        expected: eredu_core::residency::OffloadUnitId,
-        /// Identity carried by the supplied unit.
-        actual: eredu_core::residency::OffloadUnitId,
-    },
+    /// Final independently leased entry declaration failed validation.
+    #[error(transparent)]
+    Entry(#[from] AddressableBankEntryError),
     /// Source recipe inference failed.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
@@ -142,7 +138,7 @@ pub struct AddressableBankQuantizationBindings {
 /// Returns the checkpoint plan and a move-only rewrite for its resulting source.
 pub fn prepare_addressable_bank_quantization(
     source: &dyn CheckpointSource,
-    entries: impl IntoIterator<Item = (ParameterBankKey, OffloadUnit)>,
+    entries: impl IntoIterator<Item = AddressableBankEntry>,
     transform: AddressableBindingTransform,
     selected: &BTreeSet<(ParameterBankKey, String)>,
     max_working_set_bytes: u64,
@@ -155,15 +151,8 @@ pub fn prepare_addressable_bank_quantization(
     let mut targets = Vec::new();
     let mut replacements = BTreeMap::new();
     let mut packed_catalog_bytes = 0u64;
-    for (identity, unit) in entries {
-        let expected = identity.unit_id();
-        if unit.id() != &expected {
-            return Err(AddressableBankQuantizationError::UnitIdentityMismatch {
-                key: identity,
-                expected,
-                actual: unit.id().clone(),
-            });
-        }
+    for entry in entries {
+        let (identity, unit, _) = entry.into_parts();
         for binding in unit.bindings() {
             let Some(companions) = binding.quantization_companions() else {
                 continue;
@@ -230,7 +219,7 @@ impl AddressableBankQuantizationBindings {
     pub fn bind(
         self,
         source: &dyn CheckpointSource,
-    ) -> Result<Vec<(ParameterBankKey, OffloadUnit, u64)>, AddressableBankQuantizationError> {
+    ) -> Result<Vec<AddressableBankEntry>, AddressableBankQuantizationError> {
         let mut rebuilt = Vec::with_capacity(self.units.len());
         for (identity, unit) in self.units {
             let mut bindings = Vec::new();
@@ -268,11 +257,11 @@ impl AddressableBankQuantizationBindings {
                     .checked_add(binding.expected_bytes())
                     .ok_or(AddressableBankQuantizationError::MemberByteOverflow { key: identity })
             })?;
-            rebuilt.push((
+            rebuilt.push(AddressableBankEntry::new(
                 identity,
                 OffloadUnit::new(identity.unit_id(), bindings)?,
                 bytes,
-            ));
+            )?);
         }
         Ok(rebuilt)
     }

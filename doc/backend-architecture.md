@@ -3472,6 +3472,13 @@ each batch identity. The backend executes these retained batches and reports the
 plan's formats. Conversion batching does not combine independent residency units
 or alter their resource charges.
 
+`AddressableBankEntry` retains the neutral independent-unit declaration and
+admitted atomic byte extent. Private fields preserve the validated relationship
+between its global bank key and canonical residency-unit identity. Quantization
+preparation consumes these entries and rebinding returns the same validated
+entry type; the backend retains native storage separately. Selected geometry,
+duplicate catalog ownership and combined budgets remain separate admissions.
+
 `addressable_projection_bytes` supplies the common packed payload arithmetic for
 selected member admission, backend preflight and bounded transformation sizing.
 It accounts for the declared companion precision, affine biases and MXFP4 scale

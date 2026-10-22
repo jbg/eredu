@@ -566,7 +566,7 @@ fn verify_prepared_row_pool(budget: u64, parallel: bool) {
     let binding = WeightBinding::new("weight", "group", TensorSelection::Full, 16).unwrap();
     let selected = || SelectedAddressableEntries {
         parameter_targets: BTreeMap::from([((key, "weight".into()), "logical.group".into())]),
-        entries: vec![ParameterBankEntry::new(
+        entries: vec![AddressableBankEntry::new(
             key,
             OffloadUnit::new(key.unit_id(), [binding.clone()]).unwrap(),
             16,

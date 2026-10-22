@@ -12,7 +12,7 @@ use crate::{
     backend::error::Error,
     backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups},
     backend::runtime::residency::parameter_bank::{
-        AddressableParameterBank, BankAccessClass, ParameterBankEntry,
+        AddressableParameterBank, BankAccessClass, AddressableBankEntry,
     },
     module::PhysicalParam,
     tests::support::expert_dispatch::{
@@ -423,7 +423,7 @@ fn expert_exchange_ring_worker() {
             ];
             let key = identity;
             let unit = OffloadUnit::new(key.unit_id(), bindings).unwrap();
-            ParameterBankEntry::new(key, unit, 12).unwrap()
+            AddressableBankEntry::new(key, unit, 12).unwrap()
         })
         .collect::<Vec<_>>();
     let cache = AddressableParameterBank::new(
