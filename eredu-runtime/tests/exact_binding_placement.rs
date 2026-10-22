@@ -321,6 +321,85 @@ mod component_preparation {
     };
     use std::sync::Arc;
 
+    #[test]
+    fn resource_preparation_keeps_independent_materializations_and_scopes_aliases() {
+        use super::{AtomicUsize, Ordering, Source};
+        use eredu_checkpoint::recipe::RecipeAlias;
+        use eredu_runtime::{
+            prepare_resource_bindings, ParameterResourceRecipes, WeightBindingPlan,
+        };
+        use std::collections::BTreeMap;
+        let original = Arc::new(Source {
+            store: MemoryWeightStore::from_safetensors(
+                ["shared", "neighbor"]
+                    .map(|key| (key.into(), safetensors::Dtype::F32, vec![4, 2], vec![0; 32])),
+            )
+            .unwrap(),
+            overlay: false,
+            leases: AtomicUsize::new(0),
+        });
+        let recipe = || DerivedWeightRecipe::source("shared", TensorSelection::Full);
+        let resources = BTreeMap::from([
+            (
+                "first",
+                ParameterResourceRecipes {
+                    outputs: BTreeMap::from([("owner".into(), recipe())]),
+                    aliases: vec![RecipeAlias::new("consumer", "owner")],
+                },
+            ),
+            (
+                "second",
+                ParameterResourceRecipes {
+                    outputs: BTreeMap::from([("replica".into(), recipe())]),
+                    aliases: vec![],
+                },
+            ),
+        ]);
+        let (source, resources) =
+            prepare_resource_bindings(original.clone(), "resources", resources).unwrap();
+        assert_eq!(source.source_keys(), ["shared"]);
+        assert!(source.source_metadata("neighbor").is_err());
+        let plans = resources
+            .values()
+            .map(|bindings| WeightBindingPlan::new(bindings).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plans
+                .iter()
+                .flat_map(|plan| plan.owners())
+                .map(|binding| binding.expected_bytes())
+                .sum::<u64>(),
+            64
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.aliases().count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(original.leases.load(Ordering::SeqCst), 0);
+
+        let crossing = BTreeMap::from([
+            (
+                "first",
+                ParameterResourceRecipes {
+                    outputs: BTreeMap::from([("owner".into(), recipe())]),
+                    aliases: vec![],
+                },
+            ),
+            (
+                "second",
+                ParameterResourceRecipes {
+                    outputs: BTreeMap::new(),
+                    aliases: vec![RecipeAlias::new("consumer", "owner")],
+                },
+            ),
+        ]);
+        assert!(prepare_resource_bindings(original.clone(), "invalid", crossing).is_err());
+        assert_eq!(original.leases.load(Ordering::SeqCst), 0);
+    }
+
     fn description(selected: &[usize]) -> ArchitectureParameterDescription {
         let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [3]).unwrap();

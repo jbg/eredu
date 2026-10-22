@@ -3,7 +3,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeAlias, RecipeError},
+    recipe::{RecipeAlias, RecipeError},
     store::{RestrictedCheckpointSource, StoreError},
 };
 use eredu_core::BackendFailure;
@@ -12,10 +12,10 @@ use eredu_nn::{
     ParameterTopologyError, Parameterized, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, bindings_from_recipe_set, materialize_selected_bindings,
+    bind_materialized_unit, materialize_selected_bindings, prepare_resource_bindings,
     select_bindings, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture, ParameterBackend,
-    RecipeBindingError, ResidentRuntime, RuntimeStateComponents, SelectedBindingPlan,
-    WeightBinding,
+    ParameterResourceRecipes, RecipeBindingError, ResidentRuntime, RuntimeStateComponents,
+    SelectedBindingPlan, WeightBinding,
 };
 
 use super::*;
@@ -309,17 +309,18 @@ pub(super) fn prepare_bindings<T: 'static, M: Parameterized<T>>(
             recipes.remove(parameter.id.as_str());
         }
     }
-    let inputs = recipes
-        .values()
-        .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-        .collect();
-    let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
+    let (source, mut resources) = prepare_resource_bindings(
         source,
         format!("voicechat/backbone/{unit:?}"),
-        inputs,
-    )?);
-    let recipes = AtomicRecipeSet::new_with_aliases(source.as_ref(), recipes, aliases)?;
-    let bindings = bindings_from_recipe_set(source.as_ref(), recipes)?;
+        BTreeMap::from([(
+            (),
+            ParameterResourceRecipes {
+                outputs: recipes,
+                aliases,
+            },
+        )]),
+    )?;
+    let bindings = resources.remove(&()).expect("declared backbone resource");
     let bindings = eredu_runtime::apply_parameter_storage_layouts(module, bindings);
     Ok((source, bindings))
 }

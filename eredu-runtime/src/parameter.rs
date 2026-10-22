@@ -1,12 +1,14 @@
 //! Backend-neutral checkpoint materialization and parameter binding.
 
-use std::{collections::BTreeMap, marker::PhantomData};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeCatalog, RecipeDtype, RecipeError},
+    recipe::{
+        AtomicRecipeSet, DerivedWeightRecipe, RecipeAlias, RecipeCatalog, RecipeDtype, RecipeError,
+    },
     store::{
-        CheckpointSource, ReadPolicy, SharedCheckpointSource, StoreError, TensorReadRequest,
-        TensorSelection,
+        CheckpointSource, ReadPolicy, RestrictedCheckpointSource, SharedCheckpointSource,
+        StoreError, TensorReadRequest, TensorSelection,
     },
 };
 use eredu_nn::{
@@ -933,6 +935,48 @@ pub enum ModuleBindingPlanError {
     Declaration(#[from] ResidencyDeclarationError),
 }
 
+/// Family-admitted recipes and logical aliases for one independently owned resource.
+/// Aliases resolve only within this resource; separate resources retain separate
+/// materializations even when they read the same checkpoint input.
+pub struct ParameterResourceRecipes {
+    /// Canonical physical outputs, keyed by parameter identity.
+    pub outputs: BTreeMap<String, DerivedWeightRecipe>,
+    /// Logical consumers sharing an output within this resource.
+    pub aliases: Vec<RecipeAlias>,
+}
+
+/// Prepares independent resources against one exact restricted source authority.
+///
+/// The keys retain canonical storage ownership; their order does not define logical
+/// invocation or state identities. This reads metadata only. No resource is merged
+/// with another, and aliases cannot borrow a neighboring resource's materialization.
+pub fn prepare_resource_bindings<K: Ord>(
+    source: SharedCheckpointSource,
+    scope: impl Into<String>,
+    resources: BTreeMap<K, ParameterResourceRecipes>,
+) -> Result<(SharedCheckpointSource, BTreeMap<K, Vec<WeightBinding>>), RecipeBindingError> {
+    let inputs = resources
+        .values()
+        .flat_map(|resource| resource.outputs.values())
+        .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+        .collect();
+    let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
+        source, scope, inputs,
+    )?);
+    let bindings = resources
+        .into_iter()
+        .map(|(owner, resource)| {
+            let set = AtomicRecipeSet::new_with_aliases(
+                source.as_ref(),
+                resource.outputs,
+                resource.aliases,
+            )?;
+            Ok((owner, bindings_from_recipe_set(source.as_ref(), set)?))
+        })
+        .collect::<Result<_, RecipeBindingError>>()?;
+    Ok((source, bindings))
+}
+
 /// Consumes one atomic recipe publication into owner bindings and lightweight
 /// logical aliases without cloning any derived recipe.
 pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
@@ -958,9 +1002,12 @@ pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
     Ok(bindings)
 }
 
-/// Failure while lowering an atomic neutral recipe set into runtime bindings.
+/// Failure preparing exact source authority or lowering atomic recipe bindings.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeBindingError {
+    /// Exact physical source authority cannot be restricted.
+    #[error(transparent)]
+    Source(#[from] StoreError),
     /// Recipe metadata inference failed.
     #[error(transparent)]
     Recipe(#[from] RecipeError),

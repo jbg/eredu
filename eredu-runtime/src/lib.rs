@@ -329,10 +329,11 @@ pub use parallel::{
 pub use parameter::{
     apply_parameter_storage_layouts, bind_materialized_unit, bind_materialized_unit_excluding,
     bindings_from_recipe_set, build_exact_replicated_text_bindings, build_module_binding_plan,
-    materialize_bindings, materialize_selected_bindings, preflight_bindings, select_bindings,
-    BindingPlan, BindingPlanError, MaterializedUnit, ModuleBindingPlan, ModuleBindingPlanError,
-    ParameterBatchBudget, ParameterBindingTarget, ParameterOrchestrationError, PlannedBinding,
-    RecipeBindingError, SelectedBindingPlan,
+    materialize_bindings, materialize_selected_bindings, preflight_bindings,
+    prepare_resource_bindings, select_bindings, BindingPlan, BindingPlanError, MaterializedUnit,
+    ModuleBindingPlan, ModuleBindingPlanError, ParameterBatchBudget, ParameterBindingTarget,
+    ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding, RecipeBindingError,
+    SelectedBindingPlan,
 };
 pub use parameter_layout::{
     derive_partitioned_group_layout, derive_partitioned_local_layout, retained_partition_layout,

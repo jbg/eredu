@@ -1542,6 +1542,16 @@ duplicated. Codec-owned `PreparedEncoderBindings` validates per-unit recipes and
 F32 conversions against a restricted source view. VoiceChat supplies the retained
 encoder source role, and MLX realizes the selected parameter policy.
 
+Runtime `prepare_resource_bindings` lowers family-admitted physical recipes and
+logical aliases for independently owned resources. It restricts source authority
+to their actual physical inputs before atomic recipe validation, preserving
+canonical resource keys and separate materializations even when two resources
+read the same checkpoint tensor. Aliases resolve within one resource.
+`PreparedComponent`, low-level VoiceChat speech/backbone binding and backbone
+residency inspection use this preparation mechanism. VoiceChat retains topology
+admission, alias agreement, execution precision and native storage preferences;
+preparation allocates no native values and reads no checkpoint payloads.
+
 Finite encoder tensor parallelism partitions input-projection rows and ConvNeXt
 intermediate channels. Downsampling partitions output rows within every
 convolution group; segmented checkpoint reads preserve group order, and the

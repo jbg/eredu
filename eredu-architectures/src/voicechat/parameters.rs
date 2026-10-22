@@ -4,17 +4,17 @@
 //! Conformer, Gemma, MoG or codec block can be bound independently. This contract
 //! does not select a residency schedule or construct a realtime executable.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
+    store::{SharedCheckpointSource, StoreError},
 };
 use eredu_nn::{validate_parameter_topology, ParameterTopologyError, Parameterized};
 use eredu_runtime::{
-    bind_materialized_unit, bindings_from_recipe_set, materialize_selected_bindings,
-    select_bindings, ParameterBackend, ParameterOrchestrationError, RecipeBindingError,
-    SelectedBindingPlan, WeightBinding,
+    bind_materialized_unit, materialize_selected_bindings, prepare_resource_bindings,
+    select_bindings, ParameterBackend, ParameterOrchestrationError, ParameterResourceRecipes,
+    RecipeBindingError, SelectedBindingPlan, WeightBinding,
 };
 
 use super::{
@@ -248,17 +248,18 @@ fn project_unit<T: 'static, M: Parameterized<T>>(
             recipes.insert(name.to_owned(), parameter.recipe.clone());
         }
     }
-    let inputs = recipes
-        .values()
-        .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-        .collect();
-    let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
+    let (source, mut resources) = prepare_resource_bindings(
         source,
         format!("voicechat/{component:?}/module"),
-        inputs,
-    )?);
-    let recipes = AtomicRecipeSet::new_with_aliases(source.as_ref(), recipes, aliases)?;
-    let bindings = bindings_from_recipe_set(source.as_ref(), recipes)?;
+        BTreeMap::from([(
+            (),
+            ParameterResourceRecipes {
+                outputs: recipes,
+                aliases,
+            },
+        )]),
+    )?;
+    let bindings = resources.remove(&()).expect("declared module resource");
     Ok(PreparedSpeechParameterUnit {
         component,
         source,

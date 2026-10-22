@@ -4,8 +4,12 @@
 //! coexist. These bounds describe logical parameter tiers and materialization
 //! scratch, excluding activations, recurrent state, and checkpoint source caches.
 
-use eredu_checkpoint::recipe::{AtomicRecipeSet, RecipeError};
-use eredu_runtime::{bindings_from_recipe_set, LayerWeightResidency, RecipeBindingError};
+use std::collections::BTreeMap;
+
+use eredu_checkpoint::recipe::RecipeError;
+use eredu_runtime::{
+    prepare_resource_bindings, LayerWeightResidency, ParameterResourceRecipes, RecipeBindingError,
+};
 
 use super::{
     backbone::{BackbonePreparationError, PreparedBackboneParameters},
@@ -60,26 +64,29 @@ impl BackboneResources {
         if selected != prepared.parameters().len() {
             return Err(VoiceChatResidencyError::BackboneCatalog);
         }
-        let units = recipes
+        let resources = recipes
             .into_iter()
-            .map(|recipes| {
-                let recipes = AtomicRecipeSet::new(prepared.source().as_ref(), recipes)?;
-                Ok(bindings_from_recipe_set(
-                    prepared.source().as_ref(),
-                    recipes,
-                )?)
+            .enumerate()
+            .map(|(index, outputs)| {
+                (
+                    index,
+                    ParameterResourceRecipes {
+                        outputs,
+                        aliases: vec![],
+                    },
+                )
             })
-            .collect::<Result<Vec<_>, VoiceChatResidencyError>>()?;
-        let statics = SpeechProviderResources::from_bindings(
-            prepared.source(),
-            &units[..1],
-            prepared.parameters(),
+            .collect::<BTreeMap<_, _>>();
+        let (source, resources) = prepare_resource_bindings(
+            prepared.source().clone(),
+            "voicechat/backbone/residency",
+            resources,
         )?;
-        let layers = SpeechProviderResources::from_bindings(
-            prepared.source(),
-            &units[1..],
-            prepared.parameters(),
-        )?;
+        let units = resources.into_values().collect::<Vec<_>>();
+        let statics =
+            SpeechProviderResources::from_bindings(&source, &units[..1], prepared.parameters())?;
+        let layers =
+            SpeechProviderResources::from_bindings(&source, &units[1..], prepared.parameters())?;
         Ok(Self {
             parameter_bytes: add(statics.parameter_bytes, layers.parameter_bytes)?,
             static_parameter_bytes: statics.parameter_bytes,

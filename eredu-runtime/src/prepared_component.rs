@@ -1,13 +1,13 @@
 //! Exact cold component bindings and consuming placement selection.
 
 use crate::{
-    bindings_from_recipe_set, place_weight_bindings, ArchitectureParameterDescription,
+    place_weight_bindings, prepare_resource_bindings, ArchitectureParameterDescription,
     BindingPlacementError, ExecutionUnitAddress, ExecutionUnitLayout, ExecutionUnitLayoutError,
-    LocalModelLayout, ParameterGroupOwner, ParameterMemberSpec, ParameterStorageId,
-    RecipeBindingError, WeightBinding, WeightBindingPlan,
+    LocalModelLayout, ParameterGroupOwner, ParameterMemberSpec, ParameterResourceRecipes,
+    ParameterStorageId, RecipeBindingError, WeightBinding, WeightBindingPlan,
 };
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeAlias, RecipeError},
+    recipe::{DerivedWeightRecipe, RecipeAlias, RecipeError},
     store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
 };
 use std::{
@@ -130,21 +130,26 @@ impl PreparedComponent {
                 }
             }
         }
-        let inputs = recipes
-            .values()
-            .flat_map(|owner| owner.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+        let resources = recipes
+            .into_iter()
+            .map(|(owner, outputs)| {
+                let aliases = aliases.remove(&owner).unwrap_or_default();
+                (owner, ParameterResourceRecipes { outputs, aliases })
+            })
             .collect();
-        let source: SharedCheckpointSource = Arc::new(
-            RestrictedCheckpointSource::including(source, &id, inputs)
-                .map_err(ComponentPreparationError::from)?,
-        );
+        let (source, resources) = prepare_resource_bindings(source, &id, resources)
+            .map_err(ComponentPreparationError::from)?;
         let mut units = vec![Vec::new(); description.unit_layout().len()];
         let mut pinned = BTreeMap::new();
-        for (owner, recipes) in recipes {
-            let aliases = aliases.remove(&owner).unwrap_or_default();
-            let set = AtomicRecipeSet::new_with_aliases(source.as_ref(), recipes, aliases)
+        for (owner, bindings) in resources {
+            let plan = WeightBindingPlan::new(&bindings)
+                .map_err(RecipeBindingError::from)
                 .map_err(ComponentPreparationError::from)?;
+            let resolved = plan
+                .owners()
+                .map(|binding| (binding.name(), binding))
+                .chain(plan.aliases().map(|(alias, owner)| (alias.name(), owner)))
+                .collect::<BTreeMap<_, _>>();
             let mut targets = BTreeSet::new();
             for group in description
                 .groups()
@@ -152,10 +157,9 @@ impl PreparedComponent {
                 .filter(|group| group.owner() == &owner.0)
             {
                 for member in group.members() {
-                    let (_, recipe) = set
-                        .get_resolved(member.target())
-                        .expect("resolved declared parameter");
-                    if recipe
+                    let binding = resolved[member.target()];
+                    if binding
+                        .source_recipe()
                         .infer(source.as_ref())
                         .map_err(ComponentPreparationError::from)?
                         .shape
@@ -170,8 +174,6 @@ impl PreparedComponent {
                     targets.insert(member.target().to_owned());
                 }
             }
-            let bindings = bindings_from_recipe_set(source.as_ref(), set)
-                .map_err(ComponentPreparationError::from)?;
             let bindings = bindings
                 .into_iter()
                 .map(|binding| {
