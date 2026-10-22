@@ -44,10 +44,14 @@ pub fn quantizer_local_dimensions(
     if range.is_empty() || range.end > geometry.channels as usize {
         return Err(invalid("invalid quantizer channel partition"));
     }
-    eredu_runtime::validate_logical_parameter_layout(
+    eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
         layout,
-        |_| Ok::<_, Error>(Some(range.clone())),
+        |_| {
+            Ok::<_, Error>(eredu_runtime::ParameterGroupSelection::Logical(Some(
+                range.clone(),
+            )))
+        },
     )?;
     Ok(QuantizerLocalDimensions {
         channels_start: range.start as i32,

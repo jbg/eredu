@@ -55,10 +55,14 @@ pub fn rvq_local_dimensions(
         .tensor("tts_model.tts_model.rvq_embs")
         .ok_or(TtsError::Configuration("RVQ layout omits codebook bank"))?
         .expanded_logical_range(dimensions.latent as usize)?;
-    eredu_runtime::validate_logical_parameter_layout(
+    eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
         layout,
-        |_| Ok::<_, TtsError>(Some(range.clone())),
+        |_| {
+            Ok::<_, TtsError>(eredu_runtime::ParameterGroupSelection::Logical(Some(
+                range.clone(),
+            )))
+        },
     )?;
     let local = RvqLocalDimensions {
         latent_start: range.start as i32,

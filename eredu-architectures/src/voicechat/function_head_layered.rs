@@ -14,10 +14,10 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    OwnedParameterGroupSpec, ParallelComponentKernel, ParallelLayeredInvocation,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
-    StatelessComponentState, SubmissionBackend, TensorPlacement,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParallelLayeredInvocation, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -234,43 +234,17 @@ pub fn function_head_parallel_range(
         local,
     };
     range.validate()?;
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        for member in group.members() {
-            if member.sharding() != &(MemberSharding::Balanced { axis: 0 })
-                || member.global_shape().first().copied() != Some(range.global_vocabulary)
-            {
-                return Err(ChannelError::Configuration(
-                    "function-head physical member does not preserve vocabulary rows",
-                ));
-            }
-            let mut shape = member.global_shape().to_vec();
-            shape[0] = range.local.len();
-            expected.insert(
-                member.target().to_owned(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    TensorPlacement::Range {
-                        axis: 0,
-                        start: range.local.start,
-                        end: range.local.end,
-                    },
-                    None,
-                    None,
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(ChannelError::Configuration(
-            "function-head physical layout differs from its complete row declaration",
-        ));
-    }
+    eredu_runtime::validate_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |_| {
+            Ok::<_, ChannelError>(eredu_runtime::ParameterGroupSelection::BalancedAxis {
+                axis: 0,
+                global_extent: range.global_vocabulary,
+                range: range.local.clone(),
+            })
+        },
+    )?;
     Ok(range)
 }
 

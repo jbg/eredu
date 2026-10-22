@@ -47,7 +47,7 @@ pub fn decoder_local_dimensions(
 ) -> Result<DecoderLocalDimensions, Error> {
     let description = decoder_parameter_description(config, prefix)?;
     let mut units = Vec::new();
-    eredu_runtime::validate_logical_parameter_layout(
+    eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
         layout,
         |group| -> Result<_, Error> {
@@ -56,7 +56,7 @@ pub fn decoder_local_dimensions(
                 start: range.start as i32,
                 width: range.len() as i32,
             });
-            Ok(Some(range))
+            Ok(eredu_runtime::ParameterGroupSelection::Logical(Some(range)))
         },
     )?;
     Ok(DecoderLocalDimensions { units })

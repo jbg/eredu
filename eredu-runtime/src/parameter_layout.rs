@@ -60,7 +60,7 @@ pub fn derive_partitioned_group_layout<'a>(
 ///
 /// The selected tensor retains the declaration's semantic domain. Physical shape
 /// and axis placement never infer that interval, including for chunked members.
-/// Use `validate_logical_parameter_layout` to validate the complete physical group.
+/// Use `validate_parameter_layout` to validate the complete physical group.
 pub fn logical_parameter_group_range(
     group: &crate::ParameterGroupSpec,
     layout: &crate::LocalModelLayout,
@@ -106,28 +106,67 @@ pub fn logical_parameter_group_range(
         .ok_or_else(invalid)
 }
 
-/// Validates exact physical tensors against family-selected logical group ranges.
+/// Family-selected geometry validated against one declared physical parameter group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterGroupSelection {
+    /// Semantic group interval, including fused segments and explicit chunks.
+    /// `None` selects a group containing only replicated members without a domain.
+    Logical(Option<Range<usize>>),
+    /// Explicit contiguous interval of an independently balanced tensor axis.
+    /// Every member declares the same axis and complete physical extent. Rank and
+    /// communicator admission remain separate: an uneven interval implies neither.
+    BalancedAxis {
+        /// Declared tensor axis.
+        axis: usize,
+        /// Complete physical axis extent shared by all members.
+        global_extent: usize,
+        /// Exact caller-selected interval on that axis.
+        range: Range<usize>,
+    },
+}
+
+/// Validates exact physical tensors against family-selected group geometry.
 ///
-/// Families select coupled semantic ranges; the shared lowering checks uniform
-/// and chunked partitions, fused segments, replicas, shapes and companion metadata.
-/// The supplied layout contains exactly these groups, including replicated groups
-/// whose selection is `None`. No topology is inferred from a tensor's shape.
-/// Independent axis shards and expert placement use their rank-aware lowering.
-pub fn validate_logical_parameter_layout<'a, E>(
+/// The shared lowering checks logical partitions, explicit balanced-axis ranges,
+/// fused segments, chunks, replicas, shapes and companion metadata. The supplied
+/// layout contains exactly these groups. No topology is inferred from a tensor's
+/// shape or selected interval. Packed expert ownership uses rank-aware lowering.
+pub fn validate_parameter_layout<'a, E>(
     groups: impl IntoIterator<Item = &'a crate::ParameterGroupSpec>,
     layout: &crate::LocalModelLayout,
-    mut select: impl FnMut(&crate::ParameterGroupSpec) -> Result<Option<Range<usize>>, E>,
+    mut select: impl FnMut(&crate::ParameterGroupSpec) -> Result<ParameterGroupSelection, E>,
 ) -> Result<(), E>
 where
     E: From<crate::ParallelPlanError>,
 {
     let mut targets = std::collections::BTreeSet::new();
     for group in groups {
-        let logical = select(group)?;
+        let selected = select(group)?;
+        if matches!(selected, ParameterGroupSelection::BalancedAxis { .. })
+            && group.partition_units().is_some()
+        {
+            return Err(crate::ParallelPlanError::InvalidGroup(format!(
+                "parameter group {:?} declares a logical domain for independent axis selection",
+                group.logical_name(),
+            ))
+            .into());
+        }
+        let logical = match &selected {
+            ParameterGroupSelection::Logical(range) => range.clone(),
+            ParameterGroupSelection::BalancedAxis { .. } => None,
+        };
         for member in group.members() {
-            let (placement, shape) =
-                resolve_logical_member(member, group.partition_units(), logical.as_ref())
-                    .map_err(crate::ParallelPlanError::InvalidTensor)?;
+            let (placement, shape) = match &selected {
+                ParameterGroupSelection::Logical(range) => {
+                    resolve_logical_member(member, group.partition_units(), range.as_ref())
+                }
+                ParameterGroupSelection::BalancedAxis {
+                    axis,
+                    global_extent,
+                    range,
+                } => resolve_balanced_member(member, *axis, *global_extent, range),
+            }
+            .map_err(crate::ParallelPlanError::InvalidTensor)?;
             let expected = local_tensor(group, member, shape, placement, logical.clone());
             if !targets.insert(member.target()) {
                 return Err(crate::ParallelPlanError::InvalidTensor(format!(
@@ -349,7 +388,7 @@ fn resolve_member(
             let dimension = member_axis(member, *axis)?;
             let range = eredu_core::balanced_contiguous_range(dimension, parts, rank, false)
                 .map_err(|error| error.to_string())?;
-            Ok(ranged(member, *axis, range))
+            resolve_balanced_member(member, *axis, dimension, &range)
         }
         MemberSharding::Partitioned { .. }
         | MemberSharding::PartitionedChunks { .. }
@@ -388,6 +427,26 @@ fn ranged(
         },
         shape,
     )
+}
+
+fn resolve_balanced_member(
+    member: &crate::ParameterMemberSpec,
+    axis: usize,
+    global_extent: usize,
+    range: &Range<usize>,
+) -> Result<(crate::TensorPlacement, Vec<usize>), String> {
+    if member.sharding() != &(crate::MemberSharding::Balanced { axis })
+        || global_extent == 0
+        || member_axis(member, axis)? != global_extent
+        || range.is_empty()
+        || range.end > global_extent
+    {
+        return Err(format!(
+            "tensor {:?} does not preserve axis {axis} extent {global_extent} selection {range:?}",
+            member.target(),
+        ));
+    }
+    Ok(ranged(member, axis, range.clone()))
 }
 
 fn resolve_logical_member(

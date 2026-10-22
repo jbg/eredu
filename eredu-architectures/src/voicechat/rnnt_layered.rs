@@ -20,9 +20,9 @@ use eredu_runtime::{
     ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel, ComponentUnit,
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
-    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
-    StatelessComponentState, SubmissionBackend, TensorPlacement,
+    MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState,
+    SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
 
@@ -257,47 +257,21 @@ pub(crate) fn rnnt_local_dimensions_for_description(
         vocabulary_start: start as i32,
         vocabulary_end: end as i32,
     };
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        for member in group.members() {
-            let mut shape = member.global_shape().to_vec();
-            let placement = match member.sharding() {
-                MemberSharding::Balanced { axis: 0 } if shape[0] == range.global_vocabulary => {
-                    shape[0] = range.local.len();
-                    TensorPlacement::Range {
-                        axis: 0,
-                        start,
-                        end,
-                    }
+    eredu_runtime::validate_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |group| {
+            Ok::<_, RnntError>(if group.role() == ParameterRole::Vocabulary {
+                eredu_runtime::ParameterGroupSelection::BalancedAxis {
+                    axis: 0,
+                    global_extent: range.global_vocabulary,
+                    range: range.local.clone(),
                 }
-                MemberSharding::Replicated => TensorPlacement::Replicated,
-                _ => {
-                    return Err(RnntError::InvalidConfiguration(
-                        "RNNT member has incompatible vocabulary placement",
-                    ))
-                }
-            };
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    placement,
-                    None,
-                    None,
-                    false,
-                ),
-            );
-        }
-    }
-    if &expected != layout {
-        return Err(RnntError::InvalidConfiguration(
-            "RNNT physical layout differs from vocabulary and replica declarations",
-        ));
-    }
+            } else {
+                eredu_runtime::ParameterGroupSelection::Logical(None)
+            })
+        },
+    )?;
     Ok(local)
 }
 // Function pointers preserve ordinary construction for neutral backends without

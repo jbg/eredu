@@ -6889,19 +6889,24 @@ read rows, output columns and scale companions. Independently encoded fused
 gate/up tails require their own explicit scale geometry; the chunk contract alone
 does not establish support for that layout.
 
-`eredu-runtime::validate_logical_parameter_layout` validates supplied physical
-layouts against family-selected logical group intervals. It uses the same member
-lowering as rank-based placement for uniform partitions, fused segments and
-explicit chunks, including replicated companions. It rejects missing or extra
-parameters and mismatched shapes, group metadata or placements with typed errors.
+`eredu-runtime::validate_parameter_layout` validates supplied physical
+layouts against typed family-selected group geometry. `ParameterGroupSelection`
+selects a logical group interval or an explicit range of a declared balanced axis.
+It uses the same member lowering as rank-based placement for uniform partitions,
+fused segments, explicit chunks and balanced axes, including physical companions.
+It rejects missing or extra parameters and mismatched shapes, group metadata or placements with typed errors.
 `logical_parameter_group_range` extracts the declared semantic interval from a
 partitioned member's retained metadata, including explicit chunks. EAR encoder
 and decoder local geometry uses this extraction before complete layout validation.
 RVQ, MoG, character/speaker conditioning and EAR encoder, decoder and PRVQ geometry
 consume shared validation. Families retain coupled latent, feature and
 convolution ranges and their state geometry; native construction consumes the
-validated physical tensors. Independently sharded vocabulary axes and packed
-expert ownership retain their separate rank-aware placement contracts.
+validated physical tensors. RNNT and the function head select complete vocabulary
+axis ranges through this same validator. Their communicator validation remains
+separate, since an uneven interval does not identify a rank or degree. Function-head
+format admission retains its requirement that every physical companion preserves
+the complete vocabulary axis. Packed expert ownership retains its rank-aware
+placement contract.
 
 `eredu-nn::LinearRowLayout` declares independent row-block origins in a projection.
 Architecture format specifications carry that declaration into parameter metadata;

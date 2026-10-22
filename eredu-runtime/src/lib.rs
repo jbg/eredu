@@ -337,7 +337,8 @@ pub use parameter::{
 };
 pub use parameter_layout::{
     derive_partitioned_group_layout, derive_partitioned_local_layout,
-    logical_parameter_group_range, retained_partition_layout, validate_logical_parameter_layout,
+    logical_parameter_group_range, retained_partition_layout, validate_parameter_layout,
+    ParameterGroupSelection,
 };
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,

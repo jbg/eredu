@@ -52,17 +52,19 @@ pub fn mog_local_dimensions(
         dimensions.intermediate,
     )?;
     let rank = range("tts_model.tts_model.mog_head.low_mat", dimensions.rank)?;
-    eredu_runtime::validate_logical_parameter_layout(
+    eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
         layout,
         |group| {
-            Ok::<_, TtsError>(group.partition_units().map(|_| {
-                if group.logical_name() == format!("{COMPONENTS}.low_rank") {
-                    rank.clone()
-                } else {
-                    intermediate.clone()
-                }
-            }))
+            Ok::<_, TtsError>(eredu_runtime::ParameterGroupSelection::Logical(
+                group.partition_units().map(|_| {
+                    if group.logical_name() == format!("{COMPONENTS}.low_rank") {
+                        rank.clone()
+                    } else {
+                        intermediate.clone()
+                    }
+                }),
+            ))
         },
     )?;
     Ok(MogLocalDimensions {

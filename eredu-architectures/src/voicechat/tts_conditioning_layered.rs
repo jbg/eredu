@@ -109,17 +109,19 @@ pub fn conditioning_local_dimensions(
             "empty conditioning feature partition",
         ));
     }
-    eredu_runtime::validate_logical_parameter_layout(
+    eredu_runtime::validate_parameter_layout(
         description.groups().iter().map(|owned| owned.group()),
         layout,
         |group| {
-            Ok::<_, TtsError>(group.partition_units().map(|_| {
-                if group.logical_name() == format!("{CHARACTER}.tokens") {
-                    character.clone()
-                } else {
-                    output.clone()
-                }
-            }))
+            Ok::<_, TtsError>(eredu_runtime::ParameterGroupSelection::Logical(
+                group.partition_units().map(|_| {
+                    if group.logical_name() == format!("{CHARACTER}.tokens") {
+                        character.clone()
+                    } else {
+                        output.clone()
+                    }
+                }),
+            ))
         },
     )?;
     Ok(ConditioningLocalDimensions {

@@ -492,8 +492,8 @@ mod component_preparation {
     #[test]
     fn logical_layout_admission_preserves_exact_selection_and_resource_authority() {
         use eredu_runtime::{
-            validate_logical_parameter_layout, LocalModelLayout, LocalTensorLayout,
-            ParallelPlanError, TensorPlacement,
+            validate_parameter_layout, LocalModelLayout, LocalTensorLayout, ParallelPlanError,
+            TensorPlacement,
         };
         let prepared = prepared();
         let description = prepared.description();
@@ -523,14 +523,16 @@ mod component_preparation {
             }
         }
         let validate = |layout: &LocalModelLayout, range: Option<std::ops::Range<usize>>| {
-            validate_logical_parameter_layout(groups(), layout, |group| {
+            validate_parameter_layout(groups(), layout, |group| {
                 let retained = eredu_runtime::logical_parameter_group_range(group, layout)?;
                 if Some(retained) != range {
                     return Err(ParallelPlanError::InvalidGroup(
                         "selection differs from retained semantic geometry".into(),
                     ));
                 }
-                Ok(range.clone())
+                Ok(eredu_runtime::ParameterGroupSelection::Logical(
+                    range.clone(),
+                ))
             })
         };
         validate(&layout, Some(selected.clone())).unwrap();
@@ -576,6 +578,167 @@ mod component_preparation {
                 [3, 2]
             );
         }
+    }
+
+    #[test]
+    fn axis_layout_admission_keeps_companions_aligned_and_replicas_whole() {
+        use super::{AtomicUsize, Ordering, Source};
+        use eredu_runtime::{
+            derive_partitioned_local_layout, validate_parameter_layout, LocalModelLayout,
+            LocalTensorLayout, ParallelPlanError, ParameterGroupSelection, TensorPlacement,
+        };
+        let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
+        let units = ExecutionUnitLayout::new(&graph, [2]).unwrap();
+        let projection = ParameterGroupSpec::new(
+            "projection",
+            ParameterRole::Vocabulary,
+            [ParameterMemberSpec::new(
+                "weight",
+                [11, 64],
+                MemberSharding::Balanced { axis: 0 },
+            )],
+        )
+        .unwrap();
+        let projection =
+            eredu_runtime::expand_linear_format_parameter_groups(vec![projection], |_| {
+                Ok(Some(
+                    eredu_nn::LinearFormatSpec::scaled(
+                        eredu_checkpoint::LinearFormat::MxFp4,
+                        eredu_nn::ParameterSpec::trainable("scale").unwrap(),
+                    )
+                    .unwrap(),
+                ))
+            })
+            .unwrap()
+            .remove(0);
+        let groups = [
+            projection,
+            ParameterGroupSpec::new(
+                "replica",
+                ParameterRole::Replicated,
+                [ParameterMemberSpec::new(
+                    "recurrent",
+                    [2],
+                    MemberSharding::Replicated,
+                )],
+            )
+            .unwrap(),
+        ];
+        let owned = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit(units.group_id(0).unwrap().clone(), index),
+                    group.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let description =
+            ArchitectureParameterDescription::new(&graph, &units, groups, owned).unwrap();
+        let original = Arc::new(Source {
+            store: MemoryWeightStore::from_safetensors([
+                (
+                    "physical.weight".into(),
+                    safetensors::Dtype::U32,
+                    vec![11, 8],
+                    vec![0; 352],
+                ),
+                (
+                    "physical.scale".into(),
+                    safetensors::Dtype::U8,
+                    vec![11, 2],
+                    vec![0; 22],
+                ),
+                (
+                    "physical.recurrent".into(),
+                    safetensors::Dtype::F32,
+                    vec![2],
+                    vec![0; 8],
+                ),
+                (
+                    "neighbor".into(),
+                    safetensors::Dtype::F32,
+                    vec![2],
+                    vec![0; 8],
+                ),
+            ])
+            .unwrap(),
+            overlay: false,
+            leases: AtomicUsize::new(0),
+        });
+        let prepared =
+            PreparedComponent::prepare("axis-contract", description, original.clone(), |member| {
+                Ok::<_, ComponentPreparationError>(DerivedWeightRecipe::source(
+                    format!("physical.{}", member.target()),
+                    TensorSelection::Full,
+                ))
+            })
+            .unwrap();
+        let description = prepared.description();
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        let layout = derive_partitioned_local_layout(description, topology).unwrap();
+        let validate = |layout: &LocalModelLayout, range: std::ops::Range<usize>| {
+            validate_parameter_layout(
+                description.groups().iter().map(|owned| owned.group()),
+                layout,
+                |group| {
+                    Ok::<_, ParallelPlanError>(if group.role() == ParameterRole::Vocabulary {
+                        ParameterGroupSelection::BalancedAxis {
+                            axis: 0,
+                            global_extent: 11,
+                            range: range.clone(),
+                        }
+                    } else {
+                        ParameterGroupSelection::Logical(None)
+                    })
+                },
+            )
+        };
+        validate(&layout, 6..11).unwrap();
+        assert!(validate(&layout, 11..11).is_err());
+        assert!(validate(&layout, 6..12).is_err());
+        for (target, shape, range) in [("scale", vec![5, 2], 0..5), ("recurrent", vec![1], 0..1)] {
+            let mut invalid = layout.clone();
+            let tensor = layout.tensor(target).unwrap();
+            invalid.insert(
+                target.into(),
+                LocalTensorLayout::new(
+                    tensor.logical_name(),
+                    tensor.role(),
+                    tensor.global_shape().to_vec(),
+                    shape,
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: range.start,
+                        end: range.end,
+                    },
+                    None,
+                    None,
+                    false,
+                ),
+            );
+            assert!(validate(&invalid, 6..11).is_err());
+        }
+        let prepared = prepared.select(&layout).unwrap();
+        assert_eq!(
+            prepared
+                .unit_bindings()
+                .iter()
+                .flatten()
+                .map(|binding| binding.expected_bytes())
+                .sum::<u64>(),
+            178
+        );
+        assert_eq!(
+            prepared.source().source_keys(),
+            ["physical.recurrent", "physical.scale", "physical.weight"]
+        );
+        assert_eq!(original.leases.load(Ordering::SeqCst), 0);
     }
 
     #[test]
