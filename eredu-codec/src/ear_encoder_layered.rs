@@ -17,7 +17,8 @@ use eredu_runtime::{
 };
 use std::marker::PhantomData;
 
-const ENCODER: &str = "ear.encoder";
+/// Stable execution group for independently leased EAR encoder units.
+pub const ENCODER_GROUP: &str = "ear.encoder";
 /// Exact local range within one unit's declared partition axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderUnitLocalDimensions {
@@ -150,7 +151,7 @@ pub fn encoder_component_definition(
             parallel_subgroup: None,
             request_optional: false,
         }],
-        ENCODER,
+        ENCODER_GROUP,
         vec![],
         StatelessComponentState::state_layout()?,
         ArchitectureStatePartitionPlan::new([]),
@@ -260,8 +261,8 @@ impl<B: NeuralBackend> EncoderKernel<B> {
 }
 fn encoder_graph() -> Result<ExecutionGraph, Error> {
     Ok(ExecutionGraph::new(
-        vec![ExecutionGroupSpec::root(ENCODER)],
-        ENCODER,
+        vec![ExecutionGroupSpec::root(ENCODER_GROUP)],
+        ENCODER_GROUP,
     )?)
 }
 /// Cold canonical pointwise, ConvNeXt and downsampling parameter ownership.

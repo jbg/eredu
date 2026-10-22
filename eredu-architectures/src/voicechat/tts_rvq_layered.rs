@@ -20,8 +20,8 @@ use eredu_runtime::{
 };
 use std::marker::PhantomData;
 
-const BANK: &str = "voicechat.tts.rvq.bank";
-const PROJECTION: &str = "voicechat.tts.rvq.projection";
+pub(super) const BANK: &str = "voicechat.tts.rvq.bank";
+pub(super) const PROJECTION: &str = "voicechat.tts.rvq.projection";
 
 /// Coherent latent-channel slice shared by the bank and feedback projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

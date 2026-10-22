@@ -565,21 +565,27 @@ integer buffers are excluded. This unit mechanism does not declare a full speech
 graph residency schedule or distributed executable.
 
 `SpeechConstructionPlan` validates normalized speech geometry without native
-resources and constructs unloaded perception, RNNT, function-head, character/TTS,
-MoG and codec units through ordinary neural mechanisms. Transformer and convolution
-stacks expose individual blocks; codec codebook depths are separate units.
-`PreparedSpeechConstruction` restricts that catalog to retained component roles
-and returns each module with its exact parameter projection. Missing roles and
-invalid indices fail before module construction. Default perception, TTS and codec
-preparation selects F32 execution, with input/output conversion overlap included
+resources and projects each unit's canonical parameter catalog from the existing
+family declarations by execution-group identity and global unit index. It constructs
+unloaded perception, RNNT, function-head, character/TTS, MoG and codec units through
+ordinary neural mechanisms. Transformer and convolution stacks expose individual
+blocks; codec codebook depths are separate units.
+`PreparedSpeechConstruction` restricts that catalog to retained component roles.
+Its cold `prepare_unit` resolves recipes and validates declared geometry through
+`PreparedComponent` before native construction. Module construction and consuming
+assembly use those same exact bindings; parameter discovery needs no unloaded
+native module. The low-level module projection remains available for caller-supplied
+modules and validates their explicit aliases. Missing roles, invalid indices and
+recipe geometry errors fail before module construction. Default perception, TTS
+and codec preparation selects F32 execution, with input/output conversion overlap included
 in materialization bounds. The portable speech precision policy selects eligible
 narrow perception/TTS weights and arithmetic; RNNT and function-head precision
 are governed by their component equations.
 
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared
-`materialize` route checks every required speech source role before construction,
-then selects and binds each unit through shared runtime materialization and exact
+`materialize` route checks every required speech source role and prepares every
+unit's recipes before construction or payload reads, then selects and binds each unit through shared runtime materialization and exact
 completion handling. Binding failure stops assembly and preserves the original
 error through `BackendFailure`; no partial aggregate is returned. Materialization
 is unitwise, but the returned aggregate retains all its bound speech weights.

@@ -399,7 +399,8 @@ impl<B: NeuralBackend> QuantizerKernel<B> {
     }
 }
 
-fn group_name(depth: usize) -> String {
+/// Stable execution group for one independently leased residual codebook depth.
+pub fn codebook_group_name(depth: usize) -> String {
     format!("prvq.codebook.{depth}")
 }
 /// Validated selected-depth invocations over independently leased codebooks.
@@ -439,13 +440,19 @@ fn quantizer_graph(geometry: Geometry) -> Result<ExecutionGraph, Error> {
     let groups: Vec<_> = (0..geometry.depth)
         .map(|depth| {
             if depth == 0 {
-                ExecutionGroupSpec::root(group_name(depth))
+                ExecutionGroupSpec::root(codebook_group_name(depth))
             } else {
-                ExecutionGroupSpec::with_dependencies(group_name(depth), [group_name(depth - 1)])
+                ExecutionGroupSpec::with_dependencies(
+                    codebook_group_name(depth),
+                    [codebook_group_name(depth - 1)],
+                )
             }
         })
         .collect();
-    Ok(ExecutionGraph::new(groups, group_name(geometry.depth - 1))?)
+    Ok(ExecutionGraph::new(
+        groups,
+        codebook_group_name(geometry.depth - 1),
+    )?)
 }
 /// Cold canonical means/scalar geometry with one independently owned group per depth.
 pub fn quantizer_parameter_description(

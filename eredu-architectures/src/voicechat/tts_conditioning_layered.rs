@@ -24,9 +24,9 @@ use eredu_runtime::{
 };
 use std::marker::PhantomData;
 
-const CHARACTER: &str = "voicechat.tts.conditioning.character";
-const INGRESS: &str = "voicechat.tts.conditioning.ingress";
-const FUSION: &str = "voicechat.tts.conditioning.fusion";
+pub(super) const CHARACTER: &str = "voicechat.tts.conditioning.character";
+pub(super) const INGRESS: &str = "voicechat.tts.conditioning.ingress";
+pub(super) const FUSION: &str = "voicechat.tts.conditioning.fusion";
 /// Exact geometry of the three independent learned conditioning units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConditioningDimensions {

@@ -19,9 +19,9 @@ use eredu_runtime::{
 };
 use std::marker::PhantomData;
 
-const BLOCKS: &str = "voicechat.tts.mog.layers";
-const PREDICTION: &str = "voicechat.tts.mog.prediction";
-const COMPONENTS: &str = "voicechat.tts.mog.components";
+pub(super) const BLOCKS: &str = "voicechat.tts.mog.layers";
+pub(super) const PREDICTION: &str = "voicechat.tts.mog.prediction";
+pub(super) const COMPONENTS: &str = "voicechat.tts.mog.components";
 
 /// Local contraction widths; all residual, mixture and latent dimensions remain global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

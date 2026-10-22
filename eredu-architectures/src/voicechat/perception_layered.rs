@@ -31,9 +31,9 @@ pub use partition::{
     PerceptionBoundarySchema,
 };
 
-const SUBSAMPLING: &str = "voicechat.perception.subsampling";
-const ENCODER: &str = "voicechat.perception.encoder";
-const PROJECTION: &str = "voicechat.perception.projection";
+pub(super) const SUBSAMPLING: &str = "voicechat.perception.subsampling";
+pub(super) const ENCODER: &str = "voicechat.perception.encoder";
+pub(super) const PROJECTION: &str = "voicechat.perception.projection";
 
 pub(super) fn backend(error: impl std::error::Error + Send + Sync + 'static) -> PerceptionError {
     PerceptionError::Backend(BackendFailure::from_error(error))

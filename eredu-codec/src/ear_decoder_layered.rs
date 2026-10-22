@@ -23,7 +23,8 @@ use eredu_core::cache::{
     StateTensorPresence, StateTensorRole,
 };
 use std::num::NonZeroU32;
-const DECODER: &str = "ear.decoder";
+/// Stable execution group for independently leased EAR decoder units.
+pub const DECODER_GROUP: &str = "ear.decoder";
 /// Exact local range within one unit's declared partition axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecoderUnitLocalDimensions {
@@ -271,7 +272,7 @@ pub fn decoder_component_definition(
             parallel_subgroup: None,
             request_optional: false,
         }],
-        DECODER,
+        DECODER_GROUP,
         vec![],
         decoder_state_layout(config)?,
         ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
@@ -390,8 +391,8 @@ impl<B: NeuralBackend> DecoderKernel<B> {
 }
 fn decoder_graph() -> Result<ExecutionGraph, Error> {
     Ok(ExecutionGraph::new(
-        vec![ExecutionGroupSpec::root(DECODER)],
-        DECODER,
+        vec![ExecutionGroupSpec::root(DECODER_GROUP)],
+        DECODER_GROUP,
     )?)
 }
 /// Cold canonical convolution layouts and exact independent unit ownership.
