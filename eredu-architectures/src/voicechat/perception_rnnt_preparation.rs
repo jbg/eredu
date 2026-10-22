@@ -217,7 +217,6 @@ impl PreparedPerceptionRnntPipelineBindings {
                 predictor
                     .bindings()
                     .unit_bindings()
-                    .iter()
                     .flat_map(|(_, unit)| unit),
             )?,
             projection_parameter_bytes: parameter_bytes(

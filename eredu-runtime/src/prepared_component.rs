@@ -240,6 +240,19 @@ impl PreparedComponent {
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
         &self.units
     }
+    /// Selected logical addresses paired with their independently leased bindings.
+    /// Dense storage ordinals never replace group or global unit identities.
+    pub fn addressed_unit_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (ExecutionUnitAddress, &[WeightBinding])> {
+        self.units.iter().enumerate().map(|(ordinal, bindings)| {
+            (
+                self.unit_layout.address(ordinal).expect("selected unit"),
+                bindings.as_slice(),
+            )
+        })
+    }
+
     /// Pinned canonical storage, including shared consumers.
     pub fn pinned_bindings(&self) -> &BTreeMap<ParameterStorageId, Vec<WeightBinding>> {
         &self.pinned
@@ -605,6 +618,27 @@ impl PreparedComponent {
             self.units,
             self.pinned,
         )
+    }
+
+    /// Transfers unit-only authority with explicit canonical invocation addresses.
+    pub fn into_addressed_unit_parts(
+        self,
+    ) -> Result<
+        (
+            Option<LocalModelLayout>,
+            ExecutionUnitLayout,
+            SharedCheckpointSource,
+            Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
+        ),
+        ComponentPreparationError,
+    > {
+        let (local, layout, source, units) = self.into_unit_parts()?;
+        let units = units
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, bindings)| (layout.address(ordinal).expect("selected unit"), bindings))
+            .collect();
+        Ok((local, layout, source, units))
     }
 
     /// Transfers exact unit-only authority to existing materialization drivers.

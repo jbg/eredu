@@ -1,23 +1,19 @@
 //! Exact source projection from RNNT bindings into one recurrent pipeline stage.
 use super::{
-    rnnt::{RnntDimensions, RnntError},
+    rnnt::RnntDimensions,
     rnnt_predictor::rnnt_predictor_parameter_description,
     rnnt_predictor_partition::{validate_rnnt_predictor_partition, RnntPredictorBoundarySchema},
     rnnt_preparation::{PreparedRnntBindings, RnntPreparationError},
 };
-use eredu_checkpoint::store::{RestrictedCheckpointSource, SharedCheckpointSource};
+use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{
     ArchitecturePartition, ExecutionUnitAddress, ExecutionUnitLayout, LocalModelLayout,
-    WeightBinding,
+    PreparedComponent, WeightBinding,
 };
-use std::{collections::BTreeSet, sync::Arc};
 /// Retained canonical LSTM recipes and explicit optional replica placement.
 pub struct PreparedRnntPredictorBindings {
     dimensions: RnntDimensions,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
-    local_layout: Option<LocalModelLayout>,
+    prepared: PreparedComponent,
 }
 impl PreparedRnntPredictorBindings {
     /// Selects only a stage's predictor units; embedding and joint sources are excluded.
@@ -28,53 +24,24 @@ impl PreparedRnntPredictorBindings {
         let dimensions = bindings.dimensions();
         let range = validate_rnnt_predictor_partition(dimensions, partition)?;
         let description = rnnt_predictor_parameter_description(dimensions)?;
-        let (_, _, full_layout, source, full_units) = bindings.into_parts();
-        let mut units = Vec::new();
-        for (ordinal, bindings) in full_units.into_iter().enumerate() {
-            for index in range.clone() {
-                if full_layout.ordinal(1, index) == Some(ordinal) {
-                    units.push((
-                        description
-                            .unit_layout()
-                            .address(index)
-                            .expect("validated predictor unit"),
-                        bindings,
-                    ));
-                    break;
-                }
-            }
-        }
-        if units.len() != range.len() {
-            return Err(RnntError::InvalidState(
-                "RNNT predictor retained source omits selected layers",
-            )
-            .into());
-        }
-        let inputs = units
-            .iter()
-            .flat_map(|(_, bindings)| bindings)
-            .flat_map(|binding| {
-                binding
-                    .source_recipe()
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
+        let selected = range
+            .map(|index| {
+                description
+                    .unit_layout()
+                    .address(index)
+                    .expect("validated predictor unit")
             })
-            .collect::<BTreeSet<_>>();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "voicechat/rnnt/predictor-stage",
-            inputs,
-        )?);
+            .collect::<Vec<_>>();
+        let prepared = bindings
+            .prepared
+            .project("voicechat/rnnt/predictor-stage", description)?
+            .select_units(selected)?;
         Ok(Self {
             dimensions,
-            layout: description.unit_layout().clone(),
-            source,
-            units,
-            local_layout: None,
+            prepared,
         })
     }
+
     /// Selects explicit tensor replicas for a combined TP/PP execution cohort.
     /// Recurrent parameters retain their complete payload on every participant.
     pub fn select_parallel(
@@ -94,32 +61,17 @@ impl PreparedRnntPredictorBindings {
             topology,
         )
         .map_err(RnntPreparationError::Parallel)?;
-        if self
-            .local_layout
-            .as_ref()
-            .is_some_and(|selected| selected != &layout)
-        {
-            return Err(RnntPreparationError::Parallel(
-                "predictor replica placement differs from retained selection".into(),
-            ));
-        }
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(&layout)?;
         Ok((self, layout))
     }
     /// Exact completed prediction tensor payload, including the separately retained
     /// final readout on non-final stages in addition to phase-local recurrent carry.
     pub fn prediction_state_bytes(&self) -> Result<u64, RnntPreparationError> {
-        let range = self
-            .units
-            .first()
-            .expect("validated nonempty stage")
-            .0
-            .index()
-            ..self
-                .units
-                .last()
+        let units = self.prepared.unit_layout();
+        let range = units.address(0).expect("validated nonempty stage").index()
+            ..units
+                .address(units.len() - 1)
                 .expect("validated nonempty stage")
-                .0
                 .index()
                 + 1;
         Ok(super::rnnt_predictor::rnnt_predictor_prediction_state_bytes(self.dimensions, range)?)
@@ -130,15 +82,17 @@ impl PreparedRnntPredictorBindings {
     }
     /// Exact optional full-replica declaration used by cold pipeline validation.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
     /// Exact canonical stage units and their complete physical parameter bindings.
-    pub fn unit_bindings(&self) -> &[(ExecutionUnitAddress, Vec<WeightBinding>)] {
-        &self.units
+    pub fn unit_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (ExecutionUnitAddress, &[WeightBinding])> {
+        self.prepared.addressed_unit_bindings()
     }
     /// Restricted retained sources; no non-predictor or neighboring-stage tensor is visible.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
     /// Transfers prepared recipes in the same globally addressed order as execution.
     pub fn into_parts(
@@ -149,6 +103,10 @@ impl PreparedRnntPredictorBindings {
         SharedCheckpointSource,
         Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
-        (self.dimensions, self.layout, self.source, self.units)
+        let (_, layout, source, units) = self
+            .prepared
+            .into_addressed_unit_parts()
+            .expect("predictor declares only independently leased units");
+        (self.dimensions, layout, source, units)
     }
 }

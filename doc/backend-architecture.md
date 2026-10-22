@@ -994,6 +994,12 @@ adapter. Its `RnntPredictorKernel` supplies the same LSTM equations for complete
 and selected pipeline execution, with independent local parent and candidate carry. The shared `Recurrent` group kind is mandatory even without
 text or modality ingress. Exact prepared views restrict each stage to its owned
 LSTM parameters; TP cohorts replicate these small recurrent layers explicitly.
+`PreparedRnntPredictorBindings` projects canonical resource identities from the
+retained RNNT `PreparedComponent` and selects stage addresses through the shared
+sparse layout. Its compact local ordinals preserve global recurrent layer
+indices. Projection excludes embedding, joint and neighboring-stage sources,
+and retains any selected replica placement; repeated selection validates that
+placement without applying recipes twice.
 Typed boundaries carry the hidden row, zero-state prototype, global layer cut and
 full-width explicit predictor step. Cold communication admission checks the
 readout's complete F32 broadcast bounds as well as the boundary roles.

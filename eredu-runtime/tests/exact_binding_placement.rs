@@ -517,6 +517,100 @@ mod component_preparation {
     }
 
     #[test]
+    fn component_projection_rebases_groups_without_losing_sparse_addresses_or_placement() {
+        let projected_description = description(&[0, 1, 2]);
+        let graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("ingress"),
+                ExecutionGroupSpec::with_dependencies("units", ["ingress"]),
+            ],
+            "units",
+        )
+        .unwrap();
+        let layout = ExecutionUnitLayout::new(&graph, [1, 3]).unwrap();
+        let complete = ArchitectureParameterDescription::new(
+            &graph,
+            &layout,
+            projected_description
+                .groups()
+                .iter()
+                .map(|owned| owned.group().clone()),
+            projected_description.groups().iter().cloned(),
+        )
+        .unwrap();
+        let source = prepared().source().clone();
+        let original = PreparedComponent::prepare("complete", complete, source, |member| {
+            let index = member.target().strip_prefix("weight.").unwrap();
+            Ok::<_, ComponentPreparationError>(DerivedWeightRecipe::source(
+                format!("physical.{index}"),
+                TensorSelection::Full,
+            ))
+        })
+        .unwrap();
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        let local =
+            eredu_runtime::derive_partitioned_local_layout(original.description(), topology)
+                .unwrap();
+        let original = original.select(&local).unwrap();
+        let recipes = original
+            .unit_bindings()
+            .iter()
+            .flatten()
+            .map(|binding| (binding.name().to_owned(), binding.source_recipe()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let selected =
+            [1, 2].map(|index| projected_description.unit_layout().address(index).unwrap());
+        let projected = original
+            .project("projected", projected_description)
+            .unwrap()
+            .select_units(selected)
+            .unwrap();
+        let retained = projected.local_layout().unwrap().clone();
+        let projected = projected.select(&retained).unwrap();
+        assert_eq!(
+            projected.source().source_keys(),
+            ["physical.1", "physical.2"]
+        );
+        assert_eq!(projected.unit_layout().ordinal(0, 1), Some(0));
+        assert_eq!(projected.unit_layout().ordinal(0, 2), Some(1));
+        assert_eq!(
+            projected
+                .addressed_unit_bindings()
+                .map(|(address, _)| address)
+                .collect::<Vec<_>>(),
+            selected
+        );
+        for (_, bindings) in projected.addressed_unit_bindings() {
+            for binding in bindings {
+                assert_eq!(binding.source_recipe(), recipes[binding.name()]);
+                assert_eq!(
+                    binding
+                        .source_recipe()
+                        .infer(projected.source().as_ref())
+                        .unwrap()
+                        .shape(),
+                    [2, 2]
+                );
+            }
+        }
+        let (placement, layout, source, units) = projected.into_addressed_unit_parts().unwrap();
+        assert_eq!(placement, Some(retained));
+        assert_eq!(layout.address(0), Some(selected[0]));
+        assert_eq!(
+            units
+                .into_iter()
+                .map(|(address, _)| address)
+                .collect::<Vec<_>>(),
+            selected
+        );
+        assert_eq!(source.source_keys(), ["physical.1", "physical.2"]);
+    }
+
+    #[test]
     fn component_projection_rejects_unretained_storage() {
         let prepared = prepared().project("subset", description(&[2])).unwrap();
         assert!(matches!(prepared.project("invalid", description(&[0])),
