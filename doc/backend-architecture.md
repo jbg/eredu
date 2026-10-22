@@ -7843,6 +7843,17 @@ owners resume transported token IDs and effective embeddings without re-embeddin
 MTP depths keep separate cache slots. Standalone prediction operations borrow the
 kernel through the ordinary invocation and completion lifecycle.
 
+DeepSeek V4 uses the same adapter over `V4Kernel`. Its hooks retain local and
+compressed pooling attention, token-selected expert routing, hyper-connection
+streams, sequential prediction, and fused DSpark equations. Target capture and
+prediction-group completion share one equation across serial and parallel calls;
+the backend supplies vocabulary projection and reduction operators. Selected pinned
+resources contain the shared decoder aggregate plus optional hyper-head and DSpark
+modules. Partition construction consumes canonical ownership and state origin;
+transport carries token identity and explicit capture slots while the family owns
+hyper-stream flattening and reconstruction. Prediction extensions invoke kernel
+operations through the ordinary materialization and completion lifecycle.
+
 DeepSeek execution metadata reads the retained definition. Group ingress uses its
 validated dependencies, and unit construction validates global invocation addresses.
 V3 latent/rotary caches, V4 local-key and pooling streams, and independent prediction

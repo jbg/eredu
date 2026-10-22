@@ -1393,14 +1393,18 @@ where
         ));
     };
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::deepseek::v4::Model::<B>::new(args.clone(), context))
+        .then(|| {
+            crate::deepseek::v4::V4Kernel::<B>::new(args.clone(), context)
+                .and_then(|kernel| kernel.into_model())
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_deepseek_v4_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::deepseek::v4_architecture_fingerprint(&selected_args);
-    let architecture = crate::deepseek::v4::Model::<B>::new(selected_args, context)
+    let architecture = crate::deepseek::v4::V4Kernel::<B>::new(selected_args, context)
+        .and_then(|kernel| kernel.into_model())
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::deepseek_v4(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;

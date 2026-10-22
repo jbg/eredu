@@ -1771,23 +1771,27 @@ where
     ) -> Result<Self::Output, eredu_nn::Error> {
         M::invoke_module(self.unit, context, |unit| {
             let outcome = (|| {
-                let hidden =
-                    architecture.begin_partition_prediction_hidden(self.hidden, context)?;
+                let hidden = architecture
+                    .kernel_mut()
+                    .begin_partition_prediction_hidden(self.hidden, context)?;
                 let output = if let Some(observer) = self.observer {
-                    architecture.pipeline_forward_prediction_observed(
-                        unit,
-                        self.depth,
-                        &hidden,
-                        self.tokens,
-                        self.cache,
-                        self.pass,
-                        parallel,
-                        context,
-                        observer,
-                    )
+                    architecture
+                        .kernel_mut()
+                        .pipeline_forward_prediction_observed(
+                            unit,
+                            self.depth,
+                            &hidden,
+                            self.tokens,
+                            self.cache,
+                            self.pass,
+                            parallel,
+                            context,
+                            observer,
+                        )
                 } else {
                     match parallel {
                         Some(parallel) => architecture
+                            .kernel_mut()
                             .pipeline_forward_prediction_neutral_parallel(
                                 unit,
                                 &hidden,
@@ -1796,7 +1800,7 @@ where
                                 parallel,
                                 context,
                             ),
-                        None => architecture.pipeline_forward_prediction(
+                        None => architecture.kernel_mut().pipeline_forward_prediction(
                             unit,
                             &hidden,
                             self.tokens,
@@ -1805,7 +1809,9 @@ where
                         ),
                     }
                 }?;
-                architecture.finish_partition_prediction_output(output, context)
+                architecture
+                    .kernel_mut()
+                    .finish_partition_prediction_output(output, context)
             })();
             prediction_invocation(
                 outcome,
@@ -3718,7 +3724,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Output, eredu_nn::Error> {
         M::invoke_module(self.static_modules, context, |static_modules| {
-            let outcome = architecture.pipeline_prefill_dspark_extension_context_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
+            let outcome = architecture.kernel_mut().pipeline_prefill_dspark_extension_context_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
             self.strategy,
             static_modules,
             self.units,
@@ -3778,7 +3784,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Output, eredu_nn::Error> {
         M::invoke_module(self.static_modules, context, |static_modules| {
-            let outcome = architecture.pipeline_dspark_extension_proposal_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
+            let outcome = architecture.kernel_mut().pipeline_dspark_extension_proposal_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
             self.strategy,
             static_modules,
             self.units,
@@ -4814,16 +4820,16 @@ where
                 None
             };
             let source = match &source_layout {
-                Some(layout) => crate::deepseek::v4::Model::<B>::new_parallel(
+                Some(layout) => crate::deepseek::v4::V4Kernel::<B>::new_parallel(
                     args.clone(),
                     crate::deepseek::parallel::v4_local_geometry(args, layout)
                         .map_err(|error| invalid(error.to_string()))?,
                     source_context,
                 ),
-                None => crate::deepseek::v4::Model::<B>::new(args.clone(), source_context),
+                None => crate::deepseek::v4::V4Kernel::<B>::new(args.clone(), source_context),
             }
             .map_err(|error| invalid(error.to_string()))?;
-            let local = crate::deepseek::v4::Model::<B>::new_parallel(
+            let local = crate::deepseek::v4::V4Kernel::<B>::new_parallel(
                 target_args,
                 geometry,
                 execution_context,

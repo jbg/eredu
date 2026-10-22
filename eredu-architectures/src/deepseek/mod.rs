@@ -236,7 +236,7 @@ pub fn v3_replicated_expert_realization_plan(
 
 /// Derives complete V4 routed-expert ownership and rank-local bank geometry.
 pub fn v4_expert_realization_plan<B>(
-    architecture: &v4::Model<B>,
+    architecture: &v4::V4Kernel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error>
 where
