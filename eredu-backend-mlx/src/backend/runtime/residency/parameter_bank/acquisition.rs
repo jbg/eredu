@@ -443,51 +443,47 @@ impl AddressableParameterBank {
             })?;
             let identity = ParameterBankKey::new(0, namespace, global_entry);
             if !self.catalog.contains_key(&identity) {
-                return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
+                return Err(
+                    eredu_runtime::AddressableBankDemandError::MissingOwnedEntry { identity }
+                        .into(),
+                );
             }
             let count = demand.entry(identity).or_insert(0);
             *count = count.saturating_add(1);
         }
 
-        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        self.acquire_demand(demand, compact_ids, grouped_ids.len() as u64, pass, stream)
+        let entries: Vec<_> = demand.into_iter().collect();
+        let plan = if entries.is_empty() {
+            eredu_runtime::AddressableBankDemand::default()
+        } else {
+            eredu_runtime::AddressableBankDemand::new(
+                &entries,
+                &self.catalog,
+                &self.effective_member_bytes,
+                self.scratch_limit,
+            )?
+        };
+        self.acquire_demand(plan, pass, stream)
     }
 
     fn acquire_demand(
         &self,
-        demand: BTreeMap<ParameterBankKey, u64>,
-        compact_ids: Vec<ParameterBankKey>,
-        selection_count: u64,
+        plan: eredu_runtime::AddressableBankDemand,
         pass: BankAccessClass,
         stream: &Stream,
     ) -> Result<AcquiredParameters, AddressableParameterBankError> {
-        let bank = compact_ids.first().map(|key| key.bank());
-        if compact_ids.iter().any(|key| Some(key.bank()) != bank) {
-            return Err(AddressableParameterBankError::MixedBanks);
-        }
-        let scratch_bytes = demand.keys().try_fold(0u64, |total, identity| {
-            total
-                .checked_add(self.effective_member_bytes[identity])
-                .ok_or(AddressableParameterBankError::ByteOverflow)
-        })?;
-        if scratch_bytes > self.scratch_limit {
-            return Err(AddressableParameterBankError::ScratchLimitExceeded {
-                required_bytes: scratch_bytes,
-                limit_bytes: self.scratch_limit,
-                distinct_entries: demand.len(),
-            });
-        }
+        let (entries, selection_count, scratch_bytes) = plan.into_parts();
+        let bank = entries.first().map(|(key, _)| key.bank());
         let before = self.resident_snapshot()?;
         let started = Instant::now();
         let mut host_hits = 0u64;
         let mut host_misses = 0u64;
         let mut device_hits = 0u64;
         let mut device_misses = 0u64;
-        let mut requests = Vec::with_capacity(compact_ids.len());
+        let mut requests = Vec::with_capacity(entries.len());
         let mut host_requests = Vec::new();
-        for identity in &compact_ids {
+        for &(identity, selection_demand) in &entries {
             let unit = identity.unit_id();
-            let selection_demand = demand[identity];
             let host_hit = self.manager.is_resident(&unit, MemoryTier::Host)?;
             let device_hit = self.manager.is_resident(&unit, MemoryTier::Device)?;
             if host_hit {
@@ -533,7 +529,7 @@ impl AddressableParameterBank {
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
         if let Some(bank) = bank {
             let stats = statistics.entry(bank).or_default().pass_mut(pass);
-            let distinct = compact_ids.len() as u64;
+            let distinct = entries.len() as u64;
             stats.requested_selections = stats.requested_selections.saturating_add(selection_count);
             stats.distinct_entries = stats.distinct_entries.saturating_add(distinct);
             stats.coalesced_duplicates = stats
@@ -575,9 +571,10 @@ impl AddressableParameterBank {
         }
         drop(statistics);
 
+        let (identities, demand) = entries.into_iter().unzip();
         Ok(AcquiredParameters {
-            identities: compact_ids,
-            demand: demand.into_values().collect(),
+            identities,
+            demand,
             scratch_bytes,
             pass,
             transfer,
@@ -591,27 +588,13 @@ impl AddressableParameterBank {
         pass: BankAccessClass,
         stream: &Stream,
     ) -> Result<AcquiredParameters, AddressableParameterBankError> {
-        if entries.is_empty() {
-            return Err(AddressableParameterBankError::EmptyDemand);
-        }
-        let mut demand = BTreeMap::new();
-        let mut selection_count = 0u64;
-        for &(identity, count) in entries {
-            if count == 0 {
-                return Err(AddressableParameterBankError::ZeroDemand { identity });
-            }
-            if !self.catalog.contains_key(&identity) {
-                return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
-            }
-            if demand.insert(identity, count).is_some() {
-                return Err(AddressableParameterBankError::DuplicateDemand { identity });
-            }
-            selection_count = selection_count
-                .checked_add(count)
-                .ok_or(AddressableParameterBankError::ByteOverflow)?;
-        }
-        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        self.acquire_demand(demand, compact_ids, selection_count, pass, stream)
+        let plan = eredu_runtime::AddressableBankDemand::new(
+            entries,
+            &self.catalog,
+            &self.effective_member_bytes,
+            self.scratch_limit,
+        )?;
+        self.acquire_demand(plan, pass, stream)
     }
 
     /// Records a completed compact-bank construction.
@@ -623,11 +606,14 @@ impl AddressableParameterBank {
         duration: Duration,
     ) -> Result<(), AddressableParameterBankError> {
         if bytes > self.scratch_limit {
-            return Err(AddressableParameterBankError::ScratchLimitExceeded {
-                required_bytes: bytes,
-                limit_bytes: self.scratch_limit,
-                distinct_entries: 0,
-            });
+            return Err(
+                eredu_runtime::AddressableBankDemandError::ScratchLimitExceeded {
+                    required_bytes: bytes,
+                    limit_bytes: self.scratch_limit,
+                    distinct_entries: 0,
+                }
+                .into(),
+            );
         }
         let mut statistics = self
             .statistics

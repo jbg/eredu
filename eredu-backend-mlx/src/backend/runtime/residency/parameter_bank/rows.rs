@@ -90,7 +90,10 @@ impl ParameterBank<MlxNeuralBackend> for MlxRowBank {
         stream: &Stream,
     ) -> Result<AcquiredParameters, Error> {
         if request.entries().is_empty() {
-            return Err(AddressableParameterBankError::EmptyDemand.into());
+            return Err(AddressableParameterBankError::Demand(
+                eredu_runtime::AddressableBankDemandError::EmptyDemand,
+            )
+            .into());
         }
         let pass = match request.access() {
             ParameterBankAccess::Bulk => BankAccessClass::Bulk,
@@ -119,17 +122,22 @@ impl ParameterBank<MlxNeuralBackend> for MlxRowBank {
         let mut requests = Vec::with_capacity(request.entries().len());
         for &(key, demand) in request.entries() {
             if self.member_bytes(key).is_none() {
-                return Err(
-                    AddressableParameterBankError::MissingOwnedEntry { identity: key }.into(),
-                );
+                return Err(AddressableParameterBankError::Demand(
+                    eredu_runtime::AddressableBankDemandError::MissingOwnedEntry { identity: key },
+                )
+                .into());
             }
             if demand == 0 {
-                return Err(AddressableParameterBankError::ZeroDemand { identity: key }.into());
+                return Err(AddressableParameterBankError::Demand(
+                    eredu_runtime::AddressableBankDemandError::ZeroDemand { identity: key },
+                )
+                .into());
             }
             if !seen.insert(key) {
-                return Err(
-                    AddressableParameterBankError::DuplicateDemand { identity: key }.into(),
-                );
+                return Err(AddressableParameterBankError::Demand(
+                    eredu_runtime::AddressableBankDemandError::DuplicateDemand { identity: key },
+                )
+                .into());
             }
             let id = self
                 .range

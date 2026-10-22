@@ -757,11 +757,15 @@ fn rejects_invalid_missing_and_over_scratch_selections_before_loading() {
     ));
     assert!(matches!(
         cache.acquire_selection_slice(2, &[3], &[1], BankAccessClass::Incremental, &stream()),
-        Err(AddressableParameterBankError::MissingOwnedEntry { .. })
+        Err(AddressableParameterBankError::Demand(
+            eredu_runtime::AddressableBankDemandError::MissingOwnedEntry { .. }
+        ))
     ));
     assert!(matches!(
         cache.acquire_selection_slice(2, &[0, 1], &[2], BankAccessClass::Bulk, &stream()),
-        Err(AddressableParameterBankError::ScratchLimitExceeded { .. })
+        Err(AddressableParameterBankError::Demand(
+            eredu_runtime::AddressableBankDemandError::ScratchLimitExceeded { .. }
+        ))
     ));
     let report = cache.report().unwrap();
     assert_eq!(report.device_resident_entries, 0);

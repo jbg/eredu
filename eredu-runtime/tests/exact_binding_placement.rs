@@ -848,6 +848,33 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
         .unwrap()
         .into_parts();
     assert_eq!(restored, members);
+    // Compact admission charges every coexistent member at its current extent,
+    // once per physical owner regardless of its logical use count.
+    let requests: Vec<_> = members
+        .keys()
+        .rev()
+        .map(|key| (*key, key.member() as u64))
+        .collect();
+    let (admitted, uses, compact_bytes) =
+        eredu_runtime::AddressableBankDemand::new(&requests, &members, &effective_bytes, 32)
+            .unwrap()
+            .into_parts();
+    assert_eq!(
+        admitted.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        members.keys().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(uses, 5);
+    assert_eq!(compact_bytes, 32);
+    assert!(matches!(
+        eredu_runtime::AddressableBankDemand::new(&requests, &members, &restored, 32),
+        Err(
+            eredu_runtime::AddressableBankDemandError::ScratchLimitExceeded {
+                required_bytes: 64,
+                distinct_entries: 2,
+                ..
+            }
+        )
+    ));
     let ids: Vec<_> = members.keys().map(|key| key.unit_id()).collect();
     let mut controller = eredu_runtime::ResidencyController::new_with_row_ranges(
         |_| &source as &dyn CheckpointSource,

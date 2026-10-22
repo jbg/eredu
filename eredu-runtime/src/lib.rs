@@ -274,8 +274,9 @@ pub use expert::{
     TensorParallelParameterProvider,
 };
 pub use expert::{
-    validate_addressable_bank_selection, AddressableBankSelectionError, AddressableBankPreparation,
-    AddressableBankPreparationError, PreparedSelectedAddressableBank,
+    AddressableBankDemand, AddressableBankDemandError, validate_addressable_bank_selection,
+    AddressableBankSelectionError, AddressableBankPreparation, AddressableBankPreparationError,
+    PreparedSelectedAddressableBank,
 };
 pub use expert::{
     plan_addressable_bank_residency, AddressableBankResidencyError,

@@ -11143,6 +11143,15 @@ with `ArtifactError::MetadataOnly`.
 
 ### Selected history and addressable parameter banks
 
+`AddressableBankDemand` admits exact coexistent independent member resources before
+native acquisition. It validates nonzero unique use counts, selected ownership, one
+bank namespace, checked totals and the compact scratch allowance, using current
+executable extents after replacement. Canonical global key order determines request
+and returned lease order. Sharing checkpoint inputs does not merge charges. Empty
+logical selections use the shared empty demand; explicit entry requests require at
+least one member. Native cache residency observations, host staging, transfers and
+completion consume the admitted demand without reconstructing it.
+
 `eredu-nn::IndexedAttentionInput` declares grouped K/V heads, absolute selected
 positions, validity, optional selected-score masks, bounded local sources and sinks.
 Architecture equations own selection and causal eligibility. `AttentionCache::indexed_attention`

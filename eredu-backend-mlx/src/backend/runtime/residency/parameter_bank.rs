@@ -73,9 +73,9 @@ pub use movement::MlxIndexedMovement;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AddressableParameterBankError {
-    /// A compact operator cannot mix independently identified banks.
-    #[error("compact parameter-bank demand mixes bank identities")]
-    MixedBanks,
+    /// Portable demand ownership, use counts or compact resource admission failed.
+    #[error(transparent)]
+    Demand(#[from] eredu_runtime::AddressableBankDemandError),
     /// Grouped-entry placement controls were invalid.
     #[error(transparent)]
     Policy(#[from] ParameterBankOptionsError),
@@ -89,21 +89,6 @@ pub enum AddressableParameterBankError {
     /// Independent member ownership or combined residency budgets are invalid.
     #[error(transparent)]
     Preparation(#[from] eredu_runtime::AddressableBankResidencyError),
-    /// A generic acquisition contained no entries.
-    #[error("addressable entry demand must not be empty")]
-    EmptyDemand,
-    /// A generic acquisition assigned no uses to one entry.
-    #[error("addressable entry {identity:?} has zero demand")]
-    ZeroDemand {
-        /// Entry with invalid demand.
-        identity: ParameterBankKey,
-    },
-    /// A generic acquisition repeated one entry identity.
-    #[error("addressable entry demand repeats {identity:?}")]
-    DuplicateDemand {
-        /// Repeated entry.
-        identity: ParameterBankKey,
-    },
     /// No owned entry catalog exists for this namespace.
     #[error("sparse entry cache has no catalog for namespace {namespace}")]
     UnknownNamespace {
@@ -146,12 +131,6 @@ pub enum AddressableParameterBankError {
         /// Owned entries cataloged for diagnostics.
         known_owned_entries: usize,
     },
-    /// A valid global selection referred to an entry this cache does not own.
-    #[error("grouped entry {identity:?} is not owned by this cache")]
-    MissingOwnedEntry {
-        /// Requested non-owned global identity.
-        identity: ParameterBankKey,
-    },
     /// Selectionr ids used an unsupported scalar type.
     #[error("grouped entry ids must use an integer dtype, got {actual:?}")]
     InvalidSelectionDtype {
@@ -187,19 +166,6 @@ pub enum AddressableParameterBankError {
         /// Returned output shape.
         actual: Vec<i32>,
     },
-    /// Selected entries exceed the configured temporary compact-bank allowance.
-    #[error("compact entry bank for {distinct_entries} entries requires {required_bytes} bytes, exceeding the {limit_bytes}-byte scratch limit")]
-    ScratchLimitExceeded {
-        /// Required compact-bank bytes.
-        required_bytes: u64,
-        /// Configured compact-bank byte limit.
-        limit_bytes: u64,
-        /// Selected unique entry count.
-        distinct_entries: usize,
-    },
-    /// Entry byte arithmetic overflowed.
-    #[error("sparse entry byte accounting overflowed")]
-    ByteOverflow,
     /// Cache statistics mutex was poisoned by a panic.
     #[error("sparse entry cache statistics are unavailable after a panic")]
     StatisticsPoisoned,
