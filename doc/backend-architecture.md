@@ -3462,6 +3462,14 @@ It accounts for the declared companion precision, affine biases and MXFP4 scale
 encoding. Selected tasks retain source-format, packed-axis and group-alignment
 admission; the arithmetic helper does not imply native transformation support.
 
+`validate_addressable_bank_selection` checks exact ownership-key coverage and
+projects executable byte totals from retained bindings and transformation choices
+before native transformation. Direct bindings retain their prepared byte extents;
+transformed bindings use source metadata and shared packed geometry. Typed failures
+identify missing ownership, missing extents, inconsistent totals and original
+recipe or geometry causes. Native binding preflight and combined residency-budget
+admission remain separate checks in construction.
+
 `prepare_bank_parameter_members` joins final physical binding recipes to the
 retained canonical destinations for parameter inspection and editing. It infers
 geometry against the selected post-transformation source, preserves global member

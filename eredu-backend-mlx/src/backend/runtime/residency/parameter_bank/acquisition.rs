@@ -173,72 +173,19 @@ impl AddressableParameterBank {
             })?;
         let row_ranges: Vec<_> = rows.ranges().cloned().collect();
         preflight_selected_entry_bindings(store.as_ref(), &selected.entries)?;
-        let selected_keys = selected
-            .entries
-            .iter()
-            .map(|entry| entry.identity)
-            .collect::<std::collections::BTreeSet<_>>();
-        if selected_keys
-            != selected
-                .placements
-                .keys()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-        {
-            return Err(AddressableParameterBankError::Transformation {
-                source: Box::new(Error::ArchitectureModel(
-                    "selected addressable placements do not cover the exact entry keys".into(),
-                )),
-            });
-        }
-        for entry in &selected.entries {
-            let expected = selected
-                .expected_bytes
-                .get(&entry.identity)
-                .ok_or_else(|| AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "selected addressable entry {:?} has no neutral byte total",
-                        entry.identity
-                    ))),
-                })?;
-            let projected = entry
-                .unit
-                .bindings()
+        eredu_runtime::validate_addressable_bank_selection(
+            selected
+                .entries
                 .iter()
-                .try_fold(0u64, |total, binding| {
-                    let bytes = if let Some(transform) = selected
-                        .transformations
-                        .get(&(entry.identity, binding.name().to_owned()))
-                    {
-                        let metadata = binding.source_recipe().infer(store.as_ref())?;
-                        eredu_runtime::addressable_projection_bytes(
-                            binding.name(),
-                            metadata.shape(),
-                            transform.quantization(),
-                            transform.companion_dtype(),
-                        )
-                        .map_err(|error| Error::Other(Box::new(error)))?
-                    } else {
-                        binding.expected_bytes()
-                    };
-                    total.checked_add(bytes).ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "selected addressable entry bytes overflowed".into(),
-                        )
-                    })
-                })
-                .map_err(|source| AddressableParameterBankError::Transformation {
-                    source: Box::new(source),
-                })?;
-            if projected != *expected {
-                return Err(AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "selected addressable entry {:?} bytes differ: expected {}, projected {}",
-                        entry.identity, expected, projected
-                    ))),
-                });
-            }
-        }
+                .map(|entry| (entry.identity, entry.unit.bindings())),
+            &selected.placements,
+            &selected.expected_bytes,
+            &selected.transformations,
+            store.as_ref(),
+        )
+        .map_err(|source| AddressableParameterBankError::Transformation {
+            source: Box::new(Error::Other(Box::new(source))),
+        })?;
         // Validate the combined namespace/budget plan before a selected weight
         // transformation can read payloads. Rows retain their own source recipes.
         let specs = selected
