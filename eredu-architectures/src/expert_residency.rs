@@ -2,8 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eredu_checkpoint::recipe::DerivedWeightRecipe;
-use eredu_checkpoint::{recipe::RecipeCatalog, store::TensorSelection};
+use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeCatalog};
 use eredu_core::{
     balanced_contiguous_range, CollectiveGroupDescriptor, CollectiveGroupId, ParallelAxis,
     ParallelRankTopology,
@@ -1508,50 +1507,6 @@ pub enum ExpertResidencyDistribution {
     ExpertParallel,
     /// Materialize the expert on every rank that owns its execution unit.
     Replicated,
-}
-
-/// Selects architecture-canonical expert outputs for one rank's global IDs.
-///
-/// The expert axis is part of the architecture's canonical parameter geometry.
-/// Applying the selection to derived outputs lets the checkpoint recipe layer
-/// push it through fused, stacked, or transposed physical layouts without a
-/// backend recovering storage geometry.
-pub(crate) fn select_rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
-    catalog: &C,
-    global_experts: usize,
-    expert_axis: usize,
-    group_indices: &[usize],
-    outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    if group_indices.is_empty() {
-        return Err("rank-local expert recipes require at least one expert".into());
-    }
-    let mut unique = BTreeSet::new();
-    for &expert in group_indices {
-        if expert >= global_experts {
-            return Err(format!(
-                "rank-local expert {expert} is outside {global_experts} experts"
-            ));
-        }
-        if !unique.insert(expert) {
-            return Err(format!(
-                "rank-local expert recipe contains duplicate expert {expert}"
-            ));
-        }
-    }
-    let selection = TensorSelection::Indices {
-        axis: expert_axis,
-        indices: group_indices.to_vec(),
-    };
-    outputs
-        .into_iter()
-        .map(|(target, recipe)| {
-            recipe
-                .select_bounded(catalog, selection.clone())
-                .map(|recipe| (target, recipe))
-                .map_err(|error| error.to_string())
-        })
-        .collect()
 }
 
 /// One architecture-logical parameter in an independently resident expert.

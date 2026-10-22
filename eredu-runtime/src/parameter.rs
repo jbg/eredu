@@ -949,6 +949,55 @@ pub struct ParameterResourceRecipes {
     pub aliases: Vec<RecipeAlias>,
 }
 
+/// Selects ordered bank-global member identities from canonical parameter recipes.
+///
+/// Selection validates the nonempty, unique member list against the declared
+/// global count before inspecting recipes. The family supplies the canonical
+/// member axis; checkpoint selection pushdown preserves layout transforms and
+/// the requested order without acquiring payloads or inferring family geometry.
+/// Repeated canonical parameter destinations are rejected rather than overwritten.
+pub fn select_parameter_bank_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    global_members: usize,
+    member_axis: usize,
+    members: &[usize],
+    outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, RecipeBindingError> {
+    if members.is_empty() {
+        return Err(RecipeBindingError::EmptyBankSelection);
+    }
+    let mut unique = BTreeSet::new();
+    for &member in members {
+        if member >= global_members {
+            return Err(RecipeBindingError::BankMemberOutOfBounds {
+                member,
+                global_members,
+            });
+        }
+        if !unique.insert(member) {
+            return Err(RecipeBindingError::DuplicateBankMember { member });
+        }
+    }
+    let selection = TensorSelection::Indices {
+        axis: member_axis,
+        indices: members.to_vec(),
+    };
+    let mut selected = BTreeMap::new();
+    for (target, recipe) in outputs {
+        if selected.contains_key(&target) {
+            return Err(ResidencyDeclarationError::DuplicateLogicalBinding { name: target }.into());
+        }
+        let recipe = recipe
+            .select_bounded(catalog, selection.clone())
+            .map_err(|source| RecipeBindingError::ParameterRecipe {
+                target: target.clone(),
+                source,
+            })?;
+        selected.insert(target, recipe);
+    }
+    Ok(selected)
+}
+
 /// Source-free canonical bank recipes and bounded leading-axis member projections.
 ///
 /// Member identities are bank-global ordinals. Every declared parameter retains
@@ -1187,6 +1236,23 @@ pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
 /// Failure preparing exact source authority or lowering atomic recipe bindings.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeBindingError {
+    /// An ordered bank projection selected no members.
+    #[error("parameter bank selection requires at least one member")]
+    EmptyBankSelection,
+    /// A selected identity is outside the declared global bank.
+    #[error("parameter bank member {member} is outside {global_members} members")]
+    BankMemberOutOfBounds {
+        /// Requested bank-global member identity.
+        member: usize,
+        /// Declared global member count.
+        global_members: usize,
+    },
+    /// A bank projection repeats a global identity.
+    #[error("parameter bank selection repeats member {member}")]
+    DuplicateBankMember {
+        /// Repeated bank-global member identity.
+        member: usize,
+    },
     /// A canonical bank parameter cannot be projected into bounded members.
     #[error("parameter {target:?} recipe failed: {source}")]
     ParameterRecipe {

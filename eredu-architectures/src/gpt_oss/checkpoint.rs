@@ -408,13 +408,8 @@ pub fn rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
     let outputs = expert_recipes(catalog, args, layer)?
         .into_outputs()
         .into_outputs();
-    crate::expert_residency::select_rank_local_expert_recipes(
-        catalog,
-        experts,
-        0,
-        group_indices,
-        outputs,
-    )
+    eredu_runtime::select_parameter_bank_recipes(catalog, experts, 0, group_indices, outputs)
+        .map_err(|error| error.to_string())
 }
 
 /// Builds the complete architecture-owned schedule for independently resident experts.

@@ -838,9 +838,14 @@ and declared parameter order. Families retain bank namespaces, formats and exper
 selection policy. The gated-product residency builder used by Gemma4 and diffusion
 Gemma projects its selected weight, scale and bias outputs through the same bank
 catalog while preserving per-expert leases. Member projection retains bank-global
-IDs and allocates no parameter payload or native resource. Shared resource binding
-preparation uses the same checkpoint snapshot primitive while keeping aliases
-local to each independently leased resource.
+IDs and allocates no parameter payload or native resource.
+`select_parameter_bank_recipes` validates nonempty, unique ordered global member
+IDs before pushing a rank-local selection through canonical recipes. Families
+supply the member axis and geometry; runtime retains selection order and typed
+member or parameter errors. Duplicate canonical destinations are rejected.
+GPT-OSS rank-local expert preparation uses this shared projection. Shared resource
+binding preparation uses the same checkpoint snapshot primitive while keeping
+aliases local to each independently leased resource.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
 retention primitive. The family checks admitted table headers and provenance
 before bounded literal reads; controls and scales retain separate exact source

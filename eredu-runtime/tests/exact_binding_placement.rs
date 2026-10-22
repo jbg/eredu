@@ -687,6 +687,52 @@ mod component_preparation {
         let bank = ParameterBankRecipes::new(catalog, recipes.clone(), 3).unwrap();
         assert_eq!(bank.member_count(), 3);
         assert!(bank.member(3).is_none());
+        let rank =
+            eredu_runtime::select_parameter_bank_recipes(catalog, 3, 0, &[2, 0], recipes.clone())
+                .unwrap();
+        let rank = PreparedParameterRecipes::new("ordered rank", original.clone(), rank).unwrap();
+        assert_eq!(
+            rank.source().source_keys(),
+            ["scale.0", "scale.2", "weight.0", "weight.2"]
+        );
+        assert_eq!(
+            rank.recipes()["weight"]
+                .infer(rank.source().as_ref())
+                .unwrap()
+                .shape(),
+            [2, 2, 4]
+        );
+        assert!(matches!(
+            eredu_runtime::select_parameter_bank_recipes(catalog, 3, 0, &[], recipes.clone()),
+            Err(RecipeBindingError::EmptyBankSelection)
+        ));
+        assert!(matches!(
+            eredu_runtime::select_parameter_bank_recipes(catalog, 3, 0, &[2, 2], recipes.clone()),
+            Err(RecipeBindingError::DuplicateBankMember { member: 2 })
+        ));
+        assert!(matches!(
+            eredu_runtime::select_parameter_bank_recipes(catalog, 3, 0, &[3], recipes.clone()),
+            Err(RecipeBindingError::BankMemberOutOfBounds {
+                member: 3,
+                global_members: 3
+            })
+        ));
+        let duplicate_destination = eredu_runtime::select_parameter_bank_recipes(
+            catalog,
+            3,
+            0,
+            &[2, 0],
+            vec![
+                ("weight".into(), recipes["weight"].clone()),
+                ("weight".into(), recipes["weight"].clone()),
+            ],
+        );
+        assert!(matches!(
+            duplicate_destination,
+            Err(RecipeBindingError::Declaration(
+                eredu_runtime::ResidencyDeclarationError::DuplicateLogicalBinding { name }
+            )) if name == "weight"
+        ));
         let local = bank
             .map_recipes(catalog, |_, recipe| {
                 Ok::<_, RecipeBindingError>(recipe.select_bounded(
