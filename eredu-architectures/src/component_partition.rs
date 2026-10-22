@@ -536,7 +536,7 @@ impl ComponentPartitionLayout {
         layout: &LocalModelLayout,
         topology: eredu_core::ParallelRankTopology,
         ownership: &eredu_runtime::PartitionOwnership,
-        owned_groups: &[crate::partitioned_execution::PartitionedGroupRequirements],
+        owned_groups: &[eredu_runtime::PipelineGroupOwnership],
         publication_owner: usize,
         selected_routed: Option<&crate::SelectedRoutedTextRealization>,
     ) -> Result<Self, ComponentPartitionError> {

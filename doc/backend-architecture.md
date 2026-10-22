@@ -882,6 +882,14 @@ cross-group dependencies and intra-group continuations. Merge destinations do no
 relocate a producer. Ownership-only queries allocate no route metadata. Families
 retain boundary schemas and collective semantics; native composition realizes the
 declared endpoints. Invalid placement returns typed group and geometry errors.
+Runtime's `PipelineRankProjection` applies declared first/last-owner static roles,
+replicated roles, parameter consumers and state rules to one actual Cartesian
+rank. It retains read-only `PipelineGroupOwnership` intervals, local state,
+publication rank and optional logical parameter targets. Construction consumes
+these shared parts; ownership-only inspection omits target names and state.
+Families retain the declarations and selected mechanisms. State and ownership
+errors preserve their neutral causes; active embedded prediction uses its
+separate placement contract and is rejected explicitly by this base projection.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
 retention primitive. The family checks admitted table headers and provenance
 before bounded literal reads; controls and scales retain separate exact source

@@ -528,9 +528,7 @@ impl SelectedExecution {
             .map(Some)
     }
 
-    pub(crate) fn partition_groups(
-        &self,
-    ) -> Option<&[crate::partitioned_execution::PartitionedGroupRequirements]> {
+    pub(crate) fn partition_groups(&self) -> Option<&[eredu_runtime::PipelineGroupOwnership]> {
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 Some(selected.requirements().groups())

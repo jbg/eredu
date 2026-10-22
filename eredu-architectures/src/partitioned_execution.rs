@@ -26,15 +26,14 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     derive_partitioned_local_layout, retained_partition_layout, ArchitectureBoundary,
-    ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureMergeDestination,
-    ArchitecturePartition, BoundaryDimensionContract, BoundaryRoleContract, BoundaryWireSchema,
-    CommunicationCapabilities, CommunicationCompletionPolicy, CommunicationGroupRequirements,
-    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
-    CommunicationRouteDescriptor, CommunicationRouteId, CommunicationTensorLimits,
-    PartitionOwnership, PartitionState, PartitionTensorAllocator, PipelineActivationDtype,
-    PipelinePartitionArchitecture, PipelinePartitionUnitStrategy, ResolvedBoundaryWireSchema,
-    RoleExactBoundaryContract, RoutedTensorReduction, RoutedTensorReductions,
-    TopologyCommunicationPlan,
+    ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitecturePartition,
+    BoundaryDimensionContract, BoundaryRoleContract, BoundaryWireSchema, CommunicationCapabilities,
+    CommunicationCompletionPolicy, CommunicationGroupRequirements, CommunicationManifest,
+    CommunicationOperation, CommunicationOperationRequirement, CommunicationRouteDescriptor,
+    CommunicationRouteId, CommunicationTensorLimits, PartitionOwnership, PartitionState,
+    PartitionTensorAllocator, PipelineActivationDtype, PipelinePartitionArchitecture,
+    PipelinePartitionUnitStrategy, ResolvedBoundaryWireSchema, RoleExactBoundaryContract,
+    RoutedTensorReduction, RoutedTensorReductions, TopologyCommunicationPlan,
 };
 
 /// Architecture-owned multi-group executor for a prepared composite partition.
@@ -5744,31 +5743,6 @@ where
     }
 }
 
-/// One architecture group interval and its semantic pipeline owner.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct PartitionedGroupRequirements {
-    group: eredu_runtime::ExecutionGroupId,
-    units: Range<usize>,
-    pipeline_owner: usize,
-}
-
-impl PartitionedGroupRequirements {
-    /// Stable architecture execution-group identity.
-    pub const fn group(&self) -> &eredu_runtime::ExecutionGroupId {
-        &self.group
-    }
-
-    /// Group-local architecture-global units owned by this rank.
-    pub fn units(&self) -> Range<usize> {
-        self.units.clone()
-    }
-
-    /// Semantic pipeline coordinate owning these units.
-    pub const fn pipeline_owner(&self) -> usize {
-        self.pipeline_owner
-    }
-}
-
 /// Architecture-owned preconstruction admission facts for one rank.
 ///
 /// This value intentionally does not claim to be a selected partition: exact
@@ -5778,7 +5752,7 @@ impl PartitionedGroupRequirements {
 pub struct PartitionedAdmission<R> {
     execution: R,
     topology: ParallelRankTopology,
-    groups: Vec<PartitionedGroupRequirements>,
+    groups: Vec<eredu_runtime::PipelineGroupOwnership>,
     ownership: PartitionOwnership,
     publication_owner: usize,
     state: Option<PartitionState>,
@@ -5842,7 +5816,7 @@ impl<R> PartitionedAdmission<R> {
     }
 
     /// Rank-local group/unit ownership in canonical architecture order.
-    pub fn groups(&self) -> &[PartitionedGroupRequirements] {
+    pub fn groups(&self) -> &[eredu_runtime::PipelineGroupOwnership] {
         &self.groups
     }
 
@@ -7369,15 +7343,17 @@ where
     F: FnOnce(&R) -> &eredu_runtime::ReplicatedTextRequirements,
 {
     let text = text(&execution);
-    let rank = rank_requirements(text, state_layout, topology)?;
+    let rank = eredu_runtime::PipelineRankProjection::new(text, state_layout, topology, true)
+        .map_err(|error| error.to_string())?;
+    let (groups, ownership, publication_owner, state, parameter_targets) = rank.into_parts();
     Ok(PartitionedAdmission {
         execution,
         topology,
-        groups: rank.groups,
-        ownership: rank.ownership,
-        publication_owner: rank.publication_owner,
-        state: rank.state,
-        logical_parameter_targets: rank.parameter_targets,
+        groups,
+        ownership,
+        publication_owner,
+        state,
+        logical_parameter_targets: parameter_targets,
         activation_dtype,
         boundary,
         boundary_routes,
@@ -7385,207 +7361,6 @@ where
         session_group,
         tensor_group,
         expert_group,
-    })
-}
-
-struct RankRequirements {
-    groups: Vec<PartitionedGroupRequirements>,
-    ownership: PartitionOwnership,
-    publication_owner: usize,
-    state: Option<PartitionState>,
-    parameter_targets: Vec<String>,
-}
-
-fn rank_requirements(
-    execution: &eredu_runtime::ReplicatedTextRequirements,
-    state_layout: Option<&eredu_runtime::StateLayout>,
-    topology: ParallelRankTopology,
-) -> Result<RankRequirements, String> {
-    rank_requirements_inner(execution, state_layout, topology, true)
-}
-
-fn rank_requirements_inner(
-    execution: &eredu_runtime::ReplicatedTextRequirements,
-    state_layout: Option<&eredu_runtime::StateLayout>,
-    topology: ParallelRankTopology,
-    include_parameter_targets: bool,
-) -> Result<RankRequirements, String> {
-    let pp_size = topology.pipeline_parallel_size();
-    let pp_rank = topology.pipeline_parallel_rank();
-    let mut groups = Vec::new();
-    let mut static_roles = Vec::new();
-    let mut owns_input = false;
-    let output_group = execution.execution_graph().output();
-    let mut owns_output = false;
-    let mut output_pipeline = None;
-    let mut decoder_state_offset = 0usize;
-    let mut local_state_ranges = Vec::new();
-    let placements = eredu_runtime::PipelinePlacementPlan::new(
-        execution.execution_graph(),
-        execution.execution_units(),
-        execution.group_transports(),
-        pp_size,
-    )
-    .map_err(|error| error.to_string())?;
-
-    for (group_index, transport) in execution.group_transports().iter().enumerate() {
-        if transport.kind == ArchitectureGroupKind::Prediction {
-            return Err("embedded prediction is active".into());
-        }
-        let count = execution
-            .execution_units()
-            .group_range(group_index)
-            .ok_or_else(|| format!("execution group {group_index} has no unit geometry"))?
-            .len();
-        let owners = &placements.owners()[group_index];
-        let first_owner = owners.first().map_or(
-            if transport.placement == ArchitectureGroupPlacement::OutputOwner {
-                pp_size - 1
-            } else {
-                0
-            },
-            |(owner, _)| *owner,
-        );
-        let last_owner = owners.last().map_or(first_owner, |(owner, _)| *owner);
-        let merge_owner = match transport.merge_destination {
-            ArchitectureMergeDestination::LastOwner => last_owner,
-            ArchitectureMergeDestination::FirstPipelineOwner => 0,
-            ArchitectureMergeDestination::OutputOwner => pp_size - 1,
-        };
-        if execution
-            .execution_graph()
-            .dependencies(group_index)
-            .is_some_and(|dependencies| dependencies.is_empty())
-            && first_owner == pp_rank
-        {
-            owns_input = true;
-        }
-        if group_index == output_group {
-            output_pipeline = Some(merge_owner);
-            owns_output = merge_owner == pp_rank;
-        }
-        let first_role_start = static_roles.len();
-        if first_owner == pp_rank {
-            static_roles.extend(transport.first_owner_static_roles.iter().cloned());
-        }
-        if last_owner == pp_rank {
-            if last_owner == first_owner {
-                let first_roles = static_roles[first_role_start..].to_vec();
-                static_roles.extend(
-                    transport
-                        .last_owner_static_roles
-                        .iter()
-                        .filter(|role| !first_roles.contains(role))
-                        .cloned(),
-                );
-            } else {
-                static_roles.extend(transport.last_owner_static_roles.iter().cloned());
-            }
-        }
-        if let Some((_, units)) = owners.iter().find(|(owner, _)| *owner == pp_rank) {
-            groups.push(PartitionedGroupRequirements {
-                group: execution
-                    .execution_units()
-                    .group_id(group_index)
-                    .expect("validated execution layout contains every group")
-                    .clone(),
-                units: units.clone(),
-                pipeline_owner: pp_rank,
-            });
-            if transport.kind == ArchitectureGroupKind::Decoder {
-                local_state_ranges
-                    .push(decoder_state_offset + units.start..decoder_state_offset + units.end);
-            }
-        }
-        if transport.kind == ArchitectureGroupKind::Decoder {
-            decoder_state_offset = decoder_state_offset
-                .checked_add(count)
-                .ok_or_else(|| "decoder state geometry overflowed".to_owned())?;
-        }
-    }
-    local_state_ranges.sort_by_key(|range| range.start);
-    let state = if let (Some(layout), Some(plan)) = (state_layout, execution.state_partition_plan())
-    {
-        plan.resolve_partition(
-            layout,
-            execution.execution_units(),
-            |index| {
-                let id = execution.execution_units().group_id(index)?;
-                groups
-                    .iter()
-                    .find(|group| &group.group == id)
-                    .map(|group| group.units.clone())
-            },
-            owns_output,
-        )
-        .map_err(|error| error.to_string())?
-    } else if let (Some(state_layout), Some(first)) = (state_layout, local_state_ranges.first()) {
-        let start = first.start;
-        let end = local_state_ranges
-            .iter()
-            .try_fold(start, |frontier, range| {
-                (range.start == frontier)
-                    .then_some(range.end)
-                    .ok_or_else(|| "rank-local state ranges are not contiguous".to_owned())
-            })?;
-        Some(
-            PartitionState::new(
-                state_layout
-                    .slice(start..end)
-                    .map_err(|error| error.to_string())?,
-                start,
-            )
-            .map_err(|error| error.to_string())?,
-        )
-    } else {
-        None
-    };
-    let ownership = PartitionOwnership::new(owns_input, owns_output, static_roles)
-        .and_then(|ownership| {
-            ownership
-                .with_replicated_static_roles(execution.replicated_static_roles().iter().cloned())
-        })
-        .map_err(|error| error.to_string())?;
-    let parameter_targets = execution
-        .parameters()
-        .iter()
-        .filter(|_| include_parameter_targets)
-        .filter(|parameter| match parameter.owner() {
-            eredu_runtime::ReplicatedTextParameterOwner::StaticRole(role) => {
-                ownership.stores_static_role(role)
-            }
-            eredu_runtime::ReplicatedTextParameterOwner::StaticUnitConsumers {
-                role,
-                consumers,
-            } => {
-                ownership.replicated_static_roles().contains(role)
-                    || consumers.iter().any(|(group, unit)| {
-                        groups.iter().any(|owned| {
-                            owned.group.as_str() == group && owned.units.contains(unit)
-                        })
-                    })
-            }
-            eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => groups
-                .iter()
-                .any(|owned| owned.group.as_str() == group && owned.units.contains(unit)),
-            _ => false,
-        })
-        .map(|parameter| parameter.name().to_owned())
-        .collect();
-    Ok(RankRequirements {
-        groups,
-        ownership,
-        publication_owner: topology
-            .global_rank_for(eredu_core::ParallelCoordinates::new(
-                0,
-                output_pipeline
-                    .ok_or_else(|| "output group has no publication ownership".to_owned())?,
-                0,
-                topology.data_parallel_rank(),
-            ))
-            .map_err(|error| error.to_string())?,
-        state,
-        parameter_targets,
     })
 }
 
@@ -8287,7 +8062,7 @@ where
     let expected_groups = requirements
         .groups
         .iter()
-        .map(|group| (group.group.clone(), group.units.clone()))
+        .map(|group| (group.group().clone(), group.units()))
         .collect::<Vec<_>>();
     if actual_groups != expected_groups {
         return Err(format!(
@@ -8448,10 +8223,10 @@ pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
             .ok_or(ParameterError::Overflow)?;
     }
     charge(reservation, bytes)?;
-    let rank =
-        rank_requirements_inner(text, None, topology, false).map_err(|error| invalid(&error))?;
-    let owns = group.owner().is_stored_by(&rank.ownership, |id, unit| {
-        rank.groups
+    let rank = eredu_runtime::PipelineRankProjection::new(text, None, topology, false)
+        .map_err(|error| invalid(&error.to_string()))?;
+    let owns = group.owner().is_stored_by(rank.ownership(), |id, unit| {
+        rank.groups()
             .iter()
             .any(|owned| owned.group() == id && owned.units().contains(&unit))
     });
@@ -8514,20 +8289,25 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
             admission.groups(),
         )
     } else {
-        projected_rank = rank_requirements(admission.execution.text(), None, topology)
-            .map_err(ComponentPartitionError::ParameterLayout)?;
+        projected_rank = eredu_runtime::PipelineRankProjection::new(
+            admission.execution.text(),
+            None,
+            topology,
+            true,
+        )
+        .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?;
         (
             ComponentPartitionLayout::from_ownership(
                 descriptor,
                 parameters,
                 layout,
                 topology,
-                &projected_rank.ownership,
-                &projected_rank.groups,
-                projected_rank.publication_owner,
+                projected_rank.ownership(),
+                projected_rank.groups(),
+                projected_rank.publication_owner(),
                 routed,
             )?,
-            projected_rank.groups.as_slice(),
+            projected_rank.groups(),
         )
     };
     for point in unit_observations {

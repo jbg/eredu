@@ -7919,13 +7919,6 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             )
         })
         .collect::<Vec<_>>();
-    let placement = eredu_runtime::PipelinePlacementPlan::new(
-        parameters.graph(),
-        parameters.unit_layout(),
-        &transports,
-        2,
-    )
-    .unwrap();
     // Global ownership must not rebase an already selected nonzero invocation.
     let selected = parameters
         .unit_layout()
@@ -7935,6 +7928,92 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
         eredu_runtime::PipelinePlacementPlan::new(parameters.graph(), &selected, &transports, 2),
         Err(eredu_runtime::PipelinePlacementError::NonCanonicalLayout { group: 2 })
     ));
+    let state_layout = architecture.state_layout().unwrap();
+    let parameter = |name: &str, owner| {
+        let encoding = SourceTensorEncoding::Safetensors(StoredDtype::F32);
+        ReplicatedTextParameterRequirement::new(
+            name,
+            vec![name.into()],
+            vec![ReplicatedTextPhysicalSource::new(
+                name,
+                name,
+                "/exact/fixture.safetensors",
+                name,
+                encoding.clone(),
+                4,
+            )
+            .unwrap()],
+            Vec::new(),
+            Some(encoding),
+            Some(vec![1, 1]),
+            vec![1, 1],
+            LinearFormat::Dense,
+            ReplicatedTextParameterRole::LinearWeight,
+            owner,
+            ReplicatedTextParameterPresence::Required,
+            eredu_runtime::ParameterTransformConstraint::None,
+        )
+        .unwrap()
+    };
+    let requirements = ReplicatedTextRequirements::new(
+        "shared-rank-projection",
+        NeuralOperatorCapabilities::NONE,
+        parameters.graph().clone(),
+        parameters.unit_layout().clone(),
+        transports.clone(),
+        state_layout.clone(),
+        ReplicatedTextStateAccess::KeyValue,
+        vec![
+            parameter(
+                "shared",
+                ReplicatedTextParameterOwner::StaticUnitConsumers {
+                    role: "embedding".into(),
+                    consumers: vec![("text".into(), 0), ("text".into(), 1)],
+                },
+            ),
+            parameter(
+                "late",
+                ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: "text".into(),
+                    unit: 1,
+                },
+            ),
+        ],
+    )
+    .unwrap()
+    .with_state_partition_plan(architecture.state_partition_plan(&state_layout));
+    let ranks = [0, 1].map(|rank| {
+        eredu_runtime::PipelineRankProjection::new(
+            &requirements,
+            Some(&state_layout),
+            eredu_core::ParallelRankTopology::new(
+                eredu_core::ParallelTopology::new(1, 2, 1, 1).unwrap(),
+                rank,
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap()
+    });
+    assert_eq!(ranks[0].parameter_targets(), ["shared"]);
+    assert_eq!(ranks[1].parameter_targets(), ["shared", "late"]);
+    assert_eq!(ranks[0].publication_owner(), 1);
+    assert_eq!(ranks[1].publication_owner(), 1);
+    let ownership_only =
+        eredu_runtime::PipelineRankProjection::new(&requirements, None, ranks[1].topology(), false)
+            .unwrap();
+    assert_eq!(ownership_only.groups(), ranks[1].groups());
+    assert_eq!(ownership_only.ownership(), ranks[1].ownership());
+    assert!(ownership_only.state().is_none());
+    assert!(ownership_only.parameter_targets().is_empty());
+    let owned_units = |rank: usize| {
+        ranks[rank]
+            .groups()
+            .iter()
+            .find(|group| group.group().as_str() == "text")
+            .unwrap()
+            .units()
+    };
     let partitions = [
         ArchitecturePartition::<(), NoAuxiliaryBoundarySchema>::from_architecture::<
             FakeBackend,
@@ -7943,8 +8022,8 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             _,
         >(
             &architecture,
-            [("text", placement.owners()[2][0].1.clone())],
-            PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
+            [("text", owned_units(0))],
+            ranks[0].ownership().clone(),
             (),
             NoAuxiliaryBoundarySchema::new(8),
             &parameters,
@@ -7956,8 +8035,8 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             _,
         >(
             &architecture,
-            [("text", placement.owners()[2][1].1.clone())],
-            PartitionOwnership::new(false, true, std::iter::empty::<String>()).unwrap(),
+            [("text", owned_units(1))],
+            ranks[1].ownership().clone(),
             (),
             NoAuxiliaryBoundarySchema::new(8),
             &parameters,
@@ -7975,6 +8054,9 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     ];
     assert_eq!(drivers[0].state_layout().len(), 1);
     assert_eq!(drivers[1].state_layout().len(), 3);
+    for (rank, driver) in ranks.iter().zip(&drivers) {
+        assert_eq!(rank.state().unwrap().layout(), driver.state_layout());
+    }
     let schema = eredu_runtime::ArchitectureBoundary::wire_schema(partitions[0].boundary_schema())
         .unwrap()
         .resolve(1, 1)
