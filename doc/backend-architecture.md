@@ -5840,6 +5840,13 @@ native composition consumes these units without reconstructing their partitions.
 `ArtifactError::Preparation` retains the original typed acquisition, placement or
 accounting failure as its source without adding a runtime dependency to core.
 
+Ordinary text, prediction and assistant materialization use runtime's exact
+transform-group planner. Groups preserve first-observed format and task order,
+exclude direct tasks, and reject missing packed formats. Assistant construction
+validates these groups before creating native source/target modules. MLX applies
+the declared transformations and retains original neutral task and assistant
+neural-construction errors through its typed error boundary.
+
 Spark's construction retains released identity and per-weight formats separately;
 the same selected encoding drives exact source constraints and neural operators.
 Matrix companion prefixes are explicit for transition codebooks without a

@@ -165,8 +165,7 @@ where
         source_layout: Option<&eredu_runtime::LocalModelLayout>,
         tasks: &[ReplicatedTextMaterializationTask],
     ) -> Result<(), Error> {
-        let task_groups = eredu_runtime::group_replicated_text_transform_tasks(tasks)
-            .map_err(|error| Error::Quantization(error.to_string()))?;
+        let task_groups = eredu_runtime::group_replicated_text_transform_tasks(tasks)?;
         if task_groups.is_empty() {
             if source_architecture.is_some() || source_units.is_some() {
                 return Err(Error::Quantization(
@@ -193,9 +192,7 @@ where
         let target_static = target_architecture.static_modules();
         let mut combined = eredu_runtime::WeightMaterializationReport::default();
         for group in task_groups {
-            let exact_tasks = group
-                .tasks(tasks)
-                .map_err(|error| Error::Quantization(error.to_string()))?;
+            let exact_tasks = group.tasks(tasks)?;
             #[cfg(test)]
             crate::tests::support::path_instrumentation::materialization();
             let (store, report) = quantize_exact_replicated_text_tasks(

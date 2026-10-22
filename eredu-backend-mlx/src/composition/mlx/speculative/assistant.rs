@@ -257,37 +257,12 @@ pub(super) fn prepare_external_assistant_parameters<
         tasks,
     ) = prepared.into_parts();
     let mut store = store;
-    let transformed = tasks
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            )
-        })
-        .collect::<Vec<_>>();
-    if !transformed.is_empty() {
-        let source = A::module::<MlxNeuralBackend>(source_module_config, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target = A::module::<MlxNeuralBackend>(module_config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let mut groups = Vec::<(eredu_checkpoint::WeightQuantization, Vec<_>)>::new();
-        for task in transformed {
-            let format = task.executable().weight_quantization().ok_or_else(|| {
-                Error::Quantization(format!(
-                    "selected external assistant transform {:?} has no packed format",
-                    task.name()
-                ))
-            })?;
-            if let Some((_, grouped)) = groups.iter_mut().find(|(selected, _)| *selected == format)
-            {
-                grouped.push(task);
-            } else {
-                groups.push((format, vec![task]));
-            }
-        }
-        for (format, grouped) in groups {
+    let transform_groups = eredu_runtime::group_replicated_text_transform_tasks(&tasks)?;
+    if !transform_groups.is_empty() {
+        let source = A::module::<MlxNeuralBackend>(source_module_config, stream)?;
+        let target = A::module::<MlxNeuralBackend>(module_config.clone(), stream)?;
+        for group in transform_groups {
+            let grouped = group.tasks(&tasks)?;
             store = quantize_exact_replicated_text_tasks(
                 store,
                 &source,
@@ -295,17 +270,14 @@ pub(super) fn prepare_external_assistant_parameters<
                 &[] as &[A::Module<MlxNeuralBackend>],
                 &[],
                 parameter_layout.as_ref(),
-                format,
+                group.quantization(),
                 &grouped,
                 stream,
             )?
             .0;
         }
     }
-    let module = MlxModule::new(
-        A::module::<MlxNeuralBackend>(module_config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-    );
+    let module = MlxModule::new(A::module::<MlxNeuralBackend>(module_config.clone(), stream)?);
     let task_refs = tasks.iter().collect::<Vec<_>>();
     let bindings = build_mlx_exact_replicated_text_bindings(
         &module,

@@ -445,12 +445,8 @@ where
     let (source, local, selected_tasks) = prepared.into_parts();
     let mut store = store;
     let mut materialization = eredu_runtime::WeightMaterializationReport::default();
-    for group in eredu_runtime::group_replicated_text_transform_tasks(&selected_tasks)
-        .map_err(|error| Error::Quantization(error.to_string()))?
-    {
-        let tasks = group
-            .tasks(&selected_tasks)
-            .map_err(|error| Error::Quantization(error.to_string()))?;
+    for group in eredu_runtime::group_replicated_text_transform_tasks(&selected_tasks)? {
+        let tasks = group.tasks(&selected_tasks)?;
         let (transformed, report) = quantize_exact_replicated_text_tasks(
             store,
             &source,

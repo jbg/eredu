@@ -118,6 +118,10 @@ pub enum Error {
     #[error(transparent)]
     ExecutionGraph(#[from] eredu_runtime::ExecutionGraphError),
 
+    /// An exact neutral materialization task or transform group is invalid.
+    #[error(transparent)]
+    ReplicatedTextContract(#[from] eredu_runtime::ReplicatedTextContractError),
+
     /// Invalid logical-to-local execution-unit mapping or invocation.
     #[error(transparent)]
     ExecutionUnitAddressMap(#[from] eredu_runtime::ExecutionUnitAddressMapError),
