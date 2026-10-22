@@ -236,29 +236,17 @@ pub enum RoutedTextPreparationError {
     /// The admitted graph no longer matches the selected routed class.
     #[error("replicated routed text preparation is ineligible")]
     Ineligible,
+    /// Primary and independently materialized companion identities overlap.
+    #[error(transparent)]
+    Materialization(#[from] eredu_runtime::MaterializationTaskIndexError),
     /// Requirements, artifact provenance, selected formats, or modules disagreed.
     #[error("invalid replicated routed text preparation: {0}")]
     Invalid(String),
 }
 
-fn index_materialization_tasks(
-    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
-) -> BTreeMap<&str, &eredu_runtime::ReplicatedTextMaterializationTask> {
-    let mut indexed = BTreeMap::new();
-    for task in tasks {
-        for companion in task.output_companions() {
-            if let Some(exact) = companion.materialization_task() {
-                indexed.insert(companion.name(), exact);
-            }
-        }
-        indexed.insert(task.name(), task);
-    }
-    indexed
-}
-
 fn selected_member_geometry(
     unit: &crate::ExpertResidencyUnit,
-    tasks: &BTreeMap<&str, &eredu_runtime::ReplicatedTextMaterializationTask>,
+    tasks: &eredu_runtime::MaterializationTaskIndex<'_>,
 ) -> Result<(u64, u64), String> {
     let mut source_bytes = 0u64;
     let mut selected_bytes = 0u64;
@@ -359,35 +347,13 @@ fn project_bank_members_with_tasks(
     tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
     include_replicated: bool,
 ) -> Result<Vec<eredu_runtime::AddressableBankMember>, RoutedTextPreparationError> {
-    let mut selected_tasks = index_materialization_tasks(selected.materialization_tasks());
-    selected_tasks.extend(index_materialization_tasks(
-        selected.auxiliary_materialization_tasks(),
-    ));
-    let mut exact_tasks = BTreeMap::new();
-    for task in tasks {
-        if exact_tasks.insert(task.name(), task).is_some() {
-            return Err(RoutedTextPreparationError::Invalid(format!(
-                "addressable materialization repeats task {:?}",
-                task.name()
-            )));
-        }
-        // Partition projection folds encoded-linear companions into their
-        // primary task so the physical family stays atomic. A bank catalog,
-        // however, retains one binding and recipe per stored value. Re-index
-        // the exact standalone task retained by each companion under the
-        // architecture topology identity; do not reconstruct its lowering.
-        for companion in task.output_companions() {
-            let Some(exact) = companion.materialization_task() else {
-                continue;
-            };
-            if exact_tasks.insert(companion.name(), exact).is_some() {
-                return Err(RoutedTextPreparationError::Invalid(format!(
-                    "addressable materialization repeats output {:?}",
-                    companion.name()
-                )));
-            }
-        }
-    }
+    let selected_tasks = eredu_runtime::MaterializationTaskIndex::new(
+        selected
+            .materialization_tasks()
+            .iter()
+            .chain(selected.auxiliary_materialization_tasks()),
+    )?;
+    let exact_tasks = eredu_runtime::MaterializationTaskIndex::new(tasks)?;
     let mut shared_tasks = BTreeMap::new();
     let mut members = Vec::with_capacity(catalog.units().len());
     for unit in catalog.units() {
@@ -399,7 +365,7 @@ fn project_bank_members_with_tasks(
         let local_parameters = unit
             .parameters()
             .iter()
-            .filter(|parameter| exact_tasks.contains_key(parameter.logical_target()))
+            .filter(|parameter| exact_tasks.get(parameter.logical_target()).is_some())
             .count();
         if local_parameters == 0 {
             continue;
@@ -421,15 +387,12 @@ fn project_bank_members_with_tasks(
                     unit.identity()
                 ))
             })?;
-            let task = exact_tasks
-                .get(parameter.logical_target())
-                .copied()
-                .ok_or_else(|| {
-                    RoutedTextPreparationError::Invalid(format!(
-                        "addressable target {:?} has no exact materialization task",
-                        parameter.logical_target()
-                    ))
-                })?;
+            let task = exact_tasks.get(parameter.logical_target()).ok_or_else(|| {
+                RoutedTextPreparationError::Invalid(format!(
+                    "addressable target {:?} has no exact materialization task",
+                    parameter.logical_target()
+                ))
+            })?;
             let transforms = matches!(
                 task.lowering(),
                 eredu_runtime::WeightLoweringKind::Transform
@@ -2660,10 +2623,13 @@ fn maximum_selected_compact_bytes(
     requirements: &RoutedBankRequirements,
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
 ) -> Result<u64, String> {
-    let mut tasks = index_materialization_tasks(selected.materialization_tasks());
-    tasks.extend(index_materialization_tasks(
-        selected.auxiliary_materialization_tasks(),
-    ));
+    let tasks = eredu_runtime::MaterializationTaskIndex::new(
+        selected
+            .materialization_tasks()
+            .iter()
+            .chain(selected.auxiliary_materialization_tasks()),
+    )
+    .map_err(|error| error.to_string())?;
     let mut by_unit = BTreeMap::<(String, usize), Vec<u64>>::new();
     for unit in requirements.catalog().units() {
         let (_, selected_bytes) = selected_member_geometry(unit, &tasks)?;

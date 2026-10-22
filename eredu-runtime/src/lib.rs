@@ -532,6 +532,8 @@ mod parameter_coordinates;
 pub use parameter_coordinates::{
     derive_parameter_coordinates, derive_parameter_member_layout, ParameterPartitionLayout,
 };
+mod materialization_index;
+pub use materialization_index::{MaterializationTaskIndex, MaterializationTaskIndexError};
 mod pipeline_rank;
 pub use pipeline_rank::{PipelineGroupOwnership, PipelineRankError, PipelineRankProjection};
 mod pipeline_placement;

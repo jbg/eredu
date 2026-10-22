@@ -859,6 +859,14 @@ duplicate canonical destinations are rejected.
 GPT-OSS rank-local expert preparation uses this shared projection. Shared resource
 binding preparation uses the same checkpoint snapshot primitive while keeping
 aliases local to each independently leased resource.
+Runtime's borrowed `MaterializationTaskIndex` indexes primary tasks and exact
+standalone companion tasks under their declared topology output identities.
+Generated companions and aliases do not become independent acquisition units;
+equal physical source inputs do not merge distinct outputs. Duplicate selected
+outputs, including overlaps between primary and auxiliary tasks, return typed
+errors naming both owners. Routed bank preparation and compact residency sizing
+use this shared index. Families retain expert roles, route cardinality and
+format policy; indexing acquires no payload or native resource.
 Runtime's `resolve_parameter_member` resolves selected primary outputs, aliases
 and companions to their canonical parameter groups and module slots, rejecting
 ambiguous identities and invalid effective geometry. `ParameterMemberIndex`

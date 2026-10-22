@@ -257,6 +257,10 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
     };
     let mut lookup_tasks = tasks.clone();
     lookup_tasks[0] = aliased(vec!["first-consumer".into()]);
+    let materialized = eredu_runtime::MaterializationTaskIndex::new(&lookup_tasks).unwrap();
+    assert!(materialized.get("first-consumer").is_none());
+    assert!(materialized.get("encoded.scales").is_none());
+    assert!(materialized.get("encoded.biases").is_none());
     let index = eredu_runtime::ParameterMemberIndex::new(
         &lookup_tasks,
         std::sync::Arc::new(description.clone()),
@@ -494,6 +498,10 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
         Err(ParameterAcquisitionError::ExecutionOwnership { .. })
     ));
     let duplicate = vec![tasks[0].clone(), tasks[0].clone()];
+    assert!(matches!(
+        eredu_runtime::MaterializationTaskIndex::new(&duplicate),
+        Err(eredu_runtime::MaterializationTaskIndexError { target, .. }) if target == "first"
+    ));
     let error = parameter_acquisition_units(&duplicate).unwrap_err();
     assert!(
         matches!(&error, ParameterAcquisitionError::Output { target, .. } if target == "first")
