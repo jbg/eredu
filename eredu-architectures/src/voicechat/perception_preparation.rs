@@ -14,7 +14,7 @@ use eredu_runtime::{
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
-    parameters::{execution_parameter, SpeechParameterError},
+    parameters::{admitted_member, execution_parameter, SpeechParameterError},
     perception::{PerceptionDimensions, PerceptionError},
     perception_layered::perception_parameter_description,
 };
@@ -49,9 +49,6 @@ pub enum PerceptionPreparationError {
     /// The shared planner rejected the selected tensor topology.
     #[error("invalid perception tensor partition: {0}")]
     Parallel(String),
-    /// An admitted parameter disagrees with architecture or recipe geometry.
-    #[error("VoiceChat perception parameter {0} has inconsistent geometry")]
-    Geometry(String),
 }
 
 /// Cold bindings for subsampling, each Conformer block, and final projection.
@@ -121,19 +118,8 @@ impl PreparedPerceptionBindings {
             description,
             source.clone(),
             |member| {
-                let name = member.target();
-                let parameter = parameters
-                    .get(name)
-                    .filter(|p| p.component == Component::Perception)
-                    .ok_or_else(|| SpeechParameterError::MissingParameter {
-                        component: Component::Perception,
-                        name: name.into(),
-                    })?;
-                if parameter.output.shape != member.global_shape()
-                    || parameter.recipe.infer(source.as_ref())? != parameter.output
-                {
-                    return Err(PerceptionPreparationError::Geometry(name.into()));
-                }
+                let parameter =
+                    admitted_member(parameters, &source, Component::Perception, member)?;
                 let parameter = execution_parameter(parameter, &source)?;
                 Ok::<_, PerceptionPreparationError>(parameter.recipe)
             },

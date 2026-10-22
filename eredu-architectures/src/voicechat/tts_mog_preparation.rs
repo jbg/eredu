@@ -14,7 +14,7 @@ use eredu_runtime::{
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
-    parameters::{execution_parameter, SpeechParameterError},
+    parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::{MogDimensions, TtsError},
     tts_mog_layered::mog_parameter_description,
 };
@@ -128,18 +128,7 @@ impl PreparedMogBindings {
             source.clone(),
             |member| {
                 let name = member.target();
-                let parameter = parameters
-                    .get(name)
-                    .filter(|p| p.component == Component::Tts)
-                    .ok_or_else(|| SpeechParameterError::MissingParameter {
-                        component: Component::Tts,
-                        name: name.into(),
-                    })?;
-                if parameter.output.shape != member.global_shape()
-                    || parameter.recipe.infer(source.as_ref())? != parameter.output
-                {
-                    return Err(MogPreparationError::Geometry(name.into()));
-                }
+                let parameter = admitted_member(parameters, &source, Component::Tts, member)?;
                 let parameter = execution_parameter(parameter, &source)?;
                 if parameter.output.dtype != RecipeDtype::F32 {
                     return Err(MogPreparationError::Geometry(name.into()));

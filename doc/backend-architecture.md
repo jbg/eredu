@@ -833,7 +833,12 @@ transforms preserve targets, shapes and source authority. Identity-based
 projections retain transformed bindings and project local placement; sparse unit
 selection preserves global invocation addresses while compacting local ordinals
 and narrowing source access. Families own source admission, naming, aliases,
-precision policy, special recipes and additional geometry constraints.
+precision policy, special recipes and additional geometry constraints. VoiceChat's
+shared admitted-member resolver verifies component membership, the declared global
+shape and the complete inferred recipe output metadata before execution conversion.
+Its ordinary module resolver uses the same component lookup while retaining host
+exclusion and explicit alias checks. Component precision rules and original storage,
+converter workspace and conversion-overlap accounting remain family-owned.
 
 RVQ, PRVQ, RNNT, RNNT projection, perception, conditioning, MoG, the TTS transformer
 and EAR encoder/decoder preparation use this shared container. Function-head

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeDtype, RecipeError},
+    recipe::{DerivedWeightRecipe, RecipeDtype},
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
@@ -14,7 +14,7 @@ use eredu_runtime::{
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
-    parameters::SpeechParameterError,
+    parameters::{admitted_member, SpeechParameterError},
     rnnt::{RnntDimensions, RnntError},
     rnnt_layered::rnnt_parameter_description,
 };
@@ -34,9 +34,6 @@ pub enum RnntPreparationError {
     /// The restricted source could not be retained.
     #[error(transparent)]
     Source(#[from] StoreError),
-    /// An exact recipe disagrees with source metadata.
-    #[error(transparent)]
-    Recipe(#[from] RecipeError),
     /// A validated recipe cannot be represented by a runtime binding.
     #[error(transparent)]
     Binding(#[from] RecipeBindingError),
@@ -55,9 +52,6 @@ pub enum RnntPreparationError {
     /// A required canonical parameter has no recipe.
     #[error("VoiceChat RNNT parameter {0} is missing")]
     MissingParameter(String),
-    /// A parameter disagrees with its architecture or admitted metadata.
-    #[error("VoiceChat RNNT parameter {0} has inconsistent geometry")]
-    Geometry(String),
 }
 
 /// Restricted checkpoint authority and F32 recipes in architecture unit order.
@@ -94,18 +88,7 @@ impl PreparedRnntBindings {
         for owned in description.groups() {
             for member in owned.members() {
                 let name = member.target();
-                let parameter = parameters
-                    .get(name)
-                    .filter(|parameter| parameter.component == Component::Rnnt)
-                    .ok_or_else(|| SpeechParameterError::MissingParameter {
-                        component: Component::Rnnt,
-                        name: name.into(),
-                    })?;
-                if parameter.output.shape != member.global_shape()
-                    || parameter.recipe.infer(source.as_ref())? != parameter.output
-                {
-                    return Err(RnntPreparationError::Geometry(name.into()));
-                }
+                let parameter = admitted_member(parameters, &source, Component::Rnnt, member)?;
                 recipes.insert(name.into(), parameter.recipe.clone());
             }
         }

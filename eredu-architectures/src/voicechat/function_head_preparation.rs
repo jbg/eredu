@@ -16,7 +16,7 @@ use super::{
     channels::{ChannelError, TEXT_VOCABULARY_SIZE},
     checkpoint::Component,
     function_head_layered::{function_head_parameter_description, FunctionHeadDimensions},
-    parameters::SpeechParameterError,
+    parameters::{admitted_member, SpeechParameterError},
 };
 
 /// Invalid component geometry or exact retained parameter contract.
@@ -116,18 +116,8 @@ impl PreparedFunctionHeadBindings {
             source.clone(),
             |member| {
                 let name = member.target();
-                let parameter = parameters
-                    .get(name)
-                    .filter(|p| p.component == Component::FunctionHead)
-                    .ok_or_else(|| SpeechParameterError::MissingParameter {
-                        component: Component::FunctionHead,
-                        name: name.into(),
-                    })?;
-                if parameter.output.shape != member.global_shape()
-                    || parameter.recipe.infer(source.as_ref())? != parameter.output
-                {
-                    return Err(FunctionHeadPreparationError::Geometry(name.into()));
-                }
+                let parameter =
+                    admitted_member(parameters, &source, Component::FunctionHead, member)?;
                 let mut parameter = parameter.clone();
                 // Floating parameters use F32 arithmetic; packed matrix storage
                 // retains its admitted encoding and ordinary companion bindings.

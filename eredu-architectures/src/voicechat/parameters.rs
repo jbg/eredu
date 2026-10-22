@@ -15,8 +15,8 @@ use eredu_nn::{validate_parameter_topology, ParameterTopologyError, Parameterize
 use eredu_runtime::{
     bind_materialized_unit, materialize_selected_bindings, prepare_resource_bindings,
     select_bindings, ArchitectureParameterDescription, ComponentPreparationError, ParameterBackend,
-    ParameterOrchestrationError, ParameterResourceRecipes, PreparedComponent, RecipeBindingError,
-    SelectedBindingPlan, WeightBinding,
+    ParameterMemberSpec, ParameterOrchestrationError, ParameterResourceRecipes, PreparedComponent,
+    RecipeBindingError, SelectedBindingPlan, WeightBinding,
 };
 
 use super::{
@@ -39,6 +39,14 @@ pub enum SpeechParameterError {
         /// Selected component.
         component: Component,
         /// Module's exact stable identity.
+        name: String,
+    },
+    /// A declared member disagrees with its retained recipe output metadata.
+    #[error("VoiceChat component {component:?} parameter {name} disagrees with admitted metadata")]
+    InconsistentAdmission {
+        /// Selected source component.
+        component: Component,
+        /// Declared canonical identity.
         name: String,
     },
     /// Host preprocessing and integer policy buffers cannot become neural weights.
@@ -259,6 +267,40 @@ fn project_description(
     })
 }
 
+fn parameter_for_component<'a>(
+    admitted: &'a BTreeMap<String, ParameterAdmission>,
+    component: Component,
+    name: &str,
+) -> Result<&'a ParameterAdmission, SpeechParameterError> {
+    admitted
+        .get(name)
+        .filter(|parameter| parameter.component == component)
+        .ok_or_else(|| SpeechParameterError::MissingParameter {
+            component,
+            name: name.into(),
+        })
+}
+
+/// Checks retained admission before any execution conversion or accounting change.
+pub(super) fn admitted_member<'a>(
+    admitted: &'a BTreeMap<String, ParameterAdmission>,
+    source: &SharedCheckpointSource,
+    component: Component,
+    member: &ParameterMemberSpec,
+) -> Result<&'a ParameterAdmission, SpeechParameterError> {
+    let name = member.target();
+    let parameter = parameter_for_component(admitted, component, name)?;
+    if parameter.output.shape != member.global_shape()
+        || parameter.recipe.infer(source.as_ref())? != parameter.output
+    {
+        return Err(SpeechParameterError::InconsistentAdmission {
+            component,
+            name: name.into(),
+        });
+    }
+    Ok(parameter)
+}
+
 fn admitted_parameter(
     admitted: &BTreeMap<String, ParameterAdmission>,
     source: &SharedCheckpointSource,
@@ -268,13 +310,7 @@ fn admitted_parameter(
     if host_parameter(name) {
         return Err(SpeechParameterError::HostParameter(name.into()));
     }
-    let parameter = admitted
-        .get(name)
-        .filter(|parameter| parameter.component == component)
-        .ok_or_else(|| SpeechParameterError::MissingParameter {
-            component,
-            name: name.into(),
-        })?;
+    let parameter = parameter_for_component(admitted, component, name)?;
     Ok(execution_parameter(parameter, source)?)
 }
 
