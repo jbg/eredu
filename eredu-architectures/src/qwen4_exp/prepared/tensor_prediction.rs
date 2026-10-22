@@ -1,7 +1,6 @@
 //! Prediction tensor ranks over the original admitted parameter sources.
 use super::*;
 use crate::qwen4_exp::mtp::PredictionTensorPartition;
-use crate::qwen4_exp::prepared::tensor_partition::partition_recipe;
 
 /// Exact local prediction recipes, retaining shared fusion/readout and target
 /// vocabulary references. Constructing a rank reads no parameter payload.
@@ -30,7 +29,13 @@ impl PreparedPrediction {
                 owner
                     .clone()
                     .map_recipes("qwen4_exp prepared owner", |name, recipe, source| {
-                        partition_recipe(source, name, recipe, partition.parameter_selections(name))
+                        eredu_runtime::select_parameter_recipe(
+                            source,
+                            name,
+                            recipe,
+                            partition.parameter_selections(name),
+                        )
+                        .map_err(PreparationError::from)
                     })
             })
             .collect::<Result<_, PreparationError>>()?;
@@ -40,12 +45,13 @@ impl PreparedPrediction {
             .map(|(root, bank)| {
                 let bank = bank.map_recipes(self.artifact.as_ref(), |name, recipe| {
                     let canonical = format!("{root}.{name}");
-                    partition_recipe(
+                    eredu_runtime::select_parameter_recipe(
                         self.artifact.as_ref(),
                         &canonical,
                         recipe,
                         partition.parameter_selections(&canonical),
                     )
+                    .map_err(PreparationError::from)
                 })?;
                 Ok((root.clone(), Arc::new(bank)))
             })

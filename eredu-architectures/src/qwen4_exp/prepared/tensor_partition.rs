@@ -1,7 +1,6 @@
 //! Tensor-rank source authority derived from already admitted canonical owners.
 use super::*;
 use crate::qwen4_exp::target::TargetTensorPartition;
-use eredu_checkpoint::store::TensorSelection;
 
 /// Local target parameters and geometry over the original admitted source.
 /// Preparation reads no parameter/table payload and does not reopen artifacts.
@@ -39,7 +38,13 @@ impl PreparedTarget {
             owner
                 .clone()
                 .map_recipes("qwen4_exp prepared owner", |name, recipe, source| {
-                    partition_recipe(source, name, recipe, partition.parameter_selections(name))
+                    eredu_runtime::select_parameter_recipe(
+                        source,
+                        name,
+                        recipe,
+                        partition.parameter_selections(name),
+                    )
+                    .map_err(PreparationError::from)
                 })
         };
         let static_parameters = partition_owner(&self.static_parameters)?;
@@ -54,12 +59,13 @@ impl PreparedTarget {
             .map(|(root, bank)| {
                 let bank = bank.map_recipes(self.artifact.as_ref(), |name, recipe| {
                     let canonical = format!("{root}.{name}");
-                    partition_recipe(
+                    eredu_runtime::select_parameter_recipe(
                         self.artifact.as_ref(),
                         &canonical,
                         recipe,
                         partition.parameter_selections(&canonical),
                     )
+                    .map_err(PreparationError::from)
                 })?;
                 Ok((root.clone(), Arc::new(bank)))
             })
@@ -146,41 +152,4 @@ impl PreparedTensorTarget {
     ) -> Result<PreparedRowLookup, PreparationError> {
         self.source.row_lookup(layer, limits, policy)
     }
-}
-pub(super) fn partition_recipe<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
-    catalog: &C,
-    name: &str,
-    source: &DerivedWeightRecipe,
-    selections: Option<&[TensorSelection]>,
-) -> Result<DerivedWeightRecipe, PreparationError> {
-    let invalid = |error| PreparationError::Contract(format!("tensor parameter {name}: {error}"));
-    let Some(selections) = selections else {
-        source.infer(catalog).map_err(invalid)?;
-        return Ok(source.clone());
-    };
-    let mut pieces = selections
-        .iter()
-        .map(|selection| {
-            source
-                .select_bounded(catalog, selection.clone())
-                .map_err(invalid)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let recipe = if pieces.len() == 1 {
-        pieces.pop().expect("one selected piece")
-    } else {
-        let Some(TensorSelection::Range { axis, .. }) = selections.first() else {
-            return Err(PreparationError::Contract(format!(
-                "tensor parameter {name} has no range selection"
-            )));
-        };
-        DerivedWeightRecipe::Concatenate {
-            axis: *axis,
-            inputs: pieces,
-        }
-    };
-    // Check the composed output before publishing the owner. PreparedParameterRecipes
-    // retains the same exact metadata/provenance authority after selection pushdown.
-    recipe.infer(catalog).map_err(invalid)?;
-    Ok(recipe)
 }

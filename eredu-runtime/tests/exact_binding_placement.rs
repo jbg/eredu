@@ -734,15 +734,17 @@ mod component_preparation {
             )) if name == "weight"
         ));
         let local = bank
-            .map_recipes(catalog, |_, recipe| {
-                Ok::<_, RecipeBindingError>(recipe.select_bounded(
+            .map_recipes(catalog, |target, recipe| {
+                eredu_runtime::select_parameter_recipe(
                     catalog,
-                    TensorSelection::Range {
+                    target,
+                    recipe,
+                    Some(&[TensorSelection::Range {
                         axis: 1,
                         start: 1,
                         end: 2,
-                    },
-                )?)
+                    }]),
+                )
             })
             .unwrap();
         let member = PreparedParameterRecipes::new(
@@ -766,6 +768,62 @@ mod component_preparation {
                 .shape(),
             [1, 1, 1]
         );
+        let segmented = bank
+            .map_recipes(catalog, |target, recipe| {
+                eredu_runtime::select_parameter_recipe(
+                    catalog,
+                    target,
+                    recipe,
+                    Some(&[
+                        TensorSelection::Range {
+                            axis: 1,
+                            start: 1,
+                            end: 2,
+                        },
+                        TensorSelection::Range {
+                            axis: 1,
+                            start: 0,
+                            end: 1,
+                        },
+                    ]),
+                )
+            })
+            .unwrap();
+        let segmented = PreparedParameterRecipes::new(
+            "ordered segments of member 2",
+            original.clone(),
+            segmented.member(2).unwrap().clone(),
+        )
+        .unwrap();
+        assert_eq!(segmented.source().source_keys(), ["scale.2", "weight.2"]);
+        assert_eq!(
+            segmented.recipes()["weight"]
+                .infer(segmented.source().as_ref())
+                .unwrap()
+                .shape(),
+            [1, 2, 4]
+        );
+        for invalid in [
+            vec![],
+            vec![
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 0,
+                    end: 1,
+                },
+                TensorSelection::Range {
+                    axis: 2,
+                    start: 0,
+                    end: 1,
+                },
+            ],
+            vec![TensorSelection::Full, TensorSelection::Full],
+        ] {
+            assert!(matches!(
+                eredu_runtime::select_parameter_recipe(catalog, "weight", &recipes["weight"], Some(&invalid)),
+                Err(RecipeBindingError::InvalidParameterSelection { target }) if target == "weight"
+            ));
+        }
         assert_eq!(bank.recipes(), &recipes);
         assert!(matches!(ParameterBankRecipes::new(catalog, BTreeMap::from([
             ("weight".into(), stack("weight", 3)),

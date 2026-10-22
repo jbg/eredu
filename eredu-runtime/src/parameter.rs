@@ -949,6 +949,58 @@ pub struct ParameterResourceRecipes {
     pub aliases: Vec<RecipeAlias>,
 }
 
+/// Projects a canonical parameter recipe through declared physical selections.
+///
+/// No selection retains the validated complete recipe. One selection preserves
+/// its representation; multiple ordered ranges on one axis concatenate their
+/// bounded projections on that axis. Families supply ranges after accounting for
+/// their packed geometry. This function inspects metadata without reading payloads.
+pub fn select_parameter_recipe<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    target: &str,
+    source: &DerivedWeightRecipe,
+    selections: Option<&[TensorSelection]>,
+) -> Result<DerivedWeightRecipe, RecipeBindingError> {
+    let invalid_recipe = |source| RecipeBindingError::ParameterRecipe {
+        target: target.to_owned(),
+        source,
+    };
+    let recipe = match selections {
+        None => source.clone(),
+        Some([selection]) => source
+            .select_bounded(catalog, selection.clone())
+            .map_err(invalid_recipe)?,
+        Some(selections) => {
+            let Some(TensorSelection::Range { axis, .. }) = selections.first() else {
+                return Err(RecipeBindingError::InvalidParameterSelection {
+                    target: target.to_owned(),
+                });
+            };
+            if !selections.iter().all(|selection| {
+                matches!(selection, TensorSelection::Range { axis: selected, .. } if selected == axis)
+            }) {
+                return Err(RecipeBindingError::InvalidParameterSelection {
+                    target: target.to_owned(),
+                });
+            }
+            let inputs = selections
+                .iter()
+                .map(|selection| {
+                    source
+                        .select_bounded(catalog, selection.clone())
+                        .map_err(invalid_recipe)
+                })
+                .collect::<Result<_, _>>()?;
+            DerivedWeightRecipe::Concatenate {
+                axis: *axis,
+                inputs,
+            }
+        }
+    };
+    recipe.infer(catalog).map_err(invalid_recipe)?;
+    Ok(recipe)
+}
+
 /// Selects ordered bank-global member identities from canonical parameter recipes.
 ///
 /// Selection validates the nonempty, unique member list against the declared
@@ -987,12 +1039,12 @@ pub fn select_parameter_bank_recipes<C: RecipeCatalog + ?Sized>(
         if selected.contains_key(&target) {
             return Err(ResidencyDeclarationError::DuplicateLogicalBinding { name: target }.into());
         }
-        let recipe = recipe
-            .select_bounded(catalog, selection.clone())
-            .map_err(|source| RecipeBindingError::ParameterRecipe {
-                target: target.clone(),
-                source,
-            })?;
+        let recipe = select_parameter_recipe(
+            catalog,
+            &target,
+            &recipe,
+            Some(std::slice::from_ref(&selection)),
+        )?;
         selected.insert(target, recipe);
     }
     Ok(selected)
@@ -1236,6 +1288,12 @@ pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
 /// Failure preparing exact source authority or lowering atomic recipe bindings.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeBindingError {
+    /// A segmented projection has no ranges or mixes range axes or kinds.
+    #[error("parameter {target:?} selection requires one selection or ordered ranges on one axis")]
+    InvalidParameterSelection {
+        /// Canonical parameter whose selected pieces cannot be assembled.
+        target: String,
+    },
     /// An ordered bank projection selected no members.
     #[error("parameter bank selection requires at least one member")]
     EmptyBankSelection,
@@ -1253,10 +1311,10 @@ pub enum RecipeBindingError {
         /// Repeated bank-global member identity.
         member: usize,
     },
-    /// A canonical bank parameter cannot be projected into bounded members.
+    /// A canonical parameter recipe cannot be inferred or projected.
     #[error("parameter {target:?} recipe failed: {source}")]
     ParameterRecipe {
-        /// Canonical bank parameter identity.
+        /// Canonical parameter identity.
         target: String,
         /// Original typed recipe failure.
         #[source]
@@ -1265,7 +1323,7 @@ pub enum RecipeBindingError {
     /// A bank parameter describes a different leading-axis member count.
     #[error("parameter {target:?} has {actual} bank members; expected {expected}")]
     BankMemberCount {
-        /// Canonical bank parameter identity.
+        /// Canonical parameter identity.
         target: String,
         /// Declared bank member count.
         expected: usize,

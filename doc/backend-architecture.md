@@ -822,9 +822,14 @@ preserving canonical targets, validating outputs and narrowing authority to the
 transformed recipes' physical inputs. It cannot introduce a neighboring owner's
 sources. Consuming `project` selects existing canonical parameter identities,
 keeps their recipes and exact source guards, and rejects unknown targets. Qwen4
-target and prediction tensor partitions use the shared transformation traversal;
-prediction vocabulary derives from the retained target owner through identity
-projection. Runtime's source-free `ParameterBankRecipes` validates canonical
+target and prediction tensor partitions use the shared transformation traversal.
+Runtime's `select_parameter_recipe` pushes declared physical selections through
+canonical recipes and assembles ordered range segments on one axis, retaining
+canonical parameter identities and typed recipe failures. It validates geometry
+without acquiring payloads. Families supply packed coordinates and selected local
+geometry; Qwen4 target and prediction ordinary and expert owners consume this
+projection. Prediction vocabulary derives from the retained target owner through
+identity projection. Runtime's source-free `ParameterBankRecipes` validates canonical
 bank recipes and their declared member counts, then projects every parameter to
 bounded leading-axis member recipes with singleton axes. Its `map_recipes`
 transforms complete banks before deriving members and retains the declared member
@@ -846,7 +851,8 @@ parameter payload or native resource.
 `select_parameter_bank_recipes` validates nonempty, unique ordered global member
 IDs before pushing a rank-local selection through canonical recipes. Families
 supply the member axis and geometry; runtime retains selection order and typed
-member or parameter errors. Duplicate canonical destinations are rejected.
+member or parameter errors. Bank selection uses the same typed recipe selector;
+duplicate canonical destinations are rejected.
 GPT-OSS rank-local expert preparation uses this shared projection. Shared resource
 binding preparation uses the same checkpoint snapshot primitive while keeping
 aliases local to each independently leased resource.

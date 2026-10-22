@@ -332,9 +332,9 @@ pub use parameter::{
     apply_parameter_storage_layouts, bind_materialized_unit, bind_materialized_unit_excluding,
     bindings_from_recipe_set, build_exact_replicated_text_bindings, build_module_binding_plan,
     materialize_bindings, materialize_selected_bindings, preflight_bindings,
-    prepare_resource_bindings, select_bindings, select_parameter_bank_recipes, BindingPlan,
-    BindingPlanError, MaterializedUnit, ModuleBindingPlan, ModuleBindingPlanError,
-    ParameterBankRecipes, ParameterBatchBudget, ParameterBindingTarget,
+    prepare_resource_bindings, select_bindings, select_parameter_bank_recipes,
+    select_parameter_recipe, BindingPlan, BindingPlanError, MaterializedUnit, ModuleBindingPlan,
+    ModuleBindingPlanError, ParameterBankRecipes, ParameterBatchBudget, ParameterBindingTarget,
     ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding,
     PreparedParameterRecipes, RecipeBindingError, SelectedBindingPlan,
 };
