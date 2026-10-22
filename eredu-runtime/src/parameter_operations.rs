@@ -8,6 +8,11 @@ use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 
 mod assembly;
 mod banks;
+mod bank_replacements;
+pub use bank_replacements::{
+    prepare_bank_parameter_replacements, BankParameterReplacementFacts,
+    BankParameterReplacementError, PreparedBankParameterReplacements,
+};
 pub use banks::{
     prepare_bank_parameter_members, prepare_bank_parameter_slots, BankParameterPreparationError,
     PreparedBankParameter, PreparedBankParameterMember,

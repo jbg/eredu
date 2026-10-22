@@ -11198,6 +11198,14 @@ checks. A materializer cannot silently drop or add an independently selected mem
 `PreparedSelectedAddressableBank` supplies admitted residency inputs and parameter
 metadata to one native cache assembly path.
 
+`prepare_bank_parameter_replacements` consumes backend-observed replacement facts
+and retained canonical member metadata to validate floating member geometry and
+calculate each independent storage charge. It returns selected canonical identities
+and effective member bytes without publishing handles or acquiring payloads. Inactive
+overlays restore the original catalog. The backend locks all distinct physical pools,
+prepares every pool, and publishes their native handles only after ordinary parameter
+publication succeeds under the existing outer transaction.
+
 `PreparedAddressableBankResidency` consumes final entries and retained row sources,
 rechecks their actual extents and moves the catalog, bindings, rows and admitted plan
 into the backend residency manager. Native cache initialization and completion remain

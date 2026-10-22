@@ -118,39 +118,30 @@ pub(crate) fn publish_bank_parameter_replacements(
         .collect::<Result<Vec<_>, _>>()?;
     let mut prepared = Vec::with_capacity(guards.len());
     for bank in &guards {
-        let mut replacements = BTreeMap::new();
-        let mut bytes = bank.catalog.clone();
-        if active {
-            for member in &bank.parameter_members {
-                let Some(value) = values.get(&member.parameter) else {
-                    continue;
-                };
-                let count = bank
-                    .parameter_members
-                    .iter()
-                    .filter(|candidate| candidate.parameter == member.parameter)
-                    .count();
-                if value.as_array().shape().first().copied() != i32::try_from(count).ok()
-                    || !matches!(
-                        value.as_array().dtype(),
-                        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
-                    )
-                    || value.as_array().nbytes() % count != 0
-                {
-                    return Err(Error::ArchitectureModel(
-                        "bank replacement has incompatible member geometry or dtype".into(),
-                    ));
-                }
-                let entry_bytes = bytes.get_mut(&member.key).expect("retained member");
-                *entry_bytes = entry_bytes
-                    .checked_sub(member.materialized.byte_len)
-                    .and_then(|n| n.checked_add((value.as_array().nbytes() / count) as u64))
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel("bank replacement byte count overflow".into())
-                    })?;
-                replacements.insert(member.parameter.clone(), value.clone());
-            }
-        }
+        let (parameters, bytes) =
+            eredu_runtime::parameter_operations::prepare_bank_parameter_replacements(
+                &bank.parameter_members,
+                &bank.catalog,
+                active,
+                |parameter| {
+                    values.get(parameter).map(|value| {
+                        eredu_runtime::parameter_operations::BankParameterReplacementFacts {
+                            leading_dimension: value.as_array().shape().first().copied(),
+                            element_type: eredu_nn::Tensor::element_type(value),
+                            byte_len: value.as_array().nbytes() as u64,
+                        }
+                    })
+                },
+            )
+            .map_err(|source| Error::Other(Box::new(source)))?
+            .into_parts();
+        let replacements = parameters
+            .into_iter()
+            .map(|parameter| {
+                let value = values[&parameter].clone();
+                (parameter, value)
+            })
+            .collect();
         prepared.push((replacements, bytes));
     }
     if !ordinary()? {

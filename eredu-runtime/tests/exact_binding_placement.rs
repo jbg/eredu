@@ -790,6 +790,31 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
     // Final independently leased inputs enter the ordinary controller with their
     // sparse global identities and shared checkpoint authority intact.
     let (members, definitions, rows, plan) = residency.into_parts();
+    // One canonical replacement changes every independently retained member's
+    // effective charge; removing the overlay restores all original charges.
+    use eredu_runtime::parameter_operations::{
+        prepare_bank_parameter_replacements, BankParameterReplacementFacts,
+    };
+    let replacement =
+        prepare_bank_parameter_replacements(&parameters[0].members, &members, true, |parameter| {
+            (parameter == "weight").then_some(BankParameterReplacementFacts {
+                leading_dimension: Some(2),
+                element_type: Some(eredu_nn::TensorElementType::F16),
+                byte_len: 32,
+            })
+        })
+        .unwrap();
+    let (selected, effective_bytes) = replacement.into_parts();
+    assert_eq!(selected, BTreeSet::from(["weight".to_owned()]));
+    assert_eq!(effective_bytes.values().copied().sum::<u64>(), 32);
+    assert!(effective_bytes.values().all(|bytes| *bytes == 16));
+    let (_, restored) =
+        prepare_bank_parameter_replacements(&parameters[0].members, &members, false, |_| {
+            panic!("inactive overlay must not inspect replacements")
+        })
+        .unwrap()
+        .into_parts();
+    assert_eq!(restored, members);
     let ids: Vec<_> = members.keys().map(|key| key.unit_id()).collect();
     let mut controller = eredu_runtime::ResidencyController::new_with_row_ranges(
         |_| &source as &dyn CheckpointSource,
