@@ -51,8 +51,8 @@ mod quantization;
 #[allow(unused_imports)]
 pub(crate) use quantization::{packed_weight_companions, PackedWeightCompanions};
 pub use quantization::{
-    quantize_exact_realtime_tasks, quantize_exact_replicated_text_tasks,
-    quantize_module_store_with_bindings,
+    materialize_replicated_text_transform_groups, quantize_exact_realtime_tasks,
+    quantize_exact_replicated_text_tasks, quantize_module_store_with_bindings,
 };
 mod sharding;
 pub use sharding::{shard_addressable_member_bindings, shard_layer_bindings};

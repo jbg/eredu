@@ -831,6 +831,13 @@ canonical destinations and verifies each unit's non-alias payload against its
 selected byte count before native materialization. Native module paths use the
 binding's canonical logical target for this projection.
 
+MLX ordinary text, prediction and assistant construction apply runtime-selected
+transform groups through one bounded materialization sequence. Each successful
+group replaces the retained source with its completed overlay and contributes to
+the combined report. A later failure retains earlier completed overlays; the
+single-group mechanism owns native completion and failed-resource retirement.
+Format grouping and task identities remain runtime contracts.
+
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
 source authority to the recipes' physical inputs. Before recipe preparation,

@@ -190,25 +190,17 @@ where
         }
         let source_static = source.static_modules();
         let target_static = target_architecture.static_modules();
-        let mut combined = eredu_runtime::WeightMaterializationReport::default();
-        for group in task_groups {
-            let exact_tasks = group.tasks(tasks)?;
-            #[cfg(test)]
-            crate::tests::support::path_instrumentation::materialization();
-            let (store, report) = quantize_exact_replicated_text_tasks(
-                Arc::clone(&self.store),
-                source_static,
-                target_static,
-                source_units,
-                target_units,
-                source_layout,
-                group.quantization(),
-                &exact_tasks,
-                &self.stream,
-            )?;
-            self.store = store;
-            combined.merge(report);
-        }
+        let combined = materialize_replicated_text_transform_groups(
+            &mut self.store,
+            source_static,
+            target_static,
+            source_units,
+            target_units,
+            source_layout,
+            tasks,
+            &task_groups,
+            &self.stream,
+        )?;
         self.materialization = Some(combined);
         Ok(())
     }

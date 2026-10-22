@@ -634,6 +634,48 @@ where
     )
 }
 
+/// Applies retained format groups through the ordinary bounded native mechanism.
+/// Each completed group publishes its exact overlay before the next begins. On
+/// failure the caller retains the last completed source, while the failed group's
+/// completion and retirement remain owned by the single-group materializer.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_replicated_text_transform_groups<SM, U>(
+    store: &mut SharedCheckpointSource,
+    source_static: &SM,
+    target_static: &SM,
+    source_units: &[U],
+    target_units: &[U],
+    source_layout: Option<&eredu_runtime::LocalModelLayout>,
+    tasks: &[ReplicatedTextMaterializationTask],
+    groups: &[eredu_runtime::ReplicatedTextTransformGroup],
+    stream: &Stream,
+) -> Result<WeightMaterializationReport, Error>
+where
+    SM: Parameterized<crate::MlxTensor>,
+    U: Parameterized<crate::MlxTensor>,
+{
+    let mut combined = WeightMaterializationReport::default();
+    for group in groups {
+        let exact_tasks = group.tasks(tasks)?;
+        #[cfg(test)]
+        crate::tests::support::path_instrumentation::materialization();
+        let (transformed, report) = quantize_exact_replicated_text_tasks(
+            Arc::clone(store),
+            source_static,
+            target_static,
+            source_units,
+            target_units,
+            source_layout,
+            group.quantization(),
+            &exact_tasks,
+            stream,
+        )?;
+        *store = transformed;
+        combined.merge(report);
+    }
+    Ok(combined)
+}
+
 /// Builds a bounded packed overlay for an exact set of selected replicated-text tasks.
 ///
 /// Target identity, source provenance, recipe, format, and lowering come only

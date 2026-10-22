@@ -240,7 +240,7 @@ pub(super) fn prepare_external_assistant_parameters<
 ) -> Result<PreparedAssistantParameters<A>, Error> {
     use crate::backend::runtime::{
         checkpoint::binding::{build_mlx_exact_replicated_text_bindings, ModuleBindingError},
-        execution::layerwise::quantize_exact_replicated_text_tasks,
+        execution::layerwise::materialize_replicated_text_transform_groups,
     };
     let parameter_units = prepared.parameter_units().to_vec();
     let parameter_layout = prepared.parameter_layout().cloned();
@@ -261,21 +261,17 @@ pub(super) fn prepare_external_assistant_parameters<
     if !transform_groups.is_empty() {
         let source = A::module::<MlxNeuralBackend>(source_module_config, stream)?;
         let target = A::module::<MlxNeuralBackend>(module_config.clone(), stream)?;
-        for group in transform_groups {
-            let grouped = group.tasks(&tasks)?;
-            store = quantize_exact_replicated_text_tasks(
-                store,
-                &source,
-                &target,
-                &[] as &[A::Module<MlxNeuralBackend>],
-                &[],
-                parameter_layout.as_ref(),
-                group.quantization(),
-                &grouped,
-                stream,
-            )?
-            .0;
-        }
+        materialize_replicated_text_transform_groups(
+            &mut store,
+            &source,
+            &target,
+            &[] as &[A::Module<MlxNeuralBackend>],
+            &[],
+            parameter_layout.as_ref(),
+            &tasks,
+            &transform_groups,
+            stream,
+        )?;
     }
     let module = MlxModule::new(A::module::<MlxNeuralBackend>(module_config.clone(), stream)?);
     let task_refs = tasks.iter().collect::<Vec<_>>();
