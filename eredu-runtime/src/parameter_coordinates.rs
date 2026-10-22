@@ -1,21 +1,21 @@
 //! Effective parameter coordinates derived from the actual selected layout.
 //!
 //! These declarations contain no loaded-session, epoch or communication authority.
+use crate::{LocalTensorLayout, ReplicatedTextMaterializationTask, TensorPlacement};
 use eredu_core::{
     capture::{CaptureReservation, CaptureUsage},
     component::ComponentCoordinateMap,
     parameters::{ParameterCoordinateMap, ParameterError},
     ParallelRankTopology,
 };
-use eredu_runtime::{LocalTensorLayout, ReplicatedTextMaterializationTask, TensorPlacement};
 
 /// One rank's parameter ownership, including nonlocal pipeline stages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParameterPartitionLayout {
-    pub(crate) topology: ParallelRankTopology,
-    pub(crate) target: String,
-    pub(crate) global_shape: Vec<u64>,
-    pub(crate) coordinates: Option<ParameterCoordinateMap>,
+    topology: ParallelRankTopology,
+    target: String,
+    global_shape: Vec<u64>,
+    coordinates: Option<ParameterCoordinateMap>,
 }
 impl ParameterPartitionLayout {
     /// Exact retained rank topology.
@@ -61,7 +61,7 @@ pub fn derive_parameter_coordinates(
 
 /// Companion outputs are scalar storage arrays with their own retained logical
 /// geometry and sharding. Encoded weight block expansion does not apply to them.
-pub(crate) fn derive_companion_coordinates(
+fn derive_companion_coordinates(
     logical: &[usize],
     tensor: &LocalTensorLayout,
     rank: usize,
@@ -248,7 +248,7 @@ fn derive_coordinates(
     ParameterCoordinateMap::new(logical.iter().map(|n| *n as u64).collect(), axes).map(Some)
 }
 
-pub(crate) fn charge(
+fn charge(
     reservation: &mut impl CaptureReservation,
     host_bytes: u64,
 ) -> Result<(), ParameterError> {
@@ -258,9 +258,95 @@ pub(crate) fn charge(
     })?;
     Ok(())
 }
-pub(crate) fn invalid(message: &str) -> ParameterError {
+fn invalid(message: &str) -> ParameterError {
     ParameterError::Invalid(message.into())
 }
 fn coordinate_error(error: eredu_core::component::ComponentCoordinateError) -> ParameterError {
     invalid(&error.to_string())
+}
+
+/// Derives one selected parameter's effective rank-local coordinates.
+/// Families supply actual ownership and retained or ordinary placement. Runtime
+/// lowers only the requested atomic group and prepays all coordinate metadata.
+pub fn derive_parameter_member_layout(
+    resolved: crate::ResolvedParameterMember<'_>,
+    topology: ParallelRankTopology,
+    placement: ParallelRankTopology,
+    owns: bool,
+    retained_layout: Option<&crate::LocalModelLayout>,
+    reservation: &mut impl eredu_core::capture::CaptureReservation,
+) -> Result<ParameterPartitionLayout, eredu_core::parameters::ParameterError> {
+    use eredu_core::parameters::ParameterError;
+    let crate::ResolvedParameterMember {
+        task,
+        companion,
+        group,
+        member,
+    } = resolved;
+    let logical = companion.map_or_else(
+        || task.logical_shape(),
+        |companion| companion.logical_shape(),
+    );
+    let global_rank = topology.global_rank();
+    charge(
+        reservation,
+        256u64
+            .checked_add(member.target().len() as u64)
+            .and_then(|n| n.checked_add((logical.len() as u64).checked_mul(8)?))
+            .ok_or(ParameterError::Overflow)?,
+    )?;
+    let coordinates = if owns {
+        let mut bytes = 256u64;
+        for member in group.members() {
+            bytes = bytes
+                .checked_add(512)
+                .and_then(|n| n.checked_add(member.target().len() as u64))
+                .and_then(|n| n.checked_add(group.group().logical_name().len() as u64))
+                .and_then(|n| n.checked_add((member.global_shape().len() as u64).checked_mul(64)?))
+                .ok_or(ParameterError::Overflow)?;
+            if let crate::MemberSharding::Segmented { axis, .. }
+            | crate::MemberSharding::PartitionedSegments { axis, .. }
+            | crate::MemberSharding::PartitionedChunkSegments { axis, .. } = member.sharding()
+            {
+                let extent = member
+                    .global_shape()
+                    .get(*axis)
+                    .ok_or_else(|| invalid("segmented parameter axis is absent"))?;
+                bytes = bytes
+                    .checked_add(
+                        (*extent as u64)
+                            .checked_mul(32)
+                            .ok_or(ParameterError::Overflow)?,
+                    )
+                    .ok_or(ParameterError::Overflow)?;
+            }
+        }
+        charge(reservation, bytes)?;
+        let derived = if retained_layout.is_none() {
+            Some(
+                crate::derive_partitioned_group_layout(std::iter::once(group), placement)
+                    .map_err(|error| invalid(&error))?,
+            )
+        } else {
+            None
+        };
+        let tensor = retained_layout
+            .or(derived.as_ref())
+            .expect("one layout authority")
+            .tensor(member.target())
+            .ok_or_else(|| invalid("selected parameter layout is absent"))?;
+        if companion.is_some() {
+            derive_companion_coordinates(logical, tensor, global_rank, reservation)?
+        } else {
+            derive_parameter_coordinates(task, tensor, global_rank, reservation)?
+        }
+    } else {
+        None
+    };
+    Ok(ParameterPartitionLayout {
+        topology,
+        target: member.target().into(),
+        global_shape: logical.iter().map(|n| *n as u64).collect(),
+        coordinates,
+    })
 }

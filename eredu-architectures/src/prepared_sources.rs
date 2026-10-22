@@ -306,7 +306,7 @@ impl PreparedModelDiscovery {
         global_rank: usize,
         reservation: &mut impl eredu_core::capture::CaptureReservation,
     ) -> Result<
-        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
     > {
         let Some(selected) = &self.partition_selection else {

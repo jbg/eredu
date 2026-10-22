@@ -248,7 +248,7 @@ impl PreparedTargetStaticPlacement {
             usize,
             &mut MetadataReservation,
         ) -> Result<
-            Option<crate::parameter_partition::ParameterPartitionLayout>,
+            Option<eredu_runtime::ParameterPartitionLayout>,
             Error,
         >,
     ) -> Result<Option<Self>, Error> {

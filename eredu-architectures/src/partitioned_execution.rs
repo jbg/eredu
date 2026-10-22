@@ -8462,95 +8462,19 @@ pub(crate) trait TextRequirements {
     fn text(&self) -> &eredu_runtime::ReplicatedTextRequirements;
 }
 
-fn parameter_member_layout(
-    resolved: eredu_runtime::ResolvedParameterMember<'_>,
-    topology: ParallelRankTopology,
-    placement: ParallelRankTopology,
-    owns: bool,
-    retained_layout: Option<&eredu_runtime::LocalModelLayout>,
+fn charge(
     reservation: &mut impl eredu_core::capture::CaptureReservation,
-) -> Result<
-    crate::parameter_partition::ParameterPartitionLayout,
-    eredu_core::parameters::ParameterError,
-> {
-    use crate::parameter_partition::{
-        charge, derive_companion_coordinates, derive_parameter_coordinates, invalid,
-        ParameterPartitionLayout,
-    };
-    use eredu_core::parameters::ParameterError;
-    let eredu_runtime::ResolvedParameterMember {
-        task,
-        companion,
-        group,
-        member,
-    } = resolved;
-    let logical = companion.map_or_else(
-        || task.logical_shape(),
-        |companion| companion.logical_shape(),
-    );
-    let global_rank = topology.global_rank();
-    charge(
-        reservation,
-        256u64
-            .checked_add(member.target().len() as u64)
-            .and_then(|n| n.checked_add((logical.len() as u64).checked_mul(8)?))
-            .ok_or(ParameterError::Overflow)?,
-    )?;
-    let coordinates = if owns {
-        let mut bytes = 256u64;
-        for member in group.members() {
-            bytes = bytes
-                .checked_add(512)
-                .and_then(|n| n.checked_add(member.target().len() as u64))
-                .and_then(|n| n.checked_add(group.group().logical_name().len() as u64))
-                .and_then(|n| n.checked_add((member.global_shape().len() as u64).checked_mul(64)?))
-                .ok_or(ParameterError::Overflow)?;
-            if let eredu_runtime::MemberSharding::Segmented { axis, .. }
-            | eredu_runtime::MemberSharding::PartitionedSegments { axis, .. }
-            | eredu_runtime::MemberSharding::PartitionedChunkSegments { axis, .. } =
-                member.sharding()
-            {
-                let extent = member
-                    .global_shape()
-                    .get(*axis)
-                    .ok_or_else(|| invalid("segmented parameter axis is absent"))?;
-                bytes = bytes
-                    .checked_add(
-                        (*extent as u64)
-                            .checked_mul(32)
-                            .ok_or(ParameterError::Overflow)?,
-                    )
-                    .ok_or(ParameterError::Overflow)?;
-            }
-        }
-        charge(reservation, bytes)?;
-        let derived = if retained_layout.is_none() {
-            Some(
-                eredu_runtime::derive_partitioned_group_layout(std::iter::once(group), placement)
-                    .map_err(|error| invalid(&error))?,
-            )
-        } else {
-            None
-        };
-        let tensor = retained_layout
-            .or(derived.as_ref())
-            .expect("one layout authority")
-            .tensor(member.target())
-            .ok_or_else(|| invalid("selected parameter layout is absent"))?;
-        if companion.is_some() {
-            derive_companion_coordinates(logical, tensor, global_rank, reservation)?
-        } else {
-            derive_parameter_coordinates(task, tensor, global_rank, reservation)?
-        }
-    } else {
-        None
-    };
-    Ok(ParameterPartitionLayout {
-        topology,
-        target: member.target().into(),
-        global_shape: logical.iter().map(|n| *n as u64).collect(),
-        coordinates,
-    })
+    host_bytes: u64,
+) -> Result<(), eredu_core::parameters::ParameterError> {
+    reservation.reserve_quota(eredu_core::capture::CaptureUsage {
+        host_bytes,
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
+fn invalid(message: &str) -> eredu_core::parameters::ParameterError {
+    eredu_core::parameters::ParameterError::Invalid(message.into())
 }
 
 /// Prediction modules retain their own TP placement and are physically replicated
@@ -8562,11 +8486,7 @@ pub(crate) fn prediction_parameter_layout_for_rank(
     parameter: &str,
     global_rank: usize,
     reservation: &mut impl eredu_core::capture::CaptureReservation,
-) -> Result<
-    crate::parameter_partition::ParameterPartitionLayout,
-    eredu_core::parameters::ParameterError,
-> {
-    use crate::parameter_partition::invalid;
+) -> Result<eredu_runtime::ParameterPartitionLayout, eredu_core::parameters::ParameterError> {
     use eredu_core::parameters::ParameterError;
     let topology = ParallelRankTopology::new(prepared.topology().topology(), global_rank)
         .map_err(|error| invalid(&error.to_string()))?;
@@ -8592,7 +8512,7 @@ pub(crate) fn prediction_parameter_layout_for_rank(
     } else {
         None
     };
-    parameter_member_layout(
+    eredu_runtime::derive_parameter_member_layout(
         resolved,
         topology,
         placement,
@@ -8611,11 +8531,7 @@ pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
     index: Option<&eredu_runtime::ParameterMemberIndex>,
     authored: Option<&eredu_runtime::LocalModelLayout>,
     reservation: &mut impl eredu_core::capture::CaptureReservation,
-) -> Result<
-    crate::parameter_partition::ParameterPartitionLayout,
-    eredu_core::parameters::ParameterError,
-> {
-    use crate::parameter_partition::{charge, invalid};
+) -> Result<eredu_runtime::ParameterPartitionLayout, eredu_core::parameters::ParameterError> {
     use eredu_core::parameters::ParameterError;
     let topology = ParallelRankTopology::new(admission.topology().topology(), global_rank)
         .map_err(|error| invalid(&error.to_string()))?;
@@ -8630,8 +8546,8 @@ pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
         Some(index) => index.resolve(parameter)?,
         None => eredu_runtime::resolve_parameter_member(tasks, parameters, parameter)?,
     };
-    let group = resolved.group;
-    let member = resolved.member;
+    let group = resolved.group();
+    let member = resolved.member();
     let text = admission.execution.text();
     // Prepay rank metadata, including transient ownership ranges and role strings.
     // Parameter target strings are deliberately excluded from this projection.
@@ -8681,7 +8597,14 @@ pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
             retained_partition_layout(parameters, topology).map_err(ParameterError::Unsupported)?
         }
     };
-    parameter_member_layout(resolved, topology, topology, owns, retained, reservation)
+    eredu_runtime::derive_parameter_member_layout(
+        resolved,
+        topology,
+        topology,
+        owns,
+        retained,
+        reservation,
+    )
 }
 
 /// One architecture-authored boundary at its actual execution-unit ordinal.

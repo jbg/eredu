@@ -864,9 +864,14 @@ and companions to their canonical parameter groups and module slots, rejecting
 ambiguous identities and invalid effective geometry. `ParameterMemberIndex`
 retains immutable selected tasks and the validated parameter declaration for
 repeated lookup; callers cannot supply replacement slices to that index.
+Resolved records expose read-only accessors and are constructed only by runtime.
 Partitioned discovery and assistant static admission consume this shared
-resolution. Architectures retain effective coordinate derivation, semantic
-placement and pipeline ownership policy. Resolution inspects metadata and grants
+resolution. Runtime's `derive_parameter_member_layout` projects an owned or
+absent parameter through retained or ordinary placement and returns a
+`ParameterPartitionLayout`. Its coordinate compiler converts complete physical
+encoding blocks into effective scalar coordinates and prepays metadata budgets;
+companions use their own scalar geometry. Architectures retain semantic placement
+and pipeline ownership policy. Resolution inspects metadata and grants
 no parameter value, editing, checkpoint or native resource authority.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
 retention primitive. The family checks admitted table headers and provenance
@@ -7715,11 +7720,11 @@ or unused projections do not refund them.
 Architecture `PreparedModelDiscovery::parameter_partition_layout_for_rank`
 resolves the selected task, its declared aliases and emitted companions against the parameter topology
 retained by construction. It reuses the production pipeline-ownership compiler and
-lowers only the requested atomic parameter group through the production TP/EP
-layout compiler. Selected packing-axis and encoding facts convert complete
-physical quantization blocks to effective scalar coordinates. Fused segments,
-ordered expert axes, absent pipeline owners and shared static consumers retain
-their distinct meanings. FP8's uncompressed axes preserve uneven scalar ranges.
+delegates atomic parameter-group lowering and effective coordinate projection to
+runtime's `derive_parameter_member_layout`. The shared compiler consumes selected
+packing-axis and encoding facts to convert complete physical quantization blocks
+to effective scalar coordinates. Fused segments, ordered expert axes, absent
+pipeline owners and shared static consumers retain their distinct meanings. FP8's uncompressed axes preserve uneven scalar ranges.
 Neither source content resolution nor native parameter access occurs here.
 Companion coordinates describe scalar scale/bias cells; they never inherit the
 weight's packed-block expansion. Actual prepared slot metadata supplies sharing,

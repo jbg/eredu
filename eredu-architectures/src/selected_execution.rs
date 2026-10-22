@@ -343,7 +343,7 @@ impl SelectedExecution {
         global_rank: usize,
         reservation: &mut impl eredu_core::capture::CaptureReservation,
     ) -> Result<
-        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
     > {
         self.parameter_partition_layout_with_index(
@@ -363,7 +363,7 @@ impl SelectedExecution {
         index: Option<&eredu_runtime::ParameterMemberIndex>,
         reservation: &mut impl eredu_core::capture::CaptureReservation,
     ) -> Result<
-        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
     > {
         use crate::partitioned_execution::selected_parameter_layout_for_rank;

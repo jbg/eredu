@@ -131,13 +131,35 @@ impl ParameterMemberIndex {
 #[derive(Debug)]
 pub struct ResolvedParameterMember<'a> {
     /// Primary selected materialization task.
-    pub task: &'a crate::ReplicatedTextMaterializationTask,
+    pub(crate) task: &'a crate::ReplicatedTextMaterializationTask,
     /// Exact output companion when resolving a companion identity.
-    pub companion: Option<&'a crate::ReplicatedTextOutputCompanion>,
+    pub(crate) companion: Option<&'a crate::ReplicatedTextOutputCompanion>,
     /// Canonical owning parameter group.
-    pub group: &'a crate::OwnedParameterGroupSpec,
+    pub(crate) group: &'a crate::OwnedParameterGroupSpec,
     /// Canonical module member selected through the task aliases.
-    pub member: &'a crate::ParameterMemberSpec,
+    pub(crate) member: &'a crate::ParameterMemberSpec,
+}
+
+impl<'a> ResolvedParameterMember<'a> {
+    /// Primary selected materialization task.
+    pub const fn task(&self) -> &'a ReplicatedTextMaterializationTask {
+        self.task
+    }
+
+    /// Exact output companion when resolving a companion identity.
+    pub const fn companion(&self) -> Option<&'a ReplicatedTextOutputCompanion> {
+        self.companion
+    }
+
+    /// Canonical owning parameter group.
+    pub const fn group(&self) -> &'a OwnedParameterGroupSpec {
+        self.group
+    }
+
+    /// Canonical module member selected through the task aliases.
+    pub const fn member(&self) -> &'a ParameterMemberSpec {
+        self.member
+    }
 }
 
 fn resolve_parameter_member_inner<'a>(

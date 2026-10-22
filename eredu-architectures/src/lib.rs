@@ -71,7 +71,6 @@ pub mod component_partition;
 /// Optional backend operators required by each architecture family.
 pub mod operator_requirements;
 /// Effective parameter coordinates from the retained parallel selection.
-pub mod parameter_partition;
 /// Architecture-owned admission and typed handoff for partitioned execution.
 pub mod partitioned_execution;
 /// Architecture-owned construction and local geometry for embedded prediction extensions.

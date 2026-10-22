@@ -528,6 +528,10 @@ pub mod workspace_resources;
 
 mod parameter_bank;
 mod parameter_acquisition;
+mod parameter_coordinates;
+pub use parameter_coordinates::{
+    derive_parameter_coordinates, derive_parameter_member_layout, ParameterPartitionLayout,
+};
 mod parameter_members;
 pub use parameter_members::{resolve_parameter_member, ParameterMemberIndex, ResolvedParameterMember};
 pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};

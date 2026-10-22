@@ -271,9 +271,9 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
         let retained = index.resolve(query).unwrap();
         let borrowed =
             eredu_runtime::resolve_parameter_member(&lookup_tasks, &description, query).unwrap();
-        assert_eq!(retained.member.target(), canonical);
-        assert_eq!(retained.group.owner(), borrowed.group.owner());
-        assert_eq!(retained.member, borrowed.member);
+        assert_eq!(retained.member().target(), canonical);
+        assert_eq!(retained.group().owner(), borrowed.group().owner());
+        assert_eq!(retained.member(), borrowed.member());
     }
     assert!(matches!(
         index.resolve("missing"),
@@ -281,7 +281,7 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
     ));
     lookup_tasks.clear();
     assert_eq!(
-        index.resolve("first-consumer").unwrap().member.target(),
+        index.resolve("first-consumer").unwrap().member().target(),
         "first"
     );
     let duplicate = vec![tasks[0].clone(), tasks[0].clone()];
@@ -308,6 +308,104 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
     )
     .unwrap();
     let layout = eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
+    struct MetadataBudget {
+        used: u64,
+        limit: u64,
+    }
+    impl eredu_core::capture::CaptureReservation for MetadataBudget {
+        fn reserve(
+            &mut self,
+            usage: eredu_core::capture::CaptureUsage,
+        ) -> Result<Option<eredu_core::capture::CaptureSkipReason>, eredu_core::capture::CaptureError>
+        {
+            let next = self.used.checked_add(usage.host_bytes).unwrap();
+            if next > self.limit {
+                return Err(eredu_core::capture::CaptureError::Invalid(
+                    "metadata limit".into(),
+                ));
+            }
+            self.used = next;
+            Ok(None)
+        }
+    }
+    let mut effective = layout.clone();
+    effective.insert(
+        "encoded".into(),
+        LocalTensorLayout::new(
+            "encoded",
+            ParameterRole::ColumnProjection,
+            vec![8, 8],
+            vec![4, 8],
+            TensorPlacement::Shard {
+                axis: 0,
+                index: 1,
+                parts: 2,
+            },
+            None,
+            None,
+            false,
+        ),
+    );
+    let mut budget = MetadataBudget {
+        used: 0,
+        limit: u64::MAX,
+    };
+    for (query, expected_shape) in [
+        ("first-consumer", vec![4, 64]),
+        ("encoded", vec![4, 64]),
+        ("encoded.scales", vec![4, 1]),
+    ] {
+        let local = eredu_runtime::derive_parameter_member_layout(
+            index.resolve(query).unwrap(),
+            rank,
+            rank,
+            true,
+            Some(&effective),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(local.coordinates().unwrap().local_shape(), expected_shape);
+        let remote = eredu_runtime::derive_parameter_member_layout(
+            index.resolve(query).unwrap(),
+            rank,
+            rank,
+            false,
+            Some(&effective),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(remote.coordinates().is_none());
+        assert_eq!(remote.target(), local.target());
+        assert_eq!(remote.global_shape(), local.global_shape());
+    }
+    let mut denied = MetadataBudget {
+        used: 0,
+        limit: 320,
+    };
+    assert!(matches!(
+        eredu_runtime::derive_parameter_member_layout(
+            index.resolve("encoded").unwrap(),
+            rank,
+            rank,
+            true,
+            Some(&effective),
+            &mut denied
+        ),
+        Err(eredu_core::parameters::ParameterError::Budget(_))
+    ));
+    assert!(denied.used > 0);
+    let consumed = denied.used;
+    denied.limit = u64::MAX;
+    eredu_runtime::derive_parameter_member_layout(
+        index.resolve("encoded").unwrap(),
+        rank,
+        rank,
+        true,
+        Some(&effective),
+        &mut denied,
+    )
+    .unwrap();
+    assert!(denied.used > consumed);
     let source = source(vec![8, 64], false);
     let local = order_parameter_acquisition_units(
         local_parameter_acquisition_units(&tasks, &layout, &source).unwrap(),
