@@ -85,9 +85,25 @@ fn task(
     lowering: WeightLoweringKind,
     executable: LinearFormat,
 ) -> ReplicatedTextMaterializationTask {
+    owned_task(
+        "weight",
+        ReplicatedTextParameterOwner::StaticRole("head".into()),
+        shape,
+        lowering,
+        executable,
+    )
+}
+
+fn owned_task(
+    name: &str,
+    owner: ReplicatedTextParameterOwner,
+    shape: &[usize],
+    lowering: WeightLoweringKind,
+    executable: LinearFormat,
+) -> ReplicatedTextMaterializationTask {
     let encoding = SourceTensorEncoding::Safetensors(StoredDtype::F32);
     ReplicatedTextMaterializationTask::from_exact_source(
-        "weight",
+        name,
         ReplicatedTextPhysicalSource::new(
             "checkpoint.weight",
             "checkpoint.weight",
@@ -101,7 +117,7 @@ fn task(
         shape.to_vec(),
         shape.to_vec(),
         ReplicatedTextParameterRole::LinearWeight,
-        ReplicatedTextParameterOwner::StaticRole("head".into()),
+        owner,
         executable,
         lowering,
         WeightLoweringDescriptor::new(
@@ -114,6 +130,156 @@ fn task(
         .unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_order() {
+    use eredu_runtime::{
+        local_parameter_acquisition_units, order_parameter_acquisition_units,
+        parameter_acquisition_units, ArchitectureParameterDescription, ExecutionGraph,
+        ExecutionGroupSpec, ExecutionUnitLayout, MemberSharding, OwnedParameterGroupSpec,
+        ParameterAcquisitionError, ParameterGroupSpec, ParameterMemberSpec,
+        ReplicatedTextOutputCompanion,
+    };
+    let owner = |unit| ReplicatedTextParameterOwner::ExecutionUnit {
+        group: "decoder".into(),
+        unit,
+    };
+    let encoded = owned_task(
+        "encoded",
+        owner(1),
+        &[8, 64],
+        WeightLoweringKind::Transform,
+        LinearFormat::Affine(Default::default()),
+    )
+    .with_output_companions(
+        [
+            ("encoded.scales", eredu_nn::LinearCompanionRole::Scale),
+            ("encoded.biases", eredu_nn::LinearCompanionRole::AffineBias),
+        ]
+        .map(|(name, role)| {
+            ReplicatedTextOutputCompanion::new(
+                name,
+                role,
+                vec![8, 1],
+                owner(1).parameter_group_owner().unwrap(),
+            )
+            .unwrap()
+        })
+        .to_vec(),
+    )
+    .unwrap();
+    let tasks = vec![
+        owned_task(
+            "first",
+            owner(4),
+            &[8, 64],
+            WeightLoweringKind::Direct,
+            LinearFormat::Dense,
+        ),
+        encoded,
+        owned_task(
+            "third",
+            owner(4),
+            &[8, 64],
+            WeightLoweringKind::Direct,
+            LinearFormat::Dense,
+        ),
+    ];
+    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let complete = ExecutionUnitLayout::new(&graph, [5]).unwrap();
+    let selected = complete
+        .select([1, 4].map(|index| complete.address(index).unwrap()))
+        .unwrap();
+    let units =
+        order_parameter_acquisition_units(parameter_acquisition_units(&tasks).unwrap(), &selected)
+            .unwrap();
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.owner().clone())
+            .collect::<Vec<_>>(),
+        [owner(1), owner(4)]
+    );
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.parameter_bytes())
+            .collect::<Vec<_>>(),
+        [320, 4096]
+    );
+    let groups = tasks
+        .iter()
+        .map(|task| {
+            let members = std::iter::once(ParameterMemberSpec::new(
+                task.name(),
+                task.logical_shape().to_vec(),
+                MemberSharding::Balanced { axis: 0 },
+            ))
+            .chain(task.output_companions().iter().map(|companion| {
+                ParameterMemberSpec::new(
+                    companion.name(),
+                    companion.logical_shape().to_vec(),
+                    MemberSharding::Balanced { axis: 0 },
+                )
+            }));
+            OwnedParameterGroupSpec::new(
+                task.owner().parameter_group_owner().unwrap(),
+                ParameterGroupSpec::new(task.name(), ParameterRole::ColumnProjection, members)
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let description = ArchitectureParameterDescription::new(
+        &graph,
+        &complete,
+        groups.iter().map(|group| group.group().clone()),
+        groups.clone(),
+    )
+    .unwrap();
+    let rank = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+        1,
+    )
+    .unwrap();
+    let layout = eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
+    let source = source(vec![8, 64], false);
+    let local = order_parameter_acquisition_units(
+        local_parameter_acquisition_units(&tasks, &layout, &source).unwrap(),
+        &selected,
+    )
+    .unwrap();
+    assert_eq!(
+        local
+            .iter()
+            .map(|unit| unit.parameter_bytes())
+            .collect::<Vec<_>>(),
+        [160, 2048]
+    );
+    assert_eq!(
+        local[0]
+            .outputs()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["encoded", "encoded.biases", "encoded.scales"]
+    );
+    assert_eq!(local[1].task_indices(), [0, 2]);
+    assert_eq!(source.leases.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        order_parameter_acquisition_units(units, &complete),
+        Err(ParameterAcquisitionError::ExecutionOwnership { .. })
+    ));
+    let duplicate = vec![tasks[0].clone(), tasks[0].clone()];
+    let error = parameter_acquisition_units(&duplicate).unwrap_err();
+    assert!(
+        matches!(&error, ParameterAcquisitionError::Output { target, .. } if target == "first")
+    );
+    let error: eredu_core::artifact::ArtifactError = error.into();
+    assert!(std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<ParameterAcquisitionError>()
+        .is_some());
 }
 
 fn source(shape: Vec<usize>, overlay: bool) -> Source {

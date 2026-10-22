@@ -337,6 +337,10 @@ pub use parameter::{
     ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding,
     PreparedParameterRecipes, RecipeBindingError, SelectedBindingPlan,
 };
+pub use parameter_acquisition::{
+    local_parameter_acquisition_units, order_parameter_acquisition_units,
+    parameter_acquisition_units, ParameterAcquisitionError, ParameterAcquisitionUnit,
+};
 pub use parameter_layout::{
     derive_partitioned_group_layout, derive_partitioned_local_layout,
     logical_parameter_group_range, retained_partition_layout, validate_parameter_layout,
@@ -521,6 +525,7 @@ pub use weight_residency::{
 pub mod workspace_resources;
 
 mod parameter_bank;
+mod parameter_acquisition;
 pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};
 
 /// Bounded row-addressable parameter lookup.

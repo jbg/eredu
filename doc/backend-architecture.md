@@ -5828,6 +5828,18 @@ configurations. Architecture normalization binds target-dependent geometry befor
 opening the source; the family-blind materializer constructs both encoding views
 from those retained configurations. It does not derive geometry from a native
 target or reopen an artifact.
+
+Runtime's `ParameterAcquisitionUnit` groups admitted materialization tasks by
+their declared independent storage owner. It validates unique primary/companion
+outputs and companion ownership, computes selected global or rank-local payload
+bytes through shared placement and executable-format accounting, and orders
+execution-owned resources against the retained invocation layout. Source-sharing
+resources remain separately charged; compact local ordering preserves nonzero
+global unit indices. Architecture code declares owners and selected geometry;
+native composition consumes these units without reconstructing their partitions.
+`ArtifactError::Preparation` retains the original typed acquisition, placement or
+accounting failure as its source without adding a runtime dependency to core.
+
 Spark's construction retains released identity and per-weight formats separately;
 the same selected encoding drives exact source constraints and neural operators.
 Matrix companion prefixes are explicit for transition codebooks without a

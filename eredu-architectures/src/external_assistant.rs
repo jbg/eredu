@@ -10,12 +10,10 @@ pub use static_placement::PreparedTargetStaticPlacement;
 pub(crate) use static_placement::TargetStaticDescription;
 pub use target_operation::PreparedExternalTargetOperation;
 mod execution_plan;
-mod parameters;
 pub use execution_plan::{
     prepare_execution_plan_assistant, MaterializedExternalAssistantExecution,
     PreparedExternalAssistantExecution,
 };
-pub use parameters::ExternalAssistantParameterUnit;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -47,11 +45,13 @@ use muse::assistant::integration::{
 };
 
 use eredu_runtime::{
-    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion, ReplicatedTextParameterOwner,
-    ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
-    SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry, SpeculativeCaptureEnvelope,
-    SpeculativeCaptureMetadata, SpeculativeCaptureSchema, SpeculativeIdentity,
-    SpeculativeMechanism, SpeculativeMechanismRequirements, SpeculativePlacementRequest,
+    local_parameter_acquisition_units, order_parameter_acquisition_units,
+    parameter_acquisition_units, ParameterAcquisitionUnit, ReplicatedTextMaterializationTask,
+    ReplicatedTextOutputCompanion, ReplicatedTextParameterOwner, ReplicatedTextParameterRole,
+    ReplicatedTextPhysicalSource, SpeculativeArchitectureCompatibilityProof,
+    SpeculativeCaptureEntry, SpeculativeCaptureEnvelope, SpeculativeCaptureMetadata,
+    SpeculativeCaptureSchema, SpeculativeIdentity, SpeculativeMechanism,
+    SpeculativeMechanismRequirements, SpeculativePlacementRequest,
     SpeculativeRealizationRequirements, SpeculativeSelectionRequest,
     SpeculativeStateCacheIdentityIngredients, SpeculativeStrategyRequirements,
     WeightLoweringDescriptor, WeightLoweringKind,
@@ -1308,7 +1308,7 @@ pub struct PreparedExternalAssistantSource<A: ExternalAssistantArchitecture> {
     module_config: A::ModuleConfig,
     config: A::Config,
     tasks: Vec<ReplicatedTextMaterializationTask>,
-    parameter_units: Vec<ExternalAssistantParameterUnit>,
+    parameter_units: Vec<ParameterAcquisitionUnit>,
     residency: eredu_runtime::LayerWeightResidency,
     execution_layout: Option<eredu_runtime::ExecutionUnitLayout>,
     parameter_layout: Option<eredu_runtime::LocalModelLayout>,
@@ -1405,7 +1405,7 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
     }
 
     /// Complete disjoint physical acquisition units, validated before opening payloads.
-    pub fn parameter_units(&self) -> &[ExternalAssistantParameterUnit] {
+    pub fn parameter_units(&self) -> &[ParameterAcquisitionUnit] {
         &self.parameter_units
     }
 
@@ -1466,11 +1466,11 @@ impl PreparedExternalAssistantSource<MuseAssistantArchitecture> {
             &self.tasks,
             rank,
         )?;
-        let units = parameters::local_parameter_units(&self.tasks, &layout, self.source.as_ref())
-            .map_err(invalid_assistant)?;
-        self.parameter_units =
-            parameters::canonical_unit_order(units, selected.execution_definition().unit_layout())
-                .map_err(invalid_assistant)?;
+        let units = local_parameter_acquisition_units(&self.tasks, &layout, self.source.as_ref())?;
+        self.parameter_units = order_parameter_acquisition_units(
+            units,
+            selected.execution_definition().unit_layout(),
+        )?;
         self.execution_layout = Some(selected.execution_definition().unit_layout().clone());
         self.source_module_config = source;
         self.module_config = selected;
@@ -1534,12 +1534,11 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
             })?,
         };
         let parameter_units = match &parameter_layout {
-            Some(layout) => parameters::local_parameter_units(&tasks, layout, source.as_ref()),
-            None => parameters::parameter_units(&tasks),
-        }
-        .map_err(invalid_assistant)?;
+            Some(layout) => local_parameter_acquisition_units(&tasks, layout, source.as_ref()),
+            None => parameter_acquisition_units(&tasks),
+        }?;
         let parameter_units = if let Some(layout) = &execution_layout {
-            parameters::canonical_unit_order(parameter_units, layout).map_err(invalid_assistant)?
+            order_parameter_acquisition_units(parameter_units, layout)?
         } else {
             parameter_units
         };
