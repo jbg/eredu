@@ -7824,6 +7824,23 @@ conformance. Native F32 SafeTensors/GGUF and load-time affine public
 capture/intervention acceptance passes all 63 TP/PP/EP and ordinary-residency cases.
 
 
+DeepSeek V3 and V4 construct and retain a validated, source-free
+`ComponentDefinition` before native modules. It owns canonical parameter bindings,
+target and prediction graph identities, invocation paths, transport declarations,
+and complete or TP-local mutable-state geometry. Public parameter catalogs project
+that definition; source recipes and encoding policy remain family-owned. Static
+resources declare their storage roles alongside their parameter groups, including
+shared target/prediction embedding authority and V4 DSpark's pinned resources.
+
+DeepSeek execution metadata reads the retained definition. Group ingress uses its
+validated dependencies, and unit construction validates global invocation addresses.
+V3 latent/rotary caches, V4 local-key and pooling streams, and independent prediction
+state slots keep their declared geometry and persistence. Target state follows its
+pipeline unit cuts; appended prediction state belongs to the output owner. DSpark's
+prediction frontier and target-capture policy retain their separate family semantics.
+Catalog validation errors use the neutral neural error and retain their original
+source.
+
 DeepSeek expert geometry expands the retained uniform partition domain into scalar
 FFN coordinates. Encoding expansion may group several neurons into one partition
 unit so weights, packed input columns and scale/bias companions share legal cuts.

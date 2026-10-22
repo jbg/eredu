@@ -16,7 +16,7 @@ use eredu_runtime::{
     StateSegmentSpec,
 };
 
-use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
+use crate::decoder::{StaticModuleSpec, StaticModules};
 
 use super::{
     block::V3Block,
@@ -95,11 +95,11 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn routed_unit_observations(&self) -> bool {
-        self.groups.prediction_count() == 0
+        self.definition.prediction_groups().is_empty()
     }
 
     fn routed_sparse_observations(&self) -> bool {
-        self.groups.prediction_count() == 0
+        self.definition.prediction_groups().is_empty()
     }
 
     fn forward_unit_with_provider<P>(
@@ -156,11 +156,11 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn parallel_routed_unit_observations(&self) -> bool {
-        self.groups.prediction_count() == 0
+        self.definition.prediction_groups().is_empty()
     }
 
     fn parallel_routed_sparse_observations(&self) -> bool {
-        self.groups.prediction_count() == 0
+        self.definition.prediction_groups().is_empty()
     }
 
     fn forward_unit_parallel_observed_with_provider<P, O>(
@@ -404,7 +404,7 @@ pub struct Model<
 > {
     args: V3Args,
     static_modules: StaticModules<B>,
-    groups: SequentialPredictionGroups,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
     parallel_geometry: Option<Arc<super::parallel::V3LocalGeometry>>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
     partition_target_start: usize,
@@ -437,7 +437,7 @@ where
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parallel::v3_parameter_description(&self.args).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -474,10 +474,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             "DeepSeek-V3",
             crate::operator_requirements::DEEPSEEK_V3,
         )?;
-        args.validate().map_err(Error::backend)?;
+        let definition = Arc::new(component_definition(&args, None)?);
         let static_modules = StaticModules::from_spec(static_spec(&args), context)?;
         Ok(Self {
-            groups: prediction_groups(&args)?,
+            definition,
             args,
             static_modules,
             parallel_geometry: None,
@@ -497,8 +497,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             crate::operator_requirements::DEEPSEEK_V3
                 .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL),
         )?;
-        args.validate().map_err(Error::backend)?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = Arc::new(component_definition(&args, Some(&geometry))?);
         let static_modules = StaticModules::from_parallel_spec(
             static_spec(&args),
             geometry.embedding_range().clone(),
@@ -506,7 +505,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             context,
         )?;
         Ok(Self {
-            groups: prediction_groups(&args)?,
+            definition,
             args,
             static_modules,
             parallel_geometry: Some(Arc::new(geometry)),
@@ -517,10 +516,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
 
     /// Returns the state layout matching the modules this instance builds.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        match &self.parallel_geometry {
-            Some(geometry) => Ok(geometry.state_layout().clone()),
-            None => state_layout(&self.args),
-        }
+        Ok(self.definition.state_layout().clone())
+    }
+
+    /// Borrows the validated declaration retained before native construction.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Borrows the shared rank-local geometry used by unit factories.
@@ -556,7 +557,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
 
     /// Returns the prediction depth count declared by the execution graph.
     pub fn mtp_len(&self) -> usize {
-        self.groups.prediction_count()
+        self.definition.prediction_groups().len()
     }
 
     /// Borrows pinned modules for neutral checkpoint binding.
@@ -577,7 +578,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
-        self.groups.unit_count(group)?;
+        self.definition.unit(group, index)?;
         let args = self
             .parallel_geometry
             .as_ref()
@@ -1193,7 +1194,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_with_provider(
                 hidden,
@@ -1253,7 +1254,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_parallel_with_provider(
                 hidden,
@@ -1417,16 +1418,6 @@ pub(crate) fn static_spec(args: &V3Args) -> StaticModuleSpec {
     }
 }
 
-fn prediction_groups(args: &V3Args) -> Result<SequentialPredictionGroups, Error> {
-    let targets = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    SequentialPredictionGroups::new(
-        "model.layers",
-        targets,
-        (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?)
-            .map(|depth| format!("model.layers.{}", targets + depth)),
-    )
-}
-
 impl<B, S> LayeredArchitecture<B, S> for Model<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
@@ -1434,7 +1425,7 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.groups.prediction_count() == 0;
+        let target_only = self.definition.prediction_groups().is_empty();
         eredu_runtime::inspection::ObservationHookSupport::internal(
             target_only,
             target_only,
@@ -1453,23 +1444,18 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            crate::transport::decoder()
-        } else {
-            let mut transport = crate::transport::prediction();
-            if group == 1 {
-                transport.first_owner_static_roles.push("mtp".into());
-            }
-            transport
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated DeepSeek group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn prediction_execution_groups(&self) -> Vec<String> {
-        self.groups.prediction_execution_groups()
+        self.definition.prediction_groups().to_vec()
     }
 
     fn prediction_target_capture(context: &Self::ForwardContext) -> Option<&B::Tensor> {
@@ -1489,25 +1475,21 @@ where
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        layout: &StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(
-            0,
-            self.args.num_hidden_layers as usize,
-            layout,
-        )
+        super::component::state_partition_plan(self.definition.parameters(), layout)
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.groups.execution_graph()
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.groups.unit_count(group)
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.groups.unit_path(group, index)
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -1547,10 +1529,10 @@ where
                 hidden,
                 depth,
             } => {
-                if depth >= self.groups.prediction_count() {
+                if depth >= self.definition.prediction_groups().len() {
                     return Err(Error::backend(format!(
                         "V3 prediction depth {depth} is outside {} groups",
-                        self.groups.prediction_count()
+                        self.definition.prediction_groups().len()
                     )));
                 }
                 (tokens, Some(hidden), None, ForwardMode::Draft(depth))
@@ -1595,7 +1577,7 @@ where
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.begin(group, initial, dependencies)
+        super::component::begin_group(&self.definition, group, initial, dependencies)
     }
 
     fn begin_forward_observed<'a, O>(
@@ -1656,7 +1638,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let cache = state
@@ -1767,7 +1749,7 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.groups.prediction_count() == 0;
+        let target_only = self.definition.prediction_groups().is_empty();
         eredu_runtime::inspection::ObservationHookSupport::internal(
             target_only,
             target_only,
@@ -1905,10 +1887,10 @@ where
                 hidden,
                 depth,
             } => {
-                if depth >= self.groups.prediction_count() {
+                if depth >= self.definition.prediction_groups().len() {
                     return Err(Error::backend(format!(
                         "V3 prediction depth {depth} is outside {} groups",
-                        self.groups.prediction_count()
+                        self.definition.prediction_groups().len()
                     )));
                 }
                 (tokens, Some(hidden), None, ForwardMode::Draft(depth))
@@ -1961,7 +1943,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_parallel(
                 hidden,
@@ -2028,7 +2010,7 @@ where
         &self,
         _tensor_parallel: bool,
     ) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.groups.prediction_count() == 0;
+        let target_only = self.definition.prediction_groups().is_empty();
         eredu_runtime::inspection::ObservationHookSupport::internal(
             target_only,
             target_only,
@@ -2391,4 +2373,27 @@ pub fn state_layout(args: &V3Args) -> Result<StateLayout, Error> {
         segments,
     )
     .map_err(Error::backend)
+}
+
+/// Validates source-free V3 invocation, storage, state and transport ownership.
+pub fn component_definition(
+    args: &V3Args,
+    geometry: Option<&super::parallel::V3LocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => state_layout(args)?,
+    };
+    let parameters = super::parallel::v3_parameters(args).map_err(Error::backend_source)?;
+    super::component::definition(
+        "deepseek_v3",
+        parameters,
+        state,
+        crate::transport::decoder(),
+        |_address, ordinal| format!("model.layers.{ordinal}"),
+    )
 }

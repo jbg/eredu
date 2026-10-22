@@ -1112,33 +1112,51 @@ where
 pub fn v3_static_parameter_groups(
     args: &V3Args,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    Ok(v3_pinned_parameter_groups(args)?
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect())
+}
+
+fn v3_pinned_parameter_groups(
+    args: &V3Args,
+) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
     let groups = vec![
-        group(
-            "model.embed_tokens",
-            ParameterRole::Vocabulary,
-            [(
-                "model.embed_tokens.weight",
-                vec![dim(args.vocab_size)?, dim(args.hidden_size)?],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?,
-        replicated(
-            "model.norm",
-            [("model.norm.weight", vec![dim(args.hidden_size)?])],
-        )?,
-        group(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            [(
-                "lm_head.weight",
-                vec![dim(args.vocab_size)?, dim(args.hidden_size)?],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?,
+        (
+            "embedding",
+            group(
+                "model.embed_tokens",
+                ParameterRole::Vocabulary,
+                [(
+                    "model.embed_tokens.weight",
+                    vec![dim(args.vocab_size)?, dim(args.hidden_size)?],
+                    MemberSharding::Balanced { axis: 0 },
+                )],
+            )?,
+        ),
+        (
+            "norm",
+            replicated(
+                "model.norm",
+                [("model.norm.weight", vec![dim(args.hidden_size)?])],
+            )?,
+        ),
+        (
+            "output",
+            group(
+                "lm_head",
+                ParameterRole::Vocabulary,
+                [(
+                    "lm_head.weight",
+                    vec![dim(args.vocab_size)?, dim(args.hidden_size)?],
+                    MemberSharding::Balanced { axis: 0 },
+                )],
+            )?,
+        ),
     ];
     // Published V3 statics are dense even when the layer default is FP8.
     // Explicit admitted formats cover GGUF and transformed embedding/head data.
-    expand_linear_formats(groups, |name| {
+    expand_pinned_formats(groups, |name| {
         args.linear_formats
             .get(name)
             .copied()
@@ -1271,36 +1289,54 @@ pub fn v3_layer_parameter_groups(
 pub fn v4_static_parameter_groups(
     args: &V4Args,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    Ok(v4_pinned_parameter_groups(args)?
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect())
+}
+
+fn v4_pinned_parameter_groups(
+    args: &V4Args,
+) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
     let hidden = dim(args.hidden_size)?;
     let streams = dim(args.hc_mult)?;
     let mut groups = vec![
-        group(
-            "embed",
-            ParameterRole::Vocabulary,
-            [(
-                "embed.weight",
-                vec![dim(args.vocab_size)?, hidden],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?,
-        replicated("norm", [("norm.weight", vec![hidden])])?,
-        group(
-            "head",
-            ParameterRole::Vocabulary,
-            [(
-                "head.weight",
-                vec![dim(args.vocab_size)?, hidden],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?,
-        replicated(
+        (
+            "embedding",
+            group(
+                "embed",
+                ParameterRole::Vocabulary,
+                [(
+                    "embed.weight",
+                    vec![dim(args.vocab_size)?, hidden],
+                    MemberSharding::Balanced { axis: 0 },
+                )],
+            )?,
+        ),
+        ("norm", replicated("norm", [("norm.weight", vec![hidden])])?),
+        (
+            "output",
+            group(
+                "head",
+                ParameterRole::Vocabulary,
+                [(
+                    "head.weight",
+                    vec![dim(args.vocab_size)?, hidden],
+                    MemberSharding::Balanced { axis: 0 },
+                )],
+            )?,
+        ),
+        (
             "hyper_head",
-            [
-                ("hc_head_fn", vec![streams, streams * hidden]),
-                ("hc_head_base", vec![streams]),
-                ("hc_head_scale", vec![1]),
-            ],
-        )?,
+            replicated(
+                "hyper_head",
+                [
+                    ("hc_head_fn", vec![streams, streams * hidden]),
+                    ("hc_head_base", vec![streams]),
+                    ("hc_head_scale", vec![1]),
+                ],
+            )?,
+        ),
     ];
     if let Some(config) = &args.dspark {
         let last = usize::try_from(args.num_nextn_predict_layers)
@@ -1313,37 +1349,40 @@ pub fn v4_static_parameter_groups(
             .expect("validated DSpark target capture policy")
             .len();
         let markov = dim(config.markov_rank)?;
-        groups.push(replicated(
-            "dspark",
-            [
-                (
-                    "mtp.0.main_proj.weight".to_string(),
-                    vec![hidden, hidden * captures],
-                ),
-                ("mtp.0.main_norm.weight".to_string(), vec![hidden]),
-                (format!("mtp.{last}.norm.weight"), vec![hidden]),
-                (
-                    format!("mtp.{last}.hc_head_fn"),
-                    vec![streams, streams * hidden],
-                ),
-                (format!("mtp.{last}.hc_head_base"), vec![streams]),
-                (format!("mtp.{last}.hc_head_scale"), vec![1]),
-                (
-                    format!("mtp.{last}.markov_head.markov_w1.weight"),
-                    vec![dim(args.vocab_size)?, markov],
-                ),
-                (
-                    format!("mtp.{last}.markov_head.markov_w2.weight"),
-                    vec![dim(args.vocab_size)?, markov],
-                ),
-                (
-                    format!("mtp.{last}.confidence_head.proj.weight"),
-                    vec![1, hidden + markov],
-                ),
-            ],
-        )?);
+        groups.push((
+            "mtp",
+            replicated(
+                "dspark",
+                [
+                    (
+                        "mtp.0.main_proj.weight".to_string(),
+                        vec![hidden, hidden * captures],
+                    ),
+                    ("mtp.0.main_norm.weight".to_string(), vec![hidden]),
+                    (format!("mtp.{last}.norm.weight"), vec![hidden]),
+                    (
+                        format!("mtp.{last}.hc_head_fn"),
+                        vec![streams, streams * hidden],
+                    ),
+                    (format!("mtp.{last}.hc_head_base"), vec![streams]),
+                    (format!("mtp.{last}.hc_head_scale"), vec![1]),
+                    (
+                        format!("mtp.{last}.markov_head.markov_w1.weight"),
+                        vec![dim(args.vocab_size)?, markov],
+                    ),
+                    (
+                        format!("mtp.{last}.markov_head.markov_w2.weight"),
+                        vec![dim(args.vocab_size)?, markov],
+                    ),
+                    (
+                        format!("mtp.{last}.confidence_head.proj.weight"),
+                        vec![1, hidden + markov],
+                    ),
+                ],
+            )?,
+        ));
     }
-    expand_linear_formats(groups, |name| {
+    expand_pinned_formats(groups, |name| {
         // Published embedding tables remain dense under the FP8 linear default.
         // Retain any separately admitted source/transform encoding explicitly.
         if name == "embed.weight" || name.ends_with(".markov_head.markov_w1.weight") {
@@ -1360,14 +1399,21 @@ pub fn v4_static_parameter_groups(
 /// Describes every V3 target/prediction parameter with explicit graph ownership.
 pub fn v3_parameter_description(
     args: &V3Args,
+) -> Result<ArchitectureParameterDescription, eredu_nn::Error> {
+    Ok(super::v3::component_definition(args, None)?
+        .parameters()
+        .clone())
+}
+
+pub(super) fn v3_parameters(
+    args: &V3Args,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     deepseek_parameter_description(
         usize::try_from(args.num_hidden_layers)
             .map_err(|_| invalid("V3 target layer count exceeds usize"))?,
         usize::try_from(args.num_nextn_predict_layers)
             .map_err(|_| invalid("V3 prediction count exceeds usize"))?,
-        v3_static_parameter_groups(args)?,
-        ["embedding", "norm", "output"],
+        v3_pinned_parameter_groups(args)?,
         |flat| v3_layer_parameter_groups(args, flat),
     )
 }
@@ -1375,18 +1421,21 @@ pub fn v3_parameter_description(
 /// Describes every V4 target/prediction parameter with explicit graph ownership.
 pub fn v4_parameter_description(
     args: &V4Args,
+) -> Result<ArchitectureParameterDescription, eredu_nn::Error> {
+    Ok(super::v4::component_definition(args, None)?
+        .parameters()
+        .clone())
+}
+
+pub(super) fn v4_parameters(
+    args: &V4Args,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    let mut static_roles = vec!["embedding", "norm", "output", "hyper_head"];
-    if args.dspark.is_some() {
-        static_roles.push("mtp");
-    }
     deepseek_parameter_description(
         usize::try_from(args.num_hidden_layers)
             .map_err(|_| invalid("V4 target layer count exceeds usize"))?,
         usize::try_from(args.num_nextn_predict_layers)
             .map_err(|_| invalid("V4 prediction count exceeds usize"))?,
-        v4_static_parameter_groups(args)?,
-        static_roles,
+        v4_pinned_parameter_groups(args)?,
         |flat| v4_layer_parameter_groups(args, flat),
     )
 }
@@ -1394,8 +1443,7 @@ pub fn v4_parameter_description(
 fn deepseek_parameter_description(
     targets: usize,
     predictions: usize,
-    static_groups: Vec<ParameterGroupSpec>,
-    static_roles: impl IntoIterator<Item = &'static str>,
+    static_groups: Vec<(&'static str, ParameterGroupSpec)>,
     mut unit_groups: impl FnMut(usize) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     let graph = ExecutionGraph::chain(
@@ -1408,11 +1456,13 @@ fn deepseek_parameter_description(
         std::iter::once(targets).chain(std::iter::repeat_n(1, predictions)),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let mut expected = static_groups.clone();
+    let mut expected = static_groups
+        .iter()
+        .map(|(_, group)| group.clone())
+        .collect::<Vec<_>>();
     let mut owned = static_groups
         .into_iter()
-        .zip(static_roles)
-        .map(|(group, role)| {
+        .map(|(role, group)| {
             let owner = if role == "embedding" {
                 ParameterGroupOwner::static_any_of(["embedding", "mtp"])
             } else {
@@ -1873,4 +1923,19 @@ fn dim(value: i32) -> Result<usize, ParallelPlanError> {
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
     ParallelPlanError::InvalidGroup(message.into())
+}
+
+fn expand_pinned_formats(
+    groups: Vec<(&'static str, ParameterGroupSpec)>,
+    format: impl Fn(&str) -> LinearFormat,
+) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+    let mut expanded = Vec::new();
+    for (role, group) in groups {
+        expanded.extend(
+            expand_linear_formats(vec![group], &format)?
+                .into_iter()
+                .map(|group| (role, group)),
+        );
+    }
+    Ok(expanded)
 }

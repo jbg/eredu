@@ -11,6 +11,7 @@ pub mod attention;
 pub mod block;
 /// Pure SafeTensors/GGUF schemas and canonical name translation.
 pub mod checkpoint;
+mod component;
 /// Strict V3/R1 and V4 configuration normalization.
 pub mod config;
 mod encoded_expert_residency;

@@ -24,9 +24,7 @@ use eredu_runtime::{
 
 use eredu_checkpoint::LinearFormat;
 
-use crate::decoder::{
-    SequentialPredictionGroups, StaticModuleSpec, StaticModules as TextStaticModules,
-};
+use crate::decoder::{StaticModuleSpec, StaticModules as TextStaticModules};
 
 use super::{
     block::V4Block,
@@ -233,7 +231,7 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         if let Unit::Target(block) = unit {
             if group != 0 {
                 return Err(Error::backend(
@@ -631,7 +629,7 @@ where
 {
     args: V4Args,
     static_modules: StaticModules<B>,
-    groups: SequentialPredictionGroups,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
     parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
     partition_target_start: usize,
@@ -664,7 +662,7 @@ where
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parallel::v4_parameter_description(&self.args).map_err(Error::backend)
+        Ok(self.definition.parameters().clone())
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -895,10 +893,10 @@ where
             "DeepSeek-V4",
             crate::operator_requirements::DEEPSEEK_V4,
         )?;
-        args.validate().map_err(Error::backend)?;
+        let definition = Arc::new(component_definition(&args, None)?);
         let text = TextStaticModules::from_spec(text_static_spec(&args), context)?;
         Ok(Self {
-            groups: prediction_groups(&args)?,
+            definition,
             static_modules: static_modules(&args, text, context)?,
             args,
             parallel_geometry: None,
@@ -918,8 +916,7 @@ where
             crate::operator_requirements::DEEPSEEK_V4
                 .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL),
         )?;
-        args.validate().map_err(Error::backend)?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = Arc::new(component_definition(&args, Some(&geometry))?);
         let text = TextStaticModules::from_parallel_spec(
             text_static_spec(&args),
             geometry.embedding_range().clone(),
@@ -927,7 +924,7 @@ where
             context,
         )?;
         Ok(Self {
-            groups: prediction_groups(&args)?,
+            definition,
             static_modules: static_modules(&args, text, context)?,
             args,
             parallel_geometry: Some(Arc::new(geometry)),
@@ -938,10 +935,12 @@ where
 
     /// Returns the state layout matching the modules this instance builds.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        match &self.parallel_geometry {
-            Some(geometry) => Ok(geometry.state_layout().clone()),
-            None => state_layout(&self.args),
-        }
+        Ok(self.definition.state_layout().clone())
+    }
+
+    /// Borrows the validated declaration retained before native construction.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Borrows rank-local geometry for resident and streamed unit factories.
@@ -977,7 +976,7 @@ where
 
     /// Returns the prediction depth count declared by the execution graph.
     pub fn mtp_len(&self) -> usize {
-        self.groups.prediction_count()
+        self.definition.prediction_groups().len()
     }
 
     /// Returns the maximum number of draft tokens emitted by one proposal.
@@ -987,7 +986,7 @@ where
     /// of the number of blocks used to compute it.
     pub fn draft_proposal_capacity(&self) -> usize {
         self.args.dspark.as_ref().map_or_else(
-            || self.groups.prediction_count(),
+            || self.definition.prediction_groups().len(),
             |config| {
                 usize::try_from(config.block_size).expect("validated DSpark block size is positive")
             },
@@ -1012,7 +1011,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
-        self.groups.unit_count(group)?;
+        self.definition.unit(group, index)?;
         let args = self
             .parallel_geometry
             .as_ref()
@@ -1130,7 +1129,8 @@ where
                 hidden,
                 depth,
             } => {
-                if self.args.dspark.is_some() || depth >= self.groups.prediction_count() {
+                if self.args.dspark.is_some() || depth >= self.definition.prediction_groups().len()
+                {
                     return Err(Error::backend(format!(
                         "V4 sequential prediction depth {depth} is unavailable"
                     )));
@@ -2427,7 +2427,7 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_with_provider(
@@ -2526,7 +2526,7 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_parallel_with_provider(
@@ -2818,15 +2818,6 @@ fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
     }
 }
 
-fn prediction_groups(args: &V4Args) -> Result<SequentialPredictionGroups, Error> {
-    SequentialPredictionGroups::new(
-        "layers",
-        usize::try_from(args.num_hidden_layers).map_err(Error::backend)?,
-        (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?)
-            .map(|depth| format!("mtp.{depth}")),
-    )
-}
-
 fn static_modules<B>(
     args: &V4Args,
     text: TextStaticModules<B>,
@@ -2957,23 +2948,18 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            target_group_transport()
-        } else {
-            let mut transport = crate::transport::prediction();
-            if group == 1 {
-                transport.first_owner_static_roles.push("mtp".into());
-            }
-            transport
-        }
+        self.definition
+            .group_transport(group)
+            .expect("validated DeepSeek group")
+            .clone()
     }
 
     fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
+        self.definition.primary_group()
     }
 
     fn prediction_execution_groups(&self) -> Vec<String> {
-        self.groups.prediction_execution_groups()
+        self.definition.prediction_groups().to_vec()
     }
 
     fn prediction_target_capture(context: &Self::ForwardContext) -> Option<&B::Tensor> {
@@ -3001,25 +2987,21 @@ where
 
     fn state_partition_plan(
         &self,
-        layout: &eredu_runtime::StateLayout,
+        layout: &StateLayout,
     ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(
-            0,
-            self.args.num_hidden_layers as usize,
-            layout,
-        )
+        super::component::state_partition_plan(self.definition.parameters(), layout)
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.groups.execution_graph()
+        Ok(self.definition.parameters().graph().clone())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.groups.unit_count(group)
+        self.definition.unit_count(group).map_err(Error::from)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.groups.unit_path(group, index)
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn observes_unit_boundaries(&self, group: usize, _index: usize) -> bool {
@@ -3087,7 +3069,7 @@ where
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.begin(group, initial, dependencies)
+        super::component::begin_group(&self.definition, group, initial, dependencies)
     }
 
     fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
@@ -3127,7 +3109,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward(
@@ -3213,7 +3195,7 @@ where
                 context,
             )?);
         }
-        if group == self.groups.prediction_count()
+        if group == self.definition.prediction_groups().len()
             && matches!(forward.mode, ForwardMode::DsparkProposal)
         {
             let dspark = self
@@ -3380,7 +3362,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         if let Unit::Target(block) = unit {
             if group != 0 {
                 return Err(Error::backend(
@@ -3468,7 +3450,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
+        self.definition.unit_count(group).map_err(Error::from)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_parallel(
@@ -3563,7 +3545,7 @@ where
                 context,
             )?);
         }
-        if group == self.groups.prediction_count()
+        if group == self.definition.prediction_groups().len()
             && matches!(forward.mode, ForwardMode::DsparkProposal)
         {
             let dspark = self
@@ -4125,4 +4107,33 @@ fn broadcast_streams<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend>
 ) -> Result<B::Tensor, Error> {
     eredu_nn::residual_streams::ResidualStreamGeometry::new(args.hc_mult, args.hidden_size)?
         .expand(hidden, context)
+}
+
+/// Validates source-free V4 invocation, storage, state and transport ownership.
+pub fn component_definition(
+    args: &V4Args,
+    geometry: Option<&super::parallel::V4LocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => state_layout(args)?,
+    };
+    let parameters = super::parallel::v4_parameters(args).map_err(Error::backend_source)?;
+    super::component::definition(
+        "deepseek_v4",
+        parameters,
+        state,
+        target_group_transport(),
+        |address, _ordinal| {
+            if address.group() == 0 {
+                format!("layers.{}", address.index())
+            } else {
+                format!("mtp.{}", address.group() - 1)
+            }
+        },
+    )
 }
