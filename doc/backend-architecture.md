@@ -827,9 +827,10 @@ Runtime's `select_parameter_recipe` pushes declared physical selections through
 canonical recipes and assembles ordered range segments on one axis, retaining
 canonical parameter identities and typed recipe failures. It validates geometry
 without acquiring payloads. Families supply packed coordinates and selected local
-geometry; Qwen4 target and prediction ordinary and expert owners consume this
-projection. Prediction vocabulary derives from the retained target owner through
-identity projection. Runtime's source-free `ParameterBankRecipes` validates canonical
+geometry; Qwen4 target and prediction ordinary and expert owners, including
+GGUF low-level expert selection, consume this projection. Prediction vocabulary
+derives from the retained target owner through identity projection. Runtime's
+source-free `ParameterBankRecipes` validates canonical
 bank recipes and their declared member counts, then projects every parameter to
 bounded leading-axis member recipes with singleton axes. Its `map_recipes`
 transforms complete banks before deriving members and retains the declared member
@@ -845,9 +846,11 @@ Gemma projects its selected weight, scale and bias outputs through the same bank
 catalog while preserving per-expert leases. DeepSeek V3/R1 and V4 target and
 prediction experts use this bank catalog for their selected weight, scale and
 bias recipes. DeepSeek retains encoded contraction and row-block alignment,
-packed column coordinates and separate gate/up intermediate slicing in its
-family preparation. Member projection retains bank-global IDs and allocates no
-parameter payload or native resource.
+packed column coordinates and separate gate/up intermediate ranges in its family
+preparation. Both its low-level expert operation and encoded residency preparation
+use `select_parameter_recipe` to project these ranges and assemble the gate/up
+segments. Member projection retains bank-global IDs and allocates no parameter
+payload or native resource.
 `select_parameter_bank_recipes` validates nonempty, unique ordered global member
 IDs before pushing a rank-local selection through canonical recipes. Families
 supply the member axis and geometry; runtime retains selection order and typed

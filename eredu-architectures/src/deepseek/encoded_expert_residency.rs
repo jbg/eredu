@@ -9,7 +9,7 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
     intermediate: Option<std::ops::Range<usize>>,
     formats: [LinearFormat; 2],
 ) -> Result<Vec<crate::ExpertParameterRecipe>, String> {
-    use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
+    use eredu_checkpoint::recipe::RecipeDtype;
     let metadata = bank
         .gate_up
         .infer(catalog)
@@ -89,19 +89,7 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
                         "expert intermediate selection splits an encoded contraction block".into(),
                     );
                 }
-                let slice = |recipe: &DerivedWeightRecipe, axis, range: std::ops::Range<usize>| {
-                    recipe
-                        .select_bounded(
-                            catalog,
-                            TensorSelection::Range {
-                                axis,
-                                start: range.start,
-                                end: range.end,
-                            },
-                        )
-                        .map_err(|error| error.to_string())
-                };
-                if binding == "gate_up_proj" {
+                let selections = if binding == "gate_up_proj" {
                     let row_block = match source_format {
                         LinearFormat::E4M3BlockFp8(fp8) if companion => fp8.block_rows as usize,
                         _ => 1,
@@ -116,13 +104,18 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
                     }
                     let half = width.div_ceil(row_block);
                     let selected = range.start / row_block..range.end.div_ceil(row_block);
-                    recipe = DerivedWeightRecipe::Concatenate {
-                        axis: 1,
-                        inputs: vec![
-                            slice(&recipe, 1, selected.clone())?,
-                            slice(&recipe, 1, half + selected.start..half + selected.end)?,
-                        ],
-                    };
+                    vec![
+                        TensorSelection::Range {
+                            axis: 1,
+                            start: selected.start,
+                            end: selected.end,
+                        },
+                        TensorSelection::Range {
+                            axis: 1,
+                            start: half + selected.start,
+                            end: half + selected.end,
+                        },
+                    ]
                 } else {
                     let selected = if companion {
                         range.start / block..range.end.div_ceil(block)
@@ -149,8 +142,19 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
                             _ => range.clone(),
                         }
                     };
-                    recipe = slice(&recipe, 2, selected)?;
-                }
+                    vec![TensorSelection::Range {
+                        axis: 2,
+                        start: selected.start,
+                        end: selected.end,
+                    }]
+                };
+                recipe = eredu_runtime::select_parameter_recipe(
+                    catalog,
+                    &target,
+                    &recipe,
+                    Some(&selections),
+                )
+                .map_err(|error| error.to_string())?;
             }
             recipe.infer(catalog).map_err(|error| error.to_string())?;
             let role = if suffix.is_empty() && !has_scales && !has_biases {
