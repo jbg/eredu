@@ -180,6 +180,35 @@ pub fn component_definition(
         }
         None => state_layout(&args.text).map_err(Error::backend_source)?,
     };
+    definition_with_state(args, state)
+}
+
+pub(super) fn partition_definition(
+    args: &FamilyConfig,
+    local: &LocalGeometry,
+    geometry: &crate::gemma4::PartitionLocalGeometry,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    local.validate_for(args).map_err(Error::backend_source)?;
+    geometry.validate_for(args).map_err(Error::backend_source)?;
+    let expected = crate::gemma4::pipeline::partition_state_layout(
+        &args.text,
+        local.state_layout(),
+        geometry.text_units(),
+    )
+    .map_err(Error::backend_source)?;
+    if &expected != geometry.complete_state_layout() {
+        return Err(Error::backend(
+            "Gemma partition receiver state differs from its tensor geometry",
+        ));
+    }
+    definition_with_state(args, expected)
+}
+
+fn definition_with_state(
+    args: &FamilyConfig,
+    state: eredu_runtime::StateLayout,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
     let parameters = declare_parameters(args)?;
     let units = (0..parameters.unit_layout().len())
         .map(|ordinal| {

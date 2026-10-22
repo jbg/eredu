@@ -9337,6 +9337,22 @@ and transform-source preparation read the same catalog without constructing
 native media layers. Pinned text resources declare their storage roles alongside
 their parameter groups, including the tied embedding/readout owner.
 
+Gemma execution uses `ComponentAdapter` over `GemmaKernel` for serial, observed,
+parallel, routed-provider, and partitioned calls. The kernel supplies the same block
+equations, media assembly, external-assistant captures, and typed auxiliary boundary
+values. Runtime owns address/dependency checks, canonical pinned-role traversal,
+selected state mapping, and partition-contract validation. Low-level family operations
+remain available on the kernel.
+
+Partition construction consumes the exact ownership declaration and retains only
+its canonical pinned resources. Shared-KV receiver histories form part of the
+validated selected definition, with global invocation indices mapped to local state
+rows independently of parameter ownership. Complete and transform-source construction
+use the same kernel and adapter. Parameter-free media continuation prepares request
+rotary/mask state from configuration; image layers and unstandardized pooling do not
+require pinned patch/position storage. Learned standardization retains its declared
+storage owner, and audio output retains the existing atomic subsampling/output group.
+
 Gemma audio checkpoint admission and resource declarations share logical parameter
 geometry. Resource catalogs retain only the configured output bias and expand each
 matrix's configured native encoding through runtime's ordinary format projection.

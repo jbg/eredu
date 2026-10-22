@@ -8279,7 +8279,10 @@ where
             })
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::gemma4::LayeredModel::<B>::new(args, self.context))
+            .map(|args| {
+                crate::gemma4::GemmaKernel::<B>::new(args, self.context)
+                    .and_then(|kernel| kernel.into_model())
+            })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target =
@@ -8287,7 +8290,8 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::gemma4::LayeredModel::<B>::new(target, self.context)
+        let architecture = crate::gemma4::GemmaKernel::<B>::new(target, self.context)
+            .and_then(|kernel| kernel.into_model())
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,

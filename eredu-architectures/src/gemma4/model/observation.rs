@@ -2,7 +2,7 @@
 use super::*;
 use crate::decoder::ComponentInstrumentation;
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B> {
     // All ordinary and observed entry points must share this preparation.
     pub(super) fn text_block_inputs(
         &self,
@@ -107,8 +107,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         if group != 2 {
-            return <Self as RoutedLayeredArchitecture<B, S>>::forward_unit_with_provider(
-                self, group, index, unit, hidden, state, forward, pass, provider, context,
+            return <Self as RoutedComponentKernel<B, S>>::execute_routed(
+                self,
+                self.definition.unit_address(group, index)?,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                provider,
+                context,
             );
         }
         let entry = self.component_text_entry(index, hidden, observer)?;
@@ -139,7 +147,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    LayeredModel<B>
+    GemmaKernel<B>
 {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_components_parallel<S, P, O>(
@@ -164,8 +172,17 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         if group != 2 {
-            return <Self as ParallelRoutedLayeredArchitecture<B, S>>::forward_unit_parallel_with_provider(
-                self, group, index, unit, hidden, state, forward, pass, provider, parallel, context,
+            return <Self as ParallelRoutedComponentKernel<B, S>>::execute_parallel_routed(
+                self,
+                self.definition.unit_address(group, index)?,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                provider,
+                parallel,
+                context,
             );
         }
         let entry = self.component_text_entry(index, hidden, observer)?;

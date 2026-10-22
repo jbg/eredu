@@ -752,6 +752,84 @@ impl<T: Tensor> VisionState<T> {
             context,
         )
     }
+    /// Pools request geometry using only the declared optional standardization parameters.
+    pub fn finish(
+        &self,
+        config: &VisionConfig,
+        hidden: &T,
+        bias: Option<&T>,
+        scale: Option<&T>,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        if bias.is_some() != scale.is_some() || config.standardize != bias.is_some() {
+            return Err(Error::backend(
+                "vision pooling standardization differs from its configuration",
+            ));
+        }
+
+        let element = hidden
+            .element_type()
+            .ok_or_else(|| Error::backend("unknown pooled vision precision"))?;
+        let kernel = config.pooling_kernel_size;
+        let mut pooled = Vec::with_capacity(self.grid_extents.len());
+        for (batch, (height, width)) in self.grid_extents.iter().copied().enumerate() {
+            let real_patches = height * width;
+            let pooled_height = height / kernel;
+            let pooled_width = width / kernel;
+            let item = hidden
+                .index(
+                    &[
+                        Index::Range(batch as i32, batch as i32 + 1),
+                        Index::Range(0, real_patches),
+                        Index::Full,
+                    ],
+                    context,
+                )?
+                .reshape(
+                    &[
+                        1,
+                        pooled_height,
+                        kernel,
+                        pooled_width,
+                        kernel,
+                        config.hidden_size,
+                    ],
+                    context,
+                )?;
+            // Average each spatial cell as a weighted FP32 product, rounding
+            // once to the tower precision before magnitude scaling.
+            let item = item
+                .transpose_axes(&[0, 1, 3, 2, 4, 5], context)?
+                .reshape(
+                    &[
+                        pooled_height * pooled_width,
+                        kernel * kernel,
+                        config.hidden_size,
+                    ],
+                    context,
+                )?
+                .cast_float(TensorElementType::F32, context)?;
+            let weights = T::full_f32(
+                1.0 / (kernel * kernel) as f32,
+                &[1, kernel * kernel],
+                context,
+            )?;
+            pooled.push(T::matmul(&weights, &item, context)?.reshape(
+                &[1, pooled_height * pooled_width, config.hidden_size],
+                context,
+            )?);
+        }
+        let mut hidden = T::concatenate(&pooled, 1, context)?
+            .cast_float(element, context)?
+            .cast_float(TensorElementType::F32, context)?
+            .multiply_scalar((config.hidden_size as f32).sqrt(), context)?;
+        if let (Some(bias), Some(scale)) = (bias, scale) {
+            hidden = hidden
+                .subtract(&bias.cast_float(TensorElementType::F32, context)?, context)?
+                .multiply(&scale.cast_float(TensorElementType::F32, context)?, context)?;
+        }
+        hidden.cast_float(element, context)
+    }
 }
 
 /// Pinned patch, position, pooling, and standardization modules.
@@ -845,77 +923,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let element = hidden
-            .element_type()
-            .ok_or_else(|| Error::backend("unknown pooled vision precision"))?;
-        let kernel = self.config.pooling_kernel_size;
-        let mut pooled = Vec::with_capacity(state.grid_extents.len());
-        for (batch, (height, width)) in state.grid_extents.iter().copied().enumerate() {
-            let real_patches = height * width;
-            let pooled_height = height / kernel;
-            let pooled_width = width / kernel;
-            let item = hidden
-                .index(
-                    &[
-                        Index::Range(batch as i32, batch as i32 + 1),
-                        Index::Range(0, real_patches),
-                        Index::Full,
-                    ],
-                    context,
-                )?
-                .reshape(
-                    &[
-                        1,
-                        pooled_height,
-                        kernel,
-                        pooled_width,
-                        kernel,
-                        self.config.hidden_size,
-                    ],
-                    context,
-                )?;
-            // Average each spatial cell as a weighted FP32 product, rounding
-            // once to the tower precision before magnitude scaling.
-            let item = item
-                .transpose_axes(&[0, 1, 3, 2, 4, 5], context)?
-                .reshape(
-                    &[
-                        pooled_height * pooled_width,
-                        kernel * kernel,
-                        self.config.hidden_size,
-                    ],
-                    context,
-                )?
-                .cast_float(TensorElementType::F32, context)?;
-            let weights = B::Tensor::full_f32(
-                1.0 / (kernel * kernel) as f32,
-                &[1, kernel * kernel],
-                context,
-            )?;
-            pooled.push(B::Tensor::matmul(&weights, &item, context)?.reshape(
-                &[1, pooled_height * pooled_width, self.config.hidden_size],
-                context,
-            )?);
-        }
-        let mut hidden = B::Tensor::concatenate(&pooled, 1, context)?
-            .cast_float(element, context)?
-            .cast_float(TensorElementType::F32, context)?
-            .multiply_scalar((self.config.hidden_size as f32).sqrt(), context)?;
-        if let (Some(bias), Some(scale)) = (
-            self.standardization_bias.as_ref(),
-            self.standardization_scale.as_ref(),
-        ) {
-            hidden = hidden
-                .subtract(
-                    &bias.as_ref().cast_float(TensorElementType::F32, context)?,
-                    context,
-                )?
-                .multiply(
-                    &scale.as_ref().cast_float(TensorElementType::F32, context)?,
-                    context,
-                )?;
-        }
-        hidden.cast_float(element, context)
+        state.finish(
+            &self.config,
+            hidden,
+            self.standardization_bias
+                .as_ref()
+                .map(|parameter| parameter.as_ref()),
+            self.standardization_scale
+                .as_ref()
+                .map(|parameter| parameter.as_ref()),
+            context,
+        )
     }
 }
 

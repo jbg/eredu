@@ -38,7 +38,7 @@ pub use ingress::{
 pub use media::ModalityProjector;
 pub use model::{
     component_definition, parameter_description, prepare_composite_ingress, DecoderInputPart,
-    ForwardContext, LayeredModel, ModelInput, PreparedCompositeIngress, StaticModules,
+    ForwardContext, GemmaKernel, LayeredModel, ModelInput, PreparedCompositeIngress, StaticModules,
     TextBoundary, TextBoundarySchema, Unit, AUDIO_EXECUTION_GROUP, TEXT_EXECUTION_GROUP,
     VISION_EXECUTION_GROUP,
 };
@@ -62,7 +62,7 @@ pub use vision::{
 pub fn expert_realization_plan<
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 >(
-    architecture: &LayeredModel<B>,
+    architecture: &GemmaKernel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {

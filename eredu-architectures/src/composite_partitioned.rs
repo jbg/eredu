@@ -2144,8 +2144,7 @@ where
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let mut architecture =
-                crate::gemma4::LayeredModel::<B>::new_parallel(args.clone(), local, context)
-                    .and_then(|architecture| architecture.with_partition_state(&geometry))
+                crate::gemma4::GemmaKernel::<B>::new_parallel(args.clone(), local, context)
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
@@ -2172,6 +2171,23 @@ where
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?;
             }
+            let partition = ArchitecturePartition::from_description(
+                &parameters,
+                group_ranges
+                    .iter()
+                    .map(|(group, units)| (group.as_str(), units.clone())),
+                ownership.clone(),
+                geometry.complete_state_layout(),
+                &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
+                geometry.clone(),
+                crate::gemma4::TextBoundarySchema::from_partition_args(&args.text, &geometry),
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let architecture = architecture
+                .into_partition_model(&partition)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let routed_execution = realization
                 .clone()
                 .map(|plan| {
@@ -2229,7 +2245,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::Muse(source) => {
@@ -3047,8 +3063,7 @@ where
         return Err("Gemma 4 transform source changed partition state or ownership".into());
     }
     let mut architecture =
-        crate::gemma4::LayeredModel::<B>::new_parallel(source.clone(), local, context)
-            .and_then(|architecture| architecture.with_partition_state(&geometry))
+        crate::gemma4::GemmaKernel::<B>::new_parallel(source.clone(), local, context)
             .map_err(|error| error.to_string())?;
     if sparse {
         let realization = crate::gemma4::expert_realization_plan(&architecture, rank)
@@ -3066,15 +3081,14 @@ where
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
-        .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
+    let partition = ArchitecturePartition::from_description(
+        &parameters,
         ranges(),
         ownership.clone(),
-        geometry,
-        boundary,
-        &parameters,
+        geometry.complete_state_layout(),
+        &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
+        geometry.clone(),
+        crate::gemma4::TextBoundarySchema::from_partition_args(&source.text, &geometry),
     )
     .map_err(|error| error.to_string())?;
     if selected.requirements().state() != partition.state() {
@@ -3084,6 +3098,9 @@ where
         crate::gemma4::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
     }
+    let architecture = architecture
+        .into_partition_model(&partition)
+        .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 
