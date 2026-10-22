@@ -4,7 +4,7 @@ use eredu_checkpoint::{recipe::RecipeCatalog, store::TensorSelection, LinearForm
 pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     bank: &eredu_checkpoint::expert::GatedProductExpertRecipes,
-    outputs: &std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    outputs: &eredu_runtime::ParameterBankRecipes,
     expert: usize,
     intermediate: Option<std::ops::Range<usize>>,
     formats: [LinearFormat; 2],
@@ -27,11 +27,10 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
             return Err("expert intermediate selection is outside its logical rows".into());
         }
     }
-    let selection = TensorSelection::Range {
-        axis: 0,
-        start: expert,
-        end: expert.checked_add(1).ok_or("expert selection overflowed")?,
-    };
+    let member = outputs
+        .member(expert)
+        .ok_or_else(|| format!("expert {expert} is outside the declared bank"))?;
+    let outputs = outputs.recipes();
     let mut parameters = Vec::new();
     for ((binding, target), format) in [
         ("gate_up_proj", &bank.target_gate_up),
@@ -63,12 +62,10 @@ pub(super) fn unit_parameters<C: RecipeCatalog + ?Sized>(
         };
         for suffix in ["", "_scales", "_biases"] {
             let target = format!("{target}{suffix}");
-            let Some(recipe) = outputs.get(&target) else {
+            let Some(recipe) = member.get(&target) else {
                 continue;
             };
-            let mut recipe = recipe
-                .select_bounded(catalog, selection.clone())
-                .map_err(|error| error.to_string())?;
+            let mut recipe = recipe.clone();
             if let Some(range) = &intermediate {
                 let companion = !suffix.is_empty();
                 let block = match source_format {

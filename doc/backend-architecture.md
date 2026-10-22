@@ -837,8 +837,12 @@ same catalog while retaining distinct bank cache identities, distribution polici
 and declared parameter order. Families retain bank namespaces, formats and expert
 selection policy. The gated-product residency builder used by Gemma4 and diffusion
 Gemma projects its selected weight, scale and bias outputs through the same bank
-catalog while preserving per-expert leases. Member projection retains bank-global
-IDs and allocates no parameter payload or native resource.
+catalog while preserving per-expert leases. DeepSeek V3/R1 and V4 target and
+prediction experts use this bank catalog for their selected weight, scale and
+bias recipes. DeepSeek retains encoded contraction and row-block alignment,
+packed column coordinates and separate gate/up intermediate slicing in its
+family preparation. Member projection retains bank-global IDs and allocates no
+parameter payload or native resource.
 `select_parameter_bank_recipes` validates nonempty, unique ordered global member
 IDs before pushing a rank-local selection through canonical recipes. Families
 supply the member axis and geometry; runtime retains selection order and typed

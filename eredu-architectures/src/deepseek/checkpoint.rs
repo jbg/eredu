@@ -877,6 +877,20 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
     let owner_group =
         eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
     let outputs = eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, bank)?;
+    let selected_outputs = outputs
+        .into_iter()
+        .filter(|(target, _)| {
+            [&bank.target_gate_up, &bank.target_down]
+                .into_iter()
+                .any(|base| {
+                    ["", "_scales", "_biases"]
+                        .into_iter()
+                        .any(|suffix| *target == format!("{base}{suffix}"))
+                })
+        })
+        .collect();
+    let outputs = eredu_runtime::ParameterBankRecipes::new(catalog, selected_outputs, experts)
+        .map_err(|error| error.to_string())?;
     for expert in 0..experts {
         let parameters = super::encoded_expert_residency::unit_parameters(
             catalog,
