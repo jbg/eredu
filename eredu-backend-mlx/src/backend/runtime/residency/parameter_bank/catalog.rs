@@ -142,20 +142,12 @@ pub struct SelectedAddressableEntries {
     /// Source-backed entry catalog, before selected load-time transformations.
     pub entries: Vec<ParameterBankEntry>,
     /// Packed format keyed by the exact entry and local binding to transform.
-    pub transformations: BTreeMap<(ParameterBankKey, String), SelectedBindingTransform>,
+    pub transformations:
+        BTreeMap<(ParameterBankKey, String), eredu_runtime::AddressableBindingTransform>,
     /// Neutral selected byte total for each exact member.
     pub expected_bytes: BTreeMap<ParameterBankKey, u64>,
     /// Exact architecture ownership retained for every selected entry.
     pub placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
-}
-
-/// Exact native lowering values for one selected bank binding.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SelectedBindingTransform {
-    /// Packed executable format.
-    pub quantization: WeightQuantization,
-    /// Selected scale and affine-bias scalar dtype.
-    pub companion_dtype: eredu_checkpoint::recipe::RecipeDtype,
 }
 
 /// Validates and lowers exact neutral bank tasks without collapsing mechanisms.
@@ -180,15 +172,11 @@ pub fn entries_from_selected_members(
                 .into_iter()
                 .map(|(local, target)| ((key, local), target)),
         );
-        for (binding, transform) in transforms {
-            transformations.insert(
-                (key, binding),
-                SelectedBindingTransform {
-                    quantization: transform.quantization(),
-                    companion_dtype: transform.companion_dtype().clone(),
-                },
-            );
-        }
+        transformations.extend(
+            transforms
+                .into_iter()
+                .map(|(binding, transform)| ((key, binding), transform)),
+        );
         entries.push(ParameterBankEntry::new(
             key,
             OffloadUnit::new(key.unit_id(), bindings)?,
@@ -245,12 +233,15 @@ pub(crate) fn quantize_entry_catalog(
 }
 
 pub(super) fn selected_transformation_formats(
-    transformations: &BTreeMap<(ParameterBankKey, String), SelectedBindingTransform>,
+    transformations: &BTreeMap<
+        (ParameterBankKey, String),
+        eredu_runtime::AddressableBindingTransform,
+    >,
 ) -> Vec<WeightQuantization> {
     let mut formats = Vec::new();
     for transform in transformations.values() {
-        if !formats.contains(&transform.quantization) {
-            formats.push(transform.quantization);
+        if !formats.contains(&transform.quantization()) {
+            formats.push(transform.quantization());
         }
     }
     formats
@@ -259,11 +250,17 @@ pub(super) fn selected_transformation_formats(
 pub(super) fn quantize_selected_entry_catalog(
     mut source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     mut entries: Vec<ParameterBankEntry>,
-    transformations: BTreeMap<(ParameterBankKey, String), SelectedBindingTransform>,
+    transformations: BTreeMap<
+        (ParameterBankKey, String),
+        eredu_runtime::AddressableBindingTransform,
+    >,
     max_working_set_bytes: u64,
     source_stream: &Stream,
 ) -> Result<QuantizedParameterBankCatalog, Error> {
-    let mut by_format = Vec::<(SelectedBindingTransform, std::collections::BTreeSet<_>)>::new();
+    let mut by_format = Vec::<(
+        eredu_runtime::AddressableBindingTransform,
+        std::collections::BTreeSet<_>,
+    )>::new();
     for (binding, transform) in transformations {
         if let Some((_, selected)) = by_format
             .iter_mut()
@@ -279,8 +276,8 @@ pub(super) fn quantize_selected_entry_catalog(
         let transformed = quantize_selected_entry_catalog_once(
             source,
             entries,
-            transform.quantization,
-            &transform.companion_dtype,
+            transform.quantization(),
+            transform.companion_dtype(),
             &selected,
             max_working_set_bytes,
             source_stream,

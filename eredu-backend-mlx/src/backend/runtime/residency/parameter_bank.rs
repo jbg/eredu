@@ -47,7 +47,6 @@ pub(crate) use catalog::QuantizedParameterBankCatalog;
 pub use catalog::{
     entries_from_selected_members, BankAccessClass, ParameterBankEntry, ParameterBankKey,
     ParameterBankOptions, ParameterBankOptionsError, SelectedAddressableEntries,
-    SelectedBindingTransform,
 };
 use catalog::{
     packed_projection_bytes, quantize_selected_entry_catalog, selected_transformation_formats,

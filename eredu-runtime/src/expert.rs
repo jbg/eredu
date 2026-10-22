@@ -558,6 +558,17 @@ pub struct AddressableBindingTransform {
 }
 
 impl AddressableBindingTransform {
+    /// Retains the selected encoding and companion precision. Capability and
+    /// geometry admission belong to the selected task and materialization plan.
+    pub const fn new(
+        quantization: eredu_checkpoint::WeightQuantization,
+        companion_dtype: eredu_checkpoint::recipe::RecipeDtype,
+    ) -> Self {
+        Self {
+            quantization,
+            companion_dtype,
+        }
+    }
     /// Selected packed executable format.
     pub const fn quantization(&self) -> eredu_checkpoint::WeightQuantization {
         self.quantization
@@ -763,10 +774,10 @@ where
                 })?;
                 transformations.insert(
                     parameter.binding_name().to_owned(),
-                    AddressableBindingTransform {
+                    AddressableBindingTransform::new(
                         quantization,
-                        companion_dtype: parameter.source_output().dtype().clone(),
-                    },
+                        parameter.source_output().dtype().clone(),
+                    ),
                 );
                 binding = binding
                     .with_quantization_companions(

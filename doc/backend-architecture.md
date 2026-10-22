@@ -3450,6 +3450,12 @@ checkpoint-format lowering, rather than the earlier admitted member byte count.
 Backend entry construction consumes these destinations and totals directly;
 parameter editing uses the same retained logical destinations as materialization.
 
+Native bank construction retains `AddressableBindingTransform` directly from
+these plans. Transformation grouping compares the complete selected encoding and
+companion precision, and materialization consumes those same values. Backend
+code supplies the native converter without maintaining a second transformation
+description or reselecting precision.
+
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
 streams, indexed tensor operations, generic addressable member storage,

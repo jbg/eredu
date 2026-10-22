@@ -253,8 +253,8 @@ impl AddressableParameterBank {
                         let metadata = binding.source_recipe().infer(store.as_ref())?;
                         packed_projection_bytes(
                             metadata.shape(),
-                            transform.quantization,
-                            &transform.companion_dtype,
+                            transform.quantization(),
+                            transform.companion_dtype(),
                         )?
                     } else {
                         binding.expected_bytes()
