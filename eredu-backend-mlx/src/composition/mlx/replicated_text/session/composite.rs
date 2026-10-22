@@ -1372,7 +1372,7 @@ where
             PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
         let continuation = self
             .session
-            .decode_input(paired, stream)
+            .decode_input(A::prepared_input(paired), stream)
             .map_err(|error| Error::Other(Box::new(error)))?
             .into_array()
             .evaluated()?
