@@ -265,7 +265,8 @@ pub struct ArchitectureParameterDescription {
 
 impl ArchitectureParameterDescription {
     /// Validates explicit ownership against the canonical graph/layout and an
-    /// authoritative set of neutral parameter groups.
+    /// authoritative set of neutral parameter groups. Every target retains its
+    /// member metadata and group semantics, independently of member ordering.
     pub fn new(
         graph: &ExecutionGraph,
         layout: &ExecutionUnitLayout,
@@ -274,7 +275,7 @@ impl ArchitectureParameterDescription {
     ) -> Result<Self, ArchitectureParameterError> {
         validate_canonical_layout(graph, layout)
             .map_err(|error| ArchitectureParameterError::InvalidLayout(error.to_string()))?;
-        let expected = parameter_targets(expected)?;
+        let expected = parameter_declarations(expected)?;
         let groups = groups.into_iter().collect::<Vec<_>>();
         let mut actual = BTreeMap::new();
         for tagged in &groups {
@@ -298,6 +299,16 @@ impl ArchitectureParameterDescription {
             return Err(ArchitectureParameterError::UnexpectedOwnership(
                 target.clone(),
             ));
+        }
+        for tagged in &groups {
+            for member in tagged.members() {
+                if !expected[member.target()].matches(tagged.group(), member) {
+                    return Err(ArchitectureParameterError::InconsistentDeclaration {
+                        target: member.target().to_owned(),
+                        group: tagged.logical_name().to_owned(),
+                    });
+                }
+            }
         }
         Ok(Self {
             graph: graph.clone(),
@@ -435,18 +446,36 @@ impl ArchitectureParameterDescription {
     }
 }
 
-fn parameter_targets(
+struct ExpectedParameter {
+    group: std::sync::Arc<ParameterGroupSpec>,
+    member: usize,
+}
+
+impl ExpectedParameter {
+    fn matches(&self, group: &ParameterGroupSpec, member: &crate::ParameterMemberSpec) -> bool {
+        self.group.logical_name() == group.logical_name()
+            && self.group.role() == group.role()
+            && self.group.partition_units() == group.partition_units()
+            && self.group.partition_unit_assignment() == group.partition_unit_assignment()
+            && self.group.members()[self.member] == *member
+    }
+}
+
+fn parameter_declarations(
     groups: impl IntoIterator<Item = ParameterGroupSpec>,
-) -> Result<BTreeMap<String, String>, ArchitectureParameterError> {
+) -> Result<BTreeMap<String, ExpectedParameter>, ArchitectureParameterError> {
     let mut targets = BTreeMap::new();
     for group in groups {
-        for member in group.members() {
-            if let Some(previous) =
-                targets.insert(member.target().to_owned(), group.logical_name().to_owned())
-            {
+        let group = std::sync::Arc::new(group);
+        for (index, member) in group.members().iter().enumerate() {
+            let declaration = ExpectedParameter {
+                group: group.clone(),
+                member: index,
+            };
+            if let Some(previous) = targets.insert(member.target().to_owned(), declaration) {
                 return Err(ArchitectureParameterError::DuplicateExpectedTarget {
                     target: member.target().to_owned(),
-                    first: previous,
+                    first: previous.group.logical_name().to_owned(),
                     second: group.logical_name().to_owned(),
                 });
             }
@@ -513,6 +542,16 @@ pub enum ArchitectureParameterError {
     /// An ownership tag names a target outside the authoritative set.
     #[error("parameter target {0:?} is not present in the authoritative parameter groups")]
     UnexpectedOwnership(String),
+    /// An ownership tag changes an authoritative parameter or its group semantics.
+    #[error(
+        "parameter target {target:?} in group {group:?} differs from its authoritative declaration"
+    )]
+    InconsistentDeclaration {
+        /// Canonical physical parameter target.
+        target: String,
+        /// Logical group in the ownership declaration.
+        group: String,
+    },
 }
 
 /// Logical scalar kind carried by one architecture-owned boundary tensor.

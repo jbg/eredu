@@ -815,7 +815,12 @@ projection ingress captures the raw encoder result alongside its projected outpu
 
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
-source authority to the recipes' physical inputs. Physical `ComponentRecipe`
+source authority to the recipes' physical inputs. Before recipe preparation,
+`ArchitectureParameterDescription` checks ownership coverage and agreement with
+the authoritative parameter declarations: global shapes, member sharding and
+encoding metadata, logical group identity, role, partition domain and assignment.
+Member ordering does not change this agreement. Conflicting declarations fail
+with typed errors naming the parameter and group. Physical `ComponentRecipe`
 declarations may include a `ComponentRecipeConversion`: the family selects the
 required output dtype and exact source dtypes admitted for casting. Runtime keeps
 recipes already producing that dtype unchanged, applies an explicitly allowed cast

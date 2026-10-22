@@ -322,6 +322,103 @@ mod component_preparation {
     use std::sync::Arc;
 
     #[test]
+    fn component_declarations_preserve_authoritative_parameter_geometry() {
+        use eredu_runtime::{ArchitectureParameterError, PartitionUnitAssignment};
+        let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
+        let layout = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+        let member = |shape, axis| {
+            ParameterMemberSpec::new("weight", shape, MemberSharding::Partitioned { axis })
+        };
+        let group = |name, role, units, member| {
+            ParameterGroupSpec::partitioned(name, role, units, [member]).unwrap()
+        };
+        let expected = group(
+            "projection",
+            ParameterRole::ColumnProjection,
+            4,
+            member(vec![4, 4], 0),
+        );
+        let owner = ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), 0);
+        for changed in [
+            group(
+                "projection",
+                ParameterRole::ColumnProjection,
+                4,
+                member(vec![8, 4], 0),
+            ),
+            group(
+                "projection",
+                ParameterRole::ColumnProjection,
+                4,
+                member(vec![4, 4], 1),
+            ),
+            group(
+                "projection",
+                ParameterRole::RowProjection,
+                4,
+                member(vec![4, 4], 0),
+            ),
+            group(
+                "other",
+                ParameterRole::ColumnProjection,
+                4,
+                member(vec![4, 4], 0),
+            ),
+            group(
+                "projection",
+                ParameterRole::ColumnProjection,
+                2,
+                member(vec![4, 4], 0),
+            ),
+            expected
+                .clone()
+                .with_partition_unit_assignment(PartitionUnitAssignment::Repeat {
+                    semantic_units: 8,
+                })
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                ArchitectureParameterDescription::new(&graph, &layout, [expected.clone()], [OwnedParameterGroupSpec::new(owner.clone(), changed)]),
+                Err(ArchitectureParameterError::InconsistentDeclaration { target, .. }) if target == "weight"
+            ));
+        }
+        let companion =
+            ParameterMemberSpec::new("scale", vec![4], MemberSharding::Partitioned { axis: 0 });
+        let expected = ParameterGroupSpec::partitioned(
+            "projection",
+            ParameterRole::ColumnProjection,
+            4,
+            [expected.members()[0].clone(), companion],
+        )
+        .unwrap();
+        let reordered = ParameterGroupSpec::partitioned(
+            "projection",
+            ParameterRole::ColumnProjection,
+            4,
+            expected.members().iter().rev().cloned(),
+        )
+        .unwrap();
+        let description = ArchitectureParameterDescription::new(
+            &graph,
+            &layout,
+            [expected],
+            [OwnedParameterGroupSpec::new(owner, reordered)],
+        )
+        .unwrap();
+        let selected = eredu_runtime::derive_partitioned_local_layout(
+            &description,
+            eredu_core::ParallelRankTopology::new(
+                eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected.tensor("weight").unwrap().local_shape(), [2, 4]);
+        assert_eq!(selected.tensor("scale").unwrap().local_shape(), [2]);
+    }
+
+    #[test]
     fn resource_preparation_keeps_independent_materializations_and_scopes_aliases() {
         use super::{AtomicUsize, Ordering, Source};
         use eredu_checkpoint::recipe::RecipeAlias;
