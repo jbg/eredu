@@ -6894,8 +6894,11 @@ layouts against family-selected logical group intervals. It uses the same member
 lowering as rank-based placement for uniform partitions, fused segments and
 explicit chunks, including replicated companions. It rejects missing or extra
 parameters and mismatched shapes, group metadata or placements with typed errors.
+`logical_parameter_group_range` extracts the declared semantic interval from a
+partitioned member's retained metadata, including explicit chunks. EAR encoder
+and decoder local geometry uses this extraction before complete layout validation.
 RVQ, MoG, character/speaker conditioning and EAR encoder, decoder and PRVQ geometry
-consume this shared validation. Families retain coupled latent, feature and
+consume shared validation. Families retain coupled latent, feature and
 convolution ranges and their state geometry; native construction consumes the
 validated physical tensors. Independently sharded vocabulary axes and packed
 expert ownership retain their separate rank-aware placement contracts.

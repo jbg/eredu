@@ -45,27 +45,7 @@ pub fn encoder_local_dimensions(
         description.groups().iter().map(|owned| owned.group()),
         layout,
         |group| -> Result<_, Error> {
-            let first = group
-                .members()
-                .iter()
-                .find(|member| {
-                    matches!(
-                        member.sharding(),
-                        MemberSharding::Partitioned { .. }
-                            | MemberSharding::PartitionedSegments { .. }
-                    )
-                })
-                .ok_or_else(|| invalid("encoder unit has no partition declaration"))?;
-            let size = group
-                .partition_units()
-                .ok_or_else(|| invalid("encoder unit omits partition units"))?;
-            let range = layout
-                .tensor(first.target())
-                .ok_or_else(|| invalid("encoder layout omits partitioned parameter"))?
-                .expanded_logical_range(size)?;
-            if range.is_empty() || range.end > size {
-                return Err(invalid("invalid encoder partition range"));
-            }
+            let range = eredu_runtime::logical_parameter_group_range(group, layout)?;
             units.push(EncoderUnitLocalDimensions {
                 start: range.start as i32,
                 width: range.len() as i32,

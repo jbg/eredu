@@ -51,21 +51,7 @@ pub fn decoder_local_dimensions(
         description.groups().iter().map(|owned| owned.group()),
         layout,
         |group| -> Result<_, Error> {
-            let first = group
-                .members()
-                .iter()
-                .find(|member| matches!(member.sharding(), MemberSharding::Partitioned { .. }))
-                .ok_or_else(|| invalid("decoder unit has no partition declaration"))?;
-            let size = group
-                .partition_units()
-                .ok_or_else(|| invalid("decoder unit omits partition units"))?;
-            let range = layout
-                .tensor(first.target())
-                .ok_or_else(|| invalid("decoder layout omits partitioned parameter"))?
-                .expanded_logical_range(size)?;
-            if range.is_empty() || range.end > size {
-                return Err(invalid("invalid decoder partition range"));
-            }
+            let range = eredu_runtime::logical_parameter_group_range(group, layout)?;
             units.push(DecoderUnitLocalDimensions {
                 start: range.start as i32,
                 width: range.len() as i32,

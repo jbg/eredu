@@ -56,6 +56,56 @@ pub fn derive_partitioned_group_layout<'a>(
     )
 }
 
+/// Extracts a declared group's exact logical interval from a partitioned member.
+///
+/// The selected tensor retains the declaration's semantic domain. Physical shape
+/// and axis placement never infer that interval, including for chunked members.
+/// Use `validate_logical_parameter_layout` to validate the complete physical group.
+pub fn logical_parameter_group_range(
+    group: &crate::ParameterGroupSpec,
+    layout: &crate::LocalModelLayout,
+) -> Result<Range<usize>, crate::ParallelPlanError> {
+    let units = group.partition_units().ok_or_else(|| {
+        crate::ParallelPlanError::InvalidGroup(format!(
+            "parameter group {:?} has no logical partition",
+            group.logical_name(),
+        ))
+    })?;
+    let member = group
+        .members()
+        .iter()
+        .find(|member| {
+            matches!(
+                member.sharding(),
+                crate::MemberSharding::Partitioned { .. }
+                    | crate::MemberSharding::PartitionedSegments { .. }
+                    | crate::MemberSharding::PartitionedChunks { .. }
+                    | crate::MemberSharding::PartitionedChunkSegments { .. }
+            )
+        })
+        .ok_or_else(|| {
+            crate::ParallelPlanError::InvalidGroup(format!(
+                "parameter group {:?} has no partitioned member",
+                group.logical_name(),
+            ))
+        })?;
+    let invalid = || {
+        crate::ParallelPlanError::InvalidTensor(format!(
+            "parameter {:?} omits its declared logical partition",
+            member.target(),
+        ))
+    };
+    let tensor = layout.tensor(member.target()).ok_or_else(invalid)?;
+    if tensor.logical_units() != Some(units) {
+        return Err(invalid());
+    }
+    tensor
+        .logical_range()
+        .filter(|range| !range.is_empty() && range.end <= units)
+        .cloned()
+        .ok_or_else(invalid)
+}
+
 /// Validates exact physical tensors against family-selected logical group ranges.
 ///
 /// Families select coupled semantic ranges; the shared lowering checks uniform

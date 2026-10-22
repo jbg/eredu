@@ -523,8 +523,14 @@ mod component_preparation {
             }
         }
         let validate = |layout: &LocalModelLayout, range: Option<std::ops::Range<usize>>| {
-            validate_logical_parameter_layout(groups(), layout, |_| {
-                Ok::<_, ParallelPlanError>(range.clone())
+            validate_logical_parameter_layout(groups(), layout, |group| {
+                let retained = eredu_runtime::logical_parameter_group_range(group, layout)?;
+                if Some(retained) != range {
+                    return Err(ParallelPlanError::InvalidGroup(
+                        "selection differs from retained semantic geometry".into(),
+                    ));
+                }
+                Ok(range.clone())
             })
         };
         validate(&layout, Some(selected.clone())).unwrap();
