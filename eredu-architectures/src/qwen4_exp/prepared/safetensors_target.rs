@@ -194,7 +194,7 @@ impl SafetensorsTargetPlan {
             .map(|(root, recipes)| {
                 Ok((
                     root,
-                    Arc::new(PreparedExpertBank::new(
+                    Arc::new(ParameterBankRecipes::new(
                         &self.catalog,
                         recipes,
                         self.config.experts.count as usize,
@@ -386,7 +386,7 @@ impl SafetensorsTargetPlan {
         (
             PredictionSpec,
             ParameterFormats,
-            BTreeMap<String, Arc<PreparedExpertBank>>,
+            BTreeMap<String, Arc<ParameterBankRecipes>>,
         ),
         PreparationError,
     > {
@@ -410,7 +410,7 @@ impl SafetensorsTargetPlan {
             .map(|(root, recipes)| {
                 Ok((
                     root,
-                    Arc::new(PreparedExpertBank::new(
+                    Arc::new(ParameterBankRecipes::new(
                         &self.catalog,
                         recipes,
                         self.config.experts.count as usize,

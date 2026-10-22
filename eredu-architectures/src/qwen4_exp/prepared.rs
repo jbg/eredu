@@ -27,7 +27,8 @@ use eredu_nn::{
     GroupedProjectionSpec, LinearFormatSpec, ParameterSpec,
 };
 use eredu_runtime::{
-    PreparedParameterRecipes, PreparedRowLookup, RowLookupLimits, RowResidencyRange,
+    ParameterBankRecipes, PreparedParameterRecipes, PreparedRowLookup, RowLookupLimits,
+    RowResidencyRange,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -97,7 +98,7 @@ pub struct PreparedTarget {
     )>,
     artifact: SharedCheckpointSource,
     formats: ParameterFormats,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
     spec: TargetSpec,
     tables: BTreeMap<usize, PreparedNGramTable>,
     static_parameters: PreparedParameterRecipes,
@@ -238,42 +239,14 @@ impl PreparedTarget {
         )?)
     }
 }
-#[derive(Debug)]
-struct PreparedExpertBank {
-    recipes: BTreeMap<String, DerivedWeightRecipe>,
-    members: Vec<BTreeMap<String, DerivedWeightRecipe>>,
-}
-impl PreparedExpertBank {
-    fn new<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
-        source: &C,
-        recipes: BTreeMap<String, DerivedWeightRecipe>,
-        count: usize,
-    ) -> Result<Self, PreparationError> {
-        let mut members = vec![BTreeMap::new(); count];
-        for (name, recipe) in &recipes {
-            let selected = recipe
-                .select_bounded_members(source)
-                .map_err(|e| PreparationError::Contract(e.to_string()))?;
-            if selected.len() != count {
-                return Err(PreparationError::Contract(
-                    "prepared expert count mismatch".into(),
-                ));
-            }
-            for (member, recipe) in members.iter_mut().zip(selected) {
-                member.insert(name.clone(), recipe);
-            }
-        }
-        Ok(Self { recipes, members })
-    }
-}
 fn select_expert(
-    banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
+    banks: &BTreeMap<String, Arc<ParameterBankRecipes>>,
     root: &str,
     expert: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, PreparationError> {
     banks
         .get(root)
-        .and_then(|b| b.members.get(expert))
+        .and_then(|b| b.member(expert))
         .cloned()
         .ok_or_else(|| {
             PreparationError::Contract(format!("expert {expert} is outside prepared bank {root}"))

@@ -120,7 +120,7 @@ pub(super) fn target_parameters<C: eredu_checkpoint::recipe::RecipeCatalog + ?Si
     physical: &BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
     static_recipes: &BTreeMap<String, DerivedWeightRecipe>,
     unit_recipes: &[BTreeMap<String, DerivedWeightRecipe>],
-    banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
+    banks: &BTreeMap<String, Arc<ParameterBankRecipes>>,
 ) -> Result<
     (
         Vec<Parameter>,
@@ -164,10 +164,10 @@ pub(super) fn target_parameters<C: eredu_checkpoint::recipe::RecipeCatalog + ?Si
             declared.add(name, recipe, owner.clone(), false)?;
         }
         let root = format!("model.layers.{layer}.mlp.experts");
-        for (name, recipe) in &banks
+        for (name, recipe) in banks
             .get(&root)
             .ok_or_else(|| invalid("missing prepared expert bank"))?
-            .recipes
+            .recipes()
         {
             declared.add(&format!("{root}.{name}"), recipe, owner.clone(), true)?;
         }
@@ -187,7 +187,7 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
         BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
     ),
     static_recipes: &BTreeMap<String, DerivedWeightRecipe>,
-    expert_banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: &BTreeMap<String, Arc<ParameterBankRecipes>>,
     streams: Vec<AppendStreamBinding>,
     row_admission: SelectedRowLookupPlans,
 ) -> Result<RoutedTextRequirements, PreparationError> {

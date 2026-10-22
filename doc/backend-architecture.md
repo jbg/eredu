@@ -824,8 +824,15 @@ sources. Consuming `project` selects existing canonical parameter identities,
 keeps their recipes and exact source guards, and rejects unknown targets. Qwen4
 target and prediction tensor partitions use the shared transformation traversal;
 prediction vocabulary derives from the retained target owner through identity
-projection. Shared resource binding preparation uses the same checkpoint snapshot
-primitive while keeping aliases local to each independently leased resource.
+projection. Runtime's source-free `ParameterBankRecipes` validates canonical
+bank recipes and their declared member counts, then projects every parameter to
+bounded leading-axis member recipes with singleton axes. Its `map_recipes`
+transforms complete banks before deriving members and retains the declared member
+count. Qwen4 target, prediction and inspection consume this shared catalog; families retain bank namespaces,
+formats and expert selection policy. Member projection retains bank-global IDs
+and allocates no parameter payload or native resource. Shared resource binding
+preparation uses the same checkpoint snapshot primitive while keeping aliases
+local to each independently leased resource.
 Qwen4 n-gram tables, integer hash controls and scalar scales use this same
 retention primitive. The family checks admitted table headers and provenance
 before bounded literal reads; controls and scales retain separate exact source

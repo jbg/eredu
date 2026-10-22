@@ -645,6 +645,107 @@ mod component_preparation {
     }
 
     #[test]
+    fn bank_recipe_members_keep_global_ids_companions_and_local_geometry() {
+        use super::{AtomicUsize, Ordering, Source};
+        use eredu_checkpoint::store::CheckpointSource;
+        use eredu_runtime::{ParameterBankRecipes, PreparedParameterRecipes, RecipeBindingError};
+        use std::collections::BTreeMap;
+        let original = Arc::new(Source {
+            store: MemoryWeightStore::from_safetensors((0..3).flat_map(|member| {
+                [
+                    (
+                        format!("weight.{member}"),
+                        safetensors::Dtype::U32,
+                        vec![2, 4],
+                        vec![0; 32],
+                    ),
+                    (
+                        format!("scale.{member}"),
+                        safetensors::Dtype::F32,
+                        vec![2, 1],
+                        vec![0; 8],
+                    ),
+                ]
+            }))
+            .unwrap(),
+            overlay: false,
+            leases: AtomicUsize::new(0),
+        });
+        let stack = |prefix: &str, count| DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: (0..count)
+                .map(|member| {
+                    DerivedWeightRecipe::source(format!("{prefix}.{member}"), TensorSelection::Full)
+                })
+                .collect(),
+        };
+        let recipes = BTreeMap::from([
+            ("weight".into(), stack("weight", 3)),
+            ("scales".into(), stack("scale", 3)),
+        ]);
+        let catalog = original.as_ref() as &dyn CheckpointSource;
+        let bank = ParameterBankRecipes::new(catalog, recipes.clone(), 3).unwrap();
+        assert_eq!(bank.member_count(), 3);
+        assert!(bank.member(3).is_none());
+        let local = bank
+            .map_recipes(catalog, |_, recipe| {
+                Ok::<_, RecipeBindingError>(recipe.select_bounded(
+                    catalog,
+                    TensorSelection::Range {
+                        axis: 1,
+                        start: 1,
+                        end: 2,
+                    },
+                )?)
+            })
+            .unwrap();
+        let member = PreparedParameterRecipes::new(
+            "bank-global member 2",
+            original.clone(),
+            local.member(2).unwrap().clone(),
+        )
+        .unwrap();
+        assert_eq!(member.source().source_keys(), ["scale.2", "weight.2"]);
+        assert_eq!(
+            member.recipes()["weight"]
+                .infer(member.source().as_ref())
+                .unwrap()
+                .shape(),
+            [1, 1, 4]
+        );
+        assert_eq!(
+            member.recipes()["scales"]
+                .infer(member.source().as_ref())
+                .unwrap()
+                .shape(),
+            [1, 1, 1]
+        );
+        assert_eq!(bank.recipes(), &recipes);
+        assert!(matches!(ParameterBankRecipes::new(catalog, BTreeMap::from([
+            ("weight".into(), stack("weight", 3)),
+            ("scales".into(), stack("scale", 2)),
+        ]), 3), Err(RecipeBindingError::BankMemberCount { target, expected: 3, actual: 2 }) if target == "scales"));
+        assert!(matches!(
+            bank.map_recipes(catalog, |_, recipe| {
+                Ok::<_, RecipeBindingError>(recipe.select_bounded(
+                    catalog,
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 0,
+                        end: 2,
+                    },
+                )?)
+            }),
+            Err(RecipeBindingError::BankMemberCount {
+                expected: 3,
+                actual: 2,
+                ..
+            })
+        ));
+        assert_eq!(original.leases.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn resource_preparation_keeps_independent_materializations_and_scopes_aliases() {
         use super::{AtomicUsize, Ordering, Source};
         use eredu_checkpoint::{recipe::RecipeAlias, store::CheckpointSource};

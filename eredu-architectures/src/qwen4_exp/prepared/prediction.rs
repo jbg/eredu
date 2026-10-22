@@ -15,7 +15,7 @@ pub struct PreparedPrediction {
     vocabulary: PreparedParameterRecipes,
     units: Vec<PreparedParameterRecipes>,
     pub(super) artifact: SharedCheckpointSource,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
 }
 impl PreparedTarget {
     /// Prepares embedded prediction without reading any additional tensor payload.

@@ -65,7 +65,7 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
     physical: &BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
     shared_recipes: &BTreeMap<String, DerivedWeightRecipe>,
     unit_recipes: &[BTreeMap<String, DerivedWeightRecipe>],
-    expert_banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: &BTreeMap<String, Arc<ParameterBankRecipes>>,
     target_requirements: &RoutedTextRequirements,
     streams: Vec<AppendStreamBinding>,
 ) -> Result<
@@ -117,7 +117,7 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
         let complete = expert_banks
             .get(&root)
             .ok_or_else(|| invalid("missing prepared prediction bank"))?;
-        for (local, recipe) in &complete.recipes {
+        for (local, recipe) in complete.recipes() {
             declared.add(
                 &format!("{root}.{local}"),
                 recipe,

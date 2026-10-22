@@ -14,7 +14,7 @@ pub struct PreparedTensorTarget {
     partition: TargetTensorPartition,
     static_parameters: PreparedParameterRecipes,
     units: Vec<PreparedParameterRecipes>,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
 }
 impl PreparedTarget {
     /// Binds one tensor rank to exact canonical source recipes and integer controls.
@@ -52,26 +52,15 @@ impl PreparedTarget {
             .expert_banks
             .iter()
             .map(|(root, bank)| {
-                let recipes = bank
-                    .recipes
-                    .iter()
-                    .map(|(name, recipe)| {
-                        let canonical = format!("{root}.{name}");
-                        Ok((
-                            name.clone(),
-                            partition_recipe(
-                                self.artifact.as_ref(),
-                                &canonical,
-                                recipe,
-                                partition.parameter_selections(&canonical),
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, PreparationError>>()?;
-                // Partition the complete canonical group axes before deriving
-                // each bounded expert member. Singleton group axes stay intact.
-                let bank =
-                    PreparedExpertBank::new(self.artifact.as_ref(), recipes, bank.members.len())?;
+                let bank = bank.map_recipes(self.artifact.as_ref(), |name, recipe| {
+                    let canonical = format!("{root}.{name}");
+                    partition_recipe(
+                        self.artifact.as_ref(),
+                        &canonical,
+                        recipe,
+                        partition.parameter_selections(&canonical),
+                    )
+                })?;
                 Ok((root.clone(), Arc::new(bank)))
             })
             .collect::<Result<_, PreparationError>>()?;

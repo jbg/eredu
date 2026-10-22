@@ -949,6 +949,84 @@ pub struct ParameterResourceRecipes {
     pub aliases: Vec<RecipeAlias>,
 }
 
+/// Source-free canonical bank recipes and bounded leading-axis member projections.
+///
+/// Member identities are bank-global ordinals. Every declared parameter retains
+/// the singleton member axis and original recipe transforms. This catalog owns no
+/// payload, native operator, mutable state, or residency selection.
+#[derive(Debug)]
+pub struct ParameterBankRecipes {
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
+    members: Vec<BTreeMap<String, DerivedWeightRecipe>>,
+}
+
+impl ParameterBankRecipes {
+    /// Validates every declared bank member count and prepares bounded recipes
+    /// against metadata only. Physical source admission remains with the caller.
+    pub fn new<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        recipes: BTreeMap<String, DerivedWeightRecipe>,
+        member_count: usize,
+    ) -> Result<Self, RecipeBindingError> {
+        let mut members = vec![BTreeMap::new(); member_count];
+        for (target, recipe) in &recipes {
+            let selected = recipe.select_bounded_members(catalog).map_err(|source| {
+                RecipeBindingError::ParameterRecipe {
+                    target: target.clone(),
+                    source,
+                }
+            })?;
+            if selected.len() != member_count {
+                return Err(RecipeBindingError::BankMemberCount {
+                    target: target.clone(),
+                    expected: member_count,
+                    actual: selected.len(),
+                });
+            }
+            for (member, recipe) in members.iter_mut().zip(selected) {
+                member.insert(target.clone(), recipe);
+            }
+        }
+        Ok(Self { recipes, members })
+    }
+
+    /// Transforms complete bank recipes before deriving bounded members again.
+    /// Canonical targets and the declared bank-global member count remain fixed;
+    /// families supply their rank geometry and format-specific selections.
+    pub fn map_recipes<C: RecipeCatalog + ?Sized, E>(
+        &self,
+        catalog: &C,
+        mut transform: impl FnMut(&str, &DerivedWeightRecipe) -> Result<DerivedWeightRecipe, E>,
+    ) -> Result<Self, E>
+    where
+        E: From<RecipeBindingError>,
+    {
+        let recipes = self
+            .recipes
+            .iter()
+            .map(|(target, recipe)| {
+                transform(target, recipe).map(|recipe| (target.clone(), recipe))
+            })
+            .collect::<Result<_, E>>()?;
+        Self::new(catalog, recipes, self.member_count()).map_err(E::from)
+    }
+
+    /// Complete bank geometry and parameter identities before member selection.
+    pub fn recipes(&self) -> &BTreeMap<String, DerivedWeightRecipe> {
+        &self.recipes
+    }
+
+    /// Number of globally indexed members, independent of local resource order.
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Exact parameter recipes for one bank-global member, retaining its axis.
+    pub fn member(&self, member: usize) -> Option<&BTreeMap<String, DerivedWeightRecipe>> {
+        self.members.get(member)
+    }
+}
+
 /// Exact recipes and immutable physical source authority for one parameter owner.
 /// Empty owners are valid. This retains no native tensor or execution state and
 /// does not merge separately leased ordinary units, experts or pinned resources.
@@ -1109,6 +1187,25 @@ pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
 /// Failure preparing exact source authority or lowering atomic recipe bindings.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeBindingError {
+    /// A canonical bank parameter cannot be projected into bounded members.
+    #[error("parameter {target:?} recipe failed: {source}")]
+    ParameterRecipe {
+        /// Canonical bank parameter identity.
+        target: String,
+        /// Original typed recipe failure.
+        #[source]
+        source: RecipeError,
+    },
+    /// A bank parameter describes a different leading-axis member count.
+    #[error("parameter {target:?} has {actual} bank members; expected {expected}")]
+    BankMemberCount {
+        /// Canonical bank parameter identity.
+        target: String,
+        /// Declared bank member count.
+        expected: usize,
+        /// Actual recipe member count.
+        actual: usize,
+    },
     /// An identity projection names a parameter outside the retained owner.
     #[error("parameter {target:?} is absent from the prepared recipe owner")]
     UnknownParameter {

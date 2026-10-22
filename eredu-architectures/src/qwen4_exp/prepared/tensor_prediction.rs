@@ -10,7 +10,7 @@ pub struct PreparedTensorPrediction {
     source: PreparedPrediction,
     partition: PredictionTensorPartition,
     units: Vec<PreparedParameterRecipes>,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
 }
 
 impl PreparedPrediction {
@@ -38,30 +38,16 @@ impl PreparedPrediction {
             .expert_banks
             .iter()
             .map(|(root, bank)| {
-                let recipes = bank
-                    .recipes
-                    .iter()
-                    .map(|(name, recipe)| {
-                        let canonical = format!("{root}.{name}");
-                        Ok((
-                            name.clone(),
-                            partition_recipe(
-                                self.artifact.as_ref(),
-                                &canonical,
-                                recipe,
-                                partition.parameter_selections(&canonical),
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<_, PreparationError>>()?;
-                Ok((
-                    root.clone(),
-                    Arc::new(PreparedExpertBank::new(
+                let bank = bank.map_recipes(self.artifact.as_ref(), |name, recipe| {
+                    let canonical = format!("{root}.{name}");
+                    partition_recipe(
                         self.artifact.as_ref(),
-                        recipes,
-                        bank.members.len(),
-                    )?),
-                ))
+                        &canonical,
+                        recipe,
+                        partition.parameter_selections(&canonical),
+                    )
+                })?;
+                Ok((root.clone(), Arc::new(bank)))
             })
             .collect::<Result<_, PreparationError>>()?;
         Ok(PreparedTensorPrediction {

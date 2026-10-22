@@ -20,7 +20,7 @@ pub struct TargetArtifactDeclaration {
     pub(super) resolution: ResolvedCheckpointPlan,
     pub(super) gguf_source: Option<checkpoint::gguf_text::GgufTextPlan>,
     pub(super) tables: BTreeMap<usize, TableDeclaration>,
-    pub(super) banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    pub(super) banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
     pub(super) static_recipes: BTreeMap<String, DerivedWeightRecipe>,
     pub(super) unit_recipes: Vec<BTreeMap<String, DerivedWeightRecipe>>,
     pub(super) embedded_prediction: Option<SafetensorsPredictionPlan>,
