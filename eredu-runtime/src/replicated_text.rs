@@ -2571,6 +2571,72 @@ impl ReplicatedTextMaterializationTask {
         Ok(())
     }
 
+    /// Projects generated scale and affine-bias outputs onto a selected logical
+    /// shape. The caller supplies canonical output identities and the exact
+    /// member-local shape; ownership follows this task's parameter owner.
+    ///
+    /// Stored companions and formats requiring additional output roles retain
+    /// their declared outputs. Attach the result with `with_output_companions`
+    /// to validate the complete executable role set.
+    pub fn transform_output_companions(
+        &self,
+        logical_shape: &[usize],
+        scale: &str,
+        affine_bias: Option<&str>,
+    ) -> Result<Vec<ReplicatedTextOutputCompanion>, ReplicatedTextContractError> {
+        if !matches!(
+            self.lowering(),
+            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+        ) {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "task {:?} does not select a load-time transform",
+                self.name()
+            )));
+        }
+        let quantization = self.executable().weight_quantization().ok_or_else(|| {
+            ReplicatedTextContractError::invalid(format!(
+                "transformed task {:?} selected a non-quantized executable",
+                self.name()
+            ))
+        })?;
+        let mut shape = logical_shape.to_vec();
+        let input = shape
+            .last_mut()
+            .ok_or_else(|| ReplicatedTextContractError::invalid("transformed scalar parameter"))?;
+        let group = usize::try_from(quantization.group_size()).map_err(|_| {
+            ReplicatedTextContractError::invalid("transform group size exceeds usize")
+        })?;
+        if group == 0 || !input.is_multiple_of(group) {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "transformed task {:?} has incompatible companion geometry",
+                self.name()
+            )));
+        }
+        *input /= group;
+        let owner = parameter_group_owner(self.owner())?;
+        let mut outputs = vec![ReplicatedTextOutputCompanion::new(
+            scale,
+            eredu_nn::LinearCompanionRole::Scale,
+            shape.clone(),
+            owner.clone(),
+        )?];
+        if quantization.has_biases() {
+            let affine_bias = affine_bias.ok_or_else(|| {
+                ReplicatedTextContractError::invalid(format!(
+                    "transformed task {:?} omitted its affine-bias identity",
+                    self.name()
+                ))
+            })?;
+            outputs.push(ReplicatedTextOutputCompanion::new(
+                affine_bias,
+                eredu_nn::LinearCompanionRole::AffineBias,
+                shape,
+                owner,
+            )?);
+        }
+        Ok(outputs)
+    }
+
     /// Attaches the architecture's exact selected packed-output companions.
     pub fn with_output_companions(
         mut self,
@@ -3124,42 +3190,7 @@ fn build_materialization_tasks(
                     task.name()
                 ))
             })?;
-            let quantization = task.executable().weight_quantization().ok_or_else(|| {
-                ReplicatedTextContractError::invalid(format!(
-                    "transformed task {:?} selected a non-quantized executable",
-                    task.name()
-                ))
-            })?;
-            let mut shape = task.logical_shape().to_vec();
-            let input = shape.last_mut().ok_or_else(|| {
-                ReplicatedTextContractError::invalid("transformed scalar parameter")
-            })?;
-            let group = usize::try_from(quantization.group_size()).map_err(|_| {
-                ReplicatedTextContractError::invalid("transform group size exceeds usize")
-            })?;
-            if group == 0 || !input.is_multiple_of(group) {
-                return Err(ReplicatedTextContractError::invalid(format!(
-                    "transformed task {:?} has incompatible companion geometry",
-                    task.name()
-                )));
-            }
-            *input /= group;
-            let owner = parameter_group_owner(task.owner())?;
-            let mut outputs = vec![ReplicatedTextOutputCompanion::new(
-                scale,
-                eredu_nn::LinearCompanionRole::Scale,
-                shape.clone(),
-                owner.clone(),
-            )?];
-            if quantization.has_biases() {
-                outputs.push(ReplicatedTextOutputCompanion::new(
-                    affine_bias,
-                    eredu_nn::LinearCompanionRole::AffineBias,
-                    shape,
-                    owner,
-                )?);
-            }
-            outputs
+            task.transform_output_companions(task.logical_shape(), scale, Some(affine_bias))?
         } else {
             declared.remove(task.name()).unwrap_or_default()
         };

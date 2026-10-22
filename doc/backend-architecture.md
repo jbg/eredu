@@ -3419,6 +3419,14 @@ parameters that read the same physical source. Overflow errors identify the bank
 member. Architecture code admits transform roles and formats; runtime accounts
 for the resulting payload without selecting policy, scratch or state geometry.
 
+`ReplicatedTextMaterializationTask::transform_output_companions` projects generated
+scale and affine-bias geometry from the selected logical shape and quantization
+group size. Ordinary preparation and member-local bank preparation use this same
+projection. Callers retain canonical output naming and select the logical subset;
+runtime checks group alignment and derives parameter ownership. Complete output
+role validation uses the task's ordinary companion attachment contract. Stored
+companions retain their declared source and output descriptions.
+
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
 streams, indexed tensor operations, generic addressable member storage,

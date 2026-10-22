@@ -239,6 +239,9 @@ pub enum RoutedTextPreparationError {
     /// Primary and independently materialized companion identities overlap.
     #[error(transparent)]
     Materialization(#[from] eredu_runtime::MaterializationTaskIndexError),
+    /// Exact generated output geometry or ownership disagrees.
+    #[error(transparent)]
+    MaterializationContract(#[from] eredu_runtime::ReplicatedTextContractError),
     /// Selected member geometry or payload accounting disagrees.
     #[error(transparent)]
     BankGeometry(#[from] eredu_runtime::AddressableBankMemberError),
@@ -447,13 +450,6 @@ fn project_bank_members_with_tasks(
                 let mut task = task.clone();
                 if task.output_companions().is_empty() {
                     if let Some(companions) = companions.as_ref() {
-                        let quantization =
-                            task.executable().weight_quantization().ok_or_else(|| {
-                                RoutedTextPreparationError::Invalid(format!(
-                                    "addressable transform target {:?} has no packed format",
-                                    task.name()
-                                ))
-                            })?;
                         let prefix = parameter
                             .logical_target()
                             .strip_suffix(parameter.binding_name())
@@ -464,46 +460,16 @@ fn project_bank_members_with_tasks(
                                 parameter.binding_name()
                             ))
                             })?;
-                        let mut shape = metadata.shape().to_vec();
-                        let columns = shape.last_mut().ok_or_else(|| {
-                            RoutedTextPreparationError::Invalid(
-                                "addressable transform companion has no group axis".into(),
-                            )
-                        })?;
-                        *columns = columns
-                            .checked_div(quantization.group_size() as usize)
-                            .ok_or_else(|| {
-                                RoutedTextPreparationError::Invalid(
-                                    "addressable transform companion group geometry is invalid"
-                                        .into(),
-                                )
-                            })?;
-                        let owner = task.owner().parameter_group_owner().map_err(|error| {
-                            RoutedTextPreparationError::Invalid(error.to_string())
-                        })?;
-                        let mut outputs = vec![eredu_runtime::ReplicatedTextOutputCompanion::new(
-                            format!("{prefix}{}", companions.scale()),
-                            eredu_nn::LinearCompanionRole::Scale,
-                            shape.clone(),
-                            owner.clone(),
-                        )
-                        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?];
-                        if let Some(biases) = companions.affine_bias() {
-                            outputs.push(
-                                eredu_runtime::ReplicatedTextOutputCompanion::new(
-                                    format!("{prefix}{biases}"),
-                                    eredu_nn::LinearCompanionRole::AffineBias,
-                                    shape,
-                                    owner,
-                                )
-                                .map_err(|error| {
-                                    RoutedTextPreparationError::Invalid(error.to_string())
-                                })?,
-                            );
-                        }
-                        task = task.with_output_companions(outputs).map_err(|error| {
-                            RoutedTextPreparationError::Invalid(error.to_string())
-                        })?;
+                        let scale = format!("{prefix}{}", companions.scale());
+                        let affine_bias = companions
+                            .affine_bias()
+                            .map(|name| format!("{prefix}{name}"));
+                        let outputs = task.transform_output_companions(
+                            metadata.shape(),
+                            &scale,
+                            affine_bias.as_deref(),
+                        )?;
+                        task = task.with_output_companions(outputs)?;
                     }
                 }
                 let shared = eredu_runtime::AddressableBankTask::new(task)

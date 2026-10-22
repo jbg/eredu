@@ -139,7 +139,7 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
         parameter_acquisition_units, partition_parameter_acquisition_bindings,
         ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
         MemberSharding, OwnedParameterGroupSpec, ParameterAcquisitionError, ParameterGroupSpec,
-        ParameterMemberSpec, ReplicatedTextOutputCompanion,
+        ParameterMemberSpec,
     };
     let owner = |unit| ReplicatedTextParameterOwner::ExecutionUnit {
         group: "decoder".into(),
@@ -151,24 +151,15 @@ fn acquisition_preserves_independent_owners_packed_bytes_and_sparse_execution_or
         &[8, 64],
         WeightLoweringKind::Transform,
         LinearFormat::Affine(Default::default()),
-    )
-    .with_output_companions(
-        [
-            ("encoded.scales", eredu_nn::LinearCompanionRole::Scale),
-            ("encoded.biases", eredu_nn::LinearCompanionRole::AffineBias),
-        ]
-        .map(|(name, role)| {
-            ReplicatedTextOutputCompanion::new(
-                name,
-                role,
-                vec![8, 1],
-                owner(1).parameter_group_owner().unwrap(),
-            )
-            .unwrap()
-        })
-        .to_vec(),
-    )
-    .unwrap();
+    );
+    let outputs = encoded
+        .transform_output_companions(
+            encoded.logical_shape(),
+            "encoded.scales",
+            Some("encoded.biases"),
+        )
+        .unwrap();
+    let encoded = encoded.with_output_companions(outputs).unwrap();
     let tasks = vec![
         owned_task(
             "first",
