@@ -794,6 +794,35 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
         [2, 3]
     );
 
+    // Final independently leased inputs enter the ordinary controller with their
+    // sparse global identities and shared checkpoint authority intact.
+    use eredu_core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy};
+    let (members, definitions, rows, plan) = eredu_runtime::PreparedAddressableBankResidency::new(
+        catalog.entries,
+        Vec::new(),
+        OffloadConfig::new(Some(32), Some(32), 1).unwrap(),
+        ResidencyPolicy::Cacheable,
+        MemoryTier::Disk,
+    )
+    .unwrap()
+    .into_parts();
+    let ids: Vec<_> = members.keys().map(|key| key.unit_id()).collect();
+    let mut controller = eredu_runtime::ResidencyController::new_with_row_ranges(
+        |_| &source as &dyn CheckpointSource,
+        plan,
+        definitions,
+        rows,
+    )
+    .unwrap();
+    controller.ledger_mut().mark_initialized();
+    controller
+        .ledger_mut()
+        .reserve_copy(&ids[0], MemoryTier::Device, 32, &BTreeSet::new())
+        .unwrap();
+    assert!(controller
+        .ledger_mut()
+        .reserve_copy(&ids[1], MemoryTier::Device, 32, &BTreeSet::new())
+        .is_err());
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
 }
 

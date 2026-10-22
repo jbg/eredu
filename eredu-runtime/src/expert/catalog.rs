@@ -150,3 +150,108 @@ impl AddressableBankCatalog {
         Ok(catalog)
     }
 }
+
+/// Failure admitting independent members and compact rows to one residency pool.
+#[derive(Debug, thiserror::Error)]
+pub enum AddressableBankResidencyError {
+    /// A physical member occurs more than once in the pool.
+    #[error("duplicate bank residency member {key:?}")]
+    DuplicateMember {
+        /// Repeated global storage identity.
+        key: ParameterBankKey,
+    },
+    /// The pool owns neither an independent member nor a row namespace.
+    #[error("bank residency requires at least one member or row namespace")]
+    EmptyCatalog,
+    /// Member geometry, namespace overlap or configured budgets are invalid.
+    #[error(transparent)]
+    Plan(#[from] eredu_core::residency::OffloadError),
+}
+
+/// Admits exact member extents and compact row namespaces without reading payloads.
+/// Selected executable extents can be admitted before source transformations;
+/// materialized extents are admitted again when preparing native cache inputs.
+pub fn plan_addressable_bank_residency(
+    entries: impl IntoIterator<Item = (ParameterBankKey, u64)>,
+    rows: &[crate::RowResidencyRange],
+    config: eredu_core::residency::OffloadConfig,
+    policy: eredu_core::residency::ResidencyPolicy,
+    initial_tier: eredu_core::residency::MemoryTier,
+) -> Result<eredu_core::residency::OffloadPlan, AddressableBankResidencyError> {
+    use eredu_core::residency::{OffloadPlan, OffloadUnitSpec};
+    let mut keys = std::collections::BTreeSet::new();
+    let mut specs = Vec::new();
+    for (key, bytes) in entries {
+        if !keys.insert(key) {
+            return Err(AddressableBankResidencyError::DuplicateMember { key });
+        }
+        specs.push(OffloadUnitSpec::new(
+            key.unit_id(),
+            bytes,
+            policy,
+            initial_tier,
+        )?);
+    }
+    if keys.is_empty() && rows.is_empty() {
+        return Err(AddressableBankResidencyError::EmptyCatalog);
+    }
+    Ok(OffloadPlan::with_ranges(
+        config,
+        specs,
+        rows.iter().map(|row| row.range().clone()),
+    )?)
+}
+
+/// Consuming, backend-neutral cache inputs with admitted ownership and budgets.
+/// Each member remains an independent lease; compact rows retain their exact sources.
+pub struct PreparedAddressableBankResidency {
+    catalog: std::collections::BTreeMap<ParameterBankKey, u64>,
+    definitions: Vec<OffloadUnit>,
+    rows: Vec<crate::RowResidencyRange>,
+    plan: eredu_core::residency::OffloadPlan,
+}
+
+impl PreparedAddressableBankResidency {
+    /// Consumes final binding declarations and validates the combined residency plan.
+    pub fn new(
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
+        rows: Vec<crate::RowResidencyRange>,
+        config: eredu_core::residency::OffloadConfig,
+        policy: eredu_core::residency::ResidencyPolicy,
+        initial_tier: eredu_core::residency::MemoryTier,
+    ) -> Result<Self, AddressableBankResidencyError> {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let plan = plan_addressable_bank_residency(
+            entries.iter().map(|entry| (entry.key(), entry.bytes())),
+            &rows,
+            config,
+            policy,
+            initial_tier,
+        )?;
+        let mut catalog = std::collections::BTreeMap::new();
+        let mut definitions = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (key, unit, bytes) = entry.into_parts();
+            catalog.insert(key, bytes);
+            definitions.push(unit);
+        }
+        Ok(Self {
+            catalog,
+            definitions,
+            rows,
+            plan,
+        })
+    }
+
+    /// Moves admitted inputs into the backend's existing residency manager.
+    pub fn into_parts(
+        self,
+    ) -> (
+        std::collections::BTreeMap<ParameterBankKey, u64>,
+        Vec<OffloadUnit>,
+        Vec<crate::RowResidencyRange>,
+        eredu_core::residency::OffloadPlan,
+    ) {
+        (self.catalog, self.definitions, self.rows, self.plan)
+    }
+}

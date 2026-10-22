@@ -188,22 +188,15 @@ impl AddressableParameterBank {
         })?;
         // Validate the combined namespace/budget plan before a selected weight
         // transformation can read payloads. Rows retain their own source recipes.
-        let specs = selected
-            .entries
-            .iter()
-            .map(|entry| {
-                OffloadUnitSpec::new(
-                    entry.key().unit_id(),
-                    selected.expected_bytes[&entry.key()],
-                    ResidencyPolicy::Cacheable,
-                    MemoryTier::Disk,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        OffloadPlan::with_ranges(
+        eredu_runtime::plan_addressable_bank_residency(
+            selected
+                .entries
+                .iter()
+                .map(|entry| (entry.key(), selected.expected_bytes[&entry.key()])),
+            &row_ranges,
             options.storage,
-            specs,
-            row_ranges.iter().map(|range| range.range().clone()),
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
         )?;
         if selected.transformations.is_empty() {
             let parameter_members =
@@ -331,49 +324,27 @@ impl AddressableParameterBank {
         materialization: Option<WeightMaterializationReport>,
     ) -> Result<Self, AddressableParameterBankError> {
         options.validate()?;
-        let mut catalog = BTreeMap::new();
-        let mut definitions = Vec::new();
-        let mut specs = Vec::new();
+        let (catalog, definitions, row_ranges, plan) =
+            eredu_runtime::PreparedAddressableBankResidency::new(
+                entries,
+                row_ranges,
+                options.storage,
+                policy,
+                initial_tier,
+            )?
+            .into_parts();
         #[cfg(test)]
         let mut namespace_entry_counts = BTreeMap::new();
         #[cfg(test)]
         let mut namespace_global_spans = BTreeMap::new();
-        for entry in entries {
-            if catalog.insert(entry.key(), entry.bytes()).is_some() {
-                return Err(AddressableParameterBankError::DuplicateEntry {
-                    identity: entry.key(),
-                });
-            }
-            #[cfg(test)]
-            {
-                *namespace_entry_counts
-                    .entry(entry.key().unit())
-                    .or_insert(0) += 1;
-            }
-            #[cfg(test)]
-            {
-                namespace_global_spans
-                    .entry(entry.key().unit())
-                    .and_modify(|span: &mut usize| *span = (*span).max(entry.key().member() + 1))
-                    .or_insert(entry.key().member() + 1);
-            }
-            specs.push(OffloadUnitSpec::new(
-                entry.key().unit_id(),
-                entry.bytes(),
-                policy,
-                initial_tier,
-            )?);
-            let (_, unit, _) = entry.into_parts();
-            definitions.push(unit);
+        #[cfg(test)]
+        for key in catalog.keys() {
+            *namespace_entry_counts.entry(key.unit()).or_insert(0) += 1;
+            namespace_global_spans
+                .entry(key.unit())
+                .and_modify(|span: &mut usize| *span = (*span).max(key.member() + 1))
+                .or_insert(key.member() + 1);
         }
-        if catalog.is_empty() && row_ranges.is_empty() {
-            return Err(AddressableParameterBankError::EmptyCatalog);
-        }
-        let plan = OffloadPlan::with_ranges(
-            options.storage,
-            specs,
-            row_ranges.iter().map(|range| range.range().clone()),
-        )?;
         let manager = ResidencyManager::new_shared_row_ranges(
             store,
             BTreeMap::new(),

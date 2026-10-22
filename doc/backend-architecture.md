@@ -11187,6 +11187,14 @@ dense, shared-scalar E4M3 and GGML block rows; shared scalar FP8 uses its declar
 identity rather than expert block-scale equations. Lookup retains exact host integer IDs,
 chunks native acquisitions and keeps source/residency leases through completion.
 
+`plan_addressable_bank_residency` admits independent member extents and compact row
+namespaces in runtime, rejecting duplicate ownership, empty pools, namespace overlap
+and insufficient budgets before selected transformations read payloads.
+`PreparedAddressableBankResidency` consumes final entries and retained row sources,
+rechecks their actual extents and moves the catalog, bindings, rows and admitted plan
+into the backend residency manager. Native cache initialization and completion remain
+backend responsibilities.
+
 Selected grouped banks and compact row ranges share an `OffloadPlan` and residency
 manager. Resident grouped execution can use a row-only pool. Pool reports count each
 physical pool once, including row-only pools; grouped member statistics exclude table

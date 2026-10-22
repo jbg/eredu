@@ -37,9 +37,10 @@ use crate::{
     backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source,
     backend::runtime::residency::manager::{ResidencyError, ResidencyManager, ResidentTransfer},
 };
+#[cfg(test)]
+use eredu_core::residency::OffloadPlan;
 use eredu_core::residency::{
-    MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyLedgerError,
-    ResidencyPolicy,
+    MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError, ResidencyPolicy,
 };
 
 mod catalog;
@@ -87,9 +88,9 @@ pub enum AddressableParameterBankError {
         #[source]
         source: Box<Error>,
     },
-    /// No entry definitions were supplied.
-    #[error("sparse entry cache requires at least one owned entry")]
-    EmptyCatalog,
+    /// Independent member ownership or combined residency budgets are invalid.
+    #[error(transparent)]
+    Preparation(#[from] eredu_runtime::AddressableBankResidencyError),
     /// A generic acquisition contained no entries.
     #[error("addressable entry demand must not be empty")]
     EmptyDemand,
@@ -103,12 +104,6 @@ pub enum AddressableParameterBankError {
     #[error("addressable entry demand repeats {identity:?}")]
     DuplicateDemand {
         /// Repeated entry.
-        identity: ParameterBankKey,
-    },
-    /// Two catalog entries used the same namespace/global identity.
-    #[error("duplicate sparse entry catalog entry {identity:?}")]
-    DuplicateEntry {
-        /// Duplicated logical identity.
         identity: ParameterBankKey,
     },
     /// No owned entry catalog exists for this namespace.

@@ -24,8 +24,9 @@ pub use agreement::{
 };
 pub use banks::{RoutedBankProviderError, RoutedBankProviders};
 pub use catalog::{
-    AddressableBankCatalog, AddressableBankCatalogError, AddressableBankEntry,
-    AddressableBankEntryError,
+    plan_addressable_bank_residency, AddressableBankResidencyError,
+    PreparedAddressableBankResidency, AddressableBankCatalog, AddressableBankCatalogError,
+    AddressableBankEntry, AddressableBankEntryError,
 };
 pub use quantization::{
     prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,

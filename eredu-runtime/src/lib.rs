@@ -275,8 +275,9 @@ pub use expert::{
 };
 pub use expert::{validate_addressable_bank_selection, AddressableBankSelectionError};
 pub use expert::{
-    AddressableBankCatalog, AddressableBankCatalogError, AddressableBankEntry,
-    AddressableBankEntryError,
+    plan_addressable_bank_residency, AddressableBankResidencyError,
+    PreparedAddressableBankResidency, AddressableBankCatalog, AddressableBankCatalogError,
+    AddressableBankEntry, AddressableBankEntryError,
 };
 pub use expert::{
     prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
