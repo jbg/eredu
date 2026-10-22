@@ -745,12 +745,48 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
     .unwrap();
     assert_eq!(plans.iter().map(|p| p.source_bytes()).sum::<u64>(), 64);
     assert_eq!(plans.iter().map(|p| p.selected_bytes()).sum::<u64>(), 64);
-    for plan in plans {
+    for plan in &plans {
         assert_eq!(
             plan.parameter_targets().get("weight").map(String::as_str),
             Some("weight")
         );
     }
+    let targets = plans
+        .iter()
+        .flat_map(|plan| {
+            plan.parameter_targets()
+                .iter()
+                .map(move |(binding, target)| ((plan.key(), binding.clone()), target.clone()))
+        })
+        .collect();
+    let prepared = eredu_runtime::parameter_operations::prepare_bank_parameter_members(
+        plans.iter().map(|plan| (plan.key(), plan.bindings())),
+        &targets,
+        &source as &dyn CheckpointSource,
+    )
+    .unwrap();
+    let declaration =
+        ParameterMetadata::from_spec(&ParameterSpec::trainable("weight").unwrap(), true);
+    let parameters =
+        eredu_runtime::parameter_operations::prepare_bank_parameter_slots(&[declaration], prepared)
+            .unwrap();
+    assert_eq!(parameters.len(), 1);
+    assert_eq!(
+        parameters[0].slot.materialized,
+        bindings[0]
+            .source_recipe()
+            .infer(&source as &dyn CheckpointSource)
+            .unwrap()
+    );
+    assert_eq!(
+        parameters[0]
+            .members
+            .iter()
+            .map(|member| member.key.member())
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
 }
 

@@ -3456,6 +3456,15 @@ companion precision, and materialization consumes those same values. Backend
 code supplies the native converter without maintaining a second transformation
 description or reselecting precision.
 
+`prepare_bank_parameter_members` joins final physical binding recipes to the
+retained canonical destinations for parameter inspection and editing. It infers
+geometry against the selected post-transformation source, preserves global member
+identities and independent charges, and reports missing destinations or recipe
+failures with the member and local binding. The backend supplies final binding
+slices and source authority, then retains the neutral records alongside its
+native cache. Metadata preparation neither acquires payloads nor grants editing
+authority.
+
 MLX implements the mechanism bundle with native operators, module stores,
 resident and bounded policies, selected state allocation, prompt-cache bytes,
 streams, indexed tensor operations, generic addressable member storage,

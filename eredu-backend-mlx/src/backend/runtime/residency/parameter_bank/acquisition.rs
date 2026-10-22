@@ -2,46 +2,6 @@
 
 use super::*;
 
-fn prepared_parameter_members(
-    entries: &[ParameterBankEntry],
-    targets: &BTreeMap<(ParameterBankKey, String), String>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<
-    Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
-    AddressableParameterBankError,
-> {
-    let result = entries
-        .iter()
-        .flat_map(|entry| {
-            entry
-                .unit
-                .bindings()
-                .iter()
-                .map(move |binding| (entry, binding))
-        })
-        .map(|(entry, binding)| {
-            let parameter = targets
-                .get(&(entry.identity, binding.name().to_owned()))
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "selected bank binding has no logical destination".into(),
-                    )
-                })?;
-            Ok(
-                eredu_runtime::parameter_operations::PreparedBankParameterMember {
-                    key: entry.identity,
-                    binding: binding.name().to_owned(),
-                    parameter: parameter.clone(),
-                    materialized: binding.source_recipe().infer(store)?,
-                },
-            )
-        })
-        .collect::<Result<Vec<_>, Error>>();
-    result.map_err(|source| AddressableParameterBankError::Transformation {
-        source: Box::new(source),
-    })
-}
-
 /// Shared entry catalog, scheduler, residency manager, and telemetry.
 pub struct AddressableParameterBank {
     pub(super) parameter_members:
@@ -297,11 +257,20 @@ impl AddressableParameterBank {
             row_ranges.iter().map(|range| range.range().clone()),
         )?;
         if selected.transformations.is_empty() {
-            let parameter_members = prepared_parameter_members(
-                &selected.entries,
-                &selected.parameter_targets,
-                store.as_ref(),
-            )?;
+            let parameter_members =
+                eredu_runtime::parameter_operations::prepare_bank_parameter_members(
+                    selected
+                        .entries
+                        .iter()
+                        .map(|entry| (entry.identity, entry.unit.bindings())),
+                    &selected.parameter_targets,
+                    store.as_ref(),
+                )
+                .map_err(|source| {
+                    AddressableParameterBankError::Transformation {
+                        source: Box::new(Error::Other(Box::new(source))),
+                    }
+                })?;
             let mut bank = Self::new_shared_with_policy(
                 store,
                 selected.entries,
@@ -339,11 +308,18 @@ impl AddressableParameterBank {
                 });
             }
         }
-        let parameter_members = prepared_parameter_members(
-            &transformed.entries,
-            &selected.parameter_targets,
-            transformed.store.as_ref(),
-        )?;
+        let parameter_members =
+            eredu_runtime::parameter_operations::prepare_bank_parameter_members(
+                transformed
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.identity, entry.unit.bindings())),
+                &selected.parameter_targets,
+                transformed.store.as_ref(),
+            )
+            .map_err(|source| AddressableParameterBankError::Transformation {
+                source: Box::new(Error::Other(Box::new(source))),
+            })?;
         let mut bank = Self::new_shared_with_policy(
             transformed.store,
             transformed.entries,

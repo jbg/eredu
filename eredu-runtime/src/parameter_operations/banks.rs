@@ -19,6 +19,68 @@ pub struct PreparedBankParameterMember {
     pub materialized: RecipeMetadata,
 }
 
+/// Failure joining a final physical binding to its retained logical destination.
+#[derive(Debug, thiserror::Error)]
+pub enum BankParameterPreparationError {
+    /// A selected binding has no canonical destination in the retained plan.
+    #[error("bank member {key:?} binding {binding:?} has no logical destination")]
+    MissingDestination {
+        /// Original global member identity.
+        key: ParameterBankKey,
+        /// Local binding that cannot be attributed.
+        binding: String,
+    },
+    /// Final materialized recipe geometry cannot be inferred from its source.
+    #[error("bank member {key:?} binding {binding:?}: {source}")]
+    Recipe {
+        /// Original global member identity.
+        key: ParameterBankKey,
+        /// Local binding being prepared.
+        binding: String,
+        /// Original recipe or source failure.
+        #[source]
+        source: eredu_checkpoint::recipe::RecipeError,
+    },
+}
+
+/// Joins final source-backed bindings to the exact retained logical destinations.
+///
+/// This runs after any selected storage transformation and preserves entry and
+/// binding order, including independent members reading the same source. It
+/// infers metadata only; parameter slot admission, leases and editing authority
+/// remain separate. No destination is reconstructed from synthetic source names.
+pub fn prepare_bank_parameter_members<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
+    entries: impl IntoIterator<Item = (ParameterBankKey, &'a [crate::WeightBinding])>,
+    targets: &BTreeMap<(ParameterBankKey, String), String>,
+    source: &C,
+) -> Result<Vec<PreparedBankParameterMember>, BankParameterPreparationError> {
+    entries
+        .into_iter()
+        .flat_map(|(key, bindings)| bindings.iter().map(move |binding| (key, binding)))
+        .map(|(key, binding)| {
+            let parameter = targets
+                .get(&(key, binding.name().to_owned()))
+                .ok_or_else(|| BankParameterPreparationError::MissingDestination {
+                    key,
+                    binding: binding.name().to_owned(),
+                })?;
+            let materialized = binding.source_recipe().infer(source).map_err(|source| {
+                BankParameterPreparationError::Recipe {
+                    key,
+                    binding: binding.name().to_owned(),
+                    source,
+                }
+            })?;
+            Ok(PreparedBankParameterMember {
+                key,
+                binding: binding.name().to_owned(),
+                parameter: parameter.clone(),
+                materialized,
+            })
+        })
+        .collect()
+}
+
 /// One complete rank-local parameter and its ordered independent source owners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedBankParameter {
