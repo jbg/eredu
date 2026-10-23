@@ -24,6 +24,63 @@ pub fn derive_partitioned_local_layout(
     )
 }
 
+/// Exact selected parameter placement does not match a tensor communicator.
+#[derive(Debug, thiserror::Error)]
+pub enum TensorParallelLayoutError {
+    /// Communicator size or rank cannot form a tensor-only topology.
+    #[error("component {component:?} has invalid tensor communicator: {source}")]
+    Topology {
+        /// Architecture-owned component identity.
+        component: String,
+        /// Original neutral topology failure.
+        #[source]
+        source: eredu_core::TopologyError,
+    },
+    /// The declaration cannot realize this communicator's placement.
+    #[error("component {component:?} cannot derive tensor placement: {reason}")]
+    Placement {
+        /// Architecture-owned component identity.
+        component: String,
+        /// Exact layout compiler rejection.
+        reason: String,
+    },
+    /// Selected physical parameters belong to another communicator.
+    #[error("component {component:?} parameter layout differs from its tensor communicator")]
+    Mismatch {
+        /// Architecture-owned component identity.
+        component: String,
+    },
+}
+
+/// Validates ordinary tensor placement before acquisition or collective work.
+/// Families retain their additional coupled-dimension and equation constraints.
+pub fn validate_tensor_parallel_layout(
+    component: &str,
+    description: &crate::ArchitectureParameterDescription,
+    selected: &crate::LocalModelLayout,
+    size: usize,
+    rank: usize,
+) -> Result<(), TensorParallelLayoutError> {
+    let topology = eredu_core::ParallelTopology::new(size, 1, 1, 1)
+        .and_then(|topology| eredu_core::ParallelRankTopology::new(topology, rank))
+        .map_err(|source| TensorParallelLayoutError::Topology {
+            component: component.into(),
+            source,
+        })?;
+    let expected = derive_partitioned_local_layout(description, topology).map_err(|reason| {
+        TensorParallelLayoutError::Placement {
+            component: component.into(),
+            reason,
+        }
+    })?;
+    if selected != &expected {
+        return Err(TensorParallelLayoutError::Mismatch {
+            component: component.into(),
+        });
+    }
+    Ok(())
+}
+
 /// Returns an authored layout only for the exact rank whose placement it retains.
 /// Descriptions without a retained layout are lowered from their parameter groups.
 pub fn retained_partition_layout(

@@ -27,6 +27,9 @@ pub const TEXT_PAD_ID: i32 = 12;
 /// Invalid channel geometry, precision or bounded prompt admission.
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
+    /// Selected physical parameter placement differs from the tensor communicator.
+    #[error(transparent)]
+    TensorLayout(#[from] eredu_runtime::TensorParallelLayoutError),
     /// Shared component declaration or invocation is invalid.
     #[error(transparent)]
     Component(#[from] eredu_runtime::ComponentDefinitionError),

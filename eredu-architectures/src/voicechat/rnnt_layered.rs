@@ -1028,22 +1028,13 @@ impl<B: DistributedNeuralBackend> RnntKernel<B> {
             .local
             .range(self.dimensions)
             .balanced_peer_widths(B::parallel_size(parallel), B::parallel_rank(parallel))?;
-        let topology = eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(B::parallel_size(parallel), 1, 1, 1)
-                .map_err(|_| RnntError::InvalidConfiguration("invalid RNNT tensor degree"))?,
+        eredu_runtime::validate_tensor_parallel_layout(
+            "voicechat.rnnt",
+            &selected.description,
+            &selected.layout,
+            B::parallel_size(parallel),
             B::parallel_rank(parallel),
-        )
-        .map_err(|_| RnntError::InvalidConfiguration("invalid RNNT tensor rank"))?;
-        let expected =
-            eredu_runtime::derive_partitioned_local_layout(&selected.description, topology)
-                .map_err(|_| {
-                    RnntError::InvalidConfiguration("RNNT tensor placement cannot be derived")
-                })?;
-        if expected != selected.layout {
-            return Err(RnntError::InvalidConfiguration(
-                "RNNT layout differs from selected communicator",
-            ));
-        }
+        )?;
         Ok(())
     }
 }

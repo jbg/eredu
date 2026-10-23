@@ -785,6 +785,11 @@ selected projection.
 execution graph with logical unit paths, state references, group transport and
 primary/prediction identities. Construction validates addresses, paths, state
 ranges, partition rules and optional group semantics without native allocation.
+Runtime validates tensor-only communicator topology and exact selected physical
+parameter placement through the shared layout compiler. Speech kernels supply their
+declarations and selected layouts, retain coupled width checks, and preserve guarded
+collective failure handling. Layout failures identify the component and retain neutral
+topology errors as sources.
 Architecture-selected local state geometry preserves slot counts, segment identities and
 lifetimes, component roles, dtypes, residency and attention policy. Runtime validates
 these invariants before retaining the selected geometry with the definition.

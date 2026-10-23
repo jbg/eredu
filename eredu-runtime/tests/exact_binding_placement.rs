@@ -1725,6 +1725,18 @@ mod component_preparation {
         )
         .unwrap();
         let layout = derive_partitioned_local_layout(description, topology).unwrap();
+        eredu_runtime::validate_tensor_parallel_layout("axis-contract", description, &layout, 2, 1)
+            .unwrap();
+        assert!(matches!(
+            eredu_runtime::validate_tensor_parallel_layout(
+                "axis-contract",
+                description,
+                &layout,
+                2,
+                0,
+            ),
+            Err(eredu_runtime::TensorParallelLayoutError::Mismatch { .. })
+        ));
         let validate = |layout: &LocalModelLayout, range: std::ops::Range<usize>| {
             validate_parameter_layout(
                 description.groups().iter().map(|owned| owned.group()),

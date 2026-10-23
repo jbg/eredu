@@ -637,20 +637,14 @@ impl<B: DistributedNeuralBackend> MogKernel<B> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
             "parallel MoG execution requires rank-local construction",
         ))?;
-        let topology = eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(B::parallel_size(parallel), 1, 1, 1)
-                .map_err(|_| TtsError::Configuration("invalid MoG tensor degree"))?,
-            B::parallel_rank(parallel),
-        )
-        .map_err(|_| TtsError::Configuration("invalid MoG tensor rank"))?;
         let description = mog_parameter_description(self.dimensions)?;
-        let expected = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(|_| TtsError::Configuration("MoG tensor placement cannot be derived"))?;
-        if selected != &expected {
-            return Err(TtsError::Configuration(
-                "MoG layout differs from its tensor communicator",
-            ));
-        }
+        eredu_runtime::validate_tensor_parallel_layout(
+            "voicechat.tts.mog",
+            &description,
+            selected,
+            B::parallel_size(parallel),
+            B::parallel_rank(parallel),
+        )?;
         Ok(())
     }
     fn forward_unit_guarded(

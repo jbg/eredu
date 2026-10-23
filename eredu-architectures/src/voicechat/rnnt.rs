@@ -80,6 +80,9 @@ impl RnntDimensions {
 /// Portable neural/decoding failures. A failed transition leaves its parent state unchanged.
 #[derive(Debug, thiserror::Error)]
 pub enum RnntError {
+    /// Selected physical parameter placement differs from the tensor communicator.
+    #[error(transparent)]
+    TensorLayout(#[from] eredu_runtime::TensorParallelLayoutError),
     /// Shared component declaration or invocation failed.
     #[error(transparent)]
     Component(#[from] eredu_runtime::ComponentDefinitionError),

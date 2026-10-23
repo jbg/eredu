@@ -17,6 +17,9 @@ use eredu_nn::{
 /// Invalid geometry, draw payload or neural execution.
 #[derive(Debug, thiserror::Error)]
 pub enum TtsError {
+    /// Selected physical parameter placement differs from the tensor communicator.
+    #[error(transparent)]
+    TensorLayout(#[from] eredu_runtime::TensorParallelLayoutError),
     /// Shared component declaration or invocation is invalid.
     #[error(transparent)]
     Component(#[from] eredu_runtime::ComponentDefinitionError),

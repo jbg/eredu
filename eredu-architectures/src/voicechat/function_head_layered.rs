@@ -332,22 +332,14 @@ impl<B: DistributedNeuralBackend> FunctionHeadKernel<B> {
         selected
             .range
             .balanced_peer_widths(B::parallel_size(parallel), B::parallel_rank(parallel))?;
-        let topology = eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(B::parallel_size(parallel), 1, 1, 1)
-                .map_err(|_| ChannelError::Configuration("invalid function-head tensor degree"))?,
-            B::parallel_rank(parallel),
-        )
-        .map_err(|_| ChannelError::Configuration("invalid function-head tensor rank"))?;
         let description = function_head_parameter_description(self.dimensions, &self.format)?;
-        let expected = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(|_| {
-                ChannelError::Configuration("function-head tensor placement cannot be derived")
-            })?;
-        if expected != selected.layout {
-            return Err(ChannelError::Configuration(
-                "function-head layout differs from the selected communicator",
-            ));
-        }
+        eredu_runtime::validate_tensor_parallel_layout(
+            "voicechat.function_head",
+            &description,
+            &selected.layout,
+            B::parallel_size(parallel),
+            B::parallel_rank(parallel),
+        )?;
         Ok(())
     }
     fn validate_parallel_unit(&self, unit: &FunctionHead<B>) -> Result<(), ChannelError> {

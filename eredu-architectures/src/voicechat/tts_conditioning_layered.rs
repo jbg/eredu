@@ -1129,22 +1129,14 @@ impl<B: DistributedNeuralBackend> ConditioningKernel<B> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
             "parallel conditioning requires rank-local construction",
         ))?;
-        let topology = eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(B::parallel_size(parallel), 1, 1, 1)
-                .map_err(|_| TtsError::Configuration("invalid conditioning tensor degree"))?,
+        let description = conditioning_parameter_description(self.dimensions)?;
+        eredu_runtime::validate_tensor_parallel_layout(
+            "voicechat.tts.conditioning",
+            &description,
+            selected,
+            B::parallel_size(parallel),
             B::parallel_rank(parallel),
-        )
-        .map_err(|_| TtsError::Configuration("invalid conditioning tensor rank"))?;
-        let expected = eredu_runtime::derive_partitioned_local_layout(
-            &conditioning_parameter_description(self.dimensions)?,
-            topology,
-        )
-        .map_err(|_| TtsError::Configuration("conditioning placement cannot be derived"))?;
-        if selected != &expected {
-            return Err(TtsError::Configuration(
-                "conditioning layout differs from tensor communicator",
-            ));
-        }
+        )?;
         Ok(())
     }
 }
