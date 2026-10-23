@@ -1015,7 +1015,7 @@ impl LayerwiseModelMetadata {
         self.quantization
     }
 
-    /// Returns the ordered execution-unit count.
+    /// Returns the ordered physical execution-resource count.
     pub const fn layer_count(&self) -> usize {
         self.layer_count
     }

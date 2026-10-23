@@ -97,8 +97,15 @@ where
     let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
         .prepare::<Error>()?;
 
+    let invocations = eredu_runtime::ExecutionUnitAddressMap::new(
+        &layout,
+        (0..layout.len()).map(|ordinal| {
+            let address = layout.address(ordinal).expect("validated physical layout");
+            (address, address)
+        }),
+    )?;
     let mut execution_units =
-        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
+        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &invocations, options);
     for index in 0..unit_count {
         let address = layout
             .address(index)
@@ -154,6 +161,13 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
+    let invocations = eredu_runtime::ExecutionUnitAddressMap::new(
+        &layout,
+        (0..layout.len()).map(|ordinal| {
+            let address = layout.address(ordinal).expect("validated physical layout");
+            (address, address)
+        }),
+    )?;
     prepare_layerwise_policy_with_supplementary_bindings(
         store,
         architecture,
@@ -163,7 +177,7 @@ where
         stream,
         weights_stream,
         ignored,
-        layout,
+        invocations,
         static_bindings,
         unit_bindings,
         Vec::new(),
@@ -226,7 +240,7 @@ pub fn prepare_layerwise_policy_with_supplementary_bindings<A, S, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
-    layout: ExecutionUnitLayout,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
     supplementary: Vec<SupplementaryResidencyUnit>,
@@ -247,7 +261,7 @@ where
         stream,
         weights_stream,
         ignored,
-        layout,
+        invocations,
         static_bindings,
         unit_bindings,
         supplementary,
@@ -266,7 +280,7 @@ pub fn prepare_parameter_unit_policy<U, SM, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
-    layout: ExecutionUnitLayout,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
     supplementary: Vec<SupplementaryResidencyUnit>,
@@ -280,7 +294,7 @@ where
     crate::backend::runtime::checkpoint::bounded_quantization::realize_prepared_source(
         &store, stream,
     )?;
-    let unit_count = layout.len();
+    let unit_count = invocations.storage_layout().len();
     if unit_count == 0 || unit_bindings.len() != unit_count {
         return Err(Error::Parallel(format!(
             "exact MLX binding definitions contain {} units for a layout of {unit_count}",
@@ -293,7 +307,7 @@ where
         .prepare::<Error>()?;
 
     let mut execution_units =
-        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
+        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &invocations, options);
     for bindings in unit_bindings {
         execution_units = execution_units.push(bindings, |bindings| {
             host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
@@ -340,12 +354,13 @@ where
         plan,
         definitions,
         sources,
-        layout,
+        invocations,
         unit_ids,
         static_id,
         static_parameters,
         metadata,
     } = resources;
+    let layout = invocations.storage_layout();
     let dense = options.dense();
     let residency_stream = if dense.is_some() {
         Stream::new_with_device(&stream.get_device()?)
@@ -401,7 +416,7 @@ where
         residency,
         Arc::clone(&store),
         unit_ids,
-        layout,
+        invocations,
         metadata.device_layer_capacity(),
         populator,
         static_leases,

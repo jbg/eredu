@@ -384,7 +384,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
                 stream,
                 weights_stream,
                 |_| false,
-                layout.clone(),
+                addresses.clone(),
                 Vec::new(),
                 bindings,
                 Vec::new(),
@@ -406,12 +406,9 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            MlxSelectedLayerwisePolicy::resident(
-                policy.into_resident_units(units, stream)?,
-                addresses,
-            )?
+            MlxSelectedLayerwisePolicy::resident(policy.into_resident_units(units, stream)?)
         } else {
-            MlxSelectedLayerwisePolicy::bounded(policy, addresses)?
+            MlxSelectedLayerwisePolicy::bounded(policy)
         };
         MlxAssistantParameterPolicy(Some(policy))
     } else {

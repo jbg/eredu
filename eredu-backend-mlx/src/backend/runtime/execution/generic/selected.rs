@@ -31,38 +31,22 @@ impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
 }
 
 impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
-    pub(crate) fn resident(
-        policy: MlxResidentPolicy<U>,
-        addresses: ExecutionUnitAddressMap,
-    ) -> Result<Self, Error> {
-        if addresses.storage_layout() != &policy.layout {
-            return Err(Error::Parallel(
-                "selected mapping differs from the physical policy layout".into(),
-            ));
-        }
-        Ok(Self {
-            addresses,
+    pub(crate) fn resident(policy: MlxResidentPolicy<U>) -> Self {
+        Self {
+            addresses: policy.invocations.clone(),
             identity: Arc::new(()),
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Resident(
                 policy,
             ))),
-        })
+        }
     }
 
-    pub(crate) fn bounded(
-        policy: MlxLayerwisePolicy<U, P>,
-        addresses: ExecutionUnitAddressMap,
-    ) -> Result<Self, Error> {
-        if addresses.storage_layout() != &policy.layout {
-            return Err(Error::Parallel(
-                "selected mapping differs from the physical policy layout".into(),
-            ));
-        }
-        Ok(Self {
-            addresses,
+    pub(crate) fn bounded(policy: MlxLayerwisePolicy<U, P>) -> Self {
+        Self {
+            addresses: policy.invocation_map().clone(),
             identity: Arc::new(()),
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Bounded(policy))),
-        })
+        }
     }
 
     pub(crate) fn trim_parameter_conversions(
@@ -226,7 +210,8 @@ where
             .addresses
             .resolve(ordinal, address)
             .map_err(|error| eredu_runtime::LayerwiseAcquireError::Policy(Error::from(error)))?;
-        let local = local.storage_location();
+        let invocation = local;
+        let local = invocation.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
                 "selected layerwise policy lock was poisoned".into(),
@@ -237,7 +222,7 @@ where
                 policy.inspect_unit(local.ordinal(), local.address(), build, operation, context)
             }
             MlxSelectedLayerwisePolicyInner::Bounded(policy) => {
-                policy.inspect_unit(local.ordinal(), local.address(), build, operation, context)
+                policy.inspect_mapped(&self.addresses, invocation, build, operation, context)
             }
         }
     }

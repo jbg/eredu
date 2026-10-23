@@ -869,7 +869,13 @@ references retain distinct invocation identities. The validated map projects gro
 transfer sequences, distinct resource windows and group completion from invocation
 positions. Bounded native acquisition and completion consume those projections through
 the ordinary policy lifecycle; resident execution loans the selected physical module.
-Raw low-level policies use a retained identity projection through the same lifecycle.
+Cold preparation retains that map with per-owner device payloads and host-transfer
+capacities. Device and streamed-host admission use the largest distinct-resource
+invocation window; resident and host-layerwise totals count physical owners once.
+The same mapped window algorithm supplies both host and device sizing. Native
+materialization consumes the admitted map, and resident and bounded selection adopt it
+directly. Bounded raw and selected execution and inspection use this retained schedule
+through the same lifecycle; adoption cannot replace it after admission.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

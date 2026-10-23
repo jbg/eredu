@@ -30,6 +30,9 @@ pub fn default_allocator_cache_bytes(available_memory_bytes: Option<u64>) -> u64
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum BoundedResidencySizingError {
+    /// Invocation references do not match the selected resource catalog.
+    #[error(transparent)]
+    InvocationMap(#[from] crate::ExecutionUnitAddressMapError),
     /// The authoritative selected materialization contract is invalid.
     #[error(transparent)]
     Materialization(#[from] ReplicatedTextContractError),
@@ -52,45 +55,77 @@ pub enum BoundedResidencySizingError {
     },
 }
 
-/// Immutable device-parameter payload for the selected unit policy.
-/// Resident execution retains all groups simultaneously; bounded execution uses
-/// the largest adjacent window within one semantic group. This excludes static
-/// roles, conversions, loading scratch, activations and mutable state.
+/// Immutable device-parameter payload for the retained invocation schedule.
+/// Resident execution counts each selected physical owner once; bounded execution
+/// counts distinct owners in each group-local invocation window. This excludes
+/// static roles, conversions, loading scratch, activations and mutable state.
 pub fn execution_unit_parameter_window_bytes(
-    layout: &crate::ExecutionUnitLayout,
+    invocations: &crate::ExecutionUnitAddressMap,
     unit_bytes: &[u64],
     residency: LayerWeightResidency,
 ) -> Result<u64, BoundedResidencySizingError> {
-    use BoundedResidencySizingError::ArithmeticOverflow;
-    if layout.len() != unit_bytes.len() {
+    if residency.is_fully_resident() {
+        validate_storage_extents(invocations, unit_bytes)?;
+        return unit_bytes.iter().try_fold(0u64, |total, bytes| {
+            total
+                .checked_add(*bytes)
+                .ok_or(BoundedResidencySizingError::ArithmeticOverflow(
+                    "resident parameter bytes",
+                ))
+        });
+    }
+    execution_unit_window_bytes(
+        invocations,
+        unit_bytes,
+        residency.device_depth(invocations.storage_layout().len()),
+    )
+}
+
+fn validate_storage_extents(
+    invocations: &crate::ExecutionUnitAddressMap,
+    unit_bytes: &[u64],
+) -> Result<(), BoundedResidencySizingError> {
+    if invocations.storage_layout().len() != unit_bytes.len() {
         return Err(BoundedResidencySizingError::InvalidUnitCount {
-            expected: layout.len(),
+            expected: invocations.storage_layout().len(),
             actual: unit_bytes.len(),
         });
     }
-    let sum = |values: &[u64]| {
-        values.iter().try_fold(0u64, |total, bytes| {
-            total
-                .checked_add(*bytes)
-                .ok_or(ArithmeticOverflow("execution-unit parameter bytes"))
-        })
-    };
-    if residency.is_fully_resident() {
-        return sum(unit_bytes);
-    }
-    let depth = residency.device_depth(layout.len());
+    Ok(())
+}
+
+/// Largest distinct physical payload in a bounded group-local invocation window.
+pub(crate) fn execution_unit_window_bytes(
+    invocations: &crate::ExecutionUnitAddressMap,
+    unit_bytes: &[u64],
+    depth: usize,
+) -> Result<u64, BoundedResidencySizingError> {
+    validate_storage_extents(invocations, unit_bytes)?;
     if depth == 0 {
         return Ok(0);
     }
     let mut largest = 0;
-    for group in 0..layout.group_count() {
-        let values = &unit_bytes[layout
-            .group_range(group)
-            .expect("validated execution layout")];
-        if !values.is_empty() {
-            for window in values.windows(depth.min(values.len())) {
-                largest = largest.max(sum(window)?);
+    for group in 0..invocations.storage_layout().group_count() {
+        let sequence = invocations
+            .group_storage_ordinals(group)
+            .expect("validated invocation group");
+        let mut counts = vec![0usize; unit_bytes.len()];
+        let mut total = 0u64;
+        for (position, &storage) in sequence.iter().enumerate() {
+            if position >= depth {
+                let old = sequence[position - depth];
+                counts[old] -= 1;
+                if counts[old] == 0 {
+                    total -= unit_bytes[old];
+                }
             }
+            if counts[storage] == 0 {
+                total = total.checked_add(unit_bytes[storage]).ok_or(
+                    BoundedResidencySizingError::ArithmeticOverflow("execution resource window"),
+                )?;
+            }
+            counts[storage] += 1;
+            largest = largest.max(total);
         }
     }
     Ok(largest)
@@ -817,37 +852,6 @@ mod tests {
             crate::DenseDiskStreamLoadOptions::new(1024, 2048, 5, 2).unwrap(),
         );
         assert_eq!(size(&parameters, streamed, &excluded).unwrap().depth, 2);
-    }
-
-    #[test]
-    fn selected_unit_payload_counts_all_resident_groups_and_group_local_windows() {
-        let graph = crate::ExecutionGraph::chain(["context", "decoder", "head"]).unwrap();
-        let layout = crate::ExecutionUnitLayout::new(&graph, [1, 3, 1]).unwrap();
-        let bytes = [5, 2, 11, 7, 17];
-        assert_eq!(
-            execution_unit_parameter_window_bytes(
-                &layout,
-                &bytes,
-                LayerWeightResidency::FullyResident
-            )
-            .unwrap(),
-            42
-        );
-        assert_eq!(
-            execution_unit_parameter_window_bytes(&layout, &bytes, host(1)).unwrap(),
-            17
-        );
-        assert_eq!(
-            execution_unit_parameter_window_bytes(&layout, &bytes, host(2)).unwrap(),
-            18
-        );
-        assert!(execution_unit_parameter_window_bytes(&layout, &bytes[..4], host(1)).is_err());
-        assert!(execution_unit_parameter_window_bytes(
-            &layout,
-            &[u64::MAX, 1, 0, 0, 0],
-            LayerWeightResidency::FullyResident
-        )
-        .is_err());
     }
 
     #[test]

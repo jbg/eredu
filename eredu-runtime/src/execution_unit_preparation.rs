@@ -2,19 +2,17 @@
 
 use std::collections::BTreeSet;
 
-use eredu_core::residency::{
-    MemoryTier, OffloadError, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
-};
+use eredu_core::residency::{MemoryTier, OffloadError, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy};
 
 use crate::{
-    physical_binding_bytes, ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency,
-    OffloadUnit, ResidencyDeclarationError, WeightBinding,
+    physical_binding_bytes, ExecutionUnitAddress, LayerWeightResidency, OffloadUnit,
+    ResidencyDeclarationError, WeightBinding,
 };
 
 /// Invalid execution-unit resource count or aggregate capacity.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionUnitPreparationError {
-    /// Prepared resources do not match the selected invocation count.
+    /// Prepared resources do not match the selected physical owner count.
     #[error("prepared {actual} execution units for a layout of {expected}")]
     UnitCount {
         /// Selected logical invocation count.
@@ -35,16 +33,18 @@ pub enum ExecutionUnitPreparationError {
 /// Exact resource declarations and capacity facts for selected execution units.
 /// Static and supplementary resources retain their own residency boundaries.
 pub struct PreparedExecutionUnitResources {
-    layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     residency: LayerWeightResidency,
-    /// Independently materialized units in selected invocation order.
+    /// Independently materialized units in physical catalog order.
     pub definitions: Vec<OffloadUnit>,
     /// Initial residency policy for each declared unit.
     pub specs: Vec<OffloadUnitSpec>,
-    /// Stable residency identities in selected invocation order.
+    /// Stable residency identities in physical catalog order.
     pub unit_ids: Vec<OffloadUnitId>,
-    /// Physical device payloads, excluding aliases, in selected invocation order.
+    /// Physical device payloads, excluding aliases, in physical catalog order.
     pub unit_bytes: Vec<u64>,
+    /// Backend host-transfer allocation capacity for each physical owner.
+    pub host_bytes: Vec<u64>,
     /// Exact physical source inputs consumed by these units.
     pub source_keys: BTreeSet<String>,
     /// Sum of physical unit parameter payloads.
@@ -59,29 +59,31 @@ pub struct PreparedExecutionUnitResources {
 /// No checkpoint payload, backend tensor, stream or completion is required.
 pub struct ExecutionUnitResourcePreparation<'a> {
     namespace: &'a str,
-    layout: &'a ExecutionUnitLayout,
+    invocations: &'a crate::ExecutionUnitAddressMap,
     residency: LayerWeightResidency,
     resources: PreparedExecutionUnitResources,
 }
 
 impl<'a> ExecutionUnitResourcePreparation<'a> {
-    /// Starts admission for one exact selected invocation layout.
+    /// Starts admission for exact invocation references and their physical owners.
     pub fn new(
         namespace: &'a str,
-        layout: &'a ExecutionUnitLayout,
+        invocations: &'a crate::ExecutionUnitAddressMap,
         residency: LayerWeightResidency,
     ) -> Self {
+        let layout = invocations.storage_layout();
         Self {
             namespace,
-            layout,
+            invocations,
             residency,
             resources: PreparedExecutionUnitResources {
-                layout: layout.clone(),
+                invocations: invocations.clone(),
                 residency,
                 definitions: Vec::new(),
                 specs: Vec::new(),
                 unit_ids: Vec::with_capacity(layout.len()),
                 unit_bytes: Vec::with_capacity(layout.len()),
+                host_bytes: Vec::with_capacity(layout.len()),
                 source_keys: BTreeSet::new(),
                 parameter_bytes: 0,
                 total_host_bytes: 0,
@@ -103,13 +105,12 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
             + From<OffloadError>,
     {
         let ordinal = self.resources.unit_ids.len();
-        let address =
-            self.layout
-                .address(ordinal)
-                .ok_or(ExecutionUnitPreparationError::UnitCount {
-                    expected: self.layout.len(),
-                    actual: ordinal + 1,
-                })?;
+        let address = self.invocations.storage_layout().address(ordinal).ok_or(
+            ExecutionUnitPreparationError::UnitCount {
+                expected: self.invocations.storage_layout().len(),
+                actual: ordinal + 1,
+            },
+        )?;
         let bytes = physical_binding_bytes(&bindings)?;
         self.resources.parameter_bytes = self.resources.parameter_bytes.checked_add(bytes).ok_or(
             ExecutionUnitPreparationError::ArithmeticOverflow {
@@ -133,7 +134,8 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
                 .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
         );
         let group = self
-            .layout
+            .invocations
+            .storage_layout()
             .group_id(address.group())
             .expect("validated execution group");
         let id = OffloadUnitId::new(format!(
@@ -167,14 +169,15 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
         )?);
         self.resources.unit_ids.push(id);
         self.resources.unit_bytes.push(bytes);
+        self.resources.host_bytes.push(host_bytes);
         Ok(self)
     }
 
-    /// Completes admission only when every selected invocation has resources.
+    /// Completes admission only when every selected physical owner has bindings.
     pub fn finish(self) -> Result<PreparedExecutionUnitResources, ExecutionUnitPreparationError> {
-        if self.resources.unit_ids.len() != self.layout.len() {
+        if self.resources.unit_ids.len() != self.invocations.storage_layout().len() {
             return Err(ExecutionUnitPreparationError::UnitCount {
-                expected: self.layout.len(),
+                expected: self.invocations.storage_layout().len(),
                 actual: self.resources.unit_ids.len(),
             });
         }
@@ -197,24 +200,37 @@ pub struct ExecutionUnitResourceRequirements {
 /// Combines exact unit payloads with backend host-capacity facts and auxiliary lifetimes.
 /// Sequential phases share bounded windows; resident resources coexist.
 pub fn execution_unit_resource_requirements(
-    layout: &ExecutionUnitLayout,
+    invocations: &crate::ExecutionUnitAddressMap,
     unit_bytes: &[u64],
-    total_host_bytes: u64,
-    maximum_host_bytes: u64,
+    host_bytes: &[u64],
     residency: LayerWeightResidency,
     auxiliary: crate::AuxiliaryWeightRequirements,
 ) -> Result<ExecutionUnitResourceRequirements, crate::BoundedResidencySizingError> {
     use crate::BoundedResidencySizingError::ArithmeticOverflow;
     let device_window_bytes =
-        crate::execution_unit_parameter_window_bytes(layout, unit_bytes, residency)?;
+        crate::execution_unit_parameter_window_bytes(invocations, unit_bytes, residency)?;
     let dense = residency.dense();
+    if host_bytes.len() != invocations.storage_layout().len() {
+        return Err(crate::BoundedResidencySizingError::InvalidUnitCount {
+            expected: invocations.storage_layout().len(),
+            actual: host_bytes.len(),
+        });
+    }
     let host = match dense {
-        Some(options) if options.host_budget_bytes() > 0 => maximum_host_bytes
-            .checked_mul(options.host_lookahead() as u64)
-            .ok_or(ArithmeticOverflow("host execution window"))?,
+        Some(options) if options.host_budget_bytes() > 0 => {
+            crate::automatic_support::execution_unit_window_bytes(
+                invocations,
+                host_bytes,
+                options.host_lookahead(),
+            )?
+        }
         Some(_) => 0,
         None if residency.is_fully_resident() => 0,
-        None => total_host_bytes,
+        None => host_bytes.iter().try_fold(0u64, |total, bytes| {
+            total
+                .checked_add(*bytes)
+                .ok_or(ArithmeticOverflow("host execution resources"))
+        })?,
     };
     let auxiliary_host = auxiliary
         .host_bytes(residency)
@@ -295,8 +311,8 @@ pub struct ParameterResourcePreparation {
 pub struct PreparedParameterResources {
     /// Retained residency mechanism selection used to admit every resource.
     pub residency: LayerWeightResidency,
-    /// Exact selected invocation layout retained from ordinary admission.
-    pub layout: ExecutionUnitLayout,
+    /// Exact invocation references and physical layout used for admission.
+    pub invocations: crate::ExecutionUnitAddressMap,
     /// Validated initial resource policies and capacity limits.
     pub plan: eredu_core::residency::OffloadPlan,
     /// Independent physical definitions, including pinned and auxiliary owners.
@@ -304,7 +320,7 @@ pub struct PreparedParameterResources {
     /// Restricted sources retained for auxiliary physical owners.
     pub sources:
         std::collections::BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
-    /// Ordinary physical resource identities in selected invocation order.
+    /// Ordinary physical resource identities in physical catalog order.
     pub unit_ids: Vec<OffloadUnitId>,
     /// Pinned resource identity, absent for an empty pinned module.
     pub static_id: Option<OffloadUnitId>,
@@ -362,14 +378,13 @@ impl ParameterResourcePreparation {
     pub fn finish(
         mut self,
     ) -> Result<PreparedParameterResources, ParameterResourcePreparationError> {
-        let layout = &self.units.layout;
+        let layout = self.units.invocations.storage_layout();
         let residency = self.units.residency;
         let config = residency.offload()?;
         let requirements = execution_unit_resource_requirements(
-            layout,
+            &self.units.invocations,
             &self.units.unit_bytes,
-            self.units.total_host_bytes,
-            self.units.maximum_host_bytes,
+            &self.units.host_bytes,
             residency,
             self.auxiliary,
         )?;
@@ -420,7 +435,7 @@ impl ParameterResourcePreparation {
         );
         Ok(PreparedParameterResources {
             residency,
-            layout: self.units.layout,
+            invocations: self.units.invocations,
             plan,
             definitions: self.units.definitions,
             sources: self.sources,

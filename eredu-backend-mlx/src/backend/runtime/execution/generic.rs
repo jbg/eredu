@@ -121,7 +121,7 @@ pub struct MlxLayerwisePolicy<U: 'static, P = ()> {
     store: SharedCheckpointSource,
     unit_ids: Vec<OffloadUnitId>,
     layout: ExecutionUnitLayout,
-    identity_addresses: eredu_runtime::ExecutionUnitAddressMap,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     window_depth: usize,
     pinned_units: BTreeSet<OffloadUnitId>,
     populator: P,
@@ -255,12 +255,16 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
     pub(crate) fn residency_manager(&self) -> &ResidencyManager {
         &self.residency
     }
+    /// Invocation references retained by cold resource admission.
+    pub fn invocation_map(&self) -> &eredu_runtime::ExecutionUnitAddressMap {
+        &self.invocations
+    }
     /// Creates a bounded policy over validated ordered residency units.
     pub fn new(
         residency: ResidencyManager,
         store: SharedCheckpointSource,
         unit_ids: Vec<OffloadUnitId>,
-        layout: ExecutionUnitLayout,
+        invocations: eredu_runtime::ExecutionUnitAddressMap,
         window_depth: usize,
         populator: P,
         static_leases: Vec<ResidentUnitLease>,
@@ -268,6 +272,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         sample_mlx_memory: bool,
         sample_process_memory: bool,
     ) -> Result<Self, Error> {
+        let layout = invocations.storage_layout();
         if unit_ids.len() != layout.len() {
             return Err(Error::Parallel(
                 "residency units differ from the selected canonical execution layout".into(),
@@ -283,20 +288,13 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
                 "generic MLX layerwise policy window depth must be nonzero".into(),
             ));
         }
-        let identity_addresses = eredu_runtime::ExecutionUnitAddressMap::new(
-            &layout,
-            (0..layout.len()).map(|ordinal| {
-                let address = layout.address(ordinal).expect("validated physical layout");
-                (address, address)
-            }),
-        )?;
         let pinned_units = residency.pinned_unit_ids(&unit_ids)?;
         Ok(Self {
             residency,
             store,
             unit_ids,
             layout: layout.clone(),
-            identity_addresses,
+            invocations: invocations.clone(),
             window_depth,
             pinned_units,
             populator,
@@ -499,6 +497,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         }
         self.residency.enable_resident_parameter_conversions()?;
         Ok(MlxResidentPolicy {
+            invocations: self.invocations,
             units,
             residency: self.residency.clone(),
             store: Arc::clone(&self.store),

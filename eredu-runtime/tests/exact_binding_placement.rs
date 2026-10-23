@@ -2283,6 +2283,136 @@ mod component_preparation {
         )
         .unwrap();
     }
+    fn assert_mapped_resource_preparation() {
+        use eredu_core::residency::OffloadConfig;
+        use eredu_runtime::{
+            DenseDiskStreamLoadOptions, ExecutionUnitResourcePreparation, LayerWeightResidency,
+            LayerwiseLoadOptions, ParameterResourcePreparation, ParameterResourcePreparationError,
+            StaticUnitBindings, WeightBinding,
+        };
+        type Failure = Box<dyn std::error::Error>;
+        let graph = ExecutionGraph::chain(["units", "readout"]).unwrap();
+        let storage = ExecutionUnitLayout::new(&graph, [3, 1]).unwrap();
+        let logical = ExecutionUnitLayout::new(&graph, [8, 4]).unwrap();
+        let invocations = eredu_runtime::ExecutionUnitAddressMap::new(
+            &storage,
+            (3..8)
+                .chain([11])
+                .map(|ordinal| logical.address(ordinal).unwrap())
+                .zip([0, 0, 2, 1, 2, 3].map(|ordinal| storage.address(ordinal).unwrap())),
+        )
+        .unwrap();
+        let source = MemoryWeightStore::from_safetensors((0..4).map(|index| {
+            (
+                format!("physical.{index}"),
+                safetensors::Dtype::F32,
+                if index == 3 { vec![10] } else { vec![4, 2] },
+                vec![0; if index == 3 { 40 } else { 32 }],
+            )
+        }))
+        .unwrap();
+        let assemble = |mode| -> Result<eredu_runtime::PreparedParameterResources, Failure> {
+            let mut units = ExecutionUnitResourcePreparation::new("mapped", &invocations, mode);
+            for (index, bytes, selection) in [
+                (0, 32, TensorSelection::Full),
+                (
+                    1,
+                    8,
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 0,
+                        end: 1,
+                    },
+                ),
+                (
+                    2,
+                    16,
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 0,
+                        end: 2,
+                    },
+                ),
+                (3, 40, TensorSelection::Full),
+            ] {
+                let binding = WeightBinding::new(
+                    format!("mapped.weight.{index}"),
+                    format!("physical.{index}"),
+                    selection,
+                    bytes,
+                )?;
+                units = units.push(vec![binding], |_| Ok::<_, Failure>(bytes * 2))?;
+            }
+            let pinned = StaticUnitBindings::new("empty", vec![])?.prepare::<Failure>()?;
+            Ok(ParameterResourcePreparation::new(pinned, units.finish()?).finish()?)
+        };
+        let host = |device, host| {
+            LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(Some(device), Some(host), 2).unwrap(),
+            ))
+        };
+        let stream = |device, host| {
+            LayerWeightResidency::DenseDiskStream(
+                DenseDiskStreamLoadOptions::new(
+                    device,
+                    host,
+                    if host == 0 { 0 } else { 2 },
+                    if host == 0 { 0 } else { 1 },
+                )
+                .unwrap(),
+            )
+        };
+        for (mode, window) in [
+            (LayerWeightResidency::FullyResident, 96),
+            (host(48, 192), 48),
+            (stream(48, 96), 48),
+            (stream(48, 0), 48),
+        ] {
+            let resources = assemble(mode).unwrap();
+            assert_eq!(resources.invocations, invocations);
+            assert_eq!(resources.metadata.maximum_device_layer_bytes(), window);
+            assert_eq!(resources.metadata.layer_parameter_bytes(), 96);
+            eredu_runtime::ResidencyController::new(&source, resources.plan, resources.definitions)
+                .unwrap();
+        }
+        for (mode, host_failure) in [(stream(47, 96), false), (stream(48, 95), true)] {
+            let error = assemble(mode).err().unwrap();
+            match error
+                .downcast_ref::<ParameterResourcePreparationError>()
+                .unwrap()
+            {
+                ParameterResourcePreparationError::HostBudget {
+                    required: 96,
+                    budget: 95,
+                } if host_failure => {}
+                ParameterResourcePreparationError::DeviceBudget {
+                    window_bytes: 48,
+                    required: 48,
+                    budget: 47,
+                    ..
+                } if !host_failure => {}
+                other => panic!("unexpected mapped capacity rejection: {other}"),
+            }
+        }
+        assert_eq!(
+            eredu_runtime::execution_unit_parameter_window_bytes(
+                &invocations,
+                &[u64::MAX, 1, 0, 0],
+                host(48, 192)
+            )
+            .unwrap(),
+            u64::MAX
+        );
+        assert!(matches!(
+            eredu_runtime::execution_unit_parameter_window_bytes(
+                &invocations,
+                &[u64::MAX, 1, 0, 0],
+                LayerWeightResidency::FullyResident
+            ),
+            Err(eredu_runtime::BoundedResidencySizingError::ArithmeticOverflow(_))
+        ));
+    }
+
     #[test]
     fn execution_unit_admission_keeps_sparse_addresses_and_independent_capacity() {
         use eredu_core::residency::MemoryTier;
@@ -2296,6 +2426,14 @@ mod component_preparation {
             .select_units([0, 2].map(|i| description(&[0, 1, 2]).unit_layout().address(i).unwrap()))
             .unwrap();
         let layout = selected.unit_layout();
+        let admission_map = eredu_runtime::ExecutionUnitAddressMap::new(
+            layout,
+            (0..layout.len()).map(|ordinal| {
+                let address = layout.address(ordinal).unwrap();
+                (address, address)
+            }),
+        )
+        .unwrap();
         let options =
             LayerWeightResidency::LayerwiseHost(eredu_runtime::LayerwiseLoadOptions::new(
                 eredu_core::residency::OffloadConfig::new(Some(256), Some(512), 1).unwrap(),
@@ -2304,13 +2442,13 @@ mod component_preparation {
         let owner = bindings[0][0].name().to_owned();
         bindings[0].push(WeightBinding::alias("alias", owner, 32).unwrap());
         assert!(matches!(
-            ExecutionUnitResourcePreparation::new("model", layout, options).finish(),
+            ExecutionUnitResourcePreparation::new("model", &admission_map, options).finish(),
             Err(ExecutionUnitPreparationError::UnitCount {
                 expected: 2,
                 actual: 0
             })
         ));
-        let resources = ExecutionUnitResourcePreparation::new("model", layout, options)
+        let resources = ExecutionUnitResourcePreparation::new("model", &admission_map, options)
             .push(bindings[0].clone(), |_| Ok::<_, Failure>(64))
             .unwrap()
             .push(bindings[1].clone(), |_| Ok::<_, Failure>(128))
@@ -2453,7 +2591,7 @@ mod component_preparation {
             .iter()
             .all(|report| report.device_pins() == 0));
         let assemble = |mode| -> Result<eredu_runtime::PreparedParameterResources, Failure> {
-            let units = ExecutionUnitResourcePreparation::new("model", layout, mode)
+            let units = ExecutionUnitResourcePreparation::new("model", &admission_map, mode)
                 .push(bindings[0].clone(), |_| Ok::<_, Failure>(64))?
                 .push(bindings[1].clone(), |_| Ok::<_, Failure>(128))?
                 .finish()?;
@@ -2515,7 +2653,7 @@ mod component_preparation {
             (direct, 64),
         ] {
             let prepared = assemble(mode).unwrap();
-            assert_eq!(prepared.layout, *layout);
+            assert_eq!(prepared.invocations, admission_map);
             assert_eq!(prepared.metadata.maximum_device_layer_bytes(), window);
             assert_eq!(prepared.metadata.static_device_bytes(), 32);
             eredu_runtime::ResidencyController::new_with_catalogs(
@@ -2553,7 +2691,8 @@ mod component_preparation {
                 other => panic!("unexpected capacity rejection: {other}"),
             }
         }
-        let overflow = ExecutionUnitResourcePreparation::new("model", layout, options)
+        assert_mapped_resource_preparation();
+        let overflow = ExecutionUnitResourcePreparation::new("model", &admission_map, options)
             .push(bindings[0].clone(), |_| Ok::<_, Failure>(u64::MAX))
             .unwrap()
             .push(bindings[1].clone(), |_| Ok::<_, Failure>(1))
@@ -2563,7 +2702,7 @@ mod component_preparation {
             matches!(overflow.downcast_ref::<ExecutionUnitPreparationError>(),
             Some(ExecutionUnitPreparationError::ArithmeticOverflow { address, .. }) if address.index() == 2)
         );
-        let failure = ExecutionUnitResourcePreparation::new("model", layout, options)
+        let failure = ExecutionUnitResourcePreparation::new("model", &admission_map, options)
             .push(bindings[0].clone(), |_| {
                 Err::<u64, Failure>(std::io::Error::other("host capacity unavailable").into())
             })

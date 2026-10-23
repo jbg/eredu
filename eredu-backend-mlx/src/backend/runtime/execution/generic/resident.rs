@@ -9,6 +9,7 @@ pub struct MlxResidentPolicy<U> {
     pub(super) store: SharedCheckpointSource,
     pub(super) unit_ids: Vec<OffloadUnitId>,
     pub(super) layout: ExecutionUnitLayout,
+    pub(super) invocations: eredu_runtime::ExecutionUnitAddressMap,
     pub(super) window_depth: usize,
     pub(super) _static_leases: OrdinaryRetirement<Vec<ResidentUnitLease>>,
     pub(super) _transfer: ResidentTransfer,

@@ -44,62 +44,11 @@ where
         F: FnOnce(&Stream) -> Result<U, E>,
         V: FnOnce(&mut U) -> Result<(), Self::Error>,
     {
-        crate::backend::submission_recovery::reap();
-        crate::backend::ordinary_retirement::reclaim_all();
-        if self.layout.address(ordinal) != Some(address) {
-            return Err(LayerwiseAcquireError::Policy(Error::Parallel(
-                "parameter unit address differs from the selected layout".into(),
-            )));
-        }
-        self.drain().map_err(LayerwiseAcquireError::Policy)?;
-        if self.dense.as_ref().is_some_and(|dense| {
-            dense.forward.is_some() || dense.windows.iter().any(Option::is_some)
-        }) {
-            return Err(LayerwiseAcquireError::Policy(Error::Parallel(
-                "parameter inspection requires an idle streaming policy".into(),
-            )));
-        }
-        let window = self
-            .identity_addresses
-            .storage_window(ordinal, self.window_depth)
-            .expect("validated inspection address");
-        self.trim_device_window(&window)
-            .map_err(LayerwiseAcquireError::Policy)?;
-        let unit = MlxModule::new(build(stream).map_err(LayerwiseAcquireError::Architecture)?);
-        let transfer = self
-            .residency
-            .acquire_many_with_transfer(&[(self.unit_ids[ordinal].clone(), 1)], MemoryTier::Device)
+        let mapping = self.invocations.clone();
+        let invocation = mapping
+            .resolve(ordinal, address)
             .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
-        transfer
-            .order_after(stream)
-            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
-        let mut lease = MlxUnitLease::new(
-            unit,
-            MlxUnitTransfer::Ordinary {
-                _transfer: transfer,
-            },
-        )
-        .map_err(LayerwiseAcquireError::Policy)?;
-        let (unit, transfer) = lease.population_parts();
-        self.populator
-            .populate(unit, transfer)
-            .map_err(LayerwiseAcquireError::Policy)?;
-        operation(&mut lease).map_err(LayerwiseAcquireError::Policy)?;
-        // The operation evaluates every result it exports. Seal an event and the
-        // enclosing scope as well, so errors and side submissions retain the unit.
-        let marker = safemlx::ops::zeros_dtype(&[1], safemlx::Dtype::Float32, stream)
-            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
-        let event = async_eval_with_event([&marker])
-            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
-        lease
-            .submitted(event)
-            .map_err(LayerwiseAcquireError::Policy)?;
-        lease.finish().map_err(LayerwiseAcquireError::Policy)?;
-        // A transaction can inspect another unit before the outer session scope
-        // ends. Release completed transfer leases at this explicit host boundary
-        // so the next unit can evict this one within the selected window.
-        crate::backend::ordinary_retirement::reclaim_all();
-        Ok(true)
+        self.inspect_mapped(&mapping, invocation, build, operation, stream)
     }
 
     fn begin(&mut self, initial: &MlxTensor, _stream: &Stream) -> Result<(), Self::Error> {
@@ -160,7 +109,7 @@ where
     where
         BF: FnOnce(&Stream) -> Result<U, E>,
     {
-        let mapping = self.identity_addresses.clone();
+        let mapping = self.invocations.clone();
         let invocation = mapping
             .resolve(index, address)
             .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
@@ -182,7 +131,7 @@ where
         StateValues: Iterator<Item = &'a MlxTensor>,
         ContextValues: Iterator<Item = &'a MlxTensor>,
     {
-        let mapping = self.identity_addresses.clone();
+        let mapping = self.invocations.clone();
         let invocation = mapping.resolve(index, address)?;
         self.complete_mapped(
             &mapping,
@@ -223,6 +172,71 @@ where
     U: Parameterized<MlxTensor> + 'static,
     P: MlxUnitPopulator<U>,
 {
+    pub(crate) fn inspect_mapped<E, F, V>(
+        &mut self,
+        mapping: &eredu_runtime::ExecutionUnitAddressMap,
+        invocation: eredu_runtime::ExecutionUnitLeaseAddress,
+        build: F,
+        operation: V,
+        stream: &Stream,
+    ) -> Result<bool, LayerwiseAcquireError<E, Error>>
+    where
+        F: FnOnce(&Stream) -> Result<U, E>,
+        V: FnOnce(&mut U) -> Result<(), Error>,
+    {
+        let ordinal = invocation.storage_location().ordinal();
+        crate::backend::submission_recovery::reap();
+        crate::backend::ordinary_retirement::reclaim_all();
+        self.drain().map_err(LayerwiseAcquireError::Policy)?;
+        if self.dense.as_ref().is_some_and(|dense| {
+            dense.forward.is_some() || dense.windows.iter().any(Option::is_some)
+        }) {
+            return Err(LayerwiseAcquireError::Policy(Error::Parallel(
+                "parameter inspection requires an idle streaming policy".into(),
+            )));
+        }
+        let window = mapping
+            .storage_window(invocation.invocation_ordinal(), self.window_depth)
+            .expect("validated invocation");
+        self.trim_device_window(&window)
+            .map_err(LayerwiseAcquireError::Policy)?;
+        let unit = MlxModule::new(build(stream).map_err(LayerwiseAcquireError::Architecture)?);
+        let transfer = self
+            .residency
+            .acquire_many_with_transfer(&[(self.unit_ids[ordinal].clone(), 1)], MemoryTier::Device)
+            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
+        transfer
+            .order_after(stream)
+            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
+        let mut lease = MlxUnitLease::new(
+            unit,
+            MlxUnitTransfer::Ordinary {
+                _transfer: transfer,
+            },
+        )
+        .map_err(LayerwiseAcquireError::Policy)?;
+        let (unit, transfer) = lease.population_parts();
+        self.populator
+            .populate(unit, transfer)
+            .map_err(LayerwiseAcquireError::Policy)?;
+        operation(&mut lease).map_err(LayerwiseAcquireError::Policy)?;
+        // The operation evaluates every result it exports. Seal an event and the
+        // enclosing scope as well, so errors and side submissions retain the unit.
+        let marker = safemlx::ops::zeros_dtype(&[1], safemlx::Dtype::Float32, stream)
+            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
+        let event = async_eval_with_event([&marker])
+            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
+        lease
+            .submitted(event)
+            .map_err(LayerwiseAcquireError::Policy)?;
+        lease.finish().map_err(LayerwiseAcquireError::Policy)?;
+        // A transaction can inspect another unit before the outer session scope
+        // ends. Release completed transfer leases at this explicit host boundary
+        // so the next unit can evict this one within the selected window.
+        crate::backend::ordinary_retirement::reclaim_all();
+        Ok(true)
+    }
+
     pub(crate) fn acquire_mapped<E, BF>(
         &mut self,
         mapping: &eredu_runtime::ExecutionUnitAddressMap,

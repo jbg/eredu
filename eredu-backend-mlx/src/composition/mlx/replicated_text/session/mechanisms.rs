@@ -337,13 +337,7 @@ where
         &mut self,
         architecture: &mut A,
         selected: &SelectedReplicatedTextRealization,
-    ) -> Result<
-        (
-            MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
-            eredu_runtime::ExecutionUnitAddressMap,
-        ),
-        Error,
-    >
+    ) -> Result<MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>, Error>
     where
         A::Unit: 'static,
     {
@@ -411,7 +405,7 @@ where
             &self.stream,
             &self.weights_stream,
             move |key| ignored_sources.contains(key),
-            prepared.layout,
+            addresses,
             prepared.static_bindings,
             prepared.unit_bindings,
             std::mem::take(&mut self.prediction_residency.units),
@@ -426,7 +420,7 @@ where
             )?;
         self.prediction_residency
             .install(policy.residency_manager())?;
-        Ok((policy, addresses))
+        Ok(policy)
     }
 }
 
@@ -621,11 +615,11 @@ where
         selected: &SelectedReplicatedTextRealization,
         context: &Stream,
     ) -> Result<Self::ResidentPolicy, Self::Error> {
-        let (policy, addresses) = self.take_prepared_policy(architecture, selected)?;
+        let policy = self.take_prepared_policy(architecture, selected)?;
         let residency = policy.residency_manager().clone();
         let resident = policy.into_resident_units(units, context)?;
         self.resident_residency = Some(residency);
-        MlxSelectedLayerwisePolicy::resident(resident, addresses)
+        Ok(MlxSelectedLayerwisePolicy::resident(resident))
     }
 
     fn bounded_policy(
@@ -635,7 +629,7 @@ where
         _context: &Stream,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
         self.take_prepared_policy(architecture, selected)
-            .and_then(|(policy, addresses)| MlxSelectedLayerwisePolicy::bounded(policy, addresses))
+            .map(MlxSelectedLayerwisePolicy::bounded)
     }
 
     fn index_text_output(
