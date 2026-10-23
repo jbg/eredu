@@ -3439,8 +3439,11 @@ feed-forward and residual-normalization parameters; each invocation supplies its
 terminal operation to the common equation. Serial, observed, tensor-parallel,
 routed and low-rank execution borrow these same resources, preserving component
 observation timing. Parameter traversal retains canonical names and order across
-both aggregates. This structure keeps invocation-specific inter-pass normalization
-outside the body without changing the selected residency boundary.
+both aggregates. Dense body construction and live parameter projection operate on
+the body alone; complete invocations compose those same facilities with their terminal
+normalization. Common body projection also serves routed feed-forward policies.
+The body carries no terminal parameter even when its invocation requests inter-pass
+normalization. The selected residency boundary remains the enclosing execution unit.
 
 Nanbeige reuses the portable GQA/SwiGLU decoder blocks. `decoder::repeated`
 lowers physical checkpoint blocks to logical invocations with exact source

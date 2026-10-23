@@ -2561,13 +2561,22 @@ pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
     pub output_norm: Option<B::Normalization>,
 }
 
-impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
-    /// Builds an unloaded block for one global layer index.
+impl<B: NeuralBackend> TransformerBlockBody<B, Mlp<B>> {
+    /// Constructs an unloaded body without allocating invocation terminal parameters.
     pub fn new<C: Config>(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::construct_with_terminal(config, layer, context, || Ok(())).map(|(body, ())| body)
+    }
+
+    fn construct_with_terminal<C: Config, T>(
+        config: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+        terminal: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<(Self, T), Error> {
         let fields = config.block_parameter_fields().validate()?;
         let norm = |name: String| {
             B::normalization(
@@ -2592,21 +2601,9 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
             .feed_forward_output_normalization(layer)
             .map(&norm)
             .transpose()?;
-        let output_norm = config
-            .block_output_normalization(layer)
-            .map(|name| {
-                B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        config.hidden_size(),
-                        config.rms_norm_epsilon(),
-                        parameter_spec(config, name).map_err(Error::backend)?,
-                    ),
-                    context,
-                )
-            })
-            .transpose()?;
-        Ok(Self {
-            body: TransformerBlockBody {
+        let terminal = terminal()?;
+        Ok((
+            Self {
                 attention_output_norm,
                 feed_forward_output_norm,
                 self_attention: Attention::new(config, layer, context)?,
@@ -2622,8 +2619,36 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                     fields.post_attention_norm
                 ))?,
             },
-            output_norm,
-        })
+            terminal,
+        ))
+    }
+}
+
+impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
+    /// Constructs one unloaded body and its invocation-specific terminal normalization.
+    pub fn new<C: Config>(
+        config: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let (body, output_norm) =
+            TransformerBlockBody::construct_with_terminal(config, layer, context, || {
+                let output_norm = config
+                    .block_output_normalization(layer)
+                    .map(|name| {
+                        B::normalization(
+                            NormalizationConstructionSpec::learned(
+                                config.hidden_size(),
+                                config.rms_norm_epsilon(),
+                                parameter_spec(config, name).map_err(Error::backend)?,
+                            ),
+                            context,
+                        )
+                    })
+                    .transpose()?;
+                Ok(output_norm)
+            })?;
+        Ok(Self { body, output_norm })
     }
 }
 
@@ -3101,8 +3126,8 @@ where
 }
 
 /// Declares attention and normalization groups shared by dense and routed blocks.
-pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
-    block: &TransformerBlock<B, F>,
+pub fn body_common_parallel_parameter_groups<B: NeuralBackend, F>(
+    block: &TransformerBlockBody<B, F>,
     config: &impl Config,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -3128,14 +3153,14 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     }
     let head_partition = attention_partition::AttentionPartition::new(config, layer)?;
     let attention_units = head_partition.preferred_units();
-    let attention = match &block.body.self_attention.input_projection {
+    let attention = match &block.self_attention.input_projection {
         AttentionInputProjection::ExternalValue { query, key } => {
             let mut projections = vec![
                 (query, ProjectionSharding::Column),
                 (key, ProjectionSharding::Column),
-                (&block.body.self_attention.output, ProjectionSharding::Row),
+                (&block.self_attention.output, ProjectionSharding::Row),
             ];
-            if let Some(gate) = &block.body.self_attention.output_gate {
+            if let Some(gate) = &block.self_attention.output_gate {
                 projections.push((gate, ProjectionSharding::Column));
             }
             partitioned_projection_group::<B::Tensor, B::Linear>(
@@ -3150,9 +3175,9 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
                 (query, ProjectionSharding::Column),
                 (key, ProjectionSharding::Column),
                 (value, ProjectionSharding::Column),
-                (&block.body.self_attention.output, ProjectionSharding::Row),
+                (&block.self_attention.output, ProjectionSharding::Row),
             ];
-            if let Some(gate) = &block.body.self_attention.output_gate {
+            if let Some(gate) = &block.self_attention.output_gate {
                 projections.push((gate, ProjectionSharding::Column));
             }
             partitioned_projection_group::<B::Tensor, B::Linear>(
@@ -3167,7 +3192,7 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
                 format!("{attention_prefix}.projections"),
                 ParameterRole::AttentionHeads,
                 &fused.projection,
-                &block.body.self_attention.output,
+                &block.self_attention.output,
                 fused_projection_ranges(&fused.layout)?,
                 attention_units,
             )?
@@ -3177,30 +3202,17 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     let input_norm = module_parameter_group::<B::Tensor, _>(
         format!("{prefix}.{}", fields.input_norm),
         ParameterRole::Replicated,
-        &block.body.input_norm,
+        &block.input_norm,
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let post_attention_norm = module_parameter_group::<B::Tensor, _>(
         format!("{prefix}.{}", fields.post_attention_norm),
         ParameterRole::Replicated,
-        &block.body.post_attention_norm,
+        &block.post_attention_norm,
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let mut groups = vec![attention];
-    if let Some(norm) = &block.output_norm {
-        let name = config.block_output_normalization(layer).ok_or_else(|| {
-            ParallelPlanError::InvalidGroup(
-                "block output normalization is absent from configuration".into(),
-            )
-        })?;
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            name.trim_end_matches(".weight"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    if let Some(sinks) = &block.body.self_attention.sinks {
+    if let Some(sinks) = &block.self_attention.sinks {
         groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
             format!("{attention_prefix}.{}", fields.attention_sinks),
             ParameterRole::AttentionHeads,
@@ -3218,12 +3230,12 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     }
     for (norm, field, heads) in [
         (
-            &block.body.self_attention.query_norm,
+            &block.self_attention.query_norm,
             fields.attention_query_norm,
             query_heads,
         ),
         (
-            &block.body.self_attention.key_norm,
+            &block.self_attention.key_norm,
             fields.attention_key_norm,
             key_value_heads,
         ),
@@ -3251,11 +3263,11 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     for (name, norm) in [
         (
             config.attention_output_normalization(layer),
-            &block.body.attention_output_norm,
+            &block.attention_output_norm,
         ),
         (
             config.feed_forward_output_normalization(layer),
-            &block.body.feed_forward_output_norm,
+            &block.feed_forward_output_norm,
         ),
     ] {
         if let (Some(name), Some(norm)) = (name, norm) {
@@ -3272,6 +3284,58 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         .into_iter()
         .map(|group| head_partition.apply(group, |name| config.linear_format(name)))
         .collect()
+}
+
+/// Projects common body resources and the enclosing invocation's terminal normalization.
+pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
+    block: &TransformerBlock<B, F>,
+    config: &impl Config,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    with_terminal_parameter_group::<B>(
+        body_common_parallel_parameter_groups(&block.body, config, layer)?,
+        block.output_norm.as_ref(),
+        config,
+        layer,
+    )
+}
+
+fn with_terminal_parameter_group<B: NeuralBackend>(
+    mut groups: Vec<ParameterGroupSpec>,
+    terminal: Option<&B::Normalization>,
+    config: &impl Config,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    if let Some(norm) = terminal {
+        let name = config.block_output_normalization(layer).ok_or_else(|| {
+            ParallelPlanError::InvalidGroup(
+                "block output normalization is absent from configuration".into(),
+            )
+        })?;
+        groups.insert(
+            1,
+            module_parameter_group::<B::Tensor, _>(
+                name.trim_end_matches(".weight"),
+                ParameterRole::Replicated,
+                norm,
+                |_, _| Ok(MemberSharding::Replicated),
+            )?,
+        );
+    }
+    Ok(groups)
+}
+
+/// Projects every parameter owned by one dense body, excluding invocation terminals.
+pub fn body_parallel_parameter_groups<B: NeuralBackend>(
+    body: &TransformerBlockBody<B>,
+    config: &impl Config,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let mut groups = body_common_parallel_parameter_groups(body, config, layer)?;
+    groups.push(dense_mlp_parallel_parameter_group(
+        &body.mlp, config, layer,
+    )?);
+    Ok(groups)
 }
 
 /// Declares the dense SwiGLU placement group shared by dense decoder families.
@@ -3355,13 +3419,12 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     config: &impl Config,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = block_common_parallel_parameter_groups(block, config, layer)?;
-    groups.push(dense_mlp_parallel_parameter_group(
-        &block.body.mlp,
+    with_terminal_parameter_group::<B>(
+        body_parallel_parameter_groups(&block.body, config, layer)?,
+        block.output_norm.as_ref(),
         config,
         layer,
-    )?);
-    Ok(groups)
+    )
 }
 
 /// Derives the complete dense-decoder parameter topology from normalized
