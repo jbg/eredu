@@ -222,7 +222,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             BTreeMap::<ParameterStorageId, BTreeMap<String, DerivedWeightRecipe>>::new();
         let mut aliases = BTreeMap::<ParameterStorageId, Vec<RecipeAlias>>::new();
         for owned in description.groups() {
-            let owner = ParameterStorageId(owned.owner().clone());
+            let owner = ParameterStorageId::from_owner(owned.owner());
             for member in owned.members() {
                 match resolve(member)?.into() {
                     ComponentRecipe::Physical { recipe, conversion } => {
@@ -271,7 +271,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             for group in description
                 .groups()
                 .iter()
-                .filter(|group| group.owner() == &owner.0)
+                .filter(|group| ParameterStorageId::from_owner(group.owner()) == owner)
             {
                 for member in group.members() {
                     let binding = resolved[member.target()];
@@ -307,10 +307,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                         .map_err(ComponentPreparationError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = &owner.0
-            {
+            if let ParameterStorageId::ExecutionUnit { group, global_unit } = &owner {
                 let group = description
                     .graph()
                     .group_index(group.as_str())
@@ -650,7 +647,9 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                     .expect("validated unit");
                 &mut units[ordinal]
             } else {
-                pinned.entry(ParameterStorageId(owner.clone())).or_default()
+                pinned
+                    .entry(ParameterStorageId::from_owner(owner))
+                    .or_default()
             };
             for member in group.members() {
                 let invalid = || ComponentPreparationError::InvalidProjection {

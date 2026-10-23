@@ -50,7 +50,41 @@ impl From<ComponentDefinitionError> for eredu_nn::Error {
 
 /// Stable identity of canonical parameter storage, distinct from an invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ParameterStorageId(pub crate::ParameterGroupOwner);
+pub enum ParameterStorageId {
+    /// One pinned storage owner, independent of its logical consumers.
+    StaticRole(String),
+    /// Default independently leased storage for one canonical unit.
+    ExecutionUnit {
+        /// Stable execution-group identity.
+        group: crate::ExecutionGroupId,
+        /// Architecture-global unit within the group.
+        global_unit: usize,
+    },
+}
+
+impl ParameterStorageId {
+    /// Projects storage identity without including logical-consumer selection.
+    pub(crate) fn from_owner(owner: &crate::ParameterGroupOwner) -> Self {
+        match owner {
+            crate::ParameterGroupOwner::StaticRole(role)
+            | crate::ParameterGroupOwner::StaticUnitConsumers { role, .. } => {
+                Self::StaticRole(role.clone())
+            }
+            crate::ParameterGroupOwner::StaticAnyOf(roles) => Self::StaticRole(
+                roles
+                    .first()
+                    .expect("validated shared static owner")
+                    .clone(),
+            ),
+            crate::ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
+                Self::ExecutionUnit {
+                    group: group.clone(),
+                    global_unit: *global_unit,
+                }
+            }
+        }
+    }
+}
 
 /// Architecture-global identity of one mutable state slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -311,7 +345,7 @@ impl ComponentDefinition {
                     .any(|(group, unit)| group == group_id && *unit == index),
                 _ => false,
             })
-            .map(|owned| ParameterStorageId(owned.owner().clone()))
+            .map(|owned| ParameterStorageId::from_owner(owned.owner()))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect())

@@ -2075,4 +2075,128 @@ mod component_preparation {
         let projected = prepared.project("retained", description);
         assert!(projected.is_ok());
     }
+    #[test]
+    fn shared_pinned_storage_preserves_consumer_state_and_pipeline_replicas() {
+        use eredu_runtime::{
+            ArchitecturePartition, ComponentDefinition, ComponentRecipe, NoAuxiliaryBoundarySchema,
+            PartitionOwnership, WeightBindingPlan,
+        };
+        let prototype = prepared().declaration().clone();
+        let graph = prototype.parameters().graph();
+        let units = prototype.parameters().unit_layout();
+        let group = units.group_id(0).unwrap().clone();
+        let groups = ["owner", "consumer"]
+            .into_iter()
+            .zip([0, 2])
+            .map(|(name, index)| {
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::static_unit_consumers("shared", [(group.clone(), index)]),
+                    ParameterGroupSpec::new(
+                        name,
+                        ParameterRole::Replicated,
+                        [ParameterMemberSpec::new(
+                            name,
+                            [4, 2],
+                            MemberSharding::Replicated,
+                        )],
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parameters = ArchitectureParameterDescription::new(
+            graph,
+            units,
+            groups.iter().map(|g| g.group().clone()).collect::<Vec<_>>(),
+            groups,
+        )
+        .unwrap();
+        let definition = ComponentDefinition::new(
+            "shared-pinned",
+            parameters,
+            (0..3)
+                .map(|i| prototype.unit(0, i).unwrap().clone())
+                .collect(),
+            vec![prototype.group_transport(0).unwrap().clone()],
+            "units",
+            vec![],
+            prototype.state_layout().clone(),
+            prototype.state_partition_plan().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            definition.parameter_storage(0, 0).unwrap(),
+            definition.parameter_storage(0, 2).unwrap()
+        );
+        assert_ne!(
+            definition.state_slots(0, 0).unwrap().collect::<Vec<_>>(),
+            definition.state_slots(0, 2).unwrap().collect::<Vec<_>>()
+        );
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "physical".into(),
+                safetensors::Dtype::F32,
+                vec![4, 2],
+                vec![0; 32],
+            )])
+            .unwrap(),
+        );
+        let prepare = || {
+            PreparedComponent::prepare(
+                "shared-pinned",
+                definition.clone(),
+                source.clone(),
+                |member| {
+                    Ok::<_, ComponentPreparationError>(if member.target() == "owner" {
+                        ComponentRecipe::from(DerivedWeightRecipe::source(
+                            "physical",
+                            TensorSelection::Full,
+                        ))
+                    } else {
+                        ComponentRecipe::Alias("owner".into())
+                    })
+                },
+            )
+            .unwrap()
+        };
+        let mut replica_bytes = 0;
+        for index in [0, 2] {
+            let partition = ArchitecturePartition::from_description(
+                definition.parameters(),
+                [("units", index..index + 1)],
+                PartitionOwnership::new(index == 0, index == 2, std::iter::empty::<String>())
+                    .unwrap(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
+                (),
+                NoAuxiliaryBoundarySchema::new(2),
+            )
+            .unwrap();
+            let selected = definition.select_partition(&partition).unwrap();
+            assert_eq!(selected.state().unwrap().global_layers(), index..index + 1);
+            let groups = definition.parameters().select_owned(&partition);
+            assert_eq!(groups.len(), 2);
+            let parameters = ArchitectureParameterDescription::new(
+                graph,
+                units,
+                groups.iter().map(|g| g.group().clone()).collect::<Vec<_>>(),
+                groups,
+            )
+            .unwrap();
+            let prepared = prepare()
+                .project("stage", parameters)
+                .unwrap()
+                .select_units(partition.units())
+                .unwrap();
+            assert_eq!(prepared.pinned_bindings().len(), 1);
+            assert!(prepared.unit_bindings().iter().all(Vec::is_empty));
+            let bindings = prepared.pinned_bindings().values().next().unwrap();
+            let plan = WeightBindingPlan::new(bindings).unwrap();
+            assert_eq!(plan.owners().count(), 1);
+            assert_eq!(plan.aliases().count(), 1);
+            replica_bytes += plan.owners().map(|b| b.expected_bytes()).sum::<u64>();
+            assert_eq!(prepared.source().source_keys(), ["physical"]);
+        }
+        assert_eq!(replica_bytes, 64);
+    }
 }

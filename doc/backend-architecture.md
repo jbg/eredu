@@ -790,6 +790,12 @@ parameter placement through the shared layout compiler. Speech kernels supply th
 declarations and selected layouts, retain coupled width checks, and preserve guarded
 collective failure handling. Layout failures identify the component and retain neutral
 topology errors as sources.
+Canonical parameter storage identities are separate from consumer ownership declarations.
+A pinned role retains one storage identity across its explicit unit-consumer sets;
+shared static owners use their first declared storage role. Preparation groups recipes and
+aliases by storage identity. A partition stores every group in a selected storage owner,
+while observation retains declared consumers and mutable-state slots remain independent.
+Ordinary leased units retain their default unit storage identities.
 Architecture-selected local state geometry preserves slot counts, segment identities and
 lifetimes, component roles, dtypes, residency and attention policy. Runtime validates
 these invariants before retaining the selected geometry with the definition.

@@ -421,9 +421,17 @@ impl ArchitectureParameterDescription {
         &self,
         partition: &ArchitecturePartition<G, A>,
     ) -> Vec<OwnedParameterGroupSpec> {
-        self.groups
+        let storage = self
+            .groups
             .iter()
             .filter(|tagged| tagged.owner().is_local(partition))
+            .map(|tagged| crate::ParameterStorageId::from_owner(tagged.owner()))
+            .collect::<BTreeSet<_>>();
+        self.groups
+            .iter()
+            .filter(|tagged| {
+                storage.contains(&crate::ParameterStorageId::from_owner(tagged.owner()))
+            })
             .cloned()
             .collect()
     }
