@@ -785,6 +785,11 @@ selected projection.
 execution graph with logical unit paths, state references, group transport and
 primary/prediction identities. Construction validates addresses, paths, state
 ranges, partition rules and optional group semantics without native allocation.
+Native callback-derived and retained-binding policy preparation use one finalization
+implementation for residency streams and managers, pinned static binding, dense-stream
+controllers and policy assembly. Their source realization and binding admission order
+remain specific to each prepared input path; ordinary and supplementary sources feed
+the same native finalizer.
 Runtime validates tensor-only communicator topology and exact selected physical
 parameter placement through the shared layout compiler. Speech kernels supply their
 declarations and selected layouts, retain coupled width checks, and preserve guarded

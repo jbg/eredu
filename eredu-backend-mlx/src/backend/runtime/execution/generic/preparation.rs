@@ -201,29 +201,6 @@ where
     validate_device_budget(offload, static_bytes, device_window_bytes, depth)?;
 
     let plan = OffloadPlan::new(offload, specs)?;
-    let residency_stream = if dense.is_some() {
-        Stream::new_with_device(&stream.get_device()?)
-    } else {
-        stream.clone()
-    };
-    let residency = ResidencyManager::new_shared(
-        Arc::clone(&store),
-        plan,
-        definitions,
-        weights_stream.clone(),
-        residency_stream,
-    )?;
-    residency.initialize()?;
-    let mut static_leases = Vec::new();
-    if let Some(id) = static_id {
-        let lease = residency.acquire(&id, MemoryTier::Device)?;
-        populate_selected_parameterized(
-            architecture.static_modules_mut(),
-            &lease,
-            &static_parameters,
-        )?;
-        static_leases.push(lease);
-    }
     let metadata = LayerwiseModelMetadata::new(
         "generic",
         None,
@@ -235,49 +212,22 @@ where
         maximum_host_bytes,
         depth,
     );
-    let dense_controller = dense
-        .map(|options| {
-            DenseStreamController::new(
-                &residency,
-                options,
-                unit_count,
-                layer_parameter_bytes,
-                maximum_host_bytes,
-                static_bytes,
-                (0..layout.group_count())
-                    .filter(|&group| {
-                        layout
-                            .group_range(group)
-                            .is_some_and(|range| !range.is_empty())
-                    })
-                    .map(|group| {
-                        let range = layout
-                            .group_range(group)
-                            .expect("validated layout covers every execution group");
-                        let id = layout
-                            .group_id(group)
-                            .expect("validated layout names every execution group")
-                            .as_str()
-                            .to_owned();
-                        (id, unit_ids[range].to_vec())
-                    }),
-            )
-            .map(Arc::new)
-        })
-        .transpose()?;
-    let policy = MlxLayerwisePolicy::new(
-        residency,
-        Arc::clone(&store),
-        unit_ids,
-        layout,
-        depth,
+    materialize_parameter_unit_policy::<A::Unit, _, _>(
+        store,
+        architecture.static_modules_mut(),
         populator,
-        static_leases,
-        dense_controller,
-        options.sample_backend_memory(),
-        options.sample_process_memory(),
-    )?;
-    Ok((policy, metadata))
+        options,
+        stream,
+        weights_stream,
+        plan,
+        definitions,
+        std::collections::BTreeMap::new(),
+        layout,
+        unit_ids,
+        static_id,
+        static_parameters,
+        metadata,
+    )
 }
 
 /// Builds an MLX residency policy from exact binding definitions projected by
@@ -587,6 +537,59 @@ where
     validate_device_budget(offload, static_bytes, required_device, depth)?;
 
     let plan = OffloadPlan::new(offload, specs)?;
+    let metadata = LayerwiseModelMetadata::new(
+        "generic",
+        None,
+        unit_count,
+        static_bytes,
+        options.execution_residency(),
+        layer_parameter_bytes,
+        device_window_bytes,
+        maximum_host_bytes,
+        depth,
+    );
+    materialize_parameter_unit_policy::<U, _, _>(
+        store,
+        static_modules,
+        populator,
+        options,
+        stream,
+        weights_stream,
+        plan,
+        definitions,
+        sources,
+        layout,
+        unit_ids,
+        static_id,
+        static_parameters,
+        metadata,
+    )
+}
+
+/// Materializes one admitted policy with the existing native completion and transfer owners.
+#[allow(clippy::too_many_arguments)]
+fn materialize_parameter_unit_policy<U, SM, P>(
+    store: SharedCheckpointSource,
+    static_modules: &mut SM,
+    populator: P,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    plan: OffloadPlan,
+    definitions: Vec<OffloadUnit>,
+    sources: std::collections::BTreeMap<OffloadUnitId, SharedCheckpointSource>,
+    layout: ExecutionUnitLayout,
+    unit_ids: Vec<OffloadUnitId>,
+    static_id: Option<OffloadUnitId>,
+    static_parameters: BTreeSet<String>,
+    metadata: LayerwiseModelMetadata,
+) -> Result<(MlxLayerwisePolicy<U, P>, LayerwiseModelMetadata), Error>
+where
+    U: Parameterized<MlxTensor> + 'static,
+    SM: Parameterized<MlxTensor>,
+    P: MlxUnitPopulator<U>,
+{
+    let dense = options.dense();
     let residency_stream = if dense.is_some() {
         Stream::new_with_device(&stream.get_device()?)
     } else {
@@ -607,26 +610,15 @@ where
         populate_selected_parameterized(static_modules, &lease, &static_parameters)?;
         static_leases.push(lease);
     }
-    let metadata = LayerwiseModelMetadata::new(
-        "generic",
-        None,
-        unit_count,
-        static_bytes,
-        options.execution_residency(),
-        layer_parameter_bytes,
-        device_window_bytes,
-        maximum_host_bytes,
-        depth,
-    );
     let dense_controller = dense
         .map(|options| {
             DenseStreamController::new(
                 &residency,
                 options,
-                unit_count,
-                layer_parameter_bytes,
-                maximum_host_bytes,
-                static_bytes,
+                metadata.layer_count(),
+                metadata.layer_parameter_bytes(),
+                metadata.maximum_host_layer_bytes(),
+                metadata.static_device_bytes(),
                 (0..layout.group_count())
                     .filter(|&group| {
                         layout
@@ -653,7 +645,7 @@ where
         Arc::clone(&store),
         unit_ids,
         layout,
-        depth,
+        metadata.device_layer_capacity(),
         populator,
         static_leases,
         dense_controller,
