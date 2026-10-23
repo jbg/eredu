@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
-    PreparedComponent, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, LocalModelLayout, PreparedComponent,
+    RecipeBindingError, WeightBinding,
 };
 
 use super::{
@@ -243,7 +243,7 @@ impl PreparedTtsTransformerBindings {
     ) -> (
         TransformerConfig,
         eredu_runtime::ComponentDefinition,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
@@ -297,11 +297,12 @@ impl PreparedTtsTransformerPartitionBindings {
         TransformerConfig,
         eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        let (definition, local_layout, _, source, units) = self
+        let (definition, local_layout, invocations, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
@@ -309,6 +310,7 @@ impl PreparedTtsTransformerPartitionBindings {
             self.config,
             definition,
             local_layout,
+            invocations,
             source,
             units,
             self.state_layout,

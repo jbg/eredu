@@ -1519,9 +1519,9 @@ mod component_preparation {
         let (definition, _, layout, source, units) = selected.into_declared_unit_parts().unwrap();
         assert_eq!(definition.id(), "shared-contract");
         assert_eq!(definition.unit_count(0).unwrap(), 3);
-        assert_eq!(layout.address(0), Some(address));
-        assert_eq!(layout.ordinal(0, 2), Some(0));
-        assert!(layout.ordinal(0, 0).is_none());
+        assert_eq!(layout.storage_layout().address(0), Some(address));
+        assert_eq!(layout.storage_layout().ordinal(0, 2), Some(0));
+        assert!(layout.storage_layout().ordinal(0, 0).is_none());
         assert_eq!(
             units[0][0]
                 .source_recipe()
@@ -1598,7 +1598,7 @@ mod component_preparation {
         assert_eq!(selected.unit_layout().address(0), Some(addresses[1]));
         assert_eq!(selected.source().source_keys(), ["physical.2"]);
         let (_, _, retained, source, units) = selected.into_addressed_unit_parts().unwrap();
-        assert_eq!(retained, selected_layout);
+        assert_eq!(retained.storage_layout(), &selected_layout);
         assert_eq!(units[0].0, addresses[1]);
         assert_eq!(
             units[0].1[0]
@@ -2005,7 +2005,7 @@ mod component_preparation {
         }
         let (_, placement, layout, source, units) = projected.into_addressed_unit_parts().unwrap();
         assert_eq!(placement, Some(retained));
-        assert_eq!(layout.address(0), Some(selected[0]));
+        assert_eq!(layout.storage_layout().address(0), Some(selected[0]));
         let local_graph =
             ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
         let local = ExecutionUnitLayout::new(&local_graph, [2]).unwrap();
@@ -2371,6 +2371,189 @@ mod component_preparation {
             assert_eq!(prepared.source().source_keys(), ["physical"]);
         }
         assert_eq!(replica_bytes, 96);
+
+        let leased_groups = definition
+            .parameters()
+            .groups()
+            .iter()
+            .map(|owned| {
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit_consumers(group.clone(), 3, indices),
+                    owned.group().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parameters = ArchitectureParameterDescription::new(
+            graph,
+            &units,
+            leased_groups.iter().map(|owned| owned.group().clone()),
+            leased_groups.clone(),
+        )
+        .unwrap();
+        let leased = ComponentDefinition::new(
+            "shared-leased",
+            parameters,
+            (0..3)
+                .map(|i| prototype.unit(0, i).unwrap().clone())
+                .collect(),
+            vec![prototype.group_transport(0).unwrap().clone()],
+            "units",
+            vec![],
+            prototype.state_layout().clone(),
+            prototype.state_partition_plan().clone(),
+        )
+        .unwrap();
+        assert_eq!(leased.parameters().invocations().storage_layout().len(), 1);
+        assert_eq!(
+            leased.parameter_storage(0, 3).unwrap(),
+            leased.parameter_storage(0, 11).unwrap()
+        );
+        assert_ne!(
+            leased.state_slots(0, 3).unwrap().collect::<Vec<_>>(),
+            leased.state_slots(0, 11).unwrap().collect::<Vec<_>>()
+        );
+        let prepare_leased = || {
+            PreparedComponent::prepare("shared-leased", leased.clone(), source.clone(), |member| {
+                Ok::<_, ComponentPreparationError>(if member.target() == "owner" {
+                    ComponentRecipe::from(DerivedWeightRecipe::source(
+                        "physical",
+                        TensorSelection::Full,
+                    ))
+                } else {
+                    ComponentRecipe::Alias("owner".into())
+                })
+            })
+            .unwrap()
+        };
+        let full = prepare_leased();
+        assert_eq!(full.unit_bindings().len(), 1);
+        assert_eq!(full.unit_bindings()[0].len(), 2);
+        let mut leased_replica_bytes = 0;
+        for (position, index) in indices.into_iter().enumerate() {
+            let partition = ArchitecturePartition::from_description(
+                leased.parameters(),
+                [("units", index..index + 1)],
+                PartitionOwnership::new(position == 0, position == 2, std::iter::empty::<String>())
+                    .unwrap(),
+                leased.state_layout(),
+                leased.state_partition_plan(),
+                (),
+                NoAuxiliaryBoundarySchema::new(2),
+            )
+            .unwrap();
+            assert_eq!(partition.parameter_bindings().len(), 2);
+            assert_eq!(
+                partition.state().unwrap().global_layers(),
+                position..position + 1
+            );
+            let address = complete.address(index).unwrap();
+            let selected = prepare_leased()
+                .select_units([address])
+                .unwrap()
+                .select_units([address])
+                .unwrap();
+            assert_eq!(
+                selected
+                    .invocations()
+                    .logical_addresses()
+                    .collect::<Vec<_>>(),
+                [address]
+            );
+            assert_eq!(
+                selected
+                    .invocations()
+                    .storage_layout()
+                    .address(0)
+                    .unwrap()
+                    .index(),
+                3
+            );
+            assert_eq!(
+                selected.unit_source(address).unwrap().source_keys(),
+                ["physical"]
+            );
+            if index != 3 {
+                assert!(selected.unit_source(complete.address(3).unwrap()).is_err());
+            }
+            let (_, _, invocations, source, bindings) =
+                selected.into_declared_unit_parts().unwrap();
+            let mut resources = eredu_runtime::ExecutionUnitResourcePreparation::new(
+                "shared",
+                &invocations,
+                eredu_runtime::LayerWeightResidency::FullyResident,
+            );
+            for binding in bindings {
+                resources = resources
+                    .push::<Box<dyn std::error::Error>>(binding, |_| Ok(0))
+                    .unwrap();
+            }
+            let resources = resources.finish().unwrap();
+            leased_replica_bytes += resources.parameter_bytes;
+            let empty = eredu_runtime::StaticUnitBindings::new("empty", vec![])
+                .unwrap()
+                .prepare::<Box<dyn std::error::Error>>()
+                .unwrap();
+            let resources = eredu_runtime::ParameterResourcePreparation::new(empty, resources)
+                .finish()
+                .unwrap();
+            let restricted = resources.restrict_primary_source(source).unwrap();
+            eredu_runtime::ResidencyController::new(
+                restricted.as_ref(),
+                resources.plan,
+                resources.definitions,
+            )
+            .unwrap();
+        }
+        assert_eq!(leased_replica_bytes, 96);
+        assert!(matches!(
+            prepare_leased()
+                .select_units([complete.address(7).unwrap()])
+                .unwrap()
+                .project("restored", leased.clone()),
+            Err(ComponentPreparationError::InvalidProjection { .. })
+        ));
+
+        for consumers in [vec![], vec![3, 3], vec![0]] {
+            let invalid = OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit_consumers(group.clone(), 3, consumers),
+                leased_groups[0].group().clone(),
+            );
+            assert!(ArchitectureParameterDescription::new(
+                graph,
+                &units,
+                [invalid.group().clone()],
+                [invalid]
+            )
+            .is_err());
+        }
+        let mut inconsistent = leased_groups.clone();
+        inconsistent[1] = OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::execution_unit_consumers(group.clone(), 3, [3, 11]),
+            inconsistent[1].group().clone(),
+        );
+        assert!(matches!(
+            ArchitectureParameterDescription::new(
+                graph,
+                &units,
+                inconsistent.iter().map(|owned| owned.group().clone()),
+                inconsistent.clone()
+            ),
+            Err(eredu_runtime::ArchitectureParameterError::InconsistentUnitConsumers { .. })
+        ));
+        let mut conflicting = leased_groups.clone();
+        conflicting[1] = OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::execution_unit_consumers(group.clone(), 11, [11]),
+            conflicting[1].group().clone(),
+        );
+        assert!(matches!(
+            ArchitectureParameterDescription::new(
+                graph,
+                &units,
+                conflicting.iter().map(|owned| owned.group().clone()),
+                conflicting.clone()
+            ),
+            Err(eredu_runtime::ArchitectureParameterError::ConflictingUnitOwners { .. })
+        ));
         let empty = eredu_runtime::StaticUnitBindings::new("empty", vec![])
             .unwrap()
             .prepare::<Box<dyn std::error::Error>>()
@@ -2382,6 +2565,7 @@ mod component_preparation {
         )
         .unwrap();
     }
+
     fn assert_mapped_resource_preparation() {
         use eredu_core::residency::OffloadConfig;
         use eredu_runtime::{

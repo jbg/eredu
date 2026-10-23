@@ -8920,7 +8920,7 @@ fn composite_prepared_parts_drive_dependency_group_output() {
         .unwrap();
     assert!(matches!(
         ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::new(architecture(incomplete), &()),
-        Err(eredu_runtime::ResidentUnitsError::StorageGroups)
+        Err(eredu_runtime::ResidentUnitsError::InvocationMap(eredu_runtime::ExecutionUnitAddressMapError::InvocationCount { .. }))
     ));
 }
 

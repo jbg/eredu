@@ -85,7 +85,11 @@ where
     let layout = architecture
         .execution_unit_layout()
         .map_err(|error| Error::Other(Box::new(error)))?;
-    let unit_count = layout.len();
+    let invocations = architecture
+        .execution_unit_storage_map()
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    invocations.validate_layout(&layout)?;
+    let unit_count = invocations.storage_layout().len();
     if unit_count == 0 {
         return Err(Error::Parallel(
             "generic MLX architecture declared no execution units".into(),
@@ -97,26 +101,32 @@ where
     let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
         .prepare::<Error>()?;
 
-    let invocations = eredu_runtime::ExecutionUnitAddressMap::new(
-        &layout,
-        (0..layout.len()).map(|ordinal| {
-            let address = layout.address(ordinal).expect("validated physical layout");
-            (address, address)
-        }),
-    )?;
     let mut execution_units =
         eredu_runtime::ExecutionUnitResourcePreparation::new("model", &invocations, options);
     for index in 0..unit_count {
-        let address = layout
+        let address = invocations
+            .storage_layout()
             .address(index)
             .expect("validated layout covers every flat unit");
         let path = architecture
             .unit_path(address.group(), address.index())
             .map_err(|error| Error::Other(Box::new(error)))?;
         let unit = architecture
-            .build_unit(address.group(), address.index(), stream)
+            .build_storage_unit(
+                invocations
+                    .storage_location(index)
+                    .expect("declared physical owner"),
+                stream,
+            )
             .map_err(|error| Error::Other(Box::new(error)))?;
-        let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
+        let ordinal = layout
+            .ordinal(address.group(), address.index())
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "physical owner {address:?} has no canonical factory invocation"
+                ))
+            })?;
+        let bindings = unit_bindings(ordinal, address, &path, unit, store.as_ref(), stream)?;
         execution_units = execution_units.push(bindings, |bindings| {
             host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
         })?;
@@ -149,7 +159,7 @@ pub fn prepare_layerwise_policy_from_bindings<A, S, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
-    layout: ExecutionUnitLayout,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
@@ -161,13 +171,18 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
-    let invocations = eredu_runtime::ExecutionUnitAddressMap::new(
-        &layout,
-        (0..layout.len()).map(|ordinal| {
-            let address = layout.address(ordinal).expect("validated physical layout");
-            (address, address)
-        }),
-    )?;
+    let declared = architecture
+        .execution_unit_storage_map()
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    let logical = architecture
+        .execution_unit_layout()
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    declared.validate_layout(&logical)?;
+    if declared.select_invocations(invocations.logical_addresses())? != invocations {
+        return Err(Error::Parallel(
+            "prepared invocation map differs from architecture storage ownership".into(),
+        ));
+    }
     prepare_layerwise_policy_with_supplementary_bindings(
         store,
         architecture,
@@ -197,6 +212,7 @@ pub fn prepare_layerwise_policy_from_addressed_bindings<A, S, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
@@ -208,11 +224,20 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
-    let layout = architecture
-        .execution_unit_layout()
-        .map_err(|error| Error::Other(Box::new(error)))?
-        .select(units.iter().map(|(address, _)| *address))
-        .map_err(|error| Error::Other(Box::new(error)))?;
+    if !units
+        .iter()
+        .map(|(address, _)| *address)
+        .eq((0..invocations.storage_layout().len()).map(|ordinal| {
+            invocations
+                .storage_layout()
+                .address(ordinal)
+                .expect("declared physical owner")
+        }))
+    {
+        return Err(Error::Parallel(
+            "addressed bindings differ from retained physical owners".into(),
+        ));
+    }
     prepare_layerwise_policy_from_bindings(
         store,
         architecture,
@@ -222,7 +247,7 @@ where
         stream,
         weights_stream,
         ignored,
-        layout,
+        invocations,
         static_bindings,
         units.into_iter().map(|(_, bindings)| bindings).collect(),
     )

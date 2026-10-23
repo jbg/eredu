@@ -26,13 +26,16 @@ pub enum ParameterGroupOwner {
         /// Canonical group and unit identities that consume the module.
         consumers: Vec<(ExecutionGroupId, usize)>,
     },
-    /// One architecture-global unit in a canonical execution group.
+    /// One canonical independently leased module and its logical consumers.
     #[non_exhaustive]
     ExecutionUnit {
         /// Canonical execution-group identity.
         group: ExecutionGroupId,
-        /// Group-local architecture-global unit index.
+        /// Canonical physical owner address within its execution group.
         global_unit: usize,
+        /// Logical consumers in the same canonical execution group. Parameter
+        /// sharing is independent of each consumer's mutable-state ownership.
+        consumers: Vec<usize>,
     },
 }
 
@@ -79,8 +82,8 @@ impl ParameterGroupOwner {
         match (self.static_storage_role(), other.static_storage_role()) {
             (Some(left), Some(right)) => left == right,
             (None, None) => matches!((self, other), (
-                Self::ExecutionUnit { group: a, global_unit: i },
-                Self::ExecutionUnit { group: b, global_unit: j },
+                Self::ExecutionUnit { group: a, global_unit: i, .. },
+                Self::ExecutionUnit { group: b, global_unit: j, .. },
             ) if a == b && i == j),
             _ => false,
         }
@@ -88,7 +91,24 @@ impl ParameterGroupOwner {
 
     /// Creates execution-unit ownership in the architecture-global index space.
     pub fn execution_unit(group: ExecutionGroupId, global_unit: usize) -> Self {
-        Self::ExecutionUnit { group, global_unit }
+        Self::ExecutionUnit {
+            group,
+            global_unit,
+            consumers: vec![global_unit],
+        }
+    }
+
+    /// Declares one independently leased owner used by explicit logical invocations.
+    pub fn execution_unit_consumers(
+        group: ExecutionGroupId,
+        global_unit: usize,
+        consumers: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        Self::ExecutionUnit {
+            group,
+            global_unit,
+            consumers: consumers.into_iter().collect(),
+        }
     }
 
     pub(crate) fn validate(
@@ -122,16 +142,26 @@ impl ParameterGroupOwner {
                     return Err(ArchitectureParameterError::DuplicateStaticConsumer);
                 }
             }
-            ParameterGroupOwner::ExecutionUnit { .. } => {}
+            ParameterGroupOwner::ExecutionUnit { consumers, .. } => {
+                if consumers.is_empty()
+                    || consumers.iter().collect::<BTreeSet<_>>().len() != consumers.len()
+                {
+                    return Err(ArchitectureParameterError::InvalidUnitConsumers);
+                }
+            }
         }
         let consumers = match self {
             ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
                 .iter()
                 .map(|(group, unit)| (group, unit))
                 .collect::<Vec<_>>(),
-            ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
-                vec![(group, global_unit)]
-            }
+            ParameterGroupOwner::ExecutionUnit {
+                group,
+                global_unit,
+                consumers,
+            } => std::iter::once((group, global_unit))
+                .chain(consumers.iter().map(|unit| (group, unit)))
+                .collect(),
             _ => Vec::new(),
         };
         for (group, global_unit) in consumers {
@@ -189,7 +219,9 @@ impl ParameterGroupOwner {
             Self::StaticUnitConsumers { consumers, .. } => consumers
                 .iter()
                 .any(|(group, unit)| owns_unit(group, *unit)),
-            Self::ExecutionUnit { group, global_unit } => owns_unit(group, *global_unit),
+            Self::ExecutionUnit {
+                group, consumers, ..
+            } => consumers.iter().any(|unit| owns_unit(group, *unit)),
         }
     }
 
@@ -209,7 +241,9 @@ impl ParameterGroupOwner {
                         .iter()
                         .any(|(group, unit)| owns_unit(group, *unit))
             }
-            Self::ExecutionUnit { group, global_unit } => owns_unit(group, *global_unit),
+            Self::ExecutionUnit {
+                group, consumers, ..
+            } => consumers.iter().any(|unit| owns_unit(group, *unit)),
         }
     }
 
@@ -268,6 +302,7 @@ impl Deref for OwnedParameterGroupSpec {
 pub struct ArchitectureParameterDescription {
     graph: ExecutionGraph,
     unit_layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     groups: Vec<OwnedParameterGroupSpec>,
     partition_layout: Option<(
         eredu_core::ParallelRankTopology,
@@ -322,9 +357,72 @@ impl ArchitectureParameterDescription {
                 }
             }
         }
+        let mut owners = BTreeMap::new();
+        let mut claims = BTreeMap::new();
+        for tagged in &groups {
+            if let ParameterGroupOwner::ExecutionUnit {
+                group,
+                global_unit,
+                consumers,
+            } = tagged.owner()
+            {
+                let group = graph.group_index(group.as_str()).expect("validated group");
+                let owner = layout
+                    .address(
+                        layout
+                            .ordinal(group, *global_unit)
+                            .expect("validated owner"),
+                    )
+                    .expect("declared owner");
+                let consumers = consumers.iter().copied().collect::<BTreeSet<_>>();
+                if owners
+                    .insert((group, *global_unit), consumers.clone())
+                    .is_some_and(|previous| previous != consumers)
+                {
+                    return Err(ArchitectureParameterError::InconsistentUnitConsumers {
+                        group,
+                        global_unit: *global_unit,
+                    });
+                }
+                for consumer in consumers {
+                    if let Some(previous) = claims.insert((group, consumer), owner) {
+                        if previous != owner {
+                            return Err(ArchitectureParameterError::ConflictingUnitOwners {
+                                group,
+                                global_unit: consumer,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let references = (0..layout.len())
+            .map(|ordinal| {
+                let logical = layout.address(ordinal).expect("declared invocation");
+                let storage = claims
+                    .get(&(logical.group(), logical.index()))
+                    .copied()
+                    .unwrap_or(logical);
+                (logical, storage)
+            })
+            .collect::<Vec<_>>();
+        let used = references
+            .iter()
+            .map(|(_, storage)| (storage.group(), storage.index()))
+            .collect::<BTreeSet<_>>();
+        let storage = layout
+            .select(
+                (0..layout.len())
+                    .map(|ordinal| layout.address(ordinal).expect("declared invocation"))
+                    .filter(|address| used.contains(&(address.group(), address.index()))),
+            )
+            .expect("canonical physical subset");
+        let invocations = crate::ExecutionUnitAddressMap::new(&storage, references)
+            .expect("validated consumer ownership");
         Ok(Self {
             graph: graph.clone(),
             unit_layout: layout.clone(),
+            invocations,
             groups,
             partition_layout: None,
         })
@@ -388,6 +486,11 @@ impl ArchitectureParameterDescription {
         &self.unit_layout
     }
 
+    /// Canonical physical owners and the logical invocations that consume them.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
+    }
+
     /// Proves that this description still matches a concrete neutral architecture.
     pub fn validate_architecture<B, S, M>(
         &self,
@@ -405,6 +508,12 @@ impl ArchitectureParameterDescription {
         }
         if unit_layout != self.unit_layout {
             return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
+        }
+        let invocations = architecture
+            .execution_unit_storage_map()
+            .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+        if invocations != self.invocations {
+            return Err(ArchitecturePartitionError::ArchitectureStorageMapMismatch);
         }
         Ok(())
     }
@@ -534,6 +643,26 @@ fn parameter_declarations(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitectureParameterError {
+    /// A leased resource has no consumers or repeats one logical consumer.
+    #[error("architecture leased parameter owner has empty or repeated consumers")]
+    InvalidUnitConsumers,
+    /// Parameter groups for one physical owner disagree about its consumers.
+    #[error("architecture parameter owner {group}:{global_unit} has inconsistent consumers")]
+    InconsistentUnitConsumers {
+        /// Canonical group slot.
+        group: usize,
+        /// Canonical physical owner index.
+        global_unit: usize,
+    },
+    /// One logical invocation claims multiple independently leased owners.
+    #[error("architecture invocation {group}:{global_unit} has conflicting leased owners")]
+    ConflictingUnitOwners {
+        /// Canonical group slot.
+        group: usize,
+        /// Logical invocation index.
+        global_unit: usize,
+    },
+
     /// The supplied graph/layout is not canonical.
     #[error("invalid architecture parameter layout: {0}")]
     InvalidLayout(String),
@@ -1481,6 +1610,7 @@ impl PartitionGroup {
 pub struct ArchitecturePartition<G, A> {
     graph: ExecutionGraph,
     unit_layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     groups: Vec<PartitionGroup>,
     ownership: PartitionOwnership,
     state: Option<PartitionState>,
@@ -1523,6 +1653,7 @@ impl<G, A> ArchitecturePartition<G, A> {
         if parameters.unit_layout() != &unit_layout {
             return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
         }
+        parameters.validate_architecture::<B, S, M>(architecture)?;
         let complete_state = architecture
             .state_layout()
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
@@ -1540,6 +1671,9 @@ impl<G, A> ArchitecturePartition<G, A> {
         partition.state = partition
             .resolve_state_partition(&complete_state, &plan)
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
+        partition.invocations = parameters
+            .invocations()
+            .select_invocations(partition.units())?;
         partition.parameter_bindings = parameters.select_owned(&partition);
         Ok(partition)
     }
@@ -1581,6 +1715,9 @@ impl<G, A> ArchitecturePartition<G, A> {
         partition.state = partition
             .resolve_state_partition(complete_state, state_plan)
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
+        partition.invocations = parameters
+            .invocations()
+            .select_invocations(partition.units())?;
         partition.parameter_bindings = parameters.select_owned(&partition);
         Ok(partition)
     }
@@ -1661,9 +1798,24 @@ impl<G, A> ArchitecturePartition<G, A> {
             }
         }
 
+        let invocations = crate::ExecutionUnitAddressMap::new(
+            &unit_layout,
+            (0..unit_layout.len()).map(|ordinal| {
+                let address = unit_layout.address(ordinal).expect("declared invocation");
+                (address, address)
+            }),
+        )
+        .expect("identity storage map")
+        .select_invocations(groups.iter().flat_map(|group| {
+            group
+                .ordinals
+                .clone()
+                .map(|ordinal| unit_layout.address(ordinal).expect("owned invocation"))
+        }))?;
         Ok(Self {
             graph,
             unit_layout,
+            invocations,
             groups,
             ownership,
             state,
@@ -1681,6 +1833,11 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Returns the canonical complete execution-unit layout.
     pub const fn unit_layout(&self) -> &ExecutionUnitLayout {
         &self.unit_layout
+    }
+
+    /// Selected logical invocations and their canonical parameter owners, including replicas.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
     }
 
     /// Returns groups and group-local global unit ranges owned by this rank.
@@ -1808,6 +1965,12 @@ impl<G, A> ArchitecturePartition<G, A> {
         }
         if unit_layout != self.unit_layout {
             return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
+        }
+        let invocations = architecture
+            .execution_unit_storage_map()
+            .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+        if invocations.select_invocations(self.units())? != self.invocations {
+            return Err(ArchitecturePartitionError::ArchitectureStorageMapMismatch);
         }
         Ok(())
     }
@@ -2399,6 +2562,13 @@ fn validate_canonical_layout(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitecturePartitionError {
+    /// Logical ownership cannot be projected onto the declared physical owners.
+    #[error(transparent)]
+    Invocations(#[from] crate::ExecutionUnitAddressMapError),
+    /// Canonical physical ownership differs despite matching logical topology.
+    #[error("architecture partition storage map differs from the neutral architecture")]
+    ArchitectureStorageMapMismatch,
+
     /// The architecture supplied an invalid partition-boundary wire schema.
     #[error("invalid architecture partition boundary: {0}")]
     InvalidBoundary(#[from] ArchitectureBoundaryError),

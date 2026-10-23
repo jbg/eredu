@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
-    PreparedComponent, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, LocalModelLayout, PreparedComponent,
+    RecipeBindingError, WeightBinding,
 };
 
 use super::{
@@ -192,7 +192,7 @@ impl PreparedConditioningBindings {
         ConditioningDimensions,
         eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {

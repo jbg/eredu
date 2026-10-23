@@ -210,11 +210,9 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
             )))
         }
     }
-    let (config, definition, local_layout, source, units, state_layout) = prepared.into_parts();
-    if !units
-        .iter()
-        .map(|(address, _)| *address)
-        .eq(partition.units())
+    let (config, definition, local_layout, invocations, source, units, state_layout) =
+        prepared.into_parts();
+    if !invocations.logical_addresses().eq(partition.units())
         || state_layout.as_ref() != partition.state().map(|state| state.layout())
     {
         return Err(BackendFailure::from_error(TransformerError::Configuration(
@@ -240,6 +238,7 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
                 execution_stream,
                 weights_stream,
                 |_| false,
+                invocations,
                 Vec::new(),
                 units,
             )

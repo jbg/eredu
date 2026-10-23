@@ -76,12 +76,12 @@ impl ParameterStorageId {
                     .expect("validated shared static owner")
                     .clone(),
             ),
-            crate::ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
-                Self::ExecutionUnit {
-                    group: group.clone(),
-                    global_unit: *global_unit,
-                }
-            }
+            crate::ParameterGroupOwner::ExecutionUnit {
+                group, global_unit, ..
+            } => Self::ExecutionUnit {
+                group: group.clone(),
+                global_unit: *global_unit,
+            },
         }
     }
 }
@@ -328,8 +328,8 @@ impl ComponentDefinition {
             .iter()
             .filter(|owned| match owned.owner() {
                 crate::ParameterGroupOwner::ExecutionUnit {
-                    group, global_unit, ..
-                } => group == group_id && *global_unit == index,
+                    group, consumers, ..
+                } => group == group_id && consumers.contains(&index),
                 crate::ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
                     .iter()
                     .any(|(group, unit)| group == group_id && *unit == index),
@@ -473,7 +473,8 @@ pub trait ComponentKernel<B: NeuralBackend> {
     ) -> Result<Option<Vec<i32>>, Self::Error> {
         Ok(None)
     }
-    /// Builds one unloaded resource after shared address validation.
+    /// Builds one canonical parameter resource after shared storage validation.
+    /// This address identifies its physical owner; equations receive logical consumers.
     fn build_unit(
         &self,
         address: ExecutionUnitAddress,
@@ -743,12 +744,17 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
 pub struct ComponentSelection {
     component: String,
     layout: crate::ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     units: std::collections::BTreeSet<(usize, usize)>,
     state: Option<PartitionState>,
     owns_output: bool,
 }
 
 impl ComponentSelection {
+    /// Selected logical invocations and independently leased physical owners.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
+    }
     /// Selected mutable state, including explicit global-ordinal gaps.
     pub fn state(&self) -> Option<&PartitionState> {
         self.state.as_ref()
@@ -787,6 +793,11 @@ impl ComponentDefinition {
         if partition.graph() != definition.parameters.graph()
             || partition.unit_layout() != definition.parameters.unit_layout()
             || partition.parameter_bindings() != definition.parameters.select_owned(partition)
+            || !definition
+                .parameters
+                .invocations()
+                .select_invocations(partition.units())
+                .is_ok_and(|selected| &selected == partition.invocations())
         {
             return Err(invalid("partition parameter ownership"));
         }
@@ -830,6 +841,7 @@ impl ComponentDefinition {
         let selected = ComponentSelection {
             component: self.id.clone(),
             layout: self.parameters.unit_layout().clone(),
+            invocations: partition.invocations().clone(),
             units,
             state: expected,
             owns_output: partition.ownership().owns_output(),
@@ -1339,6 +1351,12 @@ where
     ) -> Result<crate::ExecutionUnitLayout, crate::ArchitectureExecutionLayoutError<K::Error>> {
         Ok(self.definition().parameters.unit_layout().clone())
     }
+    fn execution_unit_storage_map(
+        &self,
+    ) -> Result<crate::ExecutionUnitAddressMap, crate::ArchitectureExecutionLayoutError<K::Error>>
+    {
+        Ok(self.definition().parameters.invocations().clone())
+    }
     fn group_unit_count(&self, group: usize) -> Result<usize, K::Error> {
         self.definition().unit_count(group).map_err(Into::into)
     }
@@ -1357,7 +1375,44 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<K::Unit, K::Error> {
-        self.kernel.build_unit(self.address(group, index)?, context)
+        let address = self.address(group, index)?;
+        let ordinal = self
+            .definition()
+            .parameters
+            .unit_layout()
+            .ordinal(group, index)
+            .expect("validated invocation");
+        let storage = self
+            .definition()
+            .parameters
+            .invocations()
+            .resolve(ordinal, address)
+            .expect("validated declaration storage")
+            .storage_location();
+        self.kernel.build_unit(storage.address(), context)
+    }
+    fn build_storage_unit(
+        &self,
+        storage: crate::ExecutionUnitStorageLocation,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<K::Unit, K::Error> {
+        let address = storage.address();
+        let invocations = self.selection.as_ref().map_or_else(
+            || self.definition().parameters.invocations(),
+            |selection| selection.invocations(),
+        );
+        if invocations
+            .storage_layout()
+            .ordinal(address.group(), address.index())
+            .is_none()
+        {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.definition().id.clone(),
+                resource: format!("physical owner {address:?}"),
+            }
+            .into());
+        }
+        self.kernel.build_unit(address, context)
     }
     fn begin_forward<'a>(
         &mut self,

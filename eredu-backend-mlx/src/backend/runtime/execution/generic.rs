@@ -432,9 +432,9 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         A::Error: std::fmt::Display,
     {
         let unit_count = self.unit_ids.len();
-        self.materialize_resident(unit_count, stream, |address, context| {
+        self.materialize_resident(unit_count, stream, |storage, context| {
             architecture
-                .build_unit(address.group(), address.index(), context)
+                .build_storage_unit(storage, context)
                 .map_err(|error| Error::Other(Box::new(error)))
         })
     }
@@ -461,7 +461,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         mut self,
         unit_count: usize,
         stream: &Stream,
-        mut build: impl FnMut(ExecutionUnitAddress, &Stream) -> Result<U, Error>,
+        mut build: impl FnMut(eredu_runtime::ExecutionUnitStorageLocation, &Stream) -> Result<U, Error>,
     ) -> Result<MlxResidentPolicy<U>, Error>
     where
         U: Parameterized<MlxTensor>,
@@ -487,11 +487,11 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         transfer.order_after(stream)?;
         let mut units = Vec::with_capacity(self.unit_ids.len());
         for (index, lease) in transfer.leases().iter().enumerate() {
-            let address = self
-                .layout
-                .address(index)
-                .expect("validated layout covers every resident unit");
-            let mut unit = MlxModule::new(build(address, stream)?);
+            let storage = self
+                .invocations
+                .storage_location(index)
+                .expect("validated physical owner");
+            let mut unit = MlxModule::new(build(storage, stream)?);
             self.populator.populate(&mut unit, lease)?;
             units.push(Some(unit));
         }

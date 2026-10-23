@@ -72,7 +72,8 @@ pub fn materialize_ear_encoder_pipeline(
 ) -> Result<(MlxEarEncoderPipeline, LayerwiseModelMetadata), BackendFailure> {
     let (prepared, partition, cuts, manifest, plan, tensor_group, activation_dtype) =
         prepared.into_parts();
-    let (config, prefix, definition, local_layout, source, units) = prepared.into_parts();
+    let (config, prefix, definition, local_layout, invocations, source, units) =
+        prepared.into_parts();
     let architecture = EncoderKernel::new_partition(
         definition,
         config,
@@ -85,6 +86,7 @@ pub fn materialize_ear_encoder_pipeline(
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,
         source,
+        invocations,
         units,
         manifest,
         plan,

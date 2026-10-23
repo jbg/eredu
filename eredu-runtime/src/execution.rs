@@ -145,6 +145,10 @@ impl ExecutionUnitLeaseAddress {
     pub const fn invocation_ordinal(self) -> usize {
         self.ordinal
     }
+    /// Original logical equation address, independent of its physical owner.
+    pub const fn invocation_address(self) -> ExecutionUnitAddress {
+        self.logical
+    }
     /// Resolves the physical pool coordinates without reusing invocation indices.
     pub const fn storage_location(self) -> ExecutionUnitStorageLocation {
         self.storage
@@ -252,6 +256,40 @@ impl ExecutionUnitAddressMap {
         })
     }
 
+    /// Checks exact logical identities and group schema before resource construction.
+    pub fn validate_layout(
+        &self,
+        layout: &ExecutionUnitLayout,
+    ) -> Result<(), ExecutionUnitAddressMapError> {
+        if self.data.storage.group_count() != layout.group_count() {
+            return Err(ExecutionUnitAddressMapError::LayoutGroupCount {
+                expected: layout.group_count(),
+                actual: self.data.storage.group_count(),
+            });
+        }
+        for group in 0..layout.group_count() {
+            if self.data.storage.group_id(group) != layout.group_id(group) {
+                return Err(ExecutionUnitAddressMapError::LayoutGroupIdentity { group });
+            }
+            let expected = layout.group_range(group).expect("declared group");
+            let actual = self.group_range(group).expect("mapped group");
+            if expected.len() != actual.len() {
+                return Err(ExecutionUnitAddressMapError::InvocationCount {
+                    group,
+                    expected: expected.len(),
+                    actual: actual.len(),
+                });
+            }
+            for ordinal in expected {
+                self.resolve(
+                    ordinal,
+                    layout.address(ordinal).expect("declared invocation"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Retains logical consumers and their physical owners in the original order.
     /// A resource remains available when its canonical address is not itself a
     /// selected invocation. Selection cannot add or reorder logical authority.
@@ -295,9 +333,22 @@ impl ExecutionUnitAddressMap {
         Self::new(&storage, references)
     }
 
+    /// Exact logical consumers in canonical traversal order, independently of storage.
+    pub fn logical_addresses(&self) -> impl ExactSizeIterator<Item = ExecutionUnitAddress> + '_ {
+        self.data.addresses.iter().map(|(logical, _)| *logical)
+    }
+
     /// Selected physical resources, independent of their invocation count.
     pub fn storage_layout(&self) -> &ExecutionUnitLayout {
         &self.data.storage
+    }
+
+    /// Validated physical factory coordinates at one dense storage ordinal.
+    pub fn storage_location(&self, ordinal: usize) -> Option<ExecutionUnitStorageLocation> {
+        Some(ExecutionUnitStorageLocation {
+            ordinal,
+            address: self.data.storage.address(ordinal)?,
+        })
     }
 
     /// Resolves an invocation only when its logical address matches its slot.
@@ -380,6 +431,31 @@ impl ExecutionUnitAddressMap {
 /// An invalid logical-to-local execution address mapping or invocation.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ExecutionUnitAddressMapError {
+    /// Physical and logical declarations have different group counts.
+    #[error("storage map has {actual} groups, expected {expected}")]
+    LayoutGroupCount {
+        /// Logical group count.
+        expected: usize,
+        /// Physical group count.
+        actual: usize,
+    },
+    /// A physical group has another semantic identity.
+    #[error("storage map group {group} differs from its logical declaration")]
+    LayoutGroupIdentity {
+        /// Canonical group slot.
+        group: usize,
+    },
+    /// A group omits or invents logical invocations.
+    #[error("storage map group {group} has {actual} invocations, expected {expected}")]
+    InvocationCount {
+        /// Canonical group slot.
+        group: usize,
+        /// Declared invocation count.
+        expected: usize,
+        /// Mapped invocation count.
+        actual: usize,
+    },
+
     /// A projection refers to a logical invocation outside its retained authority.
     #[error("unretained logical invocation {address:?}")]
     UnknownInvocation {

@@ -871,11 +871,23 @@ references retain distinct invocation identities. The validated map projects gro
 transfer sequences, distinct resource windows and group completion from invocation
 positions. Bounded native acquisition and completion consume those projections through
 the ordinary policy lifecycle; resident execution loans the selected physical module.
+Leased parameter owners declare their canonical group/unit identity and explicit
+logical consumers. Parameter descriptions validate consumer membership, reject
+inconsistent declarations for one owner and conflicting leased owners for an invocation,
+and retain the derived physical map. Shared component adapters project that map directly.
+Factories receive validated physical storage coordinates; equations retain logical
+invocation addresses. Preparation resolves and places each canonical binding list once.
+Consuming parts retain
+the selected invocation map alongside physical bindings; partition and native construction
+validate it instead of inferring consumers from physical addresses. Source and parameter
+projections cannot restore logical invocations discarded by an earlier selection.
 The portable resident runtime validates the architecture's storage map against its
 exact logical layout before constructing or adopting modules. Its grouped pool contains
 one module per canonical physical owner. Traversal resolves each logical invocation
 through the retained map; equation addresses, mutable-state slots, observation hooks
-and remaining-tail counts follow logical positions. Parameter visitation and editing
+and remaining-tail counts follow logical positions. Native resident acquisition,
+inspection and completion retain logical lease proofs while borrowing physical pool slots;
+rejected completion restores its original resident slot. Parameter visitation and editing
 borrow physical owners once, and subsequent consumers see that same module.
 Cold preparation retains that map with per-owner device payloads and host-transfer
 capacities. Device and streamed-host admission use the largest distinct-resource

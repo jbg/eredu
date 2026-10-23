@@ -85,6 +85,7 @@ where
     pub(crate) fn new(
         mut architecture: A,
         source: SharedCheckpointSource,
+        invocations: eredu_runtime::ExecutionUnitAddressMap,
         units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
         manifest: CommunicationManifest,
         plan: PartitionedExecutionPlan,
@@ -111,10 +112,7 @@ where
             .into_component_communication(manifest, tensor_group)
             .map_err(BackendFailure::from_error)?;
         let authority = communication.authority();
-        let addresses = units
-            .iter()
-            .map(|(address, _)| *address)
-            .collect::<Vec<_>>();
+        let addresses = invocations.logical_addresses().collect::<Vec<_>>();
         detached_preparation(
             Vec::<Array>::new(),
             || {
@@ -127,6 +125,7 @@ where
                     execution_stream,
                     weights_stream,
                     |_| false,
+                    invocations,
                     vec![],
                     units,
                 )

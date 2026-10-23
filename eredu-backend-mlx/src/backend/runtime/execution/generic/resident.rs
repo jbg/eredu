@@ -18,6 +18,7 @@ pub struct MlxResidentPolicy<U> {
 /// Exclusive borrow-by-ownership of one permanently resident unit.
 pub struct MlxResidentUnit<U> {
     index: usize,
+    invocation: eredu_runtime::ExecutionUnitLeaseAddress,
     unit: MlxModule<U>,
 }
 
@@ -152,14 +153,13 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
         F: FnOnce(&Stream) -> Result<U, E>,
         V: FnOnce(&mut U) -> Result<(), Self::Error>,
     {
-        if self.layout.address(ordinal) != Some(address) {
-            return Err(LayerwiseAcquireError::Policy(Error::Parallel(
-                "parameter unit address differs from the selected layout".into(),
-            )));
-        }
+        let invocation = self
+            .invocations
+            .resolve(ordinal, address)
+            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
         let unit = self
             .units
-            .get_mut(ordinal)
+            .get_mut(invocation.storage_location().ordinal())
             .and_then(Option::as_mut)
             .ok_or_else(|| {
                 LayerwiseAcquireError::Policy(Error::Parallel("parameter unit is not idle".into()))
@@ -174,10 +174,9 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
         active: Option<(usize, ExecutionUnitAddress, Self::Lease)>,
         _stream: &Stream,
     ) {
-        let Some((ordinal, _, lease)) = active else {
+        let Some((_, _, lease)) = active else {
             return;
         };
-        debug_assert_eq!(lease.index, ordinal);
         if let Some(slot) = self.units.get_mut(lease.index) {
             debug_assert!(slot.is_none());
             if slot.is_none() {
@@ -196,11 +195,11 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
     where
         BF: FnOnce(&Stream) -> Result<U, E>,
     {
-        if self.layout.address(index) != Some(address) {
-            return Err(LayerwiseAcquireError::Policy(Error::Parallel(
-                "resident unit address differs from the selected canonical layout".into(),
-            )));
-        }
+        let invocation = self
+            .invocations
+            .resolve(index, address)
+            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
+        let index = invocation.storage_location().ordinal();
         let count = self.units.len();
         let unit = self
             .units
@@ -212,13 +211,17 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
             .take()
             .ok_or_else(|| Error::Parallel(format!("resident unit {index} is already acquired")))
             .map_err(LayerwiseAcquireError::Policy)?;
-        Ok(MlxResidentUnit { index, unit })
+        Ok(MlxResidentUnit {
+            index,
+            invocation,
+            unit,
+        })
     }
 
     fn complete<'a, StateValues, ContextValues>(
         &mut self,
         index: usize,
-        _address: eredu_runtime::ExecutionUnitAddress,
+        address: eredu_runtime::ExecutionUnitAddress,
         lease: Self::Lease,
         _output: &'a MlxTensor,
         _state_values: StateValues,
@@ -230,19 +233,19 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
         StateValues: Iterator<Item = &'a MlxTensor>,
         ContextValues: Iterator<Item = &'a MlxTensor>,
     {
-        if lease.index != index {
+        let returned = lease
+            .invocation
+            .validate_return(index, address)
+            .map_err(Error::from);
+        let slot = &mut self.units[lease.index];
+        if slot.is_some() {
             return Err(Error::Parallel(format!(
-                "resident completion returned unit {} to slot {index}",
-                lease.index
+                "resident unit slot {} was unexpectedly occupied",
+                lease.index,
             )));
         }
-        let slot = &mut self.units[index];
-        if slot.replace(lease.unit).is_some() {
-            return Err(Error::Parallel(format!(
-                "resident unit slot {index} was unexpectedly occupied"
-            )));
-        }
-        Ok(())
+        *slot = Some(lease.unit);
+        returned
     }
 
     fn finish(&mut self, _output: &MlxTensor, _stream: &Stream) -> Result<(), Self::Error> {

@@ -1036,6 +1036,18 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error>;
 
+    /// Builds a canonical physical owner independently of logical invocation lookup.
+    /// Identity-storage architectures use the ordinary unit constructor; shared
+    /// adapters validate storage identity and dispatch the canonical factory directly.
+    fn build_storage_unit(
+        &self,
+        storage: crate::ExecutionUnitStorageLocation,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Unit, Self::Error> {
+        let address = storage.address();
+        self.build_unit(address.group(), address.index(), context)
+    }
+
     /// Embeds input and prepares architecture-owned forward values.
     fn begin_forward<'a>(
         &mut self,
@@ -1853,9 +1865,6 @@ pub enum ResidentUnitsError<E> {
     /// Physical references disagree with canonical invocation identities.
     #[error("resident invocation map failed: {0}")]
     InvocationMap(#[source] crate::ExecutionUnitAddressMapError),
-    /// Physical groups differ from the declared execution layout.
-    #[error("resident storage groups differ from the declared execution layout")]
-    StorageGroups,
     /// Supplied groups differ from the declared execution graph.
     #[error("resident unit group count {actual} differs from declared {expected}")]
     GroupCount {
@@ -1927,23 +1936,9 @@ where
         layout: &ExecutionUnitLayout,
     ) -> Result<crate::ExecutionUnitAddressMap, ResidentUnitsError<A::Error>> {
         let invocations = architecture.execution_unit_storage_map()?;
-        let storage = invocations.storage_layout();
-        if storage.group_count() != layout.group_count()
-            || (0..layout.group_count()).any(|group| {
-                storage.group_id(group) != layout.group_id(group)
-                    || invocations.group_range(group) != layout.group_range(group)
-            })
-        {
-            return Err(ResidentUnitsError::StorageGroups);
-        }
-        for ordinal in 0..layout.len() {
-            invocations
-                .resolve(
-                    ordinal,
-                    layout.address(ordinal).expect("declared invocation"),
-                )
-                .map_err(ResidentUnitsError::InvocationMap)?;
-        }
+        invocations
+            .validate_layout(layout)
+            .map_err(ResidentUnitsError::InvocationMap)?;
         Ok(invocations)
     }
 
@@ -2007,11 +2002,10 @@ where
                     .group_range(group)
                     .expect("declared execution group")
                     .map(|ordinal| {
-                        let address = invocations
-                            .storage_layout()
-                            .address(ordinal)
+                        let storage = invocations
+                            .storage_location(ordinal)
                             .expect("declared physical owner");
-                        architecture.build_unit(group, address.index(), context)
+                        architecture.build_storage_unit(storage, context)
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(ResidentUnitsError::Architecture)?,

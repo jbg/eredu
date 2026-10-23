@@ -5385,6 +5385,7 @@ mod tests {
         let companion_owner = crate::ParameterGroupOwner::ExecutionUnit {
             group: crate::ExecutionGroupId::new("decoder").unwrap(),
             global_unit: 0,
+            consumers: vec![0],
         };
         exact_transform
             .set_output_companions(vec![
@@ -5455,6 +5456,7 @@ mod tests {
                 crate::ParameterGroupOwner::ExecutionUnit {
                     group: crate::ExecutionGroupId::new("decoder").unwrap(),
                     global_unit: 0,
+                    consumers: vec![0],
                 },
             )
             .unwrap()])

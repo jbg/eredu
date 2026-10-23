@@ -80,7 +80,7 @@ impl PreparedBackboneBindings {
         self,
     ) -> (
         SharedCheckpointSource,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         Vec<WeightBinding>,
         Vec<Vec<WeightBinding>>,
     ) {

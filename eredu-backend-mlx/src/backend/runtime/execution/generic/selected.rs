@@ -211,7 +211,6 @@ where
             .resolve(ordinal, address)
             .map_err(|error| eredu_runtime::LayerwiseAcquireError::Policy(Error::from(error)))?;
         let invocation = local;
-        let local = invocation.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
                 "selected layerwise policy lock was poisoned".into(),
@@ -219,7 +218,7 @@ where
         })?;
         match &mut *policy {
             MlxSelectedLayerwisePolicyInner::Resident(policy) => {
-                policy.inspect_unit(local.ordinal(), local.address(), build, operation, context)
+                policy.inspect_unit(ordinal, address, build, operation, context)
             }
             MlxSelectedLayerwisePolicyInner::Bounded(policy) => {
                 policy.inspect_mapped(&self.addresses, invocation, build, operation, context)
@@ -271,7 +270,6 @@ where
             .addresses
             .resolve(ordinal, address)
             .map_err(|error| eredu_runtime::LayerwiseAcquireError::Policy(Error::from(error)))?;
-        let local = address.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
                 "selected layerwise policy lock was poisoned".into(),
@@ -279,7 +277,7 @@ where
         })?;
         let lease = match &mut *policy {
             MlxSelectedLayerwisePolicyInner::Resident(policy) => policy
-                .acquire(local.ordinal(), local.address(), build, context)
+                .acquire(ordinal, address.invocation_address(), build, context)
                 .map(MlxSelectedUnitLeaseInner::Resident),
             MlxSelectedLayerwisePolicyInner::Bounded(policy) => policy
                 .acquire_mapped(&self.addresses, address, build, context)
@@ -322,7 +320,6 @@ where
             return Err(error.into());
         }
         let invocation = lease.address;
-        let storage = invocation.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
         })?;
@@ -331,8 +328,8 @@ where
                 MlxSelectedLayerwisePolicyInner::Resident(policy),
                 MlxSelectedUnitLeaseInner::Resident(lease),
             ) => policy.complete(
-                storage.ordinal(),
-                storage.address(),
+                ordinal,
+                address,
                 lease,
                 output,
                 state_values,

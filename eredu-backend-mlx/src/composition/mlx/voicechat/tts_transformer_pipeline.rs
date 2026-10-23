@@ -150,7 +150,8 @@ pub fn materialize_voicechat_tts_transformer_pipeline(
 > {
     let (prepared, partition, manifest, plan, tensor_group, activation_dtype) =
         prepared.into_parts();
-    let (config, definition, local_layout, source, units, state_layout) = prepared.into_parts();
+    let (config, definition, local_layout, invocations, source, units, state_layout) =
+        prepared.into_parts();
     let architecture =
         TransformerKernel::from_partition(definition, config, local_layout.as_ref(), &partition)
             .map_err(BackendFailure::from_error)?;
@@ -166,6 +167,7 @@ pub fn materialize_voicechat_tts_transformer_pipeline(
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,
         source,
+        invocations,
         units,
         manifest,
         plan,

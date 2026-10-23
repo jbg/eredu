@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ExecutionUnitLayout, LocalModelLayout,
-    PreparedComponent, RecipeBindingError, WeightBinding,
+    BindingPlacementError, ComponentPreparationError, LocalModelLayout, PreparedComponent,
+    RecipeBindingError, WeightBinding,
 };
 
 use super::{
@@ -212,7 +212,7 @@ impl PreparedPerceptionBindings {
     ) -> (
         PerceptionDimensions,
         eredu_runtime::ComponentDefinition,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
@@ -271,11 +271,12 @@ impl PreparedPerceptionPartitionBindings {
         PerceptionDimensions,
         eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        let (definition, local_layout, _, source, units) = self
+        let (definition, local_layout, invocations, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
@@ -283,6 +284,7 @@ impl PreparedPerceptionPartitionBindings {
             self.dimensions,
             definition,
             local_layout,
+            invocations,
             source,
             units,
             self.state_layout,

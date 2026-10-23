@@ -313,6 +313,117 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         bounded.policy().addresses,
         [(0, 0, 0), (0, 0, 0), (1, 1, 0), (0, 0, 0)]
     );
+    let prototype = definition(false);
+    let graph = prototype.parameters().graph();
+    let shared_layout = ExecutionUnitLayout::new(graph, [1, 2]).unwrap();
+    let weights = eredu_runtime::ParameterGroupSpec::new(
+        "shared",
+        eredu_runtime::ParameterRole::Replicated,
+        [eredu_runtime::ParameterMemberSpec::new(
+            "shared.weight",
+            [1],
+            eredu_runtime::MemberSharding::Replicated,
+        )],
+    )
+    .unwrap();
+    let parameters = ArchitectureParameterDescription::new(
+        graph,
+        &shared_layout,
+        [weights.clone()],
+        [eredu_runtime::OwnedParameterGroupSpec::new(
+            eredu_runtime::ParameterGroupOwner::execution_unit_consumers(
+                shared_layout.group_id(1).unwrap().clone(),
+                1,
+                [0, 1],
+            ),
+            weights,
+        )],
+    )
+    .unwrap();
+    let shared_definition = ComponentDefinition::new(
+        "shared-fixture",
+        parameters,
+        ["first", "second.0", "second.1"]
+            .map(|path| ComponentUnit {
+                path: path.into(),
+                state: 0..0,
+            })
+            .to_vec(),
+        vec![
+            prototype.group_transport(0).unwrap().clone(),
+            prototype.group_transport(1).unwrap().clone(),
+        ],
+        "first",
+        vec![],
+        prototype.state_layout().clone(),
+        ArchitectureStatePartitionPlan::new([]),
+    )
+    .unwrap();
+    let mut shared = ResidentRuntime::new(
+        ComponentAdapter::new(
+            shared_definition,
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap(),
+        &(),
+    )
+    .unwrap();
+    for extended in [true, false, true] {
+        let output = shared.forward((&input, extended), &mut state, &()).unwrap();
+        assert_eq!(
+            output.0,
+            if extended {
+                vec![7, 0, 11, 11]
+            } else {
+                vec![7, 0]
+            }
+        );
+    }
+    assert_eq!(shared.units().iter().map(Vec::len).sum::<usize>(), 2);
+    shared.units_mut()[1][0].marker = 29;
+    assert_eq!(
+        shared.forward((&input, true), &mut state, &()).unwrap().0,
+        [7, 0, 29, 29]
+    );
+    let declaration = shared.architecture().definition().clone();
+    let partition = eredu_runtime::ArchitecturePartition::from_description(
+        declaration.parameters(),
+        [("second", 0..1)],
+        eredu_runtime::PartitionOwnership::new(false, true, std::iter::empty::<String>()).unwrap(),
+        declaration.state_layout(),
+        declaration.state_partition_plan(),
+        (),
+        eredu_runtime::NoAuxiliaryBoundarySchema::new(2),
+    )
+    .unwrap();
+    let other_storage = declaration
+        .parameters()
+        .invocations()
+        .storage_location(0)
+        .unwrap();
+    let selected = ComponentAdapter::new(
+        declaration,
+        Kernel {
+            fail: false,
+            pinned: None,
+        },
+    )
+    .unwrap()
+    .select_partition(&partition)
+    .unwrap();
+    assert!(selected.build_storage_unit(other_storage, &()).is_err());
+    assert_eq!(
+        selected
+            .build_storage_unit(partition.invocations().storage_location(0).unwrap(), &())
+            .unwrap()
+            .marker,
+        11
+    );
+    assert_eq!(selected.build_unit(1, 0, &()).unwrap().marker, 11);
+    assert!(selected.build_unit(1, 1, &()).is_err());
     // Topology admission and low-level construction retain sparse global IDs.
     let prototype = definition(false);
     let graph = prototype.parameters().graph();

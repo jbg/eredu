@@ -134,13 +134,14 @@ pub fn materialize_voicechat_rnnt_predictor_pipeline(
         .expect("validated recurrent state ownership")
         .layout()
         .clone();
-    let (dimensions, definition, _layout, source, units) = prepared.into_parts();
+    let (dimensions, definition, invocations, source, units) = prepared.into_parts();
     let architecture =
         RnntPredictorKernel::new_partition(definition, dimensions, &partition, &cuts)
             .map_err(BackendFailure::from_error)?;
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,
         source,
+        invocations,
         units,
         manifest,
         plan,

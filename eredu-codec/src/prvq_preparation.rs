@@ -8,7 +8,7 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
-    ExecutionUnitLayout, LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
+    LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use crate::{prvq::Geometry, prvq_layered::quantizer_component_definition};
@@ -160,7 +160,7 @@ impl PreparedQuantizerBindings {
         String,
         eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {

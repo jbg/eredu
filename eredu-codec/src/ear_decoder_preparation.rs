@@ -8,7 +8,7 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
-    ExecutionUnitLayout, LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
+    LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
 use crate::{ear_decoder::DecoderConfig, ear_decoder_layered::decoder_component_definition};
@@ -173,7 +173,7 @@ impl PreparedDecoderBindings {
         String,
         eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
@@ -237,10 +237,11 @@ impl PreparedDecoderPartitionBindings {
         String,
         eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
-        let (definition, local_layout, _, source, units) = self
+        let (definition, local_layout, invocations, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
@@ -249,6 +250,7 @@ impl PreparedDecoderPartitionBindings {
             self.prefix,
             definition,
             local_layout,
+            invocations,
             source,
             units,
         )

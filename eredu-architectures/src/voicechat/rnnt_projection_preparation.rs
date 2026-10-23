@@ -7,7 +7,7 @@ use super::{
     },
 };
 use eredu_checkpoint::store::SharedCheckpointSource;
-use eredu_runtime::{ExecutionUnitLayout, LocalModelLayout, PreparedComponent, WeightBinding};
+use eredu_runtime::{LocalModelLayout, PreparedComponent, WeightBinding};
 
 /// Exact four-unit source authority, including vocabulary placement when selected.
 /// Recurrent recipes and replica declarations are excluded from this owner.
@@ -85,7 +85,7 @@ impl PreparedRnntProjectionBindings {
         RnntDimensions,
         eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {

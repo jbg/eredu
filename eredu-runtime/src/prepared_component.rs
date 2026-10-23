@@ -21,6 +21,9 @@ pub enum ComponentPreparationError {
     /// Selected unit identities are not a canonical subset.
     #[error(transparent)]
     Units(#[from] ExecutionUnitLayoutError),
+    /// Selected invocation references are incompatible with retained storage.
+    #[error(transparent)]
+    Invocations(#[from] crate::ExecutionUnitAddressMapError),
     /// Source authority cannot be restricted to the declared physical inputs.
     #[error(transparent)]
     Source(#[from] StoreError),
@@ -188,6 +191,7 @@ pub struct PreparedComponent<D: ComponentPreparationDeclaration> {
     source: SharedCheckpointSource,
     units: Vec<Vec<WeightBinding>>,
     unit_layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     pinned: BTreeMap<ParameterStorageId, Vec<WeightBinding>>,
     local_layout: Option<LocalModelLayout>,
 }
@@ -256,7 +260,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             .collect();
         let (source, resources) = prepare_resource_bindings(source, &id, resources)
             .map_err(ComponentPreparationError::from)?;
-        let mut units = vec![Vec::new(); description.unit_layout().len()];
+        let mut units = vec![Vec::new(); description.invocations().storage_layout().len()];
         let mut pinned = BTreeMap::new();
         for (owner, bindings) in resources {
             let plan = WeightBindingPlan::new(&bindings)
@@ -313,7 +317,8 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                     .group_index(group.as_str())
                     .expect("validated parameter owner");
                 let ordinal = description
-                    .unit_layout()
+                    .invocations()
+                    .storage_layout()
                     .ordinal(group, *global_unit)
                     .expect("validated execution unit");
                 units[ordinal] = bindings;
@@ -322,12 +327,14 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             }
         }
         let unit_layout = description.unit_layout().clone();
+        let invocations = description.invocations().clone();
         Ok(Self {
             id,
             declaration,
             source,
             units,
             unit_layout,
+            invocations,
             pinned,
             local_layout: None,
         })
@@ -345,18 +352,21 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     pub fn source(&self) -> &SharedCheckpointSource {
         &self.source
     }
-    /// Independently leased units in canonical layout order.
+    /// Independently leased physical owners in canonical storage order.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
         &self.units
     }
-    /// Selected logical addresses paired with their independently leased bindings.
+    /// Canonical physical addresses paired with independently leased bindings.
     /// Dense storage ordinals never replace group or global unit identities.
     pub fn addressed_unit_bindings(
         &self,
     ) -> impl ExactSizeIterator<Item = (ExecutionUnitAddress, &[WeightBinding])> {
         self.units.iter().enumerate().map(|(ordinal, bindings)| {
             (
-                self.unit_layout.address(ordinal).expect("selected unit"),
+                self.invocations
+                    .storage_layout()
+                    .address(ordinal)
+                    .expect("selected physical owner"),
                 bindings.as_slice(),
             )
         })
@@ -376,6 +386,11 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         &self.unit_layout
     }
 
+    /// Selected logical consumers and their canonical physical owners.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
+    }
+
     /// Restricts authority to one selected invocation's actual physical inputs.
     pub fn unit_source(
         &self,
@@ -388,7 +403,11 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 group: address.group(),
                 index: address.index(),
             })?;
-        self.restrict_bindings(self.units[ordinal].iter())
+        let storage = self
+            .invocations
+            .resolve(ordinal, address)?
+            .storage_location();
+        self.restrict_bindings(self.units[storage.ordinal()].iter())
     }
 
     /// Exact authority for the retained pinned aggregate, excluding leased units.
@@ -444,6 +463,18 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         if &layout != self.declaration.parameters().unit_layout() {
             return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
         }
+        let invocations =
+            architecture
+                .execution_unit_storage_map()
+                .map_err(|error| match error {
+                    crate::ArchitectureExecutionLayoutError::Architecture(error) => error,
+                    crate::ArchitectureExecutionLayoutError::Layout(error) => {
+                        A::Error::from(ComponentPreparationError::Units(error))
+                    }
+                })?;
+        if &invocations != self.declaration.parameters().invocations() {
+            return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
+        }
         for bindings in self.pinned.values_mut() {
             *bindings = crate::apply_parameter_storage_layouts(
                 architecture.static_modules(),
@@ -451,8 +482,11 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             );
         }
         for (ordinal, bindings) in self.units.iter_mut().enumerate() {
-            let address = self.unit_layout.address(ordinal).expect("selected unit");
-            let unit = architecture.build_unit(address.group(), address.index(), context)?;
+            let storage = self
+                .invocations
+                .storage_location(ordinal)
+                .expect("selected physical owner");
+            let unit = architecture.build_storage_unit(storage, context)?;
             *bindings = crate::apply_parameter_storage_layouts(&unit, std::mem::take(bindings));
         }
         Ok(self)
@@ -583,6 +617,27 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     ) -> Result<PreparedComponent<P>, ComponentPreparationError> {
         let id = id.into();
         let description = declaration.parameters();
+        for address in (0..description.unit_layout().len()).map(|ordinal| {
+            description
+                .unit_layout()
+                .address(ordinal)
+                .expect("declared invocation")
+        }) {
+            let group = description
+                .unit_layout()
+                .group_id(address.group())
+                .expect("declared group");
+            let original = (0..self.unit_layout.group_count())
+                .find(|&index| self.unit_layout.group_id(index) == Some(group));
+            if original
+                .is_none_or(|index| self.unit_layout.ordinal(index, address.index()).is_none())
+            {
+                return Err(ComponentPreparationError::InvalidProjection {
+                    component: id,
+                    target: format!("invocation {}:{}", group.as_str(), address.index()),
+                });
+            }
+        }
         let members = self
             .declaration
             .parameters()
@@ -623,7 +678,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let mut units = vec![Vec::new(); description.unit_layout().len()];
+        let mut units = vec![Vec::new(); description.invocations().storage_layout().len()];
         let mut pinned = BTreeMap::<ParameterStorageId, Vec<WeightBinding>>::new();
         let mut local_layout = self
             .local_layout
@@ -640,7 +695,8 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                     .group_index(group.as_str())
                     .expect("validated group");
                 let ordinal = description
-                    .unit_layout()
+                    .invocations()
+                    .storage_layout()
                     .ordinal(group, *global_unit)
                     .expect("validated unit");
                 &mut units[ordinal]
@@ -686,12 +742,14 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             inputs,
         )?);
         let unit_layout = description.unit_layout().clone();
+        let invocations = description.invocations().clone();
         Ok(PreparedComponent {
             id,
             declaration,
             source,
             units,
             unit_layout,
+            invocations,
             pinned,
             local_layout,
         })
@@ -704,19 +762,26 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         mut self,
         addresses: impl IntoIterator<Item = ExecutionUnitAddress>,
     ) -> Result<Self, ComponentPreparationError> {
-        let selected = self.unit_layout.select(addresses)?;
+        let addresses = addresses.into_iter().collect::<Vec<_>>();
+        let selected = self.unit_layout.select(addresses.iter().copied())?;
+        let invocations = self.invocations.select_invocations(addresses)?;
         let mut retained = self.units.into_iter().map(Some).collect::<Vec<_>>();
-        self.units = (0..selected.len())
+        self.units = (0..invocations.storage_layout().len())
             .map(|ordinal| {
-                let address = selected.address(ordinal).expect("selected address");
+                let address = invocations
+                    .storage_layout()
+                    .address(ordinal)
+                    .expect("selected physical owner");
                 let original = self
-                    .unit_layout
+                    .invocations
+                    .storage_layout()
                     .ordinal(address.group(), address.index())
                     .expect("validated subset");
                 retained[original].take().expect("unique selected address")
             })
             .collect();
         self.unit_layout = selected;
+        self.invocations = invocations;
         let inputs = self
             .units
             .iter()
@@ -743,28 +808,28 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         self,
     ) -> (
         Option<LocalModelLayout>,
-        ExecutionUnitLayout,
+        crate::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
         BTreeMap<ParameterStorageId, Vec<WeightBinding>>,
     ) {
         (
             self.local_layout,
-            self.unit_layout,
+            self.invocations,
             self.source,
             self.units,
             self.pinned,
         )
     }
 
-    /// Transfers unit-only authority with explicit canonical invocation addresses.
+    /// Transfers unit-only authority with explicit canonical physical owner addresses.
     pub fn into_addressed_unit_parts(
         self,
     ) -> Result<
         (
             D,
             Option<LocalModelLayout>,
-            ExecutionUnitLayout,
+            crate::ExecutionUnitAddressMap,
             SharedCheckpointSource,
             Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
         ),
@@ -774,21 +839,29 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         let units = units
             .into_iter()
             .enumerate()
-            .map(|(ordinal, bindings)| (layout.address(ordinal).expect("selected unit"), bindings))
+            .map(|(ordinal, bindings)| {
+                (
+                    layout
+                        .storage_layout()
+                        .address(ordinal)
+                        .expect("selected physical owner"),
+                    bindings,
+                )
+            })
             .collect();
         Ok((declaration, local, layout, source, units))
     }
 
     /// Moves the original typed declaration with its selected unit resources.
-    /// Global semantic ownership stays in the declaration; the returned layout
-    /// identifies its exact selected invocation subset without rebuilding facts.
+    /// Global semantic ownership stays in the declaration; the returned map
+    /// retains selected consumers and physical owners without rebuilding facts.
     pub fn into_declared_unit_parts(
         self,
     ) -> Result<
         (
             D,
             Option<LocalModelLayout>,
-            ExecutionUnitLayout,
+            crate::ExecutionUnitAddressMap,
             SharedCheckpointSource,
             Vec<Vec<WeightBinding>>,
         ),
@@ -800,7 +873,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         Ok((
             self.declaration,
             self.local_layout,
-            self.unit_layout,
+            self.invocations,
             self.source,
             self.units,
         ))
@@ -812,7 +885,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     ) -> Result<
         (
             Option<LocalModelLayout>,
-            ExecutionUnitLayout,
+            crate::ExecutionUnitAddressMap,
             SharedCheckpointSource,
             Vec<Vec<WeightBinding>>,
         ),
@@ -821,7 +894,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         if !self.pinned.is_empty() {
             return Err(ComponentPreparationError::PinnedResources(self.id));
         }
-        Ok((self.local_layout, self.unit_layout, self.source, self.units))
+        Ok((self.local_layout, self.invocations, self.source, self.units))
     }
 }
 
