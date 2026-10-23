@@ -171,6 +171,12 @@ impl ComponentPreparationDeclaration for crate::ComponentDefinition {
     }
 }
 
+impl<D: ComponentPreparationDeclaration> ComponentPreparationDeclaration for Arc<D> {
+    fn parameters(&self) -> &ArchitectureParameterDescription {
+        self.as_ref().parameters()
+    }
+}
+
 /// Consuming exact bindings with restricted source authority and retained placement.
 ///
 /// Family code supplies admitted recipes, including precision policy and special

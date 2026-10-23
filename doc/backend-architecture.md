@@ -608,6 +608,10 @@ Perception preparation retains its complete parameter, transport and Conformer c
 definition through precision, placement and stage selection. Pipeline validation borrows
 that declaration, and native complete and partition assembly consume it with the exact
 selected resources. Family ownership checks retain the stage-specific cache slice.
+VoiceChat backbone preparation retains the ordinary Nemotron definition in shared
+ownership with its executable. Binding storage preferences and cold resource reports
+borrow the same parameter declaration. Resident and bounded construction retain the
+existing pinned vocabulary modules and independently leased target blocks.
 TTS transformer preparation retains its definition through precision, tensor placement
 and stage selection. Selected state geometry preserves global slot identities while
 recording rank-local cache heads. Complete, local-partition and pipeline assembly

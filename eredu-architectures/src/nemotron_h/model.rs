@@ -273,35 +273,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         args: ModelArgs,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
+        let definition = std::sync::Arc::new(super::parameters::component_definition(
+            super::parameter_description(&args).map_err(Error::backend)?,
+            state_layout(&args).map_err(Error::backend)?,
+        )?);
+        Self::from_definition(args, definition, context)
+    }
+
+    /// Materializes serial statics from the definition retained during exact preparation.
+    pub(crate) fn from_definition(
+        args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Nemotron-H",
             crate::operator_requirements::NEMOTRON_H,
         )?;
         args.validate().map_err(Error::backend)?;
-        let definition = std::sync::Arc::new(super::parameters::component_definition(
-            super::parameter_description(&args).map_err(Error::backend)?,
-            state_layout(&args).map_err(Error::backend)?,
-        )?);
-        let target_units = definition.unit_count(0)?;
-        let prediction_steps = definition.prediction_groups().len();
-        let prediction_pattern = if prediction_steps == 0 {
-            0
-        } else {
-            definition.unit_count(1)?
-        };
         let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
-        let kernel = Self {
-            args,
-            static_modules,
-            definition: std::sync::Arc::clone(&definition),
-            target_units,
-            prediction_steps,
-            prediction_pattern,
-            parallel_geometry: None,
-            expert_realization: None,
-        };
-        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
-            .map_err(Error::from)
+        Self::with_selected_resources(args, definition, static_modules, None)
     }
 
     /// Builds the same target-plus-MTP lifecycle with rank-local geometry.
@@ -320,6 +311,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
             super::parameter_description(&args).map_err(Error::backend)?,
             geometry.state_layout().clone(),
         )?);
+        let static_modules = StaticModules::from_parallel_spec(
+            Self::static_spec(&args),
+            geometry.embedding_range().clone(),
+            geometry.output_range().cloned(),
+            context,
+        )?;
+        Self::with_selected_resources(args, definition, static_modules, Some(geometry))
+    }
+
+    fn with_selected_resources(
+        args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        static_modules: StaticModules<B>,
+        geometry: Option<LocalGeometry>,
+    ) -> Result<LayeredModel<B>, Error> {
         let target_units = definition.unit_count(0)?;
         let prediction_steps = definition.prediction_groups().len();
         let prediction_pattern = if prediction_steps == 0 {
@@ -327,12 +333,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         } else {
             definition.unit_count(1)?
         };
-        let static_modules = StaticModules::from_parallel_spec(
-            Self::static_spec(&args),
-            geometry.embedding_range().clone(),
-            geometry.output_range().cloned(),
-            context,
-        )?;
         let kernel = Self {
             args,
             static_modules,
@@ -340,7 +340,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
             target_units,
             prediction_steps,
             prediction_pattern,
-            parallel_geometry: Some(std::sync::Arc::new(geometry)),
+            parallel_geometry: geometry.map(std::sync::Arc::new),
             expert_realization: None,
         };
         eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)

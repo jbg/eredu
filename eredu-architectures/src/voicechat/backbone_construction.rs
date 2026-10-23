@@ -51,10 +51,14 @@ pub enum BackboneConstructionError {
 /// physical inputs used by the target; pinned vocabulary weights keep their
 /// canonical owners alongside independently leased block bindings.
 pub struct PreparedBackboneBindings {
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<std::sync::Arc<eredu_runtime::ComponentDefinition>>,
 }
 
 impl PreparedBackboneBindings {
+    /// Shared semantic definition retained by preparation and executable construction.
+    pub fn definition(&self) -> &std::sync::Arc<eredu_runtime::ComponentDefinition> {
+        self.prepared.declaration()
+    }
     /// Exact retained physical inputs, including source guards and provenance.
     pub fn source(&self) -> &SharedCheckpointSource {
         self.prepared.source()
@@ -93,9 +97,17 @@ impl PreparedBackboneParameters {
     pub fn prepare_bindings(&self) -> Result<PreparedBackboneBindings, BackbonePreparationError> {
         let description = nemotron_h::parameter_description(&self.args)
             .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?;
+        let definition = std::sync::Arc::new(
+            nemotron_h::component_definition(
+                description,
+                nemotron_h::state_layout(&self.args)
+                    .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?,
+            )
+            .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?,
+        );
         let prepared = PreparedComponent::prepare(
             "voicechat/backbone/target",
-            description,
+            definition,
             self.source.clone(),
             |member| {
                 self.parameters
@@ -123,7 +135,11 @@ impl PreparedBackboneParameters {
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
         let bindings = self.prepare_bindings()?;
-        let model = nemotron_h::CompleteNemotronKernel::<B>::new(self.args.clone(), context)?;
+        let model = nemotron_h::CompleteNemotronKernel::<B>::from_definition(
+            self.args.clone(),
+            std::sync::Arc::clone(bindings.definition()),
+            context,
+        )?;
         let prepared = bindings
             .prepared
             .with_storage_preferences::<B, S, _>(&model, context)?;
@@ -149,7 +165,12 @@ impl PreparedBackboneParameters {
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
         P: ParameterBackend<Parameter = B::Tensor>,
     {
-        let model = nemotron_h::CompleteNemotronKernel::<B>::new(self.args.clone(), context)?;
+        let bindings = self.prepare_bindings()?;
+        let model = nemotron_h::CompleteNemotronKernel::<B>::from_definition(
+            self.args.clone(),
+            std::sync::Arc::clone(bindings.definition()),
+            context,
+        )?;
         let mut runtime = ResidentRuntime::<_, B, S>::new(model, context)?;
         if runtime.units().len() != 1
             || runtime.units()[0].len() != self.args.num_hidden_layers as usize
@@ -164,7 +185,7 @@ impl PreparedBackboneParameters {
                 }
             })
         };
-        let prepared = self.prepare_bindings()?.prepared;
+        let prepared = bindings.prepared;
         let static_source = prepared
             .pinned_source()
             .map_err(BackbonePreparationError::from)?;
