@@ -69,7 +69,7 @@ pub fn layer_parallel_parameter_groups<
     groups.push(module_parameter_group::<B::Tensor, _>(
         format!("{prefix}.router"),
         ParameterRole::Replicated,
-        &block.mlp.router,
+        &block.body.mlp.router,
         |_, _| Ok(MemberSharding::Replicated),
     )?);
 
@@ -81,7 +81,7 @@ pub fn layer_parallel_parameter_groups<
         format!("{prefix}.experts.intermediate"),
         ParameterRole::ExpertIntermediate,
         units,
-        &block.mlp.experts,
+        &block.body.mlp.experts,
         |metadata, shape| expert_member_sharding(metadata.id.as_str(), shape, intermediate),
     )?);
     Ok(groups)

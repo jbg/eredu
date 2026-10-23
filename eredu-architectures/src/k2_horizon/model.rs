@@ -449,21 +449,23 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
             FeedForward::Dense(decoder::Mlp::new(local, layer, context)?)
         };
         Ok(TransformerBlock {
-            self_attention: decoder::Attention::new(local, layer, context)?,
-            mlp: Projections {
-                layer,
-                points: <ModelArgs as decoder::Config>::routed_observation_points(
-                    global,
-                    &format!("model.layers.{layer}"),
+            body: crate::decoder::TransformerBlockBody {
+                self_attention: decoder::Attention::new(local, layer, context)?,
+                mlp: Projections {
                     layer,
-                ),
-                values,
-                feed_forward,
+                    points: <ModelArgs as decoder::Config>::routed_observation_points(
+                        global,
+                        &format!("model.layers.{layer}"),
+                        layer,
+                    ),
+                    values,
+                    feed_forward,
+                },
+                input_norm: norm("input_layernorm")?,
+                post_attention_norm: norm("post_attention_layernorm")?,
+                attention_output_norm: None,
+                feed_forward_output_norm: None,
             },
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
-            attention_output_norm: None,
-            feed_forward_output_norm: None,
             output_norm: None,
         })
     }

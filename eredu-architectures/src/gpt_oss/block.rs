@@ -29,29 +29,33 @@ where
     ) -> Result<TransformerBlock<B>, Error> {
         let prefix = format!("{}.layers.{layer}", args.parameter_root);
         Ok(crate::decoder::TransformerBlock {
-            attention_output_norm: None,
-            feed_forward_output_norm: None,
+            body: crate::decoder::TransformerBlockBody {
+                attention_output_norm: None,
+                feed_forward_output_norm: None,
+                self_attention: Attention::new(args, layer, context)?,
+                mlp: RoutedMlp::new(args, layer, context)?,
+                input_norm: B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        args.hidden_size,
+                        args.rms_norm_eps,
+                        ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
+                            .map_err(Error::backend)?,
+                    ),
+                    context,
+                )?,
+                post_attention_norm: B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        args.hidden_size,
+                        args.rms_norm_eps,
+                        ParameterSpec::trainable(format!(
+                            "{prefix}.post_attention_layernorm.weight"
+                        ))
+                        .map_err(Error::backend)?,
+                    ),
+                    context,
+                )?,
+            },
             output_norm: None,
-            self_attention: Attention::new(args, layer, context)?,
-            mlp: RoutedMlp::new(args, layer, context)?,
-            input_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            post_attention_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.post_attention_layernorm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
         })
     }
 
@@ -63,29 +67,33 @@ where
     ) -> Result<TransformerBlock<B>, Error> {
         let prefix = format!("{}.layers.{layer}", global.parameter_root);
         Ok(crate::decoder::TransformerBlock {
-            attention_output_norm: None,
-            feed_forward_output_norm: None,
+            body: crate::decoder::TransformerBlockBody {
+                attention_output_norm: None,
+                feed_forward_output_norm: None,
+                self_attention: Attention::new(local, layer, context)?,
+                mlp: RoutedMlp::new_partitioned(global, local, layer, context)?,
+                input_norm: B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        global.hidden_size,
+                        global.rms_norm_eps,
+                        ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
+                            .map_err(Error::backend)?,
+                    ),
+                    context,
+                )?,
+                post_attention_norm: B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        global.hidden_size,
+                        global.rms_norm_eps,
+                        ParameterSpec::trainable(format!(
+                            "{prefix}.post_attention_layernorm.weight"
+                        ))
+                        .map_err(Error::backend)?,
+                    ),
+                    context,
+                )?,
+            },
             output_norm: None,
-            self_attention: Attention::new(local, layer, context)?,
-            mlp: RoutedMlp::new_partitioned(global, local, layer, context)?,
-            input_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    global.hidden_size,
-                    global.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            post_attention_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    global.hidden_size,
-                    global.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.post_attention_layernorm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
         })
     }
 

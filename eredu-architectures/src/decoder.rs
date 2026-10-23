@@ -2532,10 +2532,11 @@ impl<B: NeuralBackend> TensorParallelProjectionOperator<B> for Mlp<B> {
     }
 }
 
-/// One RMS-pre-norm residual decoder block.
+/// Attention and feed-forward parameter body of an RMS-pre-norm decoder block.
+/// Terminal invocation normalization is borrowed by the equation and is not owned here.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
+pub struct TransformerBlockBody<B: NeuralBackend, F = Mlp<B>> {
     /// Self-attention operator.
     pub self_attention: Attention<B>,
     /// Feed-forward operator.
@@ -2548,7 +2549,15 @@ pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
     pub attention_output_norm: Option<B::Normalization>,
     /// Optional post-feed-forward normalization before residual addition.
     pub feed_forward_output_norm: Option<B::Normalization>,
-    /// Optional normalization of the completed block output.
+}
+
+/// One decoder invocation with its body and optional terminal normalization.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
+    /// Attention, feed-forward and residual-normalization parameters.
+    pub body: TransformerBlockBody<B, F>,
+    /// Invocation-specific normalization of the completed block output.
     pub output_norm: Option<B::Normalization>,
 }
 
@@ -2575,64 +2584,60 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                 context,
             )
         };
+        let attention_output_norm = config
+            .attention_output_normalization(layer)
+            .map(&norm)
+            .transpose()?;
+        let feed_forward_output_norm = config
+            .feed_forward_output_normalization(layer)
+            .map(&norm)
+            .transpose()?;
+        let output_norm = config
+            .block_output_normalization(layer)
+            .map(|name| {
+                B::normalization(
+                    NormalizationConstructionSpec::learned(
+                        config.hidden_size(),
+                        config.rms_norm_epsilon(),
+                        parameter_spec(config, name).map_err(Error::backend)?,
+                    ),
+                    context,
+                )
+            })
+            .transpose()?;
         Ok(Self {
-            attention_output_norm: config
-                .attention_output_normalization(layer)
-                .map(&norm)
-                .transpose()?,
-            feed_forward_output_norm: config
-                .feed_forward_output_normalization(layer)
-                .map(&norm)
-                .transpose()?,
-            output_norm: config
-                .block_output_normalization(layer)
-                .map(|name| {
-                    B::normalization(
-                        NormalizationConstructionSpec::learned(
-                            config.hidden_size(),
-                            config.rms_norm_epsilon(),
-                            parameter_spec(config, name).map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
-                })
-                .transpose()?,
-            self_attention: Attention::new(config, layer, context)?,
-            mlp: Mlp::new(config, layer, context)?,
-            input_norm: norm(format!(
-                "{}.layers.{layer}.{}.weight",
-                config.parameter_root(),
-                fields.input_norm
-            ))?,
-            post_attention_norm: norm(format!(
-                "{}.layers.{layer}.{}.weight",
-                config.parameter_root(),
-                fields.post_attention_norm
-            ))?,
+            body: TransformerBlockBody {
+                attention_output_norm,
+                feed_forward_output_norm,
+                self_attention: Attention::new(config, layer, context)?,
+                mlp: Mlp::new(config, layer, context)?,
+                input_norm: norm(format!(
+                    "{}.layers.{layer}.{}.weight",
+                    config.parameter_root(),
+                    fields.input_norm
+                ))?,
+                post_attention_norm: norm(format!(
+                    "{}.layers.{layer}.{}.weight",
+                    config.parameter_root(),
+                    fields.post_attention_norm
+                ))?,
+            },
+            output_norm,
         })
     }
 }
 
-impl<B, F> TransformerBlock<B, F>
+impl<B, F> TransformerBlockBody<B, F>
 where
     B: NeuralBackend,
     F: DecoderProjectionOperator<B>,
 {
-    fn normalize_output(
-        &mut self,
-        hidden: B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        match &mut self.output_norm {
-            Some(norm) => norm.forward(&hidden, context),
-            None => Ok(hidden),
-        }
-    }
     /// Executes the shared normalization, attention, cache, and residual lifecycle
     /// with family-owned projection callbacks. The same provider is borrowed
     /// sequentially by value and feed-forward execution.
     fn forward_projections<C, D, V, H>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
@@ -2723,16 +2728,26 @@ where
         };
         let mlp = instrumentation.apply(self.mlp.residual_observation(), mlp)?;
         let hidden = instrumentation.apply("feed_forward.residual", hidden.add(&mlp, context)?)?;
-        self.normalize_output(hidden, context)
+        match output_norm {
+            Some(norm) => norm.forward(&hidden, context),
+            None => Ok(hidden),
+        }
     }
+}
 
+impl<B, F> TransformerBlock<B, F>
+where
+    B: NeuralBackend,
+    F: DecoderProjectionOperator<B>,
+{
     /// Executes this block with replicated projections.
     pub fn forward<C: AttentionCache<B::Tensor>>(
         &mut self,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             None,
             context,
@@ -2753,7 +2768,8 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             None,
             context,
@@ -2783,7 +2799,8 @@ where
     where
         F: TensorParallelProjectionOperator<B>,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             parallel,
             context,
@@ -2816,7 +2833,8 @@ where
         C: AttentionCache<B::Tensor>,
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             None,
             context,
@@ -2859,7 +2877,8 @@ where
     where
         F: TensorParallelProjectionOperator<B>,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             Some(parallel),
             context,
@@ -2892,7 +2911,8 @@ where
         C: AttentionCache<B::Tensor>,
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             Some(parallel),
             context,
@@ -2920,7 +2940,8 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             None,
             context,
@@ -2955,7 +2976,8 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             None,
             context,
@@ -3005,7 +3027,8 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             Some(parallel),
             context,
@@ -3042,7 +3065,8 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.forward_projections(
+        self.body.forward_projections(
+            self.output_norm.as_mut(),
             input,
             Some(parallel),
             context,
@@ -3104,14 +3128,14 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     }
     let head_partition = attention_partition::AttentionPartition::new(config, layer)?;
     let attention_units = head_partition.preferred_units();
-    let attention = match &block.self_attention.input_projection {
+    let attention = match &block.body.self_attention.input_projection {
         AttentionInputProjection::ExternalValue { query, key } => {
             let mut projections = vec![
                 (query, ProjectionSharding::Column),
                 (key, ProjectionSharding::Column),
-                (&block.self_attention.output, ProjectionSharding::Row),
+                (&block.body.self_attention.output, ProjectionSharding::Row),
             ];
-            if let Some(gate) = &block.self_attention.output_gate {
+            if let Some(gate) = &block.body.self_attention.output_gate {
                 projections.push((gate, ProjectionSharding::Column));
             }
             partitioned_projection_group::<B::Tensor, B::Linear>(
@@ -3126,9 +3150,9 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
                 (query, ProjectionSharding::Column),
                 (key, ProjectionSharding::Column),
                 (value, ProjectionSharding::Column),
-                (&block.self_attention.output, ProjectionSharding::Row),
+                (&block.body.self_attention.output, ProjectionSharding::Row),
             ];
-            if let Some(gate) = &block.self_attention.output_gate {
+            if let Some(gate) = &block.body.self_attention.output_gate {
                 projections.push((gate, ProjectionSharding::Column));
             }
             partitioned_projection_group::<B::Tensor, B::Linear>(
@@ -3143,7 +3167,7 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
                 format!("{attention_prefix}.projections"),
                 ParameterRole::AttentionHeads,
                 &fused.projection,
-                &block.self_attention.output,
+                &block.body.self_attention.output,
                 fused_projection_ranges(&fused.layout)?,
                 attention_units,
             )?
@@ -3153,13 +3177,13 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     let input_norm = module_parameter_group::<B::Tensor, _>(
         format!("{prefix}.{}", fields.input_norm),
         ParameterRole::Replicated,
-        &block.input_norm,
+        &block.body.input_norm,
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let post_attention_norm = module_parameter_group::<B::Tensor, _>(
         format!("{prefix}.{}", fields.post_attention_norm),
         ParameterRole::Replicated,
-        &block.post_attention_norm,
+        &block.body.post_attention_norm,
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let mut groups = vec![attention];
@@ -3176,7 +3200,7 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
             |_, _| Ok(MemberSharding::Replicated),
         )?);
     }
-    if let Some(sinks) = &block.self_attention.sinks {
+    if let Some(sinks) = &block.body.self_attention.sinks {
         groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
             format!("{attention_prefix}.{}", fields.attention_sinks),
             ParameterRole::AttentionHeads,
@@ -3194,12 +3218,12 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     }
     for (norm, field, heads) in [
         (
-            &block.self_attention.query_norm,
+            &block.body.self_attention.query_norm,
             fields.attention_query_norm,
             query_heads,
         ),
         (
-            &block.self_attention.key_norm,
+            &block.body.self_attention.key_norm,
             fields.attention_key_norm,
             key_value_heads,
         ),
@@ -3227,11 +3251,11 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     for (name, norm) in [
         (
             config.attention_output_normalization(layer),
-            &block.attention_output_norm,
+            &block.body.attention_output_norm,
         ),
         (
             config.feed_forward_output_normalization(layer),
-            &block.feed_forward_output_norm,
+            &block.body.feed_forward_output_norm,
         ),
     ] {
         if let (Some(name), Some(norm)) = (name, norm) {
@@ -3333,7 +3357,9 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = block_common_parallel_parameter_groups(block, config, layer)?;
     groups.push(dense_mlp_parallel_parameter_group(
-        &block.mlp, config, layer,
+        &block.body.mlp,
+        config,
+        layer,
     )?);
     Ok(groups)
 }

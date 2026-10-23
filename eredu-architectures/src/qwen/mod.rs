@@ -55,35 +55,37 @@ fn assemble_block<B: NeuralBackend, F>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<crate::decoder::TransformerBlock<B, F>, Error> {
     Ok(crate::decoder::TransformerBlock {
-        attention_output_norm: None,
-        feed_forward_output_norm: None,
+        body: crate::decoder::TransformerBlockBody {
+            attention_output_norm: None,
+            feed_forward_output_norm: None,
+            self_attention: Attention::new(args, layer, context)?,
+            mlp,
+            input_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!(
+                        "{}.layers.{layer}.input_layernorm.weight",
+                        args.parameter_root
+                    ))
+                    .map_err(Error::backend)?,
+                ),
+                context,
+            )?,
+            post_attention_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!(
+                        "{}.layers.{layer}.post_attention_layernorm.weight",
+                        args.parameter_root
+                    ))
+                    .map_err(Error::backend)?,
+                ),
+                context,
+            )?,
+        },
         output_norm: None,
-        self_attention: Attention::new(args, layer, context)?,
-        mlp,
-        input_norm: B::normalization(
-            NormalizationConstructionSpec::learned(
-                args.hidden_size,
-                args.rms_norm_eps,
-                ParameterSpec::trainable(format!(
-                    "{}.layers.{layer}.input_layernorm.weight",
-                    args.parameter_root
-                ))
-                .map_err(Error::backend)?,
-            ),
-            context,
-        )?,
-        post_attention_norm: B::normalization(
-            NormalizationConstructionSpec::learned(
-                args.hidden_size,
-                args.rms_norm_eps,
-                ParameterSpec::trainable(format!(
-                    "{}.layers.{layer}.post_attention_layernorm.weight",
-                    args.parameter_root
-                ))
-                .map_err(Error::backend)?,
-            ),
-            context,
-        )?,
     })
 }
 

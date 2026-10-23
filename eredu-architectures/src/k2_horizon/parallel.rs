@@ -256,7 +256,7 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = crate::decoder::block_common_parallel_parameter_groups(block, args, layer)?;
     let prefix = format!("model.layers.{layer}");
-    if let Some(values) = &block.mlp.values {
+    if let Some(values) = &block.body.mlp.values {
         groups.push(module_parameter_group::<B::Tensor, _>(
             format!("{prefix}.self_attn.v_router"),
             ParameterRole::Replicated,
@@ -282,7 +282,7 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                 .apply(group, |name| args.linear_format_for(name))?,
         );
     }
-    match &block.mlp.feed_forward {
+    match &block.body.mlp.feed_forward {
         FeedForward::Dense(mlp) => groups.push(crate::decoder::dense_mlp_parallel_parameter_group(
             mlp, args, layer,
         )?),

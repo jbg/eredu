@@ -245,7 +245,7 @@ where
             .map(|adapter| {
                 adapter.layer(
                     index,
-                    base.self_attention.query_heads * self.config().head_dim(),
+                    base.body.self_attention.query_heads * self.config().head_dim(),
                     self.config().hidden_size(),
                     context,
                 )

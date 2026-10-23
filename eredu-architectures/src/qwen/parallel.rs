@@ -214,7 +214,11 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
-    groups.push(dense_mlp_parallel_parameter_group(&block.mlp, args, layer)?);
+    groups.push(dense_mlp_parallel_parameter_group(
+        &block.body.mlp,
+        args,
+        layer,
+    )?);
     Ok(groups)
 }
 
@@ -227,7 +231,7 @@ pub fn routed_layer_parallel_parameter_groups<
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
-    match &block.mlp {
+    match &block.body.mlp {
         FeedForward::Dense(mlp) => {
             groups.push(dense_mlp_parallel_parameter_group(mlp, args, layer)?);
         }

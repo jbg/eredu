@@ -3433,6 +3433,15 @@ Shared decoder parameter declarations retain the Q/K/V and gate/up component bou
 
 The original Phi-4 uses the Llama-compatible execution class with retained `phi3` source identity and component-major fused QKV and gate/up projections. GGUF admission preserves the fused weights and their HF half-head rotary convention. Checkpoint schemas, tokenizer policy and discovery remain portable.
 
+The shared decoder block contains a typed `TransformerBlockBody` parameter
+aggregate and a separate optional terminal normalization. The body owns attention,
+feed-forward and residual-normalization parameters; each invocation supplies its
+terminal operation to the common equation. Serial, observed, tensor-parallel,
+routed and low-rank execution borrow these same resources, preserving component
+observation timing. Parameter traversal retains canonical names and order across
+both aggregates. This structure keeps invocation-specific inter-pass normalization
+outside the body without changing the selected residency boundary.
+
 Nanbeige reuses the portable GQA/SwiGLU decoder blocks. `decoder::repeated`
 lowers physical checkpoint blocks to logical invocations with exact source
 aliases and an expanded attention schedule. The generic decoder's optional
