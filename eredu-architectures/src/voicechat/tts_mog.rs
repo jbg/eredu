@@ -729,7 +729,8 @@ impl<B: NeuralBackend> MogHead<B> {
                     .with_precision(precision)?
                     .into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts separately bound layers, prediction and selected-component units.
@@ -750,13 +751,7 @@ impl<B: NeuralBackend> MogHead<B> {
                 MogKernel::new(dimensions)?.into_component()?,
                 units,
             )
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                eredu_runtime::ResidentUnitsError::GroupCount { .. }
-                | eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                    TtsError::Configuration("MoG units differ from its execution graph")
-                }
-            })?,
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Complete connected mixture geometry.

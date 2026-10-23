@@ -188,6 +188,40 @@ impl ComponentEquations<FakeBackend, StatelessComponentState> for Kernel {
     }
 }
 
+impl eredu_runtime::ParallelComponentKernel<FakeBackend, StatelessComponentState> for Kernel {
+    fn begin_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut StatelessComponentState,
+        _: &(),
+        context: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, bool>, Failure> {
+        self.begin(input, state, context)
+    }
+    fn execute_parallel(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut FakeUnit,
+        hidden: &FakeTensor,
+        state: &mut StatelessComponentState,
+        forward: &mut bool,
+        _: &(),
+        context: &(),
+    ) -> Result<FakeTensor, Failure> {
+        self.execute(address, unit, hidden, state, forward, context)
+    }
+    fn finish_parallel(
+        &mut self,
+        hidden: &FakeTensor,
+        state: &mut StatelessComponentState,
+        forward: &bool,
+        _: &(),
+        context: &(),
+    ) -> Result<FakeTensor, Failure> {
+        self.finish(hidden, state, forward, context)
+    }
+}
+
 fn definition(pinned: bool) -> ComponentDefinition {
     let graph = ExecutionGraph::new(
         vec![
@@ -301,7 +335,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
     .unwrap();
     let sparse_parameters = declaration.parameters().clone();
     let mut component = ComponentAdapter::new(
-        declaration,
+        declaration.clone(),
         Kernel {
             fail: false,
             pinned: None,
@@ -339,6 +373,90 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
     }
     assert_eq!(hidden.0, [7, 3, 17]);
     assert!(component.build_unit(0, 0, &()).is_err());
+    let adopted_units = addresses
+        .into_iter()
+        .map(|address| {
+            vec![component
+                .build_unit(address.group(), address.index(), &())
+                .unwrap()]
+        })
+        .collect();
+    let mut adopted = ResidentRuntime::from_units(component, adopted_units).unwrap();
+    let mut resident = ResidentRuntime::new(
+        ComponentAdapter::new(
+            declaration.clone(),
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap(),
+        &(),
+    )
+    .unwrap();
+    let mut sparse_runtime = LayerwiseRuntime::new(
+        ComponentAdapter::new(
+            declaration,
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap(),
+        RecordingPolicy::bounded(2),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            resident.forward((&input, true), &mut state, &()).unwrap(),
+            hidden
+        );
+        assert_eq!(
+            adopted.forward((&input, true), &mut state, &()).unwrap(),
+            hidden
+        );
+        assert_eq!(
+            sparse_runtime
+                .forward((&input, true), &mut state, &())
+                .unwrap(),
+            hidden
+        );
+        assert_eq!(
+            sparse_runtime
+                .forward_parallel((&input, true), &mut state, &(), &())
+                .unwrap(),
+            hidden
+        );
+    }
+    struct Paths(Vec<String>);
+    impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for Paths {
+        fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Failure> {
+            self.0.push(path.to_owned());
+            Ok(())
+        }
+    }
+    let mut paths = Paths(vec![]);
+    assert_eq!(
+        sparse_runtime
+            .forward_with_observer((&input, true), &mut state, &(), &mut paths)
+            .unwrap(),
+        hidden
+    );
+    for path in [
+        "first.input",
+        "first.output",
+        "second.input",
+        "second.output",
+    ] {
+        assert_eq!(
+            paths.0.iter().filter(|seen| seen.as_str() == path).count(),
+            1
+        );
+    }
+    assert!(sparse_runtime
+        .policy()
+        .addresses
+        .chunks_exact(2)
+        .all(|pair| pair == [(0, 0, 3), (1, 1, 7)]));
 }
 
 #[test]

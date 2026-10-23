@@ -459,7 +459,8 @@ where
         Ok(None)
     }
 
-    /// Chooses whether to execute the next unit.
+    /// Chooses whether to execute the next global unit within its canonical group.
+    /// Remaining units counts traversal positions, including the current invocation.
     fn before_unit(
         &mut self,
         _group: usize,
@@ -483,7 +484,7 @@ where
         Ok(())
     }
 
-    /// Observes one executed unit output.
+    /// Observes one executed unit output using its canonical group and global unit index.
     fn after_unit(
         &mut self,
         _group: usize,
@@ -694,37 +695,50 @@ impl<B, C, E> LayeredTraversalHook<B, C, E> for NoopLayeredTraversalHook where B
 
 struct ActivationObserverTraversalHook<'a, O: ?Sized> {
     observer: std::rc::Rc<std::cell::RefCell<&'a mut O>>,
-    units: Vec<Vec<Option<String>>>,
+    units: Vec<BTreeMap<usize, String>>,
     group_inputs: Vec<Option<String>>,
     group_outputs: Vec<Option<String>>,
 }
 
 impl<'a, O: ?Sized> ActivationObserverTraversalHook<'a, O> {
-    fn new<A, B, S>(architecture: &A, observer: &'a mut O) -> Result<Self, A::Error>
+    fn new<A, B, S>(
+        architecture: &A,
+        observer: &'a mut O,
+    ) -> Result<Self, crate::ArchitectureExecutionLayoutError<A::Error>>
     where
         B: NeuralBackend,
         S: RuntimeState<B>,
         A: LayeredArchitecture<B, S>,
     {
-        let graph = architecture.execution_graph()?;
+        use crate::ArchitectureExecutionLayoutError::Architecture;
+        let graph = architecture.execution_graph().map_err(Architecture)?;
+        let layout = architecture.execution_unit_layout()?;
         let mut units = Vec::with_capacity(graph.groups().len());
         let mut group_inputs = Vec::with_capacity(graph.groups().len());
         let mut group_outputs = Vec::with_capacity(graph.groups().len());
         for group in 0..graph.groups().len() {
-            let count = architecture.group_unit_count(group)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            architecture.unit_path(group, index).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
+            let mut paths = BTreeMap::new();
+            for ordinal in layout.group_range(group).expect("declared execution group") {
+                let address = layout.address(ordinal).expect("declared invocation");
+                let index = address.index();
+                if !architecture.observes_unit_boundaries(group, index) {
+                    paths.insert(
+                        index,
+                        architecture.unit_path(group, index).map_err(Architecture)?,
+                    );
+                }
+            }
+            units.push(paths);
+            group_inputs.push(
+                architecture
+                    .group_input_observation_path(group)
+                    .map_err(Architecture)?,
             );
-            group_inputs.push(architecture.group_input_observation_path(group)?);
-            group_outputs.push(architecture.group_output_observation_path(group)?);
+            group_outputs.push(
+                architecture
+                    .group_output_observation_path(group)
+                    .map_err(Architecture)?,
+            );
         }
         Ok(Self {
             observer: std::rc::Rc::new(std::cell::RefCell::new(observer)),
@@ -773,7 +787,7 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredUnitAction, E> {
-        let Some(unit) = &self.units[group][index] else {
+        let Some(unit) = self.units[group].get(&index) else {
             return Ok(LayeredUnitAction::Execute);
         };
         let path = eredu_core::UnitObservation::Input.path(unit);
@@ -790,7 +804,7 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
-        let Some(unit) = &self.units[group][index] else {
+        let Some(unit) = self.units[group].get(&index) else {
             return Ok(());
         };
         let path = eredu_core::UnitObservation::Output.path(unit);
@@ -1814,6 +1828,9 @@ pub enum ResidentUnitsError<E> {
     /// Architecture graph or unit declarations failed before adoption.
     #[error("resident architecture declaration failed: {0}")]
     Architecture(#[source] E),
+    /// Canonical invocation addresses cannot form a valid layout.
+    #[error("resident execution layout failed: {0}")]
+    Layout(#[source] crate::ExecutionUnitLayoutError),
     /// Supplied groups differ from the declared execution graph.
     #[error("resident unit group count {actual} differs from declared {expected}")]
     GroupCount {
@@ -1834,6 +1851,31 @@ pub enum ResidentUnitsError<E> {
     },
 }
 
+impl<E> From<crate::ArchitectureExecutionLayoutError<E>> for ResidentUnitsError<E> {
+    fn from(error: crate::ArchitectureExecutionLayoutError<E>) -> Self {
+        match error {
+            crate::ArchitectureExecutionLayoutError::Architecture(error) => {
+                Self::Architecture(error)
+            }
+            crate::ArchitectureExecutionLayoutError::Layout(error) => Self::Layout(error),
+        }
+    }
+}
+
+impl<E> ResidentUnitsError<E>
+where
+    E: std::error::Error + Send + Sync + 'static + From<eredu_nn::Error>,
+{
+    /// Preserves architecture errors and translates adoption/layout failures through
+    /// the neutral neural error contract, retaining the complete typed source.
+    pub fn into_architecture(self) -> E {
+        match self {
+            Self::Architecture(error) => error,
+            error => eredu_nn::Error::backend_source(error).into(),
+        }
+    }
+}
+
 /// Fully resident runtime using the same lifecycle as bounded execution.
 pub struct ResidentRuntime<A, B, S>
 where
@@ -1843,6 +1885,7 @@ where
 {
     architecture: A,
     graph: ExecutionGraph,
+    layout: ExecutionUnitLayout,
     units: Vec<Vec<A::Unit>>,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
@@ -1869,10 +1912,12 @@ where
                 actual: units.len(),
             });
         }
+        let layout = architecture.execution_unit_layout()?;
         for (group, supplied) in units.iter().enumerate() {
-            let expected = architecture
-                .group_unit_count(group)
-                .map_err(ResidentUnitsError::Architecture)?;
+            let expected = layout
+                .group_range(group)
+                .expect("declared execution group")
+                .len();
             if supplied.len() != expected {
                 return Err(ResidentUnitsError::UnitCount {
                     group,
@@ -1884,6 +1929,7 @@ where
         Ok(Self {
             architecture,
             graph,
+            layout,
             units,
             backend: std::marker::PhantomData,
         })
@@ -1893,20 +1939,29 @@ where
     pub fn new(
         architecture: A,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self, A::Error> {
-        let graph = architecture.execution_graph()?;
+    ) -> Result<Self, ResidentUnitsError<A::Error>> {
+        let graph = architecture
+            .execution_graph()
+            .map_err(ResidentUnitsError::Architecture)?;
+        let layout = architecture.execution_unit_layout()?;
         let mut units = Vec::with_capacity(graph.groups().len());
         for group in 0..graph.groups().len() {
-            let count = architecture.group_unit_count(group)?;
             units.push(
-                (0..count)
-                    .map(|index| architecture.build_unit(group, index, context))
-                    .collect::<Result<Vec<_>, _>>()?,
+                layout
+                    .group_range(group)
+                    .expect("declared execution group")
+                    .map(|ordinal| {
+                        let address = layout.address(ordinal).expect("declared invocation");
+                        architecture.build_unit(group, address.index(), context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ResidentUnitsError::Architecture)?,
             );
         }
         Ok(Self {
             architecture,
             graph,
+            layout,
             units,
             backend: std::marker::PhantomData,
         })
@@ -2061,11 +2116,20 @@ where
                 &forward_context,
             ) {
                 let unit_count = self.units[group].len();
-                for (index, unit) in self.units[group].iter_mut().enumerate() {
+                let range = self
+                    .layout
+                    .group_range(group)
+                    .expect("declared execution group");
+                for (position, unit) in self.units[group].iter_mut().enumerate() {
+                    let index = self
+                        .layout
+                        .address(range.start + position)
+                        .expect("declared invocation")
+                        .index();
                     if hook.before_unit(
                         group,
                         index,
-                        unit_count - index,
+                        unit_count - position,
                         &mut hidden,
                         &mut forward_context,
                         context,
@@ -2427,6 +2491,19 @@ where
     Submission(String),
 }
 
+impl<A: std::fmt::Display, P: std::fmt::Display> From<crate::ArchitectureExecutionLayoutError<A>>
+    for LayerwiseRuntimeError<A, P>
+{
+    fn from(error: crate::ArchitectureExecutionLayoutError<A>) -> Self {
+        match error {
+            crate::ArchitectureExecutionLayoutError::Architecture(error) => {
+                Self::Architecture(error)
+            }
+            crate::ArchitectureExecutionLayoutError::Layout(error) => Self::Layout(error),
+        }
+    }
+}
+
 /// Bounded-unit runtime invoking the same architecture lifecycle as resident execution.
 pub struct LayerwiseRuntime<A, B, S, P>
 where
@@ -2745,7 +2822,7 @@ where
     {
         let mut hook =
             ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
+                .map_err(LayerwiseRuntimeError::from)?;
         let internal_observer = hook.observer.clone();
         self.forward_with_unit_executor_and_traversal_hook(
             input,
@@ -2877,7 +2954,7 @@ where
     {
         let mut hook =
             ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
+                .map_err(LayerwiseRuntimeError::from)?;
         let routed_observer = hook.observer.clone();
         self.forward_with_unit_executor_and_traversal_hook(
             input,
@@ -3098,13 +3175,8 @@ where
             .map_err(LayerwiseRuntimeError::Architecture)?;
         let deferred_serial =
             self.policy.permits_deferred_serial_groups() && graph.is_serial_chain();
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                <A as LayeredArchitecture<B, S2>>::group_unit_count(&self.architecture, group)
-                    .map_err(LayerwiseRuntimeError::Architecture)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let layout = <A as LayeredArchitecture<B, S2>>::execution_unit_layout(&self.architecture)
+            .map_err(LayerwiseRuntimeError::from)?;
         if !deferred_serial && self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
             self.executors = Some(
                 B::fork_executors(context, graph.groups().len())
@@ -3203,16 +3275,18 @@ where
                 group,
                 &forward_context,
             ) {
-                let unit_count = layout
+                let range = layout
                     .group_range(group)
-                    .expect("layout covers every graph group")
-                    .len();
-                for index in 0..unit_count {
+                    .expect("layout covers every graph group");
+                let unit_count = range.len();
+                for (position, ordinal) in range.enumerate() {
+                    let address = layout.address(ordinal).expect("declared invocation");
+                    let index = address.index();
                     if hook
                         .before_unit(
                             group,
                             index,
-                            unit_count - index,
+                            unit_count - position,
                             &mut hidden,
                             &mut forward_context,
                             executor,
@@ -3222,12 +3296,6 @@ where
                     {
                         break;
                     }
-                    let ordinal = layout
-                        .ordinal(group, index)
-                        .expect("group-local unit belongs to the layout");
-                    let address = layout
-                        .address(ordinal)
-                        .expect("group-local unit has a stable policy address");
                     let lease = policy
                         .acquire(ordinal, address, |executor| {
                             <A as LayeredArchitecture<B, S2>>::build_unit(
@@ -3527,7 +3595,7 @@ where
     {
         let mut hook =
             ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
+                .map_err(LayerwiseRuntimeError::from)?;
         let internal_observer = hook.observer.clone();
         self.forward_parallel_with_unit_executor_and_traversal_hook(
             input,
@@ -3825,13 +3893,9 @@ where
         let initialized = (|| {
             let graph = <A as LayeredArchitecture<B, S2>>::execution_graph(&self.architecture)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            let counts = (0..graph.groups().len())
-                .map(|group| {
-                    <A as LayeredArchitecture<B, S2>>::group_unit_count(&self.architecture, group)
-                        .map_err(LayerwiseRuntimeError::Architecture)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let layout = ExecutionUnitLayout::new(&graph, counts)?;
+            let layout =
+                <A as LayeredArchitecture<B, S2>>::execution_unit_layout(&self.architecture)
+                    .map_err(LayerwiseRuntimeError::from)?;
             if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
                 self.executors = Some(
                     B::fork_executors(context, graph.groups().len())
@@ -3952,16 +4016,18 @@ where
                 group,
                 &forward_context,
             ) {
-                let unit_count = layout
+                let range = layout
                     .group_range(group)
-                    .expect("layout covers every graph group")
-                    .len();
-                for index in 0..unit_count {
+                    .expect("layout covers every graph group");
+                let unit_count = range.len();
+                for (position, ordinal) in range.enumerate() {
+                    let address = layout.address(ordinal).expect("declared invocation");
+                    let index = address.index();
                     let action = hook
                         .before_unit(
                             group,
                             index,
-                            unit_count - index,
+                            unit_count - position,
                             &mut hidden,
                             &mut forward_context,
                             executor,
@@ -3976,12 +4042,6 @@ where
                     {
                         break;
                     }
-                    let ordinal = layout
-                        .ordinal(group, index)
-                        .expect("group-local unit belongs to the layout");
-                    let address = layout
-                        .address(ordinal)
-                        .expect("group-local unit has a stable policy address");
                     let acquired = policy
                         .acquire(ordinal, address, |executor| {
                             <A as LayeredArchitecture<B, S2>>::build_unit(

@@ -832,6 +832,14 @@ nonzero global addresses and sparse selections. Native preparation and portable
 partition/pipeline admission consume that layout rather than reconstructing addresses
 from counts. Custom low-level architectures use the shared graph/count projection;
 projection errors retain the original architecture or layout failure as their source.
+Resident execution and bounded serial/tensor-parallel traversal enumerate retained
+invocation addresses. Resident modules stay dense while their layout retains global
+identities. Construction and adoption failures use one neutral translation that keeps
+architecture errors intact and retains layout/count failures as typed sources.
+Policy acquisition/completion receives a dense ordinal and the declared global address;
+equations, state lookup and observation callbacks receive the global identity. Remaining
+work counts use traversal positions. Fallback observation paths are keyed by global unit
+identity, independently of local storage ordinals and architecture-owned internal hooks.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

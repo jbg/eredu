@@ -523,7 +523,8 @@ impl<B: NeuralBackend> RvqRefinement<B> {
                 })?
                 .into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts independently materialized codebook and shared projection units.
@@ -541,13 +542,7 @@ impl<B: NeuralBackend> RvqRefinement<B> {
                     vec![RvqUnit::Projection(projection)],
                 ],
             )
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                eredu_runtime::ResidentUnitsError::GroupCount { .. }
-                | eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                    TtsError::Configuration("RVQ units differ from its execution graph")
-                }
-            })?,
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Exact selected feedback geometry.

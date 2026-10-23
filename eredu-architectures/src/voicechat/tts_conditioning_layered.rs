@@ -965,10 +965,7 @@ impl<B: NeuralBackend> ResidentConditioning<B> {
                 vec![ConditioningUnit::Fusion(fusion)],
             ],
         )
-        .map_err(|error| match error {
-            eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-            _ => TtsError::Configuration("conditioning resident unit count mismatch"),
-        })?;
+        .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         Ok(Self { runtime })
     }
 }

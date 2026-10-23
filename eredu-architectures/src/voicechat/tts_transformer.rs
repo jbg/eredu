@@ -360,7 +360,8 @@ impl<B: NeuralBackend> TtsTransformer<B> {
             runtime: eredu_runtime::ResidentRuntime::new(
                 super::tts_transformer_layered::TransformerKernel::new(config)?.into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts independently materialized blocks and normalization without replacements.
@@ -369,9 +370,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
         blocks: Vec<TransformerBlock<B>>,
         norm: B::Normalization,
     ) -> Result<Self, super::tts_transformer_layered::TransformerError> {
-        use super::tts_transformer_layered::{
-            TransformerError, TransformerKernel, TransformerUnit,
-        };
+        use super::tts_transformer_layered::{TransformerKernel, TransformerUnit};
         let units = vec![
             blocks.into_iter().map(TransformerUnit::Block).collect(),
             vec![TransformerUnit::Norm(norm)],
@@ -381,15 +380,7 @@ impl<B: NeuralBackend> TtsTransformer<B> {
                 TransformerKernel::new(config)?.into_component()?,
                 units,
             )
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                eredu_runtime::ResidentUnitsError::GroupCount { .. }
-                | eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                    TransformerError::Configuration(
-                        "TTS transformer unit count differs from its graph",
-                    )
-                }
-            })?,
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Exact retained transformer equations and physical formats.

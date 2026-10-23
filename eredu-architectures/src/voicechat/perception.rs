@@ -268,7 +268,8 @@ impl<B: NeuralBackend> Perception<B> {
                     .with_precision(precision)?
                     .into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts independently materialized units without replacement allocations.
@@ -286,21 +287,8 @@ impl<B: NeuralBackend> Perception<B> {
             vec![PerceptionUnit::Projection(projection)],
         ];
         Ok(Self {
-            runtime: eredu_runtime::ResidentRuntime::from_units(architecture, units).map_err(
-                |error| match error {
-                    eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                    eredu_runtime::ResidentUnitsError::GroupCount { .. } => {
-                        PerceptionError::Configuration(
-                            "resident perception group count differs from its graph",
-                        )
-                    }
-                    eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                        PerceptionError::Configuration(
-                            "resident perception unit count differs from its graph",
-                        )
-                    }
-                },
-            )?,
+            runtime: eredu_runtime::ResidentRuntime::from_units(architecture, units)
+                .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Connected perception geometry, independent of residency policy.

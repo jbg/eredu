@@ -171,7 +171,8 @@ impl PreparedBackboneParameters {
             std::sync::Arc::clone(bindings.definition()),
             context,
         )?;
-        let mut runtime = ResidentRuntime::<_, B, S>::new(model, context)?;
+        let mut runtime = ResidentRuntime::<_, B, S>::new(model, context)
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         if runtime.units().len() != 1
             || runtime.units()[0].len() != self.args.num_hidden_layers as usize
         {

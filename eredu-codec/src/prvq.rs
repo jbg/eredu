@@ -358,10 +358,7 @@ impl<B: NeuralBackend> ResidualQuantizer<B> {
             architecture,
             codebooks.into_iter().map(|book| vec![book]).collect(),
         )
-        .map_err(|error| match error {
-            eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-            _ => invalid("residual quantizer unit count mismatch"),
-        })?;
+        .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         Ok(Self { runtime })
     }
     /// Exact selected codebook geometry.

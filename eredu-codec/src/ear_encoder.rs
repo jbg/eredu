@@ -471,10 +471,7 @@ impl<B: NeuralBackend> NeuralEncoder<B> {
         let architecture =
             crate::ear_encoder_layered::EncoderKernel::new(config, &prefix)?.into_component()?;
         let runtime = eredu_runtime::ResidentRuntime::from_units(architecture, vec![units])
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                _ => invalid("EAR encoder resident unit count mismatch"),
-            })?;
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         Ok(Self { runtime })
     }
     /// Exact finite encoder geometry.

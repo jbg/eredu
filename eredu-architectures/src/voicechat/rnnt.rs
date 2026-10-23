@@ -491,7 +491,8 @@ impl<B: NeuralBackend> Rnnt<B> {
             runtime: eredu_runtime::ResidentRuntime::new(
                 super::rnnt_layered::RnntKernel::new(dimensions)?.into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
 }
