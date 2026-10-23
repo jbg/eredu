@@ -66,7 +66,7 @@ pub enum FunctionHeadPreparationError {
 pub struct PreparedFunctionHeadBindings {
     dimensions: FunctionHeadDimensions,
     format: eredu_nn::LinearFormatSpec,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
     parameter: ParameterAdmission,
 }
 

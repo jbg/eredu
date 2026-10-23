@@ -48,7 +48,7 @@ pub enum DecoderPreparationError {
 pub struct PreparedDecoderBindings {
     config: DecoderConfig,
     prefix: String,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedDecoderBindings {
@@ -186,7 +186,7 @@ impl PreparedDecoderBindings {
 pub struct PreparedDecoderPartitionBindings {
     config: DecoderConfig,
     prefix: String,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 impl PreparedDecoderPartitionBindings {
     /// Global streaming decoder geometry.

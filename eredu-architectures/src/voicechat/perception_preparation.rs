@@ -60,7 +60,7 @@ pub enum PerceptionPreparationError {
 pub struct PreparedPerceptionBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedPerceptionBindings {
@@ -222,7 +222,7 @@ impl PreparedPerceptionBindings {
 pub struct PreparedPerceptionPartitionBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedPerceptionPartitionBindings {

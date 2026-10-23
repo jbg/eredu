@@ -60,7 +60,7 @@ pub enum RnntPreparationError {
 /// state and can be materialized independently through shared residency providers.
 pub struct PreparedRnntBindings {
     dimensions: RnntDimensions,
-    pub(super) prepared: PreparedComponent,
+    pub(super) prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 impl PreparedRnntBindings {
     /// Projects the admitted component without resolving or reopening artifacts.

@@ -55,7 +55,7 @@ pub enum QuantizerPreparationError {
 pub struct PreparedQuantizerBindings {
     geometry: Geometry,
     prefix: String,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedQuantizerBindings {

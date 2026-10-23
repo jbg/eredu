@@ -17,7 +17,7 @@ use super::{
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::TtsError,
     tts_rvq::RvqDimensions,
-    tts_rvq_layered::rvq_parameter_description,
+    tts_rvq_layered::rvq_component_definition,
 };
 
 /// Invalid component geometry or exact retained parameter contract.
@@ -66,7 +66,7 @@ pub enum RvqPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedRvqBindings {
     dimensions: RvqDimensions,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedRvqBindings {
@@ -92,10 +92,10 @@ impl PreparedRvqBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, RvqPreparationError> {
-        let description = rvq_parameter_description(dimensions)?;
+        let definition = rvq_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_rvq/leased-units",
-            description,
+            definition,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -158,21 +158,27 @@ impl PreparedRvqBindings {
         self.prepared.source()
     }
 
+    /// Validated semantic declaration retained by this exact preparation.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         RvqDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("RVQ declares only independently leased units");
-        (self.dimensions, local, layout, source, units)
+        (self.dimensions, definition, local, layout, source, units)
     }
 }
 

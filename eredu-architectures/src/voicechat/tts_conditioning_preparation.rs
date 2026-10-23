@@ -59,7 +59,7 @@ pub enum ConditioningPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedConditioningBindings {
     dimensions: ConditioningDimensions,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedConditioningBindings {

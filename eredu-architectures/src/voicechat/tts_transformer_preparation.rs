@@ -72,7 +72,7 @@ pub enum TtsTransformerPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedTtsTransformerBindings {
     config: TransformerConfig,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedTtsTransformerBindings {
@@ -245,7 +245,7 @@ impl PreparedTtsTransformerBindings {
 /// A normalization-only stage has no state and owns only its normalization recipe.
 pub struct PreparedTtsTransformerPartitionBindings {
     config: TransformerConfig,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedTtsTransformerPartitionBindings {

@@ -206,14 +206,15 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
-            let mut architecture = match local_layout.as_ref() {
-                Some(local) => RvqKernel::<MlxNeuralBackend>::new_parallel(dimensions, local)
-                    .and_then(RvqKernel::into_component),
-                None => RvqKernel::<MlxNeuralBackend>::new(dimensions)
-                    .and_then(RvqKernel::into_component),
+            let (dimensions, definition, local_layout, layout, source, units) =
+                prepared.into_parts();
+            let kernel = match local_layout.as_ref() {
+                Some(local) => RvqKernel::<MlxNeuralBackend>::new_parallel(dimensions, local),
+                None => RvqKernel::<MlxNeuralBackend>::new(dimensions),
             }
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(TtsError::from(error)))?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,

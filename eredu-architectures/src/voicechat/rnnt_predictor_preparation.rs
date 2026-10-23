@@ -13,7 +13,7 @@ use eredu_runtime::{
 /// Retained canonical LSTM recipes and explicit optional replica placement.
 pub struct PreparedRnntPredictorBindings {
     dimensions: RnntDimensions,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 impl PreparedRnntPredictorBindings {
     /// Selects only a stage's predictor units; embedding and joint sources are excluded.

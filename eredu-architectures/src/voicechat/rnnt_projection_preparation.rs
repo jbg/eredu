@@ -13,7 +13,7 @@ use eredu_runtime::{ExecutionUnitLayout, LocalModelLayout, PreparedComponent, We
 /// Recurrent recipes and replica declarations are excluded from this owner.
 pub struct PreparedRnntProjectionBindings {
     dimensions: RnntDimensions,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 impl PreparedRnntProjectionBindings {
     /// Projects existing retained RNNT recipes without reading parameter payloads.

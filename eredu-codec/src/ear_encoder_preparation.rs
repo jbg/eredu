@@ -48,7 +48,7 @@ pub enum EncoderPreparationError {
 pub struct PreparedEncoderBindings {
     config: EncoderConfig,
     prefix: String,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedEncoderBindings {
@@ -186,7 +186,7 @@ impl PreparedEncoderBindings {
 pub struct PreparedEncoderPartitionBindings {
     config: EncoderConfig,
     prefix: String,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 impl PreparedEncoderPartitionBindings {
     /// Global finite encoder geometry.

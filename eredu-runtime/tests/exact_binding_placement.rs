@@ -1431,7 +1431,7 @@ mod component_preparation {
         ArchitectureParameterDescription::new(&graph, &layout, groups, owned).unwrap()
     }
 
-    fn prepared() -> PreparedComponent {
+    fn prepared() -> PreparedComponent<eredu_runtime::ComponentDefinition> {
         let source: SharedCheckpointSource = Arc::new(
             MemoryWeightStore::from_safetensors((0..4).map(|index| {
                 (
@@ -1443,9 +1443,33 @@ mod component_preparation {
             }))
             .unwrap(),
         );
-        PreparedComponent::prepare(
+        let declaration = eredu_runtime::ComponentDefinition::new(
             "shared-contract",
             description(&[0, 1, 2]),
+            (0..3)
+                .map(|index| eredu_runtime::ComponentUnit {
+                    path: format!("units.{index}"),
+                    state: 0..0,
+                })
+                .collect(),
+            vec![eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::Projector,
+                first_owner_static_roles: vec![],
+                last_owner_static_roles: vec![],
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            }],
+            "units",
+            vec![],
+            eredu_runtime::StatelessComponentState::state_layout().unwrap(),
+            eredu_runtime::ArchitectureStatePartitionPlan::new([]),
+        )
+        .unwrap();
+        PreparedComponent::prepare(
+            "shared-contract",
+            declaration,
             source,
             |member| {
                 let index = member.target().strip_prefix("weight.").unwrap();
@@ -1471,7 +1495,9 @@ mod component_preparation {
         );
         assert!(selected.unit_source(unselected).is_err());
         assert!(selected.pinned_source().unwrap().source_keys().is_empty());
-        let (_, layout, source, units) = selected.into_unit_parts().unwrap();
+        let (definition, _, layout, source, units) = selected.into_declared_unit_parts().unwrap();
+        assert_eq!(definition.id(), "shared-contract");
+        assert_eq!(definition.unit_count(0).unwrap(), 3);
         assert_eq!(layout.address(0), Some(address));
         assert_eq!(layout.ordinal(0, 2), Some(0));
         assert!(layout.ordinal(0, 0).is_none());

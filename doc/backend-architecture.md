@@ -582,6 +582,14 @@ in materialization bounds. The portable speech precision policy selects eligible
 narrow perception/TTS weights and arithmetic; RNNT and function-head precision
 are governed by their component equations.
 
+Preparation retains its typed `ComponentPreparationDeclaration` directly. Parameter-only
+resource plans retain `ArchitectureParameterDescription`; semantic component preparation
+retains the complete validated `ComponentDefinition` and borrows its parameter projection.
+Identity-based projection carries the requested declaration while preserving restricted
+source authority and selected placement. RVQ consumes its retained definition alongside
+exact selected unit resources to assemble the execution adapter; native materialization
+does not reconstruct its graph, state or boundary declarations.
+
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared
 `materialize` route checks every required speech source role and prepares every

@@ -153,14 +153,32 @@ impl From<DerivedWeightRecipe> for ComponentRecipe {
     }
 }
 
+/// Typed declaration retained by exact resource preparation. A resource-only
+/// declaration supplies parameter ownership; a full component definition also
+/// retains execution, state and boundary semantics through the same algorithm.
+pub trait ComponentPreparationDeclaration {
+    /// Authoritative canonical parameter ownership and global invocation layout.
+    fn parameters(&self) -> &ArchitectureParameterDescription;
+}
+impl ComponentPreparationDeclaration for ArchitectureParameterDescription {
+    fn parameters(&self) -> &ArchitectureParameterDescription {
+        self
+    }
+}
+impl ComponentPreparationDeclaration for crate::ComponentDefinition {
+    fn parameters(&self) -> &ArchitectureParameterDescription {
+        self.parameters()
+    }
+}
+
 /// Consuming exact bindings with restricted source authority and retained placement.
 ///
 /// Family code supplies admitted recipes, including precision policy and special
 /// transforms. This container validates global geometry, groups physical ownership,
 /// restricts source access, and applies rank-local placement at most once.
-pub struct PreparedComponent {
+pub struct PreparedComponent<D: ComponentPreparationDeclaration> {
     id: String,
-    description: ArchitectureParameterDescription,
+    declaration: D,
     source: SharedCheckpointSource,
     units: Vec<Vec<WeightBinding>>,
     unit_layout: ExecutionUnitLayout,
@@ -168,12 +186,12 @@ pub struct PreparedComponent {
     local_layout: Option<LocalModelLayout>,
 }
 
-impl PreparedComponent {
+impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     /// Resolves canonical targets using family-owned admitted recipe policy.
     /// No checkpoint payload is read.
     pub fn prepare<E, R>(
         id: impl Into<String>,
-        description: ArchitectureParameterDescription,
+        declaration: D,
         source: SharedCheckpointSource,
         mut resolve: impl FnMut(&ParameterMemberSpec) -> Result<R, E>,
     ) -> Result<Self, E>
@@ -182,6 +200,7 @@ impl PreparedComponent {
         R: Into<ComponentRecipe>,
     {
         let id = id.into();
+        let description = declaration.parameters();
         let mut recipes =
             BTreeMap::<ParameterStorageId, BTreeMap<String, DerivedWeightRecipe>>::new();
         let mut aliases = BTreeMap::<ParameterStorageId, Vec<RecipeAlias>>::new();
@@ -291,7 +310,7 @@ impl PreparedComponent {
         let unit_layout = description.unit_layout().clone();
         Ok(Self {
             id,
-            description,
+            declaration,
             source,
             units,
             unit_layout,
@@ -302,7 +321,11 @@ impl PreparedComponent {
 
     /// Validated canonical ownership used by this exact preparation.
     pub fn description(&self) -> &ArchitectureParameterDescription {
-        &self.description
+        self.declaration.parameters()
+    }
+    /// Exact typed declaration retained before source restriction or placement.
+    pub fn declaration(&self) -> &D {
+        &self.declaration
     }
     /// Exact retained source authority.
     pub fn source(&self) -> &SharedCheckpointSource {
@@ -393,13 +416,14 @@ impl PreparedComponent {
         A: crate::LayeredArchitecture<B, S>,
         A::Error: From<ComponentPreparationError>,
     {
-        if architecture.execution_graph()? != *self.description.graph() {
+        if architecture.execution_graph()? != *self.declaration.parameters().graph() {
             return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
         }
-        for group in 0..self.description.graph().groups().len() {
+        for group in 0..self.declaration.parameters().graph().groups().len() {
             if architecture.group_unit_count(group)?
                 != self
-                    .description
+                    .declaration
+                    .parameters()
                     .unit_layout()
                     .group_range(group)
                     .expect("declared group")
@@ -429,12 +453,12 @@ impl PreparedComponent {
         &self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<LocalModelLayout, ComponentPreparationError> {
-        let layout = crate::derive_partitioned_local_layout(&self.description, topology).map_err(
-            |reason| ComponentPreparationError::ParallelLayout {
-                component: self.id.clone(),
-                reason,
-            },
-        )?;
+        let layout =
+            crate::derive_partitioned_local_layout(self.declaration.parameters(), topology)
+                .map_err(|reason| ComponentPreparationError::ParallelLayout {
+                    component: self.id.clone(),
+                    reason,
+                })?;
         if self
             .local_layout
             .as_ref()
@@ -540,14 +564,16 @@ impl PreparedComponent {
 
     /// Selects canonical targets by identity, retaining transformed bindings and
     /// restricting source authority again. Placement is projected, never reapplied.
-    pub fn project(
+    pub fn project<P: ComponentPreparationDeclaration>(
         self,
         id: impl Into<String>,
-        description: ArchitectureParameterDescription,
-    ) -> Result<Self, ComponentPreparationError> {
+        declaration: P,
+    ) -> Result<PreparedComponent<P>, ComponentPreparationError> {
         let id = id.into();
+        let description = declaration.parameters();
         let members = self
-            .description
+            .declaration
+            .parameters()
             .groups()
             .iter()
             .flat_map(|group| {
@@ -646,9 +672,9 @@ impl PreparedComponent {
             inputs,
         )?);
         let unit_layout = description.unit_layout().clone();
-        Ok(Self {
+        Ok(PreparedComponent {
             id,
-            description,
+            declaration,
             source,
             units,
             unit_layout,
@@ -736,6 +762,33 @@ impl PreparedComponent {
             .map(|(ordinal, bindings)| (layout.address(ordinal).expect("selected unit"), bindings))
             .collect();
         Ok((local, layout, source, units))
+    }
+
+    /// Moves the original typed declaration with its selected unit resources.
+    /// Global semantic ownership stays in the declaration; the returned layout
+    /// identifies its exact selected invocation subset without rebuilding facts.
+    pub fn into_declared_unit_parts(
+        self,
+    ) -> Result<
+        (
+            D,
+            Option<LocalModelLayout>,
+            ExecutionUnitLayout,
+            SharedCheckpointSource,
+            Vec<Vec<WeightBinding>>,
+        ),
+        ComponentPreparationError,
+    > {
+        if !self.pinned.is_empty() {
+            return Err(ComponentPreparationError::PinnedResources(self.id));
+        }
+        Ok((
+            self.declaration,
+            self.local_layout,
+            self.unit_layout,
+            self.source,
+            self.units,
+        ))
     }
 
     /// Transfers exact unit-only authority to existing materialization drivers.

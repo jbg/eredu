@@ -51,7 +51,7 @@ pub enum BackboneConstructionError {
 /// physical inputs used by the target; pinned vocabulary weights keep their
 /// canonical owners alongside independently leased block bindings.
 pub struct PreparedBackboneBindings {
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedBackboneBindings {

@@ -69,7 +69,7 @@ pub enum MogPreparationError {
 pub struct PreparedMogBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: MogDimensions,
-    prepared: PreparedComponent,
+    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
 }
 
 impl PreparedMogBindings {
