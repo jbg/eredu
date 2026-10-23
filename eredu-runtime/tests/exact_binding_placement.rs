@@ -2313,65 +2313,106 @@ mod component_preparation {
                 .collect::<Vec<_>>(),
             ["model.units.00000", "model.units.00002"]
         );
+        let assemble = |mode| -> Result<eredu_runtime::PreparedParameterResources, Failure> {
+            let units = ExecutionUnitResourcePreparation::new("model", layout, mode)
+                .push(bindings[0].clone(), |_| Ok::<_, Failure>(64))?
+                .push(bindings[1].clone(), |_| Ok::<_, Failure>(128))?
+                .finish()?;
+            let pinned = eredu_runtime::StaticUnitBindings::new(
+                "pinned",
+                vec![WeightBinding::new(
+                    "pinned",
+                    "physical.0",
+                    TensorSelection::Full,
+                    32,
+                )?],
+            )?
+            .prepare::<Failure>()?;
+            let mut preparation = eredu_runtime::ParameterResourcePreparation::new(pinned, units);
+            for (index, bytes, capacity, shared) in
+                [(0, 16, 64, true), (1, 48, 128, false), (2, 8, 32, false)]
+            {
+                // The same key names different geometry in each retained source.
+                let source: SharedCheckpointSource =
+                    Arc::new(MemoryWeightStore::from_safetensors([(
+                        "physical.0".into(),
+                        safetensors::Dtype::F32,
+                        vec![bytes as usize / 4],
+                        vec![0; bytes as usize],
+                    )])?);
+                let mut bindings = vec![WeightBinding::new(
+                    format!("aux.weight.{index}"),
+                    "physical.0",
+                    TensorSelection::Full,
+                    bytes,
+                )?];
+                if shared {
+                    bindings.push(WeightBinding::alias(
+                        format!("aux.alias.{index}"),
+                        format!("aux.weight.{index}"),
+                        bytes,
+                    )?);
+                }
+                let definition = eredu_runtime::OffloadUnit::new(
+                    eredu_core::residency::OffloadUnitId::new(format!("aux.{index}"))?,
+                    bindings,
+                )?;
+                preparation = preparation
+                    .push_auxiliary(definition, source, shared, |_| Ok::<_, Failure>(capacity))?;
+            }
+            assert_eq!(preparation.source_keys(), &resources.source_keys);
+            Ok(preparation.finish()?)
+        };
         let streamed = LayerWeightResidency::DenseDiskStream(
             eredu_runtime::DenseDiskStreamLoadOptions::new(256, 512, 2, 1).unwrap(),
         );
         let direct = LayerWeightResidency::DenseDiskStream(
             eredu_runtime::DenseDiskStreamLoadOptions::new(256, 0, 0, 0).unwrap(),
         );
-        for (mode, window, host, device, aux_device, host_capacity) in [
-            (LayerWeightResidency::FullyResident, 64, 0, 136, 72, 0),
-            (options, 32, 416, 64, 0, 72),
-            (streamed, 64, 256, 64, 0, 0),
-            (direct, 64, 0, 64, 0, 0),
+        for (mode, window) in [
+            (LayerWeightResidency::FullyResident, 64),
+            (options, 32),
+            (streamed, 64),
+            (direct, 64),
         ] {
-            let mut auxiliary = eredu_runtime::AuxiliaryWeightRequirements::default();
-            let mut specs = Vec::new();
-            for (index, bytes, capacity, shared) in
-                [(0, 16, 64, true), (1, 48, 128, false), (2, 8, 32, false)]
-            {
-                let mut bindings = vec![WeightBinding::new(
-                    "weight",
-                    format!("aux.{index}"),
-                    TensorSelection::Full,
-                    bytes,
-                )
-                .unwrap()];
-                if shared {
-                    bindings.push(WeightBinding::alias("alias", "weight", bytes).unwrap());
-                }
-                let definition = eredu_runtime::OffloadUnit::new(
-                    eredu_core::residency::OffloadUnitId::new(format!("aux.{index}")).unwrap(),
-                    bindings,
-                )
-                .unwrap();
-                let (next, spec) = auxiliary
-                    .admit(&definition, mode, shared, |_| Ok::<_, Failure>(capacity))
-                    .unwrap();
-                auxiliary = next;
-                specs.push(spec);
-            }
-            let config =
-                eredu_core::residency::OffloadConfig::new(Some(aux_device), Some(host_capacity), 1)
-                    .unwrap();
-            eredu_core::residency::OffloadPlan::new(config, specs).unwrap();
-            let requirements = eredu_runtime::execution_unit_resource_requirements(
-                layout,
-                &resources.unit_bytes,
-                resources.total_host_bytes,
-                resources.maximum_host_bytes,
-                mode,
-                auxiliary,
+            let prepared = assemble(mode).unwrap();
+            assert_eq!(prepared.layout, *layout);
+            assert_eq!(prepared.metadata.maximum_device_layer_bytes(), window);
+            assert_eq!(prepared.metadata.static_device_bytes(), 32);
+            eredu_runtime::ResidencyController::new_with_catalogs(
+                |id| {
+                    prepared
+                        .sources
+                        .get(id)
+                        .map(|source| source.as_ref())
+                        .unwrap_or(selected.source().as_ref())
+                },
+                prepared.plan,
+                prepared.definitions,
             )
             .unwrap();
-            assert_eq!(
-                (
-                    requirements.device_window_bytes,
-                    requirements.required_host_bytes,
-                    requirements.required_device_bytes
-                ),
-                (window, host, device)
-            );
+        }
+        for (device, host, host_failure) in [(256, 415, true), (95, 512, false)] {
+            let mode =
+                LayerWeightResidency::LayerwiseHost(eredu_runtime::LayerwiseLoadOptions::new(
+                    eredu_core::residency::OffloadConfig::new(Some(device), Some(host), 1).unwrap(),
+                ));
+            let error = assemble(mode).err().unwrap();
+            match error
+                .downcast_ref::<eredu_runtime::ParameterResourcePreparationError>()
+                .unwrap()
+            {
+                eredu_runtime::ParameterResourcePreparationError::HostBudget {
+                    required: 416,
+                    budget: 415,
+                } if host_failure => {}
+                eredu_runtime::ParameterResourcePreparationError::DeviceBudget {
+                    required: 96,
+                    budget: 95,
+                    ..
+                } if !host_failure => {}
+                other => panic!("unexpected capacity rejection: {other}"),
+            }
         }
         let overflow = ExecutionUnitResourcePreparation::new("model", layout, options)
             .push(bindings[0].clone(), |_| Ok::<_, Failure>(u64::MAX))

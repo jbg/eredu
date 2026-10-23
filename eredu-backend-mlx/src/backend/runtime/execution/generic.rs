@@ -27,9 +27,8 @@ use crate::backend::{
             build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
         },
         execution::layerwise::{
-            validate_device_budget, validate_host_budget, validate_unused, DensePreparedTransfer,
-            DenseStreamController, DenseStreamForwardGuard, DenseStreamGroupGuard,
-            DenseTransferWindow,
+            validate_unused, DensePreparedTransfer, DenseStreamController, DenseStreamForwardGuard,
+            DenseStreamGroupGuard, DenseTransferWindow,
         },
         residency::manager::{
             host_capacity_upper_bound_for_bindings, ResidencyManager, ResidentTransfer,
@@ -38,7 +37,7 @@ use crate::backend::{
     },
 };
 use crate::MlxTensor;
-use eredu_core::residency::{MemoryTier, OffloadPlan, OffloadUnitId};
+use eredu_core::residency::{MemoryTier, OffloadUnitId};
 
 /// One populated MLX unit retained with its residency transfer.
 enum MlxUnitTransfer {

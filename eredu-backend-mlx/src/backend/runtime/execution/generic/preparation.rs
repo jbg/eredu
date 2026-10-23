@@ -89,24 +89,11 @@ where
             "generic MLX architecture declared no execution units".into(),
         ));
     }
-    let offload = options.offload()?;
-    let depth = options.device_depth(unit_count);
-    let mut definitions = Vec::new();
-    let mut specs = Vec::new();
-    let mut consumed = BTreeSet::new();
+    options.offload()?;
 
     let static_bindings = static_bindings(architecture.static_modules(), store.as_ref())?;
     let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
         .prepare::<Error>()?;
-    let static_bytes = pinned.bytes;
-    let static_parameters = pinned.parameters;
-    consumed.extend(pinned.source_keys);
-    let static_id = pinned.resource.map(|(definition, spec)| {
-        let id = definition.id().clone();
-        definitions.push(definition);
-        specs.push(spec);
-        id
-    });
 
     let mut execution_units =
         eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
@@ -126,55 +113,18 @@ where
         })?;
     }
     let units = execution_units.finish()?;
-    definitions.extend(units.definitions);
-    specs.extend(units.specs);
-    consumed.extend(units.source_keys);
+    let resources = eredu_runtime::ParameterResourcePreparation::new(pinned, units);
+    let mut consumed = resources.source_keys().clone();
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let requirements = eredu_runtime::execution_unit_resource_requirements(
-        &layout,
-        &units.unit_bytes,
-        units.total_host_bytes,
-        units.maximum_host_bytes,
-        options,
-        Default::default(),
-    )
-    .map_err(Error::from)?;
-    validate_host_budget(offload, requirements.required_host_bytes)?;
-    validate_device_budget(
-        offload,
-        static_bytes,
-        requirements.required_device_bytes,
-        depth,
-    )?;
-
-    let plan = OffloadPlan::new(offload, specs)?;
-    let metadata = LayerwiseModelMetadata::new(
-        "generic",
-        None,
-        unit_count,
-        static_bytes,
-        options.execution_residency(),
-        units.parameter_bytes,
-        requirements.device_window_bytes,
-        units.maximum_host_bytes,
-        depth,
-    );
+    let resources = resources.finish()?;
     materialize_parameter_unit_policy::<A::Unit, _, _>(
         store,
         architecture.static_modules_mut(),
         populator,
-        options,
         stream,
         weights_stream,
-        plan,
-        definitions,
-        std::collections::BTreeMap::new(),
-        layout,
-        units.unit_ids,
-        static_id,
-        static_parameters,
-        metadata,
+        resources,
     )
 }
 
@@ -333,23 +283,10 @@ where
             unit_bindings.len()
         )));
     }
-    let offload = options.offload()?;
-    let depth = options.device_depth(unit_count);
-    let mut definitions = Vec::new();
-    let mut specs = Vec::new();
-    let mut consumed = BTreeSet::new();
+    options.offload()?;
 
     let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
         .prepare::<Error>()?;
-    let static_bytes = pinned.bytes;
-    let static_parameters = pinned.parameters;
-    consumed.extend(pinned.source_keys);
-    let static_id = pinned.resource.map(|(definition, spec)| {
-        let id = definition.id().clone();
-        definitions.push(definition);
-        specs.push(spec);
-        id
-    });
 
     let mut execution_units =
         eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
@@ -359,94 +296,52 @@ where
         })?;
     }
     let units = execution_units.finish()?;
-    definitions.extend(units.definitions);
-    specs.extend(units.specs);
-    consumed.extend(units.source_keys);
-    let mut extra = eredu_runtime::AuxiliaryWeightRequirements::default();
-    let mut sources = std::collections::BTreeMap::new();
+    let mut resources = eredu_runtime::ParameterResourcePreparation::new(pinned, units);
     for unit in supplementary {
-        let (requirements, spec) =
-            extra.admit(&unit.definition, options, unit.shared, |bindings| {
+        resources =
+            resources.push_auxiliary(unit.definition, unit.source, unit.shared, |bindings| {
                 host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
             })?;
-        extra = requirements;
-        let id = unit.definition.id().clone();
-        specs.push(spec);
-        sources.insert(id, unit.source);
-        definitions.push(unit.definition);
     }
+    let mut consumed = resources.source_keys().clone();
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let requirements = eredu_runtime::execution_unit_resource_requirements(
-        &layout,
-        &units.unit_bytes,
-        units.total_host_bytes,
-        units.maximum_host_bytes,
-        options,
-        extra,
-    )
-    .map_err(Error::from)?;
-    validate_host_budget(offload, requirements.required_host_bytes)?;
-    validate_device_budget(
-        offload,
-        static_bytes,
-        requirements.required_device_bytes,
-        depth,
-    )?;
-
-    let plan = OffloadPlan::new(offload, specs)?;
-    let metadata = LayerwiseModelMetadata::new(
-        "generic",
-        None,
-        unit_count,
-        static_bytes,
-        options.execution_residency(),
-        units.parameter_bytes,
-        requirements.device_window_bytes,
-        units.maximum_host_bytes,
-        depth,
-    );
+    let resources = resources.finish()?;
     materialize_parameter_unit_policy::<U, _, _>(
         store,
         static_modules,
         populator,
-        options,
         stream,
         weights_stream,
-        plan,
-        definitions,
-        sources,
-        layout,
-        units.unit_ids,
-        static_id,
-        static_parameters,
-        metadata,
+        resources,
     )
 }
 
 /// Materializes one admitted policy with the existing native completion and transfer owners.
-#[allow(clippy::too_many_arguments)]
 fn materialize_parameter_unit_policy<U, SM, P>(
     store: SharedCheckpointSource,
     static_modules: &mut SM,
     populator: P,
-    options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-    plan: OffloadPlan,
-    definitions: Vec<OffloadUnit>,
-    sources: std::collections::BTreeMap<OffloadUnitId, SharedCheckpointSource>,
-    layout: ExecutionUnitLayout,
-    unit_ids: Vec<OffloadUnitId>,
-    static_id: Option<OffloadUnitId>,
-    static_parameters: BTreeSet<String>,
-    metadata: LayerwiseModelMetadata,
+    resources: eredu_runtime::PreparedParameterResources,
 ) -> Result<(MlxLayerwisePolicy<U, P>, LayerwiseModelMetadata), Error>
 where
     U: Parameterized<MlxTensor> + 'static,
     SM: Parameterized<MlxTensor>,
     P: MlxUnitPopulator<U>,
 {
+    let eredu_runtime::PreparedParameterResources {
+        residency: options,
+        plan,
+        definitions,
+        sources,
+        layout,
+        unit_ids,
+        static_id,
+        static_parameters,
+        metadata,
+    } = resources;
     let dense = options.dense();
     let residency_stream = if dense.is_some() {
         Stream::new_with_device(&stream.get_device()?)

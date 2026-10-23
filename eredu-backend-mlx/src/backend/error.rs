@@ -142,6 +142,9 @@ pub enum Error {
     /// Invalid admitted execution-unit resource count or capacity.
     #[error(transparent)]
     ExecutionUnitPreparation(#[from] eredu_runtime::ExecutionUnitPreparationError),
+    /// Exact parameter plan admission failed.
+    #[error(transparent)]
+    ParameterResourcePreparation(#[from] eredu_runtime::ParameterResourcePreparationError),
 
     /// Invalid logical-to-local execution-unit mapping or invocation.
     #[error(transparent)]

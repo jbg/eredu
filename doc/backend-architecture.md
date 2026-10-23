@@ -809,6 +809,12 @@ parameter placement through the shared layout compiler. Speech kernels supply th
 declarations and selected layouts, retain coupled width checks, and preserve guarded
 collective failure handling. Layout failures identify the component and retain neutral
 topology errors as sources.
+Consuming parameter resource preparation retains the admitted ordinary layout and
+residency policy, pinned destinations, independent auxiliary definitions and their exact
+source catalogs. It validates combined coexistence budgets and produces the native
+materialization plan and residency metadata from those same resources. Native preparation
+supplies transfer-capacity facts and validates unused ordinary-source inputs; materialization
+consumes the complete retained plan without rebuilding resource lists or budget policy.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

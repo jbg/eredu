@@ -36,7 +36,7 @@ use crate::{
         ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
     },
 };
-use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
+use eredu_core::residency::{MemoryTier, OffloadUnitId, ResidencyLedgerError};
 
 use eredu_nn::{LinearCompanionRole, ParameterMetadata, ParameterVisitor, Parameterized};
 use eredu_runtime::WeightMaterializationReport;
@@ -57,6 +57,4 @@ pub use quantization::{
 mod sharding;
 pub use sharding::shard_layer_bindings;
 mod validation;
-pub use validation::{
-    validate_device_budget, validate_host_budget, validate_unused, LayerwiseModelError,
-};
+pub use validation::{validate_unused, LayerwiseModelError};

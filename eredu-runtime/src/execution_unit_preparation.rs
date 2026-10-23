@@ -35,6 +35,8 @@ pub enum ExecutionUnitPreparationError {
 /// Exact resource declarations and capacity facts for selected execution units.
 /// Static and supplementary resources retain their own residency boundaries.
 pub struct PreparedExecutionUnitResources {
+    layout: ExecutionUnitLayout,
+    residency: LayerWeightResidency,
     /// Independently materialized units in selected invocation order.
     pub definitions: Vec<OffloadUnit>,
     /// Initial residency policy for each declared unit.
@@ -74,6 +76,8 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
             layout,
             residency,
             resources: PreparedExecutionUnitResources {
+                layout: layout.clone(),
+                residency,
                 definitions: Vec::new(),
                 specs: Vec::new(),
                 unit_ids: Vec::with_capacity(layout.len()),
@@ -236,4 +240,194 @@ pub fn execution_unit_resource_requirements(
         required_host_bytes,
         required_device_bytes,
     })
+}
+
+/// Failure finalizing the exact parameter resource plan.
+#[derive(Debug, thiserror::Error)]
+pub enum ParameterResourcePreparationError {
+    /// The selected residency policy is invalid.
+    #[error(transparent)]
+    Policy(#[from] crate::WeightResidencyPolicyError),
+    /// Resource capacity cannot be represented.
+    #[error(transparent)]
+    Sizing(#[from] crate::BoundedResidencySizingError),
+    /// Resource identities or initial tier policies are invalid.
+    #[error(transparent)]
+    Plan(#[from] OffloadError),
+    /// Host allocations exceed the selected budget.
+    #[error(
+        "host budget {budget} bytes cannot contain {required} bytes of host-transfer allocations"
+    )]
+    HostBudget {
+        /// Required host allocation capacity.
+        required: u64,
+        /// Selected host budget.
+        budget: u64,
+    },
+    /// Pinned and concurrently live device resources exceed the selected budget.
+    #[error("device budget {budget} bytes cannot contain {static_bytes} static bytes plus the depth-{depth} unit window ({window_bytes} bytes, {required} total)")]
+    DeviceBudget {
+        /// Pinned device payload.
+        static_bytes: u64,
+        /// Required ordinary or auxiliary device phase capacity.
+        window_bytes: u64,
+        /// Selected ordinary unit window depth.
+        depth: usize,
+        /// Total required device capacity.
+        required: u64,
+        /// Selected device budget.
+        budget: u64,
+    },
+}
+
+/// Consuming assembly of independently leased pinned, ordinary and auxiliary resources.
+/// Exact auxiliary sources stay attached to their physical owners. No native resource
+/// is created, and sequential owners retain their individual lease boundaries.
+pub struct ParameterResourcePreparation {
+    pinned: crate::PreparedStaticUnit,
+    units: PreparedExecutionUnitResources,
+    auxiliary: crate::AuxiliaryWeightRequirements,
+    sources:
+        std::collections::BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
+}
+
+/// Complete parameter plan consumed by native materialization and cold reporting.
+pub struct PreparedParameterResources {
+    /// Retained residency mechanism selection used to admit every resource.
+    pub residency: LayerWeightResidency,
+    /// Exact selected invocation layout retained from ordinary admission.
+    pub layout: ExecutionUnitLayout,
+    /// Validated initial resource policies and capacity limits.
+    pub plan: eredu_core::residency::OffloadPlan,
+    /// Independent physical definitions, including pinned and auxiliary owners.
+    pub definitions: Vec<OffloadUnit>,
+    /// Restricted sources retained for auxiliary physical owners.
+    pub sources:
+        std::collections::BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
+    /// Ordinary physical resource identities in selected invocation order.
+    pub unit_ids: Vec<OffloadUnitId>,
+    /// Pinned resource identity, absent for an empty pinned module.
+    pub static_id: Option<OffloadUnitId>,
+    /// Exact pinned destinations to populate.
+    pub static_parameters: BTreeSet<String>,
+    /// Residency report derived from the same selected resources and limits.
+    pub metadata: crate::LayerwiseModelMetadata,
+}
+
+impl ParameterResourcePreparation {
+    /// Retains admitted pinned and ordinary resources in their materialization order.
+    pub fn new(
+        mut pinned: crate::PreparedStaticUnit,
+        mut units: PreparedExecutionUnitResources,
+    ) -> Self {
+        units.source_keys.append(&mut pinned.source_keys);
+        Self {
+            pinned,
+            units,
+            auxiliary: Default::default(),
+            sources: Default::default(),
+        }
+    }
+
+    /// Exact physical inputs consumed from the ordinary source. Auxiliary owners
+    /// retain separate source authority and do not claim keys in this source.
+    pub fn source_keys(&self) -> &BTreeSet<String> {
+        &self.units.source_keys
+    }
+
+    /// Retains one independently leased auxiliary owner and its exact source.
+    pub fn push_auxiliary<E>(
+        mut self,
+        definition: OffloadUnit,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+        shared: bool,
+        host_capacity: impl FnOnce(&[WeightBinding]) -> Result<u64, E>,
+    ) -> Result<Self, E>
+    where
+        E: From<ResidencyDeclarationError>
+            + From<OffloadError>
+            + From<crate::BoundedResidencySizingError>,
+    {
+        let (requirements, spec) =
+            self.auxiliary
+                .admit(&definition, self.units.residency, shared, host_capacity)?;
+        self.auxiliary = requirements;
+        self.sources.insert(definition.id().clone(), source);
+        self.units.specs.push(spec);
+        self.units.definitions.push(definition);
+        Ok(self)
+    }
+
+    /// Validates coexistence budgets and transfers the exact plan into materialization.
+    pub fn finish(
+        mut self,
+    ) -> Result<PreparedParameterResources, ParameterResourcePreparationError> {
+        let layout = &self.units.layout;
+        let residency = self.units.residency;
+        let config = residency.offload()?;
+        let requirements = execution_unit_resource_requirements(
+            layout,
+            &self.units.unit_bytes,
+            self.units.total_host_bytes,
+            self.units.maximum_host_bytes,
+            residency,
+            self.auxiliary,
+        )?;
+        if let Some(budget) = config.host_budget_bytes() {
+            if requirements.required_host_bytes > budget {
+                return Err(ParameterResourcePreparationError::HostBudget {
+                    required: requirements.required_host_bytes,
+                    budget,
+                });
+            }
+        }
+        let required = self
+            .pinned
+            .bytes
+            .checked_add(requirements.required_device_bytes)
+            .ok_or(crate::BoundedResidencySizingError::ArithmeticOverflow(
+                "static plus device-window byte total",
+            ))?;
+        let depth = residency.device_depth(layout.len());
+        if let Some(budget) = config.device_budget_bytes() {
+            if required > budget {
+                return Err(ParameterResourcePreparationError::DeviceBudget {
+                    static_bytes: self.pinned.bytes,
+                    window_bytes: requirements.required_device_bytes,
+                    depth,
+                    required,
+                    budget,
+                });
+            }
+        }
+        let static_id = self.pinned.resource.map(|(definition, spec)| {
+            let id = definition.id().clone();
+            self.units.definitions.insert(0, definition);
+            self.units.specs.insert(0, spec);
+            id
+        });
+        let plan = eredu_core::residency::OffloadPlan::new(config, self.units.specs)?;
+        let metadata = crate::LayerwiseModelMetadata::new(
+            "generic",
+            None,
+            layout.len(),
+            self.pinned.bytes,
+            residency.execution_residency(),
+            self.units.parameter_bytes,
+            requirements.device_window_bytes,
+            self.units.maximum_host_bytes,
+            depth,
+        );
+        Ok(PreparedParameterResources {
+            residency,
+            layout: self.units.layout,
+            plan,
+            definitions: self.units.definitions,
+            sources: self.sources,
+            unit_ids: self.units.unit_ids,
+            static_id,
+            static_parameters: self.pinned.parameters,
+            metadata,
+        })
+    }
 }

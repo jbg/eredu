@@ -66,7 +66,8 @@ mod execution_unit_preparation;
 pub use execution_unit_preparation::{
     execution_unit_resource_requirements, ExecutionUnitPreparationError,
     ExecutionUnitResourcePreparation, ExecutionUnitResourceRequirements,
-    PreparedExecutionUnitResources,
+    PreparedExecutionUnitResources, ParameterResourcePreparation,
+    ParameterResourcePreparationError, PreparedParameterResources,
 };
 /// Completed-token lifecycle, snapshot reservation and branch accounting policy.
 pub mod execution_control;
