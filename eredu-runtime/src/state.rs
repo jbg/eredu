@@ -19,7 +19,8 @@ use eredu_nn::NeuralBackend;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ArchitectureStatePlacement {
-    /// Partition the state range in lockstep with one execution group's units.
+    /// Align state slots with one group's declared invocation order. Global unit
+    /// identities and dense state-slot positions remain independent.
     GroupUnits {
         /// Canonical execution-group slot.
         group: usize,
@@ -36,7 +37,7 @@ pub struct ArchitectureStatePartitionRule {
 }
 
 impl ArchitectureStatePartitionRule {
-    /// Aligns a state range one-for-one with an execution group's unit indices.
+    /// Aligns a state range one-for-one with an execution group's declared order.
     pub fn group_units(group: usize, layers: Range<usize>) -> Self {
         Self {
             layers,

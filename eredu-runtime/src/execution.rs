@@ -423,6 +423,21 @@ impl ExecutionUnitLayout {
         self.addresses.get(ordinal).copied()
     }
 
+    /// Projects a nonempty contiguous global unit range into dense flat ordinals.
+    /// Unknown identities, gaps and ranges outside the selected layout return `None`.
+    pub fn contiguous_ordinals(
+        &self,
+        group: usize,
+        global_units: Range<usize>,
+    ) -> Option<Range<usize>> {
+        if global_units.is_empty() {
+            return None;
+        }
+        let start = self.ordinal(group, global_units.start)?;
+        let end = self.ordinal(group, global_units.end - 1)? + 1;
+        (end - start == global_units.len()).then_some(start..end)
+    }
+
     /// Resolves one architecture address to its flat residency-unit slot.
     pub fn ordinal(&self, group: usize, index: usize) -> Option<usize> {
         let range = self.group_ranges.get(group)?;

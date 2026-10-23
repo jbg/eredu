@@ -1225,22 +1225,19 @@ pub struct PartitionState {
 }
 
 impl ArchitectureStatePartitionPlan {
-    /// Resolves exact rank-local state from cold unit ownership or a constructed
-    /// partition. Global-ordinal packing keeps unowned gaps stateless.
-    pub fn resolve_partition(
+    /// Validates complete state coverage and group geometry without selecting ownership.
+    pub fn validate(
         &self,
         complete: &StateLayout,
         units: &ExecutionUnitLayout,
-        owned_units: impl Fn(usize) -> Option<Range<usize>>,
-        owns_output: bool,
-    ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
+    ) -> Result<(), ArchitectureStatePartitionError> {
         if self.rules().is_empty() {
             if complete
                 .layers()
                 .iter()
                 .all(|policy| matches!(policy, eredu_core::cache::LayerCachePolicy::NoState))
             {
-                return Ok(None);
+                return Ok(());
             }
             return Err(ArchitectureStatePartitionError::EmptyPlan);
         }
@@ -1292,19 +1289,42 @@ impl ArchitectureStatePartitionPlan {
             return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
         }
 
+        Ok(())
+    }
+
+    /// Resolves exact rank-local state from global unit identities. Unit-aligned
+    /// state slots follow declared invocation order, independently of global unit IDs.
+    /// Global-ordinal packing keeps unowned state gaps stateless.
+    pub fn resolve_partition(
+        &self,
+        complete: &StateLayout,
+        units: &ExecutionUnitLayout,
+        owned_units: impl Fn(usize) -> Option<Range<usize>>,
+        owns_output: bool,
+    ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
+        self.validate(complete, units)?;
+        if self.rules().is_empty() {
+            return Ok(None);
+        }
         let mut selected = Vec::new();
         for rule in self.rules() {
             let layers = rule.layers();
             match rule.placement() {
                 ArchitectureStatePlacement::GroupUnits { group } => {
-                    if let Some(units) = owned_units(group) {
-                        if units.is_empty() || units.end > layers.len() {
-                            return Err(ArchitectureStatePartitionError::InvalidLayout(format!(
-                                "group {group} owned units {units:?} exceed its {} state slots",
-                                layers.len()
-                            )));
-                        }
-                        selected.push(layers.start + units.start..layers.start + units.end);
+                    if let Some(owned) = owned_units(group) {
+                        let ordinals = units.contiguous_ordinals(group, owned.clone()).ok_or_else(|| {
+                            ArchitectureStatePartitionError::InvalidLayout(format!(
+                                "group {group} owned units {owned:?} are not a declared contiguous range"
+                            ))
+                        })?;
+                        let base = units
+                            .group_range(group)
+                            .expect("validated state group")
+                            .start;
+                        selected.push(
+                            layers.start + (ordinals.start - base)
+                                ..layers.start + (ordinals.end - base),
+                        );
                     }
                 }
                 ArchitectureStatePlacement::OutputOwner if owns_output => {
@@ -1428,6 +1448,7 @@ pub struct PartitionGroup {
     group: ExecutionGroupId,
     group_index: usize,
     global_units: Range<usize>,
+    ordinals: Range<usize>,
 }
 
 impl PartitionGroup {
@@ -1600,14 +1621,14 @@ impl<G, A> ArchitecturePartition<G, A> {
                 .group_range(group_index)
                 .expect("canonical layout contains every graph group")
                 .len();
-            if global_units.end > available {
-                return Err(ArchitecturePartitionError::GroupRangeOutOfBounds {
-                    group,
+            let ordinals = unit_layout
+                .contiguous_ordinals(group_index, global_units.clone())
+                .ok_or_else(|| ArchitecturePartitionError::GroupRangeOutOfBounds {
+                    group: group.clone(),
                     start: global_units.start,
                     end: global_units.end,
                     available,
-                });
-            }
+                })?;
             groups.push(PartitionGroup {
                 group: unit_layout
                     .group_id(group_index)
@@ -1615,6 +1636,7 @@ impl<G, A> ArchitecturePartition<G, A> {
                     .clone(),
                 group_index,
                 global_units,
+                ordinals,
             });
         }
         groups.sort_by_key(PartitionGroup::group_index);
@@ -1669,16 +1691,10 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Traverses rank-owned execution units in canonical architecture order.
     pub fn units(&self) -> impl Iterator<Item = crate::ExecutionUnitAddress> + '_ {
         self.groups.iter().flat_map(move |owned| {
-            let group = owned.group_index;
-            let base = self
-                .unit_layout
-                .group_range(group)
-                .expect("partition group belongs to its canonical layout")
-                .start;
-            owned.global_units.clone().map(move |index| {
+            owned.ordinals.clone().map(move |ordinal| {
                 self.unit_layout
-                    .address(base + index)
-                    .expect("partition unit belongs to its canonical layout")
+                    .address(ordinal)
+                    .expect("validated partition invocation")
             })
         })
     }
@@ -2446,9 +2462,9 @@ pub enum ArchitecturePartitionError {
         /// Canonical group identity.
         group: String,
     },
-    /// A group-local global unit range exceeds the canonical group size.
+    /// A global unit range includes identities absent from the canonical layout.
     #[error(
-        "architecture partition range {start}..{end} for group {group:?} exceeds {available} units"
+        "architecture partition range {start}..{end} for group {group:?} is not contained in its {available} declared units"
     )]
     GroupRangeOutOfBounds {
         /// Canonical group identity.

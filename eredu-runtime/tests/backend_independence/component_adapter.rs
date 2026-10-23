@@ -897,19 +897,30 @@ impl eredu_runtime::PartitionComponentKernel<FakeBackend, CarryState> for CarryK
     }
 }
 
-fn carry_definition() -> ComponentDefinition {
+fn carry_definition(indices: &[usize]) -> ComponentDefinition {
     let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("carry")], "carry").unwrap();
-    let units = ExecutionUnitLayout::new(&graph, [3]).unwrap();
+    let complete = ExecutionUnitLayout::new(&graph, [indices.last().unwrap() + 1]).unwrap();
+    let units = complete
+        .select(
+            indices
+                .iter()
+                .map(|&index| complete.address(index).unwrap()),
+        )
+        .unwrap();
     let parameters = ArchitectureParameterDescription::new(&graph, &units, [], []).unwrap();
     let policy = LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap();
-    let state = StateLayout::new(LayerSchedule::new(3, vec![policy; 3]).unwrap()).unwrap();
+    let state =
+        StateLayout::new(LayerSchedule::new(indices.len(), vec![policy; indices.len()]).unwrap())
+            .unwrap();
     ComponentDefinition::new(
         "carry",
         parameters,
-        (0..3)
-            .map(|index| ComponentUnit {
+        indices
+            .iter()
+            .enumerate()
+            .map(|(position, index)| ComponentUnit {
                 path: format!("carry.{index}"),
-                state: index..index + 1,
+                state: position..position + 1,
             })
             .collect(),
         vec![ArchitectureGroupTransport {
@@ -925,7 +936,7 @@ fn carry_definition() -> ComponentDefinition {
         vec![],
         state,
         ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..3),
+            eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..indices.len()),
         ]),
     )
     .unwrap()
@@ -937,10 +948,74 @@ fn carry_state(layout: StateLayout) -> CarryState {
     .unwrap()
 }
 
+type CarryStage = (
+    ComponentAdapter<ComponentDefinition, CarryKernel>,
+    LayeredPartitionDriver,
+    CarryState,
+    Vec<ExecutionUnitAddress>,
+);
+
+fn advance_carry_stages(stages: &mut [CarryStage], step: i32) -> FakeTensor {
+    let input = FakeTensor(vec![7]);
+    let mut hidden = input.clone();
+    for (adapter, driver, state, addresses) in stages {
+        let ingress = if driver.owns_input() {
+            LayeredPartitionInput::Tokens(&input)
+        } else {
+            LayeredPartitionInput::Hidden {
+                hidden,
+                auxiliary: NoAuxiliaryBoundary,
+            }
+        };
+        let mut forward = driver
+            .begin::<FakeBackend, _, _>(adapter, ingress, None, state, None, &())
+            .unwrap();
+        for address in addresses.iter().copied() {
+            let mut unit = adapter
+                .build_unit(address.group(), address.index(), &())
+                .unwrap();
+            forward.hidden = adapter
+                .forward_unit(
+                    address.group(),
+                    address.index(),
+                    &mut unit,
+                    &forward.hidden,
+                    state,
+                    &mut forward.context,
+                    &(),
+                )
+                .unwrap();
+            let roots = adapter
+                .retained_state_ordinals(address.group(), address.index(), 0)
+                .flat_map(|local| {
+                    RuntimeState::<FakeBackend>::retained_values(state, local, address).unwrap()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(roots, [FakeTensor(vec![step])]);
+        }
+        hidden = match driver
+            .finish::<FakeBackend, _, _>(
+                adapter,
+                &forward.hidden,
+                state,
+                &mut forward.context,
+                None,
+                &(),
+            )
+            .unwrap()
+        {
+            LayeredPartitionOutput::Boundary { hidden, .. } => hidden,
+            LayeredPartitionOutput::Final { output, .. } => output,
+        };
+    }
+    hidden
+}
+
 #[test]
 fn component_partitions_preserve_repeated_advancement_and_local_carry_retention() {
     let full = ComponentAdapter::new(
-        carry_definition(),
+        carry_definition(&[0, 1, 2]),
         CarryKernel {
             offset: 0,
             has_ingress: false,
@@ -948,9 +1023,9 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
     )
     .unwrap();
     let mut resident = ResidentRuntime::new(full, &()).unwrap();
-    let mut fullstate = carry_state(carry_definition().state_layout().clone());
+    let mut fullstate = carry_state(carry_definition(&[0, 1, 2]).state_layout().clone());
     let mut stages = [0..1, 1..3].map(|range| {
-        let declaration = carry_definition();
+        let declaration = carry_definition(&[0, 1, 2]);
         let full = ComponentAdapter::new(
             declaration.clone(),
             CarryKernel {
@@ -973,74 +1048,87 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
             declaration.parameters(),
         )
         .unwrap();
+        let addresses = partition.units().collect();
         let state = carry_state(partition.state().unwrap().layout().clone());
         let driver = LayeredPartitionDriver::new(&partition, 0, range).unwrap();
         let adapter = full.select_partition(&partition).unwrap();
-        (adapter, driver, state)
+        (adapter, driver, state, addresses)
     });
     for step in 1..=3 {
         let input = FakeTensor(vec![7]);
         let expected = resident.forward(&input, &mut fullstate, &()).unwrap();
-        let mut hidden = input.clone();
-        for (adapter, driver, state) in &mut stages {
-            let ingress = if driver.owns_input() {
-                LayeredPartitionInput::Tokens(&input)
-            } else {
-                LayeredPartitionInput::Hidden {
-                    hidden,
-                    auxiliary: NoAuxiliaryBoundary,
-                }
-            };
-            let mut forward = driver
-                .begin::<FakeBackend, _, _>(adapter, ingress, None, state, None, &())
-                .unwrap();
-            for index in driver.range() {
-                let mut unit = adapter.build_unit(0, index, &()).unwrap();
-                forward.hidden = adapter
-                    .forward_unit(
-                        0,
-                        index,
-                        &mut unit,
-                        &forward.hidden,
-                        state,
-                        &mut forward.context,
-                        &(),
-                    )
-                    .unwrap();
-                let address = carry_definition()
-                    .parameters()
-                    .unit_layout()
-                    .address(index)
-                    .unwrap();
-                let roots = adapter
-                    .retained_state_ordinals(0, index, index)
-                    .flat_map(|local| {
-                        RuntimeState::<FakeBackend>::retained_values(state, local, address).unwrap()
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                assert_eq!(roots, [FakeTensor(vec![step])]);
-            }
-            hidden = match driver
-                .finish::<FakeBackend, _, _>(
-                    adapter,
-                    &forward.hidden,
-                    state,
-                    &mut forward.context,
-                    None,
-                    &(),
-                )
-                .unwrap()
-            {
-                LayeredPartitionOutput::Boundary { hidden, .. } => hidden,
-                LayeredPartitionOutput::Final { output, .. } => output,
-            };
-        }
+        let hidden = advance_carry_stages(&mut stages, step);
         assert_eq!(hidden, expected);
         assert_eq!(hidden, FakeTensor(vec![7, step, step, step]));
     }
-    let (last, _, _) = &stages[1];
+    let (last, _, _, _) = &stages[1];
     assert!(last.build_unit(0, 0, &()).is_err());
+    // Logical units 3/7 own independent dense state slots 0/1.
+    let declaration = carry_definition(&[3, 7]);
+    let mut sparse_stages = [3, 7]
+        .into_iter()
+        .enumerate()
+        .map(|(position, index)| {
+            let full = ComponentAdapter::new(
+                declaration.clone(),
+                CarryKernel {
+                    offset: index,
+                    has_ingress: false,
+                },
+            )
+            .unwrap();
+            for invalid in [0..1, 3..8] {
+                assert!(
+                    ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
+                        &full,
+                        [("carry", invalid)],
+                        PartitionOwnership::new(false, false, std::iter::empty::<String>())
+                            .unwrap(),
+                        (),
+                        NoAuxiliaryBoundarySchema::new(1),
+                        declaration.parameters(),
+                    )
+                    .is_err()
+                );
+            }
+            let partition =
+                ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
+                    &full,
+                    [("carry", index..index + 1)],
+                    PartitionOwnership::new(
+                        position == 0,
+                        position == 1,
+                        std::iter::empty::<String>(),
+                    )
+                    .unwrap(),
+                    (),
+                    NoAuxiliaryBoundarySchema::new(1),
+                    declaration.parameters(),
+                )
+                .unwrap();
+            let addresses = partition.units().collect::<Vec<_>>();
+            let state = carry_state(partition.state().unwrap().layout().clone());
+            let driver = LayeredPartitionDriver::new_with_state_range(
+                &partition,
+                0,
+                index..index + 1,
+                Some(position..position + 1),
+            )
+            .unwrap();
+            (
+                full.select_partition(&partition).unwrap(),
+                driver,
+                state,
+                addresses,
+            )
+        })
+        .collect::<Vec<_>>();
+    for step in 1..=3 {
+        assert_eq!(
+            advance_carry_stages(&mut sparse_stages, step),
+            FakeTensor(vec![7, step, step])
+        );
+    }
 }
 
 impl eredu_runtime::PipelineComponentKernel<FakeBackend, CarryState> for CarryKernel {
@@ -1074,7 +1162,7 @@ impl eredu_runtime::PipelineComponentKernel<FakeBackend, CarryState> for CarryKe
 
 #[test]
 fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
-    let base = carry_definition();
+    let base = carry_definition(&[0, 1, 2]);
     let source = ComponentAdapter::new(
         base.clone(),
         CarryKernel {
@@ -1340,7 +1428,7 @@ fn component_group_completion_preserves_dependencies_capture_and_retry() {
 
 #[test]
 fn component_parallel_group_ingress_validates_before_advancing_state() {
-    let declaration = carry_definition();
+    let declaration = carry_definition(&[0, 1, 2]);
     let mut state = carry_state(declaration.state_layout().clone());
     let mut adapter = ComponentAdapter::new(
         declaration,

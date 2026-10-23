@@ -840,6 +840,12 @@ Policy acquisition/completion receives a dense ordinal and the declared global a
 equations, state lookup and observation callbacks receive the global identity. Remaining
 work counts use traversal positions. Fallback observation paths are keyed by global unit
 identity, independently of local storage ordinals and architecture-owned internal hooks.
+Partition admission projects each owned contiguous global unit range onto its exact
+declared ordinals and retains both identities and storage positions. Traversal reads
+addresses from those ordinals. Group-aligned state slots follow declared invocation
+order rather than global unit numbers; declaration validation checks complete coverage
+without fabricating an ownership range. Missing unit IDs and ranges crossing undeclared
+gaps reject before state selection or materialization.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

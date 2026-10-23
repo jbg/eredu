@@ -174,17 +174,7 @@ impl ComponentDefinition {
             }
         }
         state_partition
-            .resolve_partition(
-                &state,
-                parameters.unit_layout(),
-                |group| {
-                    parameters
-                        .unit_layout()
-                        .group_range(group)
-                        .map(|range| 0..range.len())
-                },
-                true,
-            )
+            .validate(&state, parameters.unit_layout())
             .map_err(|source| ComponentDefinitionError::StatePartition {
                 component: id.clone(),
                 source,
