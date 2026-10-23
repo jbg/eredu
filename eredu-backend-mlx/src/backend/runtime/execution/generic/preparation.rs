@@ -89,8 +89,6 @@ where
             "generic MLX architecture declared no execution units".into(),
         ));
     }
-    let fully_resident = options.is_fully_resident();
-    let dense = options.dense();
     let offload = options.offload()?;
     let depth = options.device_depth(unit_count);
     let mut definitions = Vec::new();
@@ -147,20 +145,22 @@ where
     consumed.extend(units.source_keys);
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let device_window_bytes =
-        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &units.unit_bytes, options)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-    let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes() > 0 => units
-            .maximum_host_bytes
-            .checked_mul(dense.host_lookahead() as u64)
-            .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
-        Some(_) => 0,
-        None if fully_resident => 0,
-        None => units.total_host_bytes,
-    };
-    validate_host_budget(offload, host_required)?;
-    validate_device_budget(offload, static_bytes, device_window_bytes, depth)?;
+    let requirements = eredu_runtime::execution_unit_resource_requirements(
+        &layout,
+        &units.unit_bytes,
+        units.total_host_bytes,
+        units.maximum_host_bytes,
+        options,
+        Default::default(),
+    )
+    .map_err(|error| Error::Other(Box::new(error)))?;
+    validate_host_budget(offload, requirements.required_host_bytes)?;
+    validate_device_budget(
+        offload,
+        static_bytes,
+        requirements.required_device_bytes,
+        depth,
+    )?;
 
     let plan = OffloadPlan::new(offload, specs)?;
     let metadata = LayerwiseModelMetadata::new(
@@ -170,7 +170,7 @@ where
         static_bytes,
         options.execution_residency(),
         units.parameter_bytes,
-        device_window_bytes,
+        requirements.device_window_bytes,
         units.maximum_host_bytes,
         depth,
     );
@@ -422,40 +422,22 @@ where
     }
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let device_window_bytes =
-        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &units.unit_bytes, options)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-    let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes() > 0 => units
-            .maximum_host_bytes
-            .checked_mul(dense.host_lookahead() as u64)
-            .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
-        Some(_) => 0,
-        None if fully_resident => 0,
-        None => units.total_host_bytes,
-    };
-    let auxiliary_host = extra
-        .host_bytes(options)
-        .ok_or_else(|| Error::Parallel("auxiliary host bytes overflowed".into()))?;
-    let host_required = if dense.is_some() {
-        host_required.max(auxiliary_host)
-    } else {
-        host_required
-            .checked_add(auxiliary_host)
-            .ok_or_else(|| Error::Parallel("combined host bytes overflowed".into()))?
-    };
-    let auxiliary_device = extra
-        .device_bytes(options)
-        .ok_or_else(|| Error::Parallel("auxiliary device bytes overflowed".into()))?;
-    let required_device = if fully_resident {
-        device_window_bytes
-            .checked_add(auxiliary_device)
-            .ok_or_else(|| Error::Parallel("combined device bytes overflowed".into()))?
-    } else {
-        device_window_bytes.max(auxiliary_device)
-    };
-    validate_host_budget(offload, host_required)?;
-    validate_device_budget(offload, static_bytes, required_device, depth)?;
+    let requirements = eredu_runtime::execution_unit_resource_requirements(
+        &layout,
+        &units.unit_bytes,
+        units.total_host_bytes,
+        units.maximum_host_bytes,
+        options,
+        extra,
+    )
+    .map_err(|error| Error::Other(Box::new(error)))?;
+    validate_host_budget(offload, requirements.required_host_bytes)?;
+    validate_device_budget(
+        offload,
+        static_bytes,
+        requirements.required_device_bytes,
+        depth,
+    )?;
 
     let plan = OffloadPlan::new(offload, specs)?;
     let metadata = LayerwiseModelMetadata::new(
@@ -465,7 +447,7 @@ where
         static_bytes,
         options.execution_residency(),
         units.parameter_bytes,
-        device_window_bytes,
+        requirements.device_window_bytes,
         units.maximum_host_bytes,
         depth,
     );

@@ -791,6 +791,10 @@ and specifications, and aggregate host-capacity facts supplied by the backend. A
 is consuming and requires complete selected-unit coverage. Native callback-derived and
 retained-binding preparation consume the same admitted resource representation without
 combining independent units or changing source authority.
+Runtime also combines ordinary windows with auxiliary lifetime requirements. Resident
+resources coexist; bounded sequential phases share device windows, host-resident phases
+retain their complete host payloads, and disk-streamed phases reuse bounded host caches.
+Both native preparation paths validate budgets against these shared capacity results.
 Native callback-derived and retained-binding policy preparation use one finalization
 implementation for residency streams and managers, pinned static binding, dense-stream
 controllers and policy assembly. Their source realization and binding admission order

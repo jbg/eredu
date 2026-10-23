@@ -177,3 +177,63 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
         Ok(self.resources)
     }
 }
+
+/// Parameter capacity required by ordinary and auxiliary execution phases.
+/// Pinned statics, conversions, activations and mutable state are excluded.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExecutionUnitResourceRequirements {
+    /// Ordinary execution's largest group-local device window.
+    pub device_window_bytes: u64,
+    /// Host capacity retained across the selected phases.
+    pub required_host_bytes: u64,
+    /// Device capacity required in addition to pinned static parameters.
+    pub required_device_bytes: u64,
+}
+
+/// Combines exact unit payloads with backend host-capacity facts and auxiliary lifetimes.
+/// Sequential phases share bounded windows; resident resources coexist.
+pub fn execution_unit_resource_requirements(
+    layout: &ExecutionUnitLayout,
+    unit_bytes: &[u64],
+    total_host_bytes: u64,
+    maximum_host_bytes: u64,
+    residency: LayerWeightResidency,
+    auxiliary: crate::AuxiliaryWeightRequirements,
+) -> Result<ExecutionUnitResourceRequirements, crate::BoundedResidencySizingError> {
+    use crate::BoundedResidencySizingError::ArithmeticOverflow;
+    let device_window_bytes =
+        crate::execution_unit_parameter_window_bytes(layout, unit_bytes, residency)?;
+    let dense = residency.dense();
+    let host = match dense {
+        Some(options) if options.host_budget_bytes() > 0 => maximum_host_bytes
+            .checked_mul(options.host_lookahead() as u64)
+            .ok_or(ArithmeticOverflow("host execution window"))?,
+        Some(_) => 0,
+        None if residency.is_fully_resident() => 0,
+        None => total_host_bytes,
+    };
+    let auxiliary_host = auxiliary
+        .host_bytes(residency)
+        .ok_or(ArithmeticOverflow("auxiliary host capacity"))?;
+    let required_host_bytes = if dense.is_some() {
+        host.max(auxiliary_host)
+    } else {
+        host.checked_add(auxiliary_host)
+            .ok_or(ArithmeticOverflow("combined host capacity"))?
+    };
+    let auxiliary_device = auxiliary
+        .device_bytes(residency)
+        .ok_or(ArithmeticOverflow("auxiliary device capacity"))?;
+    let required_device_bytes = if residency.is_fully_resident() {
+        device_window_bytes
+            .checked_add(auxiliary_device)
+            .ok_or(ArithmeticOverflow("combined device capacity"))?
+    } else {
+        device_window_bytes.max(auxiliary_device)
+    };
+    Ok(ExecutionUnitResourceRequirements {
+        device_window_bytes,
+        required_host_bytes,
+        required_device_bytes,
+    })
+}

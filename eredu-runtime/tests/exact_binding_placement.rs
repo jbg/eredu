@@ -2241,7 +2241,10 @@ mod component_preparation {
             .select_units([0, 2].map(|i| description(&[0, 1, 2]).unit_layout().address(i).unwrap()))
             .unwrap();
         let layout = selected.unit_layout();
-        let options = LayerWeightResidency::LayerwiseHost(Default::default());
+        let options =
+            LayerWeightResidency::LayerwiseHost(eredu_runtime::LayerwiseLoadOptions::new(
+                eredu_core::residency::OffloadConfig::new(Some(256), Some(512), 1).unwrap(),
+            ));
         let mut bindings = selected.unit_bindings().to_vec();
         let owner = bindings[0][0].name().to_owned();
         bindings[0].push(WeightBinding::alias("alias", owner, 32).unwrap());
@@ -2276,6 +2279,43 @@ mod component_preparation {
                 .collect::<Vec<_>>(),
             ["model.units.00000", "model.units.00002"]
         );
+        let auxiliary = eredu_runtime::AuxiliaryWeightRequirements::default()
+            .checked_add_module(16, 64, true)
+            .unwrap()
+            .checked_add_module(48, 128, false)
+            .unwrap()
+            .checked_add_module(8, 32, false)
+            .unwrap();
+        let streamed = LayerWeightResidency::DenseDiskStream(
+            eredu_runtime::DenseDiskStreamLoadOptions::new(256, 512, 2, 1).unwrap(),
+        );
+        let direct = LayerWeightResidency::DenseDiskStream(
+            eredu_runtime::DenseDiskStreamLoadOptions::new(256, 0, 0, 0).unwrap(),
+        );
+        for (mode, window, host, device) in [
+            (LayerWeightResidency::FullyResident, 64, 0, 136),
+            (options, 32, 416, 64),
+            (streamed, 64, 256, 64),
+            (direct, 64, 0, 64),
+        ] {
+            let requirements = eredu_runtime::execution_unit_resource_requirements(
+                layout,
+                &resources.unit_bytes,
+                resources.total_host_bytes,
+                resources.maximum_host_bytes,
+                mode,
+                auxiliary,
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    requirements.device_window_bytes,
+                    requirements.required_host_bytes,
+                    requirements.required_device_bytes
+                ),
+                (window, host, device)
+            );
+        }
         let overflow = ExecutionUnitResourcePreparation::new("model", layout, options)
             .push(bindings[0].clone(), |_| Ok::<_, Failure>(u64::MAX))
             .unwrap()
