@@ -519,26 +519,6 @@ fn populate_selected_parameterized<M: Parameterized<MlxTensor>>(
         .map_err(Error::from)
 }
 
-/// Derives the canonical flat unit layout from a neutral architecture.
-pub fn architecture_execution_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>
-where
-    A: LayeredArchitecture<MlxNeuralBackend, S>,
-    S: RuntimeState<MlxNeuralBackend>,
-    A::Error: std::fmt::Display,
-{
-    let graph = architecture
-        .execution_graph()
-        .map_err(|error| Error::Other(Box::new(error)))?;
-    let counts = (0..graph.groups().len())
-        .map(|group| {
-            architecture
-                .group_unit_count(group)
-                .map_err(|error| Error::Other(Box::new(error)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ExecutionUnitLayout::new(&graph, counts).map_err(|error| Error::Other(Box::new(error)))
-}
-
 /// Cold preparation for bounded and resident policies.
 mod preparation;
 pub use preparation::{

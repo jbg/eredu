@@ -951,6 +951,20 @@ where
     /// Declares the dependency graph between ordered execution groups.
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error>;
 
+    /// Projects exact canonical invocation addresses before resource selection.
+    /// Shared component adapters retain this layout with their validated definition.
+    fn execution_unit_layout(
+        &self,
+    ) -> Result<crate::ExecutionUnitLayout, crate::ArchitectureExecutionLayoutError<Self::Error>>
+    {
+        use crate::ArchitectureExecutionLayoutError::Architecture;
+        let graph = self.execution_graph().map_err(Architecture)?;
+        let counts = (0..graph.groups().len())
+            .map(|group| self.group_unit_count(group).map_err(Architecture))
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::ExecutionUnitLayout::new(&graph, counts).map_err(Into::into)
+    }
+
     /// Returns the number of ordered execution units in one graph group.
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error>;
 

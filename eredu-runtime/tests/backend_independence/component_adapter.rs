@@ -275,6 +275,70 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         bounded.policy().addresses,
         [(0, 0, 0), (0, 0, 0), (1, 1, 0), (0, 0, 0)]
     );
+    // Topology admission and low-level construction retain sparse global IDs.
+    let prototype = definition(false);
+    let graph = prototype.parameters().graph();
+    let complete = ExecutionUnitLayout::new(graph, [4, 8]).unwrap();
+    let addresses = [complete.address(3).unwrap(), complete.address(11).unwrap()];
+    let sparse = complete.select(addresses).unwrap();
+    let parameters = ArchitectureParameterDescription::new(graph, &sparse, [], []).unwrap();
+    let declaration = ComponentDefinition::new(
+        "sparse-fixture",
+        parameters,
+        vec![
+            prototype.unit(0, 0).unwrap().clone(),
+            prototype.unit(1, 0).unwrap().clone(),
+        ],
+        vec![
+            prototype.group_transport(0).unwrap().clone(),
+            prototype.group_transport(1).unwrap().clone(),
+        ],
+        "first",
+        vec![],
+        prototype.state_layout().clone(),
+        ArchitectureStatePartitionPlan::new([]),
+    )
+    .unwrap();
+    let sparse_parameters = declaration.parameters().clone();
+    let mut component = ComponentAdapter::new(
+        declaration,
+        Kernel {
+            fail: false,
+            pinned: None,
+        },
+    )
+    .unwrap();
+    sparse_parameters
+        .validate_architecture::<FakeBackend, StatelessComponentState, _>(&component)
+        .unwrap();
+    let selected =
+        <_ as LayeredArchitecture<FakeBackend, StatelessComponentState>>::execution_unit_layout(
+            &component,
+        )
+        .unwrap()
+        .select(addresses)
+        .unwrap();
+    let mut hidden = input.clone();
+    let mut forward = true;
+    for ordinal in 0..selected.len() {
+        let address = selected.address(ordinal).unwrap();
+        let mut unit = component
+            .build_unit(address.group(), address.index(), &())
+            .unwrap();
+        hidden = component
+            .forward_unit(
+                address.group(),
+                address.index(),
+                &mut unit,
+                &hidden,
+                &mut state,
+                &mut forward,
+                &(),
+            )
+            .unwrap();
+    }
+    assert_eq!(hidden.0, [7, 3, 17]);
+    assert!(component.build_unit(0, 0, &()).is_err());
 }
 
 #[test]

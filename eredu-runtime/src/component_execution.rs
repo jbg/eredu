@@ -1325,6 +1325,11 @@ where
     fn execution_graph(&self) -> Result<ExecutionGraph, K::Error> {
         Ok(self.definition().parameters.graph().clone())
     }
+    fn execution_unit_layout(
+        &self,
+    ) -> Result<crate::ExecutionUnitLayout, crate::ArchitectureExecutionLayoutError<K::Error>> {
+        Ok(self.definition().parameters.unit_layout().clone())
+    }
     fn group_unit_count(&self, group: usize) -> Result<usize, K::Error> {
         self.definition().unit_count(group).map_err(Into::into)
     }

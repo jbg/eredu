@@ -82,7 +82,9 @@ where
         &Stream,
     ) -> Result<Vec<WeightBinding>, Error>,
 {
-    let layout = architecture_execution_layout::<A, S>(architecture)?;
+    let layout = architecture
+        .execution_unit_layout()
+        .map_err(|error| Error::Other(Box::new(error)))?;
     let unit_count = layout.len();
     if unit_count == 0 {
         return Err(Error::Parallel(
@@ -192,7 +194,9 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
-    let layout = architecture_execution_layout::<A, S>(architecture)?
+    let layout = architecture
+        .execution_unit_layout()
+        .map_err(|error| Error::Other(Box::new(error)))?
         .select(units.iter().map(|(address, _)| *address))
         .map_err(|error| Error::Other(Box::new(error)))?;
     prepare_layerwise_policy_from_bindings(

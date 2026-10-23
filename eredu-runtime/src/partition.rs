@@ -2323,14 +2323,20 @@ where
             )));
         }
     }
-    let mut counts = Vec::with_capacity(graph.groups().len());
+    let unit_layout = architecture
+        .execution_unit_layout()
+        .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+    validate_canonical_layout(&graph, &unit_layout)?;
     let mut paths = BTreeSet::new();
     for group in 0..graph.groups().len() {
-        let count = architecture
-            .group_unit_count(group)
-            .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
-        counts.push(count);
-        for index in 0..count {
+        for ordinal in unit_layout
+            .group_range(group)
+            .expect("canonical execution group")
+        {
+            let index = unit_layout
+                .address(ordinal)
+                .expect("canonical invocation")
+                .index();
             let path = architecture.unit_path(group, index).map_err(|error| {
                 ArchitecturePartitionError::ArchitectureTopology(error.to_string())
             })?;
@@ -2344,8 +2350,7 @@ where
             }
         }
     }
-    let unit_layout = ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+
     Ok((graph, unit_layout))
 }
 

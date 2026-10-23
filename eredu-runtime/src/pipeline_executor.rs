@@ -665,11 +665,8 @@ where
                 "a pipeline chain ingress cannot merge multiple graph dependencies",
             ));
         }
-        let counts = (0..graph.groups().len())
-            .map(|group| architecture.group_unit_count(group))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(eredu_nn::Error::backend_source)?;
-        let canonical_layout = crate::ExecutionUnitLayout::new(&graph, counts)
+        let canonical_layout = architecture
+            .execution_unit_layout()
             .map_err(eredu_nn::Error::backend_source)?;
         canonical_layout
             .select(addresses.iter().copied())

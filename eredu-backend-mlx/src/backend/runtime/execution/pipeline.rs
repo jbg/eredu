@@ -1,9 +1,6 @@
 //! Native completion and binding for architecture-selected component pipelines.
 
-use super::generic::{
-    architecture_execution_layout, prepare_layerwise_policy_from_addressed_bindings,
-    MlxSelectedLayerwisePolicy,
-};
+use super::generic::{prepare_layerwise_policy_from_addressed_bindings, MlxSelectedLayerwisePolicy};
 use crate::{
     backend::{
         distributed::MlxDistributedSession,
@@ -118,7 +115,8 @@ where
             .iter()
             .map(|(address, _)| *address)
             .collect::<Vec<_>>();
-        let layout = architecture_execution_layout::<_, S>(&architecture)
+        let layout = architecture
+            .execution_unit_layout()
             .map_err(BackendFailure::from_error)?
             .select(addresses.iter().copied())
             .map_err(BackendFailure::from_error)?;

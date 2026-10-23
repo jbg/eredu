@@ -826,6 +826,12 @@ for architecture-built modules and modules supplied by neutral construction. Sou
 adapters supply each unit once; the common finalizer validates supplied cardinality,
 orders the retained transfer before population, enables resident parameter conversions,
 and moves pinned leases and the transfer owner into the resident policy.
+Canonical execution-unit layout projection is a portable architecture contract.
+The shared component adapter returns the retained definition's layout, preserving
+nonzero global addresses and sparse selections. Native preparation and portable
+partition/pipeline admission consume that layout rather than reconstructing addresses
+from counts. Custom low-level architectures use the shared graph/count projection;
+projection errors retain the original architecture or layout failure as their source.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

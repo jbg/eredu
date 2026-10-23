@@ -3,6 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+/// Failure projecting an architecture's canonical execution-unit layout.
+#[derive(Debug, thiserror::Error)]
+pub enum ArchitectureExecutionLayoutError<E> {
+    /// The architecture cannot supply its neutral graph or group counts.
+    #[error("architecture execution layout: {0}")]
+    Architecture(#[source] E),
+    /// Declared counts cannot form a valid canonical layout.
+    #[error("execution-unit layout: {0}")]
+    Layout(#[from] ExecutionUnitLayoutError),
+}
+
 /// Stable non-empty identity for one architecture execution group.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExecutionGroupId(String);
