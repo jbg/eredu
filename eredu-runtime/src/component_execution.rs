@@ -1000,11 +1000,30 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         P: crate::LayerwisePolicy<B, K::Unit>,
     {
         let selected = self.select_partition(partition)?;
-        let state_groups = (0..selected.definition().parameters.graph().groups().len())
-            .filter(|group| selected.group_has_state_geometry(*group))
-            .collect::<std::collections::BTreeSet<_>>();
+        let definition = selected.definition();
+        let layout = definition.parameters.unit_layout();
+        let mut state_groups = std::collections::BTreeMap::new();
+        for owned in partition.groups() {
+            let group = owned.group_index();
+            if !selected.group_has_state_geometry(group) {
+                continue;
+            }
+            let units = owned.global_units();
+            let state = if let Some(rule) = definition.state_partition.rules().iter().find(|rule| {
+                matches!(rule.placement(), crate::ArchitectureStatePlacement::GroupUnits { group: owner } if owner == group)
+            }) {
+                let base = layout.group_range(group).expect("declared group").start;
+                let ordinals = layout.contiguous_ordinals(group, units).expect("validated ownership");
+                rule.layers().start + (ordinals.start - base)..rule.layers().start + (ordinals.end - base)
+            } else {
+                let first = definition.unit(group, units.start).expect("declared unit");
+                let last = definition.unit(group, units.end - 1).expect("declared unit");
+                first.state.start..last.state.end
+            };
+            state_groups.insert(group, state);
+        }
         crate::LayerwisePartitionRuntime::new(selected, policy, partition, |group| {
-            state_groups.contains(&group)
+            state_groups.get(&group).cloned()
         })
     }
     pub(crate) fn partition_entry_layout<'a>(

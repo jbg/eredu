@@ -845,7 +845,12 @@ declared ordinals and retains both identities and storage positions. Traversal r
 addresses from those ordinals. Group-aligned state slots follow declared invocation
 order rather than global unit numbers; declaration validation checks complete coverage
 without fabricating an ownership range. Missing unit IDs and ranges crossing undeclared
-gaps reject before state selection or materialization.
+gaps reject before state selection or materialization. The pipeline executor retains
+that layout to check dependency-chain group endpoints and prediction-target output
+ownership. Group boundaries use declared first/last addresses; local ranges within a
+group remain contiguous in global unit identity. Local-stage construction receives
+explicit state-slot ranges projected from declared group alignment or unit state
+references, independently of those unit ranges.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

@@ -574,6 +574,7 @@ where
     architecture: A,
     policy: P,
     addresses: Vec<crate::ExecutionUnitAddress>,
+    canonical_layout: crate::ExecutionUnitLayout,
     parallel: Option<B::ParallelContext>,
     local_agreement: Option<eredu_core::CollectiveGroupId>,
     allocator: F,
@@ -679,12 +680,12 @@ where
                 next.index() == previous.index() + 1
             } else {
                 graph.dependencies(next.group()) == Some(&[previous.group()][..])
-                    && previous.index() + 1
-                        == canonical_layout
-                            .group_range(previous.group())
-                            .unwrap()
-                            .len()
-                    && next.index() == 0
+                    && canonical_layout
+                        .address(canonical_layout.group_range(previous.group()).unwrap().end - 1)
+                        == Some(*previous)
+                    && canonical_layout
+                        .address(canonical_layout.group_range(next.group()).unwrap().start)
+                        == Some(*next)
             };
             if !contiguous {
                 return Err(eredu_nn::Error::backend(
@@ -696,6 +697,7 @@ where
             architecture,
             policy,
             addresses,
+            canonical_layout,
             parallel,
             local_agreement: None,
             allocator,
@@ -1394,8 +1396,13 @@ where
             .addresses
             .last()
             .expect("validated pipeline partition has a local unit");
-        let owns_output =
-            address.index() + 1 == self.architecture.group_unit_count(address.group())?;
+        let owns_output = self.canonical_layout.address(
+            self.canonical_layout
+                .group_range(address.group())
+                .expect("validated pipeline group")
+                .end
+                - 1,
+        ) == Some(*address);
         if owns_output {
             Ok(None)
         } else {

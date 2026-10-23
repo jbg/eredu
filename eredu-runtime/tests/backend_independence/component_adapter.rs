@@ -9,6 +9,8 @@ use eredu_runtime::{
 #[derive(Debug, thiserror::Error)]
 enum Failure {
     #[error(transparent)]
+    Neural(#[from] eredu_nn::Error),
+    #[error(transparent)]
     Definition(#[from] ComponentDefinitionError),
     #[error("injected equation failure")]
     Equation,
@@ -739,6 +741,9 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
         }
         .state_identity(state, topology)
     }
+    fn prediction_target_placeholder_shape(&self, _: &()) -> Result<Option<Vec<i32>>, Failure> {
+        Ok(Some(vec![1]))
+    }
     fn build_unit(&self, address: ExecutionUnitAddress, _: &()) -> Result<FakeUnit, Failure> {
         Ok(FakeUnit {
             marker: address.index() as i32,
@@ -1160,8 +1165,41 @@ impl eredu_runtime::PipelineComponentKernel<FakeBackend, CarryState> for CarryKe
     }
 }
 
+impl SumReductionBackend for FakeBackend {
+    fn all_reduce_sum(
+        value: FakeTensor,
+        _: &(),
+        _: &(),
+    ) -> Result<Submission<FakeTensor, CommunicationDone>, FakeCommunicationError> {
+        Ok(Submission {
+            output: value,
+            completion: CommunicationDone,
+        })
+    }
+}
+
+struct CaptureAllocator;
+impl eredu_runtime::PartitionTensorAllocator<FakeBackend> for CaptureAllocator {
+    fn tensor_placeholder(
+        &mut self,
+        shape: &[i32],
+        _: eredu_runtime::BoundaryTensorDtype,
+        _: eredu_runtime::PipelineActivationDtype,
+        _: &(),
+    ) -> Result<FakeTensor, eredu_nn::Error> {
+        assert_eq!(shape, [1]);
+        Ok(FakeTensor(vec![-1]))
+    }
+}
+
 #[test]
 fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
+    for offset in [0, 7] {
+        check_stage_carry(offset);
+    }
+}
+
+fn check_stage_carry(offset: usize) {
     let base = carry_definition(&[0, 1, 2]);
     let source = ComponentAdapter::new(
         base.clone(),
@@ -1179,7 +1217,13 @@ fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
         "carry",
     )
     .unwrap();
-    let layout = ExecutionUnitLayout::new(&graph, [1, 3]).unwrap();
+    let complete = ExecutionUnitLayout::new(&graph, [offset + 1, offset + 3]).unwrap();
+    let layout = complete
+        .select(
+            std::iter::once(complete.address(offset).unwrap())
+                .chain((0..3).map(|index| complete.address(offset + 1 + offset + index).unwrap())),
+        )
+        .unwrap();
     let parameters = ArchitectureParameterDescription::new(&graph, &layout, [], []).unwrap();
     let mut units = vec![ComponentUnit {
         path: "ingress".into(),
@@ -1202,20 +1246,82 @@ fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
     let adapter = ComponentAdapter::new(
         definition.clone(),
         CarryKernel {
-            offset: 0,
+            offset,
             has_ingress: true,
         },
     )
     .unwrap();
     let partition = ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
         &adapter,
-        [("ingress", 0..1), ("carry", 0..3)],
+        [
+            ("ingress", offset..offset + 1),
+            ("carry", offset..offset + 3),
+        ],
         PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
         (),
         NoAuxiliaryBoundarySchema::new(1),
         definition.parameters(),
     )
     .unwrap();
+    for (ordinals, valid) in [
+        (&[0, 1][..], true),
+        (&[0, 1, 2, 3][..], true),
+        (&[0, 2, 3][..], false),
+        (&[0, 1, 3][..], false),
+    ] {
+        let adapter = ComponentAdapter::new(
+            definition.clone(),
+            CarryKernel {
+                offset,
+                has_ingress: true,
+            },
+        )
+        .unwrap();
+        let addresses: Vec<_> = ordinals
+            .iter()
+            .map(|&ordinal| layout.address(ordinal).unwrap())
+            .collect();
+        let policy = eredu_runtime::ResidentUnitWindow::new(
+            addresses
+                .iter()
+                .map(|address| {
+                    adapter
+                        .build_unit(address.group(), address.index(), &())
+                        .unwrap()
+                })
+                .collect(),
+        );
+        let result = eredu_runtime::PipelinePartitionExecutor::new(
+            adapter,
+            policy,
+            addresses,
+            None,
+            CaptureAllocator,
+            eredu_runtime::PipelineActivationDtype::Float32,
+        );
+        if !valid {
+            assert!(result.is_err());
+            continue;
+        }
+        let mut executor = result.unwrap();
+        let capture = <_ as eredu_runtime::PartitionedGroupExecutor<
+            _,
+            FakeBackend,
+            CarryState,
+            (),
+            (),
+            FakeTensorMetadata,
+        >>::prediction_target_capture(&mut executor, &(), &())
+        .unwrap();
+        assert_eq!(
+            capture,
+            if ordinals.last() == Some(&3) {
+                None
+            } else {
+                Some(FakeTensor(vec![-1]))
+            }
+        );
+    }
     let mut state = carry_state(partition.state().unwrap().layout().clone());
     let mut runtime = adapter
         .into_partition_runtime(RecordingPolicy::bounded(4), &partition)
