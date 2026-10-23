@@ -878,6 +878,14 @@ The same mapped window algorithm supplies both host and device sizing. Native
 materialization consumes the admitted map, and resident and bounded selection adopt it
 directly. Bounded raw and selected execution and inspection use this retained schedule
 through the same lifecycle; adoption cannot replace it after admission.
+Consuming resource projections select logical consumers and retain each referenced
+physical owner once, including owners whose addresses are not local invocations.
+Bindings, placement and host-capacity facts move unchanged; source keys and physical
+budgets follow the retained owners. A projection that discards a retained alias's
+ordinary parameter owner fails before materialization. A later projection cannot restore
+discarded invocations merely because their storage is still available. Primary source views
+contain only pinned and ordinary recipe inputs. Each auxiliary owner retains its own
+restricted view, independently of identically named keys in another source.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

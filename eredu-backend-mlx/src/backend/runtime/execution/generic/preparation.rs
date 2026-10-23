@@ -349,6 +349,7 @@ where
     SM: Parameterized<MlxTensor>,
     P: MlxUnitPopulator<U>,
 {
+    let store = resources.restrict_primary_source(store)?;
     let eredu_runtime::PreparedParameterResources {
         residency: options,
         plan,
@@ -359,6 +360,7 @@ where
         static_id,
         static_parameters,
         metadata,
+        ..
     } = resources;
     let layout = invocations.storage_layout();
     let dense = options.dense();

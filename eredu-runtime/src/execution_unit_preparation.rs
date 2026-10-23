@@ -12,10 +12,21 @@ use crate::{
 /// Invalid execution-unit resource count or aggregate capacity.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionUnitPreparationError {
+    /// Selected logical consumers are not a subset of the retained declaration.
+    #[error(transparent)]
+    Selection(#[from] crate::ExecutionUnitAddressMapError),
+    /// A retained parameter alias refers to an ordinary owner removed by selection.
+    #[error("selected alias {alias:?} requires discarded parameter owner {owner:?}")]
+    DiscardedAliasOwner {
+        /// Retained alias parameter.
+        alias: String,
+        /// Canonical parameter whose ordinary resource was discarded.
+        owner: String,
+    },
     /// Prepared resources do not match the selected physical owner count.
     #[error("prepared {actual} execution units for a layout of {expected}")]
     UnitCount {
-        /// Selected logical invocation count.
+        /// Selected physical owner count.
         expected: usize,
         /// Number of supplied units.
         actual: usize,
@@ -23,7 +34,7 @@ pub enum ExecutionUnitPreparationError {
     /// A byte total cannot be represented.
     #[error("execution unit {address:?} overflows {context}")]
     ArithmeticOverflow {
-        /// Architecture-global invocation being admitted.
+        /// Canonical physical owner being admitted.
         address: ExecutionUnitAddress,
         /// Capacity whose addition failed.
         context: &'static str,
@@ -53,6 +64,119 @@ pub struct PreparedExecutionUnitResources {
     pub total_host_bytes: u64,
     /// Largest independently acquired host-transfer capacity.
     pub maximum_host_bytes: u64,
+}
+
+impl PreparedExecutionUnitResources {
+    /// Projects already prepared physical owners through selected logical consumers.
+    /// Recipes, placement and backend capacity facts move unchanged; no source is
+    /// reopened and no transformation or host-capacity query runs again.
+    pub fn select_invocations(
+        mut self,
+        selected: impl IntoIterator<Item = ExecutionUnitAddress>,
+    ) -> Result<Self, ExecutionUnitPreparationError> {
+        let invocations = self.invocations.select_invocations(selected)?;
+        let original = self.invocations.storage_layout();
+        for actual in [
+            self.definitions.len(),
+            self.specs.len(),
+            self.unit_ids.len(),
+            self.unit_bytes.len(),
+            self.host_bytes.len(),
+        ] {
+            if actual != original.len() {
+                return Err(ExecutionUnitPreparationError::UnitCount {
+                    expected: original.len(),
+                    actual,
+                });
+            }
+        }
+        let mut retained = vec![false; original.len()];
+        for ordinal in 0..invocations.storage_layout().len() {
+            let address = invocations
+                .storage_layout()
+                .address(ordinal)
+                .expect("selected resource");
+            let ordinal = original
+                .ordinal(address.group(), address.index())
+                .expect("retained resource");
+            retained[ordinal] = true;
+        }
+        let identity = |binding: &WeightBinding| {
+            binding
+                .logical_target()
+                .unwrap_or(binding.name())
+                .to_owned()
+        };
+        let all = self
+            .definitions
+            .iter()
+            .flat_map(|unit| unit.bindings())
+            .map(identity)
+            .collect::<BTreeSet<_>>();
+        let selected = self
+            .definitions
+            .iter()
+            .zip(&retained)
+            .filter(|(_, keep)| **keep)
+            .flat_map(|(unit, _)| unit.bindings())
+            .map(identity)
+            .collect::<BTreeSet<_>>();
+        for binding in self
+            .definitions
+            .iter()
+            .zip(&retained)
+            .filter(|(_, keep)| **keep)
+            .flat_map(|(unit, _)| unit.bindings())
+        {
+            if let Some(owner) = binding.alias_of() {
+                if all.contains(owner) && !selected.contains(owner) {
+                    return Err(ExecutionUnitPreparationError::DiscardedAliasOwner {
+                        alias: binding.name().to_owned(),
+                        owner: owner.to_owned(),
+                    });
+                }
+            }
+        }
+        fn retain<T>(values: Vec<T>, retained: &[bool]) -> Vec<T> {
+            values
+                .into_iter()
+                .zip(retained)
+                .filter_map(|(value, &retain)| retain.then_some(value))
+                .collect()
+        }
+        self.definitions = retain(self.definitions, &retained);
+        self.specs = retain(self.specs, &retained);
+        self.unit_ids = retain(self.unit_ids, &retained);
+        self.unit_bytes = retain(self.unit_bytes, &retained);
+        self.host_bytes = retain(self.host_bytes, &retained);
+        self.source_keys = self
+            .definitions
+            .iter()
+            .flat_map(|unit| unit.bindings())
+            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned))
+            .collect();
+        let sum = |bytes: &[u64], context| {
+            bytes
+                .iter()
+                .enumerate()
+                .try_fold(0u64, |sum, (ordinal, bytes)| {
+                    sum.checked_add(*bytes).ok_or(
+                        ExecutionUnitPreparationError::ArithmeticOverflow {
+                            address: invocations
+                                .storage_layout()
+                                .address(ordinal)
+                                .expect("selected resource"),
+                            context,
+                        },
+                    )
+                })
+        };
+        self.parameter_bytes = sum(&self.unit_bytes, "selected parameter bytes")?;
+        self.total_host_bytes = sum(&self.host_bytes, "selected host capacities")?;
+        self.maximum_host_bytes = self.host_bytes.iter().copied().max().unwrap_or(0);
+        self.invocations = invocations;
+        Ok(self)
+    }
 }
 
 /// Consuming admission that keeps backend host-capacity queries in unit order.
@@ -309,6 +433,7 @@ pub struct ParameterResourcePreparation {
 
 /// Complete parameter plan consumed by native materialization and cold reporting.
 pub struct PreparedParameterResources {
+    primary_source_keys: BTreeSet<String>,
     /// Retained residency mechanism selection used to admit every resource.
     pub residency: LayerWeightResidency,
     /// Exact invocation references and physical layout used for admission.
@@ -328,6 +453,24 @@ pub struct PreparedParameterResources {
     pub static_parameters: BTreeSet<String>,
     /// Residency report derived from the same selected resources and limits.
     pub metadata: crate::LayerwiseModelMetadata,
+}
+
+impl PreparedParameterResources {
+    /// Restricts the primary source to actual pinned and ordinary recipe inputs.
+    /// Auxiliary owners retain independent source views even when keys coincide.
+    pub fn restrict_primary_source(
+        &self,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<eredu_checkpoint::store::SharedCheckpointSource, eredu_checkpoint::store::StoreError>
+    {
+        Ok(std::sync::Arc::new(
+            eredu_checkpoint::store::RestrictedCheckpointSource::including(
+                source,
+                "prepared primary parameters",
+                self.primary_source_keys.clone(),
+            )?,
+        ))
+    }
 }
 
 impl ParameterResourcePreparation {
@@ -362,8 +505,21 @@ impl ParameterResourcePreparation {
     where
         E: From<ResidencyDeclarationError>
             + From<OffloadError>
-            + From<crate::BoundedResidencySizingError>,
+            + From<crate::BoundedResidencySizingError>
+            + From<eredu_checkpoint::store::StoreError>,
     {
+        let keys = definition
+            .bindings()
+            .iter()
+            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned))
+            .collect();
+        let source = std::sync::Arc::new(
+            eredu_checkpoint::store::RestrictedCheckpointSource::including(
+                source,
+                definition.id().as_str(),
+                keys,
+            )?,
+        );
         let (requirements, spec) =
             self.auxiliary
                 .admit(&definition, self.units.residency, shared, host_capacity)?;
@@ -434,6 +590,7 @@ impl ParameterResourcePreparation {
             depth,
         );
         Ok(PreparedParameterResources {
+            primary_source_keys: self.units.source_keys,
             residency,
             invocations: self.units.invocations,
             plan,

@@ -2401,49 +2401,58 @@ mod component_preparation {
                 .zip([0, 0, 2, 1, 2, 3].map(|ordinal| storage.address(ordinal).unwrap())),
         )
         .unwrap();
-        let source = MemoryWeightStore::from_safetensors((0..4).map(|index| {
-            (
-                format!("physical.{index}"),
-                safetensors::Dtype::F32,
-                if index == 3 { vec![10] } else { vec![4, 2] },
-                vec![0; if index == 3 { 40 } else { 32 }],
-            )
-        }))
-        .unwrap();
-        let assemble = |mode| -> Result<eredu_runtime::PreparedParameterResources, Failure> {
-            let mut units = ExecutionUnitResourcePreparation::new("mapped", &invocations, mode);
-            for (index, bytes, selection) in [
-                (0, 32, TensorSelection::Full),
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors((0..5).map(|index| {
                 (
-                    1,
-                    8,
-                    TensorSelection::Range {
-                        axis: 0,
-                        start: 0,
-                        end: 1,
-                    },
-                ),
-                (
-                    2,
-                    16,
-                    TensorSelection::Range {
-                        axis: 0,
-                        start: 0,
-                        end: 2,
-                    },
-                ),
-                (3, 40, TensorSelection::Full),
-            ] {
-                let binding = WeightBinding::new(
-                    format!("mapped.weight.{index}"),
                     format!("physical.{index}"),
-                    selection,
-                    bytes,
-                )?;
-                units = units.push(vec![binding], |_| Ok::<_, Failure>(bytes * 2))?;
-            }
+                    safetensors::Dtype::F32,
+                    if index == 3 { vec![10] } else { vec![4, 2] },
+                    vec![0; if index == 3 { 40 } else { 32 }],
+                )
+            }))
+            .unwrap(),
+        );
+        let prepare_units =
+            |mode| -> Result<eredu_runtime::PreparedExecutionUnitResources, Failure> {
+                let mut units = ExecutionUnitResourcePreparation::new("mapped", &invocations, mode);
+                for (index, bytes, selection) in [
+                    (0, 32, TensorSelection::Full),
+                    (
+                        1,
+                        8,
+                        TensorSelection::Range {
+                            axis: 0,
+                            start: 0,
+                            end: 1,
+                        },
+                    ),
+                    (
+                        2,
+                        16,
+                        TensorSelection::Range {
+                            axis: 0,
+                            start: 0,
+                            end: 2,
+                        },
+                    ),
+                    (3, 40, TensorSelection::Full),
+                ] {
+                    let binding = WeightBinding::new(
+                        format!("mapped.weight.{index}"),
+                        format!("physical.{index}"),
+                        selection,
+                        bytes,
+                    )?;
+                    units = units.push(vec![binding], |_| Ok::<_, Failure>(bytes * 2))?;
+                }
+                Ok(units.finish()?)
+            };
+        let finish = |units| -> Result<eredu_runtime::PreparedParameterResources, Failure> {
             let pinned = StaticUnitBindings::new("empty", vec![])?.prepare::<Failure>()?;
-            Ok(ParameterResourcePreparation::new(pinned, units.finish()?).finish()?)
+            Ok(ParameterResourcePreparation::new(pinned, units).finish()?)
+        };
+        let assemble = |mode| -> Result<eredu_runtime::PreparedParameterResources, Failure> {
+            finish(prepare_units(mode)?)
         };
         let host = |device, host| {
             LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
@@ -2471,9 +2480,106 @@ mod component_preparation {
             assert_eq!(resources.invocations, invocations);
             assert_eq!(resources.metadata.maximum_device_layer_bytes(), window);
             assert_eq!(resources.metadata.layer_parameter_bytes(), 96);
-            eredu_runtime::ResidencyController::new(&source, resources.plan, resources.definitions)
-                .unwrap();
+            let restricted = resources.restrict_primary_source(source.clone()).unwrap();
+            assert_eq!(
+                restricted.source_keys(),
+                ["physical.0", "physical.1", "physical.2", "physical.3"]
+            );
+            assert!(restricted.source_metadata("physical.4").is_err());
+            eredu_runtime::ResidencyController::new(
+                restricted.as_ref(),
+                resources.plan,
+                resources.definitions,
+            )
+            .unwrap();
         }
+        let address = |index| logical.address(index).unwrap();
+        let consumers = [address(3), address(4)];
+        let shared = prepare_units(LayerWeightResidency::FullyResident)
+            .unwrap()
+            .select_invocations(consumers)
+            .unwrap();
+        let shared = finish(shared).unwrap();
+        assert_eq!(shared.metadata.layer_parameter_bytes(), 32);
+        assert_eq!(
+            shared
+                .invocations
+                .resolve(1, consumers[1])
+                .unwrap()
+                .storage_location()
+                .ordinal(),
+            0
+        );
+        let owner = shared.invocations.storage_layout().address(0).unwrap();
+        assert!(!consumers.contains(&owner));
+        let selected = prepare_units(host(48, 192))
+            .unwrap()
+            .select_invocations([address(4), address(7)])
+            .unwrap()
+            .select_invocations([address(4)])
+            .unwrap();
+        let selected = finish(selected).unwrap();
+        assert_eq!(selected.metadata.layer_parameter_bytes(), 32);
+        assert!(matches!(
+            selected.invocations.select_invocations([address(3)]),
+            Err(eredu_runtime::ExecutionUnitAddressMapError::UnknownInvocation { .. })
+        ));
+        let restricted = selected.restrict_primary_source(source.clone()).unwrap();
+        assert_eq!(restricted.source_keys(), ["physical.0"]);
+        assert!(restricted.source_metadata("physical.2").is_err());
+        eredu_runtime::ResidencyController::new(
+            restricted.as_ref(),
+            selected.plan,
+            selected.definitions,
+        )
+        .unwrap();
+        for invalid in [[address(7), address(4)], [address(4), address(4)]] {
+            assert!(matches!(
+                invocations.select_invocations(invalid),
+                Err(eredu_runtime::ExecutionUnitAddressMapError::NonCanonicalSelection)
+            ));
+        }
+        let linked_units = || {
+            let mut units = prepare_units(LayerWeightResidency::FullyResident).unwrap();
+            let mut bindings = units.definitions[0].bindings().to_vec();
+            bindings.push(WeightBinding::alias("mapped.alias", "mapped.weight.2", 16).unwrap());
+            units.definitions[0] =
+                eredu_runtime::OffloadUnit::new(units.unit_ids[0].clone(), bindings).unwrap();
+            units
+        };
+        assert!(matches!(linked_units().select_invocations([address(4)]),
+            Err(eredu_runtime::ExecutionUnitPreparationError::DiscardedAliasOwner { owner, .. }) if owner == "mapped.weight.2"));
+        let linked = finish(
+            linked_units()
+                .select_invocations([address(4), address(5)])
+                .unwrap(),
+        )
+        .unwrap();
+        let restricted = linked.restrict_primary_source(source.clone()).unwrap();
+        eredu_runtime::ResidencyController::new(
+            restricted.as_ref(),
+            linked.plan,
+            linked.definitions,
+        )
+        .unwrap();
+        let mut replicas = 0;
+        for consumer in consumers {
+            let units = prepare_units(LayerWeightResidency::FullyResident)
+                .unwrap()
+                .select_invocations([consumer])
+                .unwrap();
+            let resources = finish(units).unwrap();
+            replicas += resources.metadata.layer_parameter_bytes();
+            let restricted = resources.restrict_primary_source(source.clone()).unwrap();
+            assert_eq!(restricted.source_keys(), ["physical.0"]);
+            eredu_runtime::ResidencyController::new(
+                restricted.as_ref(),
+                resources.plan,
+                resources.definitions,
+            )
+            .unwrap();
+        }
+        assert_eq!(replicas, 64);
         for (mode, host_failure) in [(stream(47, 96), false), (stream(48, 95), true)] {
             let error = assemble(mode).err().unwrap();
             match error
@@ -2710,12 +2816,20 @@ mod component_preparation {
             {
                 // The same key names different geometry in each retained source.
                 let source: SharedCheckpointSource =
-                    Arc::new(MemoryWeightStore::from_safetensors([(
-                        "physical.0".into(),
-                        safetensors::Dtype::F32,
-                        vec![bytes as usize / 4],
-                        vec![0; bytes as usize],
-                    )])?);
+                    Arc::new(MemoryWeightStore::from_safetensors([
+                        (
+                            "physical.0".into(),
+                            safetensors::Dtype::F32,
+                            vec![bytes as usize / 4],
+                            vec![0; bytes as usize],
+                        ),
+                        (
+                            "neighbor".into(),
+                            safetensors::Dtype::F32,
+                            vec![1],
+                            vec![0; 4],
+                        ),
+                    ])?);
                 let mut bindings = vec![WeightBinding::new(
                     format!("aux.weight.{index}"),
                     "physical.0",
@@ -2755,6 +2869,10 @@ mod component_preparation {
             assert_eq!(prepared.invocations, admission_map);
             assert_eq!(prepared.metadata.maximum_device_layer_bytes(), window);
             assert_eq!(prepared.metadata.static_device_bytes(), 32);
+            for source in prepared.sources.values() {
+                assert_eq!(source.source_keys(), ["physical.0"]);
+                assert!(source.source_metadata("neighbor").is_err());
+            }
             eredu_runtime::ResidencyController::new_with_catalogs(
                 |id| {
                     prepared

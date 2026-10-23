@@ -252,6 +252,49 @@ impl ExecutionUnitAddressMap {
         })
     }
 
+    /// Retains logical consumers and their physical owners in the original order.
+    /// A resource remains available when its canonical address is not itself a
+    /// selected invocation. Selection cannot add or reorder logical authority.
+    pub fn select_invocations(
+        &self,
+        selected: impl IntoIterator<Item = ExecutionUnitAddress>,
+    ) -> Result<Self, ExecutionUnitAddressMapError> {
+        let lookup = self
+            .data
+            .addresses
+            .iter()
+            .enumerate()
+            .map(|(ordinal, &(logical, storage))| {
+                ((logical.group(), logical.index()), (ordinal, storage))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut references = Vec::new();
+        let mut resources = BTreeSet::new();
+        let mut previous = None;
+        for logical in selected {
+            let &(ordinal, storage) = lookup
+                .get(&(logical.group(), logical.index()))
+                .ok_or(ExecutionUnitAddressMapError::UnknownInvocation { address: logical })?;
+            if previous.is_some_and(|previous| ordinal <= previous) {
+                return Err(ExecutionUnitAddressMapError::NonCanonicalSelection);
+            }
+            previous = Some(ordinal);
+            references.push((logical, storage.address()));
+            resources.insert(storage.ordinal());
+        }
+        let storage = self
+            .data
+            .storage
+            .select(resources.into_iter().map(|ordinal| {
+                self.data
+                    .storage
+                    .address(ordinal)
+                    .expect("retained physical resource")
+            }))
+            .expect("physical owners form a canonical retained subset");
+        Self::new(&storage, references)
+    }
+
     /// Selected physical resources, independent of their invocation count.
     pub fn storage_layout(&self) -> &ExecutionUnitLayout {
         &self.data.storage
@@ -337,6 +380,15 @@ impl ExecutionUnitAddressMap {
 /// An invalid logical-to-local execution address mapping or invocation.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ExecutionUnitAddressMapError {
+    /// A projection refers to a logical invocation outside its retained authority.
+    #[error("unretained logical invocation {address:?}")]
+    UnknownInvocation {
+        /// Unknown logical address, independently of physical storage availability.
+        address: ExecutionUnitAddress,
+    },
+    /// Logical projection duplicates or reorders retained invocations.
+    #[error("invocation selection must retain its original order without duplicates")]
+    NonCanonicalSelection,
     /// Completion supplied another invocation's ordinal.
     #[error("execution lease expects ordinal {expected}, received {actual}")]
     ReturnOrdinalMismatch {
