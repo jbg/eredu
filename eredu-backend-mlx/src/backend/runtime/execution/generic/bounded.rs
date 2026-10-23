@@ -219,10 +219,10 @@ where
                 .expect("dense forward begins before acquisition")
                 .next(stream)
                 .map_err(LayerwiseAcquireError::Policy)?;
-            if transfer.index() != index {
+            if transfer.step().storage_index() != index {
                 return Err(LayerwiseAcquireError::Policy(Error::Parallel(format!(
                     "dense transfer returned unit {}, expected {index}",
-                    transfer.index()
+                    transfer.step().storage_index()
                 ))));
             }
             let unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));

@@ -2265,6 +2265,7 @@ mod component_preparation {
     }
     #[test]
     fn execution_unit_admission_keeps_sparse_addresses_and_independent_capacity() {
+        use eredu_core::residency::MemoryTier;
         use eredu_runtime::{
             ExecutionUnitPreparationError, ExecutionUnitResourcePreparation, LayerWeightResidency,
             WeightBinding,
@@ -2313,6 +2314,94 @@ mod component_preparation {
                 .collect::<Vec<_>>(),
             ["model.units.00000", "model.units.00002"]
         );
+        // Repeated invocations share copies and pins while transfer occurrences
+        // remain ordered. Two ready uses of one resource do not charge two copies.
+        let plan = eredu_core::residency::OffloadPlan::new(
+            eredu_core::residency::OffloadConfig::new(Some(64), Some(512), 2).unwrap(),
+            resources.specs,
+        )
+        .unwrap();
+        let mut controller = eredu_runtime::ResidencyController::new(
+            selected.source().as_ref(),
+            plan,
+            resources.definitions,
+        )
+        .unwrap();
+        let ledger = controller.ledger_mut();
+        ledger.mark_initialized();
+        let mut schedule = eredu_runtime::DenseTransferSchedule::new([0, 0, 1, 0, 1], 2).unwrap();
+        let mut completed = Vec::new();
+        let mut first = None;
+        let mut rejected_replay = false;
+        while !schedule.is_exhausted() {
+            let protected = schedule
+                .storage_window(2)
+                .into_iter()
+                .map(|index| resources.unit_ids[index].clone())
+                .collect::<Vec<_>>();
+            ledger
+                .set_group_window("dense", &protected, MemoryTier::Device)
+                .unwrap();
+            while schedule.can_admit() {
+                let step = schedule.next_pending().unwrap();
+                let id = &resources.unit_ids[step.storage_index()];
+                if !ledger.is_resident(id, MemoryTier::Device).unwrap() {
+                    ledger
+                        .reserve_copy(id, MemoryTier::Device, 32, &Default::default())
+                        .unwrap();
+                    ledger
+                        .publish_reserved(id, MemoryTier::Device, 32, None)
+                        .unwrap();
+                }
+                ledger.pin(id, MemoryTier::Device, 1).unwrap();
+                schedule.admit(step, id.clone()).unwrap();
+            }
+            let (step, id) = schedule.pop_ready().unwrap();
+            first.get_or_insert(step);
+            if let Some(next) = schedule.next_pending() {
+                let old = first.unwrap();
+                if next.storage_index() == old.storage_index() {
+                    assert!(matches!(
+                        schedule.admit(old, id.clone()),
+                        Err(eredu_runtime::DenseTransferScheduleError::OutOfOrder { expected, actual })
+                            if expected == next && actual == old
+                    ));
+                    rejected_replay = true;
+                }
+            }
+            let reports = ledger.unit_reports();
+            assert!(
+                reports
+                    .iter()
+                    .map(|report| report.device_allocated_bytes())
+                    .sum::<u64>()
+                    <= 64
+            );
+            if completed.is_empty() {
+                assert_eq!(
+                    reports
+                        .iter()
+                        .map(|report| report.device_pins())
+                        .sum::<u64>(),
+                    2
+                );
+                assert_eq!(
+                    reports
+                        .iter()
+                        .map(|report| report.device_allocated_bytes())
+                        .sum::<u64>(),
+                    32
+                );
+            }
+            completed.push((step.ordinal(), step.storage_index()));
+            ledger.unpin(&id, MemoryTier::Device);
+        }
+        assert!(rejected_replay);
+        assert_eq!(completed, [(0, 0), (1, 0), (2, 1), (3, 0), (4, 1)]);
+        assert!(ledger
+            .unit_reports()
+            .iter()
+            .all(|report| report.device_pins() == 0));
         let assemble = |mode| -> Result<eredu_runtime::PreparedParameterResources, Failure> {
             let units = ExecutionUnitResourcePreparation::new("model", layout, mode)
                 .push(bindings[0].clone(), |_| Ok::<_, Failure>(64))?

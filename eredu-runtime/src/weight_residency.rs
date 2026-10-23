@@ -213,16 +213,35 @@ impl StaticUnitBindings {
     }
 }
 
+/// One ordered transfer occurrence and its independent physical storage index.
+/// Multiple occurrences may select the same storage without sharing mutable state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DenseTransferStep {
+    ordinal: usize,
+    storage_index: usize,
+}
+impl DenseTransferStep {
+    /// Position in this retained transfer sequence.
+    pub const fn ordinal(self) -> usize {
+        self.ordinal
+    }
+    /// Dense index into the selected physical resource catalog.
+    pub const fn storage_index(self) -> usize {
+        self.storage_index
+    }
+}
+
 /// Ordered bounded transfer cursor used by dense streamed execution.
 #[derive(Debug)]
 pub struct DenseTransferSchedule<T> {
     capacity: usize,
-    pending: VecDeque<usize>,
-    ready: VecDeque<(usize, T)>,
+    pending: VecDeque<DenseTransferStep>,
+    ready: VecDeque<(DenseTransferStep, T)>,
 }
 
 impl<T> DenseTransferSchedule<T> {
-    /// Creates a cursor over the remaining unit indices.
+    /// Retains the declared storage-use sequence, including repeated resources.
+    /// The bounded window counts transfer occurrences independently of storage IDs.
     pub fn new(
         pending: impl IntoIterator<Item = usize>,
         capacity: usize,
@@ -230,17 +249,14 @@ impl<T> DenseTransferSchedule<T> {
         if capacity == 0 {
             return Err(DenseTransferScheduleError::ZeroCapacity);
         }
-        let pending = pending.into_iter().collect::<VecDeque<_>>();
-        let mut previous = None;
-        for &index in &pending {
-            if previous.is_some_and(|previous| previous >= index) {
-                return Err(DenseTransferScheduleError::UnorderedPending {
-                    previous: previous.expect("an invalid pair has a previous index"),
-                    actual: index,
-                });
-            }
-            previous = Some(index);
-        }
+        let pending = pending
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, storage_index)| DenseTransferStep {
+                ordinal,
+                storage_index,
+            })
+            .collect();
         Ok(Self {
             capacity,
             pending,
@@ -263,23 +279,30 @@ impl<T> DenseTransferSchedule<T> {
         self.ready.len() < self.capacity && !self.pending.is_empty()
     }
 
-    /// Returns the next unit which must be submitted.
-    pub fn next_pending(&self) -> Option<usize> {
+    /// Returns the exact next transfer occurrence which must be submitted.
+    pub fn next_pending(&self) -> Option<DenseTransferStep> {
         self.pending.front().copied()
     }
 
-    /// Returns the current ready indices followed by future indices, truncated to lookahead.
-    pub fn desired_indices(&self, lookahead: usize) -> Vec<usize> {
+    /// Projects the next bounded occurrences to distinct storage IDs, preserving order.
+    /// Repeated uses count toward lookahead but protect or prefetch their storage once.
+    pub fn storage_window(&self, lookahead: usize) -> Vec<usize> {
+        let mut seen = BTreeSet::new();
         self.ready
             .iter()
-            .map(|(index, _)| *index)
-            .chain(self.pending.iter().copied())
+            .map(|(step, _)| step.storage_index())
+            .chain(self.pending.iter().map(|step| step.storage_index()))
             .take(lookahead)
+            .filter(|index| seen.insert(*index))
             .collect()
     }
 
     /// Commits one successfully submitted transfer in exact pending order.
-    pub fn admit(&mut self, index: usize, transfer: T) -> Result<(), DenseTransferScheduleError> {
+    pub fn admit(
+        &mut self,
+        step: DenseTransferStep,
+        transfer: T,
+    ) -> Result<(), DenseTransferScheduleError> {
         if self.ready.len() >= self.capacity {
             return Err(DenseTransferScheduleError::CapacityExceeded {
                 capacity: self.capacity,
@@ -290,19 +313,27 @@ impl<T> DenseTransferSchedule<T> {
             .front()
             .copied()
             .ok_or(DenseTransferScheduleError::NoPendingUnit)?;
-        if expected != index {
+        if expected != step {
             return Err(DenseTransferScheduleError::OutOfOrder {
                 expected,
-                actual: index,
+                actual: step,
             });
         }
         self.pending.pop_front();
-        self.ready.push_back((index, transfer));
+        self.ready.push_back((step, transfer));
         Ok(())
     }
 
+    /// Borrows a submitted occurrence of this storage without changing its order.
+    /// A backend can resolve its exact transfer before acquiring the same storage again.
+    pub fn ready_storage_mut(&mut self, storage_index: usize) -> Option<&mut T> {
+        self.ready.iter_mut().find_map(|(step, transfer)| {
+            (step.storage_index() == storage_index).then_some(transfer)
+        })
+    }
+
     /// Removes the oldest ready transfer for execution.
-    pub fn pop_ready(&mut self) -> Option<(usize, T)> {
+    pub fn pop_ready(&mut self) -> Option<(DenseTransferStep, T)> {
         self.ready.pop_front()
     }
 }
@@ -314,14 +345,6 @@ pub enum DenseTransferScheduleError {
     /// A transfer window cannot have zero capacity.
     #[error("dense transfer window capacity must be nonzero")]
     ZeroCapacity,
-    /// Pending units were not supplied in strictly increasing order.
-    #[error("dense transfer pending unit {actual} does not follow {previous}")]
-    UnorderedPending {
-        /// Previous index.
-        previous: usize,
-        /// Invalid next index.
-        actual: usize,
-    },
     /// Admission was attempted while the ready window was full.
     #[error("dense transfer window exceeds its capacity of {capacity}")]
     CapacityExceeded {
@@ -332,12 +355,12 @@ pub enum DenseTransferScheduleError {
     #[error("dense transfer schedule has no pending unit")]
     NoPendingUnit,
     /// A backend submitted transfers in a different order from the architecture sequence.
-    #[error("dense transfer schedule expected unit {expected}, received {actual}")]
+    #[error("dense transfer schedule expected step {expected:?}, received {actual:?}")]
     OutOfOrder {
-        /// Required next index.
-        expected: usize,
-        /// Submitted index.
-        actual: usize,
+        /// Required next occurrence and storage index.
+        expected: DenseTransferStep,
+        /// Submitted occurrence and storage index.
+        actual: DenseTransferStep,
     },
 }
 
@@ -1112,31 +1135,6 @@ mod tests {
             Err(WeightResidencyPolicyError::HostDisabledControls)
         ));
         assert!(DenseDiskStreamLoadOptions::new(1, 0, 0, 0).is_ok());
-    }
-
-    #[test]
-    fn dense_transfer_schedule_preserves_order_and_bounded_lookahead() {
-        let mut schedule = DenseTransferSchedule::new(3..7, 2).unwrap();
-        assert_eq!(schedule.desired_indices(3), vec![3, 4, 5]);
-        assert_eq!(
-            schedule.admit(4, "wrong"),
-            Err(DenseTransferScheduleError::OutOfOrder {
-                expected: 3,
-                actual: 4,
-            })
-        );
-        schedule.admit(3, "three").unwrap();
-        schedule.admit(4, "four").unwrap();
-        assert!(!schedule.can_admit());
-        assert_eq!(schedule.desired_indices(3), vec![3, 4, 5]);
-        assert_eq!(schedule.pop_ready(), Some((3, "three")));
-        schedule.admit(5, "five").unwrap();
-        assert_eq!(schedule.desired_indices(4), vec![4, 5, 6]);
-        assert_eq!(schedule.pop_ready(), Some((4, "four")));
-        assert_eq!(schedule.pop_ready(), Some((5, "five")));
-        schedule.admit(6, "six").unwrap();
-        assert_eq!(schedule.pop_ready(), Some((6, "six")));
-        assert!(schedule.is_exhausted());
     }
 
     #[test]

@@ -854,6 +854,15 @@ ownership. Group boundaries use declared first/last addresses; local ranges with
 group remain contiguous in global unit identity. Local-stage construction receives
 explicit state-slot ranges projected from declared group alignment or unit state
 references, independently of those unit ranges.
+Dense-stream transfer cursors retain ordered occurrence IDs independently of physical
+storage indices. A declared transfer sequence can revisit a resource, including
+coexistent uses of the same copy, within the ordinary bounded ready window. Admission
+checks the complete occurrence and storage identity, so an earlier transfer cannot
+stand in for a later use of that storage. Protection and prefetch project the bounded
+occurrence window to distinct storage IDs in first-use order. Native transfer windows
+retain this typed step with their existing transfer and completion guards. Reacquiring
+a copy already submitted in the ready window first resolves that copy's exact transfer;
+its separate occurrence leases continue to protect the shared allocation.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

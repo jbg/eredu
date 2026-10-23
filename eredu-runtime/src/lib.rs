@@ -543,11 +543,11 @@ pub use state::{
 };
 pub use weight_residency::{
     AuxiliaryModuleResidency, AuxiliaryWeightRequirements, DenseDiskStreamLoadOptions,
-    DenseTransferSchedule, DenseTransferScheduleError, ExecutionResidency, ExpertPass,
-    LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, OrdinaryWeightResidency,
-    ParameterBankAccess, ParameterBankKey, ParameterBankLoadOptions, ParameterBankResidency,
-    PreparedStaticUnit, StaticUnitBindings, WeightResidency, WeightResidencyPolicyError,
-    DENSE_TRANSFER_WINDOW,
+    DenseTransferSchedule, DenseTransferScheduleError, DenseTransferStep, ExecutionResidency,
+    ExpertPass, LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata,
+    OrdinaryWeightResidency, ParameterBankAccess, ParameterBankKey, ParameterBankLoadOptions,
+    ParameterBankResidency, PreparedStaticUnit, StaticUnitBindings, WeightResidency,
+    WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
 };
 
 /// Generic calibrated target workspace composition from ordinary module topology.

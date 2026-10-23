@@ -192,13 +192,13 @@ pub struct DenseTransferWindow {
 impl DenseTransferWindow {
     /// Takes the next transfer after ordering `consumer` behind its event.
     pub fn next(&mut self, consumer: &Stream) -> Result<DensePreparedTransfer, Error> {
-        let (index, transfer) = self.schedule.pop_ready().ok_or({
+        let (step, transfer) = self.schedule.pop_ready().ok_or({
             LayerwiseModelError::InvalidDenseTransferWindow {
                 index: self.units.len(),
                 unit_count: self.units.len(),
             }
         })?;
-        debug_assert_eq!(transfer.index(), index);
+        debug_assert_eq!(transfer.step(), step);
         transfer.transfer.order_after(consumer)?;
         Ok(transfer)
     }
@@ -208,10 +208,10 @@ impl DenseTransferWindow {
     /// The completed [`DensePreparedTransfer`] must be dropped before this is
     /// called so the fixed two-layer device budget can admit the replacement.
     pub fn refill(&mut self) -> Result<(), Error> {
-        let device_indices = self.schedule.desired_indices(DENSE_TRANSFER_WINDOW);
+        let device_indices = self.schedule.storage_window(DENSE_TRANSFER_WINDOW);
         let host_indices = if self.controller.background.is_some() {
             self.schedule
-                .desired_indices(self.controller.options.host_lookahead())
+                .storage_window(self.controller.options.host_lookahead())
         } else {
             Vec::new()
         };
@@ -239,10 +239,16 @@ impl DenseTransferWindow {
             }
         }
         while self.schedule.can_admit() {
-            let Some(index) = self.schedule.next_pending() else {
+            let Some(step) = self.schedule.next_pending() else {
                 break;
             };
+            let index = step.storage_index();
             let id = &self.units[index];
+            // Resolve this window's existing source transfer before the manager
+            // waits for the same copy. Each occurrence retains its own lease.
+            if let Some(previous) = self.schedule.ready_storage_mut(index) {
+                previous.synchronize()?;
+            }
             let _host = if host_indices.contains(&index) {
                 self.controller
                     .background
@@ -256,7 +262,7 @@ impl DenseTransferWindow {
                 .manager
                 .acquire_many_with_transfer(&[(id.clone(), 1)], MemoryTier::Device)?;
             self.schedule
-                .admit(index, DensePreparedTransfer { index, transfer })?;
+                .admit(step, DensePreparedTransfer { step, transfer })?;
         }
         self.controller
             .observe_group(&self.manager, &self.group, self.prefill)?;
@@ -272,7 +278,7 @@ impl Drop for DenseTransferWindow {
 
 /// One populated-unit dependency taken from a [`DenseTransferWindow`].
 pub struct DensePreparedTransfer {
-    index: usize,
+    step: eredu_runtime::DenseTransferStep,
     transfer: ResidentTransfer,
 }
 
@@ -281,9 +287,9 @@ impl DensePreparedTransfer {
         self.transfer.synchronize().map_err(Into::into)
     }
 
-    /// Returns the index in the group's authoritative unit list.
-    pub const fn index(&self) -> usize {
-        self.index
+    /// Returns the invocation occurrence and canonical storage selected for this transfer.
+    pub const fn step(&self) -> eredu_runtime::DenseTransferStep {
+        self.step
     }
 
     /// Returns the single resident lease protected by this transfer.
