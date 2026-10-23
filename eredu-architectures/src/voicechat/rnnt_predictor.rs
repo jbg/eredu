@@ -333,17 +333,18 @@ impl<B: NeuralBackend> RnntPredictorKernel<B> {
     }
     /// Retains exactly one contiguous predictor stage.
     pub fn new_partition<G>(
+        definition: ComponentDefinition,
         dimensions: RnntDimensions,
         partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
         cuts: &RnntPredictorPipelineCuts,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
-        let range = validate_rnnt_predictor_partition(dimensions, partition)?;
+        let range = validate_rnnt_predictor_partition(&definition, dimensions, partition)?;
         if cuts.dimensions() != dimensions {
             return Err(invalid("RNNT predictor cuts belong to another geometry"));
         }
         let mut value = Self::new(dimensions)?;
         value.partition = Some((range, cuts.clone()));
-        Ok(value.into_component()?.select_partition(partition)?)
+        Ok(ComponentAdapter::new(definition, value)?.select_partition(partition)?)
     }
     /// Logical F32 tensor payload of the completed prediction: local hidden/cell
     /// pairs plus a separately retained readout on every non-final stage.

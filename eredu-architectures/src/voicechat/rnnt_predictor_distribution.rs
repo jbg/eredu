@@ -1,7 +1,6 @@
 //! Cold recurrent stage, source and communication authority.
 use super::{
     rnnt::RnntError,
-    rnnt_predictor::rnnt_predictor_parameter_description,
     rnnt_predictor_partition::{
         validate_rnnt_predictor_partition, RnntPredictorBoundarySchema, RnntPredictorPipelineCuts,
     },
@@ -61,7 +60,11 @@ impl PreparedRnntPredictorPipelineBindings {
         activation_dtype: PipelineActivationDtype,
     ) -> Result<Self, RnntPredictorPipelinePreparationError> {
         use RnntPredictorPipelinePreparationError::Contract;
-        validate_rnnt_predictor_partition(bindings.dimensions(), &partition)?;
+        validate_rnnt_predictor_partition(
+            bindings.definition(),
+            bindings.dimensions(),
+            &partition,
+        )?;
         if cuts.dimensions() != bindings.dimensions()
             || activation_dtype != PipelineActivationDtype::Float32
         {
@@ -87,9 +90,8 @@ impl PreparedRnntPredictorPipelineBindings {
             }
             PipelineBindingError::Contract(message) => Contract(message),
         })?;
-        let description = rnnt_predictor_parameter_description(bindings.dimensions())?;
         eredu_runtime::validate_component_pipeline(
-            &description,
+            bindings.definition().parameters(),
             &partition,
             bindings.unit_bindings().map(|(address, _)| address),
             partition.state().map(|state| state.layout()),

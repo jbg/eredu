@@ -598,6 +598,12 @@ VoiceChat MoG, conditioning and function-head preparation retain complete defini
 through family precision transforms and tensor placement. Native assembly consumes
 those definitions with the selected bindings. Function-head encoding and companion
 admission remain family-owned and use the same retained format as its definition.
+RNNT preparation retains its complete definition; projection-only and predictor-stage
+resource projections retain their own exact semantic definitions. Predictor pipeline
+validation borrows retained parameter and carry declarations, and native full/projection/
+predictor assembly consumes those definitions alongside exact selected bindings.
+The complete and projection declarations share the family phase constructor; predictor
+carry remains separate from request-local complete RNNT forward context.
 
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared

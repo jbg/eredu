@@ -15,6 +15,15 @@ pub fn rnnt_projection_parameter_description(
 ) -> Result<ArchitectureParameterDescription, RnntError> {
     super::rnnt_layered::rnnt_projection_description(dimensions)
 }
+/// Projection-only semantic definition, without recurrent parameter or state ownership.
+pub fn rnnt_projection_component_definition(
+    dimensions: RnntDimensions,
+) -> Result<ComponentDefinition, RnntError> {
+    super::rnnt_layered::rnnt_definition_for_selection(
+        dimensions,
+        super::rnnt_layered::RnntSelection::Projections,
+    )
+}
 /// Checks vocabulary slices and joint replicas in the compact projection-only topology.
 pub fn rnnt_projection_local_dimensions(
     dimensions: RnntDimensions,

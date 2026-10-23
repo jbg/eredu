@@ -1,7 +1,7 @@
 //! Exact source projection from RNNT bindings into one recurrent pipeline stage.
 use super::{
     rnnt::RnntDimensions,
-    rnnt_predictor::rnnt_predictor_parameter_description,
+    rnnt_predictor::rnnt_predictor_component_definition,
     rnnt_predictor_partition::{validate_rnnt_predictor_partition, RnntPredictorBoundarySchema},
     rnnt_preparation::{PreparedRnntBindings, RnntPreparationError},
 };
@@ -13,7 +13,7 @@ use eredu_runtime::{
 /// Retained canonical LSTM recipes and explicit optional replica placement.
 pub struct PreparedRnntPredictorBindings {
     dimensions: RnntDimensions,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 impl PreparedRnntPredictorBindings {
     /// Selects only a stage's predictor units; embedding and joint sources are excluded.
@@ -22,11 +22,12 @@ impl PreparedRnntPredictorBindings {
         partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
     ) -> Result<Self, RnntPreparationError> {
         let dimensions = bindings.dimensions();
-        let range = validate_rnnt_predictor_partition(dimensions, partition)?;
-        let description = rnnt_predictor_parameter_description(dimensions)?;
+        let definition = rnnt_predictor_component_definition(dimensions)?;
+        let range = validate_rnnt_predictor_partition(&definition, dimensions, partition)?;
         let selected = range
             .map(|index| {
-                description
+                definition
+                    .parameters()
                     .unit_layout()
                     .address(index)
                     .expect("validated predictor unit")
@@ -34,7 +35,7 @@ impl PreparedRnntPredictorBindings {
             .collect::<Vec<_>>();
         let prepared = bindings
             .prepared
-            .project("voicechat/rnnt/predictor-stage", description)?
+            .project("voicechat/rnnt/predictor-stage", definition)?
             .select_units(selected)?;
         Ok(Self {
             dimensions,
@@ -90,19 +91,24 @@ impl PreparedRnntPredictorBindings {
     pub fn source(&self) -> &SharedCheckpointSource {
         self.prepared.source()
     }
+    /// Complete predictor definition, including global recurrent carry ownership.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
     /// Transfers prepared recipes in the same globally addressed order as execution.
     pub fn into_parts(
         self,
     ) -> (
         RnntDimensions,
+        eredu_runtime::ComponentDefinition,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
-        let (_, _, layout, source, units) = self
+        let (definition, _, layout, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("predictor declares only independently leased units");
-        (self.dimensions, layout, source, units)
+        (self.dimensions, definition, layout, source, units)
     }
 }

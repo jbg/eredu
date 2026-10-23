@@ -66,7 +66,7 @@ impl RnntPhase {
     }
 }
 #[derive(Clone, Copy)]
-enum RnntSelection {
+pub(super) enum RnntSelection {
     Complete,
     Projections,
 }
@@ -89,7 +89,13 @@ impl RnntSelection {
         }
     }
 }
-fn rnnt_component_definition(
+/// Complete RNNT operations, semantic groups and request-local state declaration.
+pub fn rnnt_component_definition(
+    dimensions: RnntDimensions,
+) -> Result<ComponentDefinition, RnntError> {
+    rnnt_definition_for_selection(dimensions, RnntSelection::Complete)
+}
+pub(super) fn rnnt_definition_for_selection(
     dimensions: RnntDimensions,
     selection: RnntSelection,
 ) -> Result<ComponentDefinition, RnntError> {
@@ -340,7 +346,7 @@ impl<B: NeuralBackend> RnntKernel<B> {
     /// Couples selected family equations with one exact semantic declaration.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
         Ok(ComponentAdapter::new(
-            rnnt_component_definition(self.dimensions, self.selection)?,
+            rnnt_definition_for_selection(self.dimensions, self.selection)?,
             self,
         )?)
     }

@@ -2,8 +2,8 @@
 use super::{
     rnnt::{RnntDimensions, RnntError},
     rnnt_predictor::{
-        invalid, rnnt_predictor_parameter_description, rnnt_predictor_state_layout, validate_row,
-        RnntPredictorForward, RnntPredictorKernel, RnntPredictorRuntimeState,
+        invalid, rnnt_predictor_state_layout, validate_row, RnntPredictorForward,
+        RnntPredictorKernel, RnntPredictorRuntimeState,
     },
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
@@ -161,10 +161,11 @@ impl RnntPredictorPipelineCuts {
 }
 /// Validates exact parameters, state slice and input/output stage ownership.
 pub fn validate_rnnt_predictor_partition<G>(
+    definition: &ComponentDefinition,
     dimensions: RnntDimensions,
     partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
 ) -> Result<Range<usize>, RnntError> {
-    let description = rnnt_predictor_parameter_description(dimensions)?;
+    let description = definition.parameters();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &RnntPredictorBoundarySchema::new(dimensions)?
@@ -192,7 +193,7 @@ pub fn validate_rnnt_predictor_partition<G>(
         .state()
         .ok_or_else(|| invalid("RNNT predictor stage lacks local carry declaration"))?;
     if state.global_layers() != range
-        || state.layout() != &rnnt_predictor_state_layout(dimensions)?.slice(range.clone())?
+        || state.layout() != &definition.state_layout().slice(range.clone())?
     {
         return Err(invalid(
             "RNNT predictor local carry declaration differs from owned layers",

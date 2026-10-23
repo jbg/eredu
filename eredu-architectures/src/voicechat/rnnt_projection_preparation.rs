@@ -3,7 +3,7 @@ use super::{
     rnnt::RnntDimensions,
     rnnt_preparation::{PreparedRnntBindings, RnntPreparationError},
     rnnt_projection_layered::{
-        rnnt_projection_local_dimensions, rnnt_projection_parameter_description,
+        rnnt_projection_component_definition, rnnt_projection_local_dimensions,
     },
 };
 use eredu_checkpoint::store::SharedCheckpointSource;
@@ -13,17 +13,17 @@ use eredu_runtime::{ExecutionUnitLayout, LocalModelLayout, PreparedComponent, We
 /// Recurrent recipes and replica declarations are excluded from this owner.
 pub struct PreparedRnntProjectionBindings {
     dimensions: RnntDimensions,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 impl PreparedRnntProjectionBindings {
     /// Projects existing retained RNNT recipes without reading parameter payloads.
     /// Existing tensor selection is retained exactly; recipes are never sliced twice.
     pub fn from_rnnt(bindings: PreparedRnntBindings) -> Result<Self, RnntPreparationError> {
         let dimensions = bindings.dimensions();
-        let description = rnnt_projection_parameter_description(dimensions)?;
+        let definition = rnnt_projection_component_definition(dimensions)?;
         let prepared = bindings
             .prepared
-            .project("voicechat/rnnt/projection-units", description)?;
+            .project("voicechat/rnnt/projection-units", definition)?;
         if let Some(layout) = prepared.local_layout() {
             rnnt_projection_local_dimensions(dimensions, layout)?;
         }
@@ -74,21 +74,26 @@ impl PreparedRnntProjectionBindings {
     pub fn source(&self) -> &SharedCheckpointSource {
         self.prepared.source()
     }
+    /// Projection semantic declaration retained independently of excluded recurrent resources.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
     /// Transfers compact layout and exactly the authority needed by its four units.
     pub fn into_parts(
         self,
     ) -> (
         RnntDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("RNNT projection declares only independently leased units");
-        (self.dimensions, local, layout, source, units)
+        (self.dimensions, definition, local, layout, source, units)
     }
 }
 

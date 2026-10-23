@@ -16,7 +16,7 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, SpeechParameterError},
     rnnt::{RnntDimensions, RnntError},
-    rnnt_layered::rnnt_parameter_description,
+    rnnt_layered::rnnt_component_definition,
 };
 
 /// Invalid RNNT geometry, retained source authority, or execution recipe.
@@ -60,7 +60,7 @@ pub enum RnntPreparationError {
 /// state and can be materialized independently through shared residency providers.
 pub struct PreparedRnntBindings {
     dimensions: RnntDimensions,
-    pub(super) prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    pub(super) prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 impl PreparedRnntBindings {
     /// Projects the admitted component without resolving or reopening artifacts.
@@ -83,16 +83,16 @@ impl PreparedRnntBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, RnntPreparationError> {
-        let description = rnnt_parameter_description(dimensions)?;
+        let definition = rnnt_component_definition(dimensions)?;
         let mut recipes = BTreeMap::new();
-        for owned in description.groups() {
+        for owned in definition.parameters().groups() {
             for member in owned.members() {
                 let name = member.target();
                 let parameter = admitted_member(parameters, &source, Component::Rnnt, member)?;
                 recipes.insert(name.into(), parameter.recipe.clone());
             }
         }
-        Self::from_recipes(dimensions, source, &recipes)
+        Self::from_definition(dimensions, definition, source, &recipes)
     }
 
     /// Selects exact component recipes from a low-level retained source.
@@ -102,10 +102,19 @@ impl PreparedRnntBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, DerivedWeightRecipe>,
     ) -> Result<Self, RnntPreparationError> {
-        let description = rnnt_parameter_description(dimensions)?;
+        let definition = rnnt_component_definition(dimensions)?;
+        Self::from_definition(dimensions, definition, source, parameters)
+    }
+
+    fn from_definition(
+        dimensions: RnntDimensions,
+        definition: eredu_runtime::ComponentDefinition,
+        source: SharedCheckpointSource,
+        parameters: &BTreeMap<String, DerivedWeightRecipe>,
+    ) -> Result<Self, RnntPreparationError> {
         let prepared = PreparedComponent::prepare(
             "voicechat/rnnt/leased-units",
-            description,
+            definition,
             source,
             |member| {
                 let name = member.target();
@@ -173,21 +182,26 @@ impl PreparedRnntBindings {
     pub fn source(&self) -> &SharedCheckpointSource {
         self.prepared.source()
     }
+    /// Complete semantic declaration retained through recipe and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
     /// Transfers source authority and architecture-ordered unit bindings.
     pub fn into_parts(
         self,
     ) -> (
         RnntDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.dimensions, local, layout, source, units)
+        (self.dimensions, definition, local, layout, source, units)
     }
 }
 
