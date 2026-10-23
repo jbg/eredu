@@ -8225,7 +8225,7 @@ pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
     charge(reservation, bytes)?;
     let rank = eredu_runtime::PipelineRankProjection::new(text, None, topology, false)
         .map_err(|error| invalid(&error.to_string()))?;
-    let owns = group.owner().is_stored_by(rank.ownership(), |id, unit| {
+    let owns = parameters.stores_owner(group.owner(), rank.ownership(), |id, unit| {
         rank.groups()
             .iter()
             .any(|owned| owned.group() == id && owned.units().contains(&unit))

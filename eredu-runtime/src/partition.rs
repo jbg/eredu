@@ -74,6 +74,18 @@ impl ParameterGroupOwner {
             || matches!(selected, Self::StaticRole(role) if self.accepts_static_role(role))
     }
 
+    /// Compares canonical storage without copying consumer declarations or role names.
+    pub(crate) fn same_storage_as(&self, other: &Self) -> bool {
+        match (self.static_storage_role(), other.static_storage_role()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => matches!((self, other), (
+                Self::ExecutionUnit { group: a, global_unit: i },
+                Self::ExecutionUnit { group: b, global_unit: j },
+            ) if a == b && i == j),
+            _ => false,
+        }
+    }
+
     /// Creates execution-unit ownership in the architecture-global index space.
     pub fn execution_unit(group: ExecutionGroupId, global_unit: usize) -> Self {
         Self::ExecutionUnit { group, global_unit }
@@ -421,19 +433,45 @@ impl ArchitectureParameterDescription {
         &self,
         partition: &ArchitecturePartition<G, A>,
     ) -> Vec<OwnedParameterGroupSpec> {
+        self.stored_groups(partition.ownership(), |group, unit| {
+            partition
+                .groups()
+                .iter()
+                .any(|owned| owned.group() == group && owned.contains(unit))
+        })
+        .cloned()
+        .collect()
+    }
+
+    /// Projects every group in a stored canonical resource, including physical replicas.
+    /// Logical invocation and observation ownership remain in each group's declaration.
+    pub fn stored_groups(
+        &self,
+        ownership: &PartitionOwnership,
+        owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
+    ) -> impl Iterator<Item = &OwnedParameterGroupSpec> {
         let storage = self
             .groups
             .iter()
-            .filter(|tagged| tagged.owner().is_local(partition))
+            .filter(|tagged| tagged.owner().is_stored_by(ownership, &owns_unit))
             .map(|tagged| crate::ParameterStorageId::from_owner(tagged.owner()))
             .collect::<BTreeSet<_>>();
-        self.groups
-            .iter()
-            .filter(|tagged| {
-                storage.contains(&crate::ParameterStorageId::from_owner(tagged.owner()))
-            })
-            .cloned()
-            .collect()
+        self.groups.iter().filter(move |tagged| {
+            storage.contains(&crate::ParameterStorageId::from_owner(tagged.owner()))
+        })
+    }
+
+    /// Resolves one canonical resource without allocating a selected parameter catalog.
+    pub fn stores_owner(
+        &self,
+        owner: &ParameterGroupOwner,
+        ownership: &PartitionOwnership,
+        owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
+    ) -> bool {
+        self.groups.iter().any(|tagged| {
+            tagged.owner().same_storage_as(owner)
+                && tagged.owner().is_stored_by(ownership, &owns_unit)
+        })
     }
 
     /// Returns canonical static storage roles selected for one partition.

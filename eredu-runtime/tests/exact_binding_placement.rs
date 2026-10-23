@@ -2160,11 +2160,13 @@ mod component_preparation {
             .unwrap()
         };
         let mut replica_bytes = 0;
-        for index in [0, 2] {
+        for (index, replica) in [(0, false), (1, false), (1, true), (2, false)] {
             let partition = ArchitecturePartition::from_description(
                 definition.parameters(),
                 [("units", index..index + 1)],
                 PartitionOwnership::new(index == 0, index == 2, std::iter::empty::<String>())
+                    .unwrap()
+                    .with_replicated_static_roles(if replica { vec!["shared"] } else { vec![] })
                     .unwrap(),
                 definition.state_layout(),
                 definition.state_partition_plan(),
@@ -2172,6 +2174,34 @@ mod component_preparation {
                 NoAuxiliaryBoundarySchema::new(2),
             )
             .unwrap();
+            let owns_unit = |group: &eredu_runtime::ExecutionGroupId, unit| {
+                partition
+                    .groups()
+                    .iter()
+                    .any(|owned| owned.group() == group && owned.contains(unit))
+            };
+            let storage_groups = definition
+                .parameters()
+                .stored_groups(partition.ownership(), owns_unit)
+                .collect::<Vec<_>>();
+            let stores_owner = definition.parameters().stores_owner(
+                definition.parameters().groups()[0].owner(),
+                partition.ownership(),
+                owns_unit,
+            );
+            if index == 1 && !replica {
+                assert!(storage_groups.is_empty());
+                assert!(!stores_owner);
+                assert!(partition.parameter_bindings().is_empty());
+                continue;
+            }
+            assert_eq!(storage_groups.len(), 2);
+            assert!(stores_owner);
+            if replica {
+                assert!(!definition.parameters().groups()[0]
+                    .owner()
+                    .is_owned_by(partition.ownership(), owns_unit));
+            }
             let selected = definition.select_partition(&partition).unwrap();
             assert_eq!(selected.state().unwrap().global_layers(), index..index + 1);
             let groups = definition.parameters().select_owned(&partition);
@@ -2197,6 +2227,6 @@ mod component_preparation {
             replica_bytes += plan.owners().map(|b| b.expected_bytes()).sum::<u64>();
             assert_eq!(prepared.source().source_keys(), ["physical"]);
         }
-        assert_eq!(replica_bytes, 64);
+        assert_eq!(replica_bytes, 96);
     }
 }

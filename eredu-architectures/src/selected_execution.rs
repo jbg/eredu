@@ -1012,16 +1012,11 @@ impl SelectedExecution {
         ) -> Result<eredu_runtime::SelectedParameterResources, String> {
             let requirements = selected.requirements();
             let owned = parameters
-                .groups()
-                .iter()
-                .filter(|group| {
-                    group
-                        .owner()
-                        .is_stored_by(requirements.ownership(), |group, unit| {
-                            requirements.groups().iter().any(|owned| {
-                                owned.group() == group && owned.units().contains(&unit)
-                            })
-                        })
+                .stored_groups(requirements.ownership(), |group, unit| {
+                    requirements
+                        .groups()
+                        .iter()
+                        .any(|owned| owned.group() == group && owned.units().contains(&unit))
                 })
                 .flat_map(|group| group.members())
                 .map(|member| member.target().to_owned())

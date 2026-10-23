@@ -796,6 +796,10 @@ shared static owners use their first declared storage role. Preparation groups r
 aliases by storage identity. A partition stores every group in a selected storage owner,
 while observation retains declared consumers and mutable-state slots remain independent.
 Ordinary leased units retain their default unit storage identities.
+Cold resource sizing, parameter-location resolution and partition binding projection
+use the same canonical storage selection. Single-member location queries scan declared
+owners without allocating a selected parameter catalog. Observation still resolves
+logical invocation ownership rather than storage replicas.
 Architecture-selected local state geometry preserves slot counts, segment identities and
 lifetimes, component roles, dtypes, residency and attention policy. Runtime validates
 these invariants before retaining the selected geometry with the definition.
