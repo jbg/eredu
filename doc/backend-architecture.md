@@ -819,7 +819,13 @@ Observed serial, routed and tensor-parallel traversal use one observation-hook
 constructor. It resolves architecture-owned group paths and unit-boundary ownership
 in canonical order before acquisition, retains the same observer for internal and
 boundary callbacks, and preserves the original architecture error as the cause of
-preflight failure. Equations and observation delivery remain in the shared traversal.
+preflight failure. Architecture kernels supply equations; shared traversal delivers
+observations.
+Resident native materialization uses one transfer-acquisition and population loop
+for architecture-built modules and modules supplied by neutral construction. Source
+adapters supply each unit once; the common finalizer validates supplied cardinality,
+orders the retained transfer before population, enables resident parameter conversions,
+and moves pinned leases and the transfer owner into the resident policy.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

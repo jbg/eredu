@@ -417,7 +417,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
     /// Populates every unit once and converts the bounded loader into a
     /// permanently resident policy without changing the architecture loop.
     pub fn into_resident<A, S>(
-        mut self,
+        self,
         architecture: &A,
         stream: &Stream,
         _state: std::marker::PhantomData<S>,
@@ -429,7 +429,50 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         S: RuntimeState<MlxNeuralBackend>,
         A::Error: std::fmt::Display,
     {
+        let unit_count = self.unit_ids.len();
+        self.materialize_resident(unit_count, stream, |address, context| {
+            architecture
+                .build_unit(address.group(), address.index(), context)
+                .map_err(|error| Error::Other(Box::new(error)))
+        })
+    }
+
+    /// Populates architecture units already constructed by neutral
+    /// orchestration and converts this loader into a resident policy.
+    pub fn into_resident_units(
+        self,
+        units: Vec<U>,
+        stream: &Stream,
+    ) -> Result<MlxResidentPolicy<U>, Error>
+    where
+        U: Parameterized<MlxTensor>,
+        P: MlxUnitPopulator<U>,
+    {
+        let unit_count = units.len();
+        let mut units = units.into_iter();
+        self.materialize_resident(unit_count, stream, |_, _| {
+            Ok(units.next().expect("validated resident unit count"))
+        })
+    }
+
+    fn materialize_resident(
+        mut self,
+        unit_count: usize,
+        stream: &Stream,
+        mut build: impl FnMut(ExecutionUnitAddress, &Stream) -> Result<U, Error>,
+    ) -> Result<MlxResidentPolicy<U>, Error>
+    where
+        U: Parameterized<MlxTensor>,
+        P: MlxUnitPopulator<U>,
+    {
         self.drain()?;
+        if unit_count != self.unit_ids.len() {
+            return Err(Error::ArchitectureModel(format!(
+                "neutral resident construction supplied {} units for layout length {}",
+                unit_count,
+                self.unit_ids.len()
+            )));
+        }
         let requests = self
             .unit_ids
             .iter()
@@ -446,65 +489,13 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
                 .layout
                 .address(index)
                 .expect("validated layout covers every resident unit");
-            let mut unit = MlxModule::new(
-                architecture
-                    .build_unit(address.group(), address.index(), stream)
-                    .map_err(|error| Error::Other(Box::new(error)))?,
-            );
+            let mut unit = MlxModule::new(build(address, stream)?);
             self.populator.populate(&mut unit, lease)?;
             units.push(Some(unit));
         }
         self.residency.enable_resident_parameter_conversions()?;
         Ok(MlxResidentPolicy {
             units,
-            residency: self.residency.clone(),
-            store: Arc::clone(&self.store),
-            unit_ids: self.unit_ids.clone(),
-            layout: self.layout.clone(),
-            window_depth: self.window_depth,
-            _static_leases: self._static_leases,
-            _transfer: transfer,
-        })
-    }
-
-    /// Populates architecture units already constructed by neutral
-    /// orchestration and converts this loader into a resident policy.
-    pub fn into_resident_units(
-        mut self,
-        units: Vec<U>,
-        stream: &Stream,
-    ) -> Result<MlxResidentPolicy<U>, Error>
-    where
-        U: Parameterized<MlxTensor>,
-        P: MlxUnitPopulator<U>,
-    {
-        self.drain()?;
-        if units.len() != self.unit_ids.len() {
-            return Err(Error::ArchitectureModel(format!(
-                "neutral resident construction supplied {} units for layout length {}",
-                units.len(),
-                self.unit_ids.len()
-            )));
-        }
-        let requests = self
-            .unit_ids
-            .iter()
-            .cloned()
-            .map(|id| (id, 1))
-            .collect::<Vec<_>>();
-        let transfer = self
-            .residency
-            .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
-        transfer.order_after(stream)?;
-        let mut populated = Vec::with_capacity(units.len());
-        for (unit, lease) in units.into_iter().zip(transfer.leases()) {
-            let mut unit = MlxModule::new(unit);
-            self.populator.populate(&mut unit, lease)?;
-            populated.push(Some(unit));
-        }
-        self.residency.enable_resident_parameter_conversions()?;
-        Ok(MlxResidentPolicy {
-            units: populated,
             residency: self.residency.clone(),
             store: Arc::clone(&self.store),
             unit_ids: self.unit_ids.clone(),
