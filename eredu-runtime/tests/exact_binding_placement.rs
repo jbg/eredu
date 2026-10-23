@@ -1530,6 +1530,84 @@ mod component_preparation {
                 .shape(),
             [4, 2]
         );
+        let prototype = self::prepared();
+        let graph = prototype.description().graph();
+        let complete = ExecutionUnitLayout::new(graph, [8]).unwrap();
+        let addresses = [complete.address(3).unwrap(), complete.address(7).unwrap()];
+        let sparse = complete.select(addresses).unwrap();
+        let groups = [0, 2]
+            .into_iter()
+            .zip(addresses)
+            .map(|(index, address)| {
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit(
+                        sparse.group_id(0).unwrap().clone(),
+                        address.index(),
+                    ),
+                    prototype.description().groups()[index].group().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let declare = |layout: &ExecutionUnitLayout, groups: Vec<OwnedParameterGroupSpec>| {
+            ArchitectureParameterDescription::new(
+                graph,
+                layout,
+                groups.iter().map(|group| group.group().clone()),
+                groups.clone(),
+            )
+        };
+        for missing in [0, 4] {
+            let invalid = OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(sparse.group_id(0).unwrap().clone(), missing),
+                groups[0].group().clone(),
+            );
+            assert!(matches!(declare(&sparse, vec![invalid]),
+                Err(eredu_runtime::ArchitectureParameterError::UnitOutOfRange { global_unit, .. }) if global_unit == missing));
+        }
+        let parameters = declare(&sparse, groups.clone()).unwrap();
+        let prepared = PreparedComponent::prepare(
+            "sparse-parameters",
+            parameters,
+            prototype.source().clone(),
+            |member| {
+                Ok::<_, ComponentPreparationError>(DerivedWeightRecipe::source(
+                    format!(
+                        "physical.{}",
+                        member.target().strip_prefix("weight.").unwrap()
+                    ),
+                    TensorSelection::Full,
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.unit_source(addresses[0]).unwrap().source_keys(),
+            ["physical.0"]
+        );
+        assert_eq!(
+            prepared.unit_source(addresses[1]).unwrap().source_keys(),
+            ["physical.2"]
+        );
+        let selected_layout = sparse.select([addresses[1]]).unwrap();
+        let selected = prepared
+            .project(
+                "sparse-owner",
+                declare(&selected_layout, vec![groups[1].clone()]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(selected.unit_layout().address(0), Some(addresses[1]));
+        assert_eq!(selected.source().source_keys(), ["physical.2"]);
+        let (_, _, retained, source, units) = selected.into_addressed_unit_parts().unwrap();
+        assert_eq!(retained, selected_layout);
+        assert_eq!(units[0].0, addresses[1]);
+        assert_eq!(
+            units[0].1[0]
+                .source_recipe()
+                .infer(source.as_ref())
+                .unwrap()
+                .shape(),
+            [4, 2]
+        );
     }
 
     #[test]
@@ -2112,11 +2190,15 @@ mod component_preparation {
         };
         let prototype = prepared().declaration().clone();
         let graph = prototype.parameters().graph();
-        let units = prototype.parameters().unit_layout();
+        let complete = ExecutionUnitLayout::new(graph, [12]).unwrap();
+        let indices = [3, 7, 11];
+        let units = complete
+            .select(indices.map(|index| complete.address(index).unwrap()))
+            .unwrap();
         let group = units.group_id(0).unwrap().clone();
         let groups = ["owner", "consumer"]
             .into_iter()
-            .zip([0, 2])
+            .zip([3, 11])
             .map(|(name, index)| {
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::static_unit_consumers("shared", [(group.clone(), index)]),
@@ -2135,11 +2217,24 @@ mod component_preparation {
             .collect::<Vec<_>>();
         let parameters = ArchitectureParameterDescription::new(
             graph,
-            units,
+            &units,
             groups.iter().map(|g| g.group().clone()).collect::<Vec<_>>(),
             groups,
         )
         .unwrap();
+        let invalid = OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_unit_consumers("shared", [(group.clone(), 0)]),
+            parameters.groups()[0].group().clone(),
+        );
+        assert!(matches!(
+            ArchitectureParameterDescription::new(
+                graph,
+                &units,
+                [invalid.group().clone()],
+                [invalid],
+            ),
+            Err(eredu_runtime::ArchitectureParameterError::UnitOutOfRange { global_unit: 0, .. })
+        ));
         let definition = ComponentDefinition::new(
             "shared-pinned",
             parameters,
@@ -2154,12 +2249,12 @@ mod component_preparation {
         )
         .unwrap();
         assert_eq!(
-            definition.parameter_storage(0, 0).unwrap(),
-            definition.parameter_storage(0, 2).unwrap()
+            definition.parameter_storage(0, 3).unwrap(),
+            definition.parameter_storage(0, 11).unwrap()
         );
         assert_ne!(
-            definition.state_slots(0, 0).unwrap().collect::<Vec<_>>(),
-            definition.state_slots(0, 2).unwrap().collect::<Vec<_>>()
+            definition.state_slots(0, 3).unwrap().collect::<Vec<_>>(),
+            definition.state_slots(0, 11).unwrap().collect::<Vec<_>>()
         );
         let source: SharedCheckpointSource = Arc::new(
             MemoryWeightStore::from_safetensors([(
@@ -2189,11 +2284,12 @@ mod component_preparation {
             .unwrap()
         };
         let mut replica_bytes = 0;
-        for (index, replica) in [(0, false), (1, false), (1, true), (2, false)] {
+        for (position, replica) in [(0, false), (1, false), (1, true), (2, false)] {
+            let index = indices[position];
             let partition = ArchitecturePartition::from_description(
                 definition.parameters(),
                 [("units", index..index + 1)],
-                PartitionOwnership::new(index == 0, index == 2, std::iter::empty::<String>())
+                PartitionOwnership::new(position == 0, position == 2, std::iter::empty::<String>())
                     .unwrap()
                     .with_replicated_static_roles(if replica { vec!["shared"] } else { vec![] })
                     .unwrap(),
@@ -2218,7 +2314,7 @@ mod component_preparation {
                 partition.ownership(),
                 owns_unit,
             );
-            if index == 1 && !replica {
+            if position == 1 && !replica {
                 assert!(storage_groups.is_empty());
                 assert!(!stores_owner);
                 assert!(partition.parameter_bindings().is_empty());
@@ -2232,12 +2328,15 @@ mod component_preparation {
                     .is_owned_by(partition.ownership(), owns_unit));
             }
             let selected = definition.select_partition(&partition).unwrap();
-            assert_eq!(selected.state().unwrap().global_layers(), index..index + 1);
+            assert_eq!(
+                selected.state().unwrap().global_layers(),
+                position..position + 1
+            );
             let groups = definition.parameters().select_owned(&partition);
             assert_eq!(groups.len(), 2);
             let parameters = ArchitectureParameterDescription::new(
                 graph,
-                units,
+                &units,
                 groups.iter().map(|g| g.group().clone()).collect::<Vec<_>>(),
                 groups,
             )

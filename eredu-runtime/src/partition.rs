@@ -148,7 +148,7 @@ impl ParameterGroupOwner {
                 .group_range(group_index)
                 .expect("validated canonical layout contains every group")
                 .len();
-            if *global_unit >= available {
+            if layout.ordinal(group_index, *global_unit).is_none() {
                 return Err(ArchitectureParameterError::UnitOutOfRange {
                     group: group.as_str().to_owned(),
                     global_unit: *global_unit,
@@ -552,8 +552,8 @@ pub enum ArchitectureParameterError {
     /// A unit owner names no canonical graph group.
     #[error("architecture parameter owner names unknown execution group {0:?}")]
     UnknownExecutionGroup(String),
-    /// A unit owner exceeds its canonical group size.
-    #[error("architecture parameter owner {group}:{global_unit} exceeds {available} units")]
+    /// A unit reference is absent from its declared group.
+    #[error("architecture parameter reference {group}:{global_unit} is not among its {available} declared units")]
     UnitOutOfRange {
         /// Canonical execution-group identity.
         group: String,
