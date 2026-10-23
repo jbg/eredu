@@ -256,15 +256,17 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
-            let mut architecture = match local_layout.as_ref() {
+            let (dimensions, definition, local_layout, layout, source, units) =
+                prepared.into_parts();
+            let kernel = match local_layout.as_ref() {
                 Some(local) => {
                     ConditioningKernel::<MlxNeuralBackend>::new_parallel(dimensions, local)
                 }
                 None => ConditioningKernel::<MlxNeuralBackend>::new(dimensions),
             }
-            .and_then(ConditioningKernel::into_component)
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(TtsError::from(error)))?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,

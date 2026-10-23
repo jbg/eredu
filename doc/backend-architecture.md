@@ -594,6 +594,10 @@ selection keeps the global definition beside sparse selected unit resources; par
 validation borrows its parameter and state projections. Full and pipeline native codec
 assembly consume that retained definition rather than rebuilding it from configuration.
 Addressed resource transfer preserves the declaration with global invocation addresses.
+VoiceChat MoG, conditioning and function-head preparation retain complete definitions
+through family precision transforms and tensor placement. Native assembly consumes
+those definitions with the selected bindings. Function-head encoding and companion
+admission remain family-owned and use the same retained format as its definition.
 
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared

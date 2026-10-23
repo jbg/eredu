@@ -16,7 +16,7 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::{MogDimensions, TtsError},
-    tts_mog_layered::mog_parameter_description,
+    tts_mog_layered::tts_mog_component_definition,
 };
 
 /// Invalid component geometry or exact retained parameter contract.
@@ -69,7 +69,7 @@ pub enum MogPreparationError {
 pub struct PreparedMogBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: MogDimensions,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedMogBindings {
@@ -121,10 +121,10 @@ impl PreparedMogBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, MogPreparationError> {
-        let description = mog_parameter_description(dimensions)?;
+        let definition = tts_mog_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_mog/leased-units",
-            description,
+            definition,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -188,21 +188,27 @@ impl PreparedMogBindings {
         self.prepared.source()
     }
 
+    /// Complete semantic declaration retained through precision and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         MogDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.dimensions, local, layout, source, units)
+        (self.dimensions, definition, local, layout, source, units)
     }
 }
 

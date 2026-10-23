@@ -15,7 +15,7 @@ use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
-    tts_conditioning_layered::{conditioning_parameter_description, ConditioningDimensions},
+    tts_conditioning_layered::{tts_conditioning_component_definition, ConditioningDimensions},
     tts_mog::TtsError,
 };
 
@@ -59,7 +59,7 @@ pub enum ConditioningPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedConditioningBindings {
     dimensions: ConditioningDimensions,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedConditioningBindings {
@@ -111,10 +111,10 @@ impl PreparedConditioningBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, ConditioningPreparationError> {
-        let description = conditioning_parameter_description(dimensions)?;
+        let definition = tts_conditioning_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_conditioning/leased-units",
-            description,
+            definition,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -180,20 +180,26 @@ impl PreparedConditioningBindings {
         self.prepared.source()
     }
 
+    /// Complete semantic declaration retained through precision and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         ConditioningDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.dimensions, local, layout, source, units)
+        (self.dimensions, definition, local, layout, source, units)
     }
 }

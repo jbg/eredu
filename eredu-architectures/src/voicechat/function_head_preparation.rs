@@ -15,7 +15,7 @@ use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     channels::{ChannelError, TEXT_VOCABULARY_SIZE},
     checkpoint::Component,
-    function_head_layered::{function_head_parameter_description, FunctionHeadDimensions},
+    function_head_layered::{function_head_component_definition, FunctionHeadDimensions},
     parameters::{admitted_member, SpeechParameterError},
 };
 
@@ -66,7 +66,7 @@ pub enum FunctionHeadPreparationError {
 pub struct PreparedFunctionHeadBindings {
     dimensions: FunctionHeadDimensions,
     format: eredu_nn::LinearFormatSpec,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
     parameter: ParameterAdmission,
 }
 
@@ -108,11 +108,11 @@ impl PreparedFunctionHeadBindings {
             })?;
         let format = crate::linear_format::standard_linear_format(weight, primary.linear_format)
             .map_err(ChannelError::from)?;
-        let description = function_head_parameter_description(dimensions, &format)?;
+        let definition = function_head_component_definition(dimensions, &format)?;
         let mut selected_parameter = None;
         let prepared = PreparedComponent::prepare(
             "voicechat/function_head/leased-units",
-            description,
+            definition,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -234,22 +234,36 @@ impl PreparedFunctionHeadBindings {
         self.prepared.source()
     }
 
+    /// Complete semantic declaration retained through precision and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         FunctionHeadDimensions,
         eredu_nn::LinearFormatSpec,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("function head declares only independently leased units");
-        (self.dimensions, self.format, local, layout, source, units)
+        (
+            self.dimensions,
+            self.format,
+            definition,
+            local,
+            layout,
+            source,
+            units,
+        )
     }
 }
 
