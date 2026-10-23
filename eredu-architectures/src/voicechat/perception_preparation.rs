@@ -16,7 +16,7 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     perception::{PerceptionDimensions, PerceptionError},
-    perception_layered::perception_parameter_description,
+    perception_layered::perception_component_definition,
 };
 
 /// Invalid component geometry or exact retained parameter contract.
@@ -60,7 +60,7 @@ pub enum PerceptionPreparationError {
 pub struct PreparedPerceptionBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedPerceptionBindings {
@@ -112,10 +112,10 @@ impl PreparedPerceptionBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, PerceptionPreparationError> {
-        let description = perception_parameter_description(dimensions)?;
+        let definition = perception_component_definition(dimensions)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/perception/leased-units",
-            description,
+            definition,
             source.clone(),
             |member| {
                 let parameter =
@@ -167,6 +167,7 @@ impl PreparedPerceptionBindings {
         >,
     ) -> Result<PreparedPerceptionPartitionBindings, PerceptionPreparationError> {
         super::perception_layered::validate_perception_partition(
+            self.prepared.declaration(),
             self.dimensions,
             self.prepared.local_layout(),
             partition,
@@ -200,20 +201,26 @@ impl PreparedPerceptionBindings {
         self.prepared.source()
     }
 
+    /// Complete semantic declaration retained through precision and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         PerceptionDimensions,
+        eredu_runtime::ComponentDefinition,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (_, layout, source, units) = self
+        let (definition, _, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.dimensions, layout, source, units)
+        (self.dimensions, definition, layout, source, units)
     }
 }
 
@@ -222,7 +229,7 @@ impl PreparedPerceptionBindings {
 pub struct PreparedPerceptionPartitionBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedPerceptionPartitionBindings {
@@ -253,22 +260,28 @@ impl PreparedPerceptionPartitionBindings {
     pub fn state_layout(&self) -> Option<&eredu_runtime::StateLayout> {
         self.state_layout.as_ref()
     }
+    /// Complete definition with global cache identities and parameter ownership.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
     /// Consumes exact stage authority without rebasing canonical unit addresses.
     pub fn into_parts(
         self,
     ) -> (
         PerceptionDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        let (_, local_layout, _, source, units) = self
+        let (definition, local_layout, _, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
         (
             self.dimensions,
+            definition,
             local_layout,
             source,
             units,

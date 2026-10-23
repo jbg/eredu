@@ -159,9 +159,9 @@ pub fn materialize_voicechat_perception_pipeline(
 > {
     let (prepared, partition, manifest, plan, tensor_group, activation_dtype) =
         prepared.into_parts();
-    let (dimensions, local_layout, source, units, state_layout) = prepared.into_parts();
+    let (dimensions, definition, local_layout, source, units, state_layout) = prepared.into_parts();
     let architecture =
-        PerceptionKernel::new_partition(dimensions, local_layout.as_ref(), &partition)
+        PerceptionKernel::new_partition(definition, dimensions, local_layout.as_ref(), &partition)
             .map_err(BackendFailure::from_error)?;
     let state = PerceptionRuntimeState::for_partition(architecture.kernel(), None)
         .map_err(BackendFailure::from_error)?;

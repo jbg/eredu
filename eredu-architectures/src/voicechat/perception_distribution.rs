@@ -1,9 +1,7 @@
 //! Exact cold authority for a retained perception component pipeline.
 use super::{
     perception::PerceptionError,
-    perception_layered::{
-        perception_parameter_description, validate_perception_partition, PerceptionBoundarySchema,
-    },
+    perception_layered::{validate_perception_partition, PerceptionBoundarySchema},
     perception_preparation::PreparedPerceptionPartitionBindings,
 };
 use eredu_core::CollectiveGroupId;
@@ -50,7 +48,12 @@ impl PreparedPerceptionPipelineBindings {
         activation_dtype: PipelineActivationDtype,
     ) -> Result<Self, PerceptionPipelinePreparationError> {
         use PerceptionPipelinePreparationError::Contract;
-        validate_perception_partition(bindings.dimensions(), bindings.local_layout(), &partition)?;
+        validate_perception_partition(
+            bindings.definition(),
+            bindings.dimensions(),
+            bindings.local_layout(),
+            &partition,
+        )?;
         if activation_dtype != PipelineActivationDtype::Float32 {
             return Err(Contract("perception requires Float32 activation transport"));
         }
@@ -64,9 +67,8 @@ impl PreparedPerceptionPipelineBindings {
                 ));
             }
         }
-        let description = perception_parameter_description(bindings.dimensions())?;
         eredu_runtime::validate_component_pipeline(
-            &description,
+            bindings.definition().parameters(),
             &partition,
             bindings.unit_bindings().map(|(address, _)| address),
             bindings.state_layout(),

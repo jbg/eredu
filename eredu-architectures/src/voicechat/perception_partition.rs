@@ -69,6 +69,7 @@ pub(super) struct PerceptionOwnership {
 }
 
 fn ownership<G>(
+    definition: &ComponentDefinition,
     dimensions: PerceptionDimensions,
     partition: &ArchitecturePartition<G, PerceptionBoundarySchema>,
 ) -> Result<PerceptionOwnership, PerceptionError> {
@@ -79,7 +80,7 @@ fn ownership<G>(
         .ok_or(PerceptionError::Configuration(
             "packed perception width exceeds I32",
         ))?;
-    let description = perception_parameter_description(dimensions)?;
+    let description = definition.parameters();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &PerceptionBoundarySchema::new(dimensions)
@@ -119,7 +120,7 @@ fn ownership<G>(
     let local_state = if blocks.is_empty() {
         None
     } else {
-        Some(perception_state_layout(dimensions)?.slice(blocks.clone())?)
+        Some(definition.state_layout().slice(blocks.clone())?)
     };
     match (partition.state(), &local_state) {
         (Some(actual), Some(expected))
@@ -141,6 +142,7 @@ fn ownership<G>(
 
 /// Validates selected units, state, physical placement and transport without native resources.
 pub fn validate_perception_partition<G>(
+    definition: &ComponentDefinition,
     dimensions: PerceptionDimensions,
     layout: Option<&LocalModelLayout>,
     partition: &ArchitecturePartition<G, PerceptionBoundarySchema>,
@@ -148,12 +150,13 @@ pub fn validate_perception_partition<G>(
     if let Some(layout) = layout {
         perception_local_dimensions(dimensions, layout)?;
     }
-    ownership(dimensions, partition).map(|_| ())
+    ownership(definition, dimensions, partition).map(|_| ())
 }
 
 impl<B: NeuralBackend> PerceptionKernel<B> {
     /// Constructs only the parameters and cache owners selected for one stage.
     pub fn new_partition<G>(
+        definition: ComponentDefinition,
         dimensions: PerceptionDimensions,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, PerceptionBoundarySchema>,
@@ -165,8 +168,8 @@ impl<B: NeuralBackend> PerceptionKernel<B> {
             Some(layout) => Self::new_parallel(dimensions, layout)?,
             None => Self::new(dimensions)?,
         };
-        architecture.partition = Some(ownership(dimensions, partition)?);
-        Ok(architecture.into_component()?.select_partition(partition)?)
+        architecture.partition = Some(ownership(&definition, dimensions, partition)?);
+        Ok(ComponentAdapter::new(definition, architecture)?.select_partition(partition)?)
     }
     /// Validates a restored stage cache without materializing learned parameters.
     /// Every cache belongs to this rank's exact interval and uses released F32 geometry.
