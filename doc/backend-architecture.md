@@ -832,6 +832,9 @@ nonzero global addresses and sparse selections. Native preparation and portable
 partition/pipeline admission consume that layout rather than reconstructing addresses
 from counts. Custom low-level architectures use the shared graph/count projection;
 projection errors retain the original architecture or layout failure as their source.
+Storage-preference application and replicated construction compare complete retained
+layouts, including global invocation identities, before building modules or binding
+backend mechanisms. Equal group counts alone do not establish this agreement.
 Resident execution and bounded serial/tensor-parallel traversal enumerate retained
 invocation addresses. Resident modules stay dense while their layout retains global
 identities. Construction and adoption failures use one neutral translation that keeps

@@ -433,18 +433,16 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         if architecture.execution_graph()? != *self.declaration.parameters().graph() {
             return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
         }
-        for group in 0..self.declaration.parameters().graph().groups().len() {
-            if architecture.group_unit_count(group)?
-                != self
-                    .declaration
-                    .parameters()
-                    .unit_layout()
-                    .group_range(group)
-                    .expect("declared group")
-                    .len()
-            {
-                return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
-            }
+        let layout = architecture
+            .execution_unit_layout()
+            .map_err(|error| match error {
+                crate::ArchitectureExecutionLayoutError::Architecture(error) => error,
+                crate::ArchitectureExecutionLayoutError::Layout(error) => {
+                    A::Error::from(ComponentPreparationError::Units(error))
+                }
+            })?;
+        if &layout != self.declaration.parameters().unit_layout() {
+            return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
         }
         for bindings in self.pinned.values_mut() {
             *bindings = crate::apply_parameter_storage_layouts(

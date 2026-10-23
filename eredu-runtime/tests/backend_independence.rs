@@ -1627,6 +1627,7 @@ fn minimal_text_backend_compiles_without_optional_execution_extensions() {
         counters: ReplicatedSessionCounters::default(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let layout = architecture.state_layout().unwrap();
     let mut state =
@@ -2187,6 +2188,7 @@ struct OrdinaryTextFixture {
     counters: ReplicatedSessionCounters,
     inconsistent_transport: bool,
     inconsistent_identity: bool,
+    unit_offset: usize,
 }
 
 impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
@@ -2229,7 +2231,7 @@ impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
         _: &(),
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
         let graph = self.execution_graph()?;
-        let layout = ExecutionUnitLayout::new(&graph, [1]).map_err(Error::backend)?;
+        let layout = self.execution_unit_layout().map_err(Error::backend)?;
         let group = eredu_runtime::ParameterGroupSpec::new(
             "decoder.weight",
             eredu_runtime::ParameterRole::Replicated,
@@ -2242,7 +2244,7 @@ impl ArchitectureParameters<FakeBackend> for OrdinaryTextFixture {
         .map_err(Error::backend)?;
         let owner = eredu_runtime::ParameterGroupOwner::execution_unit(
             layout.group_id(0).expect("decoder group").clone(),
-            0,
+            self.unit_offset,
         );
         ArchitectureParameterDescription::new(
             &graph,
@@ -2306,6 +2308,17 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder")
             .map_err(Error::backend)
+    }
+
+    fn execution_unit_layout(
+        &self,
+    ) -> Result<ExecutionUnitLayout, eredu_runtime::ArchitectureExecutionLayoutError<Self::Error>>
+    {
+        let graph = self
+            .execution_graph()
+            .map_err(eredu_runtime::ArchitectureExecutionLayoutError::Architecture)?;
+        let complete = ExecutionUnitLayout::new(&graph, [self.unit_offset + 1])?;
+        Ok(complete.select([complete.address(self.unit_offset).unwrap()])?)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
@@ -4353,6 +4366,7 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
             counters: counters.clone(),
             inconsistent_transport: false,
             inconsistent_identity: false,
+            unit_offset: 0,
         };
         let selected = selected_reference_text(&architecture, residency);
         let expected_identity = selected.requirements().architecture_identity().to_owned();
@@ -4523,6 +4537,7 @@ fn construction_report_failure_precedes_state_and_policy_native_work() {
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
     let expected_identity = selected.requirements().architecture_identity().to_owned();
@@ -4574,6 +4589,7 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     });
     let selected = selected_reference_text(&architecture.0, LayerWeightResidency::FullyResident);
     let expected_identity = selected.requirements().architecture_identity().to_owned();
@@ -4729,6 +4745,7 @@ fn observed_prediction_target_reuses_capture_transaction_and_recovers_delivery_f
             counters: counters.clone(),
             inconsistent_transport: false,
             inconsistent_identity: false,
+            unit_offset: 0,
         });
         let selected =
             selected_reference_text(&architecture.0, LayerWeightResidency::FullyResident);
@@ -4826,6 +4843,7 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
     let parameters = architecture.parameter_description(&()).unwrap();
@@ -5029,6 +5047,7 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let stateless_selected =
         selected_reference_text(&stateless_architecture, LayerWeightResidency::FullyResident);
@@ -5053,6 +5072,7 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let invalid_parameters = invalid_architecture.parameter_description(&()).unwrap();
     let invalid_partition = ArchitecturePartition::from_architecture::<
@@ -5595,6 +5615,7 @@ fn partitioned_agreement_session(
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     // The cursor fixture supplies its own admitted request contract. Ordinary
     // fake text execution keeps its separate, non-chunked declaration.
@@ -5760,6 +5781,7 @@ fn partitioned_cache_control_session(
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
     let parameters = architecture.parameter_description(&()).unwrap();
@@ -6591,6 +6613,7 @@ fn partitioned_runtime_factory_rejects_independent_task_proof_before_factory_wor
         counters,
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
     let parameters = architecture.parameter_description(&()).unwrap();
@@ -6656,6 +6679,7 @@ fn partitioned_factory_retains_typed_construction_causes_without_publishing_stat
             counters: counters.clone(),
             inconsistent_transport: false,
             inconsistent_identity: false,
+            unit_offset: 0,
         };
         let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
         let parameters = architecture.parameter_description(&()).unwrap();
@@ -6772,6 +6796,7 @@ fn partitioned_runtime_rejects_publication_and_agreement_manifest_perturbations_
             counters: counters.clone(),
             inconsistent_transport: false,
             inconsistent_identity: false,
+            unit_offset: 0,
         };
         let graph = architecture.execution_graph().unwrap();
         let plan = PartitionedExecutionPlan::new(
@@ -6860,6 +6885,7 @@ fn production_partitioned_middle_stage_completes_source_before_send_and_fences_d
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
     let parameters = architecture.parameter_description(&()).unwrap();
@@ -7051,6 +7077,7 @@ fn assert_destination_preparation_failure_is_agreed_before_transfer(
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
     let parameters = architecture.parameter_description(&()).unwrap();
@@ -7313,39 +7340,54 @@ fn corrupt_received_role_header_is_agreed_by_all_ranks_and_rolled_back() {
 
 #[test]
 fn replicated_text_contract_mismatch_fails_before_backend_work() {
-    let counters = ReplicatedSessionCounters::default();
-    let selected_architecture = OrdinaryTextFixture {
-        static_modules: FakeOperator,
-        trace: Vec::new(),
-        counters: counters.clone(),
-        inconsistent_transport: false,
-        inconsistent_identity: false,
-    };
-    let selected =
-        selected_reference_text(&selected_architecture, LayerWeightResidency::FullyResident);
-    let expected_identity = selected.requirements().architecture_identity().to_owned();
-    let constructed_architecture = OrdinaryTextFixture {
-        static_modules: FakeOperator,
-        trace: Vec::new(),
-        counters: counters.clone(),
-        inconsistent_transport: true,
-        inconsistent_identity: false,
-    };
-    let error = prepare_replicated_text_contract::<
-        _,
-        FakeBackend,
-        DeviceState<FakeBackend, FakeLayerState>,
-    >(
-        &constructed_architecture,
-        None,
-        selected,
-        &expected_identity,
-        &(),
-    )
-    .err()
-    .expect("inconsistent architecture entered backend construction");
-    assert!(error.contains("architecture execution group 0 differs from selection"));
-    assert_eq!(counters.snapshot(), ReplicatedSessionCounts::default());
+    for (transport, offset, expected) in [
+        (
+            true,
+            0,
+            "architecture execution group 0 differs from selection",
+        ),
+        (
+            false,
+            7,
+            "architecture execution-unit layout differs from selection",
+        ),
+    ] {
+        let counters = ReplicatedSessionCounters::default();
+        let selected_architecture = OrdinaryTextFixture {
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+            counters: counters.clone(),
+            inconsistent_transport: false,
+            inconsistent_identity: false,
+            unit_offset: 0,
+        };
+        let selected =
+            selected_reference_text(&selected_architecture, LayerWeightResidency::FullyResident);
+        let expected_identity = selected.requirements().architecture_identity().to_owned();
+        let constructed_architecture = OrdinaryTextFixture {
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+            counters: counters.clone(),
+            inconsistent_transport: transport,
+            inconsistent_identity: false,
+            unit_offset: offset,
+        };
+        let error = prepare_replicated_text_contract::<
+            _,
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >(
+            &constructed_architecture,
+            None,
+            selected,
+            &expected_identity,
+            &(),
+        )
+        .err()
+        .expect("inconsistent architecture entered backend construction");
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(counters.snapshot(), ReplicatedSessionCounts::default());
+    }
 }
 
 #[test]
@@ -7357,6 +7399,7 @@ fn replicated_text_identity_mismatch_fails_before_backend_work() {
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: false,
+        unit_offset: 0,
     };
     let selected =
         selected_reference_text(&selected_architecture, LayerWeightResidency::FullyResident);
@@ -7367,6 +7410,7 @@ fn replicated_text_identity_mismatch_fails_before_backend_work() {
         counters: counters.clone(),
         inconsistent_transport: false,
         inconsistent_identity: true,
+        unit_offset: 0,
     };
     let error = prepare_replicated_text_contract::<
         _,
@@ -7410,6 +7454,7 @@ fn replicated_text_selection_denies_each_required_mechanism_before_backend_work(
             counters: counters.clone(),
             inconsistent_transport: false,
             inconsistent_identity: false,
+            unit_offset: 0,
         };
         let error = try_select_reference_text(
             &architecture,
@@ -9785,6 +9830,7 @@ fn transactional_observation_requires_available_completion_before_work() {
                 counters: counters.clone(),
                 inconsistent_transport: false,
                 inconsistent_identity: false,
+                unit_offset: 0,
             };
             let selected = try_select_reference_text_with_completion(
                 &architecture,
@@ -10018,6 +10064,7 @@ fn completed_text_prefill_settles_state_and_rolls_back_before_publication() {
             counters: counters.clone(),
             inconsistent_transport: false,
             inconsistent_identity: false,
+            unit_offset: 0,
         };
         let selected =
             try_select_reference_text_with_completion(&architecture, residency, None, false, false)

@@ -5080,21 +5080,14 @@ where
     if &graph != requirements.execution_graph() {
         return Err("architecture execution graph differs from selection".into());
     }
-    if requirements.execution_units().group_count() != graph.groups().len() {
-        return Err("selected execution-unit groups differ from architecture graph".into());
+    let units = architecture
+        .execution_unit_layout()
+        .map_err(|error| error.to_string())?;
+    if &units != requirements.execution_units() {
+        return Err("architecture execution-unit layout differs from selection".into());
     }
     for group in 0..graph.groups().len() {
-        let actual = architecture
-            .group_unit_count(group)
-            .map_err(|error| error.to_string())?;
-        let expected = requirements
-            .execution_units()
-            .group_range(group)
-            .expect("validated requirement exposes every graph group")
-            .len();
-        if actual != expected
-            || architecture.group_transport(group) != requirements.group_transports()[group]
-        {
+        if architecture.group_transport(group) != requirements.group_transports()[group] {
             return Err(format!(
                 "architecture execution group {group} differs from selection"
             ));

@@ -11,6 +11,8 @@ enum Failure {
     #[error(transparent)]
     Neural(#[from] eredu_nn::Error),
     #[error(transparent)]
+    Preparation(#[from] eredu_runtime::ComponentPreparationError),
+    #[error(transparent)]
     Definition(#[from] ComponentDefinitionError),
     #[error("injected equation failure")]
     Equation,
@@ -347,6 +349,30 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
     sparse_parameters
         .validate_architecture::<FakeBackend, StatelessComponentState, _>(&component)
         .unwrap();
+    let prepare = || {
+        eredu_runtime::PreparedComponent::prepare::<
+            Failure,
+            eredu_checkpoint::recipe::DerivedWeightRecipe,
+        >(
+            "sparse-fixture",
+            sparse_parameters.clone(),
+            Arc::new(counting_source().0),
+            |_| unreachable!("fixture has no parameters"),
+        )
+        .unwrap()
+    };
+    prepare()
+        .with_storage_preferences::<FakeBackend, StatelessComponentState, _>(&component, &())
+        .unwrap();
+    assert!(matches!(
+        prepare().with_storage_preferences::<FakeBackend, StatelessComponentState, _>(
+            &adapter(false),
+            &()
+        ),
+        Err(Failure::Preparation(
+            eredu_runtime::ComponentPreparationError::ArchitectureMismatch(_)
+        ))
+    ));
     let selected =
         <_ as LayeredArchitecture<FakeBackend, StatelessComponentState>>::execution_unit_layout(
             &component,
