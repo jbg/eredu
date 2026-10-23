@@ -699,6 +699,42 @@ struct ActivationObserverTraversalHook<'a, O: ?Sized> {
     group_outputs: Vec<Option<String>>,
 }
 
+impl<'a, O: ?Sized> ActivationObserverTraversalHook<'a, O> {
+    fn new<A, B, S>(architecture: &A, observer: &'a mut O) -> Result<Self, A::Error>
+    where
+        B: NeuralBackend,
+        S: RuntimeState<B>,
+        A: LayeredArchitecture<B, S>,
+    {
+        let graph = architecture.execution_graph()?;
+        let mut units = Vec::with_capacity(graph.groups().len());
+        let mut group_inputs = Vec::with_capacity(graph.groups().len());
+        let mut group_outputs = Vec::with_capacity(graph.groups().len());
+        for group in 0..graph.groups().len() {
+            let count = architecture.group_unit_count(group)?;
+            units.push(
+                (0..count)
+                    .map(|index| {
+                        if architecture.observes_unit_boundaries(group, index) {
+                            Ok(None)
+                        } else {
+                            architecture.unit_path(group, index).map(Some)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            group_inputs.push(architecture.group_input_observation_path(group)?);
+            group_outputs.push(architecture.group_output_observation_path(group)?);
+        }
+        Ok(Self {
+            observer: std::rc::Rc::new(std::cell::RefCell::new(observer)),
+            units,
+            group_inputs,
+            group_outputs,
+        })
+    }
+}
+
 impl<B, C, E, O> LayeredTraversalHook<B, C, E> for ActivationObserverTraversalHook<'_, O>
 where
     B: NeuralBackend,
@@ -2693,49 +2729,10 @@ where
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group)
+        let mut hook =
+            ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if self.architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            self.architecture.unit_path(group, index).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let internal_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
+        let internal_observer = hook.observer.clone();
         self.forward_with_unit_executor_and_traversal_hook(
             input,
             state,
@@ -2864,49 +2861,10 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group)
+        let mut hook =
+            ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if self.architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            self.architecture.unit_path(group, index).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let routed_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
+        let routed_observer = hook.observer.clone();
         self.forward_with_unit_executor_and_traversal_hook(
             input,
             state,
@@ -3553,49 +3511,10 @@ where
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group)
+        let mut hook =
+            ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if self.architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            self.architecture.unit_path(group, index).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let internal_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
+        let internal_observer = hook.observer.clone();
         self.forward_parallel_with_unit_executor_and_traversal_hook(
             input,
             state,

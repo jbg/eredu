@@ -815,6 +815,11 @@ source catalogs. It validates combined coexistence budgets and produces the nati
 materialization plan and residency metadata from those same resources. Native preparation
 supplies transfer-capacity facts and validates unused ordinary-source inputs; materialization
 consumes the complete retained plan without rebuilding resource lists or budget policy.
+Observed serial, routed and tensor-parallel traversal use one observation-hook
+constructor. It resolves architecture-owned group paths and unit-boundary ownership
+in canonical order before acquisition, retains the same observer for internal and
+boundary callbacks, and preserves the original architecture error as the cause of
+preflight failure. Equations and observation delivery remain in the shared traversal.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or
