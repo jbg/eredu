@@ -1,8 +1,7 @@
 //! Cold authority for a retained transformer component pipeline.
 use super::{
     tts_transformer_layered::{
-        tts_transformer_parameter_description, validate_transformer_partition,
-        TransformerBoundarySchema, TransformerError,
+        validate_transformer_partition, TransformerBoundarySchema, TransformerError,
     },
     tts_transformer_preparation::PreparedTtsTransformerPartitionBindings,
 };
@@ -53,8 +52,12 @@ impl PreparedTtsTransformerPipelineBindings {
         activation_dtype: PipelineActivationDtype,
     ) -> Result<Self, TransformerPipelinePreparationError> {
         use TransformerPipelinePreparationError::Contract;
-        validate_transformer_partition(bindings.config(), bindings.local_layout(), &partition)?;
-        let description = tts_transformer_parameter_description(bindings.config())?;
+        validate_transformer_partition(
+            bindings.definition(),
+            bindings.config(),
+            bindings.local_layout(),
+            &partition,
+        )?;
         let kind = if bindings.config().geometry().causal {
             ArchitectureGroupKind::Decoder
         } else {
@@ -68,7 +71,7 @@ impl PreparedTtsTransformerPipelineBindings {
             }
         }
         eredu_runtime::validate_component_pipeline(
-            &description,
+            bindings.definition().parameters(),
             &partition,
             bindings.unit_bindings().map(|(address, _)| address),
             bindings.state_layout(),

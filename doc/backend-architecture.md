@@ -608,6 +608,10 @@ Perception preparation retains its complete parameter, transport and Conformer c
 definition through precision, placement and stage selection. Pipeline validation borrows
 that declaration, and native complete and partition assembly consume it with the exact
 selected resources. Family ownership checks retain the stage-specific cache slice.
+TTS transformer preparation retains its definition through precision, tensor placement
+and stage selection. Selected state geometry preserves global slot identities while
+recording rank-local cache heads. Complete, local-partition and pipeline assembly
+consume that definition; pipeline validation borrows its parameter and cache declarations.
 
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared
@@ -777,6 +781,9 @@ selected projection.
 execution graph with logical unit paths, state references, group transport and
 primary/prediction identities. Construction validates addresses, paths, state
 ranges, partition rules and optional group semantics without native allocation.
+Architecture-selected local state geometry preserves slot counts, segment identities and
+lifetimes, component roles, dtypes, residency and attention policy. Runtime validates
+these invariants before retaining the selected geometry with the definition.
 `ComponentDefinition::select_partition` validates canonical bindings, selected unit
 state references and exact state ownership before materialization. Its retained
 `ComponentSelection` resolves only owned global invocation addresses and preserves

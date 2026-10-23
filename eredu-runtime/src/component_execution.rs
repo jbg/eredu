@@ -178,6 +178,41 @@ impl ComponentDefinition {
     pub fn state_layout(&self) -> &StateLayout {
         &self.state
     }
+    /// Retains invocation and state-slot identities with architecture-selected local geometry.
+    /// Segment lifetimes, component roles, dtypes and residency stay unchanged.
+    pub fn with_state_layout(self, state: StateLayout) -> Result<Self, ComponentDefinitionError> {
+        let compatible = state.len() == self.state.len()
+            && state.segments() == self.state.segments()
+            && (0..state.len()).all(|slot| {
+                let original = self.state.components(slot).expect("validated state slot");
+                let selected = state.components(slot).expect("validated state slot");
+                self.state.layer(slot).map(|layer| layer.attention())
+                    == state.layer(slot).map(|layer| layer.attention())
+                    && original.len() == selected.len()
+                    && original.iter().zip(selected).all(|(a, b)| {
+                        a.role() == b.role()
+                            && a.dtype() == b.dtype()
+                            && a.residency() == b.residency()
+                            && a.presence() == b.presence()
+                    })
+            });
+        if !compatible {
+            return Err(ComponentDefinitionError::Invalid {
+                component: self.id,
+                resource: "selected state identities or lifetimes".into(),
+            });
+        }
+        Self::new(
+            self.id,
+            self.parameters,
+            self.units,
+            self.transport,
+            self.primary,
+            self.prediction,
+            state,
+            self.state_partition,
+        )
+    }
     /// Canonical number of logical invocations in one validated group.
     pub fn unit_count(&self, group: usize) -> Result<usize, ComponentDefinitionError> {
         self.parameters

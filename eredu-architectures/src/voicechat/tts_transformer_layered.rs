@@ -394,14 +394,7 @@ impl<B: NeuralBackend> TransformerKernel<B> {
         layout: &LocalModelLayout,
     ) -> Result<Self, TransformerError> {
         let blocks = transformer_local_configs(&config, layout)?;
-        let state_layout = if config.geometry().causal {
-            StateLayout::new(decoder::cache_layout_with_key_value_heads(
-                &config,
-                blocks.iter().map(Config::num_key_value_heads),
-            )?)?
-        } else {
-            transformer_state_layout(&config)?
-        };
+        let state_layout = transformer_local_state_layout(&config, &blocks)?;
         Ok(Self {
             config,
             local_blocks: Some(blocks),
@@ -644,26 +637,32 @@ pub(super) fn transformer_local_configs(
     Ok(blocks)
 }
 
+pub(super) fn transformer_local_state_layout(
+    config: &TransformerConfig,
+    blocks: &[TransformerConfig],
+) -> Result<StateLayout, TransformerError> {
+    if config.geometry().causal {
+        Ok(StateLayout::new(
+            decoder::cache_layout_with_key_value_heads(
+                config,
+                blocks.iter().map(Config::num_key_value_heads),
+            )?,
+        )?)
+    } else {
+        transformer_state_layout(config)
+    }
+}
+
 pub(super) fn validate_transformer_partition<G>(
+    definition: &ComponentDefinition,
     config: &TransformerConfig,
     layout: Option<&LocalModelLayout>,
     selected: &eredu_runtime::ArchitecturePartition<G, TransformerBoundarySchema>,
 ) -> Result<(), TransformerError> {
-    let complete = match layout {
-        Some(layout) if config.geometry().causal => {
-            let blocks = transformer_local_configs(config, layout)?;
-            StateLayout::new(decoder::cache_layout_with_key_value_heads(
-                config,
-                blocks.iter().map(Config::num_key_value_heads),
-            )?)?
-        }
-        Some(layout) => {
-            transformer_local_configs(config, layout)?;
-            transformer_state_layout(config)?
-        }
-        None => transformer_state_layout(config)?,
-    };
-    partition::validate_partition(config, &complete, selected).map(|_| ())
+    if let Some(layout) = layout {
+        transformer_local_configs(config, layout)?;
+    }
+    partition::validate_partition(definition, config, selected).map(|_| ())
 }
 
 fn transformer_graph(config: &TransformerConfig) -> Result<ExecutionGraph, TransformerError> {

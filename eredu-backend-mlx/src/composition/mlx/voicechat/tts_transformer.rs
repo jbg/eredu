@@ -198,15 +198,16 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (config, layout, source, units) = prepared.into_parts();
-            let mut architecture = match parallel {
+            let (config, definition, layout, source, units) = prepared.into_parts();
+            let kernel = match parallel {
                 Some((local, _)) => {
                     TransformerKernel::<MlxNeuralBackend>::new_parallel(config, local)
                 }
                 None => TransformerKernel::<MlxNeuralBackend>::new(config),
             }
-            .and_then(TransformerKernel::into_component)
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(TransformerError::from(error)))?;
             let state_layout = architecture
                 .state_layout()
                 .map_err(BackendFailure::from_error)?;

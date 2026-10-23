@@ -16,7 +16,7 @@ use super::{
     checkpoint::Component,
     parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_transformer::TransformerConfig,
-    tts_transformer_layered::tts_transformer_parameter_description,
+    tts_transformer_layered::tts_transformer_component_definition,
     tts_transformer_layered::TransformerError,
 };
 
@@ -72,7 +72,7 @@ pub enum TtsTransformerPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedTtsTransformerBindings {
     config: TransformerConfig,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedTtsTransformerBindings {
@@ -134,10 +134,10 @@ impl PreparedTtsTransformerBindings {
                 .map(|(name, p)| (name.clone(), p.linear_format))
                 .collect(),
         );
-        let description = tts_transformer_parameter_description(&config)?;
+        let definition = tts_transformer_component_definition(&config)?;
         let prepared = PreparedComponent::prepare(
             "voicechat/tts_transformer/leased-units",
-            description,
+            definition,
             source.clone(),
             |member| {
                 let name = member.target();
@@ -181,8 +181,15 @@ impl PreparedTtsTransformerBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, TtsTransformerPreparationError> {
-        super::tts_transformer_layered::transformer_local_configs(&self.config, layout)?;
-        self.prepared = self.prepared.select(layout)?;
+        let blocks =
+            super::tts_transformer_layered::transformer_local_configs(&self.config, layout)?;
+        let state =
+            super::tts_transformer_layered::transformer_local_state_layout(&self.config, &blocks)?;
+        self.prepared = self
+            .prepared
+            .select(layout)?
+            .with_state_layout(state)
+            .map_err(TransformerError::from)?;
         Ok(self)
     }
 
@@ -197,6 +204,7 @@ impl PreparedTtsTransformerBindings {
         >,
     ) -> Result<PreparedTtsTransformerPartitionBindings, TtsTransformerPreparationError> {
         super::tts_transformer_layered::validate_transformer_partition(
+            self.prepared.declaration(),
             &self.config,
             self.prepared.local_layout(),
             partition,
@@ -224,20 +232,26 @@ impl PreparedTtsTransformerBindings {
         self.prepared.source()
     }
 
+    /// Semantic definition with the selected rank's complete cache geometry.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         TransformerConfig,
+        eredu_runtime::ComponentDefinition,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (_, layout, source, units) = self
+        let (definition, _, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.config, layout, source, units)
+        (self.config, definition, layout, source, units)
     }
 }
 
@@ -245,7 +259,7 @@ impl PreparedTtsTransformerBindings {
 /// A normalization-only stage has no state and owns only its normalization recipe.
 pub struct PreparedTtsTransformerPartitionBindings {
     config: TransformerConfig,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedTtsTransformerPartitionBindings {
@@ -272,20 +286,32 @@ impl PreparedTtsTransformerPartitionBindings {
     pub fn state_layout(&self) -> Option<&eredu_runtime::StateLayout> {
         self.state_layout.as_ref()
     }
+    /// Complete definition with selected cache geometry and global unit identities.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
     /// Consumes exact stage authority without rebasing canonical unit addresses.
     pub fn into_parts(
         self,
     ) -> (
         TransformerConfig,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        let (_, local_layout, _, source, units) = self
+        let (definition, local_layout, _, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
-        (self.config, local_layout, source, units, self.state_layout)
+        (
+            self.config,
+            definition,
+            local_layout,
+            source,
+            units,
+            self.state_layout,
+        )
     }
 }

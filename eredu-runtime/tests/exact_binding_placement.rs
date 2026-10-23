@@ -1431,6 +1431,25 @@ mod component_preparation {
         ArchitectureParameterDescription::new(&graph, &layout, groups, owned).unwrap()
     }
 
+    fn state_layout(heads: i32) -> eredu_runtime::StateLayout {
+        eredu_runtime::StateLayout::new(
+            eredu_core::LayerSchedule::new(
+                3,
+                vec![
+                    eredu_core::cache::LayerCachePolicy::key_value(
+                        eredu_core::AttentionPolicy::Full,
+                        heads,
+                        4,
+                    )
+                    .unwrap();
+                    3
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
     fn prepared() -> PreparedComponent<eredu_runtime::ComponentDefinition> {
         let source: SharedCheckpointSource = Arc::new(
             MemoryWeightStore::from_safetensors((0..4).map(|index| {
@@ -1449,7 +1468,7 @@ mod component_preparation {
             (0..3)
                 .map(|index| eredu_runtime::ComponentUnit {
                     path: format!("units.{index}"),
-                    state: 0..0,
+                    state: index..index + 1,
                 })
                 .collect(),
             vec![eredu_runtime::ArchitectureGroupTransport {
@@ -1463,8 +1482,10 @@ mod component_preparation {
             }],
             "units",
             vec![],
-            eredu_runtime::StatelessComponentState::state_layout().unwrap(),
-            eredu_runtime::ArchitectureStatePartitionPlan::new([]),
+            state_layout(2),
+            eredu_runtime::ArchitectureStatePartitionPlan::new([
+                eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..3),
+            ]),
         )
         .unwrap();
         PreparedComponent::prepare(
@@ -1774,6 +1795,20 @@ mod component_preparation {
         let layout = prepared.parallel_layout(topology).unwrap();
         let prepared = prepared.select(&layout).unwrap();
         let before = prepared.unit_bindings()[2][0].source_recipe();
+        let prepared = prepared.with_state_layout(state_layout(1)).unwrap();
+        let declaration = prepared.declaration();
+        let selected = declaration
+            .state_partition_plan()
+            .resolve_partition(
+                declaration.state_layout(),
+                declaration.parameters().unit_layout(),
+                |_| Some(2..3),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.global_layers(), 2..3);
+        assert_eq!(selected.layout(), &state_layout(1).slice(2..3).unwrap());
         let projected = prepared.project("projected", description(&[2])).unwrap();
         assert_eq!(projected.source().source_keys(), ["physical.2"]);
         assert_eq!(projected.local_layout().unwrap().len(), 1);

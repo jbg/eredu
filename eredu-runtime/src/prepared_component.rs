@@ -186,6 +186,17 @@ pub struct PreparedComponent<D: ComponentPreparationDeclaration> {
     local_layout: Option<LocalModelLayout>,
 }
 
+impl PreparedComponent<crate::ComponentDefinition> {
+    /// Retains selected state geometry without changing resource order, authority or placement.
+    pub fn with_state_layout(
+        mut self,
+        state: crate::StateLayout,
+    ) -> Result<Self, crate::ComponentDefinitionError> {
+        self.declaration = self.declaration.with_state_layout(state)?;
+        Ok(self)
+    }
+}
+
 impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     /// Resolves canonical targets using family-owned admitted recipe policy.
     /// No checkpoint payload is read.

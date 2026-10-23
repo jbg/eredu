@@ -92,11 +92,11 @@ pub(super) struct TransformerOwnership {
 }
 
 pub(super) fn validate_partition<G>(
+    definition: &ComponentDefinition,
     config: &TransformerConfig,
-    state_layout: &StateLayout,
     partition: &ArchitecturePartition<G, TransformerBoundarySchema>,
 ) -> Result<TransformerOwnership, TransformerError> {
-    let description = tts_transformer_parameter_description(config)?;
+    let description = definition.parameters();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &TransformerBoundarySchema::new(config)
@@ -135,7 +135,7 @@ pub(super) fn validate_partition<G>(
     let local_state = if blocks.is_empty() {
         None
     } else {
-        Some(state_layout.slice(blocks.clone())?)
+        Some(definition.state_layout().slice(blocks.clone())?)
     };
     match (partition.state(), &local_state) {
         (Some(actual), Some(expected))
@@ -178,6 +178,7 @@ impl<B: NeuralBackend> TransformerKernel<B> {
     /// Constructs only units authorized by an exact canonical architecture partition.
     /// `layout` is present when these units also have tensor-parallel projections.
     pub fn from_partition<G>(
+        definition: ComponentDefinition,
         config: TransformerConfig,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, TransformerBoundarySchema>,
@@ -186,12 +187,13 @@ impl<B: NeuralBackend> TransformerKernel<B> {
             Some(layout) => Self::new_parallel(config, layout)?,
             None => Self::new(config)?,
         };
-        model.partition = Some(validate_partition(
-            &model.config,
-            &model.state_layout,
-            partition,
-        )?);
-        Ok(model.into_component()?.select_partition(partition)?)
+        if definition.state_layout() != &model.state_layout {
+            return Err(TransformerError::Configuration(
+                "TTS definition cache geometry differs from selected execution",
+            ));
+        }
+        model.partition = Some(validate_partition(&definition, &model.config, partition)?);
+        Ok(ComponentAdapter::new(definition, model)?.select_partition(partition)?)
     }
 
     /// Prepares one shared-driver stage, including explicitly stateless norm stages.
