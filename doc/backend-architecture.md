@@ -809,6 +809,12 @@ parameter placement through the shared layout compiler. Speech kernels supply th
 declarations and selected layouts, retain coupled width checks, and preserve guarded
 collective failure handling. Layout failures identify the component and retain neutral
 topology errors as sources.
+Selected provider acquisition resolves a logical invocation to typed dense storage
+coordinates. Leases retain that validated association and their policy identity through
+completion and abort. Completion validates the original invocation; abort retires or
+returns the recorded storage owner independently of caller-supplied indices. Native
+resident and bounded policies receive the selected storage coordinates, while logical
+invocation and mutable-state identities stay with architecture execution.
 Canonical parameter storage identities are separate from consumer ownership declarations.
 A pinned role retains one storage identity across its explicit unit-consumer sets;
 shared static owners use their first declared storage role. Preparation groups recipes and

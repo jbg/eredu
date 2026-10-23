@@ -17,6 +17,7 @@ pub(crate) struct MlxSelectedLayerwisePolicy<U: 'static, P> {
     /// Exact architecture addresses paired with policy-local residency addresses.
     /// Pipeline cuts may retain a nonzero global unit index at local ordinal zero.
     addresses: ExecutionUnitAddressMap,
+    identity: Arc<()>,
 }
 
 impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
@@ -24,6 +25,7 @@ impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
         Self {
             inner: Arc::clone(&self.inner),
             addresses: self.addresses.clone(),
+            identity: Arc::clone(&self.identity),
         }
     }
 }
@@ -36,6 +38,7 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
     ) -> Result<Self, Error> {
         Ok(Self {
             addresses: ExecutionUnitAddressMap::new(layout, addresses)?,
+            identity: Arc::new(()),
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Resident(
                 policy,
             ))),
@@ -49,6 +52,7 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
     ) -> Result<Self, Error> {
         Ok(Self {
             addresses: ExecutionUnitAddressMap::new(layout, addresses)?,
+            identity: Arc::new(()),
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Bounded(policy))),
         })
     }
@@ -95,7 +99,13 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
     }
 }
 
-pub(crate) enum MlxSelectedUnitLease<U: 'static> {
+pub(crate) struct MlxSelectedUnitLease<U: 'static> {
+    address: eredu_runtime::ExecutionUnitLeaseAddress,
+    identity: Arc<()>,
+    inner: MlxSelectedUnitLeaseInner<U>,
+}
+
+enum MlxSelectedUnitLeaseInner<U: 'static> {
     Resident(MlxResidentUnit<U>),
     Bounded(MlxUnitLease<U>),
 }
@@ -104,18 +114,18 @@ impl<U: 'static> Deref for MlxSelectedUnitLease<U> {
     type Target = U;
 
     fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Resident(lease) => lease,
-            Self::Bounded(lease) => lease,
+        match &self.inner {
+            MlxSelectedUnitLeaseInner::Resident(lease) => lease,
+            MlxSelectedUnitLeaseInner::Bounded(lease) => lease,
         }
     }
 }
 
 impl<U: 'static> DerefMut for MlxSelectedUnitLease<U> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Resident(lease) => lease,
-            Self::Bounded(lease) => lease,
+        match &mut self.inner {
+            MlxSelectedUnitLeaseInner::Resident(lease) => lease,
+            MlxSelectedUnitLeaseInner::Bounded(lease) => lease,
         }
     }
 }
@@ -208,6 +218,7 @@ where
             .addresses
             .resolve(ordinal, address)
             .map_err(|error| eredu_runtime::LayerwiseAcquireError::Policy(Error::from(error)))?;
+        let local = local.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
                 "selected layerwise policy lock was poisoned".into(),
@@ -215,10 +226,10 @@ where
         })?;
         match &mut *policy {
             MlxSelectedLayerwisePolicyInner::Resident(policy) => {
-                policy.inspect_unit(ordinal, local, build, operation, context)
+                policy.inspect_unit(local.ordinal(), local.address(), build, operation, context)
             }
             MlxSelectedLayerwisePolicyInner::Bounded(policy) => {
-                policy.inspect_unit(ordinal, local, build, operation, context)
+                policy.inspect_unit(local.ordinal(), local.address(), build, operation, context)
             }
         }
     }
@@ -228,6 +239,13 @@ where
         active: Option<(usize, eredu_runtime::ExecutionUnitAddress, Self::Lease)>,
         context: &Stream,
     ) {
+        let active = active.and_then(|(_, _, lease)| {
+            if !Arc::ptr_eq(&self.identity, &lease.identity) {
+                return None;
+            }
+            let storage = lease.address.storage_location();
+            Some((storage.ordinal(), storage.address(), lease.inner))
+        });
         let Ok(mut policy) = self.inner.lock() else {
             drop(active);
             return;
@@ -235,29 +253,14 @@ where
         match (&mut *policy, active) {
             (
                 MlxSelectedLayerwisePolicyInner::Resident(policy),
-                Some((ordinal, address, MlxSelectedUnitLease::Resident(lease))),
+                Some((ordinal, address, MlxSelectedUnitLeaseInner::Resident(lease))),
             ) => policy.abort(Some((ordinal, address, lease)), context),
             (
                 MlxSelectedLayerwisePolicyInner::Bounded(policy),
-                Some((ordinal, address, MlxSelectedUnitLease::Bounded(lease))),
-            ) => policy.abort(
-                Some((
-                    ordinal,
-                    self.addresses.local_address(ordinal).unwrap_or(address),
-                    lease,
-                )),
-                context,
-            ),
-            (MlxSelectedLayerwisePolicyInner::Resident(policy), None) => {
-                policy.abort(None, context)
-            }
-            (MlxSelectedLayerwisePolicyInner::Bounded(policy), None) => policy.abort(None, context),
-            (MlxSelectedLayerwisePolicyInner::Resident(policy), Some(_)) => {
-                policy.abort(None, context)
-            }
-            (MlxSelectedLayerwisePolicyInner::Bounded(policy), Some(_)) => {
-                policy.abort(None, context)
-            }
+                Some((ordinal, address, MlxSelectedUnitLeaseInner::Bounded(lease))),
+            ) => policy.abort(Some((ordinal, address, lease)), context),
+            (MlxSelectedLayerwisePolicyInner::Resident(policy), _) => policy.abort(None, context),
+            (MlxSelectedLayerwisePolicyInner::Bounded(policy), _) => policy.abort(None, context),
         }
     }
 
@@ -271,27 +274,33 @@ where
     where
         F: FnOnce(&Stream) -> Result<U, E>,
     {
-        let local = self
+        let address = self
             .addresses
             .resolve(ordinal, address)
             .map_err(|error| eredu_runtime::LayerwiseAcquireError::Policy(Error::from(error)))?;
+        let local = address.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
                 "selected layerwise policy lock was poisoned".into(),
             ))
         })?;
-        match &mut *policy {
+        let lease = match &mut *policy {
             MlxSelectedLayerwisePolicyInner::Resident(policy) => policy
-                .acquire(ordinal, local, build, context)
-                .map(MlxSelectedUnitLease::Resident),
-            MlxSelectedLayerwisePolicyInner::Bounded(policy) => {
-                policy.acquire(ordinal, local, build, context).map(|lease| {
+                .acquire(local.ordinal(), local.address(), build, context)
+                .map(MlxSelectedUnitLeaseInner::Resident),
+            MlxSelectedLayerwisePolicyInner::Bounded(policy) => policy
+                .acquire(local.ordinal(), local.address(), build, context)
+                .map(|lease| {
                     #[cfg(test)]
                     crate::tests::support::path_instrumentation::bounded_unit_acquisition();
-                    MlxSelectedUnitLease::Bounded(lease)
-                })
-            }
-        }
+                    MlxSelectedUnitLeaseInner::Bounded(lease)
+                }),
+        }?;
+        Ok(MlxSelectedUnitLease {
+            address,
+            identity: Arc::clone(&self.identity),
+            inner: lease,
+        })
     }
 
     fn complete<'a, StateValues, ContextValues>(
@@ -309,16 +318,27 @@ where
         StateValues: Iterator<Item = &'a MlxTensor>,
         ContextValues: Iterator<Item = &'a MlxTensor>,
     {
+        if !Arc::ptr_eq(&self.identity, &lease.identity) {
+            self.abort(None, context);
+            return Err(Error::ArchitectureModel(
+                "selected layerwise lease belongs to another policy".into(),
+            ));
+        }
+        if let Err(error) = lease.address.validate_return(ordinal, address) {
+            self.abort(Some((ordinal, address, lease)), context);
+            return Err(error.into());
+        }
+        let storage = lease.address.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
         })?;
-        match (&mut *policy, lease) {
+        match (&mut *policy, lease.inner) {
             (
                 MlxSelectedLayerwisePolicyInner::Resident(policy),
-                MlxSelectedUnitLease::Resident(lease),
+                MlxSelectedUnitLeaseInner::Resident(lease),
             ) => policy.complete(
-                ordinal,
-                address,
+                storage.ordinal(),
+                storage.address(),
                 lease,
                 output,
                 state_values,
@@ -327,30 +347,16 @@ where
             ),
             (
                 MlxSelectedLayerwisePolicyInner::Bounded(policy),
-                MlxSelectedUnitLease::Bounded(lease),
-            ) => {
-                let local = self.addresses.local_address(ordinal).ok_or_else(|| {
-                    Error::ArchitectureModel(format!(
-                        "bounded partition unit ordinal {ordinal} has no local slot"
-                    ))
-                })?;
-                if local.group() != address.group() {
-                    return Err(Error::ArchitectureModel(format!(
-                        "bounded partition unit group {} differs from local group {}",
-                        address.group(),
-                        local.group()
-                    )));
-                }
-                policy.complete(
-                    ordinal,
-                    local,
-                    lease,
-                    output,
-                    state_values,
-                    context_values,
-                    context,
-                )
-            }
+                MlxSelectedUnitLeaseInner::Bounded(lease),
+            ) => policy.complete(
+                storage.ordinal(),
+                storage.address(),
+                lease,
+                output,
+                state_values,
+                context_values,
+                context,
+            ),
             _ => Err(Error::ArchitectureModel(
                 "selected layerwise policy received a lease from another residency".into(),
             )),

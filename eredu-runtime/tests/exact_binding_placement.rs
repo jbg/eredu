@@ -1933,11 +1933,20 @@ mod component_preparation {
         let local = ExecutionUnitLayout::new(&local_graph, [2]).unwrap();
         let addresses = eredu_runtime::ExecutionUnitAddressMap::new(&local, &selected).unwrap();
         for (ordinal, address) in selected.into_iter().enumerate() {
-            assert_eq!(
-                addresses.resolve(ordinal, address).unwrap(),
-                local.address(ordinal).unwrap()
-            );
-            assert_eq!(addresses.local_address(ordinal), local.address(ordinal));
+            let lease = addresses.resolve(ordinal, address).unwrap();
+            lease.validate_return(ordinal, address).unwrap();
+            let storage = lease.storage_location();
+            assert_eq!(storage.ordinal(), ordinal);
+            assert_eq!(storage.address(), local.address(ordinal).unwrap());
+            assert_eq!(addresses.local_location(ordinal), Some(storage));
+            assert!(matches!(
+                lease.validate_return(ordinal + 1, address),
+                Err(eredu_runtime::ExecutionUnitAddressMapError::ReturnOrdinalMismatch { .. })
+            ));
+            assert!(matches!(
+                lease.validate_return(ordinal, selected[1 - ordinal]),
+                Err(eredu_runtime::ExecutionUnitAddressMapError::AddressMismatch { .. })
+            ));
         }
         assert!(matches!(
             addresses.resolve(0, selected[1]),
@@ -1947,7 +1956,7 @@ mod component_preparation {
             addresses.resolve(2, selected[1]),
             Err(eredu_runtime::ExecutionUnitAddressMapError::UnknownOrdinal { .. })
         ));
-        assert_eq!(addresses.local_address(2), None);
+        assert_eq!(addresses.local_location(2), None);
         assert!(matches!(
             eredu_runtime::ExecutionUnitAddressMap::new(&local, &selected[..1]),
             Err(eredu_runtime::ExecutionUnitAddressMapError::CountMismatch { .. })

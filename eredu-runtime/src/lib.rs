@@ -256,7 +256,8 @@ pub use draft::{execute_draft_group, DraftGroupExecutionError, DraftStateTransac
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupSchedule,
     ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress, ExecutionUnitAddressMap,
-    ExecutionUnitAddressMapError, ExecutionUnitLayout, ExecutionUnitLayoutError, ReadyGroupState,
+    ExecutionUnitAddressMapError, ExecutionUnitLayout, ExecutionUnitLayoutError,
+    ExecutionUnitLeaseAddress, ExecutionUnitStorageLocation, ReadyGroupState,
 };
 pub use execution_plan::{
     execution_plan_layer_residency, execution_plan_quantization, ExecutionPlanLoadError,

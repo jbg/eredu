@@ -104,12 +104,65 @@ impl ExecutionUnitAddress {
     }
 }
 
+/// Dense policy-local coordinates of one materialized execution-unit resource.
+/// These coordinates do not identify a logical invocation or a mutable-state slot.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExecutionUnitStorageLocation {
+    ordinal: usize,
+    address: ExecutionUnitAddress,
+}
+impl ExecutionUnitStorageLocation {
+    /// Dense index in the selected resource pool.
+    pub const fn ordinal(self) -> usize {
+        self.ordinal
+    }
+    /// Group and unit coordinates understood by the selected policy.
+    pub const fn address(self) -> ExecutionUnitAddress {
+        self.address
+    }
+}
+
+/// Validated invocation and storage coordinates retained with an acquired lease.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExecutionUnitLeaseAddress {
+    ordinal: usize,
+    logical: ExecutionUnitAddress,
+    storage: ExecutionUnitStorageLocation,
+}
+impl ExecutionUnitLeaseAddress {
+    /// Resolves the physical pool coordinates without reusing invocation indices.
+    pub const fn storage_location(self) -> ExecutionUnitStorageLocation {
+        self.storage
+    }
+    /// Checks that completion returns the lease for its original invocation.
+    pub fn validate_return(
+        self,
+        ordinal: usize,
+        logical: ExecutionUnitAddress,
+    ) -> Result<(), ExecutionUnitAddressMapError> {
+        if ordinal != self.ordinal {
+            return Err(ExecutionUnitAddressMapError::ReturnOrdinalMismatch {
+                expected: self.ordinal,
+                actual: ordinal,
+            });
+        }
+        if logical != self.logical {
+            return Err(ExecutionUnitAddressMapError::AddressMismatch {
+                ordinal,
+                expected: self.logical,
+                actual: logical,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Validated pairing of logical invocation addresses with policy-local addresses.
 /// Pipeline selections may start at a nonzero global index while their local
 /// policy starts at zero. This map changes neither parameter nor state ownership.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionUnitAddressMap {
-    addresses: std::sync::Arc<[(ExecutionUnitAddress, ExecutionUnitAddress)]>,
+    addresses: std::sync::Arc<[(ExecutionUnitAddress, ExecutionUnitStorageLocation)]>,
 }
 
 impl ExecutionUnitAddressMap {
@@ -142,7 +195,13 @@ impl ExecutionUnitAddressMap {
                     index: logical.index(),
                 });
             }
-            addresses.push((logical, local));
+            addresses.push((
+                logical,
+                ExecutionUnitStorageLocation {
+                    ordinal,
+                    address: local,
+                },
+            ));
         }
         Ok(Self {
             addresses: addresses.into(),
@@ -154,7 +213,7 @@ impl ExecutionUnitAddressMap {
         &self,
         ordinal: usize,
         logical: ExecutionUnitAddress,
-    ) -> Result<ExecutionUnitAddress, ExecutionUnitAddressMapError> {
+    ) -> Result<ExecutionUnitLeaseAddress, ExecutionUnitAddressMapError> {
         let &(expected, local) = self
             .addresses
             .get(ordinal)
@@ -166,11 +225,15 @@ impl ExecutionUnitAddressMap {
                 actual: logical,
             });
         }
-        Ok(local)
+        Ok(ExecutionUnitLeaseAddress {
+            ordinal,
+            logical,
+            storage: local,
+        })
     }
 
     /// Returns a retained local slot for completion or abort of an existing lease.
-    pub fn local_address(&self, ordinal: usize) -> Option<ExecutionUnitAddress> {
+    pub fn local_location(&self, ordinal: usize) -> Option<ExecutionUnitStorageLocation> {
         self.addresses.get(ordinal).map(|&(_, local)| local)
     }
 }
@@ -178,6 +241,14 @@ impl ExecutionUnitAddressMap {
 /// An invalid logical-to-local execution address mapping or invocation.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ExecutionUnitAddressMapError {
+    /// Completion supplied another invocation's ordinal.
+    #[error("execution lease expects ordinal {expected}, received {actual}")]
+    ReturnOrdinalMismatch {
+        /// Ordinal captured at acquisition.
+        expected: usize,
+        /// Ordinal supplied at completion.
+        actual: usize,
+    },
     /// Logical invocations and local policy slots differ in number.
     #[error("{logical} logical execution addresses differ from {local} local policy slots")]
     CountMismatch {
