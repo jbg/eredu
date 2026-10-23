@@ -1,6 +1,5 @@
 //! Cold streaming decoder stage, source and transport authority.
 use crate::{
-    ear_decoder_layered::decoder_parameter_description,
     ear_decoder_partition::{
         validate_decoder_partition, DecoderBoundarySchema, DecoderPipelineCuts,
     },
@@ -55,6 +54,7 @@ impl PreparedDecoderPipelineBindings {
     ) -> Result<Self, DecoderPipelinePreparationError> {
         use DecoderPipelinePreparationError::Contract;
         validate_decoder_partition(
+            bindings.definition(),
             bindings.config(),
             bindings.prefix(),
             bindings.local_layout(),
@@ -66,7 +66,7 @@ impl PreparedDecoderPipelineBindings {
             return Err(Contract("decoder cuts or F32 activation precision differ"));
         }
         eredu_runtime::validate_component_pipeline_ranges(
-            bindings.config().unit_specs()?.len(),
+            bindings.definition().parameters().unit_layout().len(),
             partition.groups()[0].global_units(),
             0,
             cuts.routes(),
@@ -83,9 +83,8 @@ impl PreparedDecoderPipelineBindings {
             }
             PipelineBindingError::Contract(message) => Contract(message),
         })?;
-        let description = decoder_parameter_description(bindings.config(), bindings.prefix())?;
         eredu_runtime::validate_component_pipeline(
-            &description,
+            bindings.definition().parameters(),
             &partition,
             bindings.unit_bindings().map(|(address, _)| address),
             partition.state().map(|state| state.layout()),

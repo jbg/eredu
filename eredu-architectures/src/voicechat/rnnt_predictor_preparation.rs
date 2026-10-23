@@ -99,7 +99,7 @@ impl PreparedRnntPredictorBindings {
         SharedCheckpointSource,
         Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
-        let (_, layout, source, units) = self
+        let (_, _, layout, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("predictor declares only independently leased units");

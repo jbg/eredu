@@ -748,6 +748,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         self,
     ) -> Result<
         (
+            D,
             Option<LocalModelLayout>,
             ExecutionUnitLayout,
             SharedCheckpointSource,
@@ -755,13 +756,13 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         ),
         ComponentPreparationError,
     > {
-        let (local, layout, source, units) = self.into_unit_parts()?;
+        let (declaration, local, layout, source, units) = self.into_declared_unit_parts()?;
         let units = units
             .into_iter()
             .enumerate()
             .map(|(ordinal, bindings)| (layout.address(ordinal).expect("selected unit"), bindings))
             .collect();
-        Ok((local, layout, source, units))
+        Ok((declaration, local, layout, source, units))
     }
 
     /// Moves the original typed declaration with its selected unit resources.

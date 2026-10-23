@@ -1,9 +1,7 @@
 //! Finite encoder pipeline ownership and exact cut-dependent channel/cadence transport.
 use crate::{
     ear_encoder::{invalid, EncoderConfig, EncoderUnitSpec},
-    ear_encoder_layered::{
-        encoder_local_dimensions, encoder_parameter_description, EncoderForward, EncoderKernel,
-    },
+    ear_encoder_layered::{encoder_local_dimensions, EncoderForward, EncoderKernel},
     Error,
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
@@ -205,11 +203,11 @@ pub(crate) struct EncoderPartition {
     cuts: EncoderPipelineCuts,
 }
 fn ownership<G>(
+    definition: &ComponentDefinition,
     config: &EncoderConfig,
-    prefix: &str,
     partition: &ArchitecturePartition<G, EncoderBoundarySchema>,
 ) -> Result<Range<usize>, Error> {
-    let description = encoder_parameter_description(config, prefix)?;
+    let description = definition.parameters();
     let groups = partition.groups();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
@@ -226,7 +224,7 @@ fn ownership<G>(
         ));
     }
     let range = groups[0].global_units();
-    let count = config.unit_specs()?.len();
+    let count = description.unit_layout().len();
     if range.is_empty()
         || range.end > count
         || partition.ownership().owns_input() != (range.start == 0)
@@ -240,6 +238,7 @@ fn ownership<G>(
 }
 /// Checks stage ownership and complete tensor placement before materialization.
 pub fn validate_encoder_partition<G>(
+    definition: &ComponentDefinition,
     config: &EncoderConfig,
     prefix: &str,
     layout: Option<&LocalModelLayout>,
@@ -248,18 +247,19 @@ pub fn validate_encoder_partition<G>(
     if let Some(layout) = layout {
         encoder_local_dimensions(config, prefix, layout)?;
     }
-    ownership(config, prefix, partition).map(|_| ())
+    ownership(definition, config, partition).map(|_| ())
 }
 impl<B: NeuralBackend> EncoderKernel<B> {
-    /// Selects exact unit ownership and retained route geometry for one pipeline stage.
+    /// Consumes the retained definition and selects exact stage units and route geometry.
     pub fn new_partition<G>(
+        definition: ComponentDefinition,
         config: EncoderConfig,
         prefix: &str,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, EncoderBoundarySchema>,
         cuts: &EncoderPipelineCuts,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
-        let range = ownership(&config, prefix, partition)?;
+        let range = ownership(&definition, &config, partition)?;
         if cuts.schema != EncoderBoundarySchema::new(&config)? {
             return Err(invalid("encoder pipeline cuts belong to another geometry"));
         }
@@ -271,7 +271,7 @@ impl<B: NeuralBackend> EncoderKernel<B> {
             range,
             cuts: cuts.clone(),
         });
-        Ok(value.into_component()?.select_partition(partition)?)
+        Ok(ComponentAdapter::new(definition, value)?.select_partition(partition)?)
     }
 
     fn selected(&self) -> Result<&EncoderPartition, Error> {

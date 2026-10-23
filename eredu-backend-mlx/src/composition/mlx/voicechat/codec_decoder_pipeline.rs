@@ -163,10 +163,16 @@ pub fn materialize_ear_decoder_pipeline(
         .expect("validated decoder state ownership")
         .layout()
         .clone();
-    let (config, prefix, local_layout, source, units) = prepared.into_parts();
-    let architecture =
-        DecoderKernel::new_partition(config, &prefix, local_layout.as_ref(), &partition, &cuts)
-            .map_err(BackendFailure::from_error)?;
+    let (config, prefix, definition, local_layout, source, units) = prepared.into_parts();
+    let architecture = DecoderKernel::new_partition(
+        definition,
+        config,
+        &prefix,
+        local_layout.as_ref(),
+        &partition,
+        &cuts,
+    )
+    .map_err(BackendFailure::from_error)?;
     let state = DecoderRuntimeState::for_partition(architecture.kernel(), None)
         .map_err(BackendFailure::from_error)?;
     let (execution, metadata) = MlxComponentPipeline::new(

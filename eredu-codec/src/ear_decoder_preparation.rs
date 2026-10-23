@@ -11,7 +11,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
-use crate::{ear_decoder::DecoderConfig, ear_decoder_layered::decoder_parameter_description};
+use crate::{ear_decoder::DecoderConfig, ear_decoder_layered::decoder_component_definition};
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
@@ -48,7 +48,7 @@ pub enum DecoderPreparationError {
 pub struct PreparedDecoderBindings {
     config: DecoderConfig,
     prefix: String,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedDecoderBindings {
@@ -61,12 +61,9 @@ impl PreparedDecoderBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, DecoderPreparationError> {
-        let description = decoder_parameter_description(&config, prefix)?;
-        let prepared = PreparedComponent::prepare(
-            "ear/decoder/leased-units",
-            description,
-            source,
-            |member| {
+        let definition = decoder_component_definition(&config, prefix)?;
+        let prepared =
+            PreparedComponent::prepare("ear/decoder/leased-units", definition, source, |member| {
                 let name = member.target();
                 let recipe = parameters
                     .get(name)
@@ -125,6 +122,7 @@ impl PreparedDecoderBindings {
         >,
     ) -> Result<PreparedDecoderPartitionBindings, DecoderPreparationError> {
         crate::ear_decoder_partition::validate_decoder_partition(
+            self.prepared.declaration(),
             &self.config,
             &self.prefix,
             self.prepared.local_layout(),
@@ -162,22 +160,36 @@ impl PreparedDecoderBindings {
         self.prepared.source()
     }
 
+    /// Validated semantic definition retained through source and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         DecoderConfig,
         String,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.config, self.prefix, local, layout, source, units)
+        (
+            self.config,
+            self.prefix,
+            definition,
+            local,
+            layout,
+            source,
+            units,
+        )
     }
 }
 
@@ -186,7 +198,7 @@ impl PreparedDecoderBindings {
 pub struct PreparedDecoderPartitionBindings {
     config: DecoderConfig,
     prefix: String,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 impl PreparedDecoderPartitionBindings {
     /// Global streaming decoder geometry.
@@ -196,6 +208,10 @@ impl PreparedDecoderPartitionBindings {
     /// Exact canonical parameter namespace.
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+    /// Complete definition retained independently of the selected pipeline units.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
     }
     /// Global TP declaration retained independently of selected pipeline units.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
@@ -219,14 +235,22 @@ impl PreparedDecoderPartitionBindings {
     ) -> (
         DecoderConfig,
         String,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
-        let (local_layout, _, source, units) = self
+        let (definition, local_layout, _, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");
-        (self.config, self.prefix, local_layout, source, units)
+        (
+            self.config,
+            self.prefix,
+            definition,
+            local_layout,
+            source,
+            units,
+        )
     }
 }

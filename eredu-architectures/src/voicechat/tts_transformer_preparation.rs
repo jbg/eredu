@@ -282,7 +282,7 @@ impl PreparedTtsTransformerPartitionBindings {
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
-        let (local_layout, _, source, units) = self
+        let (_, local_layout, _, source, units) = self
             .prepared
             .into_addressed_unit_parts()
             .expect("partition declares only independently leased units");

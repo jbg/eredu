@@ -241,15 +241,17 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (geometry, prefix, local_layout, layout, source, units) = prepared.into_parts();
-            let mut architecture = match local_layout.as_ref() {
+            let (geometry, prefix, definition, local_layout, layout, source, units) =
+                prepared.into_parts();
+            let kernel = match local_layout.as_ref() {
                 Some(local) => {
                     QuantizerKernel::<MlxNeuralBackend>::new_parallel(geometry, &prefix, local)
                 }
                 None => QuantizerKernel::<MlxNeuralBackend>::new(geometry, &prefix),
             }
-            .and_then(QuantizerKernel::into_component)
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(Error::from(error)))?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,

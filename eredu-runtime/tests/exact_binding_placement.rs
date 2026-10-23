@@ -1878,7 +1878,7 @@ mod component_preparation {
                 );
             }
         }
-        let (placement, layout, source, units) = projected.into_addressed_unit_parts().unwrap();
+        let (_, placement, layout, source, units) = projected.into_addressed_unit_parts().unwrap();
         assert_eq!(placement, Some(retained));
         assert_eq!(layout.address(0), Some(selected[0]));
         let local_graph =

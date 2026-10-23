@@ -589,6 +589,11 @@ Identity-based projection carries the requested declaration while preserving res
 source authority and selected placement. RVQ consumes its retained definition alongside
 exact selected unit resources to assemble the execution adapter; native materialization
 does not reconstruct its graph, state or boundary declarations.
+PRVQ and EAR encoder/decoder preparation retain complete definitions as well. EAR stage
+selection keeps the global definition beside sparse selected unit resources; partition
+validation borrows its parameter and state projections. Full and pipeline native codec
+assembly consume that retained definition rather than rebuilding it from configuration.
+Addressed resource transfer preserves the declaration with global invocation addresses.
 
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared

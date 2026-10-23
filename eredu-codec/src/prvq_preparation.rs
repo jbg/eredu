@@ -11,7 +11,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
-use crate::{prvq::Geometry, prvq_layered::quantizer_parameter_description};
+use crate::{prvq::Geometry, prvq_layered::quantizer_component_definition};
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +55,7 @@ pub enum QuantizerPreparationError {
 pub struct PreparedQuantizerBindings {
     geometry: Geometry,
     prefix: String,
-    prepared: PreparedComponent<eredu_runtime::ArchitectureParameterDescription>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedQuantizerBindings {
@@ -68,10 +68,10 @@ impl PreparedQuantizerBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, QuantizerPreparationError> {
-        let description = quantizer_parameter_description(geometry, prefix)?;
+        let definition = quantizer_component_definition(geometry, prefix)?;
         let prepared = PreparedComponent::prepare(
             "prvq/codebooks/leased-units",
-            description,
+            definition,
             source,
             |member| {
                 let name = member.target();
@@ -147,22 +147,36 @@ impl PreparedQuantizerBindings {
         self.prepared.source()
     }
 
+    /// Validated semantic definition retained through source and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
+
     /// Consumes exact source authority and the canonical ordered binding plan.
     pub fn into_parts(
         self,
     ) -> (
         Geometry,
         String,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        let (local, layout, source, units) = self
+        let (definition, local, layout, source, units) = self
             .prepared
-            .into_unit_parts()
+            .into_declared_unit_parts()
             .expect("component declares only independently leased units");
-        (self.geometry, self.prefix, local, layout, source, units)
+        (
+            self.geometry,
+            self.prefix,
+            definition,
+            local,
+            layout,
+            source,
+            units,
+        )
     }
 }
 

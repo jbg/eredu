@@ -2,8 +2,7 @@
 use crate::{
     ear_decoder::{invalid, DecoderConfig, DecoderState, DecoderUnitSpec, DecoderUnitState},
     ear_decoder_layered::{
-        decoder_local_dimensions, decoder_parameter_description, decoder_state_layout,
-        DecoderForward, DecoderKernel, DecoderRuntimeState,
+        decoder_local_dimensions, DecoderForward, DecoderKernel, DecoderRuntimeState,
     },
     streaming::StreamPhase,
     Error,
@@ -211,11 +210,11 @@ pub(crate) struct DecoderPartition {
     layout: StateLayout,
 }
 fn ownership<G>(
+    definition: &ComponentDefinition,
     config: &DecoderConfig,
-    prefix: &str,
     partition: &ArchitecturePartition<G, DecoderBoundarySchema>,
 ) -> Result<Range<usize>, Error> {
-    let description = decoder_parameter_description(config, prefix)?;
+    let description = definition.parameters();
     let groups = partition.groups();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
@@ -231,7 +230,7 @@ fn ownership<G>(
         ));
     }
     let range = groups[0].global_units();
-    let count = config.unit_specs()?.len();
+    let count = description.unit_layout().len();
     if range.is_empty()
         || range.end > count
         || partition.ownership().owns_input() != (range.start == 0)
@@ -245,7 +244,7 @@ fn ownership<G>(
         .state()
         .ok_or_else(|| invalid("decoder partition lacks selected cache geometry"))?;
     if state.global_layers() != range
-        || state.layout() != &decoder_state_layout(config)?.slice(range.clone())?
+        || state.layout() != &definition.state_layout().slice(range.clone())?
     {
         return Err(invalid(
             "decoder partition cache geometry differs from its selected units",
@@ -255,6 +254,7 @@ fn ownership<G>(
 }
 /// Checks stage ownership and complete tensor placement before materialization.
 pub fn validate_decoder_partition<G>(
+    definition: &ComponentDefinition,
     config: &DecoderConfig,
     prefix: &str,
     layout: Option<&LocalModelLayout>,
@@ -263,18 +263,19 @@ pub fn validate_decoder_partition<G>(
     if let Some(layout) = layout {
         decoder_local_dimensions(config, prefix, layout)?;
     }
-    ownership(config, prefix, partition).map(|_| ())
+    ownership(definition, config, partition).map(|_| ())
 }
 impl<B: NeuralBackend> DecoderKernel<B> {
-    /// Selects exact unit ownership and retained route geometry for one pipeline stage.
+    /// Consumes the retained definition and selects exact stage units and route geometry.
     pub fn new_partition<G>(
+        definition: ComponentDefinition,
         config: DecoderConfig,
         prefix: &str,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, DecoderBoundarySchema>,
         cuts: &DecoderPipelineCuts,
     ) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
-        let range = ownership(&config, prefix, partition)?;
+        let range = ownership(&definition, &config, partition)?;
         if cuts.schema != DecoderBoundarySchema::new(&config)? {
             return Err(invalid("decoder pipeline cuts belong to another geometry"));
         }
@@ -282,13 +283,13 @@ impl<B: NeuralBackend> DecoderKernel<B> {
             Some(layout) => Self::new_parallel(config, prefix, layout)?,
             None => Self::new(config, prefix)?,
         };
-        let layout = decoder_state_layout(&value.config)?.slice(range.clone())?;
+        let layout = definition.state_layout().slice(range.clone())?;
         value.partition = Some(DecoderPartition {
             range,
             cuts: cuts.clone(),
             layout,
         });
-        Ok(value.into_component()?.select_partition(partition)?)
+        Ok(ComponentAdapter::new(definition, value)?.select_partition(partition)?)
     }
 
     fn selected(&self) -> Result<&DecoderPartition, Error> {
