@@ -871,6 +871,12 @@ references retain distinct invocation identities. The validated map projects gro
 transfer sequences, distinct resource windows and group completion from invocation
 positions. Bounded native acquisition and completion consume those projections through
 the ordinary policy lifecycle; resident execution loans the selected physical module.
+The portable resident runtime validates the architecture's storage map against its
+exact logical layout before constructing or adopting modules. Its grouped pool contains
+one module per canonical physical owner. Traversal resolves each logical invocation
+through the retained map; equation addresses, mutable-state slots, observation hooks
+and remaining-tail counts follow logical positions. Parameter visitation and editing
+borrow physical owners once, and subsequent consumers see that same module.
 Cold preparation retains that map with per-owner device payloads and host-transfer
 capacities. Device and streamed-host admission use the largest distinct-resource
 invocation window; resident and host-layerwise totals count physical owners once.

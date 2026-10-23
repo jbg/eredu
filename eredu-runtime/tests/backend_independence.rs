@@ -7488,6 +7488,7 @@ impl Parameterized<FakeTensor> for FakeUnit {
 
 struct GroupedFixture {
     serial: bool,
+    storage: Option<eredu_runtime::ExecutionUnitAddressMap>,
     static_modules: FakeOperator,
     trace: Vec<(usize, usize)>,
 }
@@ -7664,6 +7665,26 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
             "text",
         )
         .map_err(Error::backend)
+    }
+
+    fn execution_unit_storage_map(
+        &self,
+    ) -> Result<
+        eredu_runtime::ExecutionUnitAddressMap,
+        eredu_runtime::ArchitectureExecutionLayoutError<Error>,
+    > {
+        if let Some(storage) = &self.storage {
+            return Ok(storage.clone());
+        }
+        let layout = self.execution_unit_layout()?;
+        Ok(eredu_runtime::ExecutionUnitAddressMap::new(
+            &layout,
+            (0..layout.len()).map(|ordinal| {
+                let address = layout.address(ordinal).unwrap();
+                (address, address)
+            }),
+        )
+        .unwrap())
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
@@ -7949,6 +7970,7 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     type FixtureState = DeviceState<FakeBackend, FakeLayerState>;
 
     let mut architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
@@ -8249,6 +8271,7 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     })
     .unwrap();
     let architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
@@ -8311,6 +8334,7 @@ fn resident_serial_groups_preserve_values_and_state_without_intermediate_submiss
             .map(|marker| FakeUnit { marker })
             .collect();
         let architecture = GroupedFixture {
+            storage: None,
             serial,
             static_modules: FakeOperator,
             trace: Vec::new(),
@@ -8506,6 +8530,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
         LayerWeightResidency::LayerwiseHost(Default::default()),
     ] {
         let architecture = GroupedFixture {
+            storage: None,
             serial: false,
             static_modules: FakeOperator,
             trace: Vec::new(),
@@ -8699,6 +8724,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
 #[test]
 fn composite_prepared_parts_drive_dependency_group_output() {
     let architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
@@ -8730,12 +8756,179 @@ fn composite_prepared_parts_drive_dependency_group_output() {
         runtime.architecture().trace,
         [(0, 0), (1, 0), (2, 0), (2, 1)]
     );
+
+    // Logical text invocations use one physical owner and independent state slots.
+    let logical = runtime.architecture().execution_unit_layout().unwrap();
+    let storage = logical
+        .select([
+            logical.address(0).unwrap(),
+            logical.address(1).unwrap(),
+            logical.address(3).unwrap(),
+        ])
+        .unwrap();
+    let map = eredu_runtime::ExecutionUnitAddressMap::new(
+        &storage,
+        (0..logical.len()).map(|ordinal| {
+            let address = logical.address(ordinal).unwrap();
+            let owner = if ordinal >= 2 {
+                logical.address(3).unwrap()
+            } else {
+                address
+            };
+            (address, owner)
+        }),
+    )
+    .unwrap();
+    let architecture = |map| GroupedFixture {
+        serial: false,
+        storage: Some(map),
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let mut shared =
+        ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::new(architecture(map.clone()), &())
+            .unwrap();
+    let mut adopted = ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::from_units(
+        architecture(map.clone()),
+        vec![
+            vec![FakeUnit { marker: 0 }],
+            vec![FakeUnit { marker: 10 }],
+            vec![FakeUnit { marker: 21 }],
+        ],
+    )
+    .unwrap();
+    let mut shared_state = fixture_state();
+    let mut adopted_state = fixture_state();
+    for step in 1..=3 {
+        let expected = FakeTensor(vec![15, 21, 21]);
+        assert_eq!(
+            shared
+                .forward(Some(&first), &mut shared_state, &())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            adopted
+                .forward(Some(&first), &mut adopted_state, &())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(shared_state.as_ref()[2].0, step);
+        assert_eq!(shared_state.as_ref()[3].0, step);
+        assert_eq!(adopted_state.as_ref()[2].0, step);
+        assert_eq!(adopted_state.as_ref()[3].0, step);
+    }
+    assert_eq!(shared.units().iter().map(Vec::len).sum::<usize>(), 3);
+    assert_eq!(
+        shared.architecture().trace,
+        [(0, 0), (1, 0), (2, 0), (2, 1)].repeat(3)
+    );
+    shared.units_mut()[2][0].marker = 9;
+    assert_eq!(
+        shared
+            .forward(Some(&first), &mut shared_state, &())
+            .unwrap(),
+        FakeTensor(vec![15, 9, 9])
+    );
+    assert_eq!(shared.invocations(), &map);
+
+    struct LogicalHook {
+        calls: Vec<(usize, usize, usize)>,
+        fail: bool,
+    }
+    impl LayeredTraversalHook<FakeBackend, GroupedForwardContext, Error> for LogicalHook {
+        fn observes_activations(&self) -> bool {
+            true
+        }
+        fn before_unit(
+            &mut self,
+            group: usize,
+            index: usize,
+            remaining: usize,
+            _: &mut FakeTensor,
+            _: &mut GroupedForwardContext,
+            _: &(),
+        ) -> Result<LayeredUnitAction, Error> {
+            self.calls.push((group, index, remaining));
+            if self.fail && group == 2 && index == 1 {
+                return Err(Error::backend("injected logical invocation failure"));
+            }
+            Ok(LayeredUnitAction::Execute)
+        }
+    }
+    let mut hook = LogicalHook {
+        calls: Vec::new(),
+        fail: true,
+    };
+    assert!(shared
+        .forward_with_traversal_hook(Some(&first), &mut shared_state, &(), &mut hook)
+        .is_err());
+    assert_eq!(hook.calls, [(0, 0, 1), (1, 0, 1), (2, 0, 2), (2, 1, 1)]);
+    assert_eq!(shared_state.as_ref()[2].0, 5);
+    assert_eq!(shared_state.as_ref()[3].0, 4);
+    hook.fail = false;
+    let (output, _) = shared
+        .forward_with_traversal_hook(Some(&first), &mut shared_state, &(), &mut hook)
+        .unwrap();
+    assert_eq!(output, FakeTensor(vec![15, 9, 9]));
+    assert_eq!(shared_state.as_ref()[2].0, 6);
+    assert_eq!(shared_state.as_ref()[3].0, 5);
+
+    let wrong_count = ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::from_units(
+        architecture(map.clone()),
+        vec![
+            vec![FakeUnit { marker: 0 }],
+            vec![FakeUnit { marker: 10 }],
+            vec![FakeUnit { marker: 20 }, FakeUnit { marker: 21 }],
+        ],
+    );
+    assert!(matches!(
+        wrong_count,
+        Err(eredu_runtime::ResidentUnitsError::UnitCount {
+            group: 2,
+            expected: 1,
+            actual: 2
+        })
+    ));
+    let reordered = eredu_runtime::ExecutionUnitAddressMap::new(
+        &storage,
+        [0, 1, 3, 2].map(|ordinal| {
+            let address = logical.address(ordinal).unwrap();
+            (
+                address,
+                if ordinal >= 2 {
+                    logical.address(3).unwrap()
+                } else {
+                    address
+                },
+            )
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::new(architecture(reordered), &()),
+        Err(eredu_runtime::ResidentUnitsError::InvocationMap(
+            eredu_runtime::ExecutionUnitAddressMapError::AddressMismatch { .. }
+        ))
+    ));
+    let incomplete = map
+        .select_invocations([
+            logical.address(0).unwrap(),
+            logical.address(1).unwrap(),
+            logical.address(2).unwrap(),
+        ])
+        .unwrap();
+    assert!(matches!(
+        ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::new(architecture(incomplete), &()),
+        Err(eredu_runtime::ResidentUnitsError::StorageGroups)
+    ));
 }
 
 #[test]
 fn layerwise_runtime_aborts_active_lease_and_forward_after_observer_error() {
     let mut state = fixture_state();
     let architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
@@ -8774,6 +8967,7 @@ fn neutral_layerwise_runtime_accepts_a_static_unit_executor() {
     })
     .unwrap();
     let architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
@@ -8922,6 +9116,7 @@ fn fixture_state() -> DeviceState<FakeBackend, FakeLayerState> {
 #[test]
 fn sequential_decision_driver_is_shared_by_resident_and_layerwise_traversal() {
     let resident_architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
@@ -8959,6 +9154,7 @@ fn sequential_decision_driver_is_shared_by_resident_and_layerwise_traversal() {
     );
 
     let layerwise_architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
@@ -9582,6 +9778,7 @@ fn distributed_prompt_cache_and_manual_rollback_never_reuse_a_commit_epoch() {
 #[test]
 fn parameter_unit_loans_preserve_semantic_addresses_and_forward_order() {
     let architecture = GroupedFixture {
+        storage: None,
         serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),

@@ -979,6 +979,25 @@ where
         crate::ExecutionUnitLayout::new(&graph, counts).map_err(Into::into)
     }
 
+    /// Projects canonical physical resources independently of logical invocations.
+    /// Every invocation retains its own equation address and mutable-state mapping.
+    /// The resident constructor validates this map against the exact logical layout
+    /// before building or adopting one module per physical owner.
+    fn execution_unit_storage_map(
+        &self,
+    ) -> Result<crate::ExecutionUnitAddressMap, crate::ArchitectureExecutionLayoutError<Self::Error>>
+    {
+        let layout = self.execution_unit_layout()?;
+        Ok(crate::ExecutionUnitAddressMap::new(
+            &layout,
+            (0..layout.len()).map(|ordinal| {
+                let address = layout.address(ordinal).expect("declared invocation");
+                (address, address)
+            }),
+        )
+        .expect("identity storage map for a validated layout"))
+    }
+
     /// Returns the number of ordered execution units in one graph group.
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error>;
 
@@ -1831,6 +1850,12 @@ pub enum ResidentUnitsError<E> {
     /// Canonical invocation addresses cannot form a valid layout.
     #[error("resident execution layout failed: {0}")]
     Layout(#[source] crate::ExecutionUnitLayoutError),
+    /// Physical references disagree with canonical invocation identities.
+    #[error("resident invocation map failed: {0}")]
+    InvocationMap(#[source] crate::ExecutionUnitAddressMapError),
+    /// Physical groups differ from the declared execution layout.
+    #[error("resident storage groups differ from the declared execution layout")]
+    StorageGroups,
     /// Supplied groups differ from the declared execution graph.
     #[error("resident unit group count {actual} differs from declared {expected}")]
     GroupCount {
@@ -1886,6 +1911,7 @@ where
     architecture: A,
     graph: ExecutionGraph,
     layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     units: Vec<Vec<A::Unit>>,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
@@ -1896,9 +1922,34 @@ where
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
 {
+    fn storage_map(
+        architecture: &A,
+        layout: &ExecutionUnitLayout,
+    ) -> Result<crate::ExecutionUnitAddressMap, ResidentUnitsError<A::Error>> {
+        let invocations = architecture.execution_unit_storage_map()?;
+        let storage = invocations.storage_layout();
+        if storage.group_count() != layout.group_count()
+            || (0..layout.group_count()).any(|group| {
+                storage.group_id(group) != layout.group_id(group)
+                    || invocations.group_range(group) != layout.group_range(group)
+            })
+        {
+            return Err(ResidentUnitsError::StorageGroups);
+        }
+        for ordinal in 0..layout.len() {
+            invocations
+                .resolve(
+                    ordinal,
+                    layout.address(ordinal).expect("declared invocation"),
+                )
+                .map_err(ResidentUnitsError::InvocationMap)?;
+        }
+        Ok(invocations)
+    }
+
     /// Adopts exact ordered, already constructed units without allocating replacements.
-    /// Unit identities and bindings remain architecture/caller-owned; graph shape
-    /// is validated before the runtime can execute any supplied module.
+    /// Physical owners and bindings remain architecture/caller-owned; the invocation
+    /// map is validated before the runtime can execute any supplied module.
     pub fn from_units(
         architecture: A,
         units: Vec<Vec<A::Unit>>,
@@ -1913,8 +1964,10 @@ where
             });
         }
         let layout = architecture.execution_unit_layout()?;
+        let invocations = Self::storage_map(&architecture, &layout)?;
         for (group, supplied) in units.iter().enumerate() {
-            let expected = layout
+            let expected = invocations
+                .storage_layout()
                 .group_range(group)
                 .expect("declared execution group")
                 .len();
@@ -1930,12 +1983,13 @@ where
             architecture,
             graph,
             layout,
+            invocations,
             units,
             backend: std::marker::PhantomData,
         })
     }
 
-    /// Builds every execution unit once and keeps it resident.
+    /// Builds each canonical physical owner once and keeps it resident.
     pub fn new(
         architecture: A,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -1944,14 +1998,19 @@ where
             .execution_graph()
             .map_err(ResidentUnitsError::Architecture)?;
         let layout = architecture.execution_unit_layout()?;
+        let invocations = Self::storage_map(&architecture, &layout)?;
         let mut units = Vec::with_capacity(graph.groups().len());
         for group in 0..graph.groups().len() {
             units.push(
-                layout
+                invocations
+                    .storage_layout()
                     .group_range(group)
                     .expect("declared execution group")
                     .map(|ordinal| {
-                        let address = layout.address(ordinal).expect("declared invocation");
+                        let address = invocations
+                            .storage_layout()
+                            .address(ordinal)
+                            .expect("declared physical owner");
                         architecture.build_unit(group, address.index(), context)
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -1962,6 +2021,7 @@ where
             architecture,
             graph,
             layout,
+            invocations,
             units,
             backend: std::marker::PhantomData,
         })
@@ -2115,17 +2175,25 @@ where
                 group,
                 &forward_context,
             ) {
-                let unit_count = self.units[group].len();
                 let range = self
                     .layout
                     .group_range(group)
                     .expect("declared execution group");
-                for (position, unit) in self.units[group].iter_mut().enumerate() {
-                    let index = self
-                        .layout
-                        .address(range.start + position)
-                        .expect("declared invocation")
-                        .index();
+                let unit_count = range.len();
+                let storage_start = self
+                    .invocations
+                    .storage_layout()
+                    .group_range(group)
+                    .expect("declared storage group")
+                    .start;
+                for (position, ordinal) in range.enumerate() {
+                    let address = self.layout.address(ordinal).expect("declared invocation");
+                    let index = address.index();
+                    let storage = self
+                        .invocations
+                        .local_location(ordinal)
+                        .expect("validated invocation storage");
+                    let unit = &mut self.units[group][storage.ordinal() - storage_start];
                     if hook.before_unit(
                         group,
                         index,
@@ -2218,17 +2286,22 @@ where
         &mut self.architecture
     }
 
-    /// Borrows resident execution units for loading or inspection.
+    /// Borrows physical owners in canonical storage order for loading or inspection.
     pub fn units(&self) -> &[Vec<A::Unit>] {
         &self.units
     }
 
-    /// Mutably borrows resident execution units for parameter binding.
+    /// Mutably borrows physical owners once for parameter binding.
     pub fn units_mut(&mut self) -> &mut [Vec<A::Unit>] {
         &mut self.units
     }
 
-    /// Decomposes the runtime without cloning backend-native values.
+    /// Retained logical-to-physical ownership used by this runtime.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
+    }
+
+    /// Decomposes the physical pool without cloning backend-native values.
     pub fn into_parts(self) -> (A, Vec<A::Unit>) {
         (
             self.architecture,
