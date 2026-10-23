@@ -2,8 +2,8 @@
 
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{
-    physical_binding_bytes, DenseDiskStreamReport, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayerWeightResidency, LayerwiseModelMetadata, ResidentLayerGroup, ResidentLayerGroupReport,
+    DenseDiskStreamReport, ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency,
+    LayerwiseModelMetadata, ResidentLayerGroup, ResidentLayerGroupReport,
 };
 
 use std::{
@@ -38,9 +38,7 @@ use crate::backend::{
     },
 };
 use crate::MlxTensor;
-use eredu_core::residency::{
-    MemoryTier, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
-};
+use eredu_core::residency::{MemoryTier, OffloadPlan, OffloadUnitId};
 
 /// One populated MLX unit retained with its residency transfer.
 enum MlxUnitTransfer {

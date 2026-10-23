@@ -543,7 +543,8 @@ pub use weight_residency::{
     DenseTransferSchedule, DenseTransferScheduleError, ExecutionResidency, ExpertPass,
     LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, OrdinaryWeightResidency,
     ParameterBankAccess, ParameterBankKey, ParameterBankLoadOptions, ParameterBankResidency,
-    StaticUnitBindings, WeightResidency, WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
+    PreparedStaticUnit, StaticUnitBindings, WeightResidency, WeightResidencyPolicyError,
+    DENSE_TRANSFER_WINDOW,
 };
 
 /// Generic calibrated target workspace composition from ordinary module topology.

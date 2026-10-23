@@ -1,9 +1,12 @@
 //! Backend-neutral immutable-weight residency policy.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use eredu_core::{
-    residency::{CacheEvictionPolicy, OffloadConfig, OffloadError, OffloadUnitId},
+    residency::{
+        CacheEvictionPolicy, MemoryTier, OffloadConfig, OffloadError, OffloadUnitId,
+        OffloadUnitSpec, ResidencyPolicy,
+    },
     DEFAULT_MAX_CACHED_SHARDS,
 };
 
@@ -70,6 +73,44 @@ impl AuxiliaryWeightRequirements {
         Some(self)
     }
 
+    /// Admits one independently materialized auxiliary owner using backend host-capacity facts.
+    pub fn admit<E>(
+        self,
+        definition: &crate::OffloadUnit,
+        residency: LayerWeightResidency,
+        shared: bool,
+        host_capacity: impl FnOnce(&[WeightBinding]) -> Result<u64, E>,
+    ) -> Result<(Self, OffloadUnitSpec), E>
+    where
+        E: From<crate::ResidencyDeclarationError>
+            + From<OffloadError>
+            + From<crate::BoundedResidencySizingError>,
+    {
+        let bytes = crate::physical_binding_bytes(definition.bindings())?;
+        let host = host_capacity(definition.bindings())?;
+        let requirements = self.checked_add_module(bytes, host, shared).ok_or(
+            crate::BoundedResidencySizingError::ArithmeticOverflow("auxiliary residency bytes"),
+        )?;
+        let resident = residency.is_fully_resident();
+        let spec = OffloadUnitSpec::new(
+            definition.id().clone(),
+            bytes,
+            if resident {
+                ResidencyPolicy::Pinned
+            } else {
+                ResidencyPolicy::Cacheable
+            },
+            if resident {
+                MemoryTier::Device
+            } else if residency.dense().is_some() {
+                MemoryTier::Disk
+            } else {
+                MemoryTier::Host
+            },
+        )?;
+        Ok((requirements, spec))
+    }
+
     /// Simultaneously retained device bytes under the selected placement.
     pub fn device_bytes(self, residency: LayerWeightResidency) -> Option<u64> {
         if residency.is_fully_resident() {
@@ -122,6 +163,53 @@ impl StaticUnitBindings {
     /// Consumes the definition into its stable identifier and checkpoint bindings.
     pub fn into_parts(self) -> (OffloadUnitId, Vec<WeightBinding>) {
         (self.id, self.bindings)
+    }
+}
+
+/// Admitted pinned bindings; empty declarations have no resource or lease.
+#[derive(Debug)]
+pub struct PreparedStaticUnit {
+    /// Physical definition and pinned-device policy, when parameters exist.
+    pub resource: Option<(crate::OffloadUnit, OffloadUnitSpec)>,
+    /// Exact module-local destinations populated from the pinned lease.
+    pub parameters: BTreeSet<String>,
+    /// Physical checkpoint inputs consumed by this resource.
+    pub source_keys: BTreeSet<String>,
+    /// Physical parameter bytes, excluding aliases.
+    pub bytes: u64,
+}
+
+impl StaticUnitBindings {
+    /// Admits exact pinned resources without constructing a native module or reading payloads.
+    pub fn prepare<E>(self) -> Result<PreparedStaticUnit, E>
+    where
+        E: From<crate::ResidencyDeclarationError> + From<OffloadError>,
+    {
+        let bytes = crate::physical_binding_bytes(&self.bindings)?;
+        let parameters = self
+            .bindings
+            .iter()
+            .map(|binding| binding.name().to_owned())
+            .collect();
+        let source_keys = self
+            .bindings
+            .iter()
+            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned))
+            .collect();
+        let resource = if self.bindings.is_empty() {
+            None
+        } else {
+            Some((
+                crate::OffloadUnit::new(self.id.clone(), self.bindings)?,
+                OffloadUnitSpec::new(self.id, bytes, ResidencyPolicy::Pinned, MemoryTier::Device)?,
+            ))
+        };
+        Ok(PreparedStaticUnit {
+            resource,
+            parameters,
+            source_keys,
+            bytes,
+        })
     }
 }
 

@@ -795,6 +795,10 @@ Runtime also combines ordinary windows with auxiliary lifetime requirements. Res
 resources coexist; bounded sequential phases share device windows, host-resident phases
 retain their complete host payloads, and disk-streamed phases reuse bounded host caches.
 Both native preparation paths validate budgets against these shared capacity results.
+Pinned and auxiliary resource admission also lives in runtime. Empty static declarations
+produce no residency resource; nonempty pinned bindings retain exact destinations, source
+keys and alias-free physical accounting. Auxiliary owners retain independent policies and
+backend-supplied host capacities under their declared shared/sequential lifetime.
 Native callback-derived and retained-binding policy preparation use one finalization
 implementation for residency streams and managers, pinned static binding, dense-stream
 controllers and policy assembly. Their source realization and binding admission order

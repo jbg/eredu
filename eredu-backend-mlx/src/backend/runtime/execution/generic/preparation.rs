@@ -96,31 +96,17 @@ where
     let mut consumed = BTreeSet::new();
 
     let static_bindings = static_bindings(architecture.static_modules(), store.as_ref())?;
-    let static_bytes = physical_binding_bytes(&static_bindings)?;
-    let static_parameters = static_bindings
-        .iter()
-        .map(|binding| binding.name().to_owned())
-        .collect();
-    consumed.extend(
-        static_bindings
-            .iter()
-            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-    );
-    // Some architectures place every learned parameter in execution units.
-    // An empty static role has no storage identity or residency lease.
-    let static_id = if static_bindings.is_empty() {
-        None
-    } else {
-        let id = OffloadUnitId::new("model.static")?;
-        definitions.push(OffloadUnit::new(id.clone(), static_bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            static_bytes,
-            ResidencyPolicy::Pinned,
-            MemoryTier::Device,
-        )?);
-        Some(id)
-    };
+    let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
+        .prepare::<Error>()?;
+    let static_bytes = pinned.bytes;
+    let static_parameters = pinned.parameters;
+    consumed.extend(pinned.source_keys);
+    let static_id = pinned.resource.map(|(definition, spec)| {
+        let id = definition.id().clone();
+        definitions.push(definition);
+        specs.push(spec);
+        id
+    });
 
     let mut execution_units =
         eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
@@ -153,7 +139,7 @@ where
         options,
         Default::default(),
     )
-    .map_err(|error| Error::Other(Box::new(error)))?;
+    .map_err(Error::from)?;
     validate_host_budget(offload, requirements.required_host_bytes)?;
     validate_device_budget(
         offload,
@@ -347,39 +333,23 @@ where
             unit_bindings.len()
         )));
     }
-    let fully_resident = options.is_fully_resident();
-    let dense = options.dense();
     let offload = options.offload()?;
     let depth = options.device_depth(unit_count);
     let mut definitions = Vec::new();
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
 
-    let static_bytes = physical_binding_bytes(&static_bindings)?;
-    let static_parameters = static_bindings
-        .iter()
-        .map(|binding| binding.name().to_owned())
-        .collect();
-    consumed.extend(
-        static_bindings
-            .iter()
-            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-    );
-    // Some architectures place every learned parameter in execution units.
-    // An empty static role has no storage identity or residency lease.
-    let static_id = if static_bindings.is_empty() {
-        None
-    } else {
-        let id = OffloadUnitId::new("model.static")?;
-        definitions.push(OffloadUnit::new(id.clone(), static_bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            static_bytes,
-            ResidencyPolicy::Pinned,
-            MemoryTier::Device,
-        )?);
-        Some(id)
-    };
+    let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
+        .prepare::<Error>()?;
+    let static_bytes = pinned.bytes;
+    let static_parameters = pinned.parameters;
+    consumed.extend(pinned.source_keys);
+    let static_id = pinned.resource.map(|(definition, spec)| {
+        let id = definition.id().clone();
+        definitions.push(definition);
+        specs.push(spec);
+        id
+    });
 
     let mut execution_units =
         eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
@@ -395,28 +365,13 @@ where
     let mut extra = eredu_runtime::AuxiliaryWeightRequirements::default();
     let mut sources = std::collections::BTreeMap::new();
     for unit in supplementary {
-        let bytes = physical_binding_bytes(unit.definition.bindings())?;
-        let host = host_capacity_upper_bound_for_bindings(unit.definition.bindings())?;
-        extra = extra
-            .checked_add_module(bytes, host, unit.shared)
-            .ok_or_else(|| Error::Parallel("auxiliary residency bytes overflowed".into()))?;
+        let (requirements, spec) =
+            extra.admit(&unit.definition, options, unit.shared, |bindings| {
+                host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
+            })?;
+        extra = requirements;
         let id = unit.definition.id().clone();
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else {
-                ResidencyPolicy::Cacheable
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
+        specs.push(spec);
         sources.insert(id, unit.source);
         definitions.push(unit.definition);
     }
@@ -430,7 +385,7 @@ where
         options,
         extra,
     )
-    .map_err(|error| Error::Other(Box::new(error)))?;
+    .map_err(Error::from)?;
     validate_host_budget(offload, requirements.required_host_bytes)?;
     validate_device_budget(
         offload,

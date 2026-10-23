@@ -135,6 +135,10 @@ pub enum Error {
     #[error(transparent)]
     ParameterAcquisition(#[from] eredu_runtime::ParameterAcquisitionError),
 
+    /// Invalid selected parameter-residency capacity.
+    #[error(transparent)]
+    ResidencySizing(#[from] eredu_runtime::BoundedResidencySizingError),
+
     /// Invalid admitted execution-unit resource count or capacity.
     #[error(transparent)]
     ExecutionUnitPreparation(#[from] eredu_runtime::ExecutionUnitPreparationError),
