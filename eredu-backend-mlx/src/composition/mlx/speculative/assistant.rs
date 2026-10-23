@@ -362,9 +362,13 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         )?;
     let policy = if let Some(layout) = prepared.layout.take() {
         use crate::backend::runtime::execution::generic::MlxSelectedLayerwisePolicy;
-        let addresses = (0..layout.len())
-            .map(|ordinal| layout.address(ordinal).expect("validated assistant layout"))
-            .collect::<Vec<_>>();
+        let addresses = eredu_runtime::ExecutionUnitAddressMap::new(
+            &layout,
+            (0..layout.len()).map(|ordinal| {
+                let address = layout.address(ordinal).expect("validated assistant layout");
+                (address, address)
+            }),
+        )?;
         let bindings = std::mem::take(&mut prepared.units);
         let (policy, _) =
             crate::backend::runtime::execution::generic::prepare_parameter_unit_policy::<
@@ -404,11 +408,10 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
                 .collect::<Result<Vec<_>, _>>()?;
             MlxSelectedLayerwisePolicy::resident(
                 policy.into_resident_units(units, stream)?,
-                &layout,
-                &addresses,
+                addresses,
             )?
         } else {
-            MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)?
+            MlxSelectedLayerwisePolicy::bounded(policy, addresses)?
         };
         MlxAssistantParameterPolicy(Some(policy))
     } else {

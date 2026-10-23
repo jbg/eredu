@@ -141,6 +141,10 @@ pub struct ExecutionUnitLeaseAddress {
     storage: ExecutionUnitStorageLocation,
 }
 impl ExecutionUnitLeaseAddress {
+    /// Position in the selected logical invocation sequence.
+    pub const fn invocation_ordinal(self) -> usize {
+        self.ordinal
+    }
     /// Resolves the physical pool coordinates without reusing invocation indices.
     pub const fn storage_location(self) -> ExecutionUnitStorageLocation {
         self.storage
@@ -168,55 +172,89 @@ impl ExecutionUnitLeaseAddress {
     }
 }
 
-/// Validated pairing of logical invocation addresses with policy-local addresses.
-/// Pipeline selections may start at a nonzero global index while their local
-/// policy starts at zero. This map changes neither parameter nor state ownership.
+/// Validated invocation references to a selected physical resource catalog.
+/// Repeated storage references preserve distinct invocation and state identities.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionUnitAddressMap {
-    addresses: std::sync::Arc<[(ExecutionUnitAddress, ExecutionUnitStorageLocation)]>,
+    data: std::sync::Arc<ExecutionUnitAddressMapData>,
+}
+#[derive(Debug, Eq, PartialEq)]
+struct ExecutionUnitAddressMapData {
+    storage: ExecutionUnitLayout,
+    addresses: Vec<(ExecutionUnitAddress, ExecutionUnitStorageLocation)>,
+    groups: Vec<Range<usize>>,
 }
 
 impl ExecutionUnitAddressMap {
-    /// Pairs each local policy slot with its selected global invocation.
-    /// Logical addresses must be unique and retain the local execution group.
+    /// Validates each logical invocation and its explicit physical storage address.
+    /// Every selected resource has at least one consumer. Logical groups are
+    /// contiguous and retain their physical group; storage may repeat within a group.
     pub fn new(
         local: &ExecutionUnitLayout,
-        logical: &[ExecutionUnitAddress],
+        references: impl IntoIterator<Item = (ExecutionUnitAddress, ExecutionUnitAddress)>,
     ) -> Result<Self, ExecutionUnitAddressMapError> {
-        if local.len() != logical.len() {
-            return Err(ExecutionUnitAddressMapError::CountMismatch {
-                local: local.len(),
-                logical: logical.len(),
-            });
-        }
         let mut seen = BTreeSet::new();
-        let mut addresses = Vec::with_capacity(logical.len());
-        for (ordinal, &logical) in logical.iter().enumerate() {
-            let local = local.address(ordinal).expect("validated local layout");
-            if local.group() != logical.group() {
+        let mut used = BTreeSet::new();
+        let mut addresses = Vec::new();
+        let mut counts = vec![0; local.group_count()];
+        let mut previous = 0;
+        for (ordinal, (logical, storage)) in references.into_iter().enumerate() {
+            let storage_ordinal = local
+                .ordinal(storage.group(), storage.index())
+                .ok_or(ExecutionUnitAddressMapError::UnknownStorage { address: storage })?;
+            if storage.group() != logical.group() {
                 return Err(ExecutionUnitAddressMapError::GroupMismatch {
                     ordinal,
-                    local: local.group(),
+                    local: storage.group(),
                     logical: logical.group(),
                 });
             }
+            if logical.group() < previous {
+                return Err(ExecutionUnitAddressMapError::UnorderedGroups { ordinal });
+            }
+            previous = logical.group();
             if !seen.insert((logical.group(), logical.index())) {
                 return Err(ExecutionUnitAddressMapError::DuplicateAddress {
                     group: logical.group(),
                     index: logical.index(),
                 });
             }
+            used.insert(storage_ordinal);
+            counts[logical.group()] += 1;
             addresses.push((
                 logical,
                 ExecutionUnitStorageLocation {
-                    ordinal,
-                    address: local,
+                    ordinal: storage_ordinal,
+                    address: storage,
                 },
             ));
         }
+        if let Some(ordinal) = (0..local.len()).find(|ordinal| !used.contains(ordinal)) {
+            return Err(ExecutionUnitAddressMapError::UnreferencedStorage {
+                address: local.address(ordinal).expect("validated storage layout"),
+            });
+        }
+        let mut start = 0;
+        let groups = counts
+            .into_iter()
+            .map(|count| {
+                let range = start..start + count;
+                start += count;
+                range
+            })
+            .collect();
         Ok(Self {
-            addresses: addresses.into(),
+            data: std::sync::Arc::new(ExecutionUnitAddressMapData {
+                storage: local.clone(),
+                addresses,
+                groups,
+            }),
         })
+    }
+
+    /// Selected physical resources, independent of their invocation count.
+    pub fn storage_layout(&self) -> &ExecutionUnitLayout {
+        &self.data.storage
     }
 
     /// Resolves an invocation only when its logical address matches its slot.
@@ -225,7 +263,8 @@ impl ExecutionUnitAddressMap {
         ordinal: usize,
         logical: ExecutionUnitAddress,
     ) -> Result<ExecutionUnitLeaseAddress, ExecutionUnitAddressMapError> {
-        let &(expected, local) = self
+        let &(expected, storage) = self
+            .data
             .addresses
             .get(ordinal)
             .ok_or(ExecutionUnitAddressMapError::UnknownOrdinal { ordinal })?;
@@ -239,13 +278,59 @@ impl ExecutionUnitAddressMap {
         Ok(ExecutionUnitLeaseAddress {
             ordinal,
             logical,
-            storage: local,
+            storage,
         })
     }
 
-    /// Returns a retained local slot for completion or abort of an existing lease.
+    /// Returns a retained storage slot for completion or abort of an existing lease.
     pub fn local_location(&self, ordinal: usize) -> Option<ExecutionUnitStorageLocation> {
-        self.addresses.get(ordinal).map(|&(_, local)| local)
+        self.data
+            .addresses
+            .get(ordinal)
+            .map(|&(_, storage)| storage)
+    }
+
+    /// Invocations in one execution group, including repeated storage consumers.
+    pub fn group_range(&self, group: usize) -> Option<Range<usize>> {
+        self.data.groups.get(group).cloned()
+    }
+
+    /// Physical storage ordinals in this group's declared invocation order.
+    pub fn group_storage_ordinals(&self, group: usize) -> Option<Vec<usize>> {
+        Some(
+            self.data.addresses[self.group_range(group)?]
+                .iter()
+                .map(|(_, storage)| storage.ordinal())
+                .collect(),
+        )
+    }
+
+    /// Unique physical resources used by the next bounded group-local invocations.
+    pub fn storage_window(
+        &self,
+        ordinal: usize,
+        lookahead: usize,
+    ) -> Option<Vec<ExecutionUnitStorageLocation>> {
+        let &(logical, _) = self.data.addresses.get(ordinal)?;
+        let end = ordinal
+            .saturating_add(lookahead)
+            .min(self.group_range(logical.group())?.end);
+        let mut seen = BTreeSet::new();
+        Some(
+            self.data.addresses[ordinal..end]
+                .iter()
+                .map(|&(_, storage)| storage)
+                .filter(|storage| seen.insert(storage.ordinal()))
+                .collect(),
+        )
+    }
+
+    /// Whether this invocation closes its execution group.
+    pub fn is_group_end(&self, ordinal: usize) -> bool {
+        self.data
+            .addresses
+            .get(ordinal)
+            .is_some_and(|(logical, _)| self.data.groups[logical.group()].end - 1 == ordinal)
     }
 }
 
@@ -260,25 +345,35 @@ pub enum ExecutionUnitAddressMapError {
         /// Ordinal supplied at completion.
         actual: usize,
     },
-    /// Logical invocations and local policy slots differ in number.
-    #[error("{logical} logical execution addresses differ from {local} local policy slots")]
-    CountMismatch {
-        /// Number of selected logical invocations.
-        logical: usize,
-        /// Number of local policy slots.
-        local: usize,
+    /// A reference does not name a selected physical resource.
+    #[error("unknown physical execution storage {address:?}")]
+    UnknownStorage {
+        /// Unselected physical resource address.
+        address: ExecutionUnitAddress,
+    },
+    /// A selected physical resource has no invocation consumer.
+    #[error("physical execution storage {address:?} has no consumer")]
+    UnreferencedStorage {
+        /// Unused physical resource address.
+        address: ExecutionUnitAddress,
+    },
+    /// Invocations return to an earlier execution group.
+    #[error("execution invocation {ordinal} returns to an earlier group")]
+    UnorderedGroups {
+        /// Position of the unordered invocation.
+        ordinal: usize,
     },
     /// A logical invocation names a different execution group from its local slot.
     #[error("execution slot {ordinal} maps logical group {logical} to local group {local}")]
     GroupMismatch {
-        /// Policy-local slot.
+        /// Logical invocation position.
         ordinal: usize,
         /// Logical execution group.
         logical: usize,
         /// Local execution group.
         local: usize,
     },
-    /// Two policy slots refer to one logical invocation.
+    /// Two entries refer to one logical invocation.
     #[error("logical execution address {group}:{index} occurs more than once")]
     DuplicateAddress {
         /// Logical execution group.
@@ -286,16 +381,16 @@ pub enum ExecutionUnitAddressMapError {
         /// Global group-local invocation index.
         index: usize,
     },
-    /// An invocation names a slot outside the selected policy.
+    /// An invocation names a position outside the retained sequence.
     #[error("execution slot {ordinal} is outside the selected policy")]
     UnknownOrdinal {
-        /// Requested local slot.
+        /// Requested logical invocation position.
         ordinal: usize,
     },
     /// The caller's logical address does not match its selected policy slot.
     #[error("execution slot {ordinal} expects {expected:?}, received {actual:?}")]
     AddressMismatch {
-        /// Requested local slot.
+        /// Requested logical invocation position.
         ordinal: usize,
         /// Retained logical invocation address.
         expected: ExecutionUnitAddress,

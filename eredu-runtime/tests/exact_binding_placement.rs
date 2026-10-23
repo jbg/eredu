@@ -1931,7 +1931,14 @@ mod component_preparation {
         let local_graph =
             ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
         let local = ExecutionUnitLayout::new(&local_graph, [2]).unwrap();
-        let addresses = eredu_runtime::ExecutionUnitAddressMap::new(&local, &selected).unwrap();
+        let addresses = eredu_runtime::ExecutionUnitAddressMap::new(
+            &local,
+            selected
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, address)| (address, local.address(ordinal).unwrap())),
+        )
+        .unwrap();
         for (ordinal, address) in selected.into_iter().enumerate() {
             let lease = addresses.resolve(ordinal, address).unwrap();
             lease.validate_return(ordinal, address).unwrap();
@@ -1958,11 +1965,24 @@ mod component_preparation {
         ));
         assert_eq!(addresses.local_location(2), None);
         assert!(matches!(
-            eredu_runtime::ExecutionUnitAddressMap::new(&local, &selected[..1]),
-            Err(eredu_runtime::ExecutionUnitAddressMapError::CountMismatch { .. })
+            eredu_runtime::ExecutionUnitAddressMap::new(
+                &local,
+                [(selected[0], local.address(0).unwrap().with_index(99))],
+            ),
+            Err(eredu_runtime::ExecutionUnitAddressMapError::UnknownStorage { .. })
         ));
         assert!(matches!(
-            eredu_runtime::ExecutionUnitAddressMap::new(&local, &[selected[0]; 2]),
+            eredu_runtime::ExecutionUnitAddressMap::new(
+                &local,
+                [(selected[0], local.address(0).unwrap())]
+            ),
+            Err(eredu_runtime::ExecutionUnitAddressMapError::UnreferencedStorage { .. })
+        ));
+        assert!(matches!(
+            eredu_runtime::ExecutionUnitAddressMap::new(
+                &local,
+                [(selected[0], local.address(0).unwrap()); 2]
+            ),
             Err(eredu_runtime::ExecutionUnitAddressMapError::DuplicateAddress { .. })
         ));
         assert_eq!(
@@ -2329,7 +2349,23 @@ mod component_preparation {
         .unwrap();
         let ledger = controller.ledger_mut();
         ledger.mark_initialized();
-        let mut schedule = eredu_runtime::DenseTransferSchedule::new([0, 0, 1, 0, 1], 2).unwrap();
+        let logical = ExecutionUnitLayout::new(selected.description().graph(), [8]).unwrap();
+        let invocations = (3..8)
+            .map(|ordinal| logical.address(ordinal).unwrap())
+            .collect::<Vec<_>>();
+        let mapping = eredu_runtime::ExecutionUnitAddressMap::new(
+            layout,
+            invocations
+                .iter()
+                .copied()
+                .zip([0, 0, 1, 0, 1].map(|ordinal| layout.address(ordinal).unwrap())),
+        )
+        .unwrap();
+        let mut schedule = eredu_runtime::DenseTransferSchedule::new(
+            mapping.group_storage_ordinals(0).unwrap(),
+            2,
+        )
+        .unwrap();
         let mut completed = Vec::new();
         let mut first = None;
         let mut rejected_replay = false;
@@ -2344,7 +2380,10 @@ mod component_preparation {
                 .unwrap();
             while schedule.can_admit() {
                 let step = schedule.next_pending().unwrap();
-                let id = &resources.unit_ids[step.storage_index()];
+                let invocation = mapping
+                    .resolve(step.ordinal(), invocations[step.ordinal()])
+                    .unwrap();
+                let id = &resources.unit_ids[invocation.storage_location().ordinal()];
                 if !ledger.is_resident(id, MemoryTier::Device).unwrap() {
                     ledger
                         .reserve_copy(id, MemoryTier::Device, 32, &Default::default())
@@ -2398,6 +2437,17 @@ mod component_preparation {
         }
         assert!(rejected_replay);
         assert_eq!(completed, [(0, 0), (1, 0), (2, 1), (3, 0), (4, 1)]);
+        assert!(!mapping.is_group_end(2));
+        assert!(mapping.is_group_end(4));
+        assert_eq!(
+            mapping
+                .storage_window(2, 2)
+                .unwrap()
+                .iter()
+                .map(|storage| storage.ordinal())
+                .collect::<Vec<_>>(),
+            [1, 0]
+        );
         assert!(ledger
             .unit_reports()
             .iter()

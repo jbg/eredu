@@ -340,8 +340,7 @@ where
     ) -> Result<
         (
             MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
-            eredu_runtime::ExecutionUnitLayout,
-            Vec<eredu_runtime::ExecutionUnitAddress>,
+            eredu_runtime::ExecutionUnitAddressMap,
         ),
         Error,
     >
@@ -351,7 +350,22 @@ where
         let prepared = self.prepared_bindings.take().ok_or_else(|| {
             Error::ArchitectureModel("execution policy requested before materialization".into())
         })?;
-        let layout = prepared.layout.clone();
+        let addresses = eredu_runtime::ExecutionUnitAddressMap::new(
+            &prepared.layout,
+            prepared
+                .addresses
+                .iter()
+                .enumerate()
+                .map(|(ordinal, &address)| {
+                    (
+                        address,
+                        prepared
+                            .layout
+                            .address(ordinal)
+                            .expect("layout derived from selected addresses"),
+                    )
+                }),
+        )?;
         let mut ignored_sources = self.ignored_checkpoint_sources.clone();
         ignored_sources.extend(
             selected
@@ -412,7 +426,7 @@ where
             )?;
         self.prediction_residency
             .install(policy.residency_manager())?;
-        Ok((policy, layout, prepared.addresses))
+        Ok((policy, addresses))
     }
 }
 
@@ -607,11 +621,11 @@ where
         selected: &SelectedReplicatedTextRealization,
         context: &Stream,
     ) -> Result<Self::ResidentPolicy, Self::Error> {
-        let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
+        let (policy, addresses) = self.take_prepared_policy(architecture, selected)?;
         let residency = policy.residency_manager().clone();
         let resident = policy.into_resident_units(units, context)?;
         self.resident_residency = Some(residency);
-        MlxSelectedLayerwisePolicy::resident(resident, &layout, &addresses)
+        MlxSelectedLayerwisePolicy::resident(resident, addresses)
     }
 
     fn bounded_policy(
@@ -621,9 +635,7 @@ where
         _context: &Stream,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
         self.take_prepared_policy(architecture, selected)
-            .and_then(|(policy, layout, addresses)| {
-                MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)
-            })
+            .and_then(|(policy, addresses)| MlxSelectedLayerwisePolicy::bounded(policy, addresses))
     }
 
     fn index_text_output(

@@ -33,11 +33,15 @@ impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
 impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
     pub(crate) fn resident(
         policy: MlxResidentPolicy<U>,
-        layout: &eredu_runtime::ExecutionUnitLayout,
-        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        addresses: ExecutionUnitAddressMap,
     ) -> Result<Self, Error> {
+        if addresses.storage_layout() != &policy.layout {
+            return Err(Error::Parallel(
+                "selected mapping differs from the physical policy layout".into(),
+            ));
+        }
         Ok(Self {
-            addresses: ExecutionUnitAddressMap::new(layout, addresses)?,
+            addresses,
             identity: Arc::new(()),
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Resident(
                 policy,
@@ -47,11 +51,15 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
 
     pub(crate) fn bounded(
         policy: MlxLayerwisePolicy<U, P>,
-        layout: &eredu_runtime::ExecutionUnitLayout,
-        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        addresses: ExecutionUnitAddressMap,
     ) -> Result<Self, Error> {
+        if addresses.storage_layout() != &policy.layout {
+            return Err(Error::Parallel(
+                "selected mapping differs from the physical policy layout".into(),
+            ));
+        }
         Ok(Self {
-            addresses: ExecutionUnitAddressMap::new(layout, addresses)?,
+            addresses,
             identity: Arc::new(()),
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Bounded(policy))),
         })
@@ -289,7 +297,7 @@ where
                 .acquire(local.ordinal(), local.address(), build, context)
                 .map(MlxSelectedUnitLeaseInner::Resident),
             MlxSelectedLayerwisePolicyInner::Bounded(policy) => policy
-                .acquire(local.ordinal(), local.address(), build, context)
+                .acquire_mapped(&self.addresses, address, build, context)
                 .map(|lease| {
                     #[cfg(test)]
                     crate::tests::support::path_instrumentation::bounded_unit_acquisition();
@@ -328,7 +336,8 @@ where
             self.abort(Some((ordinal, address, lease)), context);
             return Err(error.into());
         }
-        let storage = lease.address.storage_location();
+        let invocation = lease.address;
+        let storage = invocation.storage_location();
         let mut policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
         })?;
@@ -348,14 +357,13 @@ where
             (
                 MlxSelectedLayerwisePolicyInner::Bounded(policy),
                 MlxSelectedUnitLeaseInner::Bounded(lease),
-            ) => policy.complete(
-                storage.ordinal(),
-                storage.address(),
+            ) => policy.complete_mapped(
+                &self.addresses,
+                invocation,
                 lease,
                 output,
                 state_values,
                 context_values,
-                context,
             ),
             _ => Err(Error::ArchitectureModel(
                 "selected layerwise policy received a lease from another residency".into(),

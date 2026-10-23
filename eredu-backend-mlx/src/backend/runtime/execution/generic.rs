@@ -121,6 +121,7 @@ pub struct MlxLayerwisePolicy<U: 'static, P = ()> {
     store: SharedCheckpointSource,
     unit_ids: Vec<OffloadUnitId>,
     layout: ExecutionUnitLayout,
+    identity_addresses: eredu_runtime::ExecutionUnitAddressMap,
     window_depth: usize,
     pinned_units: BTreeSet<OffloadUnitId>,
     populator: P,
@@ -282,12 +283,20 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
                 "generic MLX layerwise policy window depth must be nonzero".into(),
             ));
         }
+        let identity_addresses = eredu_runtime::ExecutionUnitAddressMap::new(
+            &layout,
+            (0..layout.len()).map(|ordinal| {
+                let address = layout.address(ordinal).expect("validated physical layout");
+                (address, address)
+            }),
+        )?;
         let pinned_units = residency.pinned_unit_ids(&unit_ids)?;
         Ok(Self {
             residency,
             store,
             unit_ids,
             layout: layout.clone(),
+            identity_addresses,
             window_depth,
             pinned_units,
             populator,
@@ -338,16 +347,11 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
 
     fn trim_device_window(
         &self,
-        current: usize,
-        address: ExecutionUnitAddress,
+        window: &[eredu_runtime::ExecutionUnitStorageLocation],
     ) -> Result<(), Error> {
-        let range = self.layout.group_range(address.group()).ok_or_else(|| {
-            Error::Parallel(format!("unknown execution group {}", address.group()))
-        })?;
-        let end = current.saturating_add(self.window_depth).min(range.end);
         for (index, id) in self.unit_ids.iter().enumerate() {
             if !self.pinned_units.contains(id)
-                && (!range.contains(&index) || index < current || index >= end)
+                && !window.iter().any(|storage| storage.ordinal() == index)
             {
                 self.residency.evict(id, MemoryTier::Device)?;
             }

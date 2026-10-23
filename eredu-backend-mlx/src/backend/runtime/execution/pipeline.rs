@@ -120,6 +120,11 @@ where
             .map_err(BackendFailure::from_error)?
             .select(addresses.iter().copied())
             .map_err(BackendFailure::from_error)?;
+        let address_map = eredu_runtime::ExecutionUnitAddressMap::new(
+            &layout,
+            addresses.iter().copied().map(|address| (address, address)),
+        )
+        .map_err(BackendFailure::from_error)?;
         detached_preparation(
             Vec::<Array>::new(),
             || {
@@ -140,9 +145,9 @@ where
                     let resident = policy
                         .into_resident(&architecture, execution_stream, PhantomData::<S>)
                         .map_err(BackendFailure::from_error)?;
-                    Policy::<A, S>::resident(resident, &layout, &addresses)
+                    Policy::<A, S>::resident(resident, address_map)
                 } else {
-                    Policy::<A, S>::bounded(policy, &layout, &addresses)
+                    Policy::<A, S>::bounded(policy, address_map)
                 }
                 .map_err(BackendFailure::from_error)?;
                 let executor = Executor::<A, S>::new(

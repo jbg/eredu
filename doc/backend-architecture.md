@@ -863,6 +863,13 @@ occurrence window to distinct storage IDs in first-use order. Native transfer wi
 retain this typed step with their existing transfer and completion guards. Reacquiring
 a copy already submitted in the ready window first resolves that copy's exact transfer;
 its separate occurrence leases continue to protect the shared allocation.
+Selected provider acquisition resolves explicit logical invocation references against
+one retained physical layout. Each selected storage owner has a consumer; repeated
+references retain distinct invocation identities. The validated map projects group
+transfer sequences, distinct resource windows and group completion from invocation
+positions. Bounded native acquisition and completion consume those projections through
+the ordinary policy lifecycle; resident execution loans the selected physical module.
+Raw low-level policies use a retained identity projection through the same lifecycle.
 Selected provider acquisition resolves a logical invocation to typed dense storage
 coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or

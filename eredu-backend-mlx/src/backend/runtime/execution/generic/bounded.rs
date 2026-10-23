@@ -59,7 +59,11 @@ where
                 "parameter inspection requires an idle streaming policy".into(),
             )));
         }
-        self.trim_device_window(ordinal, address)
+        let window = self
+            .identity_addresses
+            .storage_window(ordinal, self.window_depth)
+            .expect("validated inspection address");
+        self.trim_device_window(&window)
             .map_err(LayerwiseAcquireError::Policy)?;
         let unit = MlxModule::new(build(stream).map_err(LayerwiseAcquireError::Architecture)?);
         let transfer = self
@@ -156,16 +160,85 @@ where
     where
         BF: FnOnce(&Stream) -> Result<U, E>,
     {
+        let mapping = self.identity_addresses.clone();
+        let invocation = mapping
+            .resolve(index, address)
+            .map_err(|error| LayerwiseAcquireError::Policy(error.into()))?;
+        self.acquire_mapped(&mapping, invocation, build, stream)
+    }
+
+    fn complete<'a, StateValues, ContextValues>(
+        &mut self,
+        index: usize,
+        address: ExecutionUnitAddress,
+        lease: Self::Lease,
+        output: &'a MlxTensor,
+        state_values: StateValues,
+        context_values: ContextValues,
+        _stream: &Stream,
+    ) -> Result<(), Self::Error>
+    where
+        MlxTensor: 'a,
+        StateValues: Iterator<Item = &'a MlxTensor>,
+        ContextValues: Iterator<Item = &'a MlxTensor>,
+    {
+        let mapping = self.identity_addresses.clone();
+        let invocation = mapping.resolve(index, address)?;
+        self.complete_mapped(
+            &mapping,
+            invocation,
+            lease,
+            output,
+            state_values,
+            context_values,
+        )
+    }
+
+    fn finish(&mut self, output: &MlxTensor, stream: &Stream) -> Result<(), Self::Error> {
+        MlxNeuralBackend::submit(stream, [output])?.wait()?;
+        self.drain()?;
+        if self.dense.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
+            self.residency
+                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
+        }
+        if let Some(dense) = &mut self.dense {
+            for window in &mut dense.windows {
+                window.take();
+            }
+            for group in &mut dense.groups {
+                if let Some(group) = group.take() {
+                    group.complete()?;
+                }
+            }
+            if let Some(forward) = dense.forward.take() {
+                forward.complete()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<U, P> MlxLayerwisePolicy<U, P>
+where
+    U: Parameterized<MlxTensor> + 'static,
+    P: MlxUnitPopulator<U>,
+{
+    pub(crate) fn acquire_mapped<E, BF>(
+        &mut self,
+        mapping: &eredu_runtime::ExecutionUnitAddressMap,
+        invocation: eredu_runtime::ExecutionUnitLeaseAddress,
+        build: BF,
+        stream: &Stream,
+    ) -> Result<MlxUnitLease<U>, LayerwiseAcquireError<E, Error>>
+    where
+        BF: FnOnce(&Stream) -> Result<U, E>,
+    {
+        let storage = invocation.storage_location();
+        let index = storage.ordinal();
+        let address = storage.address();
         crate::backend::submission_recovery::reap();
         crate::backend::ordinary_retirement::reclaim();
         let mut unloaded = Some(build(stream).map_err(LayerwiseAcquireError::Architecture)?);
-        if self.layout.address(index) != Some(address) {
-            return Err(LayerwiseAcquireError::Policy(Error::Parallel(format!(
-                "execution unit {index} does not match group {} unit {}",
-                address.group(),
-                address.index()
-            ))));
-        }
         self.reap_completed()
             .map_err(LayerwiseAcquireError::Policy)?;
         if self.dense.is_some() {
@@ -175,15 +248,14 @@ where
                 .group_id(group)
                 .expect("validated unit address names its execution group")
                 .as_str();
-            let range = self
-                .layout
-                .group_range(group)
-                .expect("validated unit address has a group range");
             let dense = self.dense.as_mut().expect("dense policy is active");
             if dense.groups[group].is_none() {
                 dense.groups[group] = Some(dense.controller.group_guard(&self.residency, group_id));
             }
             if dense.windows[group].is_none() {
+                let sequence = mapping
+                    .group_storage_ordinals(group)
+                    .expect("validated invocation group");
                 dense.windows[group] = Some(
                     dense
                         .controller
@@ -191,7 +263,7 @@ where
                             &self.residency,
                             group_id,
                             &self.unit_ids,
-                            range,
+                            sequence,
                             dense.prefill,
                         )
                         .map_err(LayerwiseAcquireError::Policy)?,
@@ -219,7 +291,13 @@ where
                 .expect("dense forward begins before acquisition")
                 .next(stream)
                 .map_err(LayerwiseAcquireError::Policy)?;
-            if transfer.step().storage_index() != index {
+            let group_start = mapping
+                .group_range(group)
+                .expect("validated invocation group")
+                .start;
+            if transfer.step().storage_index() != index
+                || transfer.step().ordinal() != invocation.invocation_ordinal() - group_start
+            {
                 return Err(LayerwiseAcquireError::Policy(Error::Parallel(format!(
                     "dense transfer returned unit {}, expected {index}",
                     transfer.step().storage_index()
@@ -245,17 +323,14 @@ where
         // overlapping in-flight unit would wait for the very transfer guard
         // retained by `pending` on this thread.
         self.drain_one().map_err(LayerwiseAcquireError::Policy)?;
-        self.trim_device_window(index, address)
+        let window = mapping
+            .storage_window(invocation.invocation_ordinal(), self.window_depth)
+            .expect("validated invocation");
+        self.trim_device_window(&window)
             .map_err(LayerwiseAcquireError::Policy)?;
-        let group_range = self
-            .layout
-            .group_range(address.group())
-            .expect("validated unit address has a group range");
-        let end = index.saturating_add(self.window_depth).min(group_range.end);
-        let requests = self.unit_ids[index..end]
+        let requests = window
             .iter()
-            .cloned()
-            .map(|id| (id, 1))
+            .map(|storage| (self.unit_ids[storage.ordinal()].clone(), 1))
             .collect::<Vec<_>>();
         let transfer = loop {
             match self
@@ -288,21 +363,21 @@ where
         Ok(lease)
     }
 
-    fn complete<'a, StateValues, ContextValues>(
+    pub(crate) fn complete_mapped<'a, StateValues, ContextValues>(
         &mut self,
-        index: usize,
-        address: ExecutionUnitAddress,
-        mut lease: Self::Lease,
+        mapping: &eredu_runtime::ExecutionUnitAddressMap,
+        invocation: eredu_runtime::ExecutionUnitLeaseAddress,
+        mut lease: MlxUnitLease<U>,
         output: &'a MlxTensor,
         state_values: StateValues,
         context_values: ContextValues,
-        _stream: &Stream,
-    ) -> Result<(), Self::Error>
+    ) -> Result<(), Error>
     where
         MlxTensor: 'a,
         StateValues: Iterator<Item = &'a MlxTensor>,
         ContextValues: Iterator<Item = &'a MlxTensor>,
     {
+        let address = invocation.storage_location().address();
         let event = async_eval_with_event(
             std::iter::once(output)
                 .chain(state_values)
@@ -311,12 +386,7 @@ where
         )?;
         lease.submitted(event)?;
         self.pending.push_back(lease);
-        if self.dense.is_some()
-            && self
-                .layout
-                .group_range(address.group())
-                .is_some_and(|range| index.checked_add(1) == Some(range.end))
-        {
+        if self.dense.is_some() && mapping.is_group_end(invocation.invocation_ordinal()) {
             // Device budgets cover one group window, not the sum of successive
             // groups. Establish every consumer's exact completion before
             // releasing this group's transfers and host/device protections.
@@ -325,29 +395,6 @@ where
             dense.windows[address.group()].take();
             if let Some(group) = dense.groups[address.group()].take() {
                 group.complete()?;
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, output: &MlxTensor, stream: &Stream) -> Result<(), Self::Error> {
-        MlxNeuralBackend::submit(stream, [output])?.wait()?;
-        self.drain()?;
-        if self.dense.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
-            self.residency
-                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
-        }
-        if let Some(dense) = &mut self.dense {
-            for window in &mut dense.windows {
-                window.take();
-            }
-            for group in &mut dense.groups {
-                if let Some(group) = group.take() {
-                    group.complete()?;
-                }
-            }
-            if let Some(forward) = dense.forward.take() {
-                forward.complete()?;
             }
         }
         Ok(())
