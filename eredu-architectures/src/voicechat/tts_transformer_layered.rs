@@ -957,8 +957,14 @@ fn forward_block<B: NeuralBackend, C: AttentionCache<B::Tensor>>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, eredu_nn::Error> {
     match parallel {
-        Some(parallel) => block.forward_tensor_parallel(input, parallel, context),
-        None => block.forward(input, context),
+        Some(parallel) => {
+            block
+                .body
+                .forward_tensor_parallel(block.output_norm.as_mut(), input, parallel, context)
+        }
+        None => block
+            .body
+            .forward(block.output_norm.as_mut(), input, context),
     }
 }
 

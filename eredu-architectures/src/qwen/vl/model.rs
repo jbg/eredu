@@ -2446,7 +2446,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
                 let mask = forward.mask.as_ref();
                 let cosine = &forward.rotary.0;
                 let sine = &forward.rotary.1;
-                let output = block.forward_with_feed_forward(
+                let output = block.body.forward_with_feed_forward(
+                    block.output_norm.as_mut(),
                     AttentionInput {
                         selected_positions: None,
                         hidden,
@@ -2529,7 +2530,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
                 let mask = forward.mask.as_ref();
                 let cosine = &forward.rotary.0;
                 let sine = &forward.rotary.1;
-                let output = block.forward_tensor_parallel_with_feed_forward(
+                let output = block.body.forward_tensor_parallel_with_feed_forward(
+                    block.output_norm.as_mut(),
                     AttentionInput {
                         selected_positions: None,
                         hidden,

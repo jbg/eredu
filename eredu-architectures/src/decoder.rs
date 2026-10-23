@@ -2760,19 +2760,21 @@ where
     }
 }
 
-impl<B, F> TransformerBlock<B, F>
+impl<B, F> TransformerBlockBody<B, F>
 where
     B: NeuralBackend,
     F: DecoderProjectionOperator<B>,
 {
-    /// Executes this block with replicated projections.
+    /// Executes this body with replicated projections and a separately borrowed terminal.
+    /// The caller owns both resource lifetimes through ordinary completion.
     pub fn forward<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2789,12 +2791,13 @@ where
     /// Executes the ordinary block equations with component capture/intervention.
     pub fn forward_observed<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2815,6 +2818,7 @@ where
     /// rank activations are reduced before the replicated adapter up projection.
     pub fn forward_with_output_adapter_observed<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         adapter: Option<&mut eredu_nn::low_rank::LowRankProjection<B>>,
         parallel: Option<&B::ParallelContext>,
@@ -2824,8 +2828,8 @@ where
     where
         F: TensorParallelProjectionOperator<B>,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             parallel,
             context,
@@ -2850,6 +2854,7 @@ where
     /// Delegates feed-forward computation while retaining the shared block lifecycle.
     pub fn forward_with_feed_forward<C, H>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
         feed_forward: H,
@@ -2858,8 +2863,8 @@ where
         C: AttentionCache<B::Tensor>,
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2874,6 +2879,7 @@ where
     /// Executes column partitions and reduced row projections.
     pub fn forward_tensor_parallel<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2882,6 +2888,7 @@ where
         F: TensorParallelProjectionOperator<B>,
     {
         self.forward_tensor_parallel_observed(
+            output_norm,
             input,
             parallel,
             context,
@@ -2894,6 +2901,7 @@ where
     /// Global selection and record assembly belong to the partition driver.
     pub fn forward_tensor_parallel_observed<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2902,8 +2910,8 @@ where
     where
         F: TensorParallelProjectionOperator<B>,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -2927,6 +2935,7 @@ where
     /// Delegates feed-forward computation for a tensor-parallel block.
     pub fn forward_tensor_parallel_with_feed_forward<C, H>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2936,8 +2945,8 @@ where
         C: AttentionCache<B::Tensor>,
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -2952,6 +2961,7 @@ where
     /// Routes both replaceable projection stages through one runtime provider.
     pub fn forward_routed<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -2965,8 +2975,8 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2986,6 +2996,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn forward_routed_observed<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -3001,8 +3012,8 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -3038,6 +3049,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn forward_routed_parallel<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -3052,8 +3064,8 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -3074,6 +3086,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn forward_routed_parallel_observed<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -3090,8 +3103,8 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.body.forward_projections(
-            self.output_norm.as_mut(),
+        self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -5970,7 +5983,8 @@ where
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        unit.forward_observed(
+        unit.body.forward_observed(
+            unit.output_norm.as_mut(),
             forward.attention_input(hidden, cache),
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
@@ -6115,7 +6129,8 @@ where
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        unit.forward_tensor_parallel_observed(
+        unit.body.forward_tensor_parallel_observed(
+            unit.output_norm.as_mut(),
             forward.attention_input(hidden, cache),
             parallel,
             context,
@@ -6197,7 +6212,8 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        unit.forward_routed(
+        unit.body.forward_routed(
+            unit.output_norm.as_mut(),
             index,
             forward.attention_input(hidden, cache),
             pass,
@@ -6229,7 +6245,8 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        unit.forward_routed_observed(
+        unit.body.forward_routed_observed(
+            unit.output_norm.as_mut(),
             index,
             forward.attention_input(hidden, cache),
             pass,
@@ -6278,7 +6295,8 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        unit.forward_routed_parallel(
+        unit.body.forward_routed_parallel(
+            unit.output_norm.as_mut(),
             index,
             forward.attention_input(hidden, cache),
             pass,
@@ -6312,7 +6330,8 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        unit.forward_routed_parallel_observed(
+        unit.body.forward_routed_parallel_observed(
+            unit.output_norm.as_mut(),
             index,
             forward.attention_input(hidden, cache),
             pass,
@@ -6795,7 +6814,11 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        block.forward(forward.attention_input(hidden, cache), context)
+        block.body.forward(
+            block.output_norm.as_mut(),
+            forward.attention_input(hidden, cache),
+            context,
+        )
     }
 
     /// Executes one replicated block while delegating its feed-forward policy
@@ -6823,7 +6846,8 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        block.forward_with_feed_forward(
+        block.body.forward_with_feed_forward(
+            block.output_norm.as_mut(),
             forward.attention_input(hidden, cache),
             context,
             feed_forward,
@@ -6851,7 +6875,12 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        block.forward_tensor_parallel(forward.attention_input(hidden, cache), parallel, context)
+        block.body.forward_tensor_parallel(
+            block.output_norm.as_mut(),
+            forward.attention_input(hidden, cache),
+            parallel,
+            context,
+        )
     }
 
     /// Executes one tensor-parallel block while delegating its feed-forward
@@ -6880,7 +6909,8 @@ where
         let cache = state
             .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        block.forward_tensor_parallel_with_feed_forward(
+        block.body.forward_tensor_parallel_with_feed_forward(
+            block.output_norm.as_mut(),
             forward.attention_input(hidden, cache),
             parallel,
             context,

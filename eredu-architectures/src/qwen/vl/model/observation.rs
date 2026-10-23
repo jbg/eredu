@@ -81,7 +81,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         let state_ordinal = self.text_state_ordinal(index)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new(&path, &mut borrowed);
-        let output = block.forward_routed_observed(
+        let output = block.body.forward_routed_observed(
+            block.output_norm.as_mut(),
             index,
             AttentionInput {
                 selected_positions: None,
@@ -151,7 +152,8 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         let state_ordinal = self.text_state_ordinal(index)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new(&path, &mut borrowed);
-        let output = block.forward_routed_parallel_observed(
+        let output = block.body.forward_routed_parallel_observed(
+            block.output_norm.as_mut(),
             index,
             AttentionInput {
                 selected_positions: None,

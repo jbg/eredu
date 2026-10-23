@@ -104,7 +104,8 @@ impl<B: NeuralBackend> TextLayer<B> {
         };
         if invocation.cache_write == CacheWritePolicy::Transient {
             let mut view = ReadOnlyCache::new(cache);
-            self.base.forward_with_output_adapter_observed(
+            self.base.body.forward_with_output_adapter_observed(
+                self.base.output_norm.as_mut(),
                 AttentionInput {
                     hidden,
                     mask,
@@ -119,7 +120,8 @@ impl<B: NeuralBackend> TextLayer<B> {
                 instrumentation,
             )
         } else {
-            self.base.forward_with_output_adapter_observed(
+            self.base.body.forward_with_output_adapter_observed(
+                self.base.output_norm.as_mut(),
                 AttentionInput {
                     hidden,
                     mask,

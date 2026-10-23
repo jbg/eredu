@@ -128,9 +128,12 @@ where
     P: ParameterProvider<B>,
     P::Error: std::fmt::Display,
 {
-    block.forward_with_feed_forward(input, context, |mlp, hidden, context| {
-        mlp.forward_with_provider(hidden, pass, provider, context)
-    })
+    block.body.forward_with_feed_forward(
+        block.output_norm.as_mut(),
+        input,
+        context,
+        |mlp, hidden, context| mlp.forward_with_provider(hidden, pass, provider, context),
+    )
 }
 
 /// Executes tensor-parallel attention and provider-backed routed experts.
@@ -148,7 +151,8 @@ where
     P: eredu_runtime::TensorParallelParameterProvider<B>,
     P::Error: std::fmt::Display,
 {
-    block.forward_tensor_parallel_with_feed_forward(
+    block.body.forward_tensor_parallel_with_feed_forward(
+        block.output_norm.as_mut(),
         input,
         parallel,
         context,
