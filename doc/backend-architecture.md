@@ -785,6 +785,12 @@ selected projection.
 execution graph with logical unit paths, state references, group transport and
 primary/prediction identities. Construction validates addresses, paths, state
 ranges, partition rules and optional group semantics without native allocation.
+Runtime incrementally admits independently leased execution-unit resources in selected
+invocation order. It validates physical payload totals, source keys, residency identities
+and specifications, and aggregate host-capacity facts supplied by the backend. Admission
+is consuming and requires complete selected-unit coverage. Native callback-derived and
+retained-binding preparation consume the same admitted resource representation without
+combining independent units or changing source authority.
 Native callback-derived and retained-binding policy preparation use one finalization
 implementation for residency streams and managers, pinned static binding, dense-stream
 controllers and policy assembly. Their source realization and binding admission order

@@ -135,6 +135,10 @@ pub enum Error {
     #[error(transparent)]
     ParameterAcquisition(#[from] eredu_runtime::ParameterAcquisitionError),
 
+    /// Invalid admitted execution-unit resource count or capacity.
+    #[error(transparent)]
+    ExecutionUnitPreparation(#[from] eredu_runtime::ExecutionUnitPreparationError),
+
     /// Invalid logical-to-local execution-unit mapping or invocation.
     #[error(transparent)]
     ExecutionUnitAddressMap(#[from] eredu_runtime::ExecutionUnitAddressMapError),

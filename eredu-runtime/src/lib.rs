@@ -62,6 +62,10 @@ pub mod draft;
 /// Logical request encoder workspace admission.
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
+mod execution_unit_preparation;
+pub use execution_unit_preparation::{
+    ExecutionUnitPreparationError, ExecutionUnitResourcePreparation, PreparedExecutionUnitResources,
+};
 /// Completed-token lifecycle, snapshot reservation and branch accounting policy.
 pub mod execution_control;
 pub mod execution_plan;

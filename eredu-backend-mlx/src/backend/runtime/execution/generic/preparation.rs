@@ -124,11 +124,8 @@ where
         Some(id)
     };
 
-    let mut unit_ids = Vec::with_capacity(unit_count);
-    let mut unit_bytes = Vec::with_capacity(unit_count);
-    let mut layer_parameter_bytes = 0u64;
-    let mut total_host_bytes = 0u64;
-    let mut maximum_host_bytes = 0u64;
+    let mut execution_units =
+        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
     for index in 0..unit_count {
         let address = layout
             .address(index)
@@ -140,62 +137,27 @@ where
             .build_unit(address.group(), address.index(), stream)
             .map_err(|error| Error::Other(Box::new(error)))?;
         let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
-        let bytes = physical_binding_bytes(&bindings)?;
-        layer_parameter_bytes = layer_parameter_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
-        let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
-        total_host_bytes = total_host_bytes
-            .checked_add(host_bytes)
-            .ok_or_else(|| Error::Parallel("generic host unit bytes overflowed".into()))?;
-        maximum_host_bytes = maximum_host_bytes.max(host_bytes);
-        consumed.extend(
-            bindings
-                .iter()
-                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-        );
-        let group_id = layout
-            .group_id(address.group())
-            .expect("validated layout names every execution group");
-        let id = OffloadUnitId::new(format!(
-            "model.{}.{:05}",
-            group_id.as_str(),
-            address.index()
-        ))?;
-        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else if dense.is_some() {
-                ResidencyPolicy::Cacheable
-            } else {
-                ResidencyPolicy::Windowed
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
-        unit_ids.push(id);
-        unit_bytes.push(bytes);
+        execution_units = execution_units.push(bindings, |bindings| {
+            host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
+        })?;
     }
+    let units = execution_units.finish()?;
+    definitions.extend(units.definitions);
+    specs.extend(units.specs);
+    consumed.extend(units.source_keys);
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
     let device_window_bytes =
-        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &unit_bytes, options)
+        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &units.unit_bytes, options)
             .map_err(|error| Error::Parallel(error.to_string()))?;
     let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
+        Some(dense) if dense.host_budget_bytes() > 0 => units
+            .maximum_host_bytes
             .checked_mul(dense.host_lookahead() as u64)
             .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
         Some(_) => 0,
         None if fully_resident => 0,
-        None => total_host_bytes,
+        None => units.total_host_bytes,
     };
     validate_host_budget(offload, host_required)?;
     validate_device_budget(offload, static_bytes, device_window_bytes, depth)?;
@@ -207,9 +169,9 @@ where
         unit_count,
         static_bytes,
         options.execution_residency(),
-        layer_parameter_bytes,
+        units.parameter_bytes,
         device_window_bytes,
-        maximum_host_bytes,
+        units.maximum_host_bytes,
         depth,
     );
     materialize_parameter_unit_policy::<A::Unit, _, _>(
@@ -223,7 +185,7 @@ where
         definitions,
         std::collections::BTreeMap::new(),
         layout,
-        unit_ids,
+        units.unit_ids,
         static_id,
         static_parameters,
         metadata,
@@ -419,59 +381,17 @@ where
         Some(id)
     };
 
-    let mut unit_ids = Vec::with_capacity(unit_count);
-    let mut unit_bytes = Vec::with_capacity(unit_count);
-    let mut layer_parameter_bytes = 0u64;
-    let mut total_host_bytes = 0u64;
-    let mut maximum_host_bytes = 0u64;
-    for (index, bindings) in unit_bindings.into_iter().enumerate() {
-        let address = layout
-            .address(index)
-            .expect("validated layout covers every flat unit");
-        let bytes = physical_binding_bytes(&bindings)?;
-        layer_parameter_bytes = layer_parameter_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
-        let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
-        total_host_bytes = total_host_bytes
-            .checked_add(host_bytes)
-            .ok_or_else(|| Error::Parallel("generic host unit bytes overflowed".into()))?;
-        maximum_host_bytes = maximum_host_bytes.max(host_bytes);
-        consumed.extend(
-            bindings
-                .iter()
-                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-        );
-        let group_id = layout
-            .group_id(address.group())
-            .expect("validated layout names every execution group");
-        let id = OffloadUnitId::new(format!(
-            "model.{}.{:05}",
-            group_id.as_str(),
-            address.index()
-        ))?;
-        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else if dense.is_some() {
-                ResidencyPolicy::Cacheable
-            } else {
-                ResidencyPolicy::Windowed
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
-        unit_ids.push(id);
-        unit_bytes.push(bytes);
+    let mut execution_units =
+        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &layout, options);
+    for bindings in unit_bindings {
+        execution_units = execution_units.push(bindings, |bindings| {
+            host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
+        })?;
     }
+    let units = execution_units.finish()?;
+    definitions.extend(units.definitions);
+    specs.extend(units.specs);
+    consumed.extend(units.source_keys);
     let mut extra = eredu_runtime::AuxiliaryWeightRequirements::default();
     let mut sources = std::collections::BTreeMap::new();
     for unit in supplementary {
@@ -503,15 +423,16 @@ where
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
     let device_window_bytes =
-        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &unit_bytes, options)
+        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &units.unit_bytes, options)
             .map_err(|error| Error::Parallel(error.to_string()))?;
     let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
+        Some(dense) if dense.host_budget_bytes() > 0 => units
+            .maximum_host_bytes
             .checked_mul(dense.host_lookahead() as u64)
             .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
         Some(_) => 0,
         None if fully_resident => 0,
-        None => total_host_bytes,
+        None => units.total_host_bytes,
     };
     let auxiliary_host = extra
         .host_bytes(options)
@@ -543,9 +464,9 @@ where
         unit_count,
         static_bytes,
         options.execution_residency(),
-        layer_parameter_bytes,
+        units.parameter_bytes,
         device_window_bytes,
-        maximum_host_bytes,
+        units.maximum_host_bytes,
         depth,
     );
     materialize_parameter_unit_policy::<U, _, _>(
@@ -559,7 +480,7 @@ where
         definitions,
         sources,
         layout,
-        unit_ids,
+        units.unit_ids,
         static_id,
         static_parameters,
         metadata,

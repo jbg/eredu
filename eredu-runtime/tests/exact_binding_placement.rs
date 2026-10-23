@@ -2229,4 +2229,69 @@ mod component_preparation {
         }
         assert_eq!(replica_bytes, 96);
     }
+    #[test]
+    fn execution_unit_admission_keeps_sparse_addresses_and_independent_capacity() {
+        use eredu_runtime::{
+            ExecutionUnitPreparationError, ExecutionUnitResourcePreparation, LayerWeightResidency,
+            WeightBinding,
+        };
+        type Failure = Box<dyn std::error::Error>;
+        let prepared = prepared();
+        let selected = prepared
+            .select_units([0, 2].map(|i| description(&[0, 1, 2]).unit_layout().address(i).unwrap()))
+            .unwrap();
+        let layout = selected.unit_layout();
+        let options = LayerWeightResidency::LayerwiseHost(Default::default());
+        let mut bindings = selected.unit_bindings().to_vec();
+        let owner = bindings[0][0].name().to_owned();
+        bindings[0].push(WeightBinding::alias("alias", owner, 32).unwrap());
+        assert!(matches!(
+            ExecutionUnitResourcePreparation::new("model", layout, options).finish(),
+            Err(ExecutionUnitPreparationError::UnitCount {
+                expected: 2,
+                actual: 0
+            })
+        ));
+        let resources = ExecutionUnitResourcePreparation::new("model", layout, options)
+            .push(bindings[0].clone(), |_| Ok::<_, Failure>(64))
+            .unwrap()
+            .push(bindings[1].clone(), |_| Ok::<_, Failure>(128))
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(resources.definitions.len(), 2);
+        assert_eq!(resources.unit_bytes, [32, 32]);
+        assert_eq!(resources.parameter_bytes, 64);
+        assert_eq!(resources.total_host_bytes, 192);
+        assert_eq!(resources.maximum_host_bytes, 128);
+        assert_eq!(
+            resources.source_keys,
+            std::collections::BTreeSet::from(["physical.0".into(), "physical.2".into()])
+        );
+        assert_eq!(
+            resources
+                .unit_ids
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            ["model.units.00000", "model.units.00002"]
+        );
+        let overflow = ExecutionUnitResourcePreparation::new("model", layout, options)
+            .push(bindings[0].clone(), |_| Ok::<_, Failure>(u64::MAX))
+            .unwrap()
+            .push(bindings[1].clone(), |_| Ok::<_, Failure>(1))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(overflow.downcast_ref::<ExecutionUnitPreparationError>(),
+            Some(ExecutionUnitPreparationError::ArithmeticOverflow { address, .. }) if address.index() == 2)
+        );
+        let failure = ExecutionUnitResourcePreparation::new("model", layout, options)
+            .push(bindings[0].clone(), |_| {
+                Err::<u64, Failure>(std::io::Error::other("host capacity unavailable").into())
+            })
+            .err()
+            .unwrap();
+        assert!(failure.downcast_ref::<std::io::Error>().is_some());
+    }
 }
