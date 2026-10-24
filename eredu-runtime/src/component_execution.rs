@@ -179,6 +179,22 @@ impl ComponentDefinition {
                 component: id.clone(),
                 source,
             })?;
+        for rule in state_partition.rules() {
+            if let crate::ArchitectureStatePlacement::Invocation { address } = rule.placement() {
+                let ordinal = parameters
+                    .unit_layout()
+                    .ordinal(address.group(), address.index())
+                    .expect("validated state owner");
+                let owner = &units[ordinal];
+                let slots = rule.layers();
+                if owner.state.start > slots.start || owner.state.end < slots.end {
+                    return Err(invalid(&format!(
+                        "state owner {:?} does not reference slots {slots:?}",
+                        owner.path
+                    )));
+                }
+            }
+        }
         Ok(Self {
             id,
             parameters,
@@ -1021,16 +1037,28 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
                 continue;
             }
             let units = owned.global_units();
-            let state = if let Some(rule) = definition.state_partition.rules().iter().find(|rule| {
-                matches!(rule.placement(), crate::ArchitectureStatePlacement::GroupUnits { group: owner } if owner == group)
-            }) {
-                let base = layout.group_range(group).expect("declared group").start;
-                let ordinals = layout.contiguous_ordinals(group, units).expect("validated ownership");
-                rule.layers().start + (ordinals.start - base)..rule.layers().start + (ordinals.end - base)
+            let state = if let Some(range) =
+                definition
+                    .state_partition
+                    .group_state_range(layout, group, units.clone())?
+            {
+                range
             } else {
-                let first = definition.unit(group, units.start).expect("declared unit");
-                let last = definition.unit(group, units.end - 1).expect("declared unit");
-                first.state.start..last.state.end
+                let mut ranges = units
+                    .map(|index| {
+                        definition
+                            .unit(group, index)
+                            .expect("declared unit")
+                            .state
+                            .clone()
+                    })
+                    .filter(|range| !range.is_empty());
+                let Some(first) = ranges.next() else {
+                    continue;
+                };
+                ranges.fold(first, |span, range| {
+                    span.start.min(range.start)..span.end.max(range.end)
+                })
             };
             state_groups.insert(group, state);
         }

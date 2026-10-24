@@ -859,6 +859,16 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
 struct CarryKernel {
     offset: usize,
     has_ingress: bool,
+    slots: Option<std::collections::BTreeMap<usize, Option<usize>>>,
+}
+impl CarryKernel {
+    fn new(offset: usize, has_ingress: bool) -> Self {
+        Self {
+            offset,
+            has_ingress,
+            slots: None,
+        }
+    }
 }
 type CarryState = DeviceState<FakeBackend, RetainedOrdinalLayerState>;
 impl ComponentKernel<FakeBackend> for CarryKernel {
@@ -934,7 +944,14 @@ impl ComponentEquations<FakeBackend, CarryState> for CarryKernel {
         if self.has_ingress && address.group() == 0 {
             return Ok(hidden.clone());
         }
-        let carry = state.layer(address.index() - self.offset).unwrap();
+        let slot = self
+            .slots
+            .as_ref()
+            .map_or(Some(address.index()), |slots| slots[&address.index()]);
+        let Some(slot) = slot else {
+            return Ok(hidden.clone());
+        };
+        let carry = state.layer(slot - self.offset).unwrap();
         carry.0 .0[0] += 1;
         let mut output = hidden.clone();
         output.0.push(carry.0 .0[0]);
@@ -1158,10 +1175,7 @@ fn advance_carry_stages(stages: &mut [CarryStage], step: i32) -> FakeTensor {
 fn component_partitions_preserve_repeated_advancement_and_local_carry_retention() {
     let full = ComponentAdapter::new(
         carry_definition(&[0, 1, 2]),
-        CarryKernel {
-            offset: 0,
-            has_ingress: false,
-        },
+        CarryKernel::new(0, false),
     )
     .unwrap();
     let mut resident = ResidentRuntime::new(full, &()).unwrap();
@@ -1170,10 +1184,7 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
         let declaration = carry_definition(&[0, 1, 2]);
         let full = ComponentAdapter::new(
             declaration.clone(),
-            CarryKernel {
-                offset: range.start,
-                has_ingress: false,
-            },
+            CarryKernel::new(range.start, false),
         )
         .unwrap();
         let partition = ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
@@ -1213,10 +1224,7 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
         .map(|(position, index)| {
             let full = ComponentAdapter::new(
                 declaration.clone(),
-                CarryKernel {
-                    offset: index,
-                    has_ingress: false,
-                },
+                CarryKernel::new(index, false),
             )
             .unwrap();
             for invalid in [0..1, 3..8] {
@@ -1330,6 +1338,270 @@ impl eredu_runtime::PartitionTensorAllocator<FakeBackend> for CaptureAllocator {
 }
 
 #[test]
+fn component_invocation_state_ownership_skips_interleaved_stateless_units() {
+    for offset in [0, 7] {
+        let base = carry_definition(&[0, 1]);
+        let graph = base.parameters().graph();
+        let complete = ExecutionUnitLayout::new(graph, [offset + 7]).unwrap();
+        let layout = complete
+            .select((offset..offset + 7).map(|index| complete.address(index).unwrap()))
+            .unwrap();
+        let units = (0..7)
+            .map(|index| ComponentUnit {
+                path: format!("operation.{}", offset + index),
+                state: match index {
+                    1 => 0..1,
+                    4 => 1..2,
+                    _ => 0..0,
+                },
+            })
+            .collect::<Vec<_>>();
+        let make = |units: Vec<ComponentUnit>, state: StateLayout, plan| {
+            ComponentDefinition::new(
+                "interleaved",
+                ArchitectureParameterDescription::new(graph, &layout, [], []).unwrap(),
+                units,
+                vec![base.group_transport(0).unwrap().clone()],
+                "carry",
+                vec![],
+                state,
+                plan,
+            )
+        };
+        let owners = |shared: bool| {
+            ArchitectureStatePartitionPlan::new(
+                std::iter::once(eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                    layout.address(1).unwrap(),
+                    0..1,
+                ))
+                .chain((!shared).then(|| {
+                    eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                        layout.address(4).unwrap(),
+                        1..2,
+                    )
+                })),
+            )
+        };
+        let definition = make(units.clone(), base.state_layout().clone(), owners(false)).unwrap();
+        let kernel = |start, shared| {
+            let mut kernel = CarryKernel::new(start, false);
+            kernel.slots = Some(
+                (0..7)
+                    .map(|index| {
+                        (
+                            offset + index,
+                            match index {
+                                1 => Some(0),
+                                4 => Some(if shared { 0 } else { 1 }),
+                                _ => None,
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            kernel
+        };
+        let adapter = || ComponentAdapter::new(definition.clone(), kernel(0, false)).unwrap();
+        let mut resident = ResidentRuntime::new(adapter(), &()).unwrap();
+        let mut full_state = carry_state(definition.state_layout().clone());
+        let mut stages = [
+            offset..offset + 3,
+            offset + 3..offset + 6,
+            offset + 6..offset + 7,
+        ]
+        .map(|range| {
+            let partition = ArchitecturePartition::from_description(
+                definition.parameters(),
+                [("carry", range.clone())],
+                PartitionOwnership::new(
+                    range.start == offset,
+                    range.end == offset + 7,
+                    std::iter::empty::<String>(),
+                )
+                .unwrap(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
+                (),
+                NoAuxiliaryBoundarySchema::new(1),
+            )
+            .unwrap();
+            let start = partition
+                .state()
+                .map_or(0, |state| state.global_layer_offset());
+            let state = partition
+                .state()
+                .map_or_else(CarryState::stateless, |state| {
+                    carry_state(state.layout().clone())
+                });
+            if range.start == offset + 6 {
+                assert!(state.optional_layout().is_none());
+            }
+            let component =
+                ComponentAdapter::new(definition.clone(), kernel(start, false)).unwrap();
+            let policy = eredu_runtime::ResidentUnitWindow::new(
+                partition
+                    .units()
+                    .map(|address| {
+                        component
+                            .build_unit(address.group(), address.index(), &())
+                            .unwrap()
+                    })
+                    .collect(),
+            );
+            let runtime = component
+                .into_partition_runtime::<FakeBackend, CarryState, _, _, _>(policy, &partition)
+                .unwrap();
+            (runtime, state, range.start == offset)
+        });
+        for step in 1..=6 {
+            let input = FakeTensor(vec![9]);
+            let expected = resident.forward(&input, &mut full_state, &()).unwrap();
+            let mut hidden = input.clone();
+            for (runtime, state, input_owner) in &mut stages {
+                let ingress = if *input_owner {
+                    LayeredPartitionInput::Tokens(&input)
+                } else {
+                    LayeredPartitionInput::Hidden {
+                        hidden,
+                        auxiliary: NoAuxiliaryBoundary,
+                    }
+                };
+                let parallel = (step % 2 == 0).then_some(&());
+                let output = runtime
+                    .forward_with_preparation(state, parallel, &(), |adapter, state, expected| {
+                        adapter.begin_prepared_partition(
+                            ingress,
+                            None,
+                            state,
+                            expected,
+                            parallel,
+                            &(),
+                        )
+                    })
+                    .unwrap();
+                hidden = match output {
+                    LayeredPartitionOutput::Boundary { hidden, .. } => hidden,
+                    LayeredPartitionOutput::Final { output, .. } => output,
+                };
+            }
+            assert_eq!(hidden, expected);
+            assert_eq!(hidden, FakeTensor(vec![9, step, step]));
+        }
+        let mut shared_units = units.clone();
+        shared_units[4].state = 0..1;
+        let shared = make(
+            shared_units,
+            base.state_layout().slice(0..1).unwrap(),
+            owners(true),
+        )
+        .unwrap();
+        let mut runtime = ResidentRuntime::new(
+            ComponentAdapter::new(shared.clone(), kernel(0, true)).unwrap(),
+            &(),
+        )
+        .unwrap();
+        let mut state = carry_state(shared.state_layout().clone());
+        for step in 1..=3 {
+            assert_eq!(
+                runtime
+                    .forward(&FakeTensor(vec![9]), &mut state, &())
+                    .unwrap(),
+                FakeTensor(vec![9, step * 2 - 1, step * 2])
+            );
+        }
+        let other_consumer = ArchitecturePartition::from_description(
+            shared.parameters(),
+            [("carry", offset + 3..offset + 6)],
+            PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
+            shared.state_layout(),
+            shared.state_partition_plan(),
+            (),
+            NoAuxiliaryBoundarySchema::new(1),
+        )
+        .unwrap();
+        assert!(shared.select_partition(&other_consumer).is_err());
+        let unknown = ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                layout.address(1).unwrap().with_index(offset + 99),
+                0..2,
+            ),
+        ]);
+        assert!(matches!(
+            make(units.clone(), base.state_layout().clone(), unknown),
+            Err(ComponentDefinitionError::StatePartition {
+                source: eredu_runtime::ArchitectureStatePartitionError::UnknownInvocation { .. },
+                ..
+            })
+        ));
+        let wrong_owner = ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                layout.address(0).unwrap(),
+                0..1,
+            ),
+            eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                layout.address(4).unwrap(),
+                1..2,
+            ),
+        ]);
+        assert!(make(units.clone(), base.state_layout().clone(), wrong_owner).is_err());
+        let mut gap_units = units.clone();
+        gap_units[4].state = 2..3;
+        gap_units[6].state = 1..2;
+        let gap_plan = ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                layout.address(1).unwrap(),
+                0..1,
+            ),
+            eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                layout.address(6).unwrap(),
+                1..2,
+            ),
+            eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                layout.address(4).unwrap(),
+                2..3,
+            ),
+        ])
+        .with_packing(eredu_runtime::StatePartitionPacking::PreserveGlobalOrdinals);
+        let gap_state = carry_definition(&[0, 1, 2]).state_layout().clone();
+        let gap = make(gap_units.clone(), gap_state.clone(), gap_plan.clone()).unwrap();
+        let partition = ArchitecturePartition::from_description(
+            gap.parameters(),
+            [("carry", offset..offset + 6)],
+            PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
+            gap.state_layout(),
+            gap.state_partition_plan(),
+            (),
+            NoAuxiliaryBoundarySchema::new(1),
+        )
+        .unwrap();
+        assert_eq!(
+            partition.state().unwrap().selected_global_layers(),
+            [0..1, 2..3]
+        );
+        assert!(matches!(
+            partition.state().unwrap().layout().layers().get(1),
+            Some(LayerCachePolicy::NoState)
+        ));
+        let span = gap
+            .state_partition_plan()
+            .group_state_range(&layout, 0, offset..offset + 6)
+            .unwrap();
+        assert_eq!(span, Some(0..3));
+        assert!(gap.select_partition(&partition).is_ok());
+        assert!(LayeredPartitionDriver::new_with_state_range(
+            &partition,
+            0,
+            offset..offset + 6,
+            span
+        )
+        .is_ok());
+        gap_units[0].state = 1..2;
+        let unowned = make(gap_units, gap_state, gap_plan).unwrap();
+        assert!(unowned.select_partition(&partition).is_err());
+    }
+}
+
+#[test]
 fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
     for offset in [0, 7] {
         check_stage_carry(offset);
@@ -1340,10 +1612,7 @@ fn check_stage_carry(offset: usize) {
     let base = carry_definition(&[0, 1, 2]);
     let source = ComponentAdapter::new(
         base.clone(),
-        CarryKernel {
-            offset: 0,
-            has_ingress: false,
-        },
+        CarryKernel::new(0, false),
     )
     .unwrap();
     let graph = ExecutionGraph::new(
@@ -1382,10 +1651,7 @@ fn check_stage_carry(offset: usize) {
     .unwrap();
     let adapter = ComponentAdapter::new(
         definition.clone(),
-        CarryKernel {
-            offset,
-            has_ingress: true,
-        },
+        CarryKernel::new(offset, true),
     )
     .unwrap();
     let partition = ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
@@ -1408,10 +1674,7 @@ fn check_stage_carry(offset: usize) {
     ] {
         let adapter = ComponentAdapter::new(
             definition.clone(),
-            CarryKernel {
-                offset,
-                has_ingress: true,
-            },
+            CarryKernel::new(offset, true),
         )
         .unwrap();
         let addresses: Vec<_> = ordinals
@@ -1675,10 +1938,7 @@ fn component_parallel_group_ingress_validates_before_advancing_state() {
     let mut state = carry_state(declaration.state_layout().clone());
     let mut adapter = ComponentAdapter::new(
         declaration,
-        CarryKernel {
-            offset: 0,
-            has_ingress: false,
-        },
+        CarryKernel::new(0, false),
     )
     .unwrap();
     let input = FakeTensor(vec![7]);

@@ -7929,15 +7929,9 @@ impl<R, G, W> BoundPartitionedAdmission<R, CompositeTextRequirements, G, W> {
                 .text()
                 .state_partition_plan()
             {
-                Some(plan) => plan.rules().iter().find_map(|rule| {
-                    (rule.placement()
-                        == eredu_runtime::ArchitectureStatePlacement::GroupUnits { group })
-                    .then(|| {
-                        let start = rule.layers().start;
-                        let units = owned.global_units();
-                        start + units.start..start + units.end
-                    })
-                }),
+                Some(plan) => plan
+                    .group_state_range(self.partition.unit_layout(), group, owned.global_units())
+                    .map_err(|error| error.to_string())?,
                 None => (transports[group].kind == ArchitectureGroupKind::Decoder)
                     .then(|| owned.global_units()),
             };

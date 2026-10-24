@@ -14,6 +14,9 @@ pub enum LayerwisePartitionConstructionError {
     /// Component selection differs from its validated declaration.
     #[error(transparent)]
     Definition(#[from] crate::ComponentDefinitionError),
+    /// Explicit state ownership cannot be projected onto selected invocations.
+    #[error(transparent)]
+    StatePartition(#[from] crate::ArchitectureStatePartitionError),
     /// Canonical partition or architecture declarations disagree.
     #[error("invalid layered stage: {0}")]
     Contract(String),

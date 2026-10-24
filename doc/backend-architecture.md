@@ -3535,6 +3535,16 @@ projection also serves routed feed-forward policies. The body carries no termina
 parameter even when its invocation requests inter-pass normalization. The selected
 residency boundary remains the enclosing execution unit.
 
+State placement rules can assign a slot range to an exact logical invocation. Stateless
+operations introduce no cache slots, and several consumers can reference one explicitly
+owned slot without duplicating it. Definition validation checks each invocation owner
+and its declared state references; partition selection rejects consumers whose required
+state owner is absent. One shared per-group projection serves component stages and cold
+composite drivers. Driver state spans follow selected slots independently of operation
+counts; preserved unowned gaps contain `NoState` and grant no mutable-state authority.
+Shared decoder definitions derive these placement rules from their declared unit state
+ranges.
+
 Shared decoder partition geometry projects canonical factory owners from the retained
 invocation map. Selected physical configurations are keyed by owner identity, including
 owners outside the local logical range. Each physical owner is localized once; the

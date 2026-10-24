@@ -5353,8 +5353,22 @@ fn decoder_component_definition<C: Config>(
             path: format!("{}.layers.{}", args.parameter_root(), address.index()),
             state: address.index()..address.index() + 1,
         })
-        .collect();
-    let partition = crate::transport::pipeline_state(0, &state);
+        .collect::<Vec<_>>();
+    let partition = eredu_runtime::ArchitectureStatePartitionPlan::new(
+        units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| !unit.state.is_empty())
+            .map(|(ordinal, unit)| {
+                eredu_runtime::ArchitectureStatePartitionRule::invocation(
+                    parameters
+                        .unit_layout()
+                        .address(ordinal)
+                        .expect("declared invocation"),
+                    unit.state.clone(),
+                )
+            }),
+    );
     eredu_runtime::ComponentDefinition::new(
         "text_decoder",
         parameters,

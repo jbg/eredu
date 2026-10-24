@@ -1412,6 +1412,19 @@ impl ArchitectureStatePartitionPlan {
                     });
                 }
             }
+            if let ArchitectureStatePlacement::Invocation { address } = rule.placement() {
+                if units.group_range(address.group()).is_none() {
+                    return Err(ArchitectureStatePartitionError::UnknownGroup {
+                        group: address.group(),
+                    });
+                }
+                if units.ordinal(address.group(), address.index()).is_none() {
+                    return Err(ArchitectureStatePartitionError::UnknownInvocation {
+                        group: address.group(),
+                        global_unit: address.index(),
+                    });
+                }
+            }
             frontier = layers.end;
         }
         if frontier != complete.len() {
@@ -1419,6 +1432,72 @@ impl ArchitectureStatePartitionPlan {
         }
 
         Ok(())
+    }
+
+    fn group_state_ranges(
+        &self,
+        units: &ExecutionUnitLayout,
+        group: usize,
+        owned: Range<usize>,
+    ) -> Result<Vec<Range<usize>>, ArchitectureStatePartitionError> {
+        let complete = units
+            .group_range(group)
+            .ok_or(ArchitectureStatePartitionError::UnknownGroup { group })?;
+        let ordinals = units
+            .contiguous_ordinals(group, owned.clone())
+            .ok_or_else(|| {
+                ArchitectureStatePartitionError::InvalidLayout(format!(
+                    "group {group} owned units {owned:?} are not a declared contiguous range"
+                ))
+            })?;
+        let mut selected = Vec::new();
+        for rule in self.rules() {
+            let layers = rule.layers();
+            match rule.placement() {
+                ArchitectureStatePlacement::GroupUnits { group: owner } if owner == group => {
+                    if layers.len() != complete.len() {
+                        return Err(ArchitectureStatePartitionError::GroupLengthMismatch {
+                            group,
+                            start: layers.start,
+                            end: layers.end,
+                            units: complete.len(),
+                        });
+                    }
+                    selected.push(
+                        layers.start + (ordinals.start - complete.start)
+                            ..layers.start + (ordinals.end - complete.start),
+                    );
+                }
+                ArchitectureStatePlacement::Invocation { address } if address.group() == group => {
+                    if units.ordinal(group, address.index()).is_none() {
+                        return Err(ArchitectureStatePartitionError::UnknownInvocation {
+                            group,
+                            global_unit: address.index(),
+                        });
+                    }
+                    if owned.contains(&address.index()) {
+                        selected.push(layers);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Projects one group's selected state span independently of its unit count.
+    /// Full plan validation establishes coverage; global-ordinal packing retains
+    /// unowned gaps as `NoState` entries in the selected partition layout.
+    pub fn group_state_range(
+        &self,
+        units: &ExecutionUnitLayout,
+        group: usize,
+        owned: Range<usize>,
+    ) -> Result<Option<Range<usize>>, ArchitectureStatePartitionError> {
+        Ok(self
+            .group_state_ranges(units, group, owned)?
+            .into_iter()
+            .reduce(|span, range| span.start.min(range.start)..span.end.max(range.end)))
     }
 
     /// Resolves exact rank-local state from global unit identities. Unit-aligned
@@ -1435,32 +1514,28 @@ impl ArchitectureStatePartitionPlan {
         if self.rules().is_empty() {
             return Ok(None);
         }
+        let groups = self
+            .rules()
+            .iter()
+            .filter_map(|rule| match rule.placement() {
+                ArchitectureStatePlacement::GroupUnits { group } => Some(group),
+                ArchitectureStatePlacement::Invocation { address } => Some(address.group()),
+                ArchitectureStatePlacement::OutputOwner => None,
+            })
+            .collect::<BTreeSet<_>>();
         let mut selected = Vec::new();
-        for rule in self.rules() {
-            let layers = rule.layers();
-            match rule.placement() {
-                ArchitectureStatePlacement::GroupUnits { group } => {
-                    if let Some(owned) = owned_units(group) {
-                        let ordinals = units.contiguous_ordinals(group, owned.clone()).ok_or_else(|| {
-                            ArchitectureStatePartitionError::InvalidLayout(format!(
-                                "group {group} owned units {owned:?} are not a declared contiguous range"
-                            ))
-                        })?;
-                        let base = units
-                            .group_range(group)
-                            .expect("validated state group")
-                            .start;
-                        selected.push(
-                            layers.start + (ordinals.start - base)
-                                ..layers.start + (ordinals.end - base),
-                        );
-                    }
-                }
-                ArchitectureStatePlacement::OutputOwner if owns_output => {
-                    selected.push(layers);
-                }
-                ArchitectureStatePlacement::OutputOwner => {}
+        for group in groups {
+            if let Some(owned) = owned_units(group) {
+                selected.extend(self.group_state_ranges(units, group, owned)?);
             }
+        }
+        if owns_output {
+            selected.extend(
+                self.rules()
+                    .iter()
+                    .filter(|rule| rule.placement() == ArchitectureStatePlacement::OutputOwner)
+                    .map(|rule| rule.layers()),
+            );
         }
         if selected.is_empty() {
             return Ok(None);
@@ -2039,12 +2114,19 @@ impl LayeredPartitionDriver {
             let state = partition
                 .state()
                 .ok_or(LayeredPartitionError::MissingState)?;
-            if state_range.len() != range.len()
+            if state_range.is_empty()
                 || state.global_layers().start > state_range.start
                 || state.global_layers().end < state_range.end
-                || state_range
-                    .clone()
-                    .any(|layer| !state.owns_global_layer(layer))
+                || state_range.clone().any(|layer| {
+                    !state.owns_global_layer(layer)
+                        && !matches!(
+                            state
+                                .layout()
+                                .layers()
+                                .get(layer - state.global_layer_offset()),
+                            Some(eredu_core::cache::LayerCachePolicy::NoState)
+                        )
+                })
             {
                 return Err(LayeredPartitionError::StateRange {
                     state: state.global_layers(),
