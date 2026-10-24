@@ -551,6 +551,7 @@ pub fn partition_local_routed_geometry(
     }
     crate::decoder::partition_local_geometry_with(
         args,
+        parameter_description(args)?.invocations(),
         layout,
         owned_units,
         |args, layer, layout| {

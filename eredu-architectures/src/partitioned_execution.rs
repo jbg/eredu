@@ -6310,6 +6310,7 @@ fn composite_partitioned_state_layout(
             let layout = derive_partitioned_local_layout(&parameters, rank)?;
             let geometry = crate::decoder::partition_local_geometry(
                 args,
+                parameters.invocations(),
                 &layout,
                 0..crate::decoder::Config::num_hidden_layers(args) as usize,
             )
@@ -6573,7 +6574,7 @@ where
     let layout = derive_partitioned_local_layout(&parameters, rank)?;
     let count = usize::try_from(args.num_hidden_layers())
         .map_err(|_| "dense-decoder layer count exceeds usize".to_owned())?;
-    crate::decoder::partition_local_geometry(args, &layout, 0..count)
+    crate::decoder::partition_local_geometry(args, parameters.invocations(), &layout, 0..count)
         .map(|geometry| geometry.complete_state_layout().clone())
         .map_err(|error| error.to_string())
 }
@@ -9773,8 +9774,13 @@ where
             "dense-decoder admission names a different execution group".into(),
         ));
     }
-    let geometry = crate::decoder::partition_local_geometry(&selected_args, &layout, owned.units())
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let geometry = crate::decoder::partition_local_geometry(
+        &selected_args,
+        parameters.invocations(),
+        &layout,
+        owned.units(),
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
     let partition = ArchitecturePartition::from_description(
@@ -9808,6 +9814,7 @@ where
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_geometry = crate::decoder::partition_local_geometry(
                 &source_args,
+                source_parameters.invocations(),
                 &source_layout,
                 owned.units(),
             )

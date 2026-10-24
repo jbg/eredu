@@ -5201,26 +5201,25 @@ impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionLocalGeometry<C> {
     owned_units: Range<usize>,
-    blocks: Vec<C>,
+    blocks: std::collections::BTreeMap<usize, C>,
     embedding_range: VocabularyParallelRange,
     output_range: Option<VocabularyParallelRange>,
     complete_state_layout: StateLayout,
 }
 
 impl<C: Config> PartitionLocalGeometry<C> {
-    /// Returns the architecture-global execution-unit range allocated locally.
+    /// Returns the logical invocation range owning this partition's cache slots.
     pub fn owned_units(&self) -> Range<usize> {
         self.owned_units.clone()
     }
 
-    /// Returns the local configuration for one architecture-global unit.
+    /// Returns one selected canonical parameter owner's construction geometry.
+    /// Its address may lie outside this partition's logical invocation range.
     pub fn block(&self, global_unit: usize) -> Option<&C> {
-        self.owned_units
-            .contains(&global_unit)
-            .then(|| &self.blocks[global_unit - self.owned_units.start])
+        self.blocks.get(&global_unit)
     }
 
-    /// Returns the number of locally allocated unit configurations.
+    /// Returns the number of selected physical owner configurations.
     pub fn local_unit_count(&self) -> usize {
         self.blocks.len()
     }
@@ -5239,9 +5238,10 @@ pub trait DecoderGeometry<C: Config>: 'static {
     const FINAL_TEXT_POSITION: bool = false;
     /// Complete local-head state geometry before pipeline slicing.
     fn complete_state_layout(&self) -> &StateLayout;
-    /// Architecture-global unit range physically owned by this kernel.
+    /// Logical invocation range owning this kernel's local cache slots.
     fn owned_units(&self) -> Range<usize>;
-    /// Configuration of one validated global unit.
+    /// Construction geometry of one selected canonical physical owner.
+    /// Mutable-state ownership is checked independently by `state_index`.
     fn block<'a>(&'a self, global: &'a C, index: usize) -> Result<&'a C, Error>;
     /// Ordinary ingress can require replicated state even on a TP-constructed kernel.
     fn ordinary_state_layout<'a>(
@@ -5322,8 +5322,11 @@ impl<C: Config> DecoderGeometry<C> for PartitionLocalGeometry<C> {
         self.owned_units.clone()
     }
     fn block<'a>(&'a self, _global: &'a C, index: usize) -> Result<&'a C, Error> {
-        self.state_index(index)?;
-        Ok(&self.blocks[index - self.owned_units.start])
+        self.block(index).ok_or_else(|| {
+            Error::backend(format!(
+                "decoder physical owner {index} is not selected for construction"
+            ))
+        })
     }
 }
 
@@ -5504,6 +5507,23 @@ where
                 "decoder module construction range differs from selected partition",
             ));
         }
+        let expected_storage = partition.invocations().storage_layout();
+        if !partition
+            .local_geometry()
+            .blocks
+            .keys()
+            .copied()
+            .eq((0..expected_storage.len()).map(|ordinal| {
+                expected_storage
+                    .address(ordinal)
+                    .expect("selected physical owner")
+                    .index()
+            }))
+        {
+            return Err(Error::backend(
+                "decoder factory geometry differs from selected parameter owners",
+            ));
+        }
         let owned = partition.local_geometry().owned_units();
         let state = partition
             .state()
@@ -5580,7 +5600,7 @@ where
         &mut self.static_modules
     }
 
-    /// Constructs an admitted unit and rejects every unowned global index.
+    /// Constructs an admitted physical owner, independently of local cache ownership.
     pub fn construct_unit(
         &self,
         global_unit: usize,
@@ -5591,15 +5611,20 @@ where
     }
 }
 
-/// Derives backend-free local decoder geometry for one selected PP range.
+/// Projects physical factory geometry from a complete invocation map and a selected PP range.
 pub fn partition_local_geometry<C: PartitionedConfig>(
     config: &C,
+    invocations: &eredu_runtime::ExecutionUnitAddressMap,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
 ) -> Result<PartitionLocalGeometry<C>, ParallelPlanError> {
-    partition_local_geometry_with(config, layout, owned_units, |config, unit, layout| {
-        config.local_block_config(unit, layout)
-    })
+    partition_local_geometry_with(
+        config,
+        invocations,
+        layout,
+        owned_units,
+        |config, unit, layout| config.local_block_config(unit, layout),
+    )
 }
 
 /// Derives partition-local decoder geometry with a family-owned block localizer.
@@ -5609,6 +5634,7 @@ pub fn partition_local_geometry<C: PartitionedConfig>(
 /// configuration. Static ownership and state geometry stay centralized here.
 pub(crate) fn partition_local_geometry_with<C, F>(
     config: &C,
+    invocations: &eredu_runtime::ExecutionUnitAddressMap,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
     mut localize: F,
@@ -5624,15 +5650,74 @@ where
             "decoder local unit range {owned_units:?} is outside {count} layers"
         )));
     }
-    let mut blocks = Vec::with_capacity(owned_units.len());
+    let invalid = |reason: String| ParallelPlanError::InvalidGroup(reason);
+    let group = (0..invocations.storage_layout().group_count())
+        .find(|&group| {
+            invocations
+                .storage_layout()
+                .group_id(group)
+                .is_some_and(|id| id.as_str() == TEXT_DECODER_EXECUTION_GROUP)
+        })
+        .ok_or_else(|| invalid("decoder geometry has no canonical execution group".into()))?;
+    let logical = invocations.logical_addresses().collect::<Vec<_>>();
+    let range = invocations
+        .group_range(group)
+        .expect("declared invocation group");
+    if range.len() != count
+        || logical[range.clone()]
+            .iter()
+            .enumerate()
+            .any(|(unit, address)| address.index() != unit)
+    {
+        return Err(invalid(
+            "decoder geometry has a different logical layer layout".into(),
+        ));
+    }
+    let selected = invocations
+        .select_invocations(owned_units.clone().map(|unit| logical[range.start + unit]))
+        .map_err(|error| invalid(error.to_string()))?;
+    let mut physical = std::collections::BTreeMap::new();
+    for ordinal in invocations
+        .storage_layout()
+        .group_range(group)
+        .expect("declared storage group")
+    {
+        let owner = invocations
+            .storage_layout()
+            .address(ordinal)
+            .expect("declared physical owner")
+            .index();
+        let local = localize(config, owner, layout)
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+        physical.insert(owner, local);
+    }
     let mut local_key_value_heads = Vec::with_capacity(count);
     for unit in 0..count {
-        let local = localize(config, unit, layout)
-            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-        local_key_value_heads.push(local.num_key_value_heads());
-        if owned_units.contains(&unit) {
-            blocks.push(local);
-        }
+        let ordinal = range.start + unit;
+        let address = logical[ordinal];
+        let owner = invocations
+            .resolve(ordinal, address)
+            .expect("validated storage mapping")
+            .storage_location()
+            .address()
+            .index();
+        local_key_value_heads.push(physical[&owner].num_key_value_heads());
+    }
+    let mut blocks = std::collections::BTreeMap::new();
+    for ordinal in selected
+        .storage_layout()
+        .group_range(group)
+        .expect("selected storage group")
+    {
+        let owner = selected
+            .storage_layout()
+            .address(ordinal)
+            .expect("selected owner")
+            .index();
+        blocks.insert(
+            owner,
+            physical.remove(&owner).expect("localized physical owner"),
+        );
     }
     let complete_state_layout = StateLayout::new(
         cache_layout_with_key_value_heads(config, local_key_value_heads)
@@ -5690,8 +5775,8 @@ pub(crate) fn validate_partitioned_decoder_description(
         .map_err(Error::backend)?;
     for layer in 0..layers {
         if !parameters.groups().iter().any(|owned| {
-            owned.owner()
-                == &eredu_runtime::ParameterGroupOwner::execution_unit(group_id.clone(), layer)
+            matches!(owned.owner(), eredu_runtime::ParameterGroupOwner::ExecutionUnit { group, consumers, .. }
+                if group == &group_id && consumers.contains(&layer))
         }) {
             return Err(Error::backend(format!(
                 "partitioned decoder parameter description omits unit {layer}"

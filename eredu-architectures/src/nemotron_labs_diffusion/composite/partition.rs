@@ -51,8 +51,12 @@ pub fn geometry(
         crate::nemotron_labs_diffusion::parallel::vision_local_widths(image, index, &layout)
             .map_err(Error::backend)?;
     }
+    let parameters =
+        crate::nemotron_labs_diffusion::parallel::composite_parameter_description(config)
+            .map_err(Error::backend)?;
     let complete = crate::decoder::partition_local_geometry(
         config,
+        parameters.invocations(),
         &layout,
         0..config.num_hidden_layers() as usize,
     )
@@ -60,7 +64,13 @@ pub fn geometry(
     let complete_state = complete.complete_state_layout().clone();
     let text = text
         .map(|range| {
-            crate::decoder::partition_local_geometry(config, &layout, range).map_err(Error::backend)
+            crate::decoder::partition_local_geometry(
+                config,
+                parameters.invocations(),
+                &layout,
+                range,
+            )
+            .map_err(Error::backend)
         })
         .transpose()?;
     Ok(Geometry {

@@ -140,6 +140,7 @@ pub fn partition_local_routed_geometry(
     validate_routed_realization(args, topology, realization)?;
     crate::decoder::partition_local_geometry_with(
         args,
+        parameter_description(args)?.invocations(),
         layout,
         owned_units,
         |args, layer, layout| {

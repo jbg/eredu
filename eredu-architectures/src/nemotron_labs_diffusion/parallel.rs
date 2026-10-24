@@ -383,7 +383,8 @@ pub fn partition(
             "shared text partition has a different parameter catalog".into(),
         ));
     }
-    let geometry = decoder::partition_local_geometry(config, layout, units.clone())?;
+    let geometry =
+        decoder::partition_local_geometry(config, parameters.invocations(), layout, units.clone())?;
     let definition = super::definition::text_partition(config, parameters, &geometry)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     eredu_runtime::ArchitecturePartition::from_description(

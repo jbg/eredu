@@ -403,7 +403,12 @@ pub fn partition_local_geometry(
     }
     let (vision_units, text_units) = partition_ranges(group_ranges)?;
     let complete = local_geometry(args, layout)?;
-    let text = qwen::partition_local_geometry(&args.text, layout, text_units.clone())?;
+    let text = qwen::partition_local_geometry(
+        &args.text,
+        qwen::dense_parameter_description(&args.text)?.invocations(),
+        layout,
+        text_units.clone(),
+    )?;
     finish_partition_geometry(
         args,
         complete,

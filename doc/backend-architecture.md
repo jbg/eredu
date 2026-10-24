@@ -3535,6 +3535,13 @@ projection also serves routed feed-forward policies. The body carries no termina
 parameter even when its invocation requests inter-pass normalization. The selected
 residency boundary remains the enclosing execution unit.
 
+Shared decoder partition geometry projects canonical factory owners from the retained
+invocation map. Selected physical configurations are keyed by owner identity, including
+owners outside the local logical range. Each physical owner is localized once; the
+complete tensor-local cache geometry projects its head dimensions to logical consumers.
+Cache indexing and state slicing retain the logical invocation range. Partition module
+construction checks the exact physical owner set before allocating static or unit modules.
+
 Nanbeige reuses the portable GQA/SwiGLU decoder blocks. `decoder::repeated`
 lowers physical checkpoint blocks to logical invocations with exact source
 aliases and an expanded attention schedule. The generic decoder's optional
