@@ -3542,6 +3542,15 @@ map through policy construction rather than reconstructing identity ownership fr
 module counts. Selected parameter ownership permits additional constructed consumers of
 the same canonical owner, while retaining every selected consumer.
 
+Shared decoder configurations explicitly declare each whole-block parameter owner.
+The parameter description groups logical consumers under that owner, and ordinary
+resident and bounded policies materialize its module once per owning partition.
+Cold recipes, projection topology and local construction geometry use canonical owner
+indices; cache state and observations retain logical invocation indices. Nanbeige reuses
+identical whole blocks across passes. When inter-pass normalization is enabled, its
+normalized last block and the final pass's unnormalized last block retain separate
+whole-block leases and body storage. Terminal normalization remains inside those leases.
+
 State placement rules can assign a slot range to an exact logical invocation. Stateless
 operations introduce no cache slots, and several consumers can reference one explicitly
 owned slot without duplicating it. Definition validation checks each invocation owner

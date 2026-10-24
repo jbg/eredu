@@ -2809,6 +2809,7 @@ impl EligibleConfig<'_> {
                 args.physical_layer_count(),
                 args.num_loops(),
                 !args.skip_loop_final_norm(),
+                |layer| crate::decoder::Config::block_parameter_owner(*args, layer),
             )?)?,
             Self::K2Horizon(args) => {
                 extend(crate::k2_horizon::linear_companion_recipes(source, args)?)?;
@@ -4263,6 +4264,9 @@ fn decoder_linear_parameter_shapes<C: crate::decoder::Config>(
     let layers = positive(config.num_hidden_layers(), "layer count")?;
     let mut result = BTreeMap::new();
     for layer in 0..layers {
+        if config.block_parameter_owner(layer) != layer {
+            continue;
+        }
         let layer_prefix = format!("{root}.layers.{layer}");
         let attention = format!("{layer_prefix}.{}", fields.attention);
         match config.attention_projection_layout() {

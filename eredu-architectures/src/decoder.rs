@@ -542,6 +542,14 @@ pub trait Config: 'static {
     fn hidden_size(&self) -> i32;
     /// Number of decoder layers.
     fn num_hidden_layers(&self) -> i32;
+    /// Canonical whole-block parameter owner for one logical invocation.
+    /// Owners are stable invocation indices and own identical construction policy,
+    /// including any terminal normalization. Mutable attention state remains local
+    /// to each invocation. Families declare sharing explicitly, independently of
+    /// checkpoint aliases.
+    fn block_parameter_owner(&self, layer: usize) -> usize {
+        layer
+    }
     /// Optional learned RMS normalization after a block's final residual.
     /// The returned canonical parameter belongs to that execution unit.
     fn block_output_normalization(&self, _layer: usize) -> Option<String> {
@@ -1166,7 +1174,7 @@ where
     let layers = usize::try_from(config.num_hidden_layers())
         .map_err(|_| ParallelPlanError::InvalidGroup("decoder layer count exceeds usize".into()))?;
     let blocks = (0..layers)
-        .map(|index| local_block(config, index, layout))
+        .map(|index| local_block(config, config.block_parameter_owner(index), layout))
         .collect::<Result<Vec<_>, _>>()?;
     let key_value_heads = blocks.iter().map(Config::num_key_value_heads);
     let state_layout = StateLayout::new(
@@ -3660,7 +3668,17 @@ pub(crate) fn parameter_description_with_formats(
         ));
     }
 
+    let mut consumers = std::collections::BTreeMap::<usize, Vec<usize>>::new();
     for layer in 0..layers {
+        let owner = config.block_parameter_owner(layer);
+        if owner >= layers || config.block_parameter_owner(owner) != owner {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "decoder invocation {layer} has invalid canonical parameter owner {owner}"
+            )));
+        }
+        consumers.entry(owner).or_default().push(layer);
+    }
+    for (layer, consumers) in consumers {
         let prefix = format!("{root}.layers.{layer}");
         let attention_prefix = format!("{prefix}.{}", fields.attention);
         let head_partition = attention_partition::AttentionPartition::new(config, layer)?;
@@ -3941,7 +3959,11 @@ pub(crate) fn parameter_description_with_formats(
         for group in unit_groups {
             let group = head_partition.apply(group, |name| format(name))?;
             owned.push(OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::execution_unit(group_id.clone(), layer),
+                ParameterGroupOwner::execution_unit_consumers(
+                    group_id.clone(),
+                    layer,
+                    consumers.iter().copied(),
+                ),
                 group,
             ));
         }

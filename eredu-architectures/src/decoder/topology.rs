@@ -182,6 +182,7 @@ pub(crate) fn text_with_feed_forward<C: Config>(
     let mut missing = Vec::new();
     let layers = (0..usize::try_from(config.num_hidden_layers()).map_err(Error::backend)?)
         .map(|layer| {
+            let owner = config.block_parameter_owner(layer);
             if config.external_attention_value(layer) {
                 missing.push(format!(
                     "layer {layer}: external attention-value provider invocation is not described"
@@ -203,7 +204,7 @@ pub(crate) fn text_with_feed_forward<C: Config>(
                         == eredu_nn::AttentionArithmetic::InputScores,
                     softcap: config.attention_softcap().is_some(),
                     sinks: config.learned_attention_sinks(),
-                    projections: attention_projections(config, layer)?
+                    projections: attention_projections(config, owner)?
                         .iter()
                         .map(|(_, s)| ProjectionTopology::from_spec(s))
                         .collect::<Result<_, _>>()?,
@@ -211,7 +212,7 @@ pub(crate) fn text_with_feed_forward<C: Config>(
                     query_key_normalization: config.query_key_norm_epsilon().is_some(),
                     rotary: config.rotary_enabled(),
                 },
-                feed_forward: feed_forward(layer)?,
+                feed_forward: feed_forward(owner)?,
                 normalization_count: 2
                     + u64::from(config.attention_output_normalization(layer).is_some())
                     + u64::from(config.feed_forward_output_normalization(layer).is_some())
