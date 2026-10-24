@@ -80,8 +80,7 @@ where
 }
 
 pub(in crate::composition::mlx::replicated_text) struct PreparedExactBindings {
-    layout: eredu_runtime::ExecutionUnitLayout,
-    addresses: Vec<eredu_runtime::ExecutionUnitAddress>,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
     excluded_parameters: std::collections::BTreeSet<String>,
@@ -210,8 +209,7 @@ where
         &mut self,
         architecture: &A,
         source_architecture: Option<&A>,
-        global_layout: &eredu_runtime::ExecutionUnitLayout,
-        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        invocations: &eredu_runtime::ExecutionUnitAddressMap,
         task_plan: &eredu_runtime::ReplicatedTextMaterializationPartitionPlan,
         units: &[A::Unit],
         source_units: Option<&[A::Unit]>,
@@ -219,12 +217,19 @@ where
         tasks: &[ReplicatedTextMaterializationTask],
         addressable_parameters: &std::collections::BTreeSet<String>,
     ) -> Result<(), Error> {
+        let addresses = (0..invocations.storage_layout().len())
+            .map(|ordinal| {
+                invocations
+                    .storage_layout()
+                    .address(ordinal)
+                    .expect("declared physical owner")
+            })
+            .collect::<Vec<_>>();
         if addresses.len() != units.len() || addresses.is_empty() {
             return Err(Error::ArchitectureModel(
                 "local partition addresses and constructed units differ".into(),
             ));
         }
-        let _ = global_layout;
         let static_tasks = task_plan
             .static_tasks(tasks)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -289,31 +294,17 @@ where
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let graph = architecture
-            .execution_graph()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                addresses
-                    .iter()
-                    .filter(|address| address.group() == group)
-                    .count()
-            })
-            .collect::<Vec<_>>();
-        let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, counts)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         (self.prepared_parameters, self.parameter_declarations) =
             super::prepared_parameters::collect::<A, S>(
                 architecture,
                 units,
-                addresses,
+                &addresses,
                 &static_bindings,
                 &unit_bindings,
                 self.store.as_ref(),
             )?;
         self.prepared_bindings = Some(PreparedExactBindings {
-            layout,
-            addresses: addresses.to_vec(),
+            invocations: invocations.clone(),
             static_bindings,
             unit_bindings,
             excluded_parameters,
@@ -344,22 +335,6 @@ where
         let prepared = self.prepared_bindings.take().ok_or_else(|| {
             Error::ArchitectureModel("execution policy requested before materialization".into())
         })?;
-        let addresses = eredu_runtime::ExecutionUnitAddressMap::new(
-            &prepared.layout,
-            prepared
-                .addresses
-                .iter()
-                .enumerate()
-                .map(|(ordinal, &address)| {
-                    (
-                        address,
-                        prepared
-                            .layout
-                            .address(ordinal)
-                            .expect("layout derived from selected addresses"),
-                    )
-                }),
-        )?;
         let mut ignored_sources = self.ignored_checkpoint_sources.clone();
         ignored_sources.extend(
             selected
@@ -405,7 +380,7 @@ where
             &self.stream,
             &self.weights_stream,
             move |key| ignored_sources.contains(key),
-            addresses,
+            prepared.invocations,
             prepared.static_bindings,
             prepared.unit_bindings,
             std::mem::take(&mut self.prediction_residency.units),
@@ -472,8 +447,7 @@ where
     fn prepare_partition_materialization(
         &mut self,
         architecture: &mut A,
-        global_layout: &eredu_runtime::ExecutionUnitLayout,
-        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        invocations: &eredu_runtime::ExecutionUnitAddressMap,
         task_partition: &eredu_runtime::ReplicatedTextMaterializationPartitionPlan,
         units: &mut [A::Unit],
         source_architecture: Option<&mut A>,
@@ -490,8 +464,7 @@ where
         self.prepare_local_partition_materialization_with_addressable_parameters(
             architecture,
             source_architecture.as_deref(),
-            global_layout,
-            addresses,
+            invocations,
             task_partition,
             units,
             source_units.as_deref(),
@@ -504,7 +477,7 @@ where
     fn prepare_materialization(
         &mut self,
         architecture: &mut A,
-        target_layout: &eredu_runtime::ExecutionUnitLayout,
+        invocations: &eredu_runtime::ExecutionUnitAddressMap,
         target_units: &mut [A::Unit],
         source_architecture: Option<&mut A>,
         source_units: Option<&mut [A::Unit]>,
@@ -512,6 +485,7 @@ where
         addressable_parameters: &[String],
         _context: &Stream,
     ) -> Result<(), Self::Error> {
+        let target_layout = invocations.storage_layout();
         if target_units.len() != target_layout.len() {
             return Err(Error::ArchitectureModel(
                 "neutral target unit set differs from the selected execution layout".into(),
@@ -586,8 +560,7 @@ where
                 self.store.as_ref(),
             )?;
         self.prepared_bindings = Some(PreparedExactBindings {
-            layout: target_layout.clone(),
-            addresses,
+            invocations: invocations.clone(),
             static_bindings,
             unit_bindings,
             excluded_parameters: addressable_parameters,

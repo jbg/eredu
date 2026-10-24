@@ -70,11 +70,20 @@ impl ParameterGroupOwner {
         }
     }
 
-    /// Compares exact ownership, allowing a constructed consumer declaration
-    /// to refine a selected static binding role.
+    /// Compares canonical ownership, allowing constructed consumers to refine
+    /// a selected binding role or extend its declared invocation consumers.
     pub fn refines_storage_owner(&self, selected: &Self) -> bool {
         self == selected
             || matches!(selected, Self::StaticRole(role) if self.accepts_static_role(role))
+            || matches!((self, selected), (
+                Self::ExecutionUnit { group, global_unit, consumers },
+                Self::ExecutionUnit {
+                    group: expected_group,
+                    global_unit: expected_unit,
+                    consumers: expected_consumers,
+                },
+            ) if group == expected_group && global_unit == expected_unit
+                && expected_consumers.iter().all(|unit| consumers.contains(unit)))
     }
 
     /// Compares canonical storage without copying consumer declarations or role names.

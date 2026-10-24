@@ -3535,6 +3535,13 @@ projection also serves routed feed-forward policies. The body carries no termina
 parameter even when its invocation requests inter-pass normalization. The selected
 residency boundary remains the enclosing execution unit.
 
+The neutral replicated and partitioned session constructors build target and optional
+transform-source modules in canonical storage order. They reject differing source and
+target ownership maps before materialization. Native binding preparation retains that
+map through policy construction rather than reconstructing identity ownership from
+module counts. Selected parameter ownership permits additional constructed consumers of
+the same canonical owner, while retaining every selected consumer.
+
 State placement rules can assign a slot range to an exact logical invocation. Stateless
 operations introduce no cache slots, and several consumers can reference one explicitly
 owned slot without duplicating it. Definition validation checks each invocation owner
