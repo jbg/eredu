@@ -1,12 +1,9 @@
 //! Shared pre-normalized residual block specialized to GPT-OSS routed experts.
 
-use eredu_nn::{
-    AttentionCache, Error, GroupedNeuralBackend, NormalizationConstructionSpec, ParameterSpec,
-    Tensor,
-};
+use eredu_nn::{AttentionCache, Error, GroupedNeuralBackend, Tensor};
 use eredu_runtime::{ExpertPass, ParameterProvider};
 
-use crate::decoder::{Attention, AttentionInput, BlockFactory};
+use crate::decoder::{AttentionInput, BlockFactory};
 
 use super::{config::ModelArgs, moe::RoutedMlp};
 
@@ -22,79 +19,21 @@ where
 {
     type FeedForward = RoutedMlp<B>;
 
-    fn build(
+    fn build_feed_forward(
         args: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B>, Error> {
-        let prefix = format!("{}.layers.{layer}", args.parameter_root);
-        Ok(crate::decoder::TransformerBlock {
-            body: crate::decoder::TransformerBlockBody {
-                attention_output_norm: None,
-                feed_forward_output_norm: None,
-                self_attention: Attention::new(args, layer, context)?,
-                mlp: RoutedMlp::new(args, layer, context)?,
-                input_norm: B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        args.hidden_size,
-                        args.rms_norm_eps,
-                        ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )?,
-                post_attention_norm: B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        args.hidden_size,
-                        args.rms_norm_eps,
-                        ParameterSpec::trainable(format!(
-                            "{prefix}.post_attention_layernorm.weight"
-                        ))
-                        .map_err(Error::backend)?,
-                    ),
-                    context,
-                )?,
-            },
-            output_norm: None,
-        })
+    ) -> Result<Self::FeedForward, Error> {
+        RoutedMlp::new(args, layer, context)
     }
 
-    fn build_partitioned(
+    fn build_partitioned_feed_forward(
         global: &ModelArgs,
         local: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B>, Error> {
-        let prefix = format!("{}.layers.{layer}", global.parameter_root);
-        Ok(crate::decoder::TransformerBlock {
-            body: crate::decoder::TransformerBlockBody {
-                attention_output_norm: None,
-                feed_forward_output_norm: None,
-                self_attention: Attention::new(local, layer, context)?,
-                mlp: RoutedMlp::new_partitioned(global, local, layer, context)?,
-                input_norm: B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        global.hidden_size,
-                        global.rms_norm_eps,
-                        ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )?,
-                post_attention_norm: B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        global.hidden_size,
-                        global.rms_norm_eps,
-                        ParameterSpec::trainable(format!(
-                            "{prefix}.post_attention_layernorm.weight"
-                        ))
-                        .map_err(Error::backend)?,
-                    ),
-                    context,
-                )?,
-            },
-            output_norm: None,
-        })
+    ) -> Result<Self::FeedForward, Error> {
+        RoutedMlp::new_partitioned(global, local, layer, context)
     }
 
     fn parameter_description(
@@ -111,7 +50,7 @@ pub fn new_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<TransformerBlock<B>, Error> {
-    <GptOssBlockFactory as BlockFactory<B, ModelArgs>>::build(args, layer, context)
+    TransformerBlock::from_factory::<_, GptOssBlockFactory>(args, args, layer, context)
 }
 
 /// Executes a block with runtime-owned expert residency.

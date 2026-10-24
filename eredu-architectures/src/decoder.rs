@@ -2570,13 +2570,34 @@ pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
 }
 
 impl<B: NeuralBackend> TransformerBlockBody<B, Mlp<B>> {
-    /// Constructs an unloaded body without allocating invocation terminal parameters.
+    /// Constructs an unloaded dense body without invocation terminal parameters.
     pub fn new<C: Config>(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::construct_with_terminal(config, layer, context, || Ok(())).map(|(body, ())| body)
+        Self::from_factory::<C, DenseBlockFactory>(config, config, layer, context)
+    }
+}
+
+impl<B: NeuralBackend, F> TransformerBlockBody<B, F> {
+    /// Constructs a body from shared attention/residual policy and a typed
+    /// feed-forward factory. Global routing and rank-local bank geometry remain distinct.
+    pub fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+        global: &C,
+        local: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        P::validate_partitioned(global, local)?;
+        Self::construct_with_terminal(
+            local,
+            layer,
+            context,
+            || Ok(()),
+            || P::build_partitioned_feed_forward(global, local, layer, context),
+        )
+        .map(|(body, ())| body)
     }
 
     fn construct_with_terminal<C: Config, T>(
@@ -2584,6 +2605,7 @@ impl<B: NeuralBackend> TransformerBlockBody<B, Mlp<B>> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
         terminal: impl FnOnce() -> Result<T, Error>,
+        feed_forward: impl FnOnce() -> Result<F, Error>,
     ) -> Result<(Self, T), Error> {
         let fields = config.block_parameter_fields().validate()?;
         let norm = |name: String| {
@@ -2615,7 +2637,7 @@ impl<B: NeuralBackend> TransformerBlockBody<B, Mlp<B>> {
                 attention_output_norm,
                 feed_forward_output_norm,
                 self_attention: Attention::new(config, layer, context)?,
-                mlp: Mlp::new(config, layer, context)?,
+                mlp: feed_forward()?,
                 input_norm: norm(format!(
                     "{}.layers.{layer}.{}.weight",
                     config.parameter_root(),
@@ -2632,30 +2654,56 @@ impl<B: NeuralBackend> TransformerBlockBody<B, Mlp<B>> {
     }
 }
 
+/// Constructs only a declared invocation's terminal normalization.
+/// Body parameters and mutable attention state are not allocated by this operation.
+pub fn terminal_normalization<B: NeuralBackend>(
+    config: &impl Config,
+    layer: usize,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<Option<B::Normalization>, Error> {
+    config
+        .block_output_normalization(layer)
+        .map(|name| {
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size(),
+                    config.rms_norm_epsilon(),
+                    parameter_spec(config, name).map_err(Error::backend)?,
+                ),
+                context,
+            )
+        })
+        .transpose()
+}
+
 impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
-    /// Constructs one unloaded body and its invocation-specific terminal normalization.
+    /// Constructs one unloaded dense body and its optional terminal normalization.
     pub fn new<C: Config>(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let (body, output_norm) =
-            TransformerBlockBody::construct_with_terminal(config, layer, context, || {
-                let output_norm = config
-                    .block_output_normalization(layer)
-                    .map(|name| {
-                        B::normalization(
-                            NormalizationConstructionSpec::learned(
-                                config.hidden_size(),
-                                config.rms_norm_epsilon(),
-                                parameter_spec(config, name).map_err(Error::backend)?,
-                            ),
-                            context,
-                        )
-                    })
-                    .transpose()?;
-                Ok(output_norm)
-            })?;
+        Self::from_factory::<C, DenseBlockFactory>(config, config, layer, context)
+    }
+}
+
+impl<B: NeuralBackend, F> TransformerBlock<B, F> {
+    /// Assembles the shared body and declared terminal without changing their
+    /// independent construction interfaces or canonical parameter names.
+    pub fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+        global: &C,
+        local: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        P::validate_partitioned(global, local)?;
+        let (body, output_norm) = TransformerBlockBody::construct_with_terminal(
+            local,
+            layer,
+            context,
+            || terminal_normalization::<B>(local, layer, context),
+            || P::build_partitioned_feed_forward(global, local, layer, context),
+        )?;
         Ok(Self { body, output_norm })
     }
 }
@@ -4809,7 +4857,8 @@ where
     })
 }
 
-/// Statically dispatched construction policy for one decoder block family.
+/// Typed projection construction and parameter policy for one decoder block family.
+/// The shared constructor owns attention, residual and terminal assembly.
 pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
     /// Architecture-selected feed-forward policy inside the shared block.
     type FeedForward: DecoderProjectionOperator<B>;
@@ -4820,26 +4869,31 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
         Ok(())
     }
 
-    /// Builds one unloaded decoder block.
-    fn build(
+    /// Admits factory-specific global/local policy before allocating body resources.
+    /// Ordinary factories validate local construction; routed factories retain
+    /// global cardinality checks independently of owner-local bank dimensions.
+    fn validate_partitioned(global: &C, local: &C) -> Result<(), Error> {
+        let _ = global;
+        Self::validate(local)
+    }
+
+    /// Builds the family-selected projection resources inside an ordinary body.
+    fn build_feed_forward(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B, Self::FeedForward>, Error>;
+    ) -> Result<Self::FeedForward, Error>;
 
-    /// Builds one partition-local block while retaining global family policy.
-    ///
-    /// Dense families use only the localized configuration. Routed families
-    /// override this hook so the router keeps global expert cardinality while
-    /// the grouped bank uses owner-local EP and TP geometry.
-    fn build_partitioned(
+    /// Retains global routing cardinality while constructing owner-local banks.
+    /// Ordinary dense projection policies consume only the localized configuration.
+    fn build_partitioned_feed_forward(
         global: &C,
         local: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B, Self::FeedForward>, Error> {
+    ) -> Result<Self::FeedForward, Error> {
         let _ = global;
-        Self::build(local, layer, context)
+        Self::build_feed_forward(local, layer, context)
     }
 
     /// Declares canonical global parameter topology without native resources.
@@ -4994,12 +5048,12 @@ pub struct DenseBlockFactory;
 impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
     type FeedForward = Mlp<B>;
 
-    fn build(
+    fn build_feed_forward(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B, Self::FeedForward>, Error> {
-        TransformerBlock::new(config, layer, context)
+    ) -> Result<Self::FeedForward, Error> {
+        Mlp::new(config, layer, context)
     }
 
     fn parameter_description(
@@ -5643,7 +5697,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B, P::FeedForward>, Error> {
         let config = self.geometry.block(&self.args, global_unit)?;
-        P::build_partitioned(&self.args, config, global_unit, context)
+        TransformerBlock::from_factory::<C, P>(&self.args, config, global_unit, context)
     }
 }
 

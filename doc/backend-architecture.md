@@ -3528,12 +3528,22 @@ feed-forward and residual-normalization parameters. Its execution entry points a
 an optional borrowed terminal module for each invocation. Serial, observed,
 tensor-parallel, routed and low-rank operations use the same projection equation and
 preserve component observation timing. Callers retain both resources through the ordinary
-completion scope. Parameter traversal retains canonical names and order across both
-aggregates. Dense body construction and live parameter projection operate on the body
+completion scope. Parameter traversal retains canonical names and module structure across
+both aggregates. Body construction and live parameter projection operate on the body
 alone; complete invocations supply their terminal normalization separately. Common body
 projection also serves routed feed-forward policies. The body carries no terminal
 parameter even when its invocation requests inter-pass normalization. The selected
 residency boundary remains the enclosing execution unit.
+
+The shared decoder constructor owns attention, residual normalization and optional
+terminal construction for dense, Qwen, GPT-OSS and K2 blocks. Typed `BlockFactory`
+hooks supply their projection resources and parameter topology. Partitioned hooks retain
+global routing cardinality while constructing rank-local expert banks and routed values.
+`TransformerBlockBody::from_factory` constructs those resources without a terminal;
+`terminal_normalization` constructs only the declared terminal module. Complete block
+construction uses the same body builder and terminal specification. Normalization groups,
+scale offsets, parameter aliases and optional post-residual normalizations come from the
+retained family configuration.
 
 The neutral replicated and partitioned session constructors build target and optional
 transform-source modules in canonical storage order. They reject differing source and

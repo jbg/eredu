@@ -36,10 +36,7 @@ pub use crate::decoder::{
 };
 
 use eredu_core::cache::PromptCacheTopology;
-use eredu_nn::{
-    Error, GroupedNeuralBackend, NeuralBackend, NormalizationConstructionSpec, ParameterSpec,
-    Tensor,
-};
+use eredu_nn::{Error, GroupedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{ModelStateIdentity, StateLayout};
 
 /// Dense Qwen decoder block.
@@ -47,47 +44,6 @@ pub type TransformerBlock<B> = crate::decoder::TransformerBlock<B>;
 
 /// Qwen decoder block selected dynamically between dense and routed feed-forward policy.
 pub type RoutedTransformerBlock<B> = crate::decoder::TransformerBlock<B, FeedForward<B>>;
-
-fn assemble_block<B: NeuralBackend, F>(
-    args: &ModelArgs,
-    layer: usize,
-    mlp: F,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<crate::decoder::TransformerBlock<B, F>, Error> {
-    Ok(crate::decoder::TransformerBlock {
-        body: crate::decoder::TransformerBlockBody {
-            attention_output_norm: None,
-            feed_forward_output_norm: None,
-            self_attention: Attention::new(args, layer, context)?,
-            mlp,
-            input_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.input_layernorm.weight",
-                        args.parameter_root
-                    ))
-                    .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            post_attention_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.post_attention_layernorm.weight",
-                        args.parameter_root
-                    ))
-                    .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-        },
-        output_norm: None,
-    })
-}
 
 /// Statically dispatched dense Qwen block construction policy.
 pub struct QwenBlockFactory;
@@ -98,7 +54,7 @@ pub fn new_block<B: NeuralBackend>(
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<TransformerBlock<B>, Error> {
-    <QwenBlockFactory as crate::decoder::BlockFactory<B, ModelArgs>>::build(args, layer, context)
+    TransformerBlock::from_factory::<_, QwenBlockFactory>(args, args, layer, context)
 }
 
 impl<B> crate::decoder::BlockFactory<B, ModelArgs> for QwenBlockFactory
@@ -116,13 +72,12 @@ where
         Ok(())
     }
 
-    fn build(
+    fn build_feed_forward(
         args: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B>, Error> {
-        <Self as crate::decoder::BlockFactory<B, ModelArgs>>::validate(args)?;
-        assemble_block(args, layer, Mlp::new(args, layer, context)?, context)
+    ) -> Result<Self::FeedForward, Error> {
+        Mlp::new(args, layer, context)
     }
 
     fn parameter_description(
@@ -201,37 +156,31 @@ where
 {
     type FeedForward = FeedForward<B>;
 
-    fn build(
+    fn validate_partitioned(global: &ModelArgs, local: &ModelArgs) -> Result<(), Error> {
+        if global.is_moe() != local.is_moe() {
+            return Err(Error::backend("global and local Qwen equations differ"));
+        }
+        Ok(())
+    }
+
+    fn build_feed_forward(
         args: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RoutedTransformerBlock<B>, Error> {
-        assemble_block(
-            args,
-            layer,
-            FeedForward::new(args, layer, context)?,
-            context,
-        )
+    ) -> Result<Self::FeedForward, Error> {
+        FeedForward::new(args, layer, context)
     }
 
-    fn build_partitioned(
+    fn build_partitioned_feed_forward(
         global: &ModelArgs,
         local: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RoutedTransformerBlock<B>, Error> {
-        if global.is_moe() != local.is_moe() {
-            return Err(Error::backend("global and local Qwen equations differ"));
-        }
+    ) -> Result<Self::FeedForward, Error> {
         if !global.is_moe() {
-            return Self::build(local, layer, context);
+            return Self::build_feed_forward(local, layer, context);
         }
-        assemble_block(
-            local,
-            layer,
-            FeedForward::new_partitioned(global, local, layer, context)?,
-            context,
-        )
+        FeedForward::new_partitioned(global, local, layer, context)
     }
 
     fn parameter_description(
@@ -248,9 +197,7 @@ pub fn new_routed_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<RoutedTransformerBlock<B>, Error> {
-    <RoutedQwenBlockFactory as crate::decoder::BlockFactory<B, ModelArgs>>::build(
-        args, layer, context,
-    )
+    RoutedTransformerBlock::from_factory::<_, RoutedQwenBlockFactory>(args, args, layer, context)
 }
 
 /// Builds one partition-local routed block with a global router and the exact
@@ -263,9 +210,7 @@ pub fn new_partitioned_routed_block<
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<RoutedTransformerBlock<B>, Error> {
-    <RoutedQwenBlockFactory as crate::decoder::BlockFactory<B, ModelArgs>>::build_partitioned(
-        global, local, layer, context,
-    )
+    RoutedTransformerBlock::from_factory::<_, RoutedQwenBlockFactory>(global, local, layer, context)
 }
 
 /// Layered Qwen lifecycle for adapters that dynamically admit dense and MoE configurations.
