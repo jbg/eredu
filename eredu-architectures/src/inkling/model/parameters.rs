@@ -136,6 +136,33 @@ pub fn component_definition(
 ) -> Result<eredu_runtime::ComponentDefinition, Error> {
     args.validate().map_err(Error::backend_source)?;
     let parameters = declare_parameters(args)?;
+    let state = component_state(args, geometry)?;
+    let units = component_units(&parameters);
+    let ownership = state_partition_plan(&state);
+    eredu_runtime::ComponentDefinition::new(
+        "inkling",
+        parameters,
+        units,
+        (0..3).map(group_transport).collect(),
+        TEXT_EXECUTION_GROUP,
+        vec![],
+        state,
+        ownership,
+    )
+    .map_err(Error::from)
+}
+
+/// Projects the canonical parameter catalog without allocating a backend resource.
+pub fn parameter_description(args: &ModelArgs) -> Result<ArchitectureParameterDescription, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    component_state(args, None)?;
+    declare_parameters(args)
+}
+
+fn component_state(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
+) -> Result<eredu_runtime::StateLayout, Error> {
     let target = match geometry {
         Some(geometry) => {
             geometry.validate_for(args).map_err(Error::backend_source)?;
@@ -151,8 +178,13 @@ pub fn component_definition(
             .transpose()
             .map_err(Error::backend_source)?,
     };
-    let state = InklingStateLayouts::new(target, prediction)?.composite;
-    let units = (0..parameters.unit_layout().len())
+    Ok(InklingStateLayouts::new(target, prediction)?.composite)
+}
+
+fn component_units(
+    parameters: &ArchitectureParameterDescription,
+) -> Vec<eredu_runtime::ComponentUnit> {
+    (0..parameters.unit_layout().len())
         .map(|ordinal| {
             let address = parameters
                 .unit_layout()
@@ -171,22 +203,136 @@ pub fn component_definition(
                 _ => unreachable!("Inkling audio has pinned resources and no execution units"),
             }
         })
-        .collect();
-    let ownership = state_partition_plan(&state);
-    eredu_runtime::ComponentDefinition::new(
-        "inkling",
-        parameters,
-        units,
-        (0..3).map(group_transport).collect(),
-        TEXT_EXECUTION_GROUP,
-        vec![],
-        state,
-        ownership,
-    )
-    .map_err(Error::from)
+        .collect()
 }
 
-/// Projects the canonical parameter catalog without allocating a backend resource.
-pub fn parameter_description(args: &ModelArgs) -> Result<ArchitectureParameterDescription, Error> {
-    component_definition(args, None).map(eredu_runtime::ComponentDefinition::into_parameters)
+fn invalid(definition: &eredu_runtime::ComponentDefinition, resource: impl Into<String>) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+
+fn validate_identity(definition: &eredu_runtime::ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != "inkling" {
+        return Err(invalid(definition, "Inkling component identity"));
+    }
+    Ok(())
+}
+
+/// Selects physical parameter formats while retaining logical consumers and state identities.
+pub fn project_parameters(
+    args: &ModelArgs,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_identity(definition)?;
+    let parameters = parameter_description(args)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+pub(crate) fn select_definition(
+    args: &ModelArgs,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&LocalGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    validate_identity(&definition)?;
+    definition.validate_parameter_topology(&declare_parameters(args)?)?;
+    let state = component_state(args, geometry)?;
+    let global = component_state(args, None)?;
+    if definition.state_layout() != &global && definition.state_layout() != &state {
+        return Err(invalid(
+            &definition,
+            "Inkling retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained =
+            crate::inkling::local_geometry(args, layout).map_err(Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: args.text_config.vocab_size as usize,
+            local: 0..args.text_config.vocab_size as usize,
+        };
+        if component_state(args, Some(&retained))? != state
+            || retained.embedding_range() != geometry.map_or(&full, LocalGeometry::embedding_range)
+            || retained.output_range() != geometry.map_or(&full, LocalGeometry::output_range)
+            || retained
+                .text_layers()
+                .iter()
+                .enumerate()
+                .any(|(index, layer)| {
+                    let expected = geometry
+                        .and_then(|geometry| geometry.text_layer(index))
+                        .unwrap_or(&args.text_config);
+                    layer.dense_intermediate_size() != expected.dense_intermediate_size()
+                        || layer.moe_intermediate_size() != expected.moe_intermediate_size()
+                        || [false, true].into_iter().any(|local| {
+                            layer.query_heads(local) != expected.query_heads(local)
+                                || layer.key_value_heads(local) != expected.key_value_heads(local)
+                                || layer.attention_head_dim(local)
+                                    != expected.attention_head_dim(local)
+                        })
+                })
+        {
+            return Err(invalid(
+                &definition,
+                "Inkling retained placement differs from selected geometry",
+            ));
+        }
+    }
+    if definition.primary_group() != TEXT_EXECUTION_GROUP
+        || !definition.prediction_groups().is_empty()
+        || definition.state_partition_plan() != &state_partition_plan(&state)
+    {
+        return Err(invalid(&definition, "Inkling execution or state ownership"));
+    }
+    for group in 0..3 {
+        if definition.group_transport(group)? != &group_transport(group) {
+            return Err(invalid(
+                &definition,
+                format!("Inkling group {group} transport"),
+            ));
+        }
+    }
+    for (ordinal, unit) in component_units(definition.parameters()).iter().enumerate() {
+        let address = definition
+            .parameters()
+            .unit_layout()
+            .address(ordinal)
+            .expect("declared Inkling unit");
+        if definition.unit(address.group(), address.index())? != unit
+            || definition
+                .unit_observation_boundaries(address.group(), address.index())?
+                .is_kernel_owned()
+        {
+            return Err(invalid(
+                &definition,
+                format!(
+                    "Inkling unit {}:{} equation geometry",
+                    address.group(),
+                    address.index()
+                ),
+            ));
+        }
+    }
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(Error::from)
+    }
 }

@@ -8123,13 +8123,24 @@ where
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
         let capability = crate::capability::inkling(args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let parent_definition = self
+            .requirements
+            .execution()
+            .shared_component_definition()
+            .ok_or_else(|| {
+                ReplicatedTextDispatchError::Architecture(
+                    "composite selection has no retained definition".into(),
+                )
+            })?;
         let source = self
             .has_transform
             .then(|| crate::inkling::with_checkpoint_formats(args, self.source_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
             .map(|args| {
-                crate::inkling::InklingKernel::<B>::new(args, self.context)
+                let definition =
+                    crate::inkling::model::project_parameters(&args, &parent_definition)?;
+                crate::inkling::InklingKernel::<B>::from_definition(args, definition, self.context)
                     .and_then(crate::inkling::InklingKernel::into_model)
             })
             .transpose()
@@ -8138,9 +8149,12 @@ where
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.model_type.clone();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::inkling::InklingKernel::<B>::new(target, self.context)
-            .and_then(crate::inkling::InklingKernel::into_model)
+        let definition = crate::inkling::model::project_parameters(&target, &parent_definition)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture =
+            crate::inkling::InklingKernel::<B>::from_definition(target, definition, self.context)
+                .and_then(crate::inkling::InklingKernel::into_model)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,
@@ -8270,12 +8284,22 @@ where
         CompositeConfig::Inkling(args) => {
             let capability = crate::capability::inkling(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let parent_definition = requirements
+                .execution()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    ReplicatedTextDispatchError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
             let source = has_transform
                 .then(|| crate::inkling::with_checkpoint_formats(args, source_formats))
                 .transpose()
                 .map_err(ReplicatedTextDispatchError::Architecture)?
                 .map(|args| {
-                    crate::inkling::InklingKernel::<B>::new(args, context)
+                    let definition =
+                        crate::inkling::model::project_parameters(&args, &parent_definition)?;
+                    crate::inkling::InklingKernel::<B>::from_definition(args, definition, context)
                         .and_then(crate::inkling::InklingKernel::into_model)
                 })
                 .transpose()
@@ -8284,9 +8308,14 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let effective_model_type = target.model_type.clone();
             let cache_identity = target.architecture_fingerprint();
-            let architecture = crate::inkling::InklingKernel::<B>::new(target, context)
-                .and_then(crate::inkling::InklingKernel::into_model)
+            let definition = crate::inkling::model::project_parameters(&target, &parent_definition)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture =
+                crate::inkling::InklingKernel::<B>::from_definition(target, definition, context)
+                    .and_then(crate::inkling::InklingKernel::into_model)
+                    .map_err(|error| {
+                        ReplicatedTextDispatchError::Architecture(error.to_string())
+                    })?;
             visit_constructed_prediction_target!(
                 architecture,
                 source,

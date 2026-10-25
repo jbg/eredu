@@ -9193,6 +9193,20 @@ boundaries. Family composite admission uses that same adapter. Specialized MTP
 operations borrow the kernel's target embeddings and readout through the
 ordinary parameter and completion lifecycle; they retain independent prediction
 state. Raw kernel operations remain available through typed kernel access.
+
+Low-level construction consumes an explicit retained `Arc<ComponentDefinition>`
+through `InklingKernel::from_definition` or `from_parallel_definition`. Complete,
+partitioned and externally paired prediction-target preparation project executable
+formats from the admitted parent. Source-format modules retain their own bindings
+and placement. Family unit, transport and composite-state producers also validate
+logical paths, state references and observation ownership before native allocation.
+Identical formats and geometry reuse the declaration allocation. State projection
+accepts the global layout or an identical retained local layout, including all
+short-convolution histories and independent prediction segments. Retained placement
+must agree with selected vocabulary ownership and attention/feed-forward geometry.
+Canonical parameter inspection validates family state geometry without constructing
+a separate invocation and observation declaration.
+
 Partition construction consumes the exact declared selection, derives its cache
 offset from selected state and retains only canonical pinned roles owned there.
 Source-format and execution-format partitions retain their own selected modules

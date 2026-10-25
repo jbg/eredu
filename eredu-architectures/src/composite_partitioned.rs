@@ -2819,9 +2819,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::inkling::parameter_description(&args).map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::inkling::model::project_parameters(&args, &retained).map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2856,8 +2868,9 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::InklingKernel::<B>::new_parallel(
+            let mut architecture = crate::inkling::InklingKernel::<B>::from_parallel_definition(
                 args.clone(),
+                definition,
                 std::sync::Arc::new(local),
                 context,
             )
@@ -3323,8 +3336,15 @@ where
         ),
     )?;
     let source = &source_args;
-    let parameters = crate::inkling::parameter_description(source)
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition = crate::inkling::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
+    let parameters = definition.parameters().clone();
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()
     {
@@ -3366,8 +3386,9 @@ where
     {
         return Err("Inkling transform source changed partition state or ownership".into());
     }
-    let mut architecture = crate::inkling::InklingKernel::<B>::new_parallel(
+    let mut architecture = crate::inkling::InklingKernel::<B>::from_parallel_definition(
         source.clone(),
+        definition,
         std::sync::Arc::new(local),
         context,
     )
@@ -3731,9 +3752,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::inkling::parameter_description(&args).map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::inkling::model::project_parameters(&args, &retained).map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -3768,8 +3801,9 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::InklingKernel::<B>::new_parallel(
+            let mut architecture = crate::inkling::InklingKernel::<B>::from_parallel_definition(
                 args.clone(),
+                definition,
                 std::sync::Arc::new(local),
                 context,
             )

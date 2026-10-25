@@ -15,7 +15,7 @@ pub type LayeredModel<B> = ComponentAdapter<
 >;
 
 mod parameters;
-pub use parameters::{component_definition, parameter_description};
+pub use parameters::{component_definition, parameter_description, project_parameters};
 
 use std::sync::Arc;
 
@@ -712,8 +712,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
     }
 
     /// Builds unloaded pinned modules from normalized family configuration.
-    pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let definition = Arc::new(component_definition(&args, None)?);
+    pub fn from_definition(
+        args: ModelArgs,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let definition = parameters::select_definition(&args, definition, None)?;
         crate::operator_requirements::require::<B>(
             "Inkling",
             crate::operator_requirements::INKLING,
@@ -730,12 +734,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
     }
 
     /// Builds one planner-derived rank-local realization of the canonical graph.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         args: ModelArgs,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         geometry: Arc<LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = Arc::new(component_definition(&args, Some(&geometry))?);
+        let definition = parameters::select_definition(&args, definition, Some(&geometry))?;
         crate::operator_requirements::require::<B>(
             "Inkling",
             crate::operator_requirements::INKLING,
