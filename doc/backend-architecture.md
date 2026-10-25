@@ -12781,3 +12781,19 @@ and sharing. A mismatch returns a typed component/resource error. Retained rank
 placement remains independent authority. Dense, routed Qwen, GPT-OSS, K2 and
 Nemotron-Labs-Diffusion use their existing declaration producers for this check;
 expert-bank and draft-adapter geometry stay family-owned.
+
+Nemotron-Labs-Diffusion text materialization consumes its retained family
+`ComponentDefinition` in complete, tensor-local and partitioned construction.
+The shared decoder checks equation paths, operation/state geometry and hook
+ownership independently of the component's discovery identifier. The family
+retains its text identity and specialized causal, diffusion and draft semantics;
+no second base-decoder declaration is required. Local-state projection preserves
+observation seams and parameter references, including draft-adapter ownership.
+
+Text preparation shares the admitted source declaration with transformation
+sources. Selected formats project only canonical parameter geometry through
+`project_text_parameters`; identical parameter descriptions reuse the retained
+allocation. Partition construction consumes those declarations and their state
+rules. Composite construction supplies an explicit child text declaration to the
+same materializers. Image assembly and cross-component state transport remain
+family-owned.

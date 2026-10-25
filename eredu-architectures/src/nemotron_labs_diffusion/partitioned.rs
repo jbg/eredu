@@ -139,19 +139,14 @@ impl<B: DistributedNeuralBackend>
     /// Materializes only resources authorized by the selected declaration.
     pub fn from_partition(
         config: FamilyConfig,
-        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<
             decoder::PartitionLocalGeometry<FamilyConfig>,
             TextBoundarySchema,
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PartitionedTextModel<B>, Error> {
-        let definition = std::sync::Arc::new(super::definition::text_partition(
-            &config,
-            parameters,
-            partition.local_geometry(),
-        )?);
-        definition.select_partition(partition)?;
+        super::definition::validate_text_identity(&definition)?;
         if partition.boundary_schema() != &TextBoundarySchema::new(config.hidden_size()) {
             return Err(eredu_runtime::ComponentDefinitionError::Invalid {
                 component: definition.id().to_owned(),
@@ -159,15 +154,9 @@ impl<B: DistributedNeuralBackend>
             }
             .into());
         }
-        let base_definition = std::sync::Arc::new(decoder::component_definition(
-            &config,
-            parameters.clone(),
-            partition.local_geometry().complete_state_layout().clone(),
-        )?);
-        let base =
-            decoder::DecoderKernel::from_partition(config, base_definition, partition, context)?
-                .into_parts()
-                .1;
+        let (definition, base, _) =
+            decoder::DecoderKernel::from_partition(config, definition, partition, context)?
+                .into_parts();
         let kernel = Self {
             definition: definition.clone(),
             base,

@@ -12,6 +12,13 @@ calls borrow a read-only cache and attend to the prefix plus the complete suppli
 block. Both use the same static modules and independently addressable layers.
 Parameter storage is separate from the transient canvas and cache state.
 
+Low-level text construction uses `TextKernel::from_definition`,
+`from_parallel_definition` or `from_partition` with an explicit retained text
+declaration. `definition::text` and `definition::text_partition` declare these
+resources without a native context. Executable format selection uses
+`definition::project_text_parameters` and retains the same operation and state
+identities.
+
 The dense attention equation uses an explicit independent `head_dim`, YaRN
 with input-precision rotary products and eager input-score/probability rounding,
 and the published position-dependent query gain

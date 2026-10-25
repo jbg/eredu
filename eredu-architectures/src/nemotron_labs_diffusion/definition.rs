@@ -8,6 +8,39 @@ use eredu_runtime::{
     StateLayout,
 };
 
+const TEXT_COMPONENT_ID: &str = "nemotron_labs_diffusion_text";
+
+/// Retains text semantics while selecting the family's exact executable parameter formats.
+pub fn project_text_parameters(
+    config: &FamilyConfig,
+    definition: &std::sync::Arc<ComponentDefinition>,
+) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
+    validate_text_identity(definition)?;
+    let parameters =
+        super::parallel::parameter_description(config).map_err(Error::backend_source)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+pub(crate) fn validate_text_identity(definition: &ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != TEXT_COMPONENT_ID {
+        return Err(ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "shared-backbone text component identity".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Declares a complete shared text stack, optionally at retained tensor-local geometry.
 pub fn text(
     config: &FamilyConfig,
@@ -90,7 +123,7 @@ fn build(
     let id = if composite {
         "nemotron_labs_diffusion_composite"
     } else {
-        "nemotron_labs_diffusion_text"
+        TEXT_COMPONENT_ID
     };
     let invalid = |resource: &str| {
         Error::from(ComponentDefinitionError::Invalid {

@@ -225,7 +225,7 @@ impl<B: DistributedNeuralBackend> super::CompositeKernel<B, StaticModules<B>> {
             Some(
                 PartitionedTextKernel::from_partition(
                     config.clone(),
-                    &description,
+                    std::sync::Arc::new(text_definition),
                     &text_partition,
                     context,
                 )?

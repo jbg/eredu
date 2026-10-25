@@ -6907,8 +6907,7 @@ fn validate_complete_definition<C: Config>(
     state: &StateLayout,
 ) -> Result<(), Error> {
     let schedule = DecoderSchedule::new(args)?;
-    if definition.id() != "text_decoder"
-        || definition.parameters().graph().groups().len() != 1
+    if definition.parameters().graph().groups().len() != 1
         || definition.primary_group() != TEXT_DECODER_EXECUTION_GROUP
         || definition.unit_count(0)? != schedule.len()
         || definition.state_layout() != state

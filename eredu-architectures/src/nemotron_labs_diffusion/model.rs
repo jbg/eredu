@@ -798,50 +798,37 @@ impl<B: NeuralBackend> RefinementComponentKernel<B> for TextKernel<B> {
 }
 
 impl<B: NeuralBackend> TextKernel<B> {
-    /// Materializes the complete declared text resources.
-    pub fn new(
+    /// Materializes complete text resources from the retained semantic declaration.
+    pub fn from_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextModel<B>, Error> {
-        let definition = std::sync::Arc::new(super::definition::text(&config, None)?);
-        let base_definition = std::sync::Arc::new(decoder::component_definition(
-            &config,
-            decoder::dense_parameter_description(&config).map_err(Error::backend_source)?,
-            decoder::state_layout(&config)?,
-        )?);
-        let base =
-            decoder::CompleteDecoderKernel::from_definition(config, base_definition, context)?
-                .into_parts()
-                .1;
+        super::definition::validate_text_identity(&definition)?;
+        let (definition, base, _) =
+            decoder::CompleteDecoderKernel::from_definition(config, definition, context)?
+                .into_parts();
         let kernel = Self {
             definition: definition.clone(),
             base,
         };
         ComponentAdapter::with_pinned_resources::<B>(definition, kernel).map_err(Error::from)
     }
-    /// Materializes exact tensor-local complete text resources.
-    pub fn new_parallel(
+    /// Materializes exact tensor-local text resources, retaining all other semantic facts.
+    pub fn from_parallel_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<ComponentDefinition>,
         geometry: decoder::LocalGeometry<FamilyConfig>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextModel<B>, Error>
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let definition = std::sync::Arc::new(super::definition::text(&config, Some(&geometry))?);
-        let base_definition = std::sync::Arc::new(decoder::component_definition(
-            &config,
-            decoder::dense_parameter_description(&config).map_err(Error::backend_source)?,
-            geometry.state_layout().clone(),
-        )?);
-        let base = decoder::CompleteDecoderKernel::from_parallel_definition(
-            config,
-            base_definition,
-            geometry,
-            context,
+        super::definition::validate_text_identity(&definition)?;
+        let (definition, base, _) = decoder::CompleteDecoderKernel::from_parallel_definition(
+            config, definition, geometry, context,
         )?
-        .into_parts()
-        .1;
+        .into_parts();
         let kernel = Self {
             definition: definition.clone(),
             base,

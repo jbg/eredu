@@ -2308,9 +2308,18 @@ where
         validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         visitor.construction_started();
+        let retained = requirements.shared_component_definition().ok_or_else(|| {
+            ReplicatedTextDispatchError::Architecture(
+                "shared-backbone selection has no retained definition".into(),
+            )
+        })?;
         let source = selected_uses_transform(&selected)
             .then(|| {
-                crate::nemotron_labs_diffusion::model::TextKernel::<B>::new(config.clone(), context)
+                crate::nemotron_labs_diffusion::model::TextKernel::<B>::from_definition(
+                    config.clone(),
+                    retained.clone(),
+                    context,
+                )
             })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -2321,9 +2330,13 @@ where
         let capability = crate::capability::nemotron_labs_diffusion(&target, false)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let effective_model_type = target.model_identity().to_owned();
-        let architecture =
-            crate::nemotron_labs_diffusion::model::TextKernel::<B>::new(target, context)
+        let definition =
+            crate::nemotron_labs_diffusion::definition::project_text_parameters(&target, &retained)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture = crate::nemotron_labs_diffusion::model::TextKernel::<B>::from_definition(
+            target, definition, context,
+        )
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let prepared = prepare_architecture_handoff::<B, S, _>(
             architecture,
             source,

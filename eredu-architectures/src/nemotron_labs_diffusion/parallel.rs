@@ -367,7 +367,7 @@ pub(crate) fn vision_local_widths(
 /// cache geometry and request-semantic transport before backend construction.
 pub fn partition(
     config: &FamilyConfig,
-    parameters: &ArchitectureParameterDescription,
+    definition: &eredu_runtime::ComponentDefinition,
     layout: &eredu_runtime::LocalModelLayout,
     units: std::ops::Range<usize>,
     ownership: eredu_runtime::PartitionOwnership,
@@ -378,14 +378,17 @@ pub fn partition(
     >,
     ParallelPlanError,
 > {
-    if parameter_description(config)? != *parameters {
-        return Err(ParallelPlanError::InvalidGroup(
-            "shared text partition has a different parameter catalog".into(),
-        ));
-    }
+    super::definition::validate_text_identity(definition)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    definition
+        .validate_parameter_topology(&parameter_description(config)?)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let parameters = definition.parameters();
     let geometry =
         decoder::partition_local_geometry(config, parameters.invocations(), layout, units.clone())?;
-    let definition = super::definition::text_partition(config, parameters, &geometry)
+    let definition = definition
+        .clone()
+        .with_state_layout(geometry.complete_state_layout().clone())
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     eredu_runtime::ArchitecturePartition::from_description(
         parameters,
