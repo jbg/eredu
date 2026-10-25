@@ -8415,6 +8415,25 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+V3 materialization consumes the cold-admitted `Arc<ComponentDefinition>` through
+`V3Kernel::from_definition` or `from_parallel_definition`. One resource materializer
+selects ordinary or tensor-local modules. `v3::project_parameters` preserves logical
+consumers and observation seams while selecting exact physical formats; unchanged
+projections reuse the allocation. Shared DeepSeek declaration producers supply
+invocation paths, state references, prediction groups and transport to runtime's
+execution-contract validator. Family checks validate global or selected latent/rotary
+state and retained vocabulary, query-head, low-rank and feed-forward geometry.
+Complete routed and dense/routed partition preparation retain source/target definitions
+and independent layouts. Parameter discovery reads canonical parameter producers
+without constructing a throwaway execution definition.
+
+`PredictionExtensionPlan` retains a validated complete component declaration at cold
+admission, with matching extension kind and architecture. Its admission comparison
+includes that semantic contract alongside checkpoint provenance. V3 extension
+materialization consumes this retained parent and projects selected formats and
+state; it keeps original source layout authority independently. Cold declarations
+for the other extension families remain available through the same plan interface.
+
 DeepSeek expert geometry expands the retained uniform partition domain into scalar
 FFN coordinates. Encoding expansion may group several neurons into one partition
 unit so weights, packed input columns and scale/bias companions share legal cuts.

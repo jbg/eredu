@@ -1400,9 +1400,9 @@ fn v4_pinned_parameter_groups(
 pub fn v3_parameter_description(
     args: &V3Args,
 ) -> Result<ArchitectureParameterDescription, eredu_nn::Error> {
-    Ok(super::v3::component_definition(args, None)?
-        .parameters()
-        .clone())
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    super::v3::state_layout(args)?;
+    v3_parameters(args).map_err(eredu_nn::Error::backend_source)
 }
 
 pub(super) fn v3_parameters(

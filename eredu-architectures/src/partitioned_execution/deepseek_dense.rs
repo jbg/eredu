@@ -31,8 +31,14 @@ where
     }
     let selected_args = crate::replicated_text::selected_deepseek_v3_args(args, selected.base())
         .map_err(architecture)?;
-    let parameters = crate::deepseek::parallel::v3_parameter_description(&selected_args)
-        .map_err(architecture)?;
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("V3 selection has no retained definition"))?;
+    let definition =
+        crate::deepseek::v3::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -73,8 +79,9 @@ where
     }) {
         let source_args = crate::replicated_text::source_deepseek_v3_args(args, selected.base())
             .map_err(architecture)?;
-        let source_parameters = crate::deepseek::parallel::v3_parameter_description(&source_args)
+        let source_definition = crate::deepseek::v3::project_parameters(&source_args, &retained)
             .map_err(architecture)?;
+        let source_parameters = source_definition.parameters().clone();
         validate_transform_parameter_space(&source_parameters, &parameters)
             .map_err(architecture)?;
         let source_layout =
@@ -105,9 +112,13 @@ where
                 "dense V3 transform source changed local unit addresses",
             ));
         }
-        let model =
-            crate::deepseek::v3::V3Kernel::<B>::new_parallel(source_args, source_geometry, context)
-                .map_err(architecture)?;
+        let model = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
+            source_args,
+            source_definition,
+            source_geometry,
+            context,
+        )
+        .map_err(architecture)?;
         let model = model
             .into_partition_model(&source_partition)
             .map_err(architecture)?;
@@ -118,8 +129,13 @@ where
     let capability_estimate =
         crate::capability::deepseek_v3(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let model = crate::deepseek::v3::V3Kernel::<B>::new_parallel(selected_args, geometry, context)
-        .map_err(architecture)?;
+    let model = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
+        selected_args,
+        definition,
+        geometry,
+        context,
+    )
+    .map_err(architecture)?;
     let model = model
         .into_partition_model(&partition)
         .map_err(architecture)?;

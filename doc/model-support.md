@@ -83,6 +83,12 @@ projector.
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 | NemotronLabs VoiceChat | realtime PCM speech, text, transcription, tools | yes | `nemotron_voicechat`; explicit split component bundle and companion | single-device controlled/iterator session; [validation](voicechat-validation.md) |
 
+Low-level DeepSeek-V3 construction consumes a retained declaration through
+`V3Kernel::from_definition` or `from_parallel_definition`.
+`deepseek::v3::project_parameters` selects physical formats while retaining logical
+consumers, observation seams and target/MTP state identities. Prediction-extension
+plans retain their complete validated declaration before target projection.
+
 Low-level Nemotron-H construction consumes a retained declaration through
 `CompleteNemotronKernel::from_definition`, `from_parallel_definition` or
 `NemotronKernel::from_partition`. `nemotron_h::component_definition` declares

@@ -4537,8 +4537,9 @@ where
             );
             let target_args =
                 crate::deepseek::v3_with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let parameters = crate::deepseek::parallel::v3_parameter_description(&target_args)
+            let definition = crate::deepseek::v3::project_parameters(&target_args, extension.definition())
                 .map_err(|error| invalid(error.to_string()))?;
+            let parameters = definition.parameters().clone();
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
                 .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v3_local_geometry(&target_args, &layout)
@@ -4550,11 +4551,10 @@ where
                         | eredu_runtime::WeightLoweringKind::DerivedTransform
                 )
             }) {
-                let source_parameters = crate::deepseek::parallel::v3_parameter_description(args)
-                    .map_err(|error| invalid(error.to_string()))?;
+                let source_parameters = extension.definition().parameters();
                 Some(std::sync::Arc::new(
                     crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                        &source_parameters,
+                        source_parameters,
                         &parameters,
                         tensor_rank,
                     )
@@ -4564,23 +4564,29 @@ where
                 None
             };
             let source = match &source_layout {
-                Some(layout) => crate::deepseek::v3::V3Kernel::<B>::new_parallel(
+                Some(layout) => crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
                     args.clone(),
+                    extension.definition().clone(),
                     crate::deepseek::parallel::v3_local_geometry(args, layout)
                         .map_err(|error| invalid(error.to_string()))?,
                     source_context,
                 ),
-                None => crate::deepseek::v3::V3Kernel::<B>::new(args.clone(), source_context),
+                None => crate::deepseek::v3::V3Kernel::<B>::from_definition(
+                    args.clone(),
+                    extension.definition().clone(),
+                    source_context,
+                ),
             }
             .map_err(|error| invalid(error.to_string()))?;
-            let target_layers = usize::try_from(args.num_hidden_layers)
-                .map_err(|error| invalid(error.to_string()))?;
+            let target_layers =
+                usize::try_from(args.num_hidden_layers).map_err(|error| invalid(error.to_string()))?;
             let state = geometry
                 .state_layout()
                 .slice(target_layers..target_layers + extension.depth())
                 .map_err(|error| invalid(error.to_string()))?;
-            let local = crate::deepseek::v3::V3Kernel::<B>::new_parallel(
+            let local = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
                 target_args,
+                definition,
                 geometry,
                 execution_context,
             )

@@ -259,49 +259,54 @@ pub struct V3Kernel<
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
     V3Kernel<B>
 {
-    /// Builds the unloaded pinned V3 modules.
-    pub fn new(args: V3Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "DeepSeek-V3",
-            crate::operator_requirements::DEEPSEEK_V3,
-        )?;
-        let definition = Arc::new(component_definition(&args, None)?);
-        let static_modules: PartitionStaticModules<B> =
-            StaticModules::from_spec(static_spec(&args), context)?.into();
-        Ok(Self {
-            definition,
-            args,
-            static_modules,
-            parallel_geometry: None,
-            expert_realization: None,
-            partition_target_start: 0,
-        })
-    }
-
-    /// Builds unloaded V3 modules using one authoritative rank-local plan.
-    pub fn new_parallel(
+    /// Materializes ordinary modules from the cold retained declaration.
+    pub fn from_definition(
         args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::materialize(args, definition, None, context)
+    }
+    /// Materializes modules using the retained definition and authoritative local geometry.
+    pub fn from_parallel_definition(
+        args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         geometry: super::parallel::V3LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::materialize(args, definition, Some(geometry), context)
+    }
+    fn materialize(
+        args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<super::parallel::V3LocalGeometry>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
-            "DeepSeek-V3 tensor parallelism",
-            crate::operator_requirements::DEEPSEEK_V3
-                .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL),
+            "DeepSeek-V3",
+            if geometry.is_some() {
+                crate::operator_requirements::DEEPSEEK_V3
+                    .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL)
+            } else {
+                crate::operator_requirements::DEEPSEEK_V3
+            },
         )?;
-        let definition = Arc::new(component_definition(&args, Some(&geometry))?);
-        let static_modules: PartitionStaticModules<B> = StaticModules::from_parallel_spec(
-            static_spec(&args),
-            geometry.embedding_range().clone(),
-            Some(geometry.output_range().clone()),
-            context,
-        )?
+        let definition = select_definition(&args, definition, geometry.as_ref())?;
+        let static_modules: PartitionStaticModules<B> = match &geometry {
+            Some(geometry) => StaticModules::from_parallel_spec(
+                static_spec(&args),
+                geometry.embedding_range().clone(),
+                Some(geometry.output_range().clone()),
+                context,
+            )?,
+            None => StaticModules::from_spec(static_spec(&args), context)?,
+        }
         .into();
         Ok(Self {
             definition,
             args,
             static_modules,
-            parallel_geometry: Some(Arc::new(geometry)),
+            parallel_geometry: geometry.map(Arc::new),
             expert_realization: None,
             partition_target_start: 0,
         })
@@ -1460,13 +1465,7 @@ pub fn component_definition(
     geometry: Option<&super::parallel::V3LocalGeometry>,
 ) -> Result<eredu_runtime::ComponentDefinition, Error> {
     args.validate().map_err(Error::backend_source)?;
-    let state = match geometry {
-        Some(geometry) => {
-            geometry.validate_for(args).map_err(Error::backend_source)?;
-            geometry.state_layout().clone()
-        }
-        None => state_layout(args)?,
-    };
+    let state = component_state(args, geometry)?;
     let parameters = super::parallel::v3_parameters(args).map_err(Error::backend_source)?;
     super::component::definition(
         "deepseek_v3",
@@ -1475,6 +1474,107 @@ pub fn component_definition(
         crate::transport::decoder(),
         |_address, ordinal| format!("model.layers.{ordinal}"),
     )
+}
+
+fn component_state(
+    args: &V3Args,
+    geometry: Option<&super::parallel::V3LocalGeometry>,
+) -> Result<StateLayout, Error> {
+    match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            Ok(geometry.state_layout().clone())
+        }
+        None => state_layout(args),
+    }
+}
+/// Selects executable formats while preserving logical consumers and observation seams.
+pub fn project_parameters(
+    args: &V3Args,
+    definition: &Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    super::component::project_parameters(
+        "deepseek_v3",
+        super::parallel::v3_parameters(args).map_err(Error::backend_source)?,
+        definition,
+    )
+}
+fn invalid_definition(
+    definition: &eredu_runtime::ComponentDefinition,
+    resource: impl Into<String>,
+) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn select_definition(
+    args: &V3Args,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::parallel::V3LocalGeometry>,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    if definition.id() != "deepseek_v3" {
+        return Err(invalid_definition(
+            &definition,
+            "DeepSeek-V3 component identity",
+        ));
+    }
+    definition.validate_parameter_topology(
+        &super::parallel::v3_parameters(args).map_err(Error::backend_source)?,
+    )?;
+    let state = component_state(args, geometry)?;
+    let global = state_layout(args)?;
+    if definition.state_layout() != &global && definition.state_layout() != &state {
+        return Err(invalid_definition(
+            &definition,
+            "V3 retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained =
+            super::parallel::v3_local_geometry(args, layout).map_err(Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: args.vocab_size as usize,
+            local: 0..args.vocab_size as usize,
+        };
+        let selected = geometry.map_or(args, super::parallel::V3LocalGeometry::args);
+        let actual = retained.args();
+        if retained.state_layout() != &state
+            || retained.embedding_range()
+                != geometry.map_or(&full, super::parallel::V3LocalGeometry::embedding_range)
+            || retained.output_range()
+                != geometry.map_or(&full, super::parallel::V3LocalGeometry::output_range)
+            || actual.num_attention_heads != selected.num_attention_heads
+            || actual.intermediate_size != selected.intermediate_size
+            || actual.moe_intermediate_size != selected.moe_intermediate_size
+            || actual.q_lora_rank != selected.q_lora_rank
+            || actual.kv_lora_rank != selected.kv_lora_rank
+            || actual.qk_nope_head_dim != selected.qk_nope_head_dim
+            || actual.qk_rope_head_dim != selected.qk_rope_head_dim
+            || actual.v_head_dim != selected.v_head_dim
+        {
+            return Err(invalid_definition(
+                &definition,
+                "V3 retained placement differs from selected geometry",
+            ));
+        }
+    }
+    super::component::validate(&definition, crate::transport::decoder(), |_, ordinal| {
+        format!("model.layers.{ordinal}")
+    })?;
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(Arc::new)
+            .map_err(Error::from)
+    }
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
