@@ -7916,15 +7916,25 @@ where
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
         let capability = crate::capability::nemotron_labs_diffusion(args, true)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let retained = self
+            .requirements
+            .execution()
+            .shared_component_definition()
+            .ok_or_else(|| {
+                ReplicatedTextDispatchError::Architecture(
+                    "composite selection has no retained definition".into(),
+                )
+            })?;
         let source = self
             .has_transform
             .then(|| {
                 args.with_checkpoint_formats(self.source_formats.clone())
                     .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))
                     .and_then(|config| {
-                        crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::new(
-                            config,
-                            self.context,
+                        let definition = crate::nemotron_labs_diffusion::definition::project_composite_parameters(&config, &retained)
+                            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                        crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::from_definition(
+                            config, definition, self.context,
                         )
                         .map_err(|error| {
                             ReplicatedTextDispatchError::Architecture(error.to_string())
@@ -7936,11 +7946,17 @@ where
             .with_checkpoint_formats(self.target_formats.clone())
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let identity = target.architecture_fingerprint();
-        let architecture = crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::new(
-            target,
-            self.context,
+        let definition = crate::nemotron_labs_diffusion::definition::project_composite_parameters(
+            &target, &retained,
         )
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture =
+            crate::nemotron_labs_diffusion::composite::CompositeKernel::<B>::from_definition(
+                target,
+                definition,
+                self.context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,

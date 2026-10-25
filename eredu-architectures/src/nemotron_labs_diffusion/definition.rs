@@ -9,6 +9,7 @@ use eredu_runtime::{
 };
 
 const TEXT_COMPONENT_ID: &str = "nemotron_labs_diffusion_text";
+const COMPOSITE_COMPONENT_ID: &str = "nemotron_labs_diffusion_composite";
 
 /// Retains text semantics while selecting the family's exact executable parameter formats.
 pub fn project_text_parameters(
@@ -95,7 +96,7 @@ pub fn composite_partition(
         .is_some_and(|(_, layout)| layout != geometry.local_layout())
     {
         return Err(ComponentDefinitionError::Invalid {
-            component: "nemotron_labs_diffusion_composite".into(),
+            component: COMPOSITE_COMPONENT_ID.into(),
             resource: "retained placement differs from selected geometry".into(),
         }
         .into());
@@ -132,7 +133,7 @@ fn build(
 ) -> Result<ComponentDefinition, Error> {
     config.validate_config()?;
     let id = if composite {
-        "nemotron_labs_diffusion_composite"
+        COMPOSITE_COMPONENT_ID
     } else {
         TEXT_COMPONENT_ID
     };
@@ -159,6 +160,42 @@ fn build(
             parameters.clone()
         }
         None => canonical,
+    };
+    validate_state(config, &state, id)?;
+    let layout = parameters.unit_layout();
+    let units = (0..layout.len())
+        .map(|ordinal| {
+            unit(
+                config,
+                composite,
+                layout.address(ordinal).expect("declared invocation"),
+            )
+        })
+        .collect();
+    let transport = if composite {
+        (0..3).map(super::parallel::group_transport).collect()
+    } else {
+        vec![crate::transport::decoder()]
+    };
+    ComponentDefinition::new(
+        id,
+        parameters,
+        units,
+        transport,
+        decoder::TEXT_DECODER_EXECUTION_GROUP,
+        vec![],
+        state,
+        state_partition(config, composite),
+    )
+    .map_err(Error::from)
+}
+
+fn validate_state(config: &FamilyConfig, state: &StateLayout, id: &str) -> Result<(), Error> {
+    let invalid = |resource: &str| {
+        Error::from(ComponentDefinitionError::Invalid {
+            component: id.into(),
+            resource: resource.into(),
+        })
     };
     let layers = config.num_hidden_layers() as usize;
     if state.len() != layers {
@@ -197,47 +234,140 @@ fn build(
             return Err(invalid(&format!("context slot {index} geometry")));
         }
     }
-    let text_group = if composite { 2 } else { 0 };
-    let layout = parameters.unit_layout();
-    let units = (0..layout.len())
-        .map(|ordinal| {
-            let address = layout.address(ordinal).expect("declared invocation");
-            let index = address.index();
-            if address.group() == text_group {
-                ComponentUnit {
-                    path: format!("{}.layers.{index}", config.parameter_root()),
-                    state: index..index + 1,
-                }
-            } else if address.group() == 0 {
-                ComponentUnit {
-                    path: format!("model.vision_tower.transformer.layers.{index}"),
-                    state: 0..0,
-                }
-            } else {
-                ComponentUnit {
-                    path: "model.multi_modal_projector".into(),
-                    state: 0..0,
-                }
-            }
-        })
-        .collect();
-    let transport = if composite {
-        (0..3).map(super::parallel::group_transport).collect()
+    Ok(())
+}
+
+fn unit(
+    config: &FamilyConfig,
+    composite: bool,
+    address: eredu_runtime::ExecutionUnitAddress,
+) -> ComponentUnit {
+    let index = address.index();
+    if address.group() == if composite { 2 } else { 0 } {
+        ComponentUnit {
+            path: format!("{}.layers.{index}", config.parameter_root()),
+            state: index..index + 1,
+        }
+    } else if address.group() == 0 {
+        ComponentUnit {
+            path: format!("model.vision_tower.transformer.layers.{index}"),
+            state: 0..0,
+        }
     } else {
-        vec![crate::transport::decoder()]
-    };
-    ComponentDefinition::new(
-        id,
-        parameters,
-        units,
-        transport,
-        decoder::TEXT_DECODER_EXECUTION_GROUP,
-        vec![],
-        state,
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
-            text_group,
-            0..layers,
-        )]),
-    )
-    .map_err(Error::from)
+        ComponentUnit {
+            path: "model.multi_modal_projector".into(),
+            state: 0..0,
+        }
+    }
+}
+
+fn state_partition(config: &FamilyConfig, composite: bool) -> ArchitectureStatePartitionPlan {
+    ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+        if composite { 2 } else { 0 },
+        0..config.num_hidden_layers() as usize,
+    )])
+}
+
+/// Projects exact composite executable formats while retaining semantic identities.
+pub fn project_composite_parameters(
+    config: &FamilyConfig,
+    definition: &std::sync::Arc<ComponentDefinition>,
+) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
+    validate_composite_identity(definition)?;
+    let parameters =
+        super::parallel::composite_parameter_description(config).map_err(Error::backend_source)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+fn validate_composite_identity(definition: &ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != COMPOSITE_COMPONENT_ID {
+        return Err(ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "shared composite identity".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) fn select_composite(
+    config: &FamilyConfig,
+    definition: std::sync::Arc<ComponentDefinition>,
+    state: &StateLayout,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
+) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
+    config.validate_config()?;
+    validate_composite_identity(&definition)?;
+    definition.validate_parameter_topology(
+        &super::parallel::composite_parameter_description(config).map_err(Error::backend_source)?,
+    )?;
+    if definition
+        .parameters()
+        .partition_layout()
+        .is_some_and(|(_, retained)| Some(retained) != layout)
+    {
+        return Err(ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "retained placement differs from selected geometry".into(),
+        }
+        .into());
+    }
+    if definition.primary_group() != decoder::TEXT_DECODER_EXECUTION_GROUP
+        || !definition.prediction_groups().is_empty()
+        || (0..3).any(|group| {
+            !definition
+                .group_transport(group)
+                .is_ok_and(|transport| transport == &super::parallel::group_transport(group))
+        })
+        || definition.state_partition_plan() != &state_partition(config, true)
+    {
+        return Err(ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "composite execution or state ownership".into(),
+        }
+        .into());
+    }
+    for ordinal in 0..definition.parameters().unit_layout().len() {
+        let address = definition
+            .parameters()
+            .unit_layout()
+            .address(ordinal)
+            .expect("declared invocation");
+        if definition.unit(address.group(), address.index())? != &unit(config, true, address)
+            || definition
+                .unit_observation_boundaries(address.group(), address.index())?
+                .is_kernel_owned()
+        {
+            return Err(ComponentDefinitionError::Invalid {
+                component: definition.id().into(),
+                resource: format!(
+                    "composite unit {}:{} equation geometry",
+                    address.group(),
+                    address.index()
+                ),
+            }
+            .into());
+        }
+    }
+    validate_state(config, definition.state_layout(), definition.id())?;
+    validate_state(config, state, definition.id())?;
+    if definition.state_layout() == state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state.clone())
+            .map(std::sync::Arc::new)
+            .map_err(Error::from)
+    }
 }

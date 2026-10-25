@@ -12832,15 +12832,22 @@ DiffusionGemma and Nemotron diffusion composites obtain their text declarations
 through this shared projection. Child transport follows the parent group contract;
 family kernels retain media assembly, equations and local state dimensions.
 
-DiffusionGemma composite materialization consumes the parent declaration retained
-by cold admission. Complete and partitioned constructors validate equation paths,
-state references, transport, hook ownership and canonical parameter topology before
-allocating native modules. Declaration construction and materialization share the
-same family unit and state-geometry rules. Custom runtime-owned observation seams
-and logical parameter references remain retained facts.
+DiffusionGemma and Nemotron diffusion composite materialization consume the parent
+declaration retained by cold admission. Complete, parallel and partitioned
+constructors validate equation paths, state references, transport, hook ownership
+and canonical parameter topology before allocating native modules. Declaration
+construction and materialization share the same family unit and state-geometry
+rules. Custom runtime-owned observation seams and logical parameter references
+remain retained facts.
 
 Composite preparation projects source and selected executable formats from that
 parent. Identical formats and state geometry reuse its allocation; selected local
 context dimensions use the ordinary validated state projection. Transformation
 sources retain their original bindings and use the existing selected task and
 completion lifecycle. The text child is projected from the resulting parent.
+
+Nemotron composite transform sources have their own source-format parameter
+layout and partition. Source placement follows the target's semantic ownership
+through the shared transform-source projection; both sides validate the same
+admitted unit addresses and complete state geometry. The preparation driver
+passes each materializer its corresponding retained declaration and local layout.

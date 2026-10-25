@@ -322,7 +322,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if vision_context {
         type Composite = nemotron_labs_diffusion::composite::Model<Backend>;
         let mut model =
-            nemotron_labs_diffusion::composite::CompositeKernel::new(config.clone(), stream)?;
+            nemotron_labs_diffusion::composite::CompositeKernel::from_definition(
+                config.clone(),
+                std::sync::Arc::new(nemotron_labs_diffusion::definition::composite(&config, None)?),
+                stream,
+            )?;
         let (policy, metadata) = prepare_layerwise_policy_with_bindings(
             source,
             &mut model,

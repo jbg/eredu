@@ -8021,7 +8021,7 @@ where
     })
 }
 
-fn validate_partitioned_binding<Q, G, W>(
+pub(crate) fn validate_partitioned_binding<Q, G, W>(
     requirements: &PartitionedAdmission<Q>,
     partition: &ArchitecturePartition<G, W>,
 ) -> Result<(), String>

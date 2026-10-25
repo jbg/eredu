@@ -4,7 +4,7 @@ use crate::nemotron_labs_diffusion::partitioned::{
     PartitionedTextKernel, TextBoundary, TextBoundarySchema,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ArchitecturePartition, LayeredPartitionInput,
+    ArchitecturePartition, LayeredPartitionInput,
     LayeredPartitionOutput, LocalModelLayout, PartitionOwnership, StateLayout,
 };
 use std::ops::Range;
@@ -119,17 +119,16 @@ impl<B: DistributedNeuralBackend> super::CompositeKernel<B, StaticModules<B>> {
     /// Validates retained ownership before materializing only its physical resources.
     pub fn from_partition(
         config: FamilyConfig,
-        parameters: &ArchitectureParameterDescription,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &ArchitecturePartition<Geometry, TextBoundarySchema>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Model<B>, Error> {
-        let definition = std::sync::Arc::new(
-            crate::nemotron_labs_diffusion::definition::composite_partition(
-                &config,
-                parameters,
-                partition.local_geometry(),
-            )?,
-        );
+        let definition = crate::nemotron_labs_diffusion::definition::select_composite(
+            &config,
+            definition,
+            partition.local_geometry().complete_state(),
+            Some(partition.local_geometry().local_layout()),
+        )?;
         definition.select_partition(partition)?;
         if partition.boundary_schema() != &TextBoundarySchema::new(config.hidden_size()) {
             return Err(eredu_runtime::ComponentDefinitionError::Invalid {

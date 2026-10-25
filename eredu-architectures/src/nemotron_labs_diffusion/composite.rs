@@ -1321,11 +1321,17 @@ where
 
 impl<B: DistributedNeuralBackend> CompositeKernel<B> {
     /// Materializes declared complete composite resources.
-    pub fn new(
+    pub fn from_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Model<B>, Error> {
-        let definition = std::sync::Arc::new(super::definition::composite(&config, None)?);
+        let definition = super::definition::select_composite(
+            &config,
+            definition,
+            &crate::decoder::state_layout(&config)?,
+            None,
+        )?;
         let image_embedding = ImageEmbedding::new(&config, context)?;
         let text_definition = super::definition::text_from_composite(&definition)?;
         let text = TextKernel::from_definition(config.clone(), text_definition, context)?
@@ -1346,8 +1352,9 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
             .map_err(Error::from)
     }
     /// Materializes declared complete composite resources.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         layout: eredu_runtime::LocalModelLayout,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Model<B>, Error> {
@@ -1357,8 +1364,12 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
                 .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
         })
         .map_err(Error::backend)?;
-        let definition =
-            std::sync::Arc::new(super::definition::composite(&config, Some(&geometry))?);
+        let definition = super::definition::select_composite(
+            &config,
+            definition,
+            geometry.state_layout(),
+            Some(&layout),
+        )?;
         let image_embedding = ImageEmbedding::new(&config, context)?;
         let text_definition = super::definition::text_from_composite(&definition)?;
         let text = TextKernel::from_parallel_definition(

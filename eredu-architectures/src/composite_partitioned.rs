@@ -1565,9 +1565,16 @@ where
     let args = source
         .with_checkpoint_formats(selected_formats(selected.base().execution()))
         .map_err(|e| error(e.to_string()))?;
-    let parameters =
-        crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&args)
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| error("composite selection has no retained definition".into()))?;
+    let definition =
+        crate::nemotron_labs_diffusion::definition::project_composite_parameters(&args, &retained)
             .map_err(|e| error(e.to_string()))?;
+    let parameters = definition.parameters().clone();
     let layout = derive_partitioned_local_layout(&parameters, selected.requirements().topology())
         .map_err(error)?;
     let range = |name: &str| {
@@ -1586,10 +1593,11 @@ where
         range(crate::decoder::TEXT_DECODER_EXECUTION_GROUP),
     )
     .map_err(|e| error(e.to_string()))?;
-    let definition = crate::nemotron_labs_diffusion::definition::composite_partition(
+    let definition = crate::nemotron_labs_diffusion::definition::select_composite(
         &args,
-        &parameters,
-        &geometry,
+        definition,
+        geometry.complete_state(),
+        Some(geometry.local_layout()),
     )
     .map_err(|e| error(e.to_string()))?;
     let partition = ArchitecturePartition::from_description(
@@ -1613,7 +1621,7 @@ where
     }
     let architecture = partition::SelectedCompositeKernel::<B>::from_partition(
         args.clone(),
-        &parameters,
+        definition,
         &partition,
         context,
     )
@@ -1625,14 +1633,66 @@ where
                     selected.requirements().execution().execution(),
                 ))
                 .map_err(|e| error(e.to_string()))?;
+            let source_parameters = retained.parameters();
+            let source_layout =
+                crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                    source_parameters,
+                    &parameters,
+                    selected.requirements().topology(),
+                )
+                .map_err(error)?;
+            let source_geometry = partition::geometry(
+                &source_args,
+                source_layout.clone(),
+                range("vision").unwrap_or(0..0),
+                range("vision_projection").is_some(),
+                range(crate::decoder::TEXT_DECODER_EXECUTION_GROUP),
+            )
+            .map_err(|e| error(e.to_string()))?;
+            if source_geometry.complete_state() != geometry.complete_state() {
+                return Err(error(
+                    "shared-backbone transform source changes state geometry".into(),
+                ));
+            }
+            let source_definition = crate::nemotron_labs_diffusion::definition::select_composite(
+                &source_args,
+                retained.clone(),
+                source_geometry.complete_state(),
+                Some(source_geometry.local_layout()),
+            )
+            .map_err(|e| error(e.to_string()))?;
+            let source_partition = ArchitecturePartition::from_description(
+                source_parameters,
+                selected
+                    .requirements()
+                    .groups()
+                    .iter()
+                    .map(|group| (group.group().as_str(), group.units())),
+                partition.ownership().clone(),
+                source_definition.state_layout(),
+                source_definition.state_partition_plan(),
+                source_geometry,
+                TextBoundarySchema::new(source_args.hidden_size()),
+            )
+            .map_err(|e| error(e.to_string()))?;
+            crate::partitioned_execution::validate_partitioned_binding(
+                selected.requirements(),
+                &source_partition,
+            )
+            .map_err(error)?;
+            if source_partition.units().ne(partition.units()) {
+                return Err(error(
+                    "shared-backbone transform source changes local unit addresses".into(),
+                ));
+            }
             let model = partition::SelectedCompositeKernel::<B>::from_partition(
                 source_args,
-                &parameters,
-                &partition,
+                source_definition,
+                &source_partition,
                 context,
             )
             .map_err(|e| error(e.to_string()))?;
-            Some((Box::new(model), layout.clone()))
+            Some((Box::new(model), source_layout))
         } else {
             None
         };
