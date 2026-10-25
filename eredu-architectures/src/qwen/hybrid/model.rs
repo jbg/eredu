@@ -758,9 +758,10 @@ pub(super) fn static_module_spec(config: &HybridConfig) -> StaticModuleSpec {
         hidden_size: config.hidden_size,
         normalization_epsilon: config.rms_norm_eps,
         normalization_offset: 1.0,
-        embedding_quantization: config
+        embedding_format: config
             .linear_format("model.embed_tokens.weight")
-            .weight_quantization(),
+            .weight_quantization()
+            .into(),
         head_format: config.linear_format("lm_head.weight"),
         tied_head: config.tie_word_embeddings,
     }

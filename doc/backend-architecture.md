@@ -8415,6 +8415,19 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+`StaticModuleSpec::embedding_format` retains the complete physical matrix encoding,
+including block-FP8 companions. Shared decoder configuration supplies its selected
+`linear_format` directly; tied output inspection uses the same embedding encoding
+and canonical parameter owner. Family declarations retain their format admission
+policy. Neutral construction preserves these encodings without implying additional
+native operator support.
+
+Shared decoder partitions use the same selected pinned-resource constructor as
+other component kernels. Canonical storage selection determines embedding, final
+normalization and untied head ownership, including tied-embedding replicas on
+output partitions. Parameter identities, normalization policy and exact vocabulary
+ranges come from the shared specification and retained geometry.
+
 `ComponentSelection::owns_storage` reports canonical parameter owners from the
 validated partition bindings, independently of logical invocation and mutable-state
 identity. The shared `PartitionStaticModules::from_selected_spec` constructor consumes

@@ -385,7 +385,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
             hidden_size: args.hidden_size,
             normalization_epsilon: args.layer_norm_epsilon,
             normalization_offset: 0.0,
-            embedding_quantization: args.weight_quantization_for(embedding_name),
+            embedding_format: args.weight_quantization_for(embedding_name).into(),
             head_format: args.weight_quantization_for("lm_head.weight").into(),
             tied_head: args.tie_word_embeddings,
         }

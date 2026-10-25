@@ -4136,8 +4136,8 @@ pub struct StaticModuleSpec {
     pub normalization_epsilon: f32,
     /// Fixed scalar added to the learned final-normalization scale.
     pub normalization_offset: f32,
-    /// Packed embedding format, when supported by the general embedding operator.
-    pub embedding_quantization: Option<WeightQuantization>,
+    /// Complete embedding physical encoding, including its declared companions.
+    pub embedding_format: LinearFormat,
     /// Complete output-head physical encoding.
     pub head_format: LinearFormat,
     /// Whether output logits reuse the embedding table.
@@ -4161,7 +4161,7 @@ impl StaticModuleSpec {
             weight: ParameterSpec::trainable(&self.embedding_weight).map_err(Error::backend)?,
             format: crate::linear_format::standard_linear_format(
                 &self.embedding_weight,
-                self.embedding_quantization.into(),
+                self.embedding_format,
             )?,
         };
         let head = (!self.tied_head)
@@ -4211,7 +4211,7 @@ impl StaticModuleSpec {
             hidden_size: config.hidden_size(),
             normalization_epsilon: config.rms_norm_epsilon(),
             normalization_offset: config.normalization_offset(),
-            embedding_quantization: config.weight_quantization(&embedding_name),
+            embedding_format: config.linear_format(&embedding_name),
             head_format: config.linear_format("lm_head.weight"),
             tied_head: config.tie_word_embeddings(),
         }
@@ -4229,7 +4229,7 @@ impl StaticModuleSpec {
             input: self.hidden_size as u64,
             output: self.vocabulary as u64,
             format: if self.tied_head {
-                self.embedding_quantization.into()
+                self.embedding_format
             } else {
                 self.head_format
             },
@@ -5645,86 +5645,6 @@ impl<B: NeuralBackend, C: Config + Clone, P, M: Clone, G: Clone> Clone
     }
 }
 
-fn partition_static_modules<B, C>(
-    config: &C,
-    geometry: &PartitionLocalGeometry<C>,
-    ownership: &eredu_runtime::PartitionOwnership,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<PartitionStaticModules<B>, Error>
-where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: Config,
-{
-    let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
-    let embeddings = (ownership.owns_input()
-        || (ownership.owns_output() && config.tie_word_embeddings()))
-    .then(|| {
-        B::vocabulary_parallel_embedding(
-            EmbeddingSpec {
-                vocabulary: config.vocabulary_size(),
-                dimensions: config.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &embedding_name,
-                    config.linear_format(&embedding_name),
-                )?,
-            },
-            geometry.embedding_range.clone(),
-            context,
-        )
-    })
-    .transpose()?;
-    let norm = ownership
-        .owns_output()
-        .then(|| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: config.normalization_groups(),
-                    dimensions: config.hidden_size(),
-                    epsilon: config.rms_norm_epsilon(),
-                    scale: normalization_scale(
-                        ParameterSpec::trainable(format!(
-                            "{}.norm.weight",
-                            config.parameter_root()
-                        ))
-                        .map_err(Error::backend)?,
-                        config.normalization_offset(),
-                    ),
-                },
-                context,
-            )
-        })
-        .transpose()?;
-    let lm_head = (ownership.owns_output() && !config.tie_word_embeddings())
-        .then(|| {
-            let name = "lm_head.weight";
-            let range = geometry.output_range.clone().ok_or_else(|| {
-                Error::backend("untied decoder output owner has no vocabulary range")
-            })?;
-            B::vocabulary_parallel_linear(
-                LinearSpec {
-                    input: config.hidden_size(),
-                    output: config.vocabulary_size(),
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        name,
-                        config.linear_format(name),
-                    )?,
-                },
-                range,
-                context,
-            )
-        })
-        .transpose()?;
-    Ok(PartitionStaticModules {
-        embeddings,
-        norm,
-        lm_head,
-    })
-}
-
 impl<B, C, P> DecoderKernel<B, C, P>
 where
     B: eredu_nn::DistributedNeuralBackend,
@@ -5809,9 +5729,18 @@ where
             )
         };
         validate_complete_definition(&args, &definition, geometry.complete_state_layout())?;
-        definition.select_partition(partition)?;
-        let static_modules =
-            partition_static_modules(&args, &geometry, partition.ownership(), context)?;
+        let selection = definition.select_partition(partition)?;
+        let static_modules = PartitionStaticModules::from_selected_spec(
+            StaticModuleSpec::from_config(&args),
+            Some((
+                geometry.embedding_range.clone(),
+                geometry.output_range.clone(),
+            )),
+            |role| {
+                selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+            },
+            context,
+        )?;
         let kernel = Self {
             schedule: DecoderSchedule::new(&args)?,
             args,

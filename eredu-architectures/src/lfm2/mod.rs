@@ -109,7 +109,7 @@ pub(crate) fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
         hidden_size: args.hidden_size,
         normalization_epsilon: args.norm_eps,
         normalization_offset: 0.0,
-        embedding_quantization: args.weight_quantization_for(embedding_name),
+        embedding_format: args.weight_quantization_for(embedding_name).into(),
         head_format: args.weight_quantization_for("lm_head.weight").into(),
         tied_head: args.tie_word_embeddings,
     }

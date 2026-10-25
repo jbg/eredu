@@ -1393,10 +1393,11 @@ pub(crate) fn static_spec(args: &V3Args) -> StaticModuleSpec {
         hidden_size: args.hidden_size,
         normalization_epsilon: args.rms_norm_eps,
         normalization_offset: 0.0,
-        embedding_quantization: args
+        embedding_format: args
             .linear_formats
             .get("model.embed_tokens.weight")
-            .and_then(|format| format.weight_quantization()),
+            .and_then(|format| format.weight_quantization())
+            .into(),
         // Published V3/R1 checkpoints keep the output head dense, including
         // otherwise block-FP8 models. An explicit selected format also covers
         // GGUF storage and admitted load-time transformations of the head.

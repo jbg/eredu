@@ -2875,7 +2875,7 @@ fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
         hidden_size: args.hidden_size,
         normalization_epsilon: args.rms_norm_eps,
         normalization_offset: 0.0,
-        embedding_quantization: None,
+        embedding_format: LinearFormat::Dense,
         head_format: args.linear_format_for("head.weight"),
         tied_head: false,
     }

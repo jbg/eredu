@@ -288,7 +288,7 @@ pub fn parameter_description(
     }
     let embedding_format = crate::linear_format::standard_linear_format(
         &statics.embedding_weight,
-        statics.embedding_quantization.into(),
+        statics.embedding_format,
     )
     .map_err(invalid)?;
     declaration

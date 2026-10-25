@@ -410,7 +410,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
             hidden_size: config.hidden_size,
             normalization_epsilon: config.layer_norm_epsilon,
             normalization_offset: 0.0,
-            embedding_quantization: config.weight_quantization_for(embedding),
+            embedding_format: config.weight_quantization_for(embedding).into(),
             head_format: config.weight_quantization_for("lm_head.weight").into(),
             tied_head: config.tie_word_embeddings,
         }
@@ -502,9 +502,10 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
             hidden_size: config.hidden_size,
             normalization_epsilon: config.rms_norm_eps,
             normalization_offset: 1.0,
-            embedding_quantization: config
+            embedding_format: config
                 .linear_format("model.embed_tokens.weight")
-                .weight_quantization(),
+                .weight_quantization()
+                .into(),
             head_format: config.linear_format("lm_head.weight"),
             tied_head: config.tie_word_embeddings,
         }
