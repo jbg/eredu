@@ -367,6 +367,64 @@ impl ComponentDefinition {
         Ok(())
     }
 
+    /// Checks the equation implementation's semantic projection against this declaration.
+    ///
+    /// Families supply their unit, transport and state-ownership producers. The
+    /// observation predicate admits runtime-owned seams or checks exact boundaries
+    /// for instrumented equations without replacing retained observation names.
+    pub fn validate_execution_contract(
+        &self,
+        primary: &str,
+        prediction: &[String],
+        units: &[ComponentUnit],
+        transport: &[ArchitectureGroupTransport],
+        state_partition: &ArchitectureStatePartitionPlan,
+        observations: impl Fn(
+            ExecutionUnitAddress,
+            &ComponentUnit,
+            &crate::UnitObservationBoundaries,
+        ) -> bool,
+    ) -> Result<(), ComponentDefinitionError> {
+        let invalid = |resource: String| ComponentDefinitionError::Invalid {
+            component: self.id.clone(),
+            resource,
+        };
+        if self.primary != primary || self.prediction != prediction {
+            return Err(invalid("equation primary or prediction groups".into()));
+        }
+        if &self.state_partition != state_partition {
+            return Err(invalid("equation state ownership".into()));
+        }
+        if self.transport.len() != transport.len() {
+            return Err(invalid("equation transport group count".into()));
+        }
+        for (group, expected) in transport.iter().enumerate() {
+            if &self.transport[group] != expected {
+                return Err(invalid(format!("equation group {group} transport")));
+            }
+        }
+        if self.units.len() != units.len() {
+            return Err(invalid("equation invocation count".into()));
+        }
+        for (ordinal, expected) in units.iter().enumerate() {
+            let address = self
+                .parameters
+                .unit_layout()
+                .address(ordinal)
+                .expect("validated invocation layout");
+            if &self.units[ordinal] != expected
+                || !observations(address, expected, &self.unit_observations[ordinal])
+            {
+                return Err(invalid(format!(
+                    "equation unit {}:{} path, state references or observation ownership",
+                    address.group(),
+                    address.index()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Projects selected physical parameter geometry while retaining semantic identities.
     /// Families supply exact replacement uses, including changed encoding companions.
     pub fn with_parameters(

@@ -301,49 +301,22 @@ pub(crate) fn select_definition(
             ));
         }
     }
-    if definition.primary_group() != TEXT_EXECUTION_GROUP
-        || !definition.prediction_groups().is_empty()
-        || definition.state_partition_plan() != &state_partition_plan(args, &state)
-    {
-        return Err(invalid(&definition, "Muse execution or state ownership"));
-    }
-    for (group, transport) in component_transport(args).iter().enumerate() {
-        if definition.group_transport(group)? != transport {
-            return Err(invalid(
-                &definition,
-                format!("Muse group {group} transport"),
-            ));
-        }
-    }
-    for (ordinal, unit) in component_units(args, definition.parameters())?
-        .iter()
-        .enumerate()
-    {
-        let address = definition
-            .parameters()
-            .unit_layout()
-            .address(ordinal)
-            .expect("declared Muse unit");
-        let boundaries =
-            definition.unit_observation_boundaries(address.group(), address.index())?;
-        let observation_matches = if address.group() == 1 {
-            boundaries
-                == &eredu_runtime::UnitObservationBoundaries::around(&unit.path)
-                    .with_kernel_ownership()
-        } else {
-            !boundaries.is_kernel_owned()
-        };
-        if definition.unit(address.group(), address.index())? != unit || !observation_matches {
-            return Err(invalid(
-                &definition,
-                format!(
-                    "Muse unit {}:{} equation geometry or observation ownership",
-                    address.group(),
-                    address.index()
-                ),
-            ));
-        }
-    }
+    definition.validate_execution_contract(
+        TEXT_EXECUTION_GROUP,
+        &[],
+        &component_units(args, definition.parameters())?,
+        &component_transport(args),
+        &state_partition_plan(args, &state),
+        |address, unit, boundaries| {
+            if address.group() == 1 {
+                boundaries
+                    == &eredu_runtime::UnitObservationBoundaries::around(&unit.path)
+                        .with_kernel_ownership()
+            } else {
+                !boundaries.is_kernel_owned()
+            }
+        },
+    )?;
     if definition.state_layout() == &state {
         Ok(definition)
     } else {

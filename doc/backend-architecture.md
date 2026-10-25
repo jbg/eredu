@@ -12839,6 +12839,16 @@ placement remains independent authority. Dense, routed Qwen, GPT-OSS, K2 and
 Nemotron-Labs-Diffusion use their existing declaration producers for this check;
 expert-bank and draft-adapter geometry stay family-owned.
 
+`ComponentDefinition::validate_execution_contract` compares the equation
+implementation's primary/prediction groups, invocation paths and state references,
+transport and state ownership against the retained declaration. Family declaration
+producers supply these projections; runtime owns count checks, global addressing
+and typed component/resource errors. Observation predicates preserve configurable
+runtime seams and enforce exact boundaries for instrumented equations. Gemma 4,
+Inkling, Muse, Qwen3-VL, conditional Qwen hybrid, DiffusionGemma text/composite and
+Nemotron Labs Diffusion composite use this contract before materialization.
+Family checks retain numerical geometry and source/placement constraints.
+
 Nemotron-Labs-Diffusion text materialization consumes its retained family
 `ComponentDefinition` in complete, tensor-local and partitioned construction.
 The shared decoder checks equation paths, operation/state geometry and hook

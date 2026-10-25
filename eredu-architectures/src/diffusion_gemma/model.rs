@@ -122,25 +122,14 @@ pub(super) fn select_definition(
         &super::parallel::parameter_description(config).map_err(Error::backend_source)?,
     )?;
     let layers = config.text.num_hidden_layers();
-    if definition.primary_group() != TEXT_EXECUTION_GROUP
-        || !definition.prediction_groups().is_empty()
-        || definition.group_transport(0)? != &text_transport()
-        || definition.state_partition_plan() != &text_state_partition_plan(layers)
-        || (0..layers).any(|index| {
-            !definition
-                .unit(0, index)
-                .is_ok_and(|unit| unit == &text_unit(index))
-                || !definition
-                    .unit_observation_boundaries(0, index)
-                    .is_ok_and(|boundary| !boundary.is_kernel_owned())
-        })
-    {
-        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
-            component: definition.id().into(),
-            resource: "shared text equation geometry".into(),
-        }
-        .into());
-    }
+    definition.validate_execution_contract(
+        TEXT_EXECUTION_GROUP,
+        &[],
+        &(0..layers).map(text_unit).collect::<Vec<_>>(),
+        &[text_transport()],
+        &text_state_partition_plan(layers),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     let state = match geometry {
         Some(geometry) => geometry
             .complete_state_layout(config)

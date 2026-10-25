@@ -290,41 +290,14 @@ pub(crate) fn select_definition(
             ));
         }
     }
-    if definition.primary_group() != TEXT_EXECUTION_GROUP
-        || !definition.prediction_groups().is_empty()
-        || definition.state_partition_plan() != &state_partition_plan(&state)
-    {
-        return Err(invalid(&definition, "Inkling execution or state ownership"));
-    }
-    for group in 0..3 {
-        if definition.group_transport(group)? != &group_transport(group) {
-            return Err(invalid(
-                &definition,
-                format!("Inkling group {group} transport"),
-            ));
-        }
-    }
-    for (ordinal, unit) in component_units(definition.parameters()).iter().enumerate() {
-        let address = definition
-            .parameters()
-            .unit_layout()
-            .address(ordinal)
-            .expect("declared Inkling unit");
-        if definition.unit(address.group(), address.index())? != unit
-            || definition
-                .unit_observation_boundaries(address.group(), address.index())?
-                .is_kernel_owned()
-        {
-            return Err(invalid(
-                &definition,
-                format!(
-                    "Inkling unit {}:{} equation geometry",
-                    address.group(),
-                    address.index()
-                ),
-            ));
-        }
-    }
+    definition.validate_execution_contract(
+        TEXT_EXECUTION_GROUP,
+        &[],
+        &component_units(definition.parameters()),
+        &(0..3).map(group_transport).collect::<Vec<_>>(),
+        &state_partition_plan(&state),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     if definition.state_layout() == &state {
         Ok(definition)
     } else {

@@ -332,35 +332,14 @@ fn select_definition(
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
     validate_identity(&definition)?;
     definition.validate_parameter_topology(&parameter_description(config)?)?;
-    let expected_units = component_units(config)?;
-    let layout = definition.parameters().unit_layout();
-    if definition.primary_group() != super::model::TEXT_EXECUTION_GROUP
-        || !definition.prediction_groups().is_empty()
-        || definition.group_transport(0)? != &vision_transport()
-        || definition.group_transport(1)? != &super::model::text_transport()
-        || definition.state_partition_plan() != &state_partition_plan(config)
-        || layout.len() != expected_units.len()
-        || expected_units
-            .iter()
-            .enumerate()
-            .any(|(ordinal, expected)| {
-                let address = layout
-                    .address(ordinal)
-                    .expect("declared complete invocation");
-                !definition
-                    .unit(address.group(), address.index())
-                    .is_ok_and(|unit| unit == expected)
-                    || !definition
-                        .unit_observation_boundaries(address.group(), address.index())
-                        .is_ok_and(|boundary| !boundary.is_kernel_owned())
-            })
-    {
-        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
-            component: definition.id().into(),
-            resource: "composite equation geometry".into(),
-        }
-        .into());
-    }
+    definition.validate_execution_contract(
+        super::model::TEXT_EXECUTION_GROUP,
+        &[],
+        &component_units(config)?,
+        &[vision_transport(), super::model::text_transport()],
+        &state_partition_plan(config),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     let state = component_state(config, geometry)?;
     if definition.state_layout() == &state {
         Ok(definition)

@@ -310,41 +310,16 @@ fn validate_definition(
             "Gemma retained state differs from selected geometry",
         ));
     }
-    if definition.primary_group() != TEXT_EXECUTION_GROUP
-        || !definition.prediction_groups().is_empty()
-        || definition.state_partition_plan() != &state_partition_plan(definition.state_layout())
-    {
-        return Err(invalid(definition, "Gemma execution or state ownership"));
-    }
-    for group in 0..3 {
-        if definition.group_transport(group)? != &group_transport(args, group) {
-            return Err(invalid(
-                definition,
-                format!("Gemma group {group} transport"),
-            ));
-        }
-    }
-    for (ordinal, unit) in component_units(definition.parameters()).iter().enumerate() {
-        let address = definition
-            .parameters()
-            .unit_layout()
-            .address(ordinal)
-            .expect("declared Gemma unit");
-        if definition.unit(address.group(), address.index())? != unit
-            || definition
-                .unit_observation_boundaries(address.group(), address.index())?
-                .is_kernel_owned()
-        {
-            return Err(invalid(
-                definition,
-                format!(
-                    "Gemma unit {}:{} equation geometry",
-                    address.group(),
-                    address.index()
-                ),
-            ));
-        }
-    }
+    definition.validate_execution_contract(
+        TEXT_EXECUTION_GROUP,
+        &[],
+        &component_units(definition.parameters()),
+        &(0..3)
+            .map(|group| group_transport(args, group))
+            .collect::<Vec<_>>(),
+        &state_partition_plan(definition.state_layout()),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     Ok(())
 }
 

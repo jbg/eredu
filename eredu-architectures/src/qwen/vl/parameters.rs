@@ -261,48 +261,14 @@ pub(crate) fn select_definition(
             ));
         }
     }
-    if definition.primary_group() != TEXT_EXECUTION_GROUP
-        || !definition.prediction_groups().is_empty()
-        || definition.state_partition_plan()
-            != &crate::transport::pipeline_state(1, definition.state_layout())
-    {
-        return Err(invalid(
-            &definition,
-            "Qwen3-VL execution or state ownership",
-        ));
-    }
-    for (group, transport) in component_transport().iter().enumerate() {
-        if definition.group_transport(group)? != transport {
-            return Err(invalid(
-                &definition,
-                format!("Qwen3-VL group {group} transport"),
-            ));
-        }
-    }
-    for (ordinal, unit) in component_units(args, definition.parameters())
-        .iter()
-        .enumerate()
-    {
-        let address = definition
-            .parameters()
-            .unit_layout()
-            .address(ordinal)
-            .expect("declared Qwen3-VL unit");
-        if definition.unit(address.group(), address.index())? != unit
-            || definition
-                .unit_observation_boundaries(address.group(), address.index())?
-                .is_kernel_owned()
-        {
-            return Err(invalid(
-                &definition,
-                format!(
-                    "Qwen3-VL unit {}:{} equation geometry",
-                    address.group(),
-                    address.index()
-                ),
-            ));
-        }
-    }
+    definition.validate_execution_contract(
+        TEXT_EXECUTION_GROUP,
+        &[],
+        &component_units(args, definition.parameters()),
+        &component_transport(),
+        &crate::transport::pipeline_state(1, definition.state_layout()),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     if definition.state_layout() == &state {
         Ok(definition)
     } else {

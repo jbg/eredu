@@ -820,44 +820,16 @@ pub(crate) fn select_conditional_definition(
         }
     }
     let parameters = definition.parameters();
-    if definition.primary_group() != crate::decoder::TARGET_EXECUTION_GROUP
-        || definition.prediction_groups() != conditional_prediction_groups(parameters)
-        || definition.state_partition_plan()
-            != &conditional_state_partition(parameters, definition.state_layout())
-    {
-        return Err(conditional_invalid(
-            &definition,
-            "conditional Qwen execution or state ownership",
-        ));
-    }
-    for group in 0..parameters.graph().groups().len() {
-        if definition.group_transport(group)? != &conditional_group_transport(group) {
-            return Err(conditional_invalid(
-                &definition,
-                format!("conditional Qwen group {group} transport"),
-            ));
-        }
-    }
-    for (ordinal, unit) in conditional_units(parameters).iter().enumerate() {
-        let address = parameters
-            .unit_layout()
-            .address(ordinal)
-            .expect("declared conditional invocation");
-        if definition.unit(address.group(), address.index())? != unit
-            || definition
-                .unit_observation_boundaries(address.group(), address.index())?
-                .is_kernel_owned()
-        {
-            return Err(conditional_invalid(
-                &definition,
-                format!(
-                    "conditional Qwen unit {}:{} equation geometry",
-                    address.group(),
-                    address.index()
-                ),
-            ));
-        }
-    }
+    definition.validate_execution_contract(
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        &conditional_prediction_groups(parameters),
+        &conditional_units(parameters),
+        &(0..parameters.graph().groups().len())
+            .map(conditional_group_transport)
+            .collect::<Vec<_>>(),
+        &conditional_state_partition(parameters, definition.state_layout()),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     if definition.state_layout() == &state {
         Ok(definition)
     } else {

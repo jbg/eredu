@@ -321,43 +321,29 @@ pub(crate) fn select_composite(
         }
         .into());
     }
-    if definition.primary_group() != decoder::TEXT_DECODER_EXECUTION_GROUP
-        || !definition.prediction_groups().is_empty()
-        || (0..3).any(|group| {
-            !definition
-                .group_transport(group)
-                .is_ok_and(|transport| transport == &super::parallel::group_transport(group))
+    let units = (0..definition.parameters().unit_layout().len())
+        .map(|ordinal| {
+            unit(
+                config,
+                true,
+                definition
+                    .parameters()
+                    .unit_layout()
+                    .address(ordinal)
+                    .expect("declared invocation"),
+            )
         })
-        || definition.state_partition_plan() != &state_partition(config, true)
-    {
-        return Err(ComponentDefinitionError::Invalid {
-            component: definition.id().into(),
-            resource: "composite execution or state ownership".into(),
-        }
-        .into());
-    }
-    for ordinal in 0..definition.parameters().unit_layout().len() {
-        let address = definition
-            .parameters()
-            .unit_layout()
-            .address(ordinal)
-            .expect("declared invocation");
-        if definition.unit(address.group(), address.index())? != &unit(config, true, address)
-            || definition
-                .unit_observation_boundaries(address.group(), address.index())?
-                .is_kernel_owned()
-        {
-            return Err(ComponentDefinitionError::Invalid {
-                component: definition.id().into(),
-                resource: format!(
-                    "composite unit {}:{} equation geometry",
-                    address.group(),
-                    address.index()
-                ),
-            }
-            .into());
-        }
-    }
+        .collect::<Vec<_>>();
+    definition.validate_execution_contract(
+        decoder::TEXT_DECODER_EXECUTION_GROUP,
+        &[],
+        &units,
+        &(0..3)
+            .map(super::parallel::group_transport)
+            .collect::<Vec<_>>(),
+        &state_partition(config, true),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     validate_state(config, definition.state_layout(), definition.id())?;
     validate_state(config, state, definition.id())?;
     if definition.state_layout() == state {
