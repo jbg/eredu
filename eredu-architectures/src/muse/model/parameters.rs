@@ -101,6 +101,40 @@ pub fn component_definition(
         }
         None => state_layout(args).map_err(Error::backend_source)?,
     };
+    let units = component_units(args, &parameters)?;
+    let transport = component_transport(args);
+    let partition = state_partition_plan(args, &state);
+    eredu_runtime::ComponentDefinition::new(
+        args.identity.model_type(),
+        parameters,
+        units,
+        transport,
+        TEXT_EXECUTION_GROUP,
+        Vec::new(),
+        state,
+        partition,
+    )
+    .and_then(|definition| {
+        let text_group = definition
+            .parameters()
+            .graph()
+            .group_index(definition.primary_group())
+            .expect("validated primary group");
+        definition.map_unit_observation_boundaries(|address, boundaries| {
+            if address.group() == text_group {
+                boundaries.clone().with_kernel_ownership()
+            } else {
+                boundaries.clone()
+            }
+        })
+    })
+    .map_err(Error::from)
+}
+
+fn component_units(
+    args: &DecoderConfig,
+    parameters: &ArchitectureParameterDescription,
+) -> Result<Vec<eredu_runtime::ComponentUnit>, Error> {
     let audio = args
         .audio_config
         .as_ref()
@@ -130,34 +164,194 @@ pub fn component_definition(
             }
         })
         .collect();
+    Ok(units)
+}
+
+fn component_transport(args: &DecoderConfig) -> Vec<eredu_runtime::ArchitectureGroupTransport> {
     let mut transport = vec![vision_group_transport(args), crate::transport::decoder()];
-    if audio.is_some() {
+    if args.audio_config.is_some() {
         transport.push(audio_group_transport());
     }
-    let partition = state_partition_plan(args, &state);
-    eredu_runtime::ComponentDefinition::new(
-        args.identity.model_type(),
-        parameters,
-        units,
-        transport,
-        TEXT_EXECUTION_GROUP,
-        Vec::new(),
-        state,
-        partition,
-    )
-    .and_then(|definition| {
-        let text_group = definition
-            .parameters()
-            .graph()
-            .group_index(definition.primary_group())
-            .expect("validated primary group");
-        definition.map_unit_observation_boundaries(|address, boundaries| {
-            if address.group() == text_group {
-                boundaries.clone().with_kernel_ownership()
-            } else {
-                boundaries.clone()
+    transport
+}
+
+/// Selects executable parameter formats while retaining logical consumers and seams.
+pub fn project_parameters(
+    args: &DecoderConfig,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    validate_identity(args, definition)?;
+    let parameters = describe(args)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+fn invalid(definition: &eredu_runtime::ComponentDefinition, resource: impl Into<String>) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn validate_identity(
+    args: &DecoderConfig,
+    definition: &eredu_runtime::ComponentDefinition,
+) -> Result<(), Error> {
+    if definition.id() != args.identity.model_type() {
+        return Err(invalid(definition, "Muse component identity"));
+    }
+    Ok(())
+}
+
+pub(crate) fn select_definition(
+    args: &DecoderConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&LocalGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    validate_identity(args, &definition)?;
+    definition.validate_parameter_topology(&describe(args)?)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => state_layout(args).map_err(Error::backend_source)?,
+    };
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained = super::super::local_geometry(args, layout).map_err(Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: args.vocab_size as usize,
+            local: 0..args.vocab_size as usize,
+        };
+        let embedding = geometry.map_or(&full, LocalGeometry::embedding_range);
+        let output = if args.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                geometry
+                    .and_then(LocalGeometry::output_range)
+                    .unwrap_or(&full),
+            )
+        };
+        if retained.state_layout() != &state
+            || retained.embedding_range() != embedding
+            || retained.output_range() != output
+            || retained
+                .text_blocks()
+                .iter()
+                .enumerate()
+                .any(|(index, block)| {
+                    block.architecture_fingerprint()
+                        != geometry
+                            .and_then(|geometry| geometry.text_block(index))
+                            .unwrap_or(args)
+                            .architecture_fingerprint()
+                })
+        {
+            return Err(invalid(
+                &definition,
+                "Muse retained placement differs from selected geometry",
+            ));
+        }
+    }
+    let global = state_layout(args).map_err(Error::backend_source)?;
+    let retained = definition.state_layout();
+    if retained.len() != global.len() || retained.segments() != global.segments() {
+        return Err(invalid(&definition, "Muse complete state geometry"));
+    }
+    for (index, (local, global)) in retained
+        .layers()
+        .iter()
+        .zip(global.layers().iter())
+        .enumerate()
+    {
+        let compatible = match (local, global) {
+            (
+                eredu_core::cache::LayerCachePolicy::KeyValue {
+                    attention,
+                    num_key_value_heads,
+                    head_dim,
+                },
+                eredu_core::cache::LayerCachePolicy::KeyValue {
+                    attention: global_attention,
+                    num_key_value_heads: global_heads,
+                    head_dim: global_dim,
+                },
+            ) => {
+                attention == global_attention
+                    && head_dim == global_dim
+                    && num_key_value_heads <= global_heads
             }
-        })
-    })
-    .map_err(Error::from)
+            _ => local == global,
+        };
+        if !compatible {
+            return Err(invalid(
+                &definition,
+                format!("Muse state slot {index} geometry"),
+            ));
+        }
+    }
+    if definition.primary_group() != TEXT_EXECUTION_GROUP
+        || !definition.prediction_groups().is_empty()
+        || definition.state_partition_plan() != &state_partition_plan(args, &state)
+    {
+        return Err(invalid(&definition, "Muse execution or state ownership"));
+    }
+    for (group, transport) in component_transport(args).iter().enumerate() {
+        if definition.group_transport(group)? != transport {
+            return Err(invalid(
+                &definition,
+                format!("Muse group {group} transport"),
+            ));
+        }
+    }
+    for (ordinal, unit) in component_units(args, definition.parameters())?
+        .iter()
+        .enumerate()
+    {
+        let address = definition
+            .parameters()
+            .unit_layout()
+            .address(ordinal)
+            .expect("declared Muse unit");
+        let boundaries =
+            definition.unit_observation_boundaries(address.group(), address.index())?;
+        let observation_matches = if address.group() == 1 {
+            boundaries
+                == &eredu_runtime::UnitObservationBoundaries::around(&unit.path)
+                    .with_kernel_ownership()
+        } else {
+            !boundaries.is_kernel_owned()
+        };
+        if definition.unit(address.group(), address.index())? != unit || !observation_matches {
+            return Err(invalid(
+                &definition,
+                format!(
+                    "Muse unit {}:{} equation geometry or observation ownership",
+                    address.group(),
+                    address.index()
+                ),
+            ));
+        }
+    }
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(Error::from)
+    }
 }

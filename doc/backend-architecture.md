@@ -9730,6 +9730,17 @@ its kernel-owned pinned resources. The adapter supplies graph, address, paramete
 state, provider, observation, and typed partition contracts from the retained
 validated definition. Complete and selected partitions use the same equations;
 selected ownership restricts unit acquisition and pinned traversal before execution.
+Low-level Muse construction consumes an explicit `Arc<ComponentDefinition>` through
+`MuseKernel::from_definition`, `from_parallel_definition` or `from_partition`.
+Cold complete and partitioned preparation project source and target parameter
+formats from that retained parent; identical formats and state geometry reuse its
+allocation. Family unit and transport producers also validate equation paths,
+state references and text's canonical kernel-owned observation seams before native
+allocation. Runtime-owned media seams retain their declared names; text input and
+output names follow the instrumented equation paths. Retained placement must match
+selected local state, vocabulary ownership and decoder block geometry.
+Local state projection preserves waveform ownership and global ordinal packing.
+Source-format modules keep their independently derived placement and partition.
 Low-level Muse operations borrow the kernel through `kernel()` or `kernel_mut()`.
 Muse retains media assembly, waveform clocks and histories, text cache geometry,
 routed expert specifications, and assistant target operations. Parallel decoder

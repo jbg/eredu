@@ -615,6 +615,12 @@ sessions with snapshots, restore, fork, cancellation and termination. Independen
 external drafting and the published DSpark/DFlash2 assistants use shared proposal,
 verification and commitment drivers. Spark accepts media and produces text.
 
+Low-level Muse construction takes an explicit retained component declaration via
+`MuseKernel::from_definition`, `from_parallel_definition` or `from_partition`.
+`muse::model::project_parameters` selects physical formats while retaining logical
+consumers, state ownership and observation seams. The same parent is consumed by
+complete and partitioned preparation for both Spark and Glimmer.
+
 The [pinned inventory](../validation/fixtures/muse-spark/inventory.json) records
 complete revisions, publisher file sizes/hashes and reference-source identities.
 It admits these checkpoint layouts:

@@ -2,7 +2,8 @@
 
 mod observation;
 mod parameters;
-pub use parameters::component_definition;
+pub(crate) use parameters::select_definition;
+pub use parameters::{component_definition, project_parameters};
 mod prefill;
 mod waveform;
 use prefill::DecoderPrefill;
@@ -1149,25 +1150,28 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
     }
 
     /// Builds unloaded pinned modules.
-    pub fn new(
+    pub fn from_definition(
         args: DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, None, None, context)
+        Self::materialize(args, definition, None, None, context)
     }
 
     /// Builds the canonical graph with planner-derived tensor-local geometry.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         args: DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, Some(geometry), None, context)
+        Self::materialize(args, definition, Some(geometry), None, context)
     }
 
     /// Builds exactly the resources and global unit view retained by an authoritative partition.
     pub fn from_partition(
         args: DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         partition: &eredu_runtime::ArchitecturePartition<
             super::PartitionLocalGeometry,
@@ -1175,11 +1179,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, Some(geometry), Some(partition), context)
+        Self::materialize(args, definition, Some(geometry), Some(partition), context)
     }
 
     fn materialize(
         args: DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<LocalGeometry>,
         partition: Option<
             &eredu_runtime::ArchitecturePartition<
@@ -1189,7 +1194,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        let definition = std::sync::Arc::new(component_definition(&args, geometry.as_ref())?);
+        let definition = parameters::select_definition(&args, definition, geometry.as_ref())?;
         let selection = partition
             .map(|partition| {
                 super::PartitionLocalFoundation::from_partition(&args, partition)

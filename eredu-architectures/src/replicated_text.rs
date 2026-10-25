@@ -8078,20 +8078,35 @@ where
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
         let capability = crate::capability::muse(args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let retained = self
+            .requirements
+            .execution()
+            .shared_component_definition()
+            .ok_or_else(|| {
+                ReplicatedTextDispatchError::Architecture(
+                    "composite selection has no retained definition".into(),
+                )
+            })?;
         let source = self
             .has_transform
             .then(|| crate::muse::with_checkpoint_formats(args, self.source_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::muse::MuseKernel::<B>::new(args, self.context))
+            .map(|args| {
+                let definition = crate::muse::model::project_parameters(&args, &retained)?;
+                crate::muse::MuseKernel::<B>::from_definition(args, definition, self.context)
+            })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = crate::muse::with_checkpoint_formats(args, self.target_formats.clone())
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.identity.text_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::muse::MuseKernel::<B>::new(target, self.context)
+        let definition = crate::muse::model::project_parameters(&target, &retained)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture =
+            crate::muse::MuseKernel::<B>::from_definition(target, definition, self.context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,

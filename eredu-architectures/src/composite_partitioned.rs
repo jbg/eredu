@@ -2329,12 +2329,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::muse::component_definition(&args, None)
-                .map_err(|error| {
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::muse::model::project_parameters(&args, &retained).map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
-                })?
-                .parameters()
-                .clone();
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2383,8 +2392,8 @@ where
             } else {
                 None
             };
-            let definition =
-                crate::muse::component_definition(&args, Some(&local)).map_err(|error| {
+            let definition = crate::muse::model::select_definition(&args, definition, Some(&local))
+                .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
             let partition = ArchitecturePartition::from_description(
@@ -2422,6 +2431,7 @@ where
             }
             let mut architecture = crate::muse::MuseKernel::<B>::from_partition(
                 args.clone(),
+                definition,
                 local,
                 &partition,
                 context,
@@ -3199,10 +3209,15 @@ where
         ),
     )?;
     let source = &source_args;
-    let parameters = crate::muse::component_definition(source, None)
-        .map_err(|error| error.to_string())?
-        .parameters()
-        .clone();
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition = crate::muse::model::project_parameters(source, &retained)
+        .map_err(|error| error.to_string())?;
+    let parameters = definition.parameters().clone();
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()
     {
@@ -3244,7 +3259,7 @@ where
     if let Some(realization) = &realization {
         routed_muse_partition_foundation(source, &layout, ranges(), ownership, rank, realization)?;
     }
-    let definition = crate::muse::component_definition(source, Some(&local))
+    let definition = crate::muse::model::select_definition(source, definition, Some(&local))
         .map_err(|error| error.to_string())?;
     let partition = ArchitecturePartition::from_description(
         definition.parameters(),
@@ -3261,9 +3276,14 @@ where
     }
     crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
         .map_err(|error| error.to_string())?;
-    let mut architecture =
-        crate::muse::MuseKernel::<B>::from_partition(source.clone(), local, &partition, context)
-            .map_err(|error| error.to_string())?;
+    let mut architecture = crate::muse::MuseKernel::<B>::from_partition(
+        source.clone(),
+        definition,
+        local,
+        &partition,
+        context,
+    )
+    .map_err(|error| error.to_string())?;
     if let Some(realization) = realization {
         architecture
             .kernel_mut()
