@@ -83,6 +83,12 @@ projector.
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 | NemotronLabs VoiceChat | realtime PCM speech, text, transcription, tools | yes | `nemotron_voicechat`; explicit split component bundle and companion | single-device controlled/iterator session; [validation](voicechat-validation.md) |
 
+Low-level Qwen3-VL construction takes a retained component declaration through
+`VlKernel::from_definition`, `from_parallel_definition` or `from_partition`.
+`qwen::vl::project_parameters` selects physical formats while retaining canonical
+consumers, observation seams and the persisted mRoPE position-delta state.
+Complete and selected partitions share one materializer and family equations.
+
 Low-level Gemma 4 construction consumes an explicit retained component declaration
 through `GemmaKernel::from_definition` or `from_parallel_definition`.
 `gemma4::model::project_parameters` selects physical formats while retaining

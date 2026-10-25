@@ -7894,20 +7894,35 @@ where
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
         let capability = crate::capability::qwen_vl(args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let retained = self
+            .requirements
+            .execution()
+            .shared_component_definition()
+            .ok_or_else(|| {
+                ReplicatedTextDispatchError::Architecture(
+                    "composite selection has no retained definition".into(),
+                )
+            })?;
         let source = self
             .has_transform
             .then(|| qwen_vl_with_formats(args, self.source_linear_formats.clone()))
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::qwen::vl::VlKernel::<B>::new(args, self.context))
+            .map(|args| {
+                let definition = crate::qwen::vl::project_parameters(&args, &retained)?;
+                crate::qwen::vl::VlKernel::<B>::from_definition(args, definition, self.context)
+            })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = qwen_vl_with_formats(args, self.target_linear_formats.clone())
             .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = crate::qwen::vl::prompt_cache_architecture_fingerprint(&target);
-        let architecture = crate::qwen::vl::VlKernel::<B>::new(target, self.context)
+        let definition = crate::qwen::vl::project_parameters(&target, &retained)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture =
+            crate::qwen::vl::VlKernel::<B>::from_definition(target, definition, self.context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,

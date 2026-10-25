@@ -9838,13 +9838,25 @@ architecture parameters; the Hugging Face convention remains weightless there.
 Qwen3-VL declares parameters without native modules by composing the ordinary
 Qwen text topology and shared vision specifications. Text execution owners map
 to the composite decoder group; canonical targets, tied storage roles, encoded
-companions and placement rules retain checkpoint-global geometry. Complete and
-tensor-parallel construction validate and retain one `ComponentDefinition`
-before allocating modules. Graphs, logical paths, transport, parameter catalogs
-and complete state reports project that definition. Vision invocations declare
+companions and placement rules retain checkpoint-global geometry. Complete,
+tensor-parallel and partitioned construction consume the `ComponentDefinition`
+retained by cold admission before allocating modules. Graphs, logical paths,
+transport, parameter catalogs and complete state reports project that definition. Vision invocations declare
 no decoder state slots; text slots include the persisted mRoPE position delta.
 Target and transform-source partition preparation derive layout from the same
 cold parameter declaration.
+
+Low-level construction takes an explicit `Arc<ComponentDefinition>` through
+`VlKernel::from_definition`, `from_parallel_definition` or `from_partition`.
+`project_parameters` selects exact executable formats while retaining logical
+consumers and observation seams; unchanged formats reuse the same allocation.
+Family unit, state and transport producers validate equation paths, state slots
+and hook ownership. Local state projection retains the integer position-delta
+component independently of KV-head sharding. Retained placement agrees with
+vocabulary ownership, text blocks, vision heads/intermediates and merger widths.
+Complete and selected preparation use these same declaration projections for
+source and target modules; source authority and placement stay independent.
+The shared partition selector validates resource and state ownership.
 
 Complete and selected Qwen3-VL use one resource materializer. Selected construction
 consumes a cold partition and validates its canonical parameters, state, boundary,

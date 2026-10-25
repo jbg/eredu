@@ -1359,25 +1359,28 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
     }
 
     /// Builds all canonical pinned resources from a validated declaration.
-    pub fn new(
+    pub fn from_definition(
         args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, None, None, context)
+        Self::materialize(args, definition, None, None, context)
     }
 
     /// Builds complete planner-derived text and vision modules.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, Some(geometry), None, context)
+        Self::materialize(args, definition, Some(geometry), None, context)
     }
 
     /// Materializes exactly the pinned roots and factories owned by a cold partition.
     pub fn from_partition(
         args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         partition: &eredu_runtime::ArchitecturePartition<
             super::PartitionLocalGeometry,
@@ -1385,11 +1388,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        Self::materialize(args, Some(geometry), Some(partition), context)
+        Self::materialize(args, definition, Some(geometry), Some(partition), context)
     }
 
     fn materialize(
         args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<LocalGeometry>,
         partition: Option<
             &eredu_runtime::ArchitecturePartition<
@@ -1399,8 +1403,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        let definition =
-            std::sync::Arc::new(super::component_definition(&args, geometry.as_ref())?);
+        let definition = super::select_definition(&args, definition, geometry.as_ref())?;
         if let Some(partition) = partition {
             super::PartitionLocalFoundation::from_partition(&args, partition)
                 .map_err(Error::backend_source)?;
@@ -1411,14 +1414,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
                 .local_geometry()
                 .validate_complete_geometry(&args, complete)
                 .map_err(Error::backend_source)?;
-            if partition.graph() != definition.parameters().graph()
-                || partition.unit_layout() != definition.parameters().unit_layout()
-                || partition.parameter_bindings() != definition.parameters().select_owned(partition)
-            {
-                return Err(Error::backend(
-                    "Qwen3-VL partition ownership differs from its definition",
-                ));
-            }
+            definition.select_partition(partition)?;
         }
         crate::operator_requirements::require::<B>(
             "Qwen3-VL",

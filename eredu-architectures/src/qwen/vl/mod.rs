@@ -28,7 +28,8 @@ pub use parallel::{
     local_geometry, partition_local_geometry, partition_local_routed_geometry, LocalGeometry,
     PartitionLocalFoundation, PartitionLocalGeometry,
 };
-pub use parameters::{component_definition, parameter_description};
+pub use parameters::{component_definition, parameter_description, project_parameters};
+pub(crate) use parameters::select_definition;
 
 pub use positions::{
     mrope_embeddings, mrope_spec, mrope_values, multimodal_position_ids, position_ids_tensor,

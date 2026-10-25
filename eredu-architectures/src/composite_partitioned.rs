@@ -2524,9 +2524,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::qwen::vl::parameter_description(&args).map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::qwen::vl::project_parameters(&args, &retained).map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2577,8 +2589,8 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let definition =
-                crate::qwen::vl::component_definition(&args, Some(&local)).map_err(|error| {
+            let definition = crate::qwen::vl::select_definition(&args, definition, Some(&local))
+                .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
             let partition = ArchitecturePartition::from_description(
@@ -2595,6 +2607,7 @@ where
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let architecture = crate::qwen::vl::VlKernel::<B>::from_partition(
                 args.clone(),
+                definition,
                 local,
                 &partition,
                 context,
@@ -3024,7 +3037,15 @@ where
         .map(|(name, format)| (name, format.into()))
         .collect(),
     )?;
-    let parameters = crate::qwen::vl::parameter_description(&source).map_err(|e| e.to_string())?;
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition =
+        crate::qwen::vl::project_parameters(&source, &retained).map_err(|e| e.to_string())?;
+    let parameters = definition.parameters().clone();
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()
     {
@@ -3067,7 +3088,7 @@ where
     {
         return Err("Qwen3-VL transform source changed partition state or ownership".into());
     }
-    let definition = crate::qwen::vl::component_definition(&source, Some(&local))
+    let definition = crate::qwen::vl::select_definition(&source, definition, Some(&local))
         .map_err(|error| error.to_string())?;
     let partition = ArchitecturePartition::from_description(
         definition.parameters(),
@@ -3084,9 +3105,10 @@ where
     }
     crate::qwen::vl::PartitionLocalFoundation::from_partition(&source, &partition)
         .map_err(|e| e.to_string())?;
-    let architecture =
-        crate::qwen::vl::VlKernel::<B>::from_partition(source, local, &partition, context)
-            .map_err(|error| error.to_string())?;
+    let architecture = crate::qwen::vl::VlKernel::<B>::from_partition(
+        source, definition, local, &partition, context,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 

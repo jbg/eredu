@@ -93,15 +93,42 @@ pub fn component_definition(
     geometry: Option<&LocalGeometry>,
 ) -> Result<ComponentDefinition, Error> {
     let parameters = parameter_description(args)?;
-    let state = match geometry {
+    let state = component_state(args, geometry)?;
+    let units = component_units(args, &parameters);
+    let transport = component_transport();
+    let partition = crate::transport::pipeline_state(1, &state);
+    ComponentDefinition::new(
+        "qwen-vl",
+        parameters,
+        units,
+        transport,
+        TEXT_EXECUTION_GROUP,
+        Vec::new(),
+        state,
+        partition,
+    )
+    .map_err(Error::from)
+}
+
+fn component_state(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
+) -> Result<eredu_runtime::StateLayout, Error> {
+    match geometry {
         Some(geometry) => {
             geometry.validate_for(args).map_err(Error::backend_source)?;
-            geometry.state_layout().clone()
+            Ok(geometry.state_layout().clone())
         }
-        None => super::state_layout(args).map_err(Error::backend_source)?,
-    };
+        None => super::state_layout(args).map_err(Error::backend_source),
+    }
+}
+
+fn component_units(
+    args: &ModelArgs,
+    parameters: &ArchitectureParameterDescription,
+) -> Vec<ComponentUnit> {
     let layout = parameters.unit_layout();
-    let units = (0..layout.len())
+    (0..layout.len())
         .map(|ordinal| {
             let address = layout.address(ordinal).expect("declared Qwen3-VL unit");
             let index = address.index();
@@ -116,8 +143,11 @@ pub fn component_definition(
                 },
             }
         })
-        .collect();
-    let transport = vec![
+        .collect()
+}
+
+fn component_transport() -> Vec<eredu_runtime::ArchitectureGroupTransport> {
+    vec![
         eredu_runtime::ArchitectureGroupTransport {
             placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
             kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
@@ -128,17 +158,159 @@ pub fn component_definition(
             request_optional: true,
         },
         crate::transport::decoder(),
-    ];
-    let partition = crate::transport::pipeline_state(1, &state);
-    ComponentDefinition::new(
-        "qwen-vl",
-        parameters,
-        units,
-        transport,
-        TEXT_EXECUTION_GROUP,
-        Vec::new(),
-        state,
-        partition,
-    )
-    .map_err(Error::from)
+    ]
+}
+
+fn invalid(definition: &ComponentDefinition, resource: impl Into<String>) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn validate_identity(definition: &ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != "qwen-vl" {
+        return Err(invalid(definition, "Qwen3-VL component identity"));
+    }
+    Ok(())
+}
+
+/// Selects physical formats while retaining canonical consumers, state and observation seams.
+pub fn project_parameters(
+    args: &ModelArgs,
+    definition: &std::sync::Arc<ComponentDefinition>,
+) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
+    validate_identity(definition)?;
+    let parameters = parameter_description(args)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+pub(crate) fn select_definition(
+    args: &ModelArgs,
+    definition: std::sync::Arc<ComponentDefinition>,
+    geometry: Option<&LocalGeometry>,
+) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
+    validate_identity(&definition)?;
+    definition.validate_parameter_topology(&parameter_description(args)?)?;
+    let state = component_state(args, geometry)?;
+    let global = component_state(args, None)?;
+    if definition.state_layout() != &global && definition.state_layout() != &state {
+        return Err(invalid(
+            &definition,
+            "Qwen3-VL retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained = super::local_geometry(args, layout).map_err(Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: args.text.vocab_size as usize,
+            local: 0..args.text.vocab_size as usize,
+        };
+        let output = if args.text.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                geometry
+                    .and_then(|geometry| geometry.text().output_range())
+                    .unwrap_or(&full),
+            )
+        };
+        let unsharded =
+            crate::qwen::vision::VisionStaticSelection::all(args.vision.clone(), "model.visual")
+                .and_then(|selection| selection.unsharded_merger_intermediates())
+                .map_err(Error::backend_source)?;
+        if retained.state_layout() != &state
+            || retained.text().embedding_range()
+                != geometry.map_or(&full, |geometry| geometry.text().embedding_range())
+            || retained.text().output_range() != output
+            || retained.merger_widths()
+                != geometry.map_or(unsharded.as_slice(), LocalGeometry::merger_widths)
+            || (0..args.vision.layer_count()).any(|index| {
+                retained.vision_block(index)
+                    != geometry.map_or(
+                        Some((args.vision.num_heads, args.vision.intermediate_size)),
+                        |geometry| geometry.vision_block(index),
+                    )
+            })
+            || retained
+                .text()
+                .blocks()
+                .iter()
+                .enumerate()
+                .any(|(index, block)| {
+                    crate::qwen::prompt_cache_architecture_fingerprint(block)
+                        != crate::qwen::prompt_cache_architecture_fingerprint(
+                            geometry
+                                .and_then(|geometry| geometry.text().block(index))
+                                .unwrap_or(&args.text),
+                        )
+                })
+        {
+            return Err(invalid(
+                &definition,
+                "Qwen3-VL retained placement differs from selected geometry",
+            ));
+        }
+    }
+    if definition.primary_group() != TEXT_EXECUTION_GROUP
+        || !definition.prediction_groups().is_empty()
+        || definition.state_partition_plan()
+            != &crate::transport::pipeline_state(1, definition.state_layout())
+    {
+        return Err(invalid(
+            &definition,
+            "Qwen3-VL execution or state ownership",
+        ));
+    }
+    for (group, transport) in component_transport().iter().enumerate() {
+        if definition.group_transport(group)? != transport {
+            return Err(invalid(
+                &definition,
+                format!("Qwen3-VL group {group} transport"),
+            ));
+        }
+    }
+    for (ordinal, unit) in component_units(args, definition.parameters())
+        .iter()
+        .enumerate()
+    {
+        let address = definition
+            .parameters()
+            .unit_layout()
+            .address(ordinal)
+            .expect("declared Qwen3-VL unit");
+        if definition.unit(address.group(), address.index())? != unit
+            || definition
+                .unit_observation_boundaries(address.group(), address.index())?
+                .is_kernel_owned()
+        {
+            return Err(invalid(
+                &definition,
+                format!(
+                    "Qwen3-VL unit {}:{} equation geometry",
+                    address.group(),
+                    address.index()
+                ),
+            ));
+        }
+    }
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(Error::from)
+    }
 }
