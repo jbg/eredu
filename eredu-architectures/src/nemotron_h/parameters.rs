@@ -473,41 +473,10 @@ pub(crate) fn component_definition(
 ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
     let layout = parameters.unit_layout();
     let target = layout.group_range(0).expect("declared target group").len();
-    let units = (0..layout.len())
-        .map(|ordinal| {
-            let address = layout.address(ordinal).expect("declared unit");
-            let path = if address.group() == 0 {
-                format!("model.layers.{}", address.index())
-            } else {
-                format!("model.mtp.layers.{}", ordinal - target)
-            };
-            eredu_runtime::ComponentUnit {
-                path,
-                state: ordinal..ordinal + 1,
-            }
-        })
-        .collect();
-    let groups = parameters.graph().groups().len();
-    let prediction = (1..groups)
-        .map(|group| {
-            layout
-                .group_id(group)
-                .expect("declared prediction group")
-                .as_str()
-                .to_owned()
-        })
-        .collect();
-    let transport = (0..groups)
-        .map(|group| {
-            if group == 0 {
-                return crate::transport::decoder();
-            }
-            let mut contract = crate::transport::prediction();
-            if group == 1 {
-                contract.first_owner_static_roles.push("mtp".into());
-            }
-            contract
-        })
+    let units = component_units(&parameters);
+    let prediction = prediction_groups(&parameters);
+    let transport = (0..parameters.graph().groups().len())
+        .map(group_transport)
         .collect();
     let partition = crate::transport::pipeline_with_output_state(0, target, &state);
     eredu_runtime::ComponentDefinition::new(
@@ -521,4 +490,163 @@ pub(crate) fn component_definition(
         partition,
     )
     .map_err(eredu_nn::Error::from)
+}
+
+fn component_units(
+    parameters: &ArchitectureParameterDescription,
+) -> Vec<eredu_runtime::ComponentUnit> {
+    let layout = parameters.unit_layout();
+    let target = layout.group_range(0).expect("declared target group").len();
+    (0..layout.len())
+        .map(|ordinal| {
+            let address = layout.address(ordinal).expect("declared unit");
+            let path = if address.group() == 0 {
+                format!("model.layers.{}", address.index())
+            } else {
+                format!("model.mtp.layers.{}", ordinal - target)
+            };
+            eredu_runtime::ComponentUnit {
+                path,
+                state: ordinal..ordinal + 1,
+            }
+        })
+        .collect()
+}
+fn prediction_groups(parameters: &ArchitectureParameterDescription) -> Vec<String> {
+    let layout = parameters.unit_layout();
+    let groups = parameters.graph().groups().len();
+    (1..groups)
+        .map(|group| {
+            layout
+                .group_id(group)
+                .expect("declared prediction group")
+                .as_str()
+                .to_owned()
+        })
+        .collect()
+}
+fn group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+    if group == 0 {
+        return crate::transport::decoder();
+    }
+    let mut transport = crate::transport::prediction();
+    if group == 1 {
+        transport.first_owner_static_roles.push("mtp".into());
+    }
+    transport
+}
+fn invalid_definition(
+    definition: &eredu_runtime::ComponentDefinition,
+    resource: impl Into<String>,
+) -> eredu_nn::Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn validate_identity(
+    definition: &eredu_runtime::ComponentDefinition,
+) -> Result<(), eredu_nn::Error> {
+    if definition.id() != "nemotron-h" {
+        return Err(invalid_definition(
+            definition,
+            "Nemotron-H component identity",
+        ));
+    }
+    Ok(())
+}
+/// Projects exact executable formats while retaining logical consumers and observation seams.
+pub fn project_parameters(
+    args: &ModelArgs,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
+    validate_identity(definition)?;
+    let parameters = parameter_description(args).map_err(eredu_nn::Error::backend_source)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(eredu_nn::Error::from)
+}
+pub(super) fn select_definition(
+    args: &ModelArgs,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    state: &eredu_runtime::StateLayout,
+    vocabulary: (
+        eredu_nn::VocabularyParallelRange,
+        Option<eredu_nn::VocabularyParallelRange>,
+    ),
+    units: impl IntoIterator<Item = (usize, super::LayerGeometry)>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
+    validate_identity(&definition)?;
+    definition.validate_parameter_topology(
+        &parameter_description(args).map_err(eredu_nn::Error::backend_source)?,
+    )?;
+    let global = super::state_layout(args).map_err(eredu_nn::Error::backend_source)?;
+    if definition.state_layout() != &global && definition.state_layout() != state {
+        return Err(invalid_definition(
+            &definition,
+            "Nemotron-H retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained =
+            super::local_geometry(args, layout).map_err(eredu_nn::Error::backend_source)?;
+        if retained.state_layout() != state
+            || retained.embedding_range() != &vocabulary.0
+            || retained.output_range() != vocabulary.1.as_ref()
+        {
+            return Err(invalid_definition(
+                &definition,
+                "Nemotron-H retained state or vocabulary placement differs from selected geometry",
+            ));
+        }
+        for (index, geometry) in units {
+            let actual = if index < retained.target_units().len() {
+                retained.target_unit(index)
+            } else {
+                retained.prediction_unit(index - retained.target_units().len())
+            };
+            if actual != Some(&geometry) {
+                return Err(invalid_definition(
+                    &definition,
+                    format!(
+                        "Nemotron-H retained unit {index} placement differs from selected geometry"
+                    ),
+                ));
+            }
+        }
+    }
+    let target = definition
+        .parameters()
+        .unit_layout()
+        .group_range(0)
+        .expect("declared target group")
+        .len();
+    definition.validate_execution_contract(
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        &prediction_groups(definition.parameters()),
+        &component_units(definition.parameters()),
+        &(0..definition.parameters().graph().groups().len())
+            .map(group_transport)
+            .collect::<Vec<_>>(),
+        &crate::transport::pipeline_with_output_state(0, target, definition.state_layout()),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
+    if definition.state_layout() == state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state.clone())
+            .map(std::sync::Arc::new)
+            .map_err(eredu_nn::Error::from)
+    }
 }

@@ -564,7 +564,7 @@ pub fn local_state_geometry(
     Ok(geometry)
 }
 
-fn global_target_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
+pub(super) fn global_target_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
     Ok(args
         .layer_schedule
         .iter()
@@ -588,7 +588,7 @@ fn global_target_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, Parall
         .collect())
 }
 
-fn global_prediction_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
+pub(super) fn global_prediction_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
     Ok(args
         .mtp_policies()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?

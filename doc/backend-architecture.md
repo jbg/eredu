@@ -9463,6 +9463,21 @@ owner. Rank-local construction retains exact local state geometry, while the
 explicit ordinary state-layout operation returns global geometry. Group assembly
 receives dependency activations after shared adapter validation.
 
+`nemotron_h::component_definition` validates source-free target and patterned MTP
+contracts from normalized configuration and optional local geometry. Complete
+construction consumes that retained declaration through
+`CompleteNemotronKernel::from_definition` or `from_parallel_definition`; one
+materializer selects ordinary or tensor-local statics. Selected target construction
+consumes it through `NemotronKernel::from_partition`. `project_parameters` selects
+physical formats while preserving logical consumers and runtime observation seams;
+unchanged projections reuse the allocation. The family validates exact global or
+selected Mamba/attention state, vocabulary ownership and target/prediction unit
+geometry before allocating modules. Shared execution-contract and partition checks
+validate paths, state references, transport and canonical resource ownership.
+Routed complete and dense/routed partition preparation retain cold source/target
+projections. VoiceChat backbone preparation consumes the same source-free definition
+and passes its retained allocation directly to materialization.
+
 Complete kernels retain target/draft selection, embedding ingress, patterned MTP
 factories, provider geometry and draft readout without target normalization.
 Resident, bounded, text and observed drivers use the shared adapter. Explicit

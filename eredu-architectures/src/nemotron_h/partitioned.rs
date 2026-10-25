@@ -6,7 +6,7 @@ use eredu_nn::{
 };
 use eredu_runtime::PartitionComponentKernel as _;
 use eredu_runtime::{
-    ArchitectureParameterDescription, LayerRuntimeState, LayeredForwardState,
+    LayerRuntimeState, LayeredForwardState,
     LayeredPartitionInput, ParameterProvider, RuntimeStateComponents, StateLayout,
 };
 
@@ -27,7 +27,7 @@ pub struct PartitionedForwardContext<T> {
 
 /// Shared typed adapter for one selected Nemotron-H target ownership view.
 pub type PartitionedLayeredModel<B> = eredu_runtime::ComponentAdapter<
-    eredu_runtime::ComponentDefinition,
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
     NemotronKernel<B>,
     eredu_runtime::KernelParameterModules,
 >;
@@ -118,7 +118,7 @@ where
     /// Constructs only the statics and target units selected by one exact partition.
     pub fn from_partition(
         args: ModelArgs,
-        parameters: &ArchitectureParameterDescription,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<
             PartitionLocalGeometry,
             TargetBoundarySchema,
@@ -158,24 +158,20 @@ where
                 "Nemotron-H construction range differs from selected partition",
             ));
         }
-        let state = partition
-            .state()
-            .ok_or_else(|| Error::backend("partitioned Nemotron-H has no selected state"))?;
-        let expected_state = partition
-            .local_geometry()
-            .complete_state_layout()
-            .slice(owned.clone())
-            .map_err(Error::backend)?;
-        if state.global_layer_offset() != owned.start || state.layout() != &expected_state {
-            return Err(Error::backend(
-                "Nemotron-H partition state does not match its global unit range",
-            ));
-        }
         let geometry = partition.local_geometry().clone();
-        let definition = super::parameters::component_definition(
-            parameters.clone(),
-            geometry.complete_state_layout().clone(),
+        let definition = super::parameters::select_definition(
+            &args,
+            definition,
+            geometry.complete_state_layout(),
+            (
+                geometry.embedding_range().clone(),
+                geometry.output_range().cloned(),
+            ),
+            geometry
+                .owned_units()
+                .map(|index| (index, *geometry.unit(index).expect("validated local unit"))),
         )?;
+        definition.select_partition(partition)?;
         let static_modules = partition_static_modules(&args, &geometry, partition, context)?;
         let kernel = Self {
             args,

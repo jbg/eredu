@@ -11,8 +11,27 @@ pub mod mtp;
 pub mod parallel;
 mod parameters;
 mod partitioned;
-pub(crate) use parameters::component_definition;
-pub use parameters::parameter_description;
+/// Validates source-free target and embedded-prediction declarations.
+pub fn component_definition(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry
+                .validate_for(args)
+                .map_err(eredu_nn::Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => state_layout(args).map_err(eredu_nn::Error::backend_source)?,
+    };
+    parameters::component_definition(
+        parameter_description(args).map_err(eredu_nn::Error::backend_source)?,
+        state,
+    )
+}
+pub use parameters::{parameter_description, project_parameters};
 
 pub use attention::{new_attention, new_attention_at};
 pub use block::{Block, Operator};

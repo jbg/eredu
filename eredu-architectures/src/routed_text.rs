@@ -1438,16 +1438,37 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid(
+                "Nemotron-H selection has no retained definition".into(),
+            )
+        })?;
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::nemotron_h::CompleteNemotronKernel::<B>::new(args.clone(), context))
+        .then(|| {
+            let definition = crate::nemotron_h::project_parameters(args, &retained)?;
+            crate::nemotron_h::CompleteNemotronKernel::<B>::from_definition(
+                args.clone(),
+                definition,
+                context,
+            )
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_nemotron_h_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::nemotron_h::CompleteNemotronKernel::<B>::new(selected_args, context)
+    let definition = crate::nemotron_h::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture = crate::nemotron_h::CompleteNemotronKernel::<B>::from_definition(
+        selected_args,
+        definition,
+        context,
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::nemotron_h(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets = addressable_parameter_targets::<Relu2Operation>(bank_residency, &plan, &catalog);

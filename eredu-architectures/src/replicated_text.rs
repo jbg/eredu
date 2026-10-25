@@ -397,10 +397,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
     fn definition(
         config: &Self::Config,
     ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-        crate::nemotron_h::component_definition(
-            crate::nemotron_h::parameter_description(config).map_err(eredu_nn::Error::backend)?,
-            crate::nemotron_h::state_layout(config).map_err(eredu_nn::Error::backend)?,
-        )
+        crate::nemotron_h::component_definition(config, None)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         let embedding = "model.embeddings.weight";
@@ -3386,11 +3383,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(args) => decoder(*args, crate::gpt_oss::parameter_description(args)),
             Self::Lfm2(args) => crate::lfm2::component_definition(args),
             Self::KimiLinear(args) => crate::kimi_linear::component_definition(args),
-            Self::NemotronH(args) => crate::nemotron_h::component_definition(
-                crate::nemotron_h::parameter_description(args)
-                    .map_err(eredu_nn::Error::backend_source)?,
-                crate::nemotron_h::state_layout(args).map_err(eredu_nn::Error::backend_source)?,
-            ),
+            Self::NemotronH(args) => crate::nemotron_h::component_definition(args, None),
             Self::QwenHybrid(args) => crate::qwen::hybrid::component_definition(args, None),
             Self::DeepSeekV3(args) => crate::deepseek::v3::component_definition(args, None),
             Self::DeepSeekV4(args) => crate::deepseek::v4::component_definition(args, None),

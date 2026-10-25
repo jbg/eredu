@@ -268,37 +268,27 @@ pub struct CompleteNemotronKernel<B: GroupedNeuralBackend + eredu_nn::Distribute
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemotronKernel<B> {
-    /// Builds unloaded static modules and validates target plus MTP schedules.
-    pub fn new(
-        args: ModelArgs,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredModel<B>, Error> {
-        let definition = std::sync::Arc::new(super::parameters::component_definition(
-            super::parameter_description(&args).map_err(Error::backend)?,
-            state_layout(&args).map_err(Error::backend)?,
-        )?);
-        Self::from_definition(args, definition, context)
-    }
-
-    /// Materializes serial statics from the definition retained during exact preparation.
-    pub(crate) fn from_definition(
+    /// Materializes serial resources from the cold retained declaration.
+    pub fn from_definition(
         args: ModelArgs,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
-        crate::operator_requirements::require::<B>(
-            "Nemotron-H",
-            crate::operator_requirements::NEMOTRON_H,
-        )?;
-        args.validate().map_err(Error::backend)?;
-        let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
-        Self::with_selected_resources(args, definition, static_modules, None)
+        Self::materialize(args, definition, None, context)
     }
-
-    /// Builds the same target-plus-MTP lifecycle with rank-local geometry.
-    pub fn new_parallel(
+    /// Materializes the same target/MTP equations with admitted rank-local geometry.
+    pub fn from_parallel_definition(
         args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredModel<B>, Error> {
+        Self::materialize(args, definition, Some(geometry), context)
+    }
+    fn materialize(
+        args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
@@ -306,18 +296,54 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
             crate::operator_requirements::NEMOTRON_H,
         )?;
         args.validate().map_err(Error::backend)?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
-        let definition = std::sync::Arc::new(super::parameters::component_definition(
-            super::parameter_description(&args).map_err(Error::backend)?,
-            geometry.state_layout().clone(),
-        )?);
-        let static_modules = StaticModules::from_parallel_spec(
-            Self::static_spec(&args),
-            geometry.embedding_range().clone(),
-            geometry.output_range().cloned(),
-            context,
-        )?;
-        Self::with_selected_resources(args, definition, static_modules, Some(geometry))
+        let definition = match &geometry {
+            Some(geometry) => {
+                geometry.validate_for(&args).map_err(Error::backend)?;
+                super::parameters::select_definition(
+                    &args,
+                    definition,
+                    geometry.state_layout(),
+                    (
+                        geometry.embedding_range().clone(),
+                        geometry.output_range().cloned(),
+                    ),
+                    geometry
+                        .target_units()
+                        .iter()
+                        .chain(geometry.prediction_units())
+                        .copied()
+                        .enumerate(),
+                )?
+            }
+            None => {
+                let state = state_layout(&args).map_err(Error::backend)?;
+                let full = eredu_nn::VocabularyParallelRange {
+                    global_vocabulary: args.vocab_size as usize,
+                    local: 0..args.vocab_size as usize,
+                };
+                let targets = super::parallel::global_target_geometry(&args)
+                    .map_err(Error::backend_source)?;
+                let predictions = super::parallel::global_prediction_geometry(&args)
+                    .map_err(Error::backend_source)?;
+                super::parameters::select_definition(
+                    &args,
+                    definition,
+                    &state,
+                    (full.clone(), (!args.tie_word_embeddings).then_some(full)),
+                    targets.into_iter().chain(predictions).enumerate(),
+                )?
+            }
+        };
+        let static_modules = match &geometry {
+            Some(geometry) => StaticModules::from_parallel_spec(
+                Self::static_spec(&args),
+                geometry.embedding_range().clone(),
+                geometry.output_range().cloned(),
+                context,
+            )?,
+            None => StaticModules::from_spec(Self::static_spec(&args), context)?,
+        };
+        Self::with_selected_resources(args, definition, static_modules, geometry)
     }
 
     fn with_selected_resources(

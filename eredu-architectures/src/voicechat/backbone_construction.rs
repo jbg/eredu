@@ -95,15 +95,9 @@ impl PreparedBackboneParameters {
     /// Prepares exact target resources from the source-free Nemotron declaration.
     /// No native module, tensor, device or checkpoint payload is required.
     pub fn prepare_bindings(&self) -> Result<PreparedBackboneBindings, BackbonePreparationError> {
-        let description = nemotron_h::parameter_description(&self.args)
-            .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?;
         let definition = std::sync::Arc::new(
-            nemotron_h::component_definition(
-                description,
-                nemotron_h::state_layout(&self.args)
-                    .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?,
-            )
-            .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?,
+            nemotron_h::component_definition(&self.args, None)
+                .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))?,
         );
         let prepared = PreparedComponent::prepare(
             "voicechat/backbone/target",
