@@ -1033,16 +1033,37 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid(
+                "Kimi Linear selection has no retained definition".into(),
+            )
+        })?;
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::kimi_linear::CompleteKimiKernel::<B>::new(args.clone(), context))
+        .then(|| {
+            let definition = crate::kimi_linear::project_parameters(args, &retained)?;
+            crate::kimi_linear::CompleteKimiKernel::<B>::from_definition(
+                args.clone(),
+                definition,
+                context,
+            )
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_kimi_linear_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::kimi_linear::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::kimi_linear::CompleteKimiKernel::<B>::new(selected_args, context)
+    let definition = crate::kimi_linear::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture = crate::kimi_linear::CompleteKimiKernel::<B>::from_definition(
+        selected_args,
+        definition,
+        context,
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::kimi_linear(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =

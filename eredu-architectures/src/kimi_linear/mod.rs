@@ -39,7 +39,7 @@ pub use parallel::{
     PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
 pub use partitioned::{
-    CompleteKimiGeometry, CompleteKimiKernel, KimiGeometry, KimiKernel, PartitionedLayeredModel,
+    project_parameters, CompleteKimiGeometry, CompleteKimiKernel, KimiGeometry, KimiKernel, PartitionedLayeredModel,
 };
 
 use crate::decoder::StaticModuleSpec;
@@ -70,7 +70,7 @@ pub fn component_definition(args: &ModelArgs) -> Result<eredu_runtime::Component
 
 /// Complete Kimi execution through the shared typed component adapter.
 pub type LayeredModel<B> = eredu_runtime::ComponentAdapter<
-    eredu_runtime::ComponentDefinition,
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
     CompleteKimiKernel<B>,
     eredu_runtime::KernelParameterModules,
 >;

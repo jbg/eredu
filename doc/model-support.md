@@ -83,6 +83,12 @@ projector.
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 | NemotronLabs VoiceChat | realtime PCM speech, text, transcription, tools | yes | `nemotron_voicechat`; explicit split component bundle and companion | single-device controlled/iterator session; [validation](voicechat-validation.md) |
 
+Low-level Kimi Linear construction consumes a retained declaration through
+`CompleteKimiKernel::from_definition`, `from_parallel_definition` or
+`KimiKernel::from_partition`. `kimi_linear::project_parameters` preserves logical
+consumers, observation seams and recurrent/compressed state ownership while
+selecting physical formats.
+
 Low-level LFM2 construction consumes a retained component declaration through
 `CompleteLfm2Kernel::from_definition`, `from_parallel_definition` or
 `Lfm2Kernel::from_partition`. `lfm2::project_parameters` selects physical formats

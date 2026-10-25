@@ -9699,6 +9699,20 @@ companions and compatible partition units. Full metadata and dense/routed
 partition source preparation consume this declaration without constructing
 native modules for discovery.
 
+Kimi Linear complete, tensor-local and selected construction consumes the cold
+`Arc<ComponentDefinition>` through `CompleteKimiKernel::from_definition`,
+`from_parallel_definition` or `KimiKernel::from_partition`.
+`kimi_linear::project_parameters` selects exact formats while retaining logical
+consumers and runtime observation seams; unchanged projections reuse the allocation.
+One complete materializer selects serial or local pinned modules. Complete and
+partition geometry supply vocabulary, block and KDA/MLA state ownership to one
+definition selector. The shared runtime contract validates equation paths, state
+references, transport and hook ownership. Family checks validate exact global or
+selected state and retained block/vocabulary placement; shared partition selection
+validates canonical resources and state ownership before allocation. Routed complete
+and dense/routed partition preparation retain source/target definitions and derive
+independent local layouts from admitted formats.
+
 Kimi attention and LFM2 attention/convolution companions inherit their primary projection's semantic head or
 output-column sharding through neutral parameter metadata. Their own physical
 shapes determine the scale/bias intervals; checkpoint-name suffixes do not make

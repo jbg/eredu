@@ -9461,8 +9461,18 @@ where
             "resident Kimi Linear requires a dense prediction-free schedule".into(),
         ));
     }
-    let parameters = crate::kimi_linear::parameter_description(&selected_args)
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "Kimi Linear selection has no retained definition".into(),
+            )
+        })?;
+    let definition = crate::kimi_linear::project_parameters(&selected_args, &retained)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -9508,10 +9518,11 @@ where
                 crate::replicated_text::requirement_formats(selected.base().requirements()),
             )
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let source_parameters = crate::kimi_linear::parameter_description(&source_args)
+            let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
+            let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -9551,7 +9562,7 @@ where
             }
             let source_architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
                 source_args,
-                &source_parameters,
+                source_definition,
                 &source_partition,
                 context,
             )
@@ -9563,7 +9574,7 @@ where
         .transpose()?;
     let architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
         selected_args,
-        &parameters,
+        definition,
         &partition,
         context,
     )
@@ -11081,8 +11092,19 @@ where
         eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: RoutedPartitionedProductionVisitor<B, S>,
 {
-    let parameters = crate::kimi_linear::parameter_description(&selected_args)
+    let retained = selected
+        .base()
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "Kimi Linear selection has no retained definition".into(),
+            )
+        })?;
+    let definition = crate::kimi_linear::project_parameters(&selected_args, &retained)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -11139,8 +11161,9 @@ where
             crate::replicated_text::requirement_formats(selected.base().text().requirements()),
         )
         .map_err(error)?;
-        let source_parameters = crate::kimi_linear::parameter_description(&source_args)
+        let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
+        let source_parameters = source_definition.parameters().clone();
         validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
@@ -11184,7 +11207,7 @@ where
         }
         let source = crate::kimi_linear::KimiKernel::<B>::from_partition(
             source_args,
-            &source_parameters,
+            source_definition,
             &source_partition,
             context,
         )
@@ -11196,7 +11219,7 @@ where
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::kimi_linear::KimiKernel::<B>::from_partition(
             selected_args,
-            &parameters,
+            definition,
             &partition,
             context,
         )
