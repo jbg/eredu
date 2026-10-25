@@ -258,9 +258,48 @@ impl ComponentDefinition {
     /// Retains invocation and state-slot identities with architecture-selected local geometry.
     /// Segment lifetimes, component roles, dtypes and residency stay unchanged.
     pub fn with_state_layout(self, state: StateLayout) -> Result<Self, ComponentDefinitionError> {
+        self.project_state_layout(state, &std::collections::BTreeSet::new())
+    }
+
+    /// Declares persistent resources for selected dormant slots, such as receiver histories.
+    /// Global slot identities, segment ownership and lifetimes remain unchanged. Existing
+    /// active slots require an identical policy; all other slots use ordinary geometry checks.
+    pub fn with_materialized_state_slots(
+        self,
+        state: StateLayout,
+        slots: impl IntoIterator<Item = StateSlotId>,
+    ) -> Result<Self, ComponentDefinitionError> {
+        let mut materialized = std::collections::BTreeSet::new();
+        for StateSlotId(slot) in slots {
+            let original = self.state.layer(slot);
+            let selected = state.layer(slot);
+            if !materialized.insert(slot)
+                || state
+                    .components(slot)
+                    .is_none_or(|components| components.is_empty())
+                || (!matches!(original, Some(eredu_core::cache::LayerCachePolicy::NoState))
+                    && original != selected)
+            {
+                return Err(ComponentDefinitionError::Invalid {
+                    component: self.id,
+                    resource: format!("materialized state slot {slot}"),
+                });
+            }
+        }
+        self.project_state_layout(state, &materialized)
+    }
+
+    fn project_state_layout(
+        self,
+        state: StateLayout,
+        materialized: &std::collections::BTreeSet<usize>,
+    ) -> Result<Self, ComponentDefinitionError> {
         let compatible = state.len() == self.state.len()
             && state.segments() == self.state.segments()
             && (0..state.len()).all(|slot| {
+                if materialized.contains(&slot) {
+                    return true;
+                }
                 let original = self.state.components(slot).expect("validated state slot");
                 let selected = state.components(slot).expect("validated state slot");
                 self.state.layer(slot).map(|layer| layer.attention())

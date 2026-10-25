@@ -9962,10 +9962,14 @@ Gemma flattens its padded media batch into the admitted sequence dimension and
 restores the encoder batch from the retained request geometry. Native backends
 perform ordinary tensor reshaping and transfer, without interpreting media parts.
 
-Gemma 4 constructs a validated, source-free `ComponentDefinition` before native
-modules. It retains the execution graph, canonical parameter ownership, invocation
-paths, state references, and transport contracts for the complete or TP-local
-geometry. Execution metadata projects this retained definition. Cold partition
+Gemma 4 materialization consumes the validated `ComponentDefinition` retained by
+cold admission. Low-level constructors take that explicit parent through
+`GemmaKernel::from_definition` or `from_parallel_definition`. Source and target
+formats project its canonical parameter catalog and logical consumers; unchanged
+formats and geometry reuse its allocation. Family unit and state producers validate
+paths, state references, transport and runtime-owned observation seams before native
+allocation. Retained placement agrees with vocabulary rows, per-layer channels and
+text block geometry. Execution metadata projects this retained definition. Cold partition
 and transform-source preparation read the same catalog without constructing
 native media layers. Pinned text resources declare their storage roles alongside
 their parameter groups, including the tied embedding/readout owner.
@@ -9989,7 +9993,10 @@ storage owner, and audio output retains the existing atomic subsampling/output g
 Gemma audio checkpoint admission and resource declarations share logical parameter
 geometry. Resource catalogs retain only the configured output bias and expand each
 matrix's configured native encoding through runtime's ordinary format projection.
-Checkpoint admission retains its optional output-bias contract. Vision declarations
+Checkpoint admission retains its optional output-bias contract. Cold declarations
+resolve that member from admitted tensor presence, including MLX-converted source
+aliases and projector GGUF companions, before ownership and parameter accounting
+are retained. Vision declarations
 use the shared source-free vision topology; both media towers retain independently
 leased encoder layers and their existing pinned resource boundaries. Shared KV
 receiver state and per-layer input transport keep their family-defined geometry.
@@ -12876,3 +12883,13 @@ layout and partition. Source placement follows the target's semantic ownership
 through the shared transform-source projection; both sides validate the same
 admitted unit addresses and complete state geometry. The preparation driver
 passes each materializer its corresponding retained declaration and local layout.
+
+`ComponentDefinition::with_materialized_state_slots` explicitly selects dormant
+state slots that acquire persistent resources, such as transported receiver
+histories. Slot identities and segment lifetimes remain unchanged; duplicate or
+unknown slots and changes to already active policies reject. Ordinary state
+geometry projection preserves component roles, dtypes and residency. Both paths
+retain observation seams, parameter consumers and the same partition ownership.
+Families validate the exact added state geometry and the transport that requires
+it. Gemma shared-KV partitions use this projection for their declared receiver
+caches, without reconstructing the component or its parameter topology.

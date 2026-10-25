@@ -2157,16 +2157,11 @@ where
         }
 
         CompositeConfig::Gemma4(source) => {
-            let mut exact = source.clone();
-            if let Some(audio) = exact.audio.as_mut() {
-                audio.output_projection_bias = selected
-                    .requirements()
-                    .execution()
-                    .inspection()
-                    .tensors()
-                    .get("model.audio_tower.output_proj.bias")
-                    .is_some();
-            }
+            let exact = source.with_audio_output_projection_bias(
+                crate::gemma4::checkpoint::audio_output_projection_bias(
+                    selected.requirements().execution().inspection(),
+                ),
+            );
             let args = crate::gemma4::with_checkpoint_formats(&exact, target_formats)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
             let sparse = args.text.layer_schedule.iter().any(|policy| {
@@ -2178,9 +2173,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::gemma4::parameter_description(&args).map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::gemma4::model::project_parameters(&args, &retained).map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2215,11 +2222,13 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture =
-                crate::gemma4::GemmaKernel::<B>::new_parallel(args.clone(), local, context)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+            let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
+                args.clone(),
+                definition,
+                local,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 Some(
                     crate::gemma4::expert_realization_plan(&architecture, rank)
@@ -3112,8 +3121,15 @@ where
         source.text.layer_schedule.iter().any(|policy| {
             policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe
         });
-    let parameters = crate::gemma4::parameter_description(source)
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition = crate::gemma4::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
+    let parameters = definition.parameters().clone();
     if parameters.graph() != target_parameters.graph()
         || parameters.unit_layout() != target_parameters.unit_layout()
     {
@@ -3157,9 +3173,13 @@ where
     {
         return Err("Gemma 4 transform source changed partition state or ownership".into());
     }
-    let mut architecture =
-        crate::gemma4::GemmaKernel::<B>::new_parallel(source.clone(), local, context)
-            .map_err(|error| error.to_string())?;
+    let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
+        source.clone(),
+        definition,
+        local,
+        context,
+    )
+    .map_err(|error| error.to_string())?;
     if sparse {
         let realization = crate::gemma4::expert_realization_plan(&architecture, rank)
             .map_err(|error| error.to_string())?

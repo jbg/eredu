@@ -173,21 +173,27 @@ pub fn component_definition(
     geometry: Option<&LocalGeometry>,
 ) -> Result<eredu_runtime::ComponentDefinition, Error> {
     args.validate().map_err(Error::backend_source)?;
-    let state = match geometry {
-        Some(geometry) => {
-            geometry.validate_for(args).map_err(Error::backend_source)?;
-            geometry.state_layout().clone()
-        }
-        None => state_layout(&args.text).map_err(Error::backend_source)?,
-    };
-    definition_with_state(args, state)
+    definition_with_state(args, component_state(args, geometry)?)
 }
 
-pub(super) fn partition_definition(
+fn component_state(
+    args: &FamilyConfig,
+    geometry: Option<&LocalGeometry>,
+) -> Result<eredu_runtime::StateLayout, Error> {
+    match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            Ok(geometry.state_layout().clone())
+        }
+        None => state_layout(&args.text).map_err(Error::backend_source),
+    }
+}
+
+fn partition_state(
     args: &FamilyConfig,
     local: &LocalGeometry,
     geometry: &crate::gemma4::PartitionLocalGeometry,
-) -> Result<eredu_runtime::ComponentDefinition, Error> {
+) -> Result<eredu_runtime::StateLayout, Error> {
     args.validate().map_err(Error::backend_source)?;
     local.validate_for(args).map_err(Error::backend_source)?;
     geometry.validate_for(args).map_err(Error::backend_source)?;
@@ -202,7 +208,7 @@ pub(super) fn partition_definition(
             "Gemma partition receiver state differs from its tensor geometry",
         ));
     }
-    definition_with_state(args, expected)
+    Ok(expected)
 }
 
 fn definition_with_state(
@@ -210,25 +216,7 @@ fn definition_with_state(
     state: eredu_runtime::StateLayout,
 ) -> Result<eredu_runtime::ComponentDefinition, Error> {
     let parameters = declare_parameters(args)?;
-    let units = (0..parameters.unit_layout().len())
-        .map(|ordinal| {
-            let address = parameters
-                .unit_layout()
-                .address(ordinal)
-                .expect("declared Gemma unit");
-            let index = address.index();
-            let (root, state) = match address.group() {
-                0 => ("model.vision_tower.encoder.layers", 0..0),
-                1 => ("model.audio_tower.layers", 0..0),
-                2 => ("model.language_model.layers", index..index + 1),
-                _ => unreachable!("validated Gemma group"),
-            };
-            eredu_runtime::ComponentUnit {
-                path: format!("{root}.{index}"),
-                state,
-            }
-        })
-        .collect();
+    let units = component_units(&parameters);
     let ownership = state_partition_plan(&state);
     eredu_runtime::ComponentDefinition::new(
         "gemma4",
@@ -247,5 +235,216 @@ fn definition_with_state(
 pub fn parameter_description(
     args: &FamilyConfig,
 ) -> Result<ArchitectureParameterDescription, Error> {
-    Ok(component_definition(args, None)?.parameters().clone())
+    args.validate().map_err(Error::backend_source)?;
+    component_state(args, None)?;
+    declare_parameters(args)
+}
+
+fn component_units(
+    parameters: &ArchitectureParameterDescription,
+) -> Vec<eredu_runtime::ComponentUnit> {
+    (0..parameters.unit_layout().len())
+        .map(|ordinal| {
+            let address = parameters
+                .unit_layout()
+                .address(ordinal)
+                .expect("declared Gemma unit");
+            let index = address.index();
+            let (root, state) = match address.group() {
+                0 => ("model.vision_tower.encoder.layers", 0..0),
+                1 => ("model.audio_tower.layers", 0..0),
+                2 => ("model.language_model.layers", index..index + 1),
+                _ => unreachable!("validated Gemma group"),
+            };
+            eredu_runtime::ComponentUnit {
+                path: format!("{root}.{index}"),
+                state,
+            }
+        })
+        .collect()
+}
+
+fn invalid(definition: &eredu_runtime::ComponentDefinition, resource: impl Into<String>) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn validate_identity(definition: &eredu_runtime::ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != "gemma4" {
+        return Err(invalid(definition, "Gemma component identity"));
+    }
+    Ok(())
+}
+
+/// Selects exact physical formats while retaining logical consumers and observation seams.
+pub fn project_parameters(
+    args: &FamilyConfig,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_identity(definition)?;
+    let parameters = parameter_description(args)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+fn validate_definition(
+    args: &FamilyConfig,
+    definition: &eredu_runtime::ComponentDefinition,
+    allowed: &[&eredu_runtime::StateLayout],
+) -> Result<(), Error> {
+    validate_identity(definition)?;
+    definition.validate_parameter_topology(&declare_parameters(args)?)?;
+    if !allowed.contains(&definition.state_layout()) {
+        return Err(invalid(
+            definition,
+            "Gemma retained state differs from selected geometry",
+        ));
+    }
+    if definition.primary_group() != TEXT_EXECUTION_GROUP
+        || !definition.prediction_groups().is_empty()
+        || definition.state_partition_plan() != &state_partition_plan(definition.state_layout())
+    {
+        return Err(invalid(definition, "Gemma execution or state ownership"));
+    }
+    for group in 0..3 {
+        if definition.group_transport(group)? != &group_transport(args, group) {
+            return Err(invalid(
+                definition,
+                format!("Gemma group {group} transport"),
+            ));
+        }
+    }
+    for (ordinal, unit) in component_units(definition.parameters()).iter().enumerate() {
+        let address = definition
+            .parameters()
+            .unit_layout()
+            .address(ordinal)
+            .expect("declared Gemma unit");
+        if definition.unit(address.group(), address.index())? != unit
+            || definition
+                .unit_observation_boundaries(address.group(), address.index())?
+                .is_kernel_owned()
+        {
+            return Err(invalid(
+                definition,
+                format!(
+                    "Gemma unit {}:{} equation geometry",
+                    address.group(),
+                    address.index()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_placement(
+    args: &FamilyConfig,
+    definition: &eredu_runtime::ComponentDefinition,
+    geometry: Option<&LocalGeometry>,
+) -> Result<(), Error> {
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained =
+            crate::gemma4::local_geometry(args, layout).map_err(Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: args.text.vocab_size as usize,
+            local: 0..args.text.vocab_size as usize,
+        };
+        let per_layer = 0..args.text.hidden_size_per_layer_input;
+        let output = if args.text.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                geometry
+                    .and_then(LocalGeometry::output_range)
+                    .unwrap_or(&full),
+            )
+        };
+        if retained.state_layout() != &component_state(args, geometry)?
+            || retained.embedding_range() != geometry.map_or(&full, LocalGeometry::embedding_range)
+            || retained.output_range() != output
+            || retained.per_layer_range()
+                != geometry.map_or(&per_layer, LocalGeometry::per_layer_range)
+            || retained
+                .text_blocks()
+                .iter()
+                .enumerate()
+                .any(|(index, block)| {
+                    block.architecture_fingerprint()
+                        != geometry
+                            .and_then(|geometry| geometry.text_block(index))
+                            .unwrap_or(&args.text)
+                            .architecture_fingerprint()
+                })
+        {
+            return Err(invalid(
+                definition,
+                "Gemma retained placement differs from selected geometry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn project_state(
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    state: eredu_runtime::StateLayout,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(Error::from)
+    }
+}
+
+pub(super) fn select_definition(
+    args: &FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&LocalGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    let state = component_state(args, geometry)?;
+    let global = component_state(args, None)?;
+    validate_definition(args, &definition, &[&global, &state])?;
+    validate_placement(args, &definition, geometry)?;
+    project_state(definition, state)
+}
+
+pub(super) fn select_partition_definition(
+    args: &FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    local: &LocalGeometry,
+    geometry: &crate::gemma4::PartitionLocalGeometry,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    let state = partition_state(args, local, geometry)?;
+    let global = component_state(args, None)?;
+    validate_definition(args, &definition, &[&global, local.state_layout(), &state])?;
+    validate_placement(args, &definition, Some(local))?;
+    if definition.state_layout() == &state {
+        return Ok(definition);
+    }
+    let receivers = crate::gemma4::pipeline::receiver_caches(&args.text, geometry.text_units())
+        .into_iter()
+        .map(|(receiver, _)| eredu_runtime::StateSlotId(receiver));
+    definition
+        .as_ref()
+        .clone()
+        .with_materialized_state_slots(state, receivers)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
 }

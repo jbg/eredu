@@ -6970,7 +6970,10 @@ impl CompositeConfig<'_> {
         }
     }
 
-    fn component_definition(&self) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+    fn component_definition(
+        &self,
+        inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
         match self {
             Self::NemotronLabsDiffusion(args) => {
                 crate::nemotron_labs_diffusion::definition::composite(args, None)
@@ -6978,7 +6981,12 @@ impl CompositeConfig<'_> {
             Self::Diffusion(args) => {
                 crate::diffusion_gemma::composite::component_definition(args, None)
             }
-            Self::Gemma4(args) => crate::gemma4::model::component_definition(args, None),
+            Self::Gemma4(args) => crate::gemma4::model::component_definition(
+                &args.with_audio_output_projection_bias(
+                    crate::gemma4::checkpoint::audio_output_projection_bias(inspection),
+                ),
+                None,
+            ),
             Self::Inkling(args) => crate::inkling::model::component_definition(args, None),
             Self::Muse(args) => crate::muse::model::component_definition(args, None),
             Self::QwenVl(args) => crate::qwen::vl::component_definition(args, None),
@@ -7525,7 +7533,7 @@ fn derive_composite_text_requirements(
         _ => {}
     }
     let definition = config
-        .component_definition()
+        .component_definition(inspection)
         .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     let processor = composite_processor_requirements(inspection.architecture_plan(), &config)?;
     let mut execution = replicated_text_requirements_for_structure(
@@ -8035,12 +8043,18 @@ where
                     ReplicatedTextParameterPresence::OptionalAbsent
                 )
             });
-        let mut exact_args = args.clone();
-        if let Some(audio) = exact_args.audio.as_mut() {
-            audio.output_projection_bias = output_projection_bias;
-        }
+        let exact_args = args.with_audio_output_projection_bias(output_projection_bias);
         let capability = crate::capability::gemma4(&exact_args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let retained = self
+            .requirements
+            .execution()
+            .shared_component_definition()
+            .ok_or_else(|| {
+                ReplicatedTextDispatchError::Architecture(
+                    "composite selection has no retained definition".into(),
+                )
+            })?;
         let source = self
             .has_transform
             .then(|| {
@@ -8049,7 +8063,8 @@ where
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
             .map(|args| {
-                crate::gemma4::GemmaKernel::<B>::new(args, self.context)
+                let definition = crate::gemma4::model::project_parameters(&args, &retained)?;
+                crate::gemma4::GemmaKernel::<B>::from_definition(args, definition, self.context)
                     .and_then(|kernel| kernel.into_model())
             })
             .transpose()
@@ -8059,9 +8074,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::gemma4::GemmaKernel::<B>::new(target, self.context)
-            .and_then(|kernel| kernel.into_model())
+        let definition = crate::gemma4::model::project_parameters(&target, &retained)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let architecture =
+            crate::gemma4::GemmaKernel::<B>::from_definition(target, definition, self.context)
+                .and_then(|kernel| kernel.into_model())
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,

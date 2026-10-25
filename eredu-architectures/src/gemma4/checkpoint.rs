@@ -347,6 +347,33 @@ fn mlx_vlm_physical_name(name: &str) -> Option<String> {
     None
 }
 
+/// Exact optional audio bias presence across admitted primary and companion sources.
+pub(crate) fn audio_output_projection_bias<P>(
+    inspection: &eredu_core::artifact::ArtifactInspection<P>,
+) -> bool {
+    let projector = inspection.validated_gguf().and_then(|gguf| {
+        gguf.companion(&eredu_core::artifact::ArtifactCompanionRole::MediaProjector)
+            .map(|companion| companion.checkpoint())
+    });
+    audio_output_projection_bias_in(inspection.tensors(), projector)
+}
+
+fn audio_output_projection_bias_in(
+    tensors: &eredu_core::checkpoint::TensorCatalog,
+    projector: Option<&eredu_gguf::Checkpoint>,
+) -> bool {
+    let canonical = "model.audio_tower.output_proj.bias";
+    tensors.get(canonical).is_some()
+        || mlx_vlm_physical_name(canonical).is_some_and(|physical| tensors.get(&physical).is_some())
+        || projector_physical_name(canonical).is_some_and(|physical| {
+            projector.is_some_and(|projector| {
+                projector
+                    .tensors()
+                    .any(|tensor| tensor.descriptor().name == physical)
+            })
+        })
+}
+
 /// Whether a name uses the `mlx-vlm` physical spelling rather than the
 /// released or backend-neutral one.
 pub(crate) fn is_mlx_vlm_physical_name(name: &str) -> bool {

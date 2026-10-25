@@ -15,7 +15,7 @@ pub type LayeredModel<B> = ComponentAdapter<
 
 mod observation;
 mod parameters;
-pub use parameters::{component_definition, parameter_description};
+pub use parameters::{component_definition, parameter_description, project_parameters};
 
 use std::collections::HashMap;
 
@@ -1210,22 +1210,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
     }
 
     /// Builds unloaded pinned text and configured media modules.
-    pub fn new(
+    pub fn from_definition(
         args: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Gemma 4",
             crate::operator_requirements::GEMMA4,
         )?;
-        let definition = std::sync::Arc::new(component_definition(&args, None)?);
+        let definition = parameters::select_definition(&args, definition, None)?;
         let text = model_text::StaticTextModules::new(&args.text, context)?;
         Self::with_text(args, definition, text, None, context)
     }
 
     /// Builds the same multimodal graph with planner-derived text geometry.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         args: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
@@ -1233,7 +1235,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             "Gemma 4",
             crate::operator_requirements::GEMMA4,
         )?;
-        let definition = std::sync::Arc::new(component_definition(&args, Some(&geometry))?);
+        let definition = parameters::select_definition(&args, definition, Some(&geometry))?;
         let text = model_text::StaticTextModules::new_parallel(&args.text, &geometry, context)?;
         Self::with_text(args, definition, text, Some(geometry), context)
     }
@@ -1368,9 +1370,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             .parallel_geometry
             .as_ref()
             .ok_or_else(|| Error::backend("Gemma partition requires parallel geometry"))?;
-        self.definition = std::sync::Arc::new(parameters::partition_definition(
-            &self.args, local, geometry,
-        )?);
+        self.definition = parameters::select_partition_definition(
+            &self.args,
+            self.definition.clone(),
+            local,
+            geometry,
+        )?;
         self.definition.select_partition(partition)?;
         self.partition_state_offset = geometry.text_units().start;
         self.partition_media_inputs = [

@@ -1699,8 +1699,57 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
     }
     let (last, _, _, _) = &stages[1];
     assert!(last.build_unit(0, 0, &()).is_err());
-    // Logical units 3/7 own independent dense state slots 0/1.
-    let declaration = carry_definition(&[3, 7]);
+    // Logical units 3/7 own independent dense state slots 0/1. The second
+    // history materializes when this selected execution needs a receiver.
+    let expected = carry_definition(&[3, 7]);
+    let dormant = StateLayout::new(
+        LayerSchedule::new(
+            2,
+            vec![
+                expected.state_layout().layer(0).unwrap().clone(),
+                LayerCachePolicy::NoState,
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let declaration = ComponentDefinition::new(
+        expected.id(),
+        expected.parameters().clone(),
+        vec![
+            expected.unit(0, 3).unwrap().clone(),
+            expected.unit(0, 7).unwrap().clone(),
+        ],
+        vec![expected.group_transport(0).unwrap().clone()],
+        "carry",
+        vec![],
+        dormant,
+        expected.state_partition_plan().clone(),
+    )
+    .unwrap();
+    let selected = expected.state_layout().clone();
+    assert!(declaration
+        .clone()
+        .with_state_layout(selected.clone())
+        .is_err());
+    for invalid in [
+        vec![eredu_runtime::StateSlotId(1), eredu_runtime::StateSlotId(1)],
+        vec![eredu_runtime::StateSlotId(2)],
+    ] {
+        assert!(declaration
+            .clone()
+            .with_materialized_state_slots(selected.clone(), invalid)
+            .is_err());
+    }
+    let declaration = declaration
+        .with_materialized_state_slots(selected, [eredu_runtime::StateSlotId(1)])
+        .unwrap();
+    let declaration = declaration
+        .with_materialized_state_slots(
+            expected.state_layout().clone(),
+            [eredu_runtime::StateSlotId(1)],
+        )
+        .unwrap();
     let mut sparse_stages = [3, 7]
         .into_iter()
         .enumerate()
