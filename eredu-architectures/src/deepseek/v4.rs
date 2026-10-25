@@ -26,10 +26,7 @@ use eredu_runtime::{
 
 use eredu_checkpoint::LinearFormat;
 
-use crate::decoder::{
-    DecoderStaticResources, PartitionStaticModules, StaticModuleSpec,
-    StaticModules as TextStaticModules,
-};
+use crate::decoder::{DecoderStaticResources, PartitionStaticModules, StaticModuleSpec};
 
 use super::{
     block::V4Block,
@@ -757,42 +754,68 @@ where
         self.pipeline_finish_parallel(hidden, parallel, context)
     }
 
-    /// Builds unloaded pinned V4 modules.
-    pub fn new(args: V4Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let definition = Arc::new(component_definition(&args, None)?);
-        let construction = V4UnitFactory::from_definition(args, definition, None)?;
-        construction.require_operators::<B>()?;
-        let text = TextStaticModules::from_spec(text_static_spec(&construction.args), context)?;
-        Ok(Self {
-            static_modules: static_modules(&construction, text, context)?,
-            construction,
-            partition_target_start: 0,
-        })
+    /// Materializes ordinary modules from the cold retained declaration.
+    pub fn from_definition(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::materialize(args, definition, None, |_| Ok(None), context)
     }
 
-    /// Builds unloaded V4 modules using one authoritative rank-local plan.
-    pub fn new_parallel(
+    /// Materializes modules using the retained definition and authoritative local geometry.
+    pub fn from_parallel_definition(
         args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         geometry: super::parallel::V4LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = Arc::new(component_definition(&args, Some(&geometry))?);
-        let construction = V4UnitFactory::from_definition(args, definition, Some(geometry))?;
-        construction.require_operators::<B>()?;
-        let geometry = construction
-            .parallel_geometry
-            .as_ref()
-            .expect("selected parallel geometry");
-        let text = TextStaticModules::from_parallel_spec(
-            text_static_spec(&construction.args),
-            geometry.embedding_range().clone(),
-            Some(geometry.output_range().clone()),
+        Self::materialize(args, definition, Some(geometry), |_| Ok(None), context)
+    }
+
+    /// Validates selected ownership before allocating its pinned resources.
+    pub fn from_partition_definition<G, A>(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: super::parallel::V4LocalGeometry,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        Self::materialize(
+            args,
+            definition,
+            Some(geometry),
+            |definition| {
+                definition
+                    .select_partition(partition)
+                    .map(Some)
+                    .map_err(Error::from)
+            },
             context,
-        )?;
+        )?
+        .into_partition_model(partition)
+    }
+
+    fn materialize(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<super::parallel::V4LocalGeometry>,
+        select: impl FnOnce(
+            &eredu_runtime::ComponentDefinition,
+        ) -> Result<Option<eredu_runtime::ComponentSelection>, Error>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let construction = V4UnitFactory::from_definition(args, definition, geometry)?;
+        construction.require_operators::<B>()?;
+        let selection = select(&construction.definition)?;
+        let partition_target_start = selection
+            .as_ref()
+            .and_then(|selection| selection.state())
+            .map_or(0, |state| state.global_layer_offset());
         Ok(Self {
-            static_modules: static_modules(&construction, text, context)?,
+            static_modules: static_modules(&construction, selection.as_ref(), context)?,
             construction,
-            partition_target_start: 0,
+            partition_target_start,
         })
     }
 
@@ -865,24 +888,22 @@ where
         self.partition_target_start = selected
             .state()
             .map_or(0, |state| state.global_layer_offset());
-        let roles: std::collections::BTreeSet<_> = partition
-            .parameter_bindings()
-            .iter()
-            .filter_map(|binding| binding.owner().static_storage_role())
-            .collect();
-        if !roles.contains("embedding") {
+        let owns = |role: &str| {
+            selected.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+        };
+        if !owns("embedding") {
             self.static_modules.text.embeddings = None;
         }
-        if !roles.contains("norm") {
+        if !owns("norm") {
             self.static_modules.text.norm = None;
         }
-        if !roles.contains("output") {
+        if !owns("output") {
             self.static_modules.text.lm_head = None;
         }
-        if !roles.contains("hyper_head") {
+        if !owns("hyper_head") {
             self.static_modules.hyper_head = None;
         }
-        if !roles.contains("mtp") {
+        if !owns("mtp") {
             self.static_modules.dspark = None;
         }
         ComponentAdapter::with_partition_resources::<B, _, _>(
@@ -2862,29 +2883,53 @@ fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
 
 fn static_modules<B>(
     construction: &V4UnitFactory,
-    text: TextStaticModules<B>,
+    selection: Option<&eredu_runtime::ComponentSelection>,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<StaticModules<B>, Error>
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
     let args = &construction.args;
-    let hyper_head = HyperHead::new(
-        HyperHeadSpec {
-            streams: args.hc_mult,
-            hidden_size: args.hidden_size,
-            norm_epsilon: args.rms_norm_eps,
-            epsilon: args.hc_eps,
-            function: parameter("hc_head_fn")?,
-            base: parameter("hc_head_base")?,
-            scale: parameter("hc_head_scale")?,
-        },
+    let owns = |role: &str| {
+        selection.is_none_or(|selection| {
+            selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+        })
+    };
+    let text = PartitionStaticModules::from_selected_spec(
+        text_static_spec(args),
+        construction.parallel_geometry.as_ref().map(|geometry| {
+            (
+                geometry.embedding_range().clone(),
+                Some(geometry.output_range().clone()),
+            )
+        }),
+        owns,
         context,
     )?;
-    let dspark = construction.construct_dspark::<B>(context)?;
+    let hyper_head = owns("hyper_head")
+        .then(|| {
+            HyperHead::new(
+                HyperHeadSpec {
+                    streams: args.hc_mult,
+                    hidden_size: args.hidden_size,
+                    norm_epsilon: args.rms_norm_eps,
+                    epsilon: args.hc_eps,
+                    function: parameter("hc_head_fn")?,
+                    base: parameter("hc_head_base")?,
+                    scale: parameter("hc_head_scale")?,
+                },
+                context,
+            )
+        })
+        .transpose()?;
+    let dspark = if owns("mtp") {
+        construction.construct_dspark::<B>(context)?
+    } else {
+        None
+    };
     Ok(StaticModules {
-        text: text.into(),
-        hyper_head: Some(hyper_head),
+        text,
+        hyper_head,
         dspark,
     })
 }

@@ -92,6 +92,11 @@ and external prediction preparation use its shared unit construction.
 consumers, observation seams and target/MTP state identities. Prediction-extension
 plans retain their complete validated declaration before target projection.
 
+Low-level DeepSeek-V4 complete, tensor-local and partition materialization consume
+a retained declaration through `V4Kernel::from_definition`,
+`from_parallel_definition` and `from_partition_definition`. Partition construction
+validates ownership before allocating selected text, hyper-head and DSpark resources.
+
 Low-level DeepSeek-V4 `V4UnitFactory::from_definition` validates independent
 target/MTP/DSpark unit construction from a retained declaration and selected
 geometry. Kernels and external prediction preparation share this construction;

@@ -8464,6 +8464,17 @@ through the factory, under the ordinary shared-module residency and completion
 lifecycle. V4 parameter discovery uses the canonical parameter producer without
 constructing an execution definition.
 
+Complete and tensor-local V4 materialization consume the admitted
+`Arc<ComponentDefinition>` through `V4Kernel::from_definition` and
+`from_parallel_definition`. `from_partition_definition` validates selected
+ownership before allocating any pinned resources. One materializer uses canonical
+storage selection with the shared decoder pinned-resource constructor; the target
+hyper-head and DSpark statics are constructed only on their declared owners.
+Retained state geometry supplies each partition's global state origin. Routed
+complete and partition preparation preserve the source and executable definitions
+and their independent layouts. The low-level consuming partition operation retains
+its canonical ownership checks.
+
 `PredictionExtensionPlan` retains a validated complete component declaration at cold
 admission, with matching extension kind and architecture. Its admission comparison
 includes that semantic contract alongside checkpoint provenance. V3 and V4 extension

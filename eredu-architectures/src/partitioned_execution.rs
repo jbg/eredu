@@ -11623,10 +11623,19 @@ where
             "DeepSeek-V4 selected a non-gated expert equation".into(),
         ));
     }
-    let parameters = crate::deepseek::v4::component_definition(&selected_args, None)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?
-        .parameters()
-        .clone();
+    let retained = selected
+        .base()
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "V4 selection has no retained definition".into(),
+            )
+        })?;
+    let definition = crate::deepseek::v4::project_parameters(&selected_args, &retained)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -11680,8 +11689,9 @@ where
         let source_args =
             crate::replicated_text::source_deepseek_v4_args(&selected_args, selected.base().text())
                 .map_err(error)?;
-        let source_parameters = crate::deepseek::parallel::v4_parameter_description(&source_args)
+        let source_definition = crate::deepseek::v4::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
+        let source_parameters = source_definition.parameters().clone();
         validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
@@ -11731,25 +11741,30 @@ where
                 "routed V4 transform source changed local unit addresses".into(),
             ));
         }
-        let mut source =
-            crate::deepseek::v4::V4Kernel::<B>::new_parallel(source_args, source_local, context)
-                .map_err(|e| error(e.to_string()))?;
-        source.install_expert_realization(source_plan);
-        let source = source
-            .into_partition_model(&source_partition)
-            .map_err(|e| error(e.to_string()))?;
+        let mut source = crate::deepseek::v4::V4Kernel::<B>::from_partition_definition(
+            source_args,
+            source_definition,
+            source_local,
+            &source_partition,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        source.kernel_mut().install_expert_realization(source_plan);
         Some((source, source_layout))
     } else {
         None
     };
-    let mut architecture =
-        crate::deepseek::v4::V4Kernel::<B>::new_parallel(selected_args, local, context).map_err(
-            |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
-        )?;
-    architecture.install_expert_realization(plan.clone());
-    let architecture = architecture
-        .into_partition_model(&partition)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let mut architecture = crate::deepseek::v4::V4Kernel::<B>::from_partition_definition(
+        selected_args,
+        definition,
+        local,
+        &partition,
+        context,
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    architecture
+        .kernel_mut()
+        .install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         architecture,
         source_architecture,

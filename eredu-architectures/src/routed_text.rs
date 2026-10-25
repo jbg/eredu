@@ -1354,9 +1354,16 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid("V4 selection has no retained definition".into())
+        })?;
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
         .then(|| {
-            crate::deepseek::v4::V4Kernel::<B>::new(args.clone(), context)
+            let definition = crate::deepseek::v4::project_parameters(args, &retained)?;
+            crate::deepseek::v4::V4Kernel::<B>::from_definition(args.clone(), definition, context)
                 .and_then(|kernel| kernel.into_model())
         })
         .transpose()
@@ -1365,9 +1372,12 @@ where
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::deepseek::v4_architecture_fingerprint(&selected_args);
-    let architecture = crate::deepseek::v4::V4Kernel::<B>::new(selected_args, context)
-        .and_then(|kernel| kernel.into_model())
+    let definition = crate::deepseek::v4::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture =
+        crate::deepseek::v4::V4Kernel::<B>::from_definition(selected_args, definition, context)
+            .and_then(|kernel| kernel.into_model())
+            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::deepseek_v4(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
