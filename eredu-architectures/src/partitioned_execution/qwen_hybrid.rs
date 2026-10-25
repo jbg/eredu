@@ -61,8 +61,14 @@ where
     }
     let selected_args = crate::replicated_text::selected_qwen_hybrid_args(args, selected.base())
         .map_err(architecture)?;
-    let parameters =
-        crate::qwen::hybrid::parameter_description(&selected_args).map_err(architecture)?;
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("Qwen hybrid selection has no retained definition"))?;
+    let definition =
+        crate::qwen::hybrid::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -104,8 +110,9 @@ where
         )
     }) {
         let source_args = args.clone();
-        let source_parameters =
-            crate::qwen::hybrid::parameter_description(&source_args).map_err(architecture)?;
+        let source_definition = crate::qwen::hybrid::project_parameters(&source_args, &retained)
+            .map_err(architecture)?;
+        let source_parameters = source_definition.parameters().clone();
         validate_transform_parameter_space(&source_parameters, &parameters)
             .map_err(architecture)?;
         let source_layout =
@@ -137,7 +144,7 @@ where
         }
         let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             source_args,
-            &source_parameters,
+            source_definition,
             &source_partition,
             context,
         )
@@ -151,7 +158,7 @@ where
     let effective_model_type = selected_args.model_type.clone();
     let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
         selected_args,
-        &parameters,
+        definition,
         &partition,
         context,
     )
@@ -223,8 +230,15 @@ where
     let selected_args =
         crate::replicated_text::selected_qwen_hybrid_args(args, selected.base().text())
             .map_err(architecture)?;
-    let parameters =
-        crate::qwen::hybrid::parameter_description(&selected_args).map_err(architecture)?;
+    let retained = selected
+        .base()
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("Qwen hybrid selection has no retained definition"))?;
+    let definition =
+        crate::qwen::hybrid::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -261,8 +275,9 @@ where
                 | eredu_runtime::WeightLoweringKind::DerivedTransform
         )
     }) {
-        let source_parameters =
-            crate::qwen::hybrid::parameter_description(args).map_err(architecture)?;
+        let source_definition =
+            crate::qwen::hybrid::project_parameters(args, &retained).map_err(architecture)?;
+        let source_parameters = source_definition.parameters().clone();
         validate_transform_parameter_space(&source_parameters, &parameters)
             .map_err(architecture)?;
         let source_layout =
@@ -297,7 +312,7 @@ where
         }
         let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             args.clone(),
-            &source_parameters,
+            source_definition,
             &source_partition,
             context,
         )
@@ -312,7 +327,7 @@ where
     let effective_model_type = selected_args.model_type.clone();
     let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
         selected_args,
-        &parameters,
+        definition,
         &partition,
         context,
     )

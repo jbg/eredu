@@ -66,10 +66,10 @@ pub use parallel::{
     local_geometry, local_unit_config, ConditionalLocalGeometry,
     ConditionalPartitionLocalFoundation, ConditionalPartitionLocalGeometry, LocalGeometry,
 };
-pub(crate) use parameters::select_conditional_definition;
+pub(crate) use parameters::{select_conditional_definition, select_definition};
 pub use parameters::{
     component_definition, conditional_component_definition, conditional_parameter_description,
-    parameter_description, project_conditional_parameters, unit_parallel_parameter_groups,
+    parameter_description, project_conditional_parameters, project_parameters, unit_parallel_parameter_groups,
 };
 
 /// Derives the complete replicated target/MTP expert plan from normalized geometry.

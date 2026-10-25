@@ -6,7 +6,7 @@ use eredu_nn::{
     Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState,
+    ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState,
     LayeredPartitionInput, LayeredPartitionOutput, ModelStateIdentity, ParameterProvider,
     ResidentExpertProvider, RuntimeStateComponents, StateLayout,
 };
@@ -176,24 +176,25 @@ pub struct QwenKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacke
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B> {
     /// Builds unloaded pinned modules and the exact configured graph.
-    pub fn new(
+    pub fn from_definition(
         config: HybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid",
             crate::operator_requirements::QWEN_HYBRID,
         )?;
-        let definition = std::sync::Arc::new(super::component_definition(&config, None)?);
-        Self::from_definition(config, None, definition, context)
+        Self::materialize(config, None, definition, context)
     }
 
-    fn from_definition(
+    fn materialize(
         config: HybridConfig,
         geometry: Option<LocalGeometry>,
         definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
+        let definition = super::select_definition(&config, definition, geometry.as_ref())?;
         let target_layers = definition.unit_count(0)?;
         let prediction_steps = definition.prediction_groups().len();
         let spec = static_module_spec(&config);
@@ -255,7 +256,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
     /// Materializes only the static resources and units owned by a selected target partition.
     pub fn from_partition(
         config: HybridConfig,
-        parameters: &ArchitectureParameterDescription,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<
             LocalGeometry,
             eredu_runtime::NoAuxiliaryBoundarySchema,
@@ -276,10 +277,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
             ));
         }
         let geometry = partition.local_geometry();
-        let definition = std::sync::Arc::new(super::component_definition(&config, Some(geometry))?);
-        if definition.parameters() != parameters
-            || partition.boundary_schema()
-                != &eredu_runtime::NoAuxiliaryBoundarySchema::new(config.hidden_size)
+        let definition = super::select_definition(&config, definition, Some(geometry))?;
+        if partition.boundary_schema()
+            != &eredu_runtime::NoAuxiliaryBoundarySchema::new(config.hidden_size)
         {
             return Err(Error::backend(
                 "Qwen partition parameters or boundary differ from its configuration",
@@ -295,19 +295,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
                 "Qwen target partition names another execution group",
             ));
         }
-        let state = partition
-            .state()
-            .ok_or_else(|| Error::backend("Qwen target partition has no selected state"))?;
+        definition.select_partition(partition)?;
         let range = owned.global_units();
-        let expected = geometry
-            .state_layout()
-            .slice(range.clone())
-            .map_err(Error::backend)?;
-        if state.global_layer_offset() != range.start || state.layout() != &expected {
-            return Err(Error::backend(
-                "Qwen partition state differs from its owned target units",
-            ));
-        }
         let stores = |role: &str| {
             partition
                 .parameter_bindings()
@@ -449,8 +438,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
     }
 
     /// Builds the canonical target/MTP graph with planner-derived local modules.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         config: HybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
@@ -462,9 +452,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
             "Qwen hybrid tensor parallelism",
             eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
         )?;
-        let definition =
-            std::sync::Arc::new(super::component_definition(&config, Some(&geometry))?);
-        Self::from_definition(config, Some(geometry), definition, context)
+        Self::materialize(config, Some(geometry), definition, context)
     }
 
     /// Returns normalized hybrid policy.

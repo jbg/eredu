@@ -436,53 +436,13 @@ pub fn component_definition(
     geometry: Option<&super::LocalGeometry>,
 ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
     let parameters = parameter_description(config).map_err(eredu_nn::Error::backend)?;
-    let state = match geometry {
-        Some(geometry) => {
-            geometry
-                .validate_for(config)
-                .map_err(eredu_nn::Error::backend)?;
-            geometry.state_layout().clone()
-        }
-        None => super::state_layout(config).map_err(eredu_nn::Error::backend)?,
-    };
-    let layout = parameters.unit_layout();
-    let targets = layout.group_range(0).expect("declared target group").len();
-    let units = (0..layout.len())
-        .map(|ordinal| {
-            let address = layout.address(ordinal).expect("declared invocation");
-            eredu_runtime::ComponentUnit {
-                path: if address.group() == 0 {
-                    format!("model.layers.{}", address.index())
-                } else {
-                    format!("mtp.layers.{}", address.group() - 1)
-                },
-                state: ordinal..ordinal + 1,
-            }
-        })
+    let state = component_state(config, geometry)?;
+    let units = component_units(&parameters);
+    let prediction = prediction_groups(&parameters);
+    let transport = (0..parameters.graph().groups().len())
+        .map(group_transport)
         .collect();
-    let groups = parameters.graph().groups().len();
-    let prediction = (1..groups)
-        .map(|group| {
-            layout
-                .group_id(group)
-                .expect("declared prediction group")
-                .as_str()
-                .to_owned()
-        })
-        .collect();
-    let transport = (0..groups)
-        .map(|group| {
-            if group == 0 {
-                return crate::transport::decoder();
-            }
-            let mut transport = crate::transport::prediction();
-            if group == 1 {
-                transport.first_owner_static_roles.push("mtp".into());
-            }
-            transport
-        })
-        .collect();
-    let partition = crate::transport::pipeline_with_output_state(0, targets, &state);
+    let partition = component_state_partition(&parameters, &state);
     eredu_runtime::ComponentDefinition::new(
         "qwen-hybrid",
         parameters,
@@ -494,6 +454,177 @@ pub fn component_definition(
         partition,
     )
     .map_err(eredu_nn::Error::from)
+}
+
+fn component_state(
+    config: &HybridConfig,
+    geometry: Option<&super::LocalGeometry>,
+) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+    match geometry {
+        Some(geometry) => {
+            geometry
+                .validate_for(config)
+                .map_err(eredu_nn::Error::backend)?;
+            Ok(geometry.state_layout().clone())
+        }
+        None => super::state_layout(config).map_err(eredu_nn::Error::backend),
+    }
+}
+fn component_units(
+    parameters: &ArchitectureParameterDescription,
+) -> Vec<eredu_runtime::ComponentUnit> {
+    let layout = parameters.unit_layout();
+    (0..layout.len())
+        .map(|ordinal| {
+            let address = layout.address(ordinal).expect("declared invocation");
+            eredu_runtime::ComponentUnit {
+                path: if address.group() == 0 {
+                    format!("model.layers.{}", address.index())
+                } else {
+                    format!("mtp.layers.{}", address.group() - 1)
+                },
+                state: ordinal..ordinal + 1,
+            }
+        })
+        .collect()
+}
+fn prediction_groups(parameters: &ArchitectureParameterDescription) -> Vec<String> {
+    let layout = parameters.unit_layout();
+    let groups = parameters.graph().groups().len();
+    (1..groups)
+        .map(|group| {
+            layout
+                .group_id(group)
+                .expect("declared prediction group")
+                .as_str()
+                .to_owned()
+        })
+        .collect()
+}
+fn group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+    if group == 0 {
+        return crate::transport::decoder();
+    }
+    let mut transport = crate::transport::prediction();
+    if group == 1 {
+        transport.first_owner_static_roles.push("mtp".into());
+    }
+    transport
+}
+fn component_state_partition(
+    parameters: &ArchitectureParameterDescription,
+    state: &eredu_runtime::StateLayout,
+) -> eredu_runtime::ArchitectureStatePartitionPlan {
+    let targets = parameters
+        .unit_layout()
+        .group_range(0)
+        .expect("declared target group")
+        .len();
+    crate::transport::pipeline_with_output_state(0, targets, state)
+}
+
+/// Projects executable formats while retaining logical consumers, state and observation seams.
+pub fn project_parameters(
+    config: &HybridConfig,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
+    validate_text_identity(definition)?;
+    let parameters = parameter_description(config).map_err(eredu_nn::Error::backend)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(eredu_nn::Error::from)
+}
+fn validate_text_identity(
+    definition: &eredu_runtime::ComponentDefinition,
+) -> Result<(), eredu_nn::Error> {
+    if definition.id() != "qwen-hybrid" {
+        return Err(invalid_definition(
+            definition,
+            "Qwen hybrid component identity",
+        ));
+    }
+    Ok(())
+}
+pub(crate) fn select_definition(
+    config: &HybridConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::LocalGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
+    validate_text_identity(&definition)?;
+    definition.validate_parameter_topology(
+        &parameter_description(config).map_err(eredu_nn::Error::backend)?,
+    )?;
+    let state = component_state(config, geometry)?;
+    let global = component_state(config, None)?;
+    if definition.state_layout() != &global && definition.state_layout() != &state {
+        return Err(invalid_definition(
+            &definition,
+            "Qwen hybrid retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained =
+            super::local_geometry(config, layout).map_err(eredu_nn::Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: config.vocab_size as usize,
+            local: 0..config.vocab_size as usize,
+        };
+        let output = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(geometry.and_then(|g| g.output_range()).unwrap_or(&full))
+        };
+        if retained.state_layout() != &state
+            || retained.embedding_range()
+                != geometry.map_or(&full, super::LocalGeometry::embedding_range)
+            || retained.output_range() != output
+            || (0..config.num_hidden_layers as usize).any(|i| {
+                !same_local_dimensions(
+                    retained.target(i).expect("declared target"),
+                    geometry.and_then(|g| g.target(i)).unwrap_or(config),
+                )
+            })
+            || (0..config.mtp_num_hidden_layers as usize).any(|i| {
+                !same_local_dimensions(
+                    retained.prediction(i).expect("declared prediction"),
+                    geometry.and_then(|g| g.prediction(i)).unwrap_or(config),
+                )
+            })
+        {
+            return Err(invalid_definition(
+                &definition,
+                "Qwen hybrid retained placement differs from selected geometry",
+            ));
+        }
+    }
+    let parameters = definition.parameters();
+    definition.validate_execution_contract(
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        &prediction_groups(parameters),
+        &component_units(parameters),
+        &(0..parameters.graph().groups().len())
+            .map(group_transport)
+            .collect::<Vec<_>>(),
+        &component_state_partition(parameters, definition.state_layout()),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(eredu_nn::Error::from)
+    }
 }
 
 pub(crate) fn conditional_execution_graph(
@@ -688,7 +819,7 @@ fn conditional_state_partition(
         .len();
     crate::transport::pipeline_with_output_state(1, targets, state)
 }
-fn conditional_invalid(
+fn invalid_definition(
     definition: &eredu_runtime::ComponentDefinition,
     resource: impl Into<String>,
 ) -> eredu_nn::Error {
@@ -702,7 +833,7 @@ fn validate_conditional_identity(
     definition: &eredu_runtime::ComponentDefinition,
 ) -> Result<(), eredu_nn::Error> {
     if definition.id() != "qwen-hybrid-conditional" {
-        return Err(conditional_invalid(
+        return Err(invalid_definition(
             definition,
             "conditional Qwen component identity",
         ));
@@ -729,7 +860,7 @@ pub fn project_conditional_parameters(
         .map_err(eredu_nn::Error::from)
 }
 
-fn same_conditional_dimensions(a: &super::HybridConfig, b: &super::HybridConfig) -> bool {
+fn same_local_dimensions(a: &super::HybridConfig, b: &super::HybridConfig) -> bool {
     a.num_attention_heads == b.num_attention_heads
         && a.num_key_value_heads == b.num_key_value_heads
         && a.linear_num_key_heads == b.linear_num_key_heads
@@ -749,7 +880,7 @@ pub(crate) fn select_conditional_definition(
     let state = conditional_state(parsed, geometry)?;
     let global = conditional_state(parsed, None)?;
     if definition.state_layout() != &global && definition.state_layout() != &state {
-        return Err(conditional_invalid(
+        return Err(invalid_definition(
             &definition,
             "conditional Qwen retained state differs from global or selected geometry",
         ));
@@ -794,7 +925,7 @@ pub(crate) fn select_conditional_definition(
                     })
             })
             || (0..parsed.text.num_hidden_layers as usize).any(|i| {
-                !same_conditional_dimensions(
+                !same_local_dimensions(
                     retained.text().target(i).expect("declared local target"),
                     geometry
                         .and_then(|g| g.text().target(i))
@@ -802,7 +933,7 @@ pub(crate) fn select_conditional_definition(
                 )
             })
             || (0..parsed.text.mtp_num_hidden_layers as usize).any(|i| {
-                !same_conditional_dimensions(
+                !same_local_dimensions(
                     retained
                         .text()
                         .prediction(i)
@@ -813,7 +944,7 @@ pub(crate) fn select_conditional_definition(
                 )
             })
         {
-            return Err(conditional_invalid(
+            return Err(invalid_definition(
                 &definition,
                 "conditional Qwen retained placement differs from selected geometry",
             ));

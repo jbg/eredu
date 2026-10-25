@@ -9419,6 +9419,19 @@ state offsets and selected local state.
 Low-level media, prediction and restricted-state operations live on
 `ConditionalKernel`; constructors return the shared adapter.
 
+Text Qwen hybrid complete, tensor-local and target-partition construction consumes
+an explicit retained `Arc<ComponentDefinition>` through `QwenKernel::from_definition`,
+`from_parallel_definition` and `from_partition`. `qwen::hybrid::project_parameters`
+selects executable formats while preserving logical consumers and observation seams.
+Identical projections reuse the allocation. Declaration producers supply target/MTP
+paths, independent state slots, transport and partition ownership to the shared
+execution-contract validator. Family checks validate global or selected recurrent,
+convolution and attention state plus retained vocabulary, head and intermediate
+placement. Routed complete preparation and dense/routed partition preparation retain
+the cold source definition and independently project source/target formats and local
+layouts. Shared partition selection validates canonical resource and state ownership
+before pinned materialization.
+
 Conditional hybrid construction takes the cold-admitted `Arc<ComponentDefinition>`
 through `ConditionalKernel::from_definition`, `from_parallel_definition` or
 `from_partition`. `project_conditional_parameters` selects executable formats

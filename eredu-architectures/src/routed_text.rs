@@ -1115,16 +1115,30 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid(
+                "Qwen hybrid selection has no retained definition".into(),
+            )
+        })?;
     let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::qwen::hybrid::QwenKernel::<B>::new(args.clone(), context))
+        .then(|| {
+            let definition = crate::qwen::hybrid::project_parameters(args, &retained)?;
+            crate::qwen::hybrid::QwenKernel::<B>::from_definition(args.clone(), definition, context)
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_qwen_hybrid_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::qwen::hybrid::QwenKernel::<B>::new(selected_args, context)
+    let definition = crate::qwen::hybrid::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture =
+        crate::qwen::hybrid::QwenKernel::<B>::from_definition(selected_args, definition, context)
+            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::qwen_hybrid_text(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
