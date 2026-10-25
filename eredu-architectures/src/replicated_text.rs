@@ -1669,8 +1669,9 @@ where
             StaticModules = crate::decoder::StaticModules<B>,
         > + 'static;
 
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error>;
 }
@@ -1683,11 +1684,12 @@ where
     F: FixedReplicatedFamily<B>,
 {
     type Model = FixedReplicatedModel<B, F, MixedState>;
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedKernel::new(config, context)?.into_model()
+        FixedReplicatedKernel::from_definition(config, definition, context)?.into_model()
     }
 }
 
@@ -1699,11 +1701,12 @@ where
     F: FixedReplicatedFamily<B>,
 {
     type Model = FixedReplicatedModel<B, F, AttentionState>;
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedKernel::new(config, context)?.into_model()
+        FixedReplicatedKernel::from_definition(config, definition, context)?.into_model()
     }
 }
 
@@ -1715,11 +1718,12 @@ where
     F: FixedReplicatedFamily<B>,
 {
     type Model = FixedReplicatedModel<B, F, FixedState>;
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedKernel::new(config, context)?.into_model()
+        FixedReplicatedKernel::from_definition(config, definition, context)?.into_model()
     }
 }
 
@@ -1730,11 +1734,12 @@ where
     F: FixedReplicatedFamily<B>,
 {
     type Model = FixedReplicatedModel<B, F, Stateless>;
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        FixedReplicatedKernel::new(config, context)?.into_model()
+        FixedReplicatedKernel::from_definition(config, definition, context)?.into_model()
     }
 }
 
@@ -1755,6 +1760,11 @@ where
         + FixedProfile<B, S, QwenHybridReplicated>,
 {
     let requirements = selected.requirements().clone();
+    let retained = requirements.shared_component_definition().ok_or_else(|| {
+        ReplicatedTextDispatchError::Architecture(
+            "replicated selection has no retained definition".into(),
+        )
+    })?;
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
@@ -1767,15 +1777,25 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| <P as FixedProfile<B, S, Lfm2Replicated>>::new(args.clone(), context))
+                .then(|| {
+                    <P as FixedProfile<B, S, Lfm2Replicated>>::from_definition(
+                        args.clone(),
+                        retained.clone(),
+                        context,
+                    )
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_lfm2_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::lfm2::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, Lfm2Replicated>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture = <P as FixedProfile<B, S, Lfm2Replicated>>::from_definition(
+                args,
+                retained.clone(),
+                context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
@@ -1797,17 +1817,25 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| <P as FixedProfile<B, S, NemotronHReplicated>>::new(args.clone(), context))
+                .then(|| {
+                    <P as FixedProfile<B, S, NemotronHReplicated>>::from_definition(
+                        args.clone(),
+                        retained.clone(),
+                        context,
+                    )
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args = selected_nemotron_h_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, NemotronHReplicated>>::new(args, context)
-                .map_err(|error| {
-                ReplicatedTextDispatchError::Architecture(error.to_string())
-            })?;
+            let architecture = <P as FixedProfile<B, S, NemotronHReplicated>>::from_definition(
+                args,
+                retained.clone(),
+                context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
@@ -1830,7 +1858,11 @@ where
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
                 .then(|| {
-                    <P as FixedProfile<B, S, QwenHybridReplicated>>::new(args.clone(), context)
+                    <P as FixedProfile<B, S, QwenHybridReplicated>>::from_definition(
+                        args.clone(),
+                        retained.clone(),
+                        context,
+                    )
                 })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -1838,8 +1870,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, QwenHybridReplicated>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture = <P as FixedProfile<B, S, QwenHybridReplicated>>::from_definition(
+                args,
+                retained.clone(),
+                context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
@@ -1862,7 +1898,11 @@ where
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
                 .then(|| {
-                    <P as FixedProfile<B, S, KimiLinearReplicated>>::new(args.clone(), context)
+                    <P as FixedProfile<B, S, KimiLinearReplicated>>::from_definition(
+                        args.clone(),
+                        retained.clone(),
+                        context,
+                    )
                 })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
@@ -1870,8 +1910,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::kimi_linear::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, KimiLinearReplicated>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture = <P as FixedProfile<B, S, KimiLinearReplicated>>::from_definition(
+                args,
+                retained.clone(),
+                context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
@@ -1986,8 +2030,9 @@ where
             Error = eredu_nn::Error,
             StaticModules = crate::decoder::StaticModules<B>,
         > + 'static;
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error>;
 }
@@ -2001,11 +2046,12 @@ where
         eredu_runtime::RuntimeStateComponents<B> + eredu_nn::CompressedAttentionCache<B::Tensor>,
 {
     type Model = CompressedReplicatedModel<B, F>;
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        CompressedReplicatedKernel::new(config, context)?.into_model()
+        CompressedReplicatedKernel::from_definition(config, definition, context)?.into_model()
     }
 }
 
@@ -2017,11 +2063,12 @@ where
     S::LayerState: eredu_nn::CompressedAttentionCache<B::Tensor>,
 {
     type Model = CompressedReplicatedModel<B, F, crate::replicated_model::CompressedState>;
-    fn new(
+    fn from_definition(
         config: F::Config,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
-        CompressedReplicatedKernel::new(config, context)?.into_model()
+        CompressedReplicatedKernel::from_definition(config, definition, context)?.into_model()
     }
 }
 
@@ -2040,6 +2087,11 @@ where
         + CompressedProfile<B, S, DeepSeekV3DenseReplicated>,
 {
     let requirements = selected.requirements().clone();
+    let retained = requirements.shared_component_definition().ok_or_else(|| {
+        ReplicatedTextDispatchError::Architecture(
+            "replicated selection has no retained definition".into(),
+        )
+    })?;
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
@@ -2053,14 +2105,24 @@ where
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| <P as CompressedProfile<B, S, $family>>::new(args.clone(), context))
+                .then(|| {
+                    <P as CompressedProfile<B, S, $family>>::from_definition(
+                        args.clone(),
+                        retained.clone(),
+                        context,
+                    )
+                })
                 .transpose()
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let args =
                 $select(args, &selected).map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity = $identity(&args);
-            let architecture = <P as CompressedProfile<B, S, $family>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let architecture = <P as CompressedProfile<B, S, $family>>::from_definition(
+                args,
+                retained.clone(),
+                context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
@@ -2576,6 +2638,11 @@ where
         AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
 {
     let requirements = selected.requirements().clone();
+    let retained = requirements.shared_component_definition().ok_or_else(|| {
+        ReplicatedTextDispatchError::Architecture(
+            "replicated selection has no retained definition".into(),
+        )
+    })?;
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
@@ -2588,8 +2655,9 @@ where
             let effective_model_type = args.model_type.clone();
             let source_architecture = selected_uses_transform(&selected)
                 .then(|| {
-                    <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new(
+                    <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::from_definition(
                         args.clone(),
+                        retained.clone(),
                         context,
                     )
                 })
@@ -2599,11 +2667,12 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
                 crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
-            let mut architecture =
-                <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new(args, context)
-                    .map_err(|error| {
-                        ReplicatedTextDispatchError::Architecture(error.to_string())
-                    })?;
+            let mut architecture = <MixedState as FixedProfile<
+                B,
+                D::State,
+                QwenHybridReplicated,
+            >>::from_definition(args, retained.clone(), context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             architecture.kernel_mut().enable_prediction_capture();
             let prepared = prepare_architecture_handoff::<B, D::State, _>(
                 architecture,
@@ -2631,8 +2700,9 @@ where
     let effective_model_type = args.model_type.clone();
     let source_architecture = selected_uses_transform(&selected)
         .then(|| {
-            <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(
+            <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::from_definition(
                 args.clone(),
+                retained.clone(),
                 context,
             )
         })
@@ -2643,8 +2713,12 @@ where
     let prompt_cache_architecture_identity =
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
     let mut architecture =
-        <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(args, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::from_definition(
+            args,
+            retained.clone(),
+            context,
+        )
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     architecture.kernel_mut().enable_prediction_capture();
     let prepared = prepare_architecture_handoff::<B, D::State, _>(
         architecture,

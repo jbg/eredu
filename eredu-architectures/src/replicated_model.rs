@@ -117,6 +117,94 @@ pub(crate) trait CompressedReplicatedFamily<B: BlockwiseAttentionBackend>: 'stat
     }
 }
 
+fn select_definition(
+    definition: Arc<ComponentDefinition>,
+    expected: ComponentDefinition,
+) -> Result<Arc<ComponentDefinition>, Error> {
+    let invalid = |resource: &str| eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    };
+    if definition.id() != expected.id() || definition.state_layout() != expected.state_layout() {
+        return Err(invalid("replicated component identity or state geometry").into());
+    }
+    let units = (0..expected.parameters().unit_layout().len())
+        .map(|ordinal| {
+            let address = expected
+                .parameters()
+                .unit_layout()
+                .address(ordinal)
+                .expect("declared invocation");
+            expected.unit(address.group(), address.index()).cloned()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let transport = (0..expected.parameters().graph().groups().len())
+        .map(|group| expected.group_transport(group).cloned())
+        .collect::<Result<Vec<_>, _>>()?;
+    definition.validate_execution_contract(
+        expected.primary_group(),
+        expected.prediction_groups(),
+        &units,
+        &transport,
+        expected.state_partition_plan(),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
+    let mut parameters = expected.parameters().clone();
+    if let Some((rank, layout)) = definition.parameters().partition_layout() {
+        let incomplete = |layout: &eredu_runtime::LocalModelLayout| {
+            layout.tensors().find_map(|(target, tensor)| {
+                let complete = |placement: &eredu_runtime::TensorPlacement| {
+                    use eredu_runtime::TensorPlacement;
+                    match placement {
+                        TensorPlacement::Replicated | TensorPlacement::Local => true,
+                        TensorPlacement::Rank { rank: owner } => *owner == rank.global_rank(),
+                        TensorPlacement::Shard { index, parts, .. } => *index == 0 && *parts == 1,
+                        TensorPlacement::Range { axis, start, end } => {
+                            *start == 0 && tensor.global_shape().get(*axis) == Some(end)
+                        }
+                        TensorPlacement::Indices { axis, indices } => tensor
+                            .global_shape()
+                            .get(*axis)
+                            .is_some_and(|width| indices.iter().copied().eq(0..*width)),
+                        TensorPlacement::Omit => false,
+                    }
+                };
+                (tensor.local_shape() != tensor.global_shape()
+                    || !complete(tensor.placement())
+                    || !tensor.additional_placements().iter().all(complete))
+                .then(|| target.to_owned())
+            })
+        };
+        if let Some(target) = incomplete(layout) {
+            return Err(invalid(&format!(
+                "replicated parameter {target} requires complete geometry"
+            ))
+            .into());
+        }
+        let selected = eredu_runtime::derive_partitioned_local_layout(&parameters, rank)
+            .map_err(Error::backend)?;
+        if let Some(target) = incomplete(&selected) {
+            return Err(invalid(&format!(
+                "replicated selected parameter {target} requires complete geometry"
+            ))
+            .into());
+        }
+        parameters = parameters
+            .with_partition_layout(rank, selected)
+            .map_err(Error::backend_source)?;
+    }
+    if definition.parameters() == &parameters {
+        return Ok(definition);
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(Arc::new)
+        .map_err(Error::from)
+}
+
 pub(crate) struct MixedState;
 pub(crate) struct AttentionState;
 pub(crate) struct FixedState;
@@ -446,9 +534,13 @@ pub(crate) struct FixedReplicatedKernel<
     family: PhantomData<(F, P)>,
 }
 impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P: 'static> FixedReplicatedKernel<B, F, P> {
-    pub fn new(config: F::Config, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+    pub fn from_definition(
+        config: F::Config,
+        definition: Arc<ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         F::validate(&config)?;
-        let definition = Arc::new(F::definition(&config)?);
+        let definition = select_definition(definition, F::definition(&config)?)?;
         let static_modules = StaticModules::from_spec(F::static_spec(&config), context)?;
         Ok(Self {
             config,
@@ -744,9 +836,13 @@ pub(crate) struct CompressedReplicatedKernel<
 impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P: 'static>
     CompressedReplicatedKernel<B, F, P>
 {
-    pub fn new(config: F::Config, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+    pub fn from_definition(
+        config: F::Config,
+        definition: Arc<ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         F::validate(&config)?;
-        let definition = Arc::new(F::definition(&config)?);
+        let definition = select_definition(definition, F::definition(&config)?)?;
         let static_modules = StaticModules::from_spec(F::static_spec(&config), context)?;
         Ok(Self {
             config,

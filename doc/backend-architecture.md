@@ -12852,6 +12852,16 @@ placement remains independent authority. Dense, routed Qwen, GPT-OSS, K2 and
 Nemotron-Labs-Diffusion use their existing declaration producers for this check;
 expert-bank and draft-adapter geometry stay family-owned.
 
+Fixed-state and compressed-attention replicated construction consumes the
+cold-admitted declaration through its typed profile handoff, including external
+prediction targets. Both kernels use one definition selector. It validates identity,
+exact mutable state, invocation paths, transport and observation ownership against
+family declaration producers; physical format projection preserves logical consumers and
+runtime seams. Identical source/target declarations reuse the retained allocation.
+Retained placement describes complete tensors for these replicated equations;
+selected parameter geometry is checked before modules are allocated. Partitioned
+and tensor-sharded equations retain their own declared local geometry.
+
 `ComponentDefinition::validate_execution_contract` compares the equation
 implementation's primary/prediction groups, invocation paths and state references,
 transport and state ownership against the retained declaration. Family declaration
