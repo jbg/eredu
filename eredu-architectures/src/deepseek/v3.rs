@@ -20,7 +20,7 @@ use eredu_runtime::{
 use std::sync::Arc;
 
 use crate::decoder::{
-    DecoderStaticResources, PartitionStaticModules, StaticModuleSpec, StaticModules,
+    DecoderStaticResources, PartitionStaticModules, StaticModuleSpec,
 };
 
 use super::{
@@ -265,7 +265,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::materialize(args, definition, None, context)
+        Self::materialize(args, definition, None, |_| Ok(None), context)
     }
     /// Materializes modules using the retained definition and authoritative local geometry.
     pub fn from_parallel_definition(
@@ -274,12 +274,38 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         geometry: super::parallel::V3LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::materialize(args, definition, Some(geometry), context)
+        Self::materialize(args, definition, Some(geometry), |_| Ok(None), context)
     }
+    /// Validates selected ownership before allocating its pinned resources.
+    pub fn from_partition_definition<G, A>(
+        args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: super::parallel::V3LocalGeometry,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        Self::materialize(
+            args,
+            definition,
+            Some(geometry),
+            |definition| {
+                definition
+                    .select_partition(partition)
+                    .map(Some)
+                    .map_err(Error::from)
+            },
+            context,
+        )?
+        .into_partition_model(partition)
+    }
+
     fn materialize(
         args: V3Args,
         definition: Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<super::parallel::V3LocalGeometry>,
+        select: impl FnOnce(
+            &eredu_runtime::ComponentDefinition,
+        ) -> Result<Option<eredu_runtime::ComponentSelection>, Error>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
@@ -292,23 +318,34 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             },
         )?;
         let definition = select_definition(&args, definition, geometry.as_ref())?;
-        let static_modules: PartitionStaticModules<B> = match &geometry {
-            Some(geometry) => StaticModules::from_parallel_spec(
-                static_spec(&args),
-                geometry.embedding_range().clone(),
-                Some(geometry.output_range().clone()),
-                context,
-            )?,
-            None => StaticModules::from_spec(static_spec(&args), context)?,
-        }
-        .into();
+        let selection = select(&definition)?;
+        let partition_target_start = selection
+            .as_ref()
+            .and_then(|selection| selection.state())
+            .map_or(0, |state| state.global_layer_offset());
+        let static_modules = PartitionStaticModules::from_selected_spec(
+            static_spec(&args),
+            geometry.as_ref().map(|geometry| {
+                (
+                    geometry.embedding_range().clone(),
+                    Some(geometry.output_range().clone()),
+                )
+            }),
+            |role| {
+                selection.as_ref().is_none_or(|selection| {
+                    selection
+                        .owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+                })
+            },
+            context,
+        )?;
         Ok(Self {
             definition,
             args,
             static_modules,
             parallel_geometry: geometry.map(Arc::new),
             expert_realization: None,
-            partition_target_start: 0,
+            partition_target_start,
         })
     }
 
@@ -437,18 +474,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         self.partition_target_start = selection
             .state()
             .map_or(0, |state| state.global_layer_offset());
-        let roles: std::collections::BTreeSet<_> = partition
-            .parameter_bindings()
-            .iter()
-            .filter_map(|group| group.owner().static_storage_role())
-            .collect();
-        if !roles.contains("embedding") {
+        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
+            "embedding".into(),
+        )) {
             self.static_modules.embeddings = None;
         }
-        if !roles.contains("norm") {
+        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
+            "norm".into(),
+        )) {
             self.static_modules.norm = None;
         }
-        if !roles.contains("output") {
+        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
+            "output".into(),
+        )) {
             self.static_modules.lm_head = None;
         }
         ComponentAdapter::with_partition_resources::<B, _, _>(

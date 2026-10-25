@@ -11553,32 +11553,30 @@ where
                 "routed V3 transform source changed local unit addresses".into(),
             ));
         }
-        let mut source = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
+        let mut source = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
             source_args,
             source_definition,
             source_local,
+            &source_partition,
             context,
         )
         .map_err(|e| error(e.to_string()))?;
-        source.install_expert_realization(source_plan);
-        let source = source
-            .into_partition_model(&source_partition)
-            .map_err(|e| error(e.to_string()))?;
+        source.kernel_mut().install_expert_realization(source_plan);
         Some((source, source_layout))
     } else {
         None
     };
-    let mut architecture = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
+    let mut architecture = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
         selected_args,
         definition,
         local,
+        &partition,
         context,
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    architecture.install_expert_realization(plan.clone());
-    let architecture = architecture
-        .into_partition_model(&partition)
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    architecture
+        .kernel_mut()
+        .install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         architecture,
         source_architecture,

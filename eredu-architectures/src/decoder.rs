@@ -5090,6 +5090,55 @@ pub struct PartitionStaticModules<B: NeuralBackend> {
     pub lm_head: Option<B::Linear>,
 }
 
+impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
+    /// Materializes only canonical pinned roles selected before native allocation.
+    pub(crate) fn from_selected_spec(
+        spec: StaticModuleSpec,
+        vocabulary: Option<(VocabularyParallelRange, Option<VocabularyParallelRange>)>,
+        owns: impl Fn(&str) -> bool,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let (embedding, head, normalization) = spec.construction_specs()?;
+        if let Some((embedding_range, output_range)) = &vocabulary {
+            embedding_range.validate_global_rows(embedding.vocabulary)?;
+            if head.is_some() != output_range.is_some() {
+                return Err(Error::backend(
+                    "vocabulary ownership differs from tied or independent readout",
+                ));
+            }
+            if let (Some(head), Some(range)) = (&head, output_range) {
+                range.validate_global_rows(head.output)?;
+            }
+        }
+        let embeddings = owns("embedding")
+            .then(|| match &vocabulary {
+                Some((range, _)) => {
+                    B::vocabulary_parallel_embedding(embedding, range.clone(), context)
+                }
+                None => B::embedding(embedding, context),
+            })
+            .transpose()?;
+        let norm = owns("norm")
+            .then(|| B::normalization(normalization, context))
+            .transpose()?;
+        let lm_head = head
+            .filter(|_| owns("output"))
+            .map(|head| match &vocabulary {
+                Some((_, Some(range))) => {
+                    B::vocabulary_parallel_linear(head, range.clone(), context)
+                }
+                Some((_, None)) => Err(Error::backend("selected output has no vocabulary range")),
+                None => B::linear(head, context),
+            })
+            .transpose()?;
+        Ok(Self {
+            embeddings,
+            norm,
+            lm_head,
+        })
+    }
+}
+
 impl<B: NeuralBackend> From<StaticModules<B>> for PartitionStaticModules<B> {
     fn from(modules: StaticModules<B>) -> Self {
         Self {

@@ -2,7 +2,7 @@
 
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
-    EmbeddingSpec, Error, LinearSpec, NormalizationConstructionSpec, ParameterSpec, Tensor,
+    Error, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, LayerRuntimeState, LayeredForwardState,
@@ -297,77 +297,6 @@ fn select_definition(
     }
 }
 
-fn partition_static_modules<B, A>(
-    args: &ModelArgs,
-    geometry: &PartitionLocalGeometry,
-    partition: &eredu_runtime::ArchitecturePartition<PartitionLocalGeometry, A>,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<PartitionStaticModules<B>, Error>
-where
-    B: eredu_nn::GroupedNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + BlockwiseAttentionBackend,
-{
-    let ownership = partition.ownership();
-    let embedding_name = "model.embed_tokens.weight";
-    let embeddings = (ownership.owns_input()
-        || (ownership.owns_output() && args.tie_word_embeddings))
-        .then(|| {
-            B::vocabulary_parallel_embedding(
-                EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable(embedding_name).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        embedding_name,
-                        args.weight_quantization_for(embedding_name).into(),
-                    )?,
-                },
-                geometry.embedding_range().clone(),
-                context,
-            )
-        })
-        .transpose()?;
-    let norm = ownership
-        .owns_output()
-        .then(|| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
-                ),
-                context,
-            )
-        })
-        .transpose()?;
-    let lm_head = (ownership.owns_output() && !args.tie_word_embeddings)
-        .then(|| {
-            let name = "lm_head.weight";
-            B::vocabulary_parallel_linear(
-                LinearSpec {
-                    input: args.hidden_size,
-                    output: args.vocab_size,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        name,
-                        args.weight_quantization_for(name).into(),
-                    )?,
-                },
-                geometry.output_range().cloned().ok_or_else(|| {
-                    Error::backend("untied Kimi output owner has no vocabulary range")
-                })?,
-                context,
-            )
-        })
-        .transpose()?;
-    Ok(PartitionStaticModules {
-        embeddings,
-        norm,
-        lm_head,
-    })
-}
 
 impl<B> KimiKernel<B>
 where
@@ -412,8 +341,18 @@ where
         }
         let geometry = partition.local_geometry().clone();
         let definition = select_definition(&args, definition, &geometry)?;
-        definition.select_partition(partition)?;
-        let static_modules = partition_static_modules(&args, &geometry, partition, context)?;
+        let selection = definition.select_partition(partition)?;
+        let static_modules = PartitionStaticModules::from_selected_spec(
+            super::static_spec(&args),
+            Some((
+                geometry.embedding_range().clone(),
+                geometry.output_range().cloned(),
+            )),
+            |role| {
+                selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+            },
+            context,
+        )?;
         let kernel = Self {
             args,
             static_modules,

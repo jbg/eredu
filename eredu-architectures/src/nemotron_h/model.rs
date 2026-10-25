@@ -373,7 +373,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
             .map_err(Error::from)
     }
 
-    fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
+    pub(super) fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
         let embedding_name = "model.embeddings.weight";
         StaticModuleSpec {
             // One full-width group keeps reduction and learned scale in F32.

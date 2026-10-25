@@ -112,16 +112,14 @@ where
                 "dense V3 transform source changed local unit addresses",
             ));
         }
-        let model = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
+        let model = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
             source_args,
             source_definition,
             source_geometry,
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
-        let model = model
-            .into_partition_model(&source_partition)
-            .map_err(architecture)?;
         Some((model, source_layout))
     } else {
         None
@@ -129,16 +127,14 @@ where
     let capability_estimate =
         crate::capability::deepseek_v3(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let model = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
+    let model = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
         selected_args,
         definition,
         geometry,
+        &partition,
         context,
     )
     .map_err(architecture)?;
-    let model = model
-        .into_partition_model(&partition)
-        .map_err(architecture)?;
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition)
         .map_err(architecture)?;
     visitor

@@ -8415,6 +8415,23 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+`ComponentSelection::owns_storage` reports canonical parameter owners from the
+validated partition bindings, independently of logical invocation and mutable-state
+identity. The shared `PartitionStaticModules::from_selected_spec` constructor consumes
+family parameter/normalization policy, exact vocabulary geometry and this selected
+storage authority. It validates specifications before native allocation and creates
+only selected embedding, normalization and readout modules. Tied output uses its
+canonical embedding owner, including required pipeline replicas. LFM2, Kimi Linear,
+Nemotron-H and V3 consume this shared constructor; family code retains equations
+and exceptional local geometry.
+
+V3 partition preparation uses `V3Kernel::from_partition_definition` to validate
+ownership before allocating pinned resources. Complete, tensor-local and selected
+construction use one materializer. The low-level consuming partition operation
+retains its ownership checks; production preparation selects resources before
+construction. Independently leased units and source/target layouts keep their
+existing residency and completion lifecycles.
+
 V3 materialization consumes the cold-admitted `Arc<ComponentDefinition>` through
 `V3Kernel::from_definition` or `from_parallel_definition`. One resource materializer
 selects ordinary or tensor-local modules. `v3::project_parameters` preserves logical

@@ -1109,13 +1109,14 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
     ) -> Result<B::Tensor, Self::Error>;
 }
 
-/// Validated owned invocations and independent mutable-state projection.
+/// Validated invocation, canonical storage and independent mutable-state ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentSelection {
     component: String,
     layout: crate::ExecutionUnitLayout,
     invocations: crate::ExecutionUnitAddressMap,
     units: std::collections::BTreeSet<(usize, usize)>,
+    storage: std::collections::BTreeSet<ParameterStorageId>,
     state: Option<PartitionState>,
     owns_output: bool,
 }
@@ -1124,6 +1125,10 @@ impl ComponentSelection {
     /// Selected logical invocations and independently leased physical owners.
     pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
         &self.invocations
+    }
+    /// Whether canonical parameter storage is physically selected on this partition.
+    pub fn owns_storage(&self, storage: &ParameterStorageId) -> bool {
+        self.storage.contains(storage)
     }
     /// Selected mutable state, including explicit global-ordinal gaps.
     pub fn state(&self) -> Option<&PartitionState> {
@@ -1213,6 +1218,11 @@ impl ComponentDefinition {
             layout: self.parameters.unit_layout().clone(),
             invocations: partition.invocations().clone(),
             units,
+            storage: partition
+                .parameter_bindings()
+                .iter()
+                .map(|group| ParameterStorageId::from_owner(group.owner()))
+                .collect(),
             state: expected,
             owns_output: partition.ownership().owns_output(),
         };
