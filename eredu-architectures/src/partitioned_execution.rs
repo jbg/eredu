@@ -8268,12 +8268,11 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
         &derived
     };
     let projected_rank;
-    let (mut result, groups) = if topology == admission.topology() {
+    let (ownership, groups, publication_owner) = if topology == admission.topology() {
         (
-            ComponentPartitionLayout::from_admission(
-                descriptor, parameters, layout, admission, routed,
-            )?,
+            admission.ownership(),
             admission.groups(),
+            admission.publication_owner(),
         )
     } else {
         projected_rank = eredu_runtime::PipelineRankProjection::new(
@@ -8284,19 +8283,22 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
         )
         .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?;
         (
-            ComponentPartitionLayout::from_ownership(
-                descriptor,
-                parameters,
-                layout,
-                topology,
-                projected_rank.ownership(),
-                projected_rank.groups(),
-                projected_rank.publication_owner(),
-                routed,
-            )?,
+            projected_rank.ownership(),
             projected_rank.groups(),
+            projected_rank.publication_owner(),
         )
     };
+    let mut result = ComponentPartitionLayout::from_ownership(
+        descriptor,
+        parameters,
+        layout,
+        topology,
+        ownership,
+        groups,
+        publication_owner,
+        routed,
+        admission.execution.text().component_definition(),
+    )?;
     for point in unit_observations {
         let owner =
             eredu_runtime::ParameterGroupOwner::execution_unit(point.group.clone(), point.unit);

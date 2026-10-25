@@ -91,7 +91,7 @@ impl ParameterStorageId {
 pub struct StateSlotId(pub usize);
 
 /// One logical invocation and its independent state references.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentUnit {
     /// Stable architecture-owned operation path.
     pub path: String,
@@ -99,17 +99,27 @@ pub struct ComponentUnit {
     pub state: Range<usize>,
 }
 
+/// One logical parameter reference at its exact invocation, independent of storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentParameterUse {
+    /// Invocation executing the parameterized equation.
+    pub invocation: ExecutionUnitAddress,
+    /// Canonical parameter target declared by the physical resource owner.
+    pub target: String,
+}
+
 /// One retained semantic definition used by shared execution contracts.
 ///
 /// Parameter descriptions supply the validated graph and storage ownership;
 /// paths and state references follow its canonical invocation layout. Group
 /// transport and primary/prediction identities are retained with the definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentDefinition {
     id: String,
     parameters: ArchitectureParameterDescription,
     units: Vec<ComponentUnit>,
     unit_observations: Vec<crate::UnitObservationBoundaries>,
+    parameter_uses: std::collections::BTreeMap<String, ComponentParameterUse>,
     transport: Vec<ArchitectureGroupTransport>,
     primary: String,
     prediction: Vec<String>,
@@ -205,6 +215,7 @@ impl ComponentDefinition {
             parameters,
             units,
             unit_observations,
+            parameter_uses: Default::default(),
             transport,
             primary,
             prediction,
@@ -248,7 +259,7 @@ impl ComponentDefinition {
                 resource: "selected state identities or lifetimes".into(),
             });
         }
-        Self::new(
+        let mut selected = Self::new(
             self.id,
             self.parameters,
             self.units,
@@ -257,7 +268,85 @@ impl ComponentDefinition {
             self.prediction,
             state,
             self.state_partition,
-        )
+        )?;
+        selected.unit_observations = self.unit_observations;
+        selected.parameter_uses = self.parameter_uses;
+        Ok(selected)
+    }
+    /// Retains architecture-authored logical references after validating their consumers.
+    pub fn with_parameter_uses(
+        mut self,
+        uses: impl IntoIterator<Item = (String, ComponentParameterUse)>,
+    ) -> Result<Self, ComponentDefinitionError> {
+        let mut declared = std::collections::BTreeMap::new();
+        for (logical, usage) in uses {
+            let address = usage.invocation;
+            let invalid = || ComponentDefinitionError::Invalid {
+                component: self.id.clone(),
+                resource: format!("parameter use {logical:?} -> {:?}", usage.target),
+            };
+            self.unit(address.group(), address.index())?;
+            let group = self
+                .parameters
+                .unit_layout()
+                .group_id(address.group())
+                .expect("validated group");
+            let owned = self
+                .parameters
+                .groups()
+                .iter()
+                .find(|owned| {
+                    owned
+                        .members()
+                        .iter()
+                        .any(|member| member.target() == usage.target)
+                })
+                .ok_or_else(&invalid)?;
+            let admitted = match owned.owner() {
+                crate::ParameterGroupOwner::ExecutionUnit {
+                    group: owner,
+                    consumers,
+                    ..
+                } => owner == group && consumers.contains(&address.index()),
+                crate::ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
+                    .iter()
+                    .any(|(owner, index)| owner == group && *index == address.index()),
+                _ => false,
+            };
+            if logical.trim().is_empty() || !admitted || declared.contains_key(&logical) {
+                return Err(invalid());
+            }
+            declared.insert(logical, usage);
+        }
+        self.parameter_uses = declared;
+        Ok(self)
+    }
+    /// Exact logical references; these do not introduce physical parameter owners.
+    pub fn parameter_uses(&self) -> &std::collections::BTreeMap<String, ComponentParameterUse> {
+        &self.parameter_uses
+    }
+    /// Invocation owning a declared seam or an internal observation below its unit path.
+    pub fn observation_invocation(&self, path: &str) -> Option<ExecutionUnitAddress> {
+        let original = path.strip_suffix(".effective").unwrap_or(path);
+        let exact = self.unit_observations.iter().position(|boundaries| {
+            boundaries.input_path() == Some(path)
+                || boundaries.output_path() == Some(path)
+                || boundaries.input_path() == Some(original)
+                || boundaries.output_path() == Some(original)
+        });
+        let ordinal = exact.or_else(|| {
+            self.units
+                .iter()
+                .enumerate()
+                .filter(|(_, unit)| {
+                    original
+                        .strip_prefix(&unit.path)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+                })
+                .max_by_key(|(_, unit)| unit.path.len())
+                .map(|(ordinal, _)| ordinal)
+        })?;
+        self.parameters.unit_layout().address(ordinal)
     }
     /// Canonical number of logical invocations in one validated group.
     pub fn unit_count(&self, group: usize) -> Result<usize, ComponentDefinitionError> {

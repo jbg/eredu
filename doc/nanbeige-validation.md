@@ -5,12 +5,13 @@ execution drivers. Its physical blocks are expanded into logical invocations
 with exact checkpoint aliases, independent KV state and optional inter-pass
 RMSNorm. No family-specific backend implementation is required.
 
-Identical whole-block invocations share one resident module and canonical parameter
-binding. With deferred inter-pass normalization, the resident stack contains one module
-per physical checkpoint block. With inter-pass normalization, it retains one additional
-last-block module for the final pass, whose output has no inter-pass RMSNorm. Those two
-last-block variants still duplicate their body storage. Pipeline owners retain their
-required physical replicas, and every logical invocation keeps its independent KV state.
+Logical invocations share one canonical body per physical checkpoint block and
+retain independent KV state. Inter-pass RMSNorm has its own independently leased
+resource, shared across the boundaries that use it. Final readout normalization
+is a separately accounted pinned replica. Pipeline owners retain the physical
+resources needed by their selected invocations. Cold scalar and logical-layer
+capture ownership follows those invocations rather than parameter aliases;
+a normalization-only stage owns the post-normalization output seam and no KV state.
 
 Cold architecture discovery exposes the released configuration as a decoder
 group with 22 physical layers, two passes and shared weights. Its 44 logical

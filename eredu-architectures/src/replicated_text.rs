@@ -4611,13 +4611,6 @@ fn replicated_text_requirements_for_structure(
     let floating_source = crate::preparation::prepared_floating_state_dtype_source(inspection)
         .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
     let state_partition_plan = match &config {
-        EligibleConfig::Nanbeige(args) => Some(
-            crate::decoder::DecoderSchedule::new(*args)
-                .map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                })?
-                .state_partition_plan(&execution_units),
-        ),
         EligibleConfig::Muse(args) => Some(crate::muse::model::state_partition_plan(
             args,
             &state_layout,
@@ -4647,7 +4640,26 @@ fn replicated_text_requirements_for_structure(
     })
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     if let Some(plan) = state_partition_plan {
-        requirements = requirements.with_state_partition_plan(plan);
+        requirements = requirements
+            .with_state_partition_plan(plan)
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+    }
+    if let EligibleConfig::Nanbeige(args) = &config {
+        let definition = crate::decoder::decoder_component_definition(
+            *args,
+            crate::decoder::dense_parameter_description(*args).map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?,
+            requirements.state_layout().clone(),
+        )
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
+        requirements = requirements
+            .with_component_definition(definition)
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
     }
     requirements =
         requirements.with_execution_topology(config.execution_topology().map_err(|error| {

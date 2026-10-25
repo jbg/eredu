@@ -12691,3 +12691,21 @@ owns that layer's final output seam. Whole-block low-level construction remains
 available through `construct_block`, using the same body and normalization
 constructors. Ordinary, parallel, routed and observed operation dispatch uses
 the shared adapter and never constructs a temporary whole block.
+
+`ComponentParameterUse` associates a logical parameter reference with an exact
+invocation and canonical storage target. The runtime validates the target and
+its declared consumers; these references add no materialized owners or parameter
+accounting. Decoder declarations derive the references from their typed operation
+schedule and canonical parameter groups. Local state geometry selection preserves
+these references and the retained observation boundaries.
+
+Cold text requirements can retain the validated component definition. Its state
+partition rules remain authoritative: conflicting independently supplied rules
+reject in either declaration order. Nanbeige cold inspection retains this source-free
+definition and resolves scalar component placement through its canonical targets.
+An immutable inspection view supplies logical parameter coordinates without
+creating bindings or widening checkpoint source authority. Exact declared seams
+take precedence over internal unit namespaces when assigning observation owners.
+Body residual captures and post-normalization output captures can therefore belong
+to different pipeline stages while shared parameters retain one canonical owner
+per physical placement. Local and other-rank inspection use one projection path.

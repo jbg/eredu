@@ -8139,7 +8139,8 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
         ],
     )
     .unwrap()
-    .with_state_partition_plan(architecture.state_partition_plan(&state_layout));
+    .with_state_partition_plan(architecture.state_partition_plan(&state_layout))
+    .unwrap();
     let ranks = [0, 1].map(|rank| {
         eredu_runtime::PipelineRankProjection::new(
             &requirements,

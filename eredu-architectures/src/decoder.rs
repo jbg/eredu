@@ -5438,7 +5438,7 @@ pub type PartitionedLayeredModel<B, C, P = DenseBlockFactory> = eredu_runtime::C
     eredu_runtime::KernelParameterModules,
 >;
 
-fn decoder_component_definition<C: Config>(
+pub(crate) fn decoder_component_definition<C: Config>(
     args: &C,
     parameters: ArchitectureParameterDescription,
     state: StateLayout,
@@ -5464,6 +5464,53 @@ fn decoder_component_definition<C: Config>(
             },
         })
         .collect::<Vec<_>>();
+    let mut parameter_uses = Vec::new();
+    for owned in parameters.groups() {
+        let ParameterGroupOwner::ExecutionUnit {
+            group,
+            global_unit,
+            consumers,
+            ..
+        } = owned.owner()
+        else {
+            continue;
+        };
+        let group_index = parameters
+            .graph()
+            .group_index(group.as_str())
+            .expect("declared group");
+        let canonical = schedule.path(args, *global_unit)?;
+        for &consumer in consumers {
+            let prefix = schedule.path(args, consumer)?;
+            let ordinal = parameters
+                .unit_layout()
+                .ordinal(group_index, consumer)
+                .expect("declared invocation");
+            let invocation = parameters
+                .unit_layout()
+                .address(ordinal)
+                .expect("declared invocation");
+            for member in owned.members() {
+                let suffix = member
+                    .target()
+                    .strip_prefix(&canonical)
+                    .filter(|suffix| suffix.starts_with('.'))
+                    .ok_or_else(|| {
+                        Error::backend(format!(
+                            "decoder resource {} is outside its declared owner {canonical}",
+                            member.target()
+                        ))
+                    })?;
+                parameter_uses.push((
+                    format!("{prefix}{suffix}"),
+                    eredu_runtime::ComponentParameterUse {
+                        invocation,
+                        target: member.target().into(),
+                    },
+                ));
+            }
+        }
+    }
     let partition = schedule.state_partition_plan(parameters.unit_layout());
     eredu_runtime::ComponentDefinition::new(
         "text_decoder",
@@ -5475,6 +5522,7 @@ fn decoder_component_definition<C: Config>(
         state,
         partition,
     )
+    .and_then(|definition| definition.with_parameter_uses(parameter_uses))
     .and_then(|definition| {
         definition.map_unit_observation_boundaries(|address, _| {
             schedule.boundaries(args, address.index())

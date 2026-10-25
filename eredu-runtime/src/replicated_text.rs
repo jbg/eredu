@@ -1212,6 +1212,7 @@ impl ReplicatedTextContractError {
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
+    component: Option<std::sync::Arc<crate::ComponentDefinition>>,
     state_partition_plan: Option<crate::ArchitectureStatePartitionPlan>,
     prefill_input_retention: crate::memory_forecast::PrefillInputRetention,
     execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
@@ -1300,18 +1301,65 @@ impl ReplicatedTextRequirements {
         self.execution_topology.as_ref()
     }
 
+    /// Retains the same validated component facts for cold ownership and execution.
+    pub fn with_component_definition(
+        mut self,
+        definition: crate::ComponentDefinition,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        if self
+            .component
+            .as_deref()
+            .is_some_and(|retained| retained != &definition)
+            || definition.parameters().graph() != &self.execution_graph
+            || definition.parameters().unit_layout() != &self.execution_units
+            || definition.state_layout() != &self.state_layout
+            || self
+                .state_partition_plan
+                .as_ref()
+                .is_some_and(|plan| plan != definition.state_partition_plan())
+            || (0..self.group_transports.len()).any(|group| {
+                definition.group_transport(group).ok() != self.group_transports.get(group)
+            })
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "component definition differs from text execution structure",
+            ));
+        }
+        self.state_partition_plan = None;
+        self.component = Some(std::sync::Arc::new(definition));
+        Ok(self)
+    }
+    /// Source-free invocation and parameter-use authority, when retained by the family.
+    pub fn component_definition(&self) -> Option<&crate::ComponentDefinition> {
+        self.component.as_deref()
+    }
+
     /// Retains explicit state placement for decoder and non-decoder groups.
     pub fn with_state_partition_plan(
         mut self,
         plan: crate::ArchitectureStatePartitionPlan,
-    ) -> Self {
-        self.state_partition_plan = Some(plan);
-        self
+    ) -> Result<Self, ReplicatedTextContractError> {
+        plan.validate(&self.state_layout, &self.execution_units)
+            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        if self
+            .component
+            .as_ref()
+            .is_some_and(|definition| definition.state_partition_plan() != &plan)
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "state partition plan differs from retained component definition",
+            ));
+        }
+        self.state_partition_plan = self.component.is_none().then_some(plan);
+        Ok(self)
     }
 
-    /// Exact state placement, when the architecture declares non-default owners.
+    /// Exact state placement projected from the retained semantic authority.
     pub fn state_partition_plan(&self) -> Option<&crate::ArchitectureStatePartitionPlan> {
-        self.state_partition_plan.as_ref()
+        self.component
+            .as_ref()
+            .map(|definition| definition.state_partition_plan())
+            .or(self.state_partition_plan.as_ref())
     }
 
     /// Declares input ownership across consecutive decoder prefix invocations.
@@ -1432,6 +1480,7 @@ impl ReplicatedTextRequirements {
         }
         Ok(Self {
             execution_topology: None,
+            component: None,
             state_partition_plan: None,
             prefill_input_retention: crate::memory_forecast::PrefillInputRetention::TokenIds,
             chunked_prefill: false,

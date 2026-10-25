@@ -359,6 +359,34 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         ArchitectureStatePartitionPlan::new([]),
     )
     .unwrap();
+    let uses = [0, 1].map(|index| {
+        (
+            format!("second.{index}.weight"),
+            eredu_runtime::ComponentParameterUse {
+                invocation: shared_layout
+                    .address(shared_layout.ordinal(1, index).unwrap())
+                    .unwrap(),
+                target: "shared.weight".into(),
+            },
+        )
+    });
+    let mut wrong_consumer = uses[0].clone();
+    wrong_consumer.1.invocation = shared_layout.address(0).unwrap();
+    assert!(shared_definition
+        .clone()
+        .with_parameter_uses([wrong_consumer])
+        .is_err());
+    let mut dangling = uses[0].clone();
+    dangling.1.target = "absent.weight".into();
+    assert!(shared_definition
+        .clone()
+        .with_parameter_uses([dangling])
+        .is_err());
+    assert!(shared_definition
+        .clone()
+        .with_parameter_uses([uses[0].clone(), uses[0].clone()])
+        .is_err());
+    let shared_definition = shared_definition.with_parameter_uses(uses).unwrap();
     let mut shared = ResidentRuntime::new(
         ComponentAdapter::new(
             shared_definition,
@@ -635,6 +663,10 @@ fn component_logical_observation_boundaries_span_independently_leased_operations
                 } else {
                     paths
                 }
+            })
+            .and_then(|definition| {
+                let state = definition.state_layout().clone();
+                definition.with_state_layout(state)
             })
             .unwrap()
     };
@@ -1586,6 +1618,101 @@ fn component_invocation_state_ownership_skips_interleaved_stateless_units() {
             )
         };
         let definition = make(units.clone(), base.state_layout().clone(), owners(false)).unwrap();
+        // Cold placement consumes the complete declaration; selected execution
+        // below retains the nonzero interval without inventing prefix state.
+        let cold_units = (0..offset)
+            .map(|index| ComponentUnit {
+                path: format!("operation.{index}"),
+                state: 0..0,
+            })
+            .chain(units.iter().cloned())
+            .collect();
+        let cold_definition = ComponentDefinition::new(
+            "interleaved",
+            ArchitectureParameterDescription::new(graph, &complete, [], []).unwrap(),
+            cold_units,
+            vec![base.group_transport(0).unwrap().clone()],
+            "carry",
+            vec![],
+            definition.state_layout().clone(),
+            owners(false),
+        )
+        .unwrap();
+        let requirements = eredu_runtime::ReplicatedTextRequirements::new(
+            "interleaved",
+            eredu_nn::NeuralOperatorCapabilities::NONE,
+            graph.clone(),
+            complete.clone(),
+            vec![base.group_transport(0).unwrap().clone()],
+            definition.state_layout().clone(),
+            eredu_runtime::ReplicatedTextStateAccess::KeyValue,
+            vec![],
+        )
+        .unwrap();
+        let incompatible = ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::output_owner(0..2),
+        ]);
+        let cold = requirements
+            .clone()
+            .with_component_definition(cold_definition.clone())
+            .unwrap();
+        let changed_seams = cold_definition
+            .clone()
+            .map_unit_observation_boundaries(|address, boundaries| {
+                if address.index() == 0 {
+                    eredu_runtime::UnitObservationBoundaries::new(Some("changed.input".into()), None)
+                } else {
+                    boundaries.clone()
+                }
+            })
+            .unwrap();
+        assert!(cold
+            .clone()
+            .with_component_definition(changed_seams)
+            .is_err());
+        let cold = cold
+            .with_component_definition(cold_definition.clone())
+            .unwrap();
+        assert!(cold
+            .clone()
+            .with_state_partition_plan(incompatible.clone())
+            .is_err());
+        assert!(requirements
+            .with_state_partition_plan(incompatible)
+            .unwrap()
+            .with_component_definition(cold_definition.clone())
+            .is_err());
+        for rank in 0..3 {
+            let projection = eredu_runtime::PipelineRankProjection::new(
+                &cold,
+                Some(definition.state_layout()),
+                eredu_core::ParallelRankTopology::new(
+                    eredu_core::ParallelTopology::new(1, 3, 1, 1).unwrap(),
+                    rank,
+                )
+                .unwrap(),
+                false,
+            )
+            .unwrap();
+            let expected = [offset + 1, offset + 4]
+                .into_iter()
+                .enumerate()
+                .filter(|(_, invocation)| {
+                    projection
+                        .groups()
+                        .iter()
+                        .any(|group| group.units().contains(invocation))
+                })
+                .map(|(slot, _)| slot)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                projection.state().map(|state| state.global_layers()),
+                expected
+                    .first()
+                    .zip(expected.last())
+                    .map(|(first, last)| *first..last + 1)
+            );
+        }
         let kernel = |start, shared| {
             let mut kernel = CarryKernel::new(start, false);
             kernel.slots = Some(

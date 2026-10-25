@@ -305,25 +305,6 @@ impl ComponentPartitionLayout {
             .map_err(Into::into)
     }
 
-    pub(crate) fn from_admission<R>(
-        descriptor: &ArchitectureDescriptor,
-        parameters: &ArchitectureParameterDescription,
-        layout: &LocalModelLayout,
-        admission: &crate::partitioned_execution::PartitionedAdmission<R>,
-        routed: Option<&crate::SelectedRoutedTextRealization>,
-    ) -> Result<Self, ComponentPartitionError> {
-        Self::from_ownership(
-            descriptor,
-            parameters,
-            layout,
-            admission.topology(),
-            admission.ownership(),
-            admission.groups(),
-            admission.publication_owner(),
-            routed,
-        )
-    }
-
     fn from_components(
         descriptor: &ArchitectureDescriptor,
         components: &[ComponentGroup],
@@ -539,8 +520,52 @@ impl ComponentPartitionLayout {
         owned_groups: &[eredu_runtime::PipelineGroupOwnership],
         publication_owner: usize,
         selected_routed: Option<&crate::SelectedRoutedTextRealization>,
+        component: Option<&eredu_runtime::ComponentDefinition>,
     ) -> Result<Self, ComponentPartitionError> {
+        let owns_invocation = |address: eredu_runtime::ExecutionUnitAddress| {
+            let group = parameters.unit_layout().group_id(address.group());
+            owned_groups.iter().any(|owned| {
+                Some(owned.group()) == group && owned.units().contains(&address.index())
+            })
+        };
+        let observation_local = |path: &str| {
+            component
+                .and_then(|definition| definition.observation_invocation(path))
+                .map(&owns_invocation)
+        };
+        // This inspection-only view projects declared references onto canonical
+        // placement; it allocates neither parameter storage nor execution units.
+        let projected_layout;
+        let layout = if let Some(definition) = component {
+            if definition.parameters().invocations() != parameters.invocations() {
+                return Err(ComponentPartitionError::ParameterLayout(
+                    "component invocation authority differs from selected parameters".into(),
+                ));
+            }
+            let mut projected = layout.clone();
+            for (logical, usage) in definition.parameter_uses() {
+                let tensor = layout
+                    .tensor(&usage.target)
+                    .ok_or_else(|| ComponentPartitionError::MissingWeight(usage.target.clone()))?;
+                if projected
+                    .tensor(logical)
+                    .is_some_and(|existing| existing != tensor)
+                {
+                    return Err(ComponentPartitionError::InvalidPlacement(logical.clone()));
+                }
+                projected.insert(logical.clone(), tensor.clone());
+            }
+            projected_layout = projected;
+            &projected_layout
+        } else {
+            layout
+        };
         let owns_parameter_invocation = |parameter: &str| {
+            if let Some(usage) =
+                component.and_then(|definition| definition.parameter_uses().get(parameter))
+            {
+                return Ok(owns_invocation(usage.invocation));
+            }
             let owned = parameters
                 .groups()
                 .iter()
@@ -601,6 +626,22 @@ impl ComponentPartitionLayout {
                 })
                 .collect::<Vec<_>>();
             if points.is_empty() {
+                continue;
+            }
+            if points
+                .iter()
+                .all(|point| observation_local(&point.path).is_some())
+            {
+                for point in points {
+                    replicated_observation(
+                        &mut observations,
+                        descriptor,
+                        &point.path,
+                        "hidden",
+                        observation_local(&point.path).expect("declared observation"),
+                        ObservationHookSite::Unit,
+                    )?;
+                }
                 continue;
             }
             let owner = if node.kind == eredu_core::ArchitectureNodeKind::DecoderBlock {
@@ -700,7 +741,7 @@ impl ComponentPartitionLayout {
                         descriptor,
                         path,
                         "hidden",
-                        local,
+                        observation_local(path).unwrap_or(local),
                         ObservationHookSite::Unit,
                     )?;
                 }
