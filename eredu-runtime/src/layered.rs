@@ -695,7 +695,7 @@ impl<B, C, E> LayeredTraversalHook<B, C, E> for NoopLayeredTraversalHook where B
 
 struct ActivationObserverTraversalHook<'a, O: ?Sized> {
     observer: std::rc::Rc<std::cell::RefCell<&'a mut O>>,
-    units: Vec<BTreeMap<usize, String>>,
+    units: Vec<BTreeMap<usize, crate::UnitObservationBoundaries>>,
     group_inputs: Vec<Option<String>>,
     group_outputs: Vec<Option<String>>,
 }
@@ -721,11 +721,11 @@ impl<'a, O: ?Sized> ActivationObserverTraversalHook<'a, O> {
             for ordinal in layout.group_range(group).expect("declared execution group") {
                 let address = layout.address(ordinal).expect("declared invocation");
                 let index = address.index();
-                if !architecture.observes_unit_boundaries(group, index) {
-                    paths.insert(
-                        index,
-                        architecture.unit_path(group, index).map_err(Architecture)?,
-                    );
+                let boundaries = architecture
+                    .unit_observation_boundaries(group, index)
+                    .map_err(Architecture)?;
+                if !boundaries.is_kernel_owned() {
+                    paths.insert(index, boundaries);
                 }
             }
             units.push(paths);
@@ -790,9 +790,10 @@ where
         let Some(unit) = self.units[group].get(&index) else {
             return Ok(LayeredUnitAction::Execute);
         };
-        let path = eredu_core::UnitObservation::Input.path(unit);
         let mut observer = self.observer.borrow_mut();
-        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        if let Some(input) = unit.observe_input(&mut **observer, value)? {
+            *value = input;
+        }
         Ok(LayeredUnitAction::Execute)
     }
 
@@ -807,9 +808,10 @@ where
         let Some(unit) = self.units[group].get(&index) else {
             return Ok(());
         };
-        let path = eredu_core::UnitObservation::Output.path(unit);
-        let mut observer = self.observer.borrow_mut();
-        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        if let Some(path) = unit.output_path() {
+            let mut observer = self.observer.borrow_mut();
+            *value = observe_and_intervene(&mut **observer, path, value)?;
+        }
         Ok(())
     }
 
@@ -1004,12 +1006,16 @@ where
     /// Returns the stable architecture-owned path of one group-local execution unit.
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error>;
 
-    /// Whether observed unit execution owns both input/output capture and
-    /// intervention, including their effective companions. The traversal omits
-    /// its outer copies of those exact seams. This includes observed provider
-    /// and parallel entry points and preserves in-unit state/capture timing.
-    fn observes_unit_boundaries(&self, _group: usize, _index: usize) -> bool {
-        false
+    /// Exact logical seams around this operation, independent of its execution path.
+    /// Kernel-owned boundaries are emitted inside the observed equation itself.
+    fn unit_observation_boundaries(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<crate::UnitObservationBoundaries, Self::Error> {
+        Ok(crate::UnitObservationBoundaries::around(
+            &self.unit_path(group, index)?,
+        ))
     }
 
     /// Architecture-owned name for the activation selected at group ingress.
@@ -2835,14 +2841,12 @@ where
             state,
             context,
             |architecture, group, index, unit, hidden, state, forward, context, observer| {
-                let owned = architecture.observes_unit_boundaries(group, index);
-                let path = owned
-                    .then(|| architecture.unit_path(group, index))
-                    .transpose()?;
-                let input = path
-                    .as_ref()
-                    .map(|path| observe_and_intervene(observer, &format!("{path}.input"), hidden))
-                    .transpose()?;
+                let boundaries = architecture.unit_observation_boundaries(group, index)?;
+                let input = if boundaries.is_kernel_owned() {
+                    boundaries.observe_input(observer, hidden)?
+                } else {
+                    None
+                };
                 let output = execute(
                     architecture,
                     group,
@@ -2853,11 +2857,12 @@ where
                     forward,
                     context,
                 )?;
-                match path {
-                    Some(path) => {
-                        observe_and_intervene(observer, &format!("{path}.output"), &output)
-                    }
-                    None => Ok(output),
+                if boundaries.is_kernel_owned() {
+                    Ok(boundaries
+                        .observe_output(observer, &output)?
+                        .unwrap_or(output))
+                } else {
+                    Ok(output)
                 }
             },
             observer,
@@ -3718,20 +3723,22 @@ where
             parallel,
             context,
             |architecture, group, index, unit, hidden, state, forward, parallel, context| {
-                let path = architecture.unit_path(group, index)?;
-                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+                let boundaries = architecture.unit_observation_boundaries(group, index)?;
+                let input = boundaries.observe_input(observer, hidden)?;
                 let output = execute(
                     architecture,
                     group,
                     index,
                     unit,
-                    &input,
+                    input.as_ref().unwrap_or(hidden),
                     state,
                     forward,
                     parallel,
                     context,
                 )?;
-                observe_and_intervene(observer, &format!("{path}.output"), &output)
+                Ok(boundaries
+                    .observe_output(observer, &output)?
+                    .unwrap_or(output))
             },
         )
     }

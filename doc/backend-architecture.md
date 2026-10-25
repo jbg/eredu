@@ -3571,6 +3571,16 @@ counts; preserved unowned gaps contain `NoState` and grant no mutable-state auth
 Shared decoder definitions derive these placement rules from their declared unit state
 ranges.
 
+`ComponentDefinition` retains exact input/output observation paths and their execution
+owner for each operation. Either end can be absent, so a logical input and output can
+surround several independently leased operations. Declaration projection rejects empty
+or duplicate seam names. Shared resident, bounded, parallel and partitioned traversal
+uses these retained paths for capture and intervention. Equation-owned seams remain
+inside their equation timing; raw custom executors receive their outer seams from
+the shared driver. Muse text and DeepSeek V4 declare that ownership with their units.
+Observer failures use the ordinary lease abort/completion lifecycle, and absent seams
+leave the current activation borrowed.
+
 Shared decoder partition geometry projects canonical factory owners from the retained
 invocation map. Selected physical configurations are keyed by owner identity, including
 owners outside the local logical range. Each physical owner is localized once; the

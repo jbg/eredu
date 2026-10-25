@@ -608,6 +608,75 @@ impl<'a, T> From<&'a eredu_nn::GroupSelection<T>> for RoutingDecision<'a, T> {
     }
 }
 
+/// Exact logical input/output seams for one execution operation.
+/// Several operations can carry distinct ends of one logical boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitObservationBoundaries {
+    input: Option<String>,
+    output: Option<String>,
+    kernel_owned: bool,
+}
+
+impl UnitObservationBoundaries {
+    /// Declares independently optional input and output capture/intervention paths.
+    pub fn new(input: Option<String>, output: Option<String>) -> Self {
+        Self {
+            input,
+            output,
+            kernel_owned: false,
+        }
+    }
+
+    /// Declares ordinary boundaries around one logical unit path.
+    pub fn around(unit: &str) -> Self {
+        Self::new(
+            Some(eredu_core::UnitObservation::Input.path(unit)),
+            Some(eredu_core::UnitObservation::Output.path(unit)),
+        )
+    }
+
+    /// Places these seams inside the equation's own observation lifecycle.
+    pub fn with_kernel_ownership(mut self) -> Self {
+        self.kernel_owned = true;
+        self
+    }
+
+    /// Whether the equation emits and intervenes at its own boundary seams.
+    pub const fn is_kernel_owned(&self) -> bool {
+        self.kernel_owned
+    }
+    /// Declared input capture/intervention path.
+    pub fn input_path(&self) -> Option<&str> {
+        self.input.as_deref()
+    }
+    /// Declared output capture/intervention path.
+    pub fn output_path(&self) -> Option<&str> {
+        self.output.as_deref()
+    }
+
+    /// Observes the declared input, retaining the original by borrow when absent.
+    pub fn observe_input<T: Clone, E, O: ActivationObserver<T, E> + ?Sized>(
+        &self,
+        observer: &mut O,
+        value: &T,
+    ) -> Result<Option<T>, E> {
+        self.input_path()
+            .map(|path| observe_and_intervene(observer, path, value))
+            .transpose()
+    }
+
+    /// Observes the declared output, retaining the original by borrow when absent.
+    pub fn observe_output<T: Clone, E, O: ActivationObserver<T, E> + ?Sized>(
+        &self,
+        observer: &mut O,
+        value: &T,
+    ) -> Result<Option<T>, E> {
+        self.output_path()
+            .map(|path| observe_and_intervene(observer, path, value))
+            .transpose()
+    }
+}
+
 /// Observes an activation and applies an optional replacement without
 /// materializing its backend-native value.
 pub fn observe_and_intervene<T, E, O>(observer: &mut O, path: &str, value: &T) -> Result<T, E>

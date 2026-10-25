@@ -1757,19 +1757,14 @@ where
                         eredu_nn::Error::backend_source(error)
                     }
                 })?;
-            let path = self
+            let boundaries = self
                 .architecture
-                .unit_path(address.group(), address.index())
+                .unit_observation_boundaries(address.group(), address.index())
                 .map_err(eredu_nn::Error::backend_source)?;
-            let unit_boundaries = self
-                .architecture
-                .observes_unit_boundaries(address.group(), address.index());
-            if !unit_boundaries {
-                hidden = eredu_runtime::observe_and_intervene(
-                    observer,
-                    &format!("{path}.input"),
-                    &hidden,
-                )?;
+            if !boundaries.is_kernel_owned() {
+                if let Some(input) = boundaries.observe_input(observer, &hidden)? {
+                    hidden = input;
+                }
             }
             hidden = self
                 .unit_strategy
@@ -1788,12 +1783,10 @@ where
                     observer,
                 )
                 .map_err(eredu_nn::Error::backend_source)?;
-            if !unit_boundaries {
-                hidden = eredu_runtime::observe_and_intervene(
-                    observer,
-                    &format!("{path}.output"),
-                    &hidden,
-                )?;
+            if !boundaries.is_kernel_owned() {
+                hidden = boundaries
+                    .observe_output(observer, &hidden)?
+                    .unwrap_or(hidden);
             }
             let state_values = if driver.optional_state_layout().is_some() {
                 let global = self.architecture.state_ordinal(

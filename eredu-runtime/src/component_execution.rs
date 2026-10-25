@@ -109,6 +109,7 @@ pub struct ComponentDefinition {
     id: String,
     parameters: ArchitectureParameterDescription,
     units: Vec<ComponentUnit>,
+    unit_observations: Vec<crate::UnitObservationBoundaries>,
     transport: Vec<ArchitectureGroupTransport>,
     primary: String,
     prediction: Vec<String>,
@@ -195,10 +196,15 @@ impl ComponentDefinition {
                 }
             }
         }
+        let unit_observations = units
+            .iter()
+            .map(|unit| crate::UnitObservationBoundaries::around(&unit.path))
+            .collect();
         Ok(Self {
             id,
             parameters,
             units,
+            unit_observations,
             transport,
             primary,
             prediction,
@@ -309,6 +315,65 @@ impl ComponentDefinition {
     pub fn state_partition_plan(&self) -> &ArchitectureStatePartitionPlan {
         &self.state_partition
     }
+    /// Projects exact per-operation seams and ownership before execution selection.
+    /// Boundary names are globally unique within this component.
+    pub fn map_unit_observation_boundaries(
+        mut self,
+        mut project: impl FnMut(
+            ExecutionUnitAddress,
+            &crate::UnitObservationBoundaries,
+        ) -> crate::UnitObservationBoundaries,
+    ) -> Result<Self, ComponentDefinitionError> {
+        let projected = self
+            .unit_observations
+            .iter()
+            .enumerate()
+            .map(|(ordinal, boundaries)| {
+                project(
+                    self.parameters
+                        .unit_layout()
+                        .address(ordinal)
+                        .expect("declared invocation"),
+                    boundaries,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut paths = std::collections::BTreeSet::new();
+        for boundaries in &projected {
+            for path in [boundaries.input_path(), boundaries.output_path()]
+                .into_iter()
+                .flatten()
+            {
+                if path.trim().is_empty() || !paths.insert(path) {
+                    return Err(ComponentDefinitionError::Invalid {
+                        component: self.id.clone(),
+                        resource: format!("observation boundary {path:?}"),
+                    });
+                }
+            }
+        }
+        self.unit_observations = projected;
+        Ok(self)
+    }
+
+    /// Borrows the retained logical boundaries of one exact invocation.
+    pub fn unit_observation_boundaries(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<&crate::UnitObservationBoundaries, ComponentDefinitionError> {
+        let ordinal = self
+            .parameters
+            .unit_layout()
+            .ordinal(group, index)
+            .ok_or_else(|| ComponentDefinitionError::Address {
+                component: self.id.clone(),
+                group,
+                index,
+            })?;
+        Ok(&self.unit_observations[ordinal])
+    }
+
     /// Resolves a logical invocation using the canonical address map.
     pub fn unit(
         &self,
@@ -514,11 +579,6 @@ pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKer
     /// Explicit coverage of ordinary internal equation hooks.
     fn observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
         Default::default()
-    }
-
-    /// Whether unit equations own their input/output observation and intervention seams.
-    fn observes_unit_boundaries(&self, _address: ExecutionUnitAddress) -> bool {
-        false
     }
 
     /// Optional semantic path for the selected group input.
@@ -1247,9 +1307,15 @@ where
         self.kernel.observation_hooks()
     }
 
-    fn observes_unit_boundaries(&self, group: usize, index: usize) -> bool {
-        self.address(group, index)
-            .is_ok_and(|address| self.kernel.observes_unit_boundaries(address))
+    fn unit_observation_boundaries(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<crate::UnitObservationBoundaries, K::Error> {
+        self.definition()
+            .unit_observation_boundaries(group, index)
+            .cloned()
+            .map_err(Into::into)
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {

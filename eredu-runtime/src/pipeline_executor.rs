@@ -1012,21 +1012,16 @@ where
                 communication_executor,
             )?;
             let prepared: Result<_, A::Error> = (|| {
-                let path = architecture.unit_path(address.group(), address.index())?;
-                let unit_boundaries =
-                    architecture.observes_unit_boundaries(address.group(), address.index());
-                let unit_input = if unit_boundaries {
+                let boundaries =
+                    architecture.unit_observation_boundaries(address.group(), address.index())?;
+                let unit_input = if boundaries.is_kernel_owned() {
                     None
                 } else {
-                    Some(crate::observe_and_intervene(
-                        observer,
-                        &format!("{path}.input"),
-                        &forward.hidden,
-                    )?)
+                    boundaries.observe_input(observer, &forward.hidden)?
                 };
-                Ok((path, unit_boundaries, unit_input))
+                Ok((boundaries, unit_input))
             })();
-            let (path, unit_boundaries, unit_input) = agree_pipeline_local(
+            let (boundaries, unit_input) = agree_pipeline_local(
                 communication,
                 local_agreement,
                 3,
@@ -1065,10 +1060,12 @@ where
                         )
                         .map_err(pipeline_backend_source::<A::Error>)?;
                 }
-                forward.hidden = if unit_boundaries {
+                forward.hidden = if boundaries.is_kernel_owned() {
                     unit_output
                 } else {
-                    crate::observe_and_intervene(observer, &format!("{path}.output"), &unit_output)?
+                    boundaries
+                        .observe_output(observer, &unit_output)?
+                        .unwrap_or(unit_output)
                 };
                 let mut state_values = Vec::new();
                 for state_ordinal in architecture.partition_retained_state_ordinals(

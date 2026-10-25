@@ -145,5 +145,19 @@ pub fn component_definition(
         state,
         partition,
     )
+    .and_then(|definition| {
+        let text_group = definition
+            .parameters()
+            .graph()
+            .group_index(definition.primary_group())
+            .expect("validated primary group");
+        definition.map_unit_observation_boundaries(|address, boundaries| {
+            if address.group() == text_group {
+                boundaries.clone().with_kernel_ownership()
+            } else {
+                boundaries.clone()
+            }
+        })
+    })
     .map_err(Error::from)
 }

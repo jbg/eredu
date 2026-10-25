@@ -599,6 +599,209 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
 }
 
 #[test]
+fn component_logical_observation_boundaries_span_independently_leased_operations() {
+    use eredu_runtime::UnitObservationBoundaries;
+    struct Observer {
+        seen: Vec<(String, FakeTensor)>,
+        fail: Option<&'static str>,
+    }
+    impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for Observer {
+        fn observe(&mut self, path: &str, value: &FakeTensor) -> Result<(), Failure> {
+            self.seen.push((path.into(), value.clone()));
+            if self.fail == Some(path) {
+                Err(Failure::Equation)
+            } else {
+                Ok(())
+            }
+        }
+        fn intervene(&mut self, path: &str, _: &FakeTensor) -> Result<Option<FakeTensor>, Failure> {
+            Ok(match path {
+                "logical.input" => Some(FakeTensor(vec![9])),
+                "logical.output" => Some(FakeTensor(vec![99])),
+                _ => None,
+            })
+        }
+    }
+    let split = |kernel_owned| {
+        definition(false)
+            .map_unit_observation_boundaries(|address, _| {
+                let paths = if address.group() == 0 {
+                    UnitObservationBoundaries::new(Some("logical.input".into()), None)
+                } else {
+                    UnitObservationBoundaries::new(None, Some("logical.output".into()))
+                };
+                if kernel_owned {
+                    paths.with_kernel_ownership()
+                } else {
+                    paths
+                }
+            })
+            .unwrap()
+    };
+    assert!(definition(false)
+        .map_unit_observation_boundaries(|_, _| {
+            UnitObservationBoundaries::new(Some("ambiguous".into()), None)
+        })
+        .is_err());
+    assert!(definition(false)
+        .map_unit_observation_boundaries(|_, _| {
+            UnitObservationBoundaries::new(Some(" ".into()), None)
+        })
+        .is_err());
+    let check = |seen: &[(String, FakeTensor)]| {
+        let logical = seen
+            .iter()
+            .filter(|(path, _)| path.starts_with("logical."))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logical,
+            [
+                ("logical.input".into(), FakeTensor(vec![1])),
+                ("logical.output".into(), FakeTensor(vec![9, 0, 10]))
+            ]
+        );
+        assert!(!seen.iter().any(|(path, _)| matches!(
+            path.as_str(),
+            "first.input" | "first.output" | "second.input" | "second.output"
+        )));
+    };
+    let component = |kernel_owned| {
+        ComponentAdapter::new(
+            split(kernel_owned),
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap()
+    };
+    let architecture = component(false);
+    let units = [(0, 0), (1, 0)]
+        .into_iter()
+        .map(|(group, index)| architecture.build_unit(group, index, &()).unwrap())
+        .collect();
+    let mut resident =
+        LayerwiseRuntime::new(architecture, eredu_runtime::ResidentUnitWindow::new(units));
+    let mut state = StatelessComponentState::new().unwrap();
+    let mut observer = Observer {
+        seen: vec![],
+        fail: None,
+    };
+    assert_eq!(
+        resident
+            .forward_with_observer((&FakeTensor(vec![1]), true), &mut state, &(), &mut observer)
+            .unwrap(),
+        FakeTensor(vec![99])
+    );
+    check(&observer.seen);
+    for mode in 0..4 {
+        for kernel_owned in [false, true] {
+            // Raw custom executors borrow their declared seams from the driver;
+            // ordinary observed equations emit kernel-owned seams themselves.
+            if kernel_owned && mode < 2 {
+                continue;
+            }
+            let mut runtime =
+                LayerwiseRuntime::new(component(kernel_owned), RecordingPolicy::bounded(2));
+            let mut observer = Observer {
+                seen: vec![],
+                fail: None,
+            };
+            let input = FakeTensor(vec![1]);
+            let output = match mode {
+                0 => runtime.forward_with_observer((&input, true), &mut state, &(), &mut observer),
+                1 => runtime.forward_parallel_with_observer(
+                    (&input, true),
+                    &mut state,
+                    &(),
+                    &(),
+                    &mut observer,
+                ),
+                2 => runtime.forward_with_unit_executor_and_observer(
+                    (&input, true),
+                    &mut state,
+                    &(),
+                    |a, g, i, u, h, s, f, c| a.forward_unit(g, i, u, h, s, f, c),
+                    &mut observer,
+                ),
+                _ => runtime.forward_parallel_with_unit_executor_and_observer(
+                    (&input, true),
+                    &mut state,
+                    &(),
+                    &(),
+                    |a, g, i, u, h, s, f, p, c| a.forward_unit_parallel(g, i, u, h, s, f, p, c),
+                    &mut observer,
+                ),
+            }
+            .unwrap();
+            assert_eq!(output, FakeTensor(vec![99]));
+            check(&observer.seen);
+            assert!(!runtime.policy().forward_active);
+        }
+    }
+    let mut runtime = LayerwiseRuntime::new(component(false), RecordingPolicy::bounded(2));
+    for path in ["logical.input", "logical.output"] {
+        let mut observer = Observer {
+            seen: vec![],
+            fail: Some(path),
+        };
+        assert!(runtime
+            .forward_with_observer((&FakeTensor(vec![1]), true), &mut state, &(), &mut observer)
+            .is_err());
+        assert!(!runtime.policy().forward_active);
+    }
+    assert_eq!(runtime.policy().aborts, 2);
+    let mut observer = Observer {
+        seen: vec![],
+        fail: None,
+    };
+    assert_eq!(
+        runtime
+            .forward_with_observer((&FakeTensor(vec![1]), true), &mut state, &(), &mut observer)
+            .unwrap(),
+        FakeTensor(vec![99])
+    );
+    check(&observer.seen);
+    let owned = definition(false)
+        .map_unit_observation_boundaries(|address, boundaries| {
+            if address.group() == 0 {
+                UnitObservationBoundaries::new(None, Some("fixture.internal".into()))
+                    .with_kernel_ownership()
+            } else {
+                boundaries.clone()
+            }
+        })
+        .unwrap();
+    let mut runtime = LayerwiseRuntime::new(
+        ComponentAdapter::new(
+            owned,
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap(),
+        RecordingPolicy::bounded(2),
+    );
+    let mut observer = Observer {
+        seen: vec![],
+        fail: None,
+    };
+    runtime
+        .forward_with_observer((&FakeTensor(vec![1]), true), &mut state, &(), &mut observer)
+        .unwrap();
+    assert_eq!(
+        observer
+            .seen
+            .iter()
+            .filter(|(path, _)| path == "fixture.internal")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn component_equation_failure_aborts_the_same_policy_and_allows_retry() {
     let mut runtime = LayerwiseRuntime::new(adapter(true), RecordingPolicy::bounded(2));
     let input = FakeTensor(vec![7]);

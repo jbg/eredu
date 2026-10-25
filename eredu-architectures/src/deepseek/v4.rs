@@ -3156,7 +3156,7 @@ pub fn component_definition(
         None => state_layout(args)?,
     };
     let parameters = super::parallel::v4_parameters(args).map_err(Error::backend_source)?;
-    super::component::definition(
+    let definition = super::component::definition(
         "deepseek_v4",
         parameters,
         state,
@@ -3168,7 +3168,21 @@ pub fn component_definition(
                 format!("mtp.{}", address.group() - 1)
             }
         },
-    )
+    )?;
+    let target_group = definition
+        .parameters()
+        .graph()
+        .group_index(definition.primary_group())
+        .expect("validated primary group");
+    definition
+        .map_unit_observation_boundaries(|address, boundaries| {
+            if address.group() == target_group || args.dspark.is_none() {
+                boundaries.clone().with_kernel_ownership()
+            } else {
+                boundaries.clone()
+            }
+        })
+        .map_err(Error::from)
 }
 
 impl<B> ComponentKernel<B> for V4Kernel<B>
@@ -3305,9 +3319,6 @@ where
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         let complete = self.args.dspark.is_none();
         eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
-    }
-    fn observes_unit_boundaries(&self, address: ExecutionUnitAddress) -> bool {
-        address.group() == 0 || self.args.dspark.is_none()
     }
     fn begin<'a>(
         &mut self,

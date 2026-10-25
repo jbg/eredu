@@ -1847,9 +1847,6 @@ where
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
     }
-    fn observes_unit_boundaries(&self, address: eredu_runtime::ExecutionUnitAddress) -> bool {
-        address.group() == 1
-    }
     fn execute_observed<O>(
         &mut self,
         address: eredu_runtime::ExecutionUnitAddress,

@@ -314,7 +314,7 @@ pub use input::{
 pub use inspection::{
     observe_and_intervene, observe_model_logits, ActivationObserver, BorrowedActivationObserver,
     NoopObserver, RoutingDecision, RoutingObservation, TargetStateCapture, TargetStateCaptureError,
-    TargetStateTap,
+    TargetStateTap, UnitObservationBoundaries,
 };
 pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
