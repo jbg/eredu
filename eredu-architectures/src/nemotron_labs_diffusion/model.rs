@@ -804,9 +804,15 @@ impl<B: NeuralBackend> TextKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextModel<B>, Error> {
         let definition = std::sync::Arc::new(super::definition::text(&config, None)?);
-        let base = decoder::CompleteDecoderKernel::new(config, context)?
-            .into_parts()
-            .1;
+        let base_definition = std::sync::Arc::new(decoder::component_definition(
+            &config,
+            decoder::dense_parameter_description(&config).map_err(Error::backend_source)?,
+            decoder::state_layout(&config)?,
+        )?);
+        let base =
+            decoder::CompleteDecoderKernel::from_definition(config, base_definition, context)?
+                .into_parts()
+                .1;
         let kernel = Self {
             definition: definition.clone(),
             base,
@@ -823,9 +829,19 @@ impl<B: NeuralBackend> TextKernel<B> {
         B: eredu_nn::DistributedNeuralBackend,
     {
         let definition = std::sync::Arc::new(super::definition::text(&config, Some(&geometry))?);
-        let base = decoder::CompleteDecoderKernel::new_parallel(config, geometry, context)?
-            .into_parts()
-            .1;
+        let base_definition = std::sync::Arc::new(decoder::component_definition(
+            &config,
+            decoder::dense_parameter_description(&config).map_err(Error::backend_source)?,
+            geometry.state_layout().clone(),
+        )?);
+        let base = decoder::CompleteDecoderKernel::from_parallel_definition(
+            config,
+            base_definition,
+            geometry,
+            context,
+        )?
+        .into_parts()
+        .1;
         let kernel = Self {
             definition: definition.clone(),
             base,

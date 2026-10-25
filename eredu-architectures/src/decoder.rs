@@ -5079,7 +5079,7 @@ impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
 
 /// Shared runtime adapter for a complete decoder and its typed resource aggregate.
 pub type LayeredModel<B, C, P = DenseBlockFactory> = eredu_runtime::ComponentAdapter<
-    eredu_runtime::ComponentDefinition,
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
     CompleteDecoderKernel<B, C, P>,
     eredu_runtime::KernelParameterModules,
 >;
@@ -5438,12 +5438,31 @@ pub type PartitionedLayeredModel<B, C, P = DenseBlockFactory> = eredu_runtime::C
     eredu_runtime::KernelParameterModules,
 >;
 
-pub(crate) fn decoder_component_definition<C: Config>(
+/// Declares decoder operations and resource ownership without native allocation.
+pub fn component_definition<C: Config>(
     args: &C,
     parameters: ArchitectureParameterDescription,
     state: StateLayout,
 ) -> Result<eredu_runtime::ComponentDefinition, Error> {
     let schedule = DecoderSchedule::new(args)?;
+    if parameters.graph().groups().len() != 1
+        || parameters.graph().groups()[0].id() != TEXT_DECODER_EXECUTION_GROUP
+        || parameters.unit_layout().len() != schedule.len()
+        || (0..schedule.len()).any(|index| {
+            parameters
+                .unit_layout()
+                .address(index)
+                .is_none_or(|address| address.index() != index)
+        })
+        || state.len() != args.num_hidden_layers() as usize
+    {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: "text_decoder".into(),
+            resource: "configured operation or cache identities".into(),
+        }
+        .into());
+    }
+
     let units = (0..parameters.unit_layout().len())
         .map(|ordinal| {
             parameters
@@ -5464,6 +5483,32 @@ pub(crate) fn decoder_component_definition<C: Config>(
             },
         })
         .collect::<Vec<_>>();
+    let parameter_uses = parameter_uses(args, &schedule, &parameters)?;
+    let partition = schedule.state_partition_plan(parameters.unit_layout());
+    eredu_runtime::ComponentDefinition::new(
+        "text_decoder",
+        parameters,
+        units,
+        vec![crate::transport::decoder()],
+        TEXT_DECODER_EXECUTION_GROUP,
+        vec![],
+        state,
+        partition,
+    )
+    .and_then(|definition| definition.with_parameter_uses(parameter_uses))
+    .and_then(|definition| {
+        definition.map_unit_observation_boundaries(|address, _| {
+            schedule.boundaries(args, address.index())
+        })
+    })
+    .map_err(Error::from)
+}
+
+fn parameter_uses<C: Config>(
+    args: &C,
+    schedule: &DecoderSchedule,
+    parameters: &ArchitectureParameterDescription,
+) -> Result<Vec<(String, eredu_runtime::ComponentParameterUse)>, Error> {
     let mut parameter_uses = Vec::new();
     for owned in parameters.groups() {
         let ParameterGroupOwner::ExecutionUnit {
@@ -5511,24 +5556,25 @@ pub(crate) fn decoder_component_definition<C: Config>(
             }
         }
     }
-    let partition = schedule.state_partition_plan(parameters.unit_layout());
-    eredu_runtime::ComponentDefinition::new(
-        "text_decoder",
-        parameters,
-        units,
-        vec![crate::transport::decoder()],
-        TEXT_DECODER_EXECUTION_GROUP,
-        vec![],
-        state,
-        partition,
-    )
-    .and_then(|definition| definition.with_parameter_uses(parameter_uses))
-    .and_then(|definition| {
-        definition.map_unit_observation_boundaries(|address, _| {
-            schedule.boundaries(args, address.index())
-        })
-    })
-    .map_err(Error::from)
+    Ok(parameter_uses)
+}
+
+/// Retains semantic ownership while selecting exact family-authored physical formats.
+pub fn project_parameters<C: Config>(
+    args: &C,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    parameters: ArchitectureParameterDescription,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = parameter_uses(args, &DecoderSchedule::new(args)?, &parameters)?;
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
 }
 
 /// Typed decoder equations over exact admitted pipeline geometry.
@@ -5710,7 +5756,7 @@ where
             }
         }
         let geometry = partition.local_geometry().clone();
-        let definition = decoder_component_definition(
+        let definition = component_definition(
             &args,
             parameters.clone(),
             geometry.complete_state_layout.clone(),
@@ -6896,15 +6942,56 @@ where
     }
 }
 
+fn validate_complete_definition<C: Config>(
+    args: &C,
+    definition: &eredu_runtime::ComponentDefinition,
+    state: &StateLayout,
+) -> Result<(), Error> {
+    let schedule = DecoderSchedule::new(args)?;
+    if definition.id() != "text_decoder"
+        || definition.parameters().graph().groups().len() != 1
+        || definition.primary_group() != TEXT_DECODER_EXECUTION_GROUP
+        || definition.unit_count(0)? != schedule.len()
+        || definition.state_layout() != state
+    {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "decoder construction geometry".into(),
+        }
+        .into());
+    }
+    for index in 0..schedule.len() {
+        let unit = definition.unit(0, index)?;
+        let slots = match schedule.operation(index)? {
+            DecoderOperation::Body { layer } => layer..layer + 1,
+            DecoderOperation::Terminal { .. } => 0..0,
+        };
+        if unit.path != schedule.path(args, index)?
+            || unit.state != slots
+            || definition
+                .unit_observation_boundaries(0, index)?
+                .is_kernel_owned()
+        {
+            return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+                component: definition.id().into(),
+                resource: format!("decoder operation {index} equation geometry"),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
 impl<B, C, P> CompleteDecoderKernel<B, C, P>
 where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
 {
-    /// Builds unloaded pinned modules from normalized architecture arguments.
-    pub fn new(
+    /// Materializes pinned resources from an already validated semantic definition.
+    pub fn from_definition(
         args: C,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B, C, P>, Error> {
         args.validate_config()?;
@@ -6913,11 +7000,7 @@ where
             "shared decoder equations",
             operator_requirements(&args),
         )?;
-        let definition = decoder_component_definition(
-            &args,
-            P::parameter_description(&args).map_err(Error::backend)?,
-            state_layout(&args)?,
-        )?;
+        validate_complete_definition(&args, &definition, &state_layout(&args)?)?;
         let static_modules = StaticModules::new(&args, context)?;
         let geometry = CompleteDecoderGeometry {
             parallel: None,
@@ -6935,9 +7018,10 @@ where
             .map_err(Error::from)
     }
 
-    /// Builds the same model lifecycle with planner-derived rank-local modules.
-    pub fn new_parallel(
+    /// Materializes the retained declaration with planner-derived rank-local geometry.
+    pub fn from_parallel_definition(
         args: C,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry<C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B, C, P>, Error>
@@ -6951,11 +7035,17 @@ where
             operator_requirements(&args),
         )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
-        let definition = decoder_component_definition(
-            &args,
-            P::parameter_description(&args).map_err(Error::backend)?,
-            geometry.state_layout().clone(),
-        )?;
+        let definition = if definition.state_layout() == geometry.state_layout() {
+            definition
+        } else {
+            std::sync::Arc::new(
+                definition
+                    .as_ref()
+                    .clone()
+                    .with_state_layout(geometry.state_layout().clone())?,
+            )
+        };
+        validate_complete_definition(&args, &definition, geometry.state_layout())?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         let geometry = CompleteDecoderGeometry {
             parallel: Some(std::sync::Arc::new(geometry)),

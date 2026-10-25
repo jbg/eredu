@@ -1334,6 +1334,13 @@ impl ReplicatedTextRequirements {
         self.component.as_deref()
     }
 
+    /// Shares the retained immutable declaration with resource construction.
+    pub fn shared_component_definition(
+        &self,
+    ) -> Option<std::sync::Arc<crate::ComponentDefinition>> {
+        self.component.clone()
+    }
+
     /// Retains explicit state placement for decoder and non-decoder groups.
     pub fn with_state_partition_plan(
         mut self,

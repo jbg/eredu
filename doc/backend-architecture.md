@@ -746,8 +746,8 @@ parameter topology without constructing native blocks. Graph, unit paths, state
 partition rules and parameter discovery project that retained definition.
 
 `LayeredModel` and `PartitionedLayeredModel` are `ComponentAdapter` specializations
-over the same `DecoderKernel`. `CompleteDecoderKernel::new` and `new_parallel`
-construct complete adapters; `DecoderKernel::from_partition` constructs exact
+over the same `DecoderKernel`. `CompleteDecoderKernel::from_definition` and
+`from_parallel_definition` materialize retained complete declarations; `DecoderKernel::from_partition` constructs exact
 selected ownership. `CompleteDecoderGeometry` and `PartitionLocalGeometry` supply
 the geometry used by the shared equations. Complete geometry preserves replicated
 state admission, explicit TP admission, chunked text prefill and final-position
@@ -12738,3 +12738,26 @@ validation consume this same rule for ordinary attention, compressed attention,
 fixed state and append streams. Incompatible combinations return typed contract
 errors. This classification grants no native execution or state-storage capability;
 selection still requires the exact backend mechanism facts.
+
+Shared decoder materialization accepts an `Arc<ComponentDefinition>` retained by
+cold requirements. Unchanged executable formats reuse that allocation. Source
+modules for an admitted transformation share the source declaration; selected
+modules project only the family-authored physical parameter description and exact
+logical uses. The runtime rejects changed graph, invocation/storage mapping,
+primary targets, primary ownership or companion owners. State slots, lifetimes,
+operation paths and observation seams remain retained semantic facts.
+
+`decoder::component_definition` declares low-level decoder resources without a
+native context. Complete materializers validate equation geometry and external-hook
+ownership before allocating pinned modules. Parallel construction projects local
+state geometry while retaining resource references. Ordinary and routed K2, Qwen and GPT-OSS preparation use this
+boundary through the same adapter. Parameter conversion and exact source binding
+remain in the ordinary preparation and residency lifecycle. Complete construction
+requires an explicit declaration; GPT-OSS uses the shared materialization boundary
+directly.
+
+One typed source/selected decoder materializer serves ordinary and routed
+preparation. The ordinary visitor handoff also shares construction and contract
+assembly; families provide selected configuration, precision policy, capability
+estimates and cache identity. These steps use the existing preparation driver and
+completion lifecycle.

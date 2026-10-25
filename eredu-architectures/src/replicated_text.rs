@@ -911,200 +911,112 @@ where
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
+    visitor.construction_started();
     match eligible {
         EligibleConfig::Gemma2(args) => {
-            visitor.construction_started();
             let capability_estimate = crate::capability::gemma2(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = "gemma2".to_owned();
-            let source_architecture = selected_uses_transform(&selected)
-                .then(|| {
-                    crate::decoder::CompleteDecoderKernel::<B, crate::gemma2::ModelArgs>::new(
-                        args.clone(),
-                        context,
-                    )
-                })
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_gemma2_args(args, &selected)
+            let selected_args = selected_gemma2_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
-                crate::gemma2::prompt_cache_architecture_fingerprint(&args);
-            let architecture =
-                crate::decoder::CompleteDecoderKernel::<B, crate::gemma2::ModelArgs>::new(
-                    args, context,
-                )
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let prepared = prepare_architecture_handoff::<B, S, _>(
-                architecture,
-                source_architecture,
+                crate::gemma2::prompt_cache_architecture_fingerprint(&selected_args);
+            visit_prepared_decoder::<B, S, _, crate::decoder::DenseBlockFactory, _>(
+                args,
+                selected_args,
                 requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
+                visitor,
+                store,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Llama(args) => {
-            visitor.construction_started();
             let capability_estimate = crate::capability::llama(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected_uses_transform(&selected)
-                .then(|| {
-                    crate::decoder::CompleteDecoderKernel::<B, crate::llama::ModelArgs>::new(
-                        args.clone(),
-                        context,
-                    )
-                })
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_llama_args(args, &selected)
+            let selected_args = selected_llama_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
-                crate::llama::prompt_cache_architecture_fingerprint(&args);
-            let architecture =
-                crate::decoder::CompleteDecoderKernel::<B, crate::llama::ModelArgs>::new(
-                    args, context,
-                )
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let prepared = prepare_architecture_handoff::<B, S, _>(
-                architecture,
-                source_architecture,
+                crate::llama::prompt_cache_architecture_fingerprint(&selected_args);
+            visit_prepared_decoder::<B, S, _, crate::decoder::DenseBlockFactory, _>(
+                args,
+                selected_args,
                 requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
+                visitor,
+                store,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Nanbeige(args) => {
-            visitor.construction_started();
             let capability_estimate = crate::capability::nanbeige(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = "nanbeige".to_owned();
-            let source_architecture = selected_uses_transform(&selected)
-                .then(|| {
-                    crate::decoder::CompleteDecoderKernel::<B, crate::nanbeige::ModelArgs>::new(
-                        args.clone(),
-                        context,
-                    )
-                })
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_nanbeige_args(args, &selected)
+            let selected_args = selected_nanbeige_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
-                crate::nanbeige::prompt_cache_architecture_fingerprint(&args);
-            let architecture =
-                crate::decoder::CompleteDecoderKernel::<B, crate::nanbeige::ModelArgs>::new(
-                    args, context,
-                )
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let prepared = prepare_architecture_handoff::<B, S, _>(
-                architecture,
-                source_architecture,
+                crate::nanbeige::prompt_cache_architecture_fingerprint(&selected_args);
+            visit_prepared_decoder::<B, S, _, crate::decoder::DenseBlockFactory, _>(
+                args,
+                selected_args,
                 requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
+                visitor,
+                store,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::K2Horizon(args) => {
-            visitor.construction_started();
             let capability_estimate = crate::capability::k2_horizon(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected_uses_transform(&selected)
-                .then(|| {
-                    crate::decoder::CompleteDecoderKernel::<
-                        B,
-                        crate::k2_horizon::ModelArgs,
-                        crate::k2_horizon::DenseBlockFactory,
-                    >::new(args.clone(), context)
-                })
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_k2_horizon_args(args, &selected)
+            let selected_args = selected_k2_horizon_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
-                crate::k2_horizon::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::decoder::CompleteDecoderKernel::<
-                B,
-                crate::k2_horizon::ModelArgs,
-                crate::k2_horizon::DenseBlockFactory,
-            >::new(args, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let prepared = prepare_architecture_handoff::<B, S, _>(
-                architecture,
-                source_architecture,
+                crate::k2_horizon::prompt_cache_architecture_fingerprint(&selected_args);
+            visit_prepared_decoder::<B, S, _, crate::k2_horizon::DenseBlockFactory, _>(
+                args,
+                selected_args,
                 requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
+                visitor,
+                store,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Qwen(args) => {
-            visitor.construction_started();
             let capability_estimate = crate::capability::qwen(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected_uses_transform(&selected)
-                .then(|| {
-                    crate::decoder::CompleteDecoderKernel::<
-                        B,
-                        crate::qwen::ModelArgs,
-                        crate::qwen::QwenBlockFactory,
-                    >::new(args.clone(), context)
-                })
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_qwen_args(args, &selected)
+            let selected_args = selected_qwen_args(args, &selected)
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
             let prompt_cache_architecture_identity =
-                crate::qwen::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::decoder::CompleteDecoderKernel::<
-                B,
-                crate::qwen::ModelArgs,
-                crate::qwen::QwenBlockFactory,
-            >::new(args, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let prepared = prepare_architecture_handoff::<B, S, _>(
-                architecture,
-                source_architecture,
+                crate::qwen::prompt_cache_architecture_fingerprint(&selected_args);
+            visit_prepared_decoder::<B, S, _, crate::qwen::QwenBlockFactory, _>(
+                args,
+                selected_args,
                 requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
+                visitor,
+                store,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Lfm2(_)
         | EligibleConfig::KimiLinear(_)
@@ -1123,6 +1035,116 @@ where
             unreachable!("ordinary replicated eligibility returned heterogeneous state")
         }
     }
+}
+
+fn visit_prepared_decoder<B, S, C, P, V>(
+    source_args: &C,
+    args: C,
+    requirements: ReplicatedTextRequirements,
+    selected: SelectedReplicatedTextRealization,
+    capability: crate::capability::CapabilityEstimate,
+    model_type: String,
+    identity: String,
+    context: &<B::Tensor as Tensor>::Context,
+    visitor: V,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: NeuralBackend,
+    C: crate::decoder::Config + Clone,
+    P: crate::decoder::BlockFactory<B, C>,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+    V: ReplicatedTextArchitectureVisitor<B, S>,
+{
+    let (architecture, source) =
+        materialize_decoder::<B, C, P>(source_args, args, &selected, context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let prepared = prepare_architecture_handoff::<B, S, _>(
+        architecture,
+        source,
+        requirements,
+        selected,
+        capability,
+        model_type,
+        identity,
+        context,
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    visitor
+        .visit(prepared, store)
+        .map_err(ReplicatedTextDispatchError::Backend)
+}
+
+/// Materializes the selected resource pair from retained declarations through one typed boundary.
+pub(crate) fn materialize_decoder<B, C, P>(
+    source_args: &C,
+    args: C,
+    selected: &SelectedReplicatedTextRealization,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<
+    (
+        crate::decoder::LayeredModel<B, C, P>,
+        Option<crate::decoder::LayeredModel<B, C, P>>,
+    ),
+    eredu_nn::Error,
+>
+where
+    B: NeuralBackend,
+    C: crate::decoder::Config + Clone,
+    P: crate::decoder::BlockFactory<B, C>,
+{
+    let retained = selected
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| eredu_nn::Error::backend("decoder selection has no retained definition"))?;
+    let source = selected_uses_transform(selected)
+        .then(|| {
+            crate::decoder::CompleteDecoderKernel::<B, C, P>::from_definition(
+                source_args.clone(),
+                retained,
+                context,
+            )
+        })
+        .transpose()?;
+    let definition = selected_decoder_definition::<B, C, P>(&args, selected)?;
+    let architecture = crate::decoder::CompleteDecoderKernel::<B, C, P>::from_definition(
+        args, definition, context,
+    )?;
+    Ok((architecture, source))
+}
+
+fn selected_decoder_definition<B, C, P>(
+    args: &C,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error>
+where
+    B: NeuralBackend,
+    C: crate::decoder::Config,
+    P: crate::decoder::BlockFactory<B, C>,
+{
+    let retained = selected
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| eredu_nn::Error::backend("decoder selection has no retained definition"))?;
+    let original = selected
+        .requirements()
+        .parameters()
+        .iter()
+        .map(|parameter| (parameter.name(), parameter.native_executable()))
+        .collect::<HashMap<_, _>>();
+    let changed = selected
+        .parameters()
+        .iter()
+        .any(|parameter| original.get(parameter.name()).copied() != Some(parameter.executable()));
+    if !changed {
+        return Ok(retained);
+    }
+    crate::decoder::project_parameters(
+        args,
+        &retained,
+        P::parameter_description(args).map_err(eredu_nn::Error::backend_source)?,
+    )
 }
 
 pub(crate) fn selected_uses_transform(selected: &SelectedReplicatedTextRealization) -> bool {
@@ -3240,7 +3262,7 @@ impl EligibleConfig<'_> {
                 eredu_runtime::ParallelPlanError,
             >,
         ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
-            crate::decoder::decoder_component_definition(
+            crate::decoder::component_definition(
                 args,
                 parameters.map_err(eredu_nn::Error::backend_source)?,
                 crate::decoder::state_layout(args)?,

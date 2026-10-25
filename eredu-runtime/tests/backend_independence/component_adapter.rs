@@ -321,7 +321,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         eredu_runtime::ParameterRole::Replicated,
         [eredu_runtime::ParameterMemberSpec::new(
             "shared.weight",
-            [1],
+            [1, 64],
             eredu_runtime::MemberSharding::Replicated,
         )],
     )
@@ -386,7 +386,164 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         .clone()
         .with_parameter_uses([uses[0].clone(), uses[0].clone()])
         .is_err());
-    let shared_definition = shared_definition.with_parameter_uses(uses).unwrap();
+    let shared_definition = shared_definition
+        .with_parameter_uses(uses)
+        .unwrap()
+        .map_unit_observation_boundaries(|address, original| {
+            if address.group() != 1 {
+                return original.clone();
+            }
+            if address.index() == 0 {
+                eredu_runtime::UnitObservationBoundaries::new(Some("shared.input".into()), None)
+            } else {
+                eredu_runtime::UnitObservationBoundaries::new(None, Some("shared.output".into()))
+            }
+        })
+        .unwrap();
+    let source_group = shared_definition.parameters().groups()[0].clone();
+    let selected_group = eredu_runtime::expand_linear_format_parameter_groups(
+        vec![source_group.group().clone()],
+        |_| {
+            Ok(Some(
+                eredu_nn::LinearFormatSpec::scaled(
+                    eredu_checkpoint::LinearFormat::MxFp4,
+                    eredu_nn::ParameterSpec::trainable("shared.scale").unwrap(),
+                )
+                .unwrap(),
+            ))
+        },
+    )
+    .unwrap()
+    .remove(0);
+    let projected_parameters = ArchitectureParameterDescription::new(
+        graph,
+        &shared_layout,
+        [selected_group.clone()],
+        [eredu_runtime::OwnedParameterGroupSpec::new(
+            source_group.owner().clone(),
+            selected_group,
+        )],
+    )
+    .unwrap();
+    let projected_uses = [0, 1]
+        .into_iter()
+        .flat_map(|index| {
+            let invocation = shared_layout
+                .address(shared_layout.ordinal(1, index).unwrap())
+                .unwrap();
+            ["weight", "scale"].map(move |suffix| {
+                (
+                    format!("second.{index}.{suffix}"),
+                    eredu_runtime::ComponentParameterUse {
+                        invocation,
+                        target: format!("shared.{suffix}"),
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let renamed = eredu_runtime::ParameterGroupSpec::new(
+        "shared",
+        eredu_runtime::ParameterRole::Replicated,
+        [eredu_runtime::ParameterMemberSpec::new(
+            "neighbor.weight",
+            [1, 64],
+            eredu_runtime::MemberSharding::Replicated,
+        )],
+    )
+    .unwrap();
+    let renamed = ArchitectureParameterDescription::new(
+        graph,
+        &shared_layout,
+        [renamed.clone()],
+        [eredu_runtime::OwnedParameterGroupSpec::new(
+            source_group.owner().clone(),
+            renamed,
+        )],
+    )
+    .unwrap();
+    assert!(shared_definition
+        .clone()
+        .with_parameters(renamed, projected_uses.clone())
+        .is_err());
+    let packed = projected_parameters.groups()[0].group();
+    let detached = [
+        eredu_runtime::OwnedParameterGroupSpec::new(
+            source_group.owner().clone(),
+            eredu_runtime::ParameterGroupSpec::new(
+                "shared",
+                packed.role(),
+                packed
+                    .members()
+                    .iter()
+                    .filter(|member| member.linear_companion().is_none())
+                    .cloned(),
+            )
+            .unwrap(),
+        ),
+        eredu_runtime::OwnedParameterGroupSpec::new(
+            eredu_runtime::ParameterGroupOwner::static_role("detached"),
+            eredu_runtime::ParameterGroupSpec::new(
+                "detached",
+                packed.role(),
+                packed
+                    .members()
+                    .iter()
+                    .filter(|member| member.linear_companion().is_some())
+                    .cloned(),
+            )
+            .unwrap(),
+        ),
+    ];
+    let detached = ArchitectureParameterDescription::new(
+        graph,
+        &shared_layout,
+        detached.iter().map(|group| group.group().clone()),
+        detached.clone(),
+    )
+    .unwrap();
+    assert!(shared_definition
+        .clone()
+        .with_parameters(detached, projected_uses.clone())
+        .is_err());
+    let shared_definition = shared_definition
+        .with_parameters(projected_parameters, projected_uses)
+        .unwrap();
+    struct SharedObservation(Vec<String>);
+    impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for SharedObservation {
+        fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Failure> {
+            self.0.push(path.into());
+            Ok(())
+        }
+    }
+    let mut observed = LayerwiseRuntime::new(
+        ComponentAdapter::new(
+            shared_definition.clone(),
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap(),
+        RecordingPolicy::bounded(shared_layout.len()),
+    );
+    let mut observer = SharedObservation(vec![]);
+    assert_eq!(
+        observed
+            .forward_with_observer((&input, true), &mut state, &(), &mut observer)
+            .unwrap()
+            .0,
+        [7, 0, 11, 11]
+    );
+    assert_eq!(
+        observer
+            .0
+            .iter()
+            .filter(|path| path.starts_with("shared."))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["shared.input", "shared.output"]
+    );
     let mut shared = ResidentRuntime::new(
         ComponentAdapter::new(
             shared_definition,

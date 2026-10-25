@@ -273,6 +273,59 @@ impl ComponentDefinition {
         selected.parameter_uses = self.parameter_uses;
         Ok(selected)
     }
+    /// Projects selected physical parameter geometry while retaining semantic identities.
+    /// Families supply exact replacement uses, including changed encoding companions.
+    pub fn with_parameters(
+        mut self,
+        parameters: ArchitectureParameterDescription,
+        uses: impl IntoIterator<Item = (String, ComponentParameterUse)>,
+    ) -> Result<Self, ComponentDefinitionError> {
+        let invalid = |resource: &str| ComponentDefinitionError::Invalid {
+            component: self.id.clone(),
+            resource: resource.into(),
+        };
+        if parameters.graph() != self.parameters.graph()
+            || parameters.unit_layout() != self.parameters.unit_layout()
+            || parameters.invocations() != self.parameters.invocations()
+        {
+            return Err(invalid("selected parameter invocation or storage identity"));
+        }
+        let primaries = |description: &ArchitectureParameterDescription| {
+            description
+                .groups()
+                .iter()
+                .flat_map(|group| {
+                    group
+                        .members()
+                        .iter()
+                        .filter(|member| member.linear_companion().is_none())
+                        .map(move |member| (member.target().to_owned(), group.owner().clone()))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let original = primaries(&self.parameters);
+        let selected = primaries(&parameters);
+        if original != selected {
+            return Err(invalid("selected primary parameter ownership"));
+        }
+        for group in parameters.groups() {
+            for member in group.members() {
+                match (member.linear_companion(), member.linear_companion_of()) {
+                    (Some(_), Some(primary)) if selected.get(primary) == Some(group.owner()) => {}
+                    (None, None) => {}
+                    _ => {
+                        return Err(invalid(&format!(
+                            "selected companion {} has no matching primary owner",
+                            member.target()
+                        )))
+                    }
+                }
+            }
+        }
+        self.parameters = parameters;
+        self.with_parameter_uses(uses)
+    }
+
     /// Retains architecture-authored logical references after validating their consumers.
     pub fn with_parameter_uses(
         mut self,
