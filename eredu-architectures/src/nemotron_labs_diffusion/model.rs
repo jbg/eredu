@@ -240,7 +240,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextLayer<B>, Error> {
-        let base = self.base.construct_unit(index, context)?;
+        let base = self.base.construct_block(index, context)?;
         let draft_adapter = self
             .config()
             .draft_adapter()

@@ -9364,7 +9364,9 @@ to the shared `ComponentAdapter`; addressing, graph and parameter descriptions,
 pinned-role traversal, text projection and completion contracts use that adapter.
 Typed profiles adapt attention-only, fixed-only, mixed, compressed and stateless
 cache views without requiring unrelated backend state capabilities. Each invocation
-keeps its own declared layer state and independent residency unit. The shared
+keeps its own declared layer state. Explicit parameter sharing selects the same
+independently leased canonical resource for each consumer; state sharing is a
+separate declaration. The shared
 decoder resource aggregate owns embedding and tied or untied readout. Its public
 instrumented serial/parallel finalization and `final_hidden_position` helper also
 preserve low-level readout operations independently of a complete model. Readout
@@ -12672,3 +12674,20 @@ Observation coverage remains specific to the invoked operation. Selected typed
 partition readout emits internal readout hooks; its ordinary low-level parallel
 readout leaves the observer unused. Complete ordinary parallel readout emits those
 hooks. Composite observed ingress retains its explicit image-embedding seam.
+
+Shared dense decoder execution retains a `DecoderSchedule` of body and stateless
+terminal operations. Canonical body owners are independent of logical cache
+slots; between-pass normalization has its own resource and lease. Nanbeige
+consumers reuse each physical body across all passes and reuse one between-pass
+normalization resource. Final readout normalization remains a separately
+accounted pinned replica. Resident and bounded construction use the same
+`DecoderUnit` variants and body equations.
+
+Decoder parameter descriptions, cold operation counts, state partition rules,
+construction geometry and observation boundaries project that schedule. A
+normalization-only partition has no cache state. Body operations retain their
+logical layer's cache and internal observation paths; the following terminal
+owns that layer's final output seam. Whole-block low-level construction remains
+available through `construct_block`, using the same body and normalization
+constructors. Ordinary, parallel, routed and observed operation dispatch uses
+the shared adapter and never constructs a temporary whole block.

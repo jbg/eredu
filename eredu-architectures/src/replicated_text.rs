@@ -3281,7 +3281,11 @@ impl EligibleConfig<'_> {
     fn unit_count(&self) -> Result<usize, String> {
         let count = match self {
             Self::NemotronLabsDiffusion(args) => args.num_hidden_layers(),
-            Self::Nanbeige(args) => args.state_layer_count() as i32,
+            Self::Nanbeige(args) => {
+                return crate::decoder::DecoderSchedule::new(*args)
+                    .map(|schedule| schedule.len())
+                    .map_err(|error| error.to_string())
+            }
             Self::Gemma2(args) => args.dense_config().num_hidden_layers,
             Self::Llama(args) => args.num_hidden_layers,
             Self::K2Horizon(args) => args.num_hidden_layers,
@@ -4607,6 +4611,13 @@ fn replicated_text_requirements_for_structure(
     let floating_source = crate::preparation::prepared_floating_state_dtype_source(inspection)
         .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
     let state_partition_plan = match &config {
+        EligibleConfig::Nanbeige(args) => Some(
+            crate::decoder::DecoderSchedule::new(*args)
+                .map_err(|error| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                })?
+                .state_partition_plan(&execution_units),
+        ),
         EligibleConfig::Muse(args) => Some(crate::muse::model::state_partition_plan(
             args,
             &state_layout,
@@ -5756,6 +5767,23 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
                 unit,
             })
     };
+    if let EligibleConfig::Nanbeige(args) = config {
+        if let Some((layer, suffix)) = name
+            .strip_prefix("model.layers.")
+            .and_then(|rest| rest.split_once('.'))
+        {
+            if let Ok(layer) = layer.parse::<usize>() {
+                let schedule =
+                    crate::decoder::DecoderSchedule::new(*args).expect("admitted decoder schedule");
+                let operation = schedule.body_operation(layer)
+                    + usize::from(suffix.starts_with("output_norm."));
+                return ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: crate::decoder::TEXT_DECODER_EXECUTION_GROUP.into(),
+                    unit: schedule.owner(operation),
+                };
+            }
+        }
+    }
     if matches!(config, EligibleConfig::NemotronLabsDiffusion(_)) {
         if let Some(owner) = execution_unit(
             "draft_adapter.layers.",

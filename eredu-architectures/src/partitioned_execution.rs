@@ -6565,8 +6565,7 @@ where
     let parameters =
         crate::decoder::dense_parameter_description(args).map_err(|error| error.to_string())?;
     let layout = derive_partitioned_local_layout(&parameters, rank)?;
-    let count = usize::try_from(args.num_hidden_layers())
-        .map_err(|_| "dense-decoder layer count exceeds usize".to_owned())?;
+    let count = parameters.unit_layout().len();
     crate::decoder::partition_local_geometry(args, parameters.invocations(), &layout, 0..count)
         .map(|geometry| geometry.complete_state_layout().clone())
         .map_err(|error| error.to_string())

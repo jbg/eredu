@@ -564,9 +564,11 @@ The family uses the standard dense execution paths: fully resident, per-block
 host offloading, disk streaming, tensor parallelism, pipeline parallelism and
 combined TP/PP, with selected weight transformations and logical-layer captures.
 Publisher-layout GGUF checkpoints preserve their native encodings and Q/K row
-ordering. Each logical invocation owns a separately materialized block, so
-resident memory includes those replicas; checkpoint storage remains physical.
-Bounded residency can admit one logical block at a time.
+ordering. Logical invocations reuse canonical physical bodies while retaining
+independent KV caches. Between-pass normalization is a separate shared resource;
+final normalization retains its accounted pinned replica. Bounded residency
+leases each body and between-pass normalization independently. Pipeline owners
+materialize the canonical resources needed by their selected invocations.
 
 Validation includes independent numerical oracles, controlled/uninterrupted
 generation comparisons, and the downloaded official SafeTensors checkpoint
