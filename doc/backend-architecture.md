@@ -12771,3 +12771,13 @@ Local cache geometry changes dimensions through the validated state projection.
 The partition materializer validates equation geometry, canonical parameter
 ownership and state ownership before allocating pinned native modules. Observation
 seams and logical parameter references survive this projection unchanged.
+
+Partition-capable decoder families supply their canonical parameter description
+through `PartitionedConfig::partition_parameter_description`. The shared
+materializer validates it through `ComponentDefinition::validate_parameter_topology`
+before native allocation. The runtime compares invocation/storage identities and
+exact owned group specifications, including member geometry, encoding companions
+and sharing. A mismatch returns a typed component/resource error. Retained rank
+placement remains independent authority. Dense, routed Qwen, GPT-OSS, K2 and
+Nemotron-Labs-Diffusion use their existing declaration producers for this check;
+expert-bank and draft-adapter geometry stay family-owned.

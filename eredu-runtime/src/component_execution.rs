@@ -273,6 +273,41 @@ impl ComponentDefinition {
         selected.parameter_uses = self.parameter_uses;
         Ok(selected)
     }
+    /// Validates equation resource topology against a family-authored declaration.
+    /// Retained rank placement is separate authority and is not reconstructed here.
+    pub fn validate_parameter_topology(
+        &self,
+        expected: &ArchitectureParameterDescription,
+    ) -> Result<(), ComponentDefinitionError> {
+        let declared = self.parameters();
+        let invalid = |resource: String| ComponentDefinitionError::Invalid {
+            component: self.id.clone(),
+            resource,
+        };
+        if declared.graph() != expected.graph()
+            || declared.unit_layout() != expected.unit_layout()
+            || declared.invocations() != expected.invocations()
+        {
+            return Err(invalid(
+                "configured canonical invocation or storage topology".into(),
+            ));
+        }
+        if declared.groups() != expected.groups() {
+            let group = declared
+                .groups()
+                .iter()
+                .zip(expected.groups())
+                .find_map(|(actual, expected)| (actual != expected).then_some(expected))
+                .or_else(|| expected.groups().get(declared.groups().len()))
+                .or_else(|| declared.groups().get(expected.groups().len()));
+            return Err(invalid(format!(
+                "configured canonical parameter group {}",
+                group.map_or("ordering", |group| group.group().logical_name()),
+            )));
+        }
+        Ok(())
+    }
+
     /// Projects selected physical parameter geometry while retaining semantic identities.
     /// Families supply exact replacement uses, including changed encoding companions.
     pub fn with_parameters(

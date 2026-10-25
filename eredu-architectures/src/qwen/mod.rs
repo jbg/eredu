@@ -132,19 +132,11 @@ impl crate::decoder::PartitionedConfig for ModelArgs {
         parallel::local_block_args(self, layer, layout).map_err(eredu_nn::Error::backend)
     }
 
-    fn validate_partition_parameters(
+    fn partition_parameter_description(
         &self,
-        parameters: &eredu_runtime::ArchitectureParameterDescription,
-    ) -> Result<(), eredu_nn::Error> {
-        if !self.is_moe() {
-            let expected = crate::decoder::dense_parameter_description(self)
-                .map_err(eredu_nn::Error::backend)?;
-            return (&expected == parameters)
-                .then_some(())
-                .ok_or_else(|| eredu_nn::Error::backend("dense Qwen parameter topology drifted"));
-        }
-        crate::decoder::validate_partitioned_decoder_description(self, parameters)?;
-        validate_routed_partition_parameters(self, parameters)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        parallel::parameter_description(self)
     }
 }
 
@@ -220,51 +212,6 @@ pub type RoutedLayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, Rout
 /// Pipeline-local Qwen3-MoE model with global routing and local expert banks.
 pub type PartitionedRoutedLayeredModel<B> =
     crate::decoder::PartitionedLayeredModel<B, ModelArgs, RoutedQwenBlockFactory>;
-
-fn validate_routed_partition_parameters(
-    args: &ModelArgs,
-    parameters: &eredu_runtime::ArchitectureParameterDescription,
-) -> Result<(), Error> {
-    let experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    for layer in 0..layers {
-        let prefix = format!("{}.layers.{layer}", args.parameter_root);
-        for required in [
-            format!("{prefix}.mlp.gate"),
-            format!("{prefix}.mlp.experts.intermediate"),
-            format!("{prefix}.self_attn.q_norm"),
-            format!("{prefix}.self_attn.k_norm"),
-        ] {
-            if !parameters
-                .groups()
-                .iter()
-                .any(|owned| owned.group().logical_name() == required)
-            {
-                return Err(Error::backend(format!(
-                    "routed Qwen parameter description omits {required}"
-                )));
-            }
-        }
-        let expert_group = parameters
-            .groups()
-            .iter()
-            .find(|owned| {
-                owned.group().logical_name() == format!("{prefix}.mlp.experts.intermediate")
-            })
-            .expect("required expert group was checked above");
-        if expert_group
-            .group()
-            .members()
-            .iter()
-            .any(|member| member.global_shape().first().copied() != Some(experts))
-        {
-            return Err(Error::backend(format!(
-                "routed Qwen unit {layer} expert axis differs from {experts}"
-            )));
-        }
-    }
-    Ok(())
-}
 
 /// Declares Qwen cache identity independently of concrete cache storage.
 pub fn state_identity(

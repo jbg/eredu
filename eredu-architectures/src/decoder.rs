@@ -764,22 +764,12 @@ pub trait PartitionedConfig: Config + Clone {
         dense_local_block_config(self, layer, layout)
     }
 
-    /// Validates that a selected parameter description belongs to this family.
-    ///
-    /// The default remains the exact dense declaration. Routed families may
-    /// validate their distinct router/bank topology without weakening dense
-    /// construction.
-    fn validate_partition_parameters(
+    /// Declares the canonical topology admitted by partition construction.
+    /// Specialized families supply their existing router, bank or adapter declaration.
+    fn partition_parameter_description(
         &self,
-        parameters: &ArchitectureParameterDescription,
-    ) -> Result<(), Error> {
-        let expected = dense_parameter_description(self).map_err(Error::backend)?;
-        if &expected != parameters {
-            return Err(Error::backend(
-                "decoder partition belongs to a different normalized parameter topology",
-            ));
-        }
-        Ok(())
+    ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+        dense_parameter_description(self)
     }
 }
 
@@ -5705,7 +5695,10 @@ where
             "shared decoder equations",
             operator_requirements(&args),
         )?;
-        args.validate_partition_parameters(definition.parameters())?;
+        let expected = args
+            .partition_parameter_description()
+            .map_err(Error::backend_source)?;
+        definition.validate_parameter_topology(&expected)?;
         let [group] = partition.groups() else {
             return Err(Error::backend(
                 "dense decoder partition must own exactly one execution group",
@@ -5999,47 +5992,6 @@ where
         output_range,
         complete_state_layout,
     })
-}
-
-/// Validates the common graph and unit ownership of a routed decoder description.
-pub(crate) fn validate_partitioned_decoder_description(
-    config: &impl Config,
-    parameters: &ArchitectureParameterDescription,
-) -> Result<(), Error> {
-    let [group] = parameters.graph().groups() else {
-        return Err(Error::backend(
-            "partitioned decoder parameter graph must contain one execution group",
-        ));
-    };
-    if group.id() != TEXT_DECODER_EXECUTION_GROUP {
-        return Err(Error::backend(
-            "partitioned decoder parameter graph names a different execution group",
-        ));
-    }
-    let layers = DecoderSchedule::new(config)?.len();
-    if parameters
-        .unit_layout()
-        .group_range(0)
-        .map(|range| range.len())
-        != Some(layers)
-    {
-        return Err(Error::backend(
-            "partitioned decoder parameter unit layout differs from configured depth",
-        ));
-    }
-    let group_id = eredu_runtime::ExecutionGroupId::new(TEXT_DECODER_EXECUTION_GROUP)
-        .map_err(Error::backend)?;
-    for layer in 0..layers {
-        if !parameters.groups().iter().any(|owned| {
-            matches!(owned.owner(), eredu_runtime::ParameterGroupOwner::ExecutionUnit { group, consumers, .. }
-                if group == &group_id && consumers.contains(&layer))
-        }) {
-            return Err(Error::backend(format!(
-                "partitioned decoder parameter description omits unit {layer}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn dense_local_block_config<C: PartitionedConfig>(
