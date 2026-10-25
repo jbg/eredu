@@ -573,7 +573,98 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         shared.forward((&input, true), &mut state, &()).unwrap().0,
         [7, 0, 29, 29]
     );
+    let rank = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1).unwrap(),
+        0,
+    )
+    .unwrap();
+    let pinned = definition(true);
+    let retained =
+        eredu_runtime::derive_partitioned_local_layout(pinned.parameters(), rank).unwrap();
+    let parameters = pinned
+        .parameters()
+        .clone()
+        .with_partition_layout(rank, retained)
+        .unwrap();
+    let pinned = pinned.with_parameters(parameters, []).unwrap();
+    let without_pinned = pinned
+        .project_groups(
+            "without-neighbor",
+            ExecutionGraph::chain(["first"]).unwrap(),
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+    assert!(
+        eredu_runtime::derive_partitioned_local_layout(without_pinned.parameters(), rank)
+            .unwrap()
+            .is_empty()
+    );
+    let other_rank = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+        0,
+    )
+    .unwrap();
+    assert!(eredu_runtime::derive_partitioned_local_layout(
+        without_pinned.parameters(),
+        other_rank
+    )
+    .is_err());
     let declaration = shared.architecture().definition().clone();
+    let child = declaration
+        .project_groups(
+            "shared-child",
+            ExecutionGraph::chain(["second"]).unwrap(),
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+    let mut resident_child = ResidentRuntime::new(
+        ComponentAdapter::new(
+            child.clone(),
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap(),
+        &(),
+    )
+    .unwrap();
+    assert_eq!(
+        resident_child
+            .forward((&input, true), &mut state, &())
+            .unwrap()
+            .0,
+        [7, 1, 1]
+    );
+    assert_eq!(resident_child.units()[0].len(), 1);
+    let mut child = LayerwiseRuntime::new(
+        ComponentAdapter::new(
+            child,
+            Kernel {
+                fail: false,
+                pinned: None,
+            },
+        )
+        .unwrap(),
+        RecordingPolicy::bounded(2),
+    );
+    let mut child_observer = SharedObservation(vec![]);
+    assert_eq!(
+        child
+            .forward_with_observer((&input, true), &mut state, &(), &mut child_observer)
+            .unwrap()
+            .0,
+        [7, 1, 1]
+    );
+    assert_eq!(
+        child_observer
+            .0
+            .iter()
+            .filter(|path| path.starts_with("shared."))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["shared.input", "shared.output"]
+    );
     let partition = eredu_runtime::ArchitecturePartition::from_description(
         declaration.parameters(),
         [("second", 0..1)],
@@ -1774,7 +1865,10 @@ fn component_invocation_state_ownership_skips_interleaved_stateless_units() {
                 })),
             )
         };
-        let definition = make(units.clone(), base.state_layout().clone(), owners(false)).unwrap();
+        let definition = make(units.clone(), base.state_layout().clone(), owners(false))
+            .unwrap()
+            .project_groups("interleaved", graph.clone(), std::iter::empty::<String>())
+            .unwrap();
         // Cold placement consumes the complete declaration; selected execution
         // below retains the nonzero interval without inventing prefix state.
         let cold_units = (0..offset)
@@ -2136,6 +2230,34 @@ fn check_stage_carry(offset: usize) {
         ]),
     )
     .unwrap();
+    assert!(definition
+        .project_groups(
+            "lost-state-owner",
+            ExecutionGraph::chain(["ingress"]).unwrap(),
+            std::iter::empty::<String>(),
+        )
+        .is_err());
+    let child = definition
+        .project_groups(
+            "carry-child",
+            ExecutionGraph::chain(["carry"]).unwrap(),
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+    let mut child_state = carry_state(child.state_layout().clone());
+    let mut child = ResidentRuntime::new(
+        ComponentAdapter::new(child, CarryKernel::new(offset, false)).unwrap(),
+        &(),
+    )
+    .unwrap();
+    for step in 1..=3 {
+        assert_eq!(
+            child
+                .forward(&FakeTensor(vec![9]), &mut child_state, &())
+                .unwrap(),
+            FakeTensor(vec![9, step, step, step])
+        );
+    }
     let adapter = ComponentAdapter::new(
         definition.clone(),
         CarryKernel::new(offset, true),

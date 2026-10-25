@@ -186,9 +186,9 @@ impl<B: DistributedNeuralBackend> super::CompositeKernel<B, StaticModules<B>> {
             ));
         }
         let text = if let Some(local) = &geometry.text {
-            let description =
-                crate::nemotron_labs_diffusion::parallel::parameter_description(&config)
-                    .map_err(Error::backend)?;
+            let text_definition =
+                crate::nemotron_labs_diffusion::definition::text_from_composite(&definition)?;
+            let description = text_definition.parameters();
             let text_ownership = PartitionOwnership::new(
                 ownership.owns_static_role("embedding"),
                 ownership.owns_static_role("output"),
@@ -199,13 +199,8 @@ impl<B: DistributedNeuralBackend> super::CompositeKernel<B, StaticModules<B>> {
                     .cloned(),
             )
             .map_err(Error::backend)?;
-            let text_definition = crate::nemotron_labs_diffusion::definition::text_partition(
-                &config,
-                &description,
-                local,
-            )?;
             let text_partition = ArchitecturePartition::from_description(
-                &description,
+                description,
                 [(
                     crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
                     local.owned_units(),
@@ -225,7 +220,7 @@ impl<B: DistributedNeuralBackend> super::CompositeKernel<B, StaticModules<B>> {
             Some(
                 PartitionedTextKernel::from_partition(
                     config.clone(),
-                    std::sync::Arc::new(text_definition),
+                    text_definition,
                     &text_partition,
                     context,
                 )?

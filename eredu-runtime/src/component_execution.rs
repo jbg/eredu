@@ -1,5 +1,7 @@
 //! Validated component declarations and typed equation adapters.
 
+mod projection;
+
 use crate::{
     ActivationObserver, ArchitectureGroupTransport, ArchitectureParameterDescription,
     ArchitectureParameters, ArchitectureStatePartitionPlan, ComponentResourceAccess,
@@ -21,6 +23,24 @@ pub enum ComponentDefinitionError {
         /// Exact invalid state contract.
         #[source]
         source: crate::ArchitectureStatePartitionError,
+    },
+    /// A projected parameter declaration violates canonical ownership or placement.
+    #[error("component {component:?}: {source}")]
+    Parameters {
+        /// Stable component identity.
+        component: String,
+        /// Exact invalid parameter contract.
+        #[source]
+        source: crate::ArchitectureParameterError,
+    },
+    /// A projected invocation layout violates stable group addressing.
+    #[error("component {component:?}: {source}")]
+    UnitLayout {
+        /// Stable component identity.
+        component: String,
+        /// Exact invalid invocation layout.
+        #[source]
+        source: crate::ExecutionUnitLayoutError,
     },
     /// A declaration does not cover its canonical resources.
     #[error("component {component:?}: invalid {resource}")]

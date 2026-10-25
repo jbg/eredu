@@ -1327,7 +1327,7 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
     ) -> Result<Model<B>, Error> {
         let definition = std::sync::Arc::new(super::definition::composite(&config, None)?);
         let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text_definition = std::sync::Arc::new(super::definition::text(&config, None)?);
+        let text_definition = super::definition::text_from_composite(&definition)?;
         let text = TextKernel::from_definition(config.clone(), text_definition, context)?
             .into_parts()
             .1;
@@ -1360,8 +1360,7 @@ impl<B: DistributedNeuralBackend> CompositeKernel<B> {
         let definition =
             std::sync::Arc::new(super::definition::composite(&config, Some(&geometry))?);
         let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text_definition =
-            std::sync::Arc::new(super::definition::text(&config, Some(&geometry))?);
+        let text_definition = super::definition::text_from_composite(&definition)?;
         let text = TextKernel::from_parallel_definition(
             config.clone(),
             text_definition,

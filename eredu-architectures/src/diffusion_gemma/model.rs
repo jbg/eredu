@@ -59,6 +59,21 @@ pub fn component_definition(
     .map_err(Error::from)
 }
 
+pub(super) fn project_from_composite(
+    definition: &eredu_runtime::ComponentDefinition,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    let graph = eredu_runtime::ExecutionGraph::chain([TEXT_EXECUTION_GROUP])
+        .map_err(Error::backend_source)?;
+    definition
+        .project_groups(
+            TEXT_COMPONENT_ID,
+            graph,
+            ["embedding", "norm", "output", "conditioning"],
+        )
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
 fn text_unit(index: usize) -> eredu_runtime::ComponentUnit {
     eredu_runtime::ComponentUnit {
         path: format!("model.decoder.layers.{index}"),

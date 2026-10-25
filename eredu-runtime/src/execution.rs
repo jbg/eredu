@@ -616,6 +616,37 @@ impl ExecutionUnitLayout {
         })
     }
 
+    /// Projects named groups while preserving sparse global invocation indices.
+    pub fn project_groups(&self, graph: &ExecutionGraph) -> Result<Self, ExecutionUnitLayoutError> {
+        let mut group_ids = Vec::new();
+        let mut group_ranges = Vec::new();
+        let mut addresses = Vec::new();
+        for (group, specification) in graph.groups().iter().enumerate() {
+            let parent = self
+                .group_ids
+                .iter()
+                .position(|id| id.as_str() == specification.id())
+                .ok_or_else(|| ExecutionUnitLayoutError::UnknownSelectedGroup {
+                    group: specification.id().to_owned(),
+                })?;
+            group_ids.push(self.group_ids[parent].clone());
+            let start = addresses.len();
+            addresses.extend(
+                self.addresses[self.group_ranges[parent].clone()]
+                    .iter()
+                    .map(|address| ExecutionUnitAddress {
+                        group,
+                        index: address.index(),
+                    }),
+            );
+            group_ranges.push(start..addresses.len());
+        }
+        Ok(Self {
+            group_ids,
+            group_ranges,
+            addresses,
+        })
+    }
     /// Returns the total number of execution units in group-major order.
     pub fn len(&self) -> usize {
         self.addresses.len()
@@ -699,6 +730,12 @@ pub enum ExecutionUnitLayoutError {
         group: usize,
         /// Canonical group-local unit index.
         index: usize,
+    },
+    /// A projected group is not present in the source layout.
+    #[error("selected execution group {group:?} is absent from the source layout")]
+    UnknownSelectedGroup {
+        /// Stable execution-group identity.
+        group: String,
     },
     /// Selected addresses repeat or change canonical traversal order.
     #[error("selected execution units must be unique and in canonical order")]

@@ -2391,8 +2391,9 @@ where
 
     /// Acquires one populated unit for exclusive execution.
     ///
-    /// The flat ordinal addresses storage while `address` preserves the
-    /// architecture execution group and group-local unit index for scheduling.
+    /// The ordinal and address identify an invocation in the driver layout.
+    /// A selected policy resolves that pair through its retained invocation/storage
+    /// map before admitting or acquiring physical storage.
     fn acquire<E, F>(
         &mut self,
         ordinal: usize,

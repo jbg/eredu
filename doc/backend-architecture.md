@@ -12814,3 +12814,20 @@ Feedback parameters remain independently declared input-owner resources. Routed
 bank plans, encoder visibility and transient refinement semantics remain family
 policies. Composite assembly supplies an explicit child text declaration to these
 same materializers.
+
+`ComponentDefinition::project_groups` derives child components from named parent
+groups and explicitly selected pinned roles. Families provide the child graph;
+omitted dependencies terminate at caller-owned ingress, while dependencies between
+included groups remain intact. Unit paths, operation seams, logical parameter
+references and canonical storage owners come from the parent declaration.
+`ExecutionUnitLayout::project_groups` remaps group coordinates by stable identity
+and preserves sparse global invocation indices.
+
+Child projection retains the complete state-slot namespace and remaps its owner
+rules. Excluded state owners and changed output-owned state destinations reject.
+Parameter consumers must remain valid in the child graph; errors preserve their
+original neutral ownership or layout source. Retained rank placement is restricted
+to selected targets without re-deriving placement or applying transformations.
+DiffusionGemma and Nemotron diffusion composites obtain their text declarations
+through this shared projection. Child transport follows the parent group contract;
+family kernels retain media assembly, equations and local state dimensions.

@@ -13,6 +13,11 @@ Low-level text construction uses `TextKernel::from_definition`,
 `model::project_parameters` selects executable formats while retaining invocation
 and state identities.
 
+Composite text kernels obtain their child declarations from the parent through
+`ComponentDefinition::project_groups`. Parameter ownership and observation seams
+remain shared semantic facts; local context dimensions use the ordinary validated
+state projection.
+
 Validation uses the neutral layered-runtime driver and public model admission
 with MLX CPU tensors. The public-loader fixture constructs the complete official
 image/text architecture and invokes context and refinement through the retained

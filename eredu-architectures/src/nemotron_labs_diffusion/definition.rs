@@ -41,6 +41,17 @@ pub(crate) fn validate_text_identity(definition: &ComponentDefinition) -> Result
     Ok(())
 }
 
+pub(crate) fn text_from_composite(
+    definition: &ComponentDefinition,
+) -> Result<std::sync::Arc<ComponentDefinition>, Error> {
+    let graph = eredu_runtime::ExecutionGraph::chain([decoder::TEXT_DECODER_EXECUTION_GROUP])
+        .map_err(Error::backend_source)?;
+    definition
+        .project_groups(TEXT_COMPONENT_ID, graph, ["embedding", "norm", "output"])
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
 /// Declares a complete shared text stack, optionally at retained tensor-local geometry.
 pub fn text(
     config: &FamilyConfig,

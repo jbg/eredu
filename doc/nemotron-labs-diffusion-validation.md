@@ -19,6 +19,11 @@ resources without a native context. Executable format selection uses
 `definition::project_text_parameters` and retains the same operation and state
 identities.
 
+Composite text kernels obtain their child declarations from the parent through
+`ComponentDefinition::project_groups`. Parameter ownership and observation seams
+remain shared semantic facts; local context dimensions use the ordinary validated
+state projection.
+
 The dense attention equation uses an explicit independent `head_dim`, YaRN
 with input-precision rotary products and eager input-score/probability rounding,
 and the published position-dependent query gain
