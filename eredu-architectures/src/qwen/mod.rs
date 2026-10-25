@@ -6,6 +6,7 @@ pub mod hybrid;
 pub mod ingress;
 mod moe;
 mod parallel;
+pub(crate) use parallel::parameter_description;
 pub mod vision;
 pub mod vl;
 

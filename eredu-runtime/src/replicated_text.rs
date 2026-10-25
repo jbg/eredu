@@ -1804,75 +1804,65 @@ impl ReplicatedTextRequirements {
     }
 }
 
+impl ReplicatedTextStateAccess {
+    /// Infers the exact access capability from declared state roles, without native resources.
+    pub fn from_layout(layout: &StateLayout) -> Result<Self, ReplicatedTextContractError> {
+        use eredu_core::cache::StateComponentRole;
+        let mut ordinary = false;
+        let mut compressed = false;
+        let mut fixed = false;
+        let mut streams = false;
+        for role in (0..layout.len())
+            .flat_map(|layer| layout.components(layer).expect("validated state layout"))
+            .map(StateComponentPolicy::role)
+        {
+            match role {
+                StateComponentRole::AttentionKeys | StateComponentRole::AttentionValues => {
+                    ordinary = true
+                }
+                StateComponentRole::CompressedLatent | StateComponentRole::RotaryKeys => {
+                    compressed = true
+                }
+                StateComponentRole::Fixed(_) => fixed = true,
+                StateComponentRole::AppendStream { .. } => streams = true,
+            }
+        }
+        if ordinary && compressed || streams && (!ordinary || compressed) {
+            return Err(ReplicatedTextContractError::invalid(
+                "state layout combines incompatible attention or append-stream roles",
+            ));
+        }
+        Ok(if streams {
+            Self::AttentionWithStreams
+        } else {
+            match (ordinary, compressed, fixed) {
+                (false, false, false) => Self::Stateless,
+                (true, false, false) => Self::KeyValue,
+                (false, false, true) => Self::Fixed,
+                (true, false, true) => Self::AttentionWithFixed,
+                (false, true, false) => Self::CompressedAttention,
+                (false, true, true) => Self::CompressedAttentionWithFixed,
+                (true, true, _) => unreachable!("rejected mixed attention encodings"),
+            }
+        })
+    }
+}
+
 fn validate_state_access_profile(
     layout: &StateLayout,
     access: ReplicatedTextStateAccess,
 ) -> Result<(), ReplicatedTextContractError> {
-    use eredu_core::cache::StateComponentRole;
-
+    if matches!(ReplicatedTextStateAccess::from_layout(layout), Ok(inferred) if inferred == access)
+    {
+        return Ok(());
+    }
     let roles = (0..layout.len())
-        .flat_map(|layer| {
-            layout
-                .components(layer)
-                .expect("validated state layout exposes every layer")
-        })
+        .flat_map(|layer| layout.components(layer).expect("validated state layout"))
         .map(StateComponentPolicy::role)
         .collect::<Vec<_>>();
-    let ordinary = |role| {
-        matches!(
-            role,
-            StateComponentRole::AttentionKeys | StateComponentRole::AttentionValues
-        )
-    };
-    let compressed = |role| {
-        matches!(
-            role,
-            StateComponentRole::CompressedLatent | StateComponentRole::RotaryKeys
-        )
-    };
-    let fixed = |role| matches!(role, StateComponentRole::Fixed(_));
-    let has_ordinary = roles.iter().copied().any(ordinary);
-    let has_compressed = roles.iter().copied().any(compressed);
-    let has_fixed = roles.iter().copied().any(fixed);
-    let append = |role| matches!(role, StateComponentRole::AppendStream { .. });
-    let coherent = match access {
-        ReplicatedTextStateAccess::AttentionWithStreams => {
-            has_ordinary
-                && roles.iter().copied().any(append)
-                && roles
-                    .iter()
-                    .copied()
-                    .all(|role| ordinary(role) || fixed(role) || append(role))
-        }
-        ReplicatedTextStateAccess::Stateless => roles.is_empty(),
-        ReplicatedTextStateAccess::KeyValue => roles.iter().copied().all(ordinary) && has_ordinary,
-        ReplicatedTextStateAccess::Fixed => roles.iter().copied().all(fixed) && has_fixed,
-        ReplicatedTextStateAccess::AttentionWithFixed => {
-            roles
-                .iter()
-                .copied()
-                .all(|role| ordinary(role) || fixed(role))
-                && has_ordinary
-                && has_fixed
-        }
-        ReplicatedTextStateAccess::CompressedAttention => {
-            roles.iter().copied().all(compressed) && has_compressed
-        }
-        ReplicatedTextStateAccess::CompressedAttentionWithFixed => {
-            roles
-                .iter()
-                .copied()
-                .all(|role| compressed(role) || fixed(role))
-                && has_compressed
-                && has_fixed
-        }
-    };
-    if !coherent {
-        return Err(ReplicatedTextContractError::invalid(format!(
-            "state access profile {access:?} does not match component roles {roles:?}"
-        )));
-    }
-    Ok(())
+    Err(ReplicatedTextContractError::invalid(format!(
+        "state access profile {access:?} does not match component roles {roles:?}"
+    )))
 }
 
 /// One required grouped-compute mechanism.

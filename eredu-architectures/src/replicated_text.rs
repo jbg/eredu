@@ -1142,17 +1142,15 @@ fn validate_plan_identity(
     if requirements.architecture_identity() != config.architecture_identity() {
         return Err("selected realization belongs to a different normalized architecture".into());
     }
-    let graph = eredu_runtime::ExecutionGraph::chain([config.execution_group()])
+    let definition = config
+        .component_definition()
         .map_err(|error| error.to_string())?;
-    let units = eredu_runtime::ExecutionUnitLayout::new(&graph, [config.unit_count()?])
-        .map_err(|error| error.to_string())?;
-    let state_layout = config.state_layout()?;
     if requirements.operators() != config.operators()
-        || requirements.execution_graph() != &graph
-        || requirements.execution_units() != &units
-        || requirements.group_transports() != [config.group_transport()]
-        || requirements.state_layout() != &state_layout
-        || requirements.state_access() != config.state_access()
+        || requirements.component_definition() != Some(&definition)
+        || requirements.state_layout() != definition.state_layout()
+        || requirements.state_access()
+            != ReplicatedTextStateAccess::from_layout(definition.state_layout())
+                .map_err(|error| error.to_string())?
     {
         return Err(
             "selected realization structure differs from the normalized architecture".into(),
@@ -3155,46 +3153,10 @@ impl EligibleConfig<'_> {
     }
 
     fn state_access(&self) -> ReplicatedTextStateAccess {
-        let layout = self
-            .state_layout()
-            .expect("eligible configuration has a valid state layout");
-        let roles = (0..layout.len()).flat_map(|layer| {
-            layout
-                .components(layer)
-                .expect("validated state layout exposes every layer")
-                .iter()
-                .map(eredu_core::cache::StateComponentPolicy::role)
-        });
-        let mut ordinary = false;
-        let mut compressed = false;
-        let mut fixed = false;
-        let mut streams = false;
-        for role in roles {
-            match role {
-                eredu_core::cache::StateComponentRole::AttentionKeys
-                | eredu_core::cache::StateComponentRole::AttentionValues => ordinary = true,
-                eredu_core::cache::StateComponentRole::CompressedLatent
-                | eredu_core::cache::StateComponentRole::RotaryKeys => compressed = true,
-                eredu_core::cache::StateComponentRole::Fixed(_) => fixed = true,
-                eredu_core::cache::StateComponentRole::AppendStream { .. } => streams = true,
-            }
-        }
-        if streams {
-            assert!(
-                ordinary && !compressed,
-                "append streams require ordinary attention in this profile"
-            );
-            return ReplicatedTextStateAccess::AttentionWithStreams;
-        }
-        match (ordinary, compressed, fixed) {
-            (false, false, false) => ReplicatedTextStateAccess::Stateless,
-            (true, false, false) => ReplicatedTextStateAccess::KeyValue,
-            (false, false, true) => ReplicatedTextStateAccess::Fixed,
-            (true, false, true) => ReplicatedTextStateAccess::AttentionWithFixed,
-            (false, true, false) => ReplicatedTextStateAccess::CompressedAttention,
-            (false, true, true) => ReplicatedTextStateAccess::CompressedAttentionWithFixed,
-            (true, true, _) => unreachable!("eligible replicated layout mixes attention encodings"),
-        }
+        ReplicatedTextStateAccess::from_layout(
+            &self.state_layout().expect("validated family state"),
+        )
+        .expect("validated family state access")
     }
 
     fn operators(&self) -> NeuralOperatorCapabilities {
@@ -3270,11 +3232,54 @@ impl EligibleConfig<'_> {
         }
     }
 
-    fn group_transport(&self) -> eredu_runtime::ArchitectureGroupTransport {
+    fn component_definition(&self) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+        fn decoder<C: crate::decoder::Config>(
+            args: &C,
+            parameters: Result<
+                eredu_runtime::ArchitectureParameterDescription,
+                eredu_runtime::ParallelPlanError,
+            >,
+        ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+            crate::decoder::decoder_component_definition(
+                args,
+                parameters.map_err(eredu_nn::Error::backend_source)?,
+                crate::decoder::state_layout(args)?,
+            )
+        }
         match self {
-            Self::DeepSeekV4(_) => crate::deepseek::v4::target_group_transport(),
-            Self::DiffusionGemma(_) => crate::diffusion_gemma::model::text_transport(),
-            _ => crate::transport::decoder(),
+            Self::NemotronLabsDiffusion(args) => {
+                crate::nemotron_labs_diffusion::definition::text(args, None)
+            }
+            Self::Llama(args) => decoder(*args, crate::decoder::dense_parameter_description(*args)),
+            Self::Nanbeige(args) => {
+                decoder(*args, crate::decoder::dense_parameter_description(*args))
+            }
+            Self::Gemma2(args) => {
+                decoder(*args, crate::decoder::dense_parameter_description(*args))
+            }
+            Self::K2Horizon(args) => decoder(*args, crate::k2_horizon::parameter_description(args)),
+            Self::Qwen(args) => decoder(*args, crate::qwen::parameter_description(args)),
+            Self::GptOss(args) => decoder(*args, crate::gpt_oss::parameter_description(args)),
+            Self::Lfm2(args) => crate::lfm2::component_definition(args),
+            Self::KimiLinear(args) => crate::kimi_linear::component_definition(args),
+            Self::NemotronH(args) => crate::nemotron_h::component_definition(
+                crate::nemotron_h::parameter_description(args)
+                    .map_err(eredu_nn::Error::backend_source)?,
+                crate::nemotron_h::state_layout(args).map_err(eredu_nn::Error::backend_source)?,
+            ),
+            Self::QwenHybrid(args) => crate::qwen::hybrid::component_definition(args, None),
+            Self::DeepSeekV3(args) => crate::deepseek::v3::component_definition(args, None),
+            Self::DeepSeekV4(args) => crate::deepseek::v4::component_definition(args, None),
+            Self::DiffusionGemma(args) => {
+                crate::diffusion_gemma::model::component_definition(args, None)
+            }
+            Self::Gemma4(args) => crate::gemma4::model::component_definition(args, None),
+            Self::Inkling(args) => crate::inkling::model::component_definition(args, None),
+            Self::Muse(args) => crate::muse::model::component_definition(args, None),
+            Self::QwenVl(args) => crate::qwen::vl::component_definition(args, None),
+            Self::QwenCompositeHybrid(args) => {
+                crate::qwen::hybrid::conditional_component_definition(args, None)
+            }
         }
     }
 
@@ -4577,68 +4582,30 @@ fn replicated_text_requirements_for_structure(
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
     let plan = inspection.architecture_plan();
     let normalized = artifact::normalize(inspection, &config)?;
-    let component = match (component, &config) {
-        (Some(component), _) => Some(component),
-        (None, EligibleConfig::Nanbeige(args)) => Some(
-            crate::decoder::decoder_component_definition(
-                *args,
-                crate::decoder::dense_parameter_description(*args).map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                })?,
-                crate::decoder::state_layout(*args).map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-                })?,
-            )
-            .map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-            })?,
-        ),
-        _ => None,
+    let component = match component {
+        Some(component) => component,
+        None => config.component_definition().map_err(|error| {
+            ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+        })?,
     };
-    let (execution_graph, execution_units, group_transports, state_layout) = match &component {
-        Some(definition) => (
-            definition.parameters().graph().clone(),
-            definition.parameters().unit_layout().clone(),
-            (0..definition.parameters().graph().groups().len())
-                .map(|group| {
-                    definition
-                        .group_transport(group)
-                        .expect("declared transport")
-                        .clone()
-                })
-                .collect(),
-            definition.state_layout().clone(),
-        ),
-        None => {
-            let graph = eredu_runtime::ExecutionGraph::chain([config.execution_group()]).map_err(
-                |error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()),
-            )?;
-            let units = eredu_runtime::ExecutionUnitLayout::new(
-                &graph,
-                [config
-                    .unit_count()
-                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?],
-            )
-            .map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-            })?;
-            let state = config
-                .state_layout()
-                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
-            (graph, units, vec![config.group_transport()], state)
-        }
-    };
+    let execution_graph = component.parameters().graph().clone();
+    let execution_units = component.parameters().unit_layout().clone();
+    let group_transports = (0..execution_graph.groups().len())
+        .map(|group| {
+            component
+                .group_transport(group)
+                .expect("declared transport")
+                .clone()
+        })
+        .collect();
+    let state_layout = component.state_layout().clone();
+    let state_access = ReplicatedTextStateAccess::from_layout(&state_layout)
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     let (parameters, derived_recipes, derived_recipe_outputs) = normalized.parameters.clone();
     let shared_source_keys = normalized.shared_source_keys.clone();
     let auxiliary = normalized.prediction.clone();
     let floating_source = crate::preparation::prepared_floating_state_dtype_source(inspection)
         .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
-    let state_partition_plan = match &config {
-        EligibleConfig::Muse(args) if component.is_none() => Some(
-            crate::muse::model::state_partition_plan(args, &state_layout),
-        ),
-        _ => None,
-    };
     let mut requirements = ReplicatedTextRequirements::new(
         config.architecture_identity(),
         config.operators(),
@@ -4646,7 +4613,7 @@ fn replicated_text_requirements_for_structure(
         execution_units,
         group_transports,
         state_layout,
-        config.state_access(),
+        state_access,
         parameters,
     )
     .and_then(|requirements| {
@@ -4661,20 +4628,9 @@ fn replicated_text_requirements_for_structure(
             )
     })
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
-    if let Some(plan) = state_partition_plan {
-        requirements = requirements
-            .with_state_partition_plan(plan)
-            .map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-            })?;
-    }
-    if let Some(definition) = component {
-        requirements = requirements
-            .with_component_definition(definition)
-            .map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-            })?;
-    }
+    requirements = requirements
+        .with_component_definition(component)
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     requirements =
         requirements.with_execution_topology(config.execution_topology().map_err(|error| {
             ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())

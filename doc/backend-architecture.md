@@ -12724,3 +12724,17 @@ ownership; selected receiver-cache geometry remains an explicit architecture-own
 state view. Gemma pipeline admission retains its declared receiver replicas through
 that view. Media processing, numerical equations and coupled scheduling remain
 family-owned.
+
+Single-stack cold admission also projects execution structure from the family's
+validated component definition. Dense and routed shared decoders, LFM2, Kimi
+Linear, Nemotron-H, Qwen hybrid, DeepSeek and iterative text stacks retain that
+definition with their requirements. Selected-plan identity validates the retained
+semantic definition, rather than constructing another graph from a family depth.
+Checkpoint recipes still use the family's parameter and logical-layer geometry.
+
+`ReplicatedTextStateAccess::from_layout` infers the exact state capability from
+neutral component roles. Cold requirement construction and runtime profile
+validation consume this same rule for ordinary attention, compressed attention,
+fixed state and append streams. Incompatible combinations return typed contract
+errors. This classification grants no native execution or state-storage capability;
+selection still requires the exact backend mechanism facts.

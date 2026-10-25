@@ -6,6 +6,7 @@ pub mod config;
 pub mod model;
 pub mod moe;
 pub mod parallel;
+pub(crate) use parallel::parameter_description;
 
 pub use block::{new_block, GptOssBlockFactory, TransformerBlock};
 pub use checkpoint::{
