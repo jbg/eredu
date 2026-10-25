@@ -2676,10 +2676,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::qwen::hybrid::conditional_parameter_description(&args)
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition = crate::qwen::hybrid::project_conditional_parameters(&args, &retained)
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2733,7 +2744,7 @@ where
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let definition =
-                crate::qwen::hybrid::conditional_component_definition(&args, Some(&local))
+                crate::qwen::hybrid::select_conditional_definition(&args, definition, Some(&local))
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
@@ -2755,6 +2766,7 @@ where
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
                 args.clone(),
+                definition,
                 local,
                 &partition,
                 context,
@@ -3628,10 +3640,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::qwen::hybrid::conditional_parameter_description(&args)
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition = crate::qwen::hybrid::project_conditional_parameters(&args, &retained)
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -3685,7 +3708,7 @@ where
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let definition =
-                crate::qwen::hybrid::conditional_component_definition(&args, Some(&local))
+                crate::qwen::hybrid::select_conditional_definition(&args, definition, Some(&local))
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
@@ -3707,6 +3730,7 @@ where
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
                 args.clone(),
+                definition,
                 local,
                 &partition,
                 context,

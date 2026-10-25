@@ -1192,11 +1192,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
     }
 
     /// Builds the exact configured vision/text/MTP graph.
-    pub fn new(
+    pub fn from_definition(
         parsed: ParsedHybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalLayeredModel<B>, Error> {
-        let definition = super::conditional_component_definition(&parsed, None)?;
         Self::materialize(parsed, definition, None, None, context)
     }
 
@@ -1228,18 +1228,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
     }
 
     /// Builds the conditional graph with planner-derived local modules.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         parsed: ParsedHybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: ConditionalLocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalLayeredModel<B>, Error> {
-        let definition = super::conditional_component_definition(&parsed, Some(&geometry))?;
         Self::materialize(parsed, definition, Some(geometry), None, context)
     }
 
     /// Materializes exactly the pinned roots and unit factories owned by an authoritative partition.
     pub fn from_partition(
         parsed: ParsedHybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: ConditionalLocalGeometry,
         partition: &eredu_runtime::ArchitecturePartition<
             super::ConditionalPartitionLocalGeometry,
@@ -1247,47 +1248,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalLayeredModel<B>, Error> {
-        let definition = super::conditional_component_definition(&parsed, Some(&geometry))?;
-        super::ConditionalPartitionLocalFoundation::from_partition(&parsed, partition)
-            .map_err(Error::backend_source)?;
-        partition
-            .local_geometry()
-            .validate_complete_geometry(&parsed, &geometry)
-            .map_err(Error::backend_source)?;
-        if partition.graph() != definition.parameters().graph()
-            || partition.unit_layout() != definition.parameters().unit_layout()
-            || partition.parameter_bindings() != definition.parameters().select_owned(partition)
-        {
-            return Err(Error::backend(
-                "conditional Qwen partition parameter ownership differs from its definition",
-            ));
-        }
-        let expected = definition
-            .state_partition_plan()
-            .resolve_partition(
-                definition.state_layout(),
-                definition.parameters().unit_layout(),
-                |group| {
-                    partition
-                        .groups()
-                        .iter()
-                        .find(|owned| owned.group_index() == group)
-                        .map(|owned| owned.global_units())
-                },
-                partition.ownership().owns_output(),
-            )
-            .map_err(Error::backend_source)?;
-        if partition.state() != expected.as_ref() {
-            return Err(Error::backend(
-                "conditional Qwen partition state differs from its definition",
-            ));
-        }
         Self::materialize(parsed, definition, Some(geometry), Some(partition), context)
     }
 
     fn materialize(
         parsed: ParsedHybridConfig,
-        definition: eredu_runtime::ComponentDefinition,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<ConditionalLocalGeometry>,
         partition: Option<
             &eredu_runtime::ArchitecturePartition<
@@ -1297,6 +1263,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalLayeredModel<B>, Error> {
+        let definition =
+            super::select_conditional_definition(&parsed, definition, geometry.as_ref())?;
+        if let Some(partition) = partition {
+            super::ConditionalPartitionLocalFoundation::from_partition(&parsed, partition)
+                .map_err(Error::backend_source)?;
+            partition
+                .local_geometry()
+                .validate_complete_geometry(
+                    &parsed,
+                    geometry.as_ref().ok_or_else(|| {
+                        Error::backend("selected conditional Qwen has no complete geometry")
+                    })?,
+                )
+                .map_err(Error::backend_source)?;
+            definition.select_partition(partition)?;
+        }
         crate::operator_requirements::require::<B>(
             "Qwen hybrid conditional",
             crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
@@ -1381,7 +1363,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
         };
         let vision = VisionStatic::from_selection(selection, widths, context)?;
         let selected_state = partition.and_then(|partition| partition.state());
-        let definition = std::sync::Arc::new(definition);
         let kernel = Self {
             parsed,
             definition: std::sync::Arc::clone(&definition),

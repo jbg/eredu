@@ -9419,6 +9419,19 @@ state offsets and selected local state.
 Low-level media, prediction and restricted-state operations live on
 `ConditionalKernel`; constructors return the shared adapter.
 
+Conditional hybrid construction takes the cold-admitted `Arc<ComponentDefinition>`
+through `ConditionalKernel::from_definition`, `from_parallel_definition` or
+`from_partition`. `project_conditional_parameters` selects executable formats
+while retaining logical consumers and observation seams; identical projections
+reuse the allocation. The family validates invocation paths, independent target
+and MTP state slots, transport and hook ownership from the same producers used
+for declaration. Global or selected state agrees with recurrent convolution,
+linear-attention and KV-cache geometry. Retained placement agrees with vocabulary
+ownership, target and prediction dimensions, vision heads/intermediates and
+merger widths. Complete source/target preparation and selected partition
+preparation consume these projections. The shared partition selector validates
+canonical resource and state ownership before native allocation.
+
 Complete and selected Nemotron-H target readout uses one `TargetReadout`
 equation over borrowed decoder resources. It normalizes once, then returns hidden
 values or projects through the actual tied embedding or untied head. Serial,

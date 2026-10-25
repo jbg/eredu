@@ -83,6 +83,12 @@ projector.
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 | NemotronLabs VoiceChat | realtime PCM speech, text, transcription, tools | yes | `nemotron_voicechat`; explicit split component bundle and companion | single-device controlled/iterator session; [validation](voicechat-validation.md) |
 
+Low-level conditional Qwen hybrid construction takes a retained component
+declaration through `ConditionalKernel::from_definition`,
+`from_parallel_definition` or `from_partition`.
+`qwen::hybrid::project_conditional_parameters` selects physical formats while
+retaining logical consumers, observation seams and target/MTP state ownership.
+
 Low-level Qwen3-VL construction takes a retained component declaration through
 `VlKernel::from_definition`, `from_parallel_definition` or `from_partition`.
 `qwen::vl::project_parameters` selects physical formats while retaining canonical

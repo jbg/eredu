@@ -582,19 +582,47 @@ pub fn conditional_component_definition(
     geometry: Option<&super::ConditionalLocalGeometry>,
 ) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
     let parameters = conditional_parameter_description(parsed)?;
-    let state = match geometry {
+    let state = conditional_state(parsed, geometry)?;
+    let units = conditional_units(&parameters);
+    let prediction = conditional_prediction_groups(&parameters);
+    let transport = (0..parameters.graph().groups().len())
+        .map(conditional_group_transport)
+        .collect();
+    let partition = conditional_state_partition(&parameters, &state);
+    eredu_runtime::ComponentDefinition::new(
+        "qwen-hybrid-conditional",
+        parameters,
+        units,
+        transport,
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        prediction,
+        state,
+        partition,
+    )
+    .map_err(eredu_nn::Error::from)
+}
+
+fn conditional_state(
+    parsed: &super::ParsedHybridConfig,
+    geometry: Option<&super::ConditionalLocalGeometry>,
+) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+    match geometry {
         Some(geometry) => {
             geometry
                 .validate_for(parsed)
                 .map_err(eredu_nn::Error::backend)?;
-            geometry.state_layout().clone()
+            Ok(geometry.state_layout().clone())
         }
-        None => super::state_layout(&parsed.text).map_err(eredu_nn::Error::backend)?,
-    };
+        None => super::state_layout(&parsed.text).map_err(eredu_nn::Error::backend),
+    }
+}
+
+fn conditional_units(
+    parameters: &ArchitectureParameterDescription,
+) -> Vec<eredu_runtime::ComponentUnit> {
     let layout = parameters.unit_layout();
     let vision_units = layout.group_range(0).expect("declared vision group").len();
-    let targets = layout.group_range(1).expect("declared target group").len();
-    let units = (0..layout.len())
+    (0..layout.len())
         .map(|ordinal| {
             let address = layout.address(ordinal).expect("declared invocation");
             let (path, state) = match address.group() {
@@ -611,9 +639,13 @@ pub fn conditional_component_definition(
             };
             eredu_runtime::ComponentUnit { path, state }
         })
-        .collect();
+        .collect()
+}
+
+fn conditional_prediction_groups(parameters: &ArchitectureParameterDescription) -> Vec<String> {
+    let layout = parameters.unit_layout();
     let groups = parameters.graph().groups().len();
-    let prediction = (2..groups)
+    (2..groups)
         .map(|group| {
             layout
                 .group_id(group)
@@ -621,38 +653,219 @@ pub fn conditional_component_definition(
                 .as_str()
                 .to_owned()
         })
-        .collect();
-    let transport = (0..groups)
-        .map(|group| match group {
-            0 => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            },
-            1 => crate::transport::decoder(),
-            group => {
-                let mut transport = crate::transport::prediction();
-                if group == 2 {
-                    transport.first_owner_static_roles.push("mtp".into());
-                }
-                transport
+        .collect()
+}
+
+fn conditional_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+    match group {
+        0 => eredu_runtime::ArchitectureGroupTransport {
+            placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+            kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            first_owner_static_roles: vec!["vision".into()],
+            last_owner_static_roles: Vec::new(),
+            merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
+            parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
+            request_optional: true,
+        },
+        1 => crate::transport::decoder(),
+        group => {
+            let mut transport = crate::transport::prediction();
+            if group == 2 {
+                transport.first_owner_static_roles.push("mtp".into());
             }
-        })
-        .collect();
-    let partition = crate::transport::pipeline_with_output_state(1, targets, &state);
-    eredu_runtime::ComponentDefinition::new(
-        "qwen-hybrid-conditional",
-        parameters,
-        units,
-        transport,
-        crate::decoder::TARGET_EXECUTION_GROUP,
-        prediction,
-        state,
-        partition,
-    )
-    .map_err(eredu_nn::Error::from)
+            transport
+        }
+    }
+}
+fn conditional_state_partition(
+    parameters: &ArchitectureParameterDescription,
+    state: &eredu_runtime::StateLayout,
+) -> eredu_runtime::ArchitectureStatePartitionPlan {
+    let targets = parameters
+        .unit_layout()
+        .group_range(1)
+        .expect("declared target group")
+        .len();
+    crate::transport::pipeline_with_output_state(1, targets, state)
+}
+fn conditional_invalid(
+    definition: &eredu_runtime::ComponentDefinition,
+    resource: impl Into<String>,
+) -> eredu_nn::Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn validate_conditional_identity(
+    definition: &eredu_runtime::ComponentDefinition,
+) -> Result<(), eredu_nn::Error> {
+    if definition.id() != "qwen-hybrid-conditional" {
+        return Err(conditional_invalid(
+            definition,
+            "conditional Qwen component identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Projects exact conditional formats while retaining invocation, storage and state identities.
+pub fn project_conditional_parameters(
+    parsed: &super::ParsedHybridConfig,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
+    validate_conditional_identity(definition)?;
+    let parameters = conditional_parameter_description(parsed)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(eredu_nn::Error::from)
+}
+
+fn same_conditional_dimensions(a: &super::HybridConfig, b: &super::HybridConfig) -> bool {
+    a.num_attention_heads == b.num_attention_heads
+        && a.num_key_value_heads == b.num_key_value_heads
+        && a.linear_num_key_heads == b.linear_num_key_heads
+        && a.linear_num_value_heads == b.linear_num_value_heads
+        && a.intermediate_size == b.intermediate_size
+        && a.moe_intermediate_size == b.moe_intermediate_size
+        && a.shared_expert_intermediate_size == b.shared_expert_intermediate_size
+}
+
+pub(crate) fn select_conditional_definition(
+    parsed: &super::ParsedHybridConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::ConditionalLocalGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
+    validate_conditional_identity(&definition)?;
+    definition.validate_parameter_topology(&conditional_parameter_description(parsed)?)?;
+    let state = conditional_state(parsed, geometry)?;
+    let global = conditional_state(parsed, None)?;
+    if definition.state_layout() != &global && definition.state_layout() != &state {
+        return Err(conditional_invalid(
+            &definition,
+            "conditional Qwen retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained = super::conditional_local_geometry(parsed, layout)
+            .map_err(eredu_nn::Error::backend_source)?;
+        let vision = parsed
+            .vision
+            .as_ref()
+            .expect("validated conditional vision");
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: parsed.text.vocab_size as usize,
+            local: 0..parsed.text.vocab_size as usize,
+        };
+        let output = if parsed.text.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                geometry
+                    .and_then(|g| g.text().output_range())
+                    .unwrap_or(&full),
+            )
+        };
+        let unsharded =
+            crate::qwen::vision::VisionStaticSelection::all(vision.clone(), "model.visual")
+                .and_then(|s| s.unsharded_merger_intermediates())
+                .map_err(eredu_nn::Error::backend_source)?;
+        if retained.state_layout() != &state
+            || retained.text().embedding_range()
+                != geometry.map_or(&full, |g| g.text().embedding_range())
+            || retained.text().output_range() != output
+            || retained.merger_widths()
+                != geometry.map_or(
+                    unsharded.as_slice(),
+                    super::ConditionalLocalGeometry::merger_widths,
+                )
+            || (0..vision.layer_count()).any(|i| {
+                retained.vision_block(i)
+                    != geometry.map_or(Some((vision.num_heads, vision.intermediate_size)), |g| {
+                        g.vision_block(i)
+                    })
+            })
+            || (0..parsed.text.num_hidden_layers as usize).any(|i| {
+                !same_conditional_dimensions(
+                    retained.text().target(i).expect("declared local target"),
+                    geometry
+                        .and_then(|g| g.text().target(i))
+                        .unwrap_or(&parsed.text),
+                )
+            })
+            || (0..parsed.text.mtp_num_hidden_layers as usize).any(|i| {
+                !same_conditional_dimensions(
+                    retained
+                        .text()
+                        .prediction(i)
+                        .expect("declared local prediction"),
+                    geometry
+                        .and_then(|g| g.text().prediction(i))
+                        .unwrap_or(&parsed.text),
+                )
+            })
+        {
+            return Err(conditional_invalid(
+                &definition,
+                "conditional Qwen retained placement differs from selected geometry",
+            ));
+        }
+    }
+    let parameters = definition.parameters();
+    if definition.primary_group() != crate::decoder::TARGET_EXECUTION_GROUP
+        || definition.prediction_groups() != conditional_prediction_groups(parameters)
+        || definition.state_partition_plan()
+            != &conditional_state_partition(parameters, definition.state_layout())
+    {
+        return Err(conditional_invalid(
+            &definition,
+            "conditional Qwen execution or state ownership",
+        ));
+    }
+    for group in 0..parameters.graph().groups().len() {
+        if definition.group_transport(group)? != &conditional_group_transport(group) {
+            return Err(conditional_invalid(
+                &definition,
+                format!("conditional Qwen group {group} transport"),
+            ));
+        }
+    }
+    for (ordinal, unit) in conditional_units(parameters).iter().enumerate() {
+        let address = parameters
+            .unit_layout()
+            .address(ordinal)
+            .expect("declared conditional invocation");
+        if definition.unit(address.group(), address.index())? != unit
+            || definition
+                .unit_observation_boundaries(address.group(), address.index())?
+                .is_kernel_owned()
+        {
+            return Err(conditional_invalid(
+                &definition,
+                format!(
+                    "conditional Qwen unit {}:{} equation geometry",
+                    address.group(),
+                    address.index()
+                ),
+            ));
+        }
+    }
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(eredu_nn::Error::from)
+    }
 }
