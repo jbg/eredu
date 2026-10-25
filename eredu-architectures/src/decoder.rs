@@ -5433,7 +5433,7 @@ impl<C: Config> DecoderGeometry<C> for PartitionLocalGeometry<C> {
 
 /// Shared runtime adapter over an admitted decoder partition and its typed equations.
 pub type PartitionedLayeredModel<B, C, P = DenseBlockFactory> = eredu_runtime::ComponentAdapter<
-    eredu_runtime::ComponentDefinition,
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
     DecoderKernel<B, C, P>,
     eredu_runtime::KernelParameterModules,
 >;
@@ -5695,7 +5695,7 @@ where
     /// Constructs only modules already selected by an exact neutral partition.
     pub fn from_partition<A>(
         args: C,
-        parameters: &ArchitectureParameterDescription,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<PartitionLocalGeometry<C>, A>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PartitionedLayeredModel<B, C, P>, Error> {
@@ -5705,7 +5705,7 @@ where
             "shared decoder equations",
             operator_requirements(&args),
         )?;
-        args.validate_partition_parameters(parameters)?;
+        args.validate_partition_parameters(definition.parameters())?;
         let [group] = partition.groups() else {
             return Err(Error::backend(
                 "dense decoder partition must own exactly one execution group",
@@ -5756,11 +5756,18 @@ where
             }
         }
         let geometry = partition.local_geometry().clone();
-        let definition = component_definition(
-            &args,
-            parameters.clone(),
-            geometry.complete_state_layout.clone(),
-        )?;
+        let definition = if definition.state_layout() == geometry.complete_state_layout() {
+            definition
+        } else {
+            std::sync::Arc::new(
+                definition
+                    .as_ref()
+                    .clone()
+                    .with_state_layout(geometry.complete_state_layout().clone())?,
+            )
+        };
+        validate_complete_definition(&args, &definition, geometry.complete_state_layout())?;
+        definition.select_partition(partition)?;
         let static_modules =
             partition_static_modules(&args, &geometry, partition.ownership(), context)?;
         let kernel = Self {

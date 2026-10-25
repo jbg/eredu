@@ -1114,7 +1114,7 @@ where
     Ok((architecture, source))
 }
 
-fn selected_decoder_definition<B, C, P>(
+pub(crate) fn selected_decoder_definition<B, C, P>(
     args: &C,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error>

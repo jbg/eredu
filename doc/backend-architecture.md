@@ -12761,3 +12761,13 @@ preparation. The ordinary visitor handoff also shares construction and contract
 assembly; families provide selected configuration, precision policy, capability
 estimates and cache identity. These steps use the existing preparation driver and
 completion lifecycle.
+
+Partitioned shared decoders consume the same retained declaration. Dense and
+routed preparation project selected formats through the common decoder parameter
+projection; transformation sources retain their original canonical bindings.
+Partition state ownership comes from the declaration's operation-to-slot rules,
+including stateless terminal operations between cache-owning body invocations.
+Local cache geometry changes dimensions through the validated state projection.
+The partition materializer validates equation geometry, canonical parameter
+ownership and state ownership before allocating pinned native modules. Observation
+seams and logical parameter references survive this projection unchanged.
