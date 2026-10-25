@@ -18,6 +18,11 @@ Composite text kernels obtain their child declarations from the parent through
 remain shared semantic facts; local context dimensions use the ordinary validated
 state projection.
 
+Complete composite construction uses `CompositeKernel::from_definition`;
+partition construction supplies the same retained parent declaration to
+`from_partition`. Format and state projections preserve the admitted operation
+and resource identities.
+
 Validation uses the neutral layered-runtime driver and public model admission
 with MLX CPU tensors. The public-loader fixture constructs the complete official
 image/text architecture and invokes context and refinement through the retained

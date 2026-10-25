@@ -63,6 +63,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
     /// Materializes the exact resources selected by an authoritative composite partition.
     pub fn from_partition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<
             super::super::parallel::CompositeGeometry,
             BoundarySchema,
@@ -70,7 +71,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Model<B>, Error> {
         let geometry = partition.local_geometry();
-        let definition = std::sync::Arc::new(component_definition(&config, Some(geometry))?);
+        let definition = select_definition(&config, definition, Some(geometry))?;
         definition.select_partition(partition)?;
         if partition.boundary_schema() != &BoundarySchema::new(config.text.hidden_size) {
             return Err(eredu_runtime::ComponentDefinitionError::Invalid {

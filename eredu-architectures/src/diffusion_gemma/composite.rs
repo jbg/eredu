@@ -201,18 +201,47 @@ pub fn parameter_description(
     .map_err(Error::backend_source)
 }
 
-/// Validates image invocations and shared text state before materialization.
-pub fn component_definition(
+const COMPONENT_ID: &str = "diffusion_gemma_composite";
+
+fn component_units(config: &FamilyConfig) -> Result<Vec<eredu_runtime::ComponentUnit>, Error> {
+    let vision = config
+        .vision
+        .as_ref()
+        .ok_or_else(|| Error::backend("composite requires an image tower"))?;
+    Ok((0..vision.num_hidden_layers as usize)
+        .map(|index| eredu_runtime::ComponentUnit {
+            path: format!("model.encoder.vision_tower.encoder.layers.{index}"),
+            state: 0..0,
+        })
+        .chain(
+            (0..config.text.num_hidden_layers()).map(|index| eredu_runtime::ComponentUnit {
+                path: format!("model.decoder.layers.{index}"),
+                state: index..index + 1,
+            }),
+        )
+        .collect())
+}
+
+fn state_partition_plan(config: &FamilyConfig) -> eredu_runtime::ArchitectureStatePartitionPlan {
+    eredu_runtime::ArchitectureStatePartitionPlan::new([
+        eredu_runtime::ArchitectureStatePartitionRule::group_units(
+            1,
+            0..config.text.num_hidden_layers(),
+        ),
+    ])
+}
+
+fn component_state(
     config: &FamilyConfig,
     geometry: Option<&super::parallel::CompositeGeometry>,
-) -> Result<eredu_runtime::ComponentDefinition, Error> {
+) -> Result<StateLayout, Error> {
     let layers = config.text.num_hidden_layers();
     let vision_layers = config
         .vision
         .as_ref()
         .ok_or_else(|| Error::backend("composite requires an image tower"))?
         .num_hidden_layers as usize;
-    let state = match geometry {
+    match geometry {
         Some(geometry) => {
             geometry
                 .text
@@ -242,32 +271,107 @@ pub fn component_definition(
                     "composite local geometry changes declared unit or state ownership",
                 ));
             }
-            geometry.complete_state.clone()
+            Ok(geometry.complete_state.clone())
         }
-        None => super::state_layout(config).map_err(Error::backend_source)?,
-    };
+        None => super::state_layout(config).map_err(Error::backend_source),
+    }
+}
+
+/// Validates image invocations and shared text state without native resources.
+pub fn component_definition(
+    config: &FamilyConfig,
+    geometry: Option<&super::parallel::CompositeGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
     eredu_runtime::ComponentDefinition::new(
-        "diffusion_gemma_composite",
+        COMPONENT_ID,
         parameter_description(config)?,
-        (0..vision_layers)
-            .map(|index| eredu_runtime::ComponentUnit {
-                path: format!("model.encoder.vision_tower.encoder.layers.{index}"),
-                state: 0..0,
-            })
-            .chain((0..layers).map(|index| eredu_runtime::ComponentUnit {
-                path: format!("model.decoder.layers.{index}"),
-                state: index..index + 1,
-            }))
-            .collect(),
+        component_units(config)?,
         vec![vision_transport(), super::model::text_transport()],
         super::model::TEXT_EXECUTION_GROUP,
         vec![],
-        state,
-        eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(1, 0..layers),
-        ]),
+        component_state(config, geometry)?,
+        state_partition_plan(config),
     )
     .map_err(Error::from)
+}
+
+/// Selects family-authored executable formats while retaining parent semantic ownership.
+pub fn project_parameters(
+    config: &FamilyConfig,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_identity(definition)?;
+    let parameters = parameter_description(config)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+fn validate_identity(definition: &eredu_runtime::ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != COMPONENT_ID {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "composite component identity".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn select_definition(
+    config: &FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::parallel::CompositeGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_identity(&definition)?;
+    definition.validate_parameter_topology(&parameter_description(config)?)?;
+    let expected_units = component_units(config)?;
+    let layout = definition.parameters().unit_layout();
+    if definition.primary_group() != super::model::TEXT_EXECUTION_GROUP
+        || !definition.prediction_groups().is_empty()
+        || definition.group_transport(0)? != &vision_transport()
+        || definition.group_transport(1)? != &super::model::text_transport()
+        || definition.state_partition_plan() != &state_partition_plan(config)
+        || layout.len() != expected_units.len()
+        || expected_units
+            .iter()
+            .enumerate()
+            .any(|(ordinal, expected)| {
+                let address = layout
+                    .address(ordinal)
+                    .expect("declared complete invocation");
+                !definition
+                    .unit(address.group(), address.index())
+                    .is_ok_and(|unit| unit == expected)
+                    || !definition
+                        .unit_observation_boundaries(address.group(), address.index())
+                        .is_ok_and(|boundary| !boundary.is_kernel_owned())
+            })
+    {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "composite equation geometry".into(),
+        }
+        .into());
+    }
+    let state = component_state(config, geometry)?;
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(Error::from)
+    }
 }
 
 /// Image parameters are replicated within a tensor group and cut per layer by PP.
@@ -286,11 +390,12 @@ pub fn vision_transport() -> ArchitectureGroupTransport {
 
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
     /// Declares shared text and independently materialized image modules.
-    pub fn new(
+    pub fn from_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Model<B>, Error> {
-        let definition = std::sync::Arc::new(component_definition(&config, None)?);
+        let definition = select_definition(&config, definition, None)?;
         let text_definition = super::model::project_from_composite(&definition)?;
         let kernel = Self {
             definition,

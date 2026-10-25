@@ -1825,10 +1825,21 @@ where
 
         CompositeConfig::Diffusion(source) => {
             let args = source.with_checkpoint_formats(target_formats);
-            let parameters = crate::diffusion_gemma::composite::parameter_description(&args)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
                 })?;
+            let definition = crate::diffusion_gemma::composite::project_parameters(
+                &args, &retained,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let parameters = definition.parameters().clone();
             let rank = selected.requirements().topology();
             let layout = derive_partitioned_local_layout(&parameters, rank)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -1882,11 +1893,19 @@ where
             } else {
                 None
             };
-            let definition =
-                crate::diffusion_gemma::composite::component_definition(&args, Some(&geometry))
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+            let definition = if definition.state_layout() == &geometry.complete_state {
+                definition
+            } else {
+                std::sync::Arc::new(
+                    definition
+                        .as_ref()
+                        .clone()
+                        .with_state_layout(geometry.complete_state.clone())
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?,
+                )
+            };
             let partition = ArchitecturePartition::from_description(
                 &parameters,
                 groups
@@ -1907,6 +1926,7 @@ where
             let mut architecture =
                 crate::diffusion_gemma::composite::CompositeKernel::<B>::from_partition(
                     args.clone(),
+                    definition,
                     &partition,
                     context,
                 )
@@ -1955,20 +1975,15 @@ where
                         )
                     })
                 {
-                    let source_parameters =
-                        crate::diffusion_gemma::composite::parameter_description(source).map_err(
-                            |error| {
-                                CompositePartitionPreparationError::Architecture(error.to_string())
-                            },
-                        )?;
+                    let source_parameters = retained.parameters();
                     crate::partitioned_execution::validate_transform_parameter_space(
-                        &source_parameters,
+                        source_parameters,
                         &parameters,
                     )
                     .map_err(CompositePartitionPreparationError::Architecture)?;
                     let source_layout =
                         crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                            &source_parameters,
+                            source_parameters,
                             &parameters,
                             rank,
                         )
@@ -2011,15 +2026,23 @@ where
                         None
                     };
                     let source_definition =
-                        crate::diffusion_gemma::composite::component_definition(
-                            source,
-                            Some(&source_geometry),
-                        )
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?;
+                        if retained.state_layout() == &source_geometry.complete_state {
+                            retained.clone()
+                        } else {
+                            std::sync::Arc::new(
+                                retained
+                                    .as_ref()
+                                    .clone()
+                                    .with_state_layout(source_geometry.complete_state.clone())
+                                    .map_err(|error| {
+                                        CompositePartitionPreparationError::Architecture(
+                                            error.to_string(),
+                                        )
+                                    })?,
+                            )
+                        };
                     let source_partition = ArchitecturePartition::from_description(
-                        &source_parameters,
+                        source_parameters,
                         groups
                             .iter()
                             .map(|group| (group.group().as_str(), group.units())),
@@ -2037,6 +2060,7 @@ where
                     let mut source_model =
                         crate::diffusion_gemma::composite::CompositeKernel::<B>::from_partition(
                             source.clone(),
+                            source_definition,
                             &source_partition,
                             context,
                         )
@@ -2071,6 +2095,7 @@ where
                 source_architecture; partition = partition
             )
         }
+
         CompositeConfig::Gemma4(source) => {
             let mut exact = source.clone();
             if let Some(audio) = exact.audio.as_mut() {

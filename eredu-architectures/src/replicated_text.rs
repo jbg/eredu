@@ -7960,11 +7960,24 @@ where
     {
         let capability = crate::capability::diffusion_gemma(args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let retained = self
+            .requirements
+            .execution()
+            .shared_component_definition()
+            .ok_or_else(|| {
+                ReplicatedTextDispatchError::Architecture(
+                    "composite selection has no retained definition".into(),
+                )
+            })?;
         let source = self
             .has_transform
             .then(|| {
-                crate::diffusion_gemma::composite::CompositeKernel::<B>::new(
-                    args.with_checkpoint_formats(self.source_formats.clone()),
+                let config = args.with_checkpoint_formats(self.source_formats.clone());
+                let definition =
+                    crate::diffusion_gemma::composite::project_parameters(&config, &retained)?;
+                crate::diffusion_gemma::composite::CompositeKernel::<B>::from_definition(
+                    config,
+                    definition,
                     self.context,
                 )
             })
@@ -7972,9 +7985,15 @@ where
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = args.with_checkpoint_formats(self.target_formats.clone());
         let identity = target.architecture_fingerprint();
+        let definition = crate::diffusion_gemma::composite::project_parameters(&target, &retained)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let architecture =
-            crate::diffusion_gemma::composite::CompositeKernel::<B>::new(target, self.context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            crate::diffusion_gemma::composite::CompositeKernel::<B>::from_definition(
+                target,
+                definition,
+                self.context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         self.visit(
             architecture,
             source,
@@ -7983,7 +8002,6 @@ where
             identity,
         )
     }
-
     #[inline(never)]
     fn gemma4(
         self,
