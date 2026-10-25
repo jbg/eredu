@@ -8432,6 +8432,14 @@ retains its ownership checks; production preparation selects resources before
 construction. Independently leased units and source/target layouts keep their
 existing residency and completion lifecycles.
 
+`V3UnitFactory` retains and validates the definition, source or selected local
+geometry, and expert realization independently of pinned resources. Complete V3
+kernels retain this factory and delegate unit construction to it. External V3
+prediction preparation constructs its independently leased units through the same
+factory, without creating target embedding, normalization or readout modules.
+Prediction units retain their own declared output heads and ordinary parameter,
+state and completion lifecycles.
+
 V3 materialization consumes the cold-admitted `Arc<ComponentDefinition>` through
 `V3Kernel::from_definition` or `from_parallel_definition`. One resource materializer
 selects ordinary or tensor-local modules. `v3::project_parameters` preserves logical

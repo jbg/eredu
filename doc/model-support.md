@@ -85,7 +85,9 @@ projector.
 
 Low-level DeepSeek-V3 construction consumes a retained declaration through
 `V3Kernel::from_definition`, `from_parallel_definition` or
-`from_partition_definition`.
+`from_partition_definition`. `V3UnitFactory::from_definition` validates independent
+target/MTP unit construction without pinned target resources; complete kernels
+and external prediction preparation use its shared unit construction.
 `deepseek::v3::project_parameters` selects physical formats while retaining logical
 consumers, observation seams and target/MTP state identities. Prediction-extension
 plans retain their complete validated declaration before target projection.

@@ -4563,20 +4563,18 @@ where
             } else {
                 None
             };
-            let source = match &source_layout {
-                Some(layout) => crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
-                    args.clone(),
-                    extension.definition().clone(),
+            let source_geometry = source_layout
+                .as_ref()
+                .map(|layout| {
                     crate::deepseek::parallel::v3_local_geometry(args, layout)
-                        .map_err(|error| invalid(error.to_string()))?,
-                    source_context,
-                ),
-                None => crate::deepseek::v3::V3Kernel::<B>::from_definition(
-                    args.clone(),
-                    extension.definition().clone(),
-                    source_context,
-                ),
-            }
+                        .map_err(|error| invalid(error.to_string()))
+                })
+                .transpose()?;
+            let source = crate::deepseek::v3::V3UnitFactory::from_definition(
+                args.clone(),
+                extension.definition().clone(),
+                source_geometry,
+            )
             .map_err(|error| invalid(error.to_string()))?;
             let target_layers =
                 usize::try_from(args.num_hidden_layers).map_err(|error| invalid(error.to_string()))?;
@@ -4584,11 +4582,10 @@ where
                 .state_layout()
                 .slice(target_layers..target_layers + extension.depth())
                 .map_err(|error| invalid(error.to_string()))?;
-            let local = crate::deepseek::v3::V3Kernel::<B>::from_parallel_definition(
+            let local = crate::deepseek::v3::V3UnitFactory::from_definition(
                 target_args,
                 definition,
-                geometry,
-                execution_context,
+                Some(geometry),
             )
             .map_err(|error| invalid(error.to_string()))?;
             let descriptor =
@@ -4599,10 +4596,10 @@ where
             let mut units = Vec::with_capacity(extension.depth());
             for depth in 0..extension.depth() {
                 let source_unit = source
-                    .construct_unit(depth + 1, 0, source_context)
+                    .construct_unit::<B>(depth + 1, 0, source_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 let mut local_unit = local
-                    .construct_unit(depth + 1, 0, execution_context)
+                    .construct_unit::<B>(depth + 1, 0, execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 if let crate::deepseek::v3::Unit::Prediction(prediction) = &mut local_unit {
                     if let crate::deepseek::block::V3FeedForward::Routed(moe) =

@@ -19,9 +19,7 @@ use eredu_runtime::{
 };
 use std::sync::Arc;
 
-use crate::decoder::{
-    DecoderStaticResources, PartitionStaticModules, StaticModuleSpec,
-};
+use crate::decoder::{DecoderStaticResources, PartitionStaticModules, StaticModuleSpec};
 
 use super::{
     block::V3Block,
@@ -243,296 +241,59 @@ pub enum TargetPartitionInput<'a, T> {
     },
 }
 
-/// Thin target-model architecture over the shared V3 block and generic
-/// resident/layerwise execution lifecycle.
-pub struct V3Kernel<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
-> {
+/// Validated V3 unit construction without pinned embedding or readout resources.
+/// Complete models and independently leased prediction units share this factory.
+pub struct V3UnitFactory {
     args: V3Args,
-    static_modules: PartitionStaticModules<B>,
     definition: Arc<eredu_runtime::ComponentDefinition>,
     parallel_geometry: Option<Arc<super::parallel::V3LocalGeometry>>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
-    partition_target_start: usize,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
-    V3Kernel<B>
-{
-    /// Materializes ordinary modules from the cold retained declaration.
+impl V3UnitFactory {
+    /// Retains the semantic definition and validates global or selected local geometry.
+    /// This step allocates no native modules.
     pub fn from_definition(
         args: V3Args,
         definition: Arc<eredu_runtime::ComponentDefinition>,
-        context: &<B::Tensor as Tensor>::Context,
+        geometry: Option<super::parallel::V3LocalGeometry>,
     ) -> Result<Self, Error> {
-        Self::materialize(args, definition, None, |_| Ok(None), context)
-    }
-    /// Materializes modules using the retained definition and authoritative local geometry.
-    pub fn from_parallel_definition(
-        args: V3Args,
-        definition: Arc<eredu_runtime::ComponentDefinition>,
-        geometry: super::parallel::V3LocalGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Self::materialize(args, definition, Some(geometry), |_| Ok(None), context)
-    }
-    /// Validates selected ownership before allocating its pinned resources.
-    pub fn from_partition_definition<G, A>(
-        args: V3Args,
-        definition: Arc<eredu_runtime::ComponentDefinition>,
-        geometry: super::parallel::V3LocalGeometry,
-        partition: &eredu_runtime::ArchitecturePartition<G, A>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Model<B>, Error> {
-        Self::materialize(
+        let definition = select_definition(&args, definition, geometry.as_ref())?;
+        Ok(Self {
             args,
             definition,
-            Some(geometry),
-            |definition| {
-                definition
-                    .select_partition(partition)
-                    .map(Some)
-                    .map_err(Error::from)
-            },
-            context,
-        )?
-        .into_partition_model(partition)
+            parallel_geometry: geometry.map(Arc::new),
+            expert_realization: None,
+        })
     }
 
-    fn materialize(
-        args: V3Args,
-        definition: Arc<eredu_runtime::ComponentDefinition>,
-        geometry: Option<super::parallel::V3LocalGeometry>,
-        select: impl FnOnce(
-            &eredu_runtime::ComponentDefinition,
-        ) -> Result<Option<eredu_runtime::ComponentSelection>, Error>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    fn require_operators<
+        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
+    >(
+        &self,
+    ) -> Result<(), Error> {
         crate::operator_requirements::require::<B>(
             "DeepSeek-V3",
-            if geometry.is_some() {
+            if self.parallel_geometry.is_some() {
                 crate::operator_requirements::DEEPSEEK_V3
                     .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL)
             } else {
                 crate::operator_requirements::DEEPSEEK_V3
             },
-        )?;
-        let definition = select_definition(&args, definition, geometry.as_ref())?;
-        let selection = select(&definition)?;
-        let partition_target_start = selection
-            .as_ref()
-            .and_then(|selection| selection.state())
-            .map_or(0, |state| state.global_layer_offset());
-        let static_modules = PartitionStaticModules::from_selected_spec(
-            static_spec(&args),
-            geometry.as_ref().map(|geometry| {
-                (
-                    geometry.embedding_range().clone(),
-                    Some(geometry.output_range().clone()),
-                )
-            }),
-            |role| {
-                selection.as_ref().is_none_or(|selection| {
-                    selection
-                        .owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
-                })
-            },
-            context,
-        )?;
-        Ok(Self {
-            definition,
-            args,
-            static_modules,
-            parallel_geometry: geometry.map(Arc::new),
-            expert_realization: None,
-            partition_target_start,
-        })
-    }
-
-    /// Returns the state layout matching the modules this instance builds.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        Ok(self.definition.state_layout().clone())
-    }
-
-    /// Borrows the validated declaration retained before native construction.
-    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        &self.definition
-    }
-
-    /// Borrows the shared rank-local geometry used by unit factories.
-    pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V3LocalGeometry>> {
-        self.parallel_geometry.clone()
-    }
-
-    /// Installs the architecture-derived expert realization used by every unit factory.
-    pub fn install_expert_realization(
-        &mut self,
-        realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-    ) {
-        self.expert_realization = Some(realization);
-    }
-
-    fn embedding_mut(&mut self) -> Result<&mut B::Embedding, Error> {
-        self.static_modules
-            .embeddings
-            .as_mut()
-            .ok_or_else(|| Error::backend("V3 does not own embedding storage"))
-    }
-    fn normalization_mut(&mut self) -> Result<&mut B::Normalization, Error> {
-        self.static_modules
-            .norm
-            .as_mut()
-            .ok_or_else(|| Error::backend("V3 does not own readout normalization"))
-    }
-    fn begin_input<S>(
-        &mut self,
-        input: EmbeddedInput<'_, B::Tensor>,
-        state: &mut S,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: CompressedAttentionCache<B::Tensor>,
-    {
-        if parallel.is_some() && self.parallel_geometry.is_none() {
-            return Err(Error::backend("V3 model was not built with local geometry"));
-        }
-        let expected = self.state_layout_impl()?;
-        if state.layout() != &expected {
-            return Err(Error::backend(format!(
-                "V3 runtime state layout {:?} does not match architecture layout {expected:?}",
-                state.layout()
-            )));
-        }
-        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
-            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
-            EmbeddedInput::Draft {
-                tokens,
-                hidden,
-                depth,
-            } => {
-                if depth >= self.definition.prediction_groups().len() {
-                    return Err(Error::backend(format!(
-                        "V3 prediction depth {depth} is outside {} groups",
-                        self.definition.prediction_groups().len()
-                    )));
-                }
-                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
-            }
-            EmbeddedInput::DsparkContext { .. } | EmbeddedInput::DsparkProposal { .. } => {
-                return Err(Error::backend(
-                    "DSpark input is only supported by DeepSeek-V4",
-                ));
-            }
-        };
-        let embedded = match parallel {
-            Some(parallel) => B::vocabulary_parallel_lookup(
-                self.embedding_mut()?,
-                tokens,
-                EmbeddingLookupPolicy::Strict,
-                parallel,
-                context,
-            )?,
-            None => self.embedding_mut()?.forward(tokens, context)?,
-        };
-        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
-        let sequence = embedded.dim(1);
-        let mask = if let Some(mask) = supplied_mask {
-            Some(mask.clone())
-        } else if matches!(mode, ForwardMode::Target) && sequence > 1 {
-            let offset = state.layer(0).map_err(Error::backend)?.offset();
-            Some(B::causal_mask(sequence, offset, None, context)?)
-        } else {
-            None
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                tokens: tokens.clone(),
-                embedded,
-                mask,
-                mode,
-                target_capture: None,
-                draft_logits: None,
-                draft_hidden: None,
-            },
-        })
-    }
-
-    /// Consumes the complete declaration, equations, and pinned resource aggregate.
-    pub fn into_model(self) -> Result<Model<B>, Error> {
-        ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
-            .map_err(Error::from)
-    }
-    /// Consumes exact partition ownership, retaining canonical resources and local state origin.
-    pub fn into_partition_model<G, A>(
-        mut self,
-        partition: &eredu_runtime::ArchitecturePartition<G, A>,
-    ) -> Result<Model<B>, Error> {
-        let selection = self.definition.select_partition(partition)?;
-        self.partition_target_start = selection
-            .state()
-            .map_or(0, |state| state.global_layer_offset());
-        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
-            "embedding".into(),
-        )) {
-            self.static_modules.embeddings = None;
-        }
-        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
-            "norm".into(),
-        )) {
-            self.static_modules.norm = None;
-        }
-        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
-            "output".into(),
-        )) {
-            self.static_modules.lm_head = None;
-        }
-        ComponentAdapter::with_partition_resources::<B, _, _>(
-            self.definition.clone(),
-            self,
-            partition,
         )
-        .map_err(Error::from)
     }
 
-    fn target_state_ordinal(&self, index: usize) -> Result<usize, Error> {
-        index
-            .checked_sub(self.partition_target_start)
-            .ok_or_else(|| {
-                Error::backend("V3 target unit precedes the selected partition state slice")
-            })
-    }
-
-    /// Returns the normalized V3 arguments.
-    pub const fn args(&self) -> &V3Args {
-        &self.args
-    }
-
-    /// Returns the prediction depth count declared by the execution graph.
-    pub fn mtp_len(&self) -> usize {
-        self.definition.prediction_groups().len()
-    }
-
-    /// Borrows pinned modules for neutral checkpoint binding.
-    pub const fn static_modules(&self) -> &PartitionStaticModules<B> {
-        &self.static_modules
-    }
-
-    /// Mutably borrows pinned modules for neutral checkpoint binding.
-    pub fn static_modules_mut(&mut self) -> &mut PartitionStaticModules<B> {
-        &mut self.static_modules
-    }
-
-    /// Constructs one target or prediction unit from this model's authoritative
-    /// global or rank-local geometry.
-    pub fn construct_unit(
+    /// Constructs only the addressed target or prediction resource.
+    pub fn construct_unit<B>(
         &self,
         group: usize,
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Unit<B>, Error> {
+    ) -> Result<Unit<B>, Error>
+    where
+        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
+    {
+        self.require_operators::<B>()?;
         self.definition.unit(group, index)?;
         let args = self
             .parallel_geometry
@@ -592,6 +353,286 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             }
         }
         Ok(unit)
+    }
+}
+
+/// Thin target-model architecture over the shared V3 block and generic
+/// resident/layerwise execution lifecycle.
+pub struct V3Kernel<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
+> {
+    construction: V3UnitFactory,
+    static_modules: PartitionStaticModules<B>,
+    partition_target_start: usize,
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
+    V3Kernel<B>
+{
+    /// Materializes ordinary modules from the cold retained declaration.
+    pub fn from_definition(
+        args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::materialize(args, definition, None, |_| Ok(None), context)
+    }
+    /// Materializes modules using the retained definition and authoritative local geometry.
+    pub fn from_parallel_definition(
+        args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: super::parallel::V3LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::materialize(args, definition, Some(geometry), |_| Ok(None), context)
+    }
+    /// Validates selected ownership before allocating its pinned resources.
+    pub fn from_partition_definition<G, A>(
+        args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: super::parallel::V3LocalGeometry,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        Self::materialize(
+            args,
+            definition,
+            Some(geometry),
+            |definition| {
+                definition
+                    .select_partition(partition)
+                    .map(Some)
+                    .map_err(Error::from)
+            },
+            context,
+        )?
+        .into_partition_model(partition)
+    }
+
+    fn materialize(
+        args: V3Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<super::parallel::V3LocalGeometry>,
+        select: impl FnOnce(
+            &eredu_runtime::ComponentDefinition,
+        ) -> Result<Option<eredu_runtime::ComponentSelection>, Error>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let construction = V3UnitFactory::from_definition(args, definition, geometry)?;
+        construction.require_operators::<B>()?;
+        let selection = select(&construction.definition)?;
+        let partition_target_start = selection
+            .as_ref()
+            .and_then(|selection| selection.state())
+            .map_or(0, |state| state.global_layer_offset());
+        let static_modules = PartitionStaticModules::from_selected_spec(
+            static_spec(&construction.args),
+            construction.parallel_geometry.as_ref().map(|geometry| {
+                (
+                    geometry.embedding_range().clone(),
+                    Some(geometry.output_range().clone()),
+                )
+            }),
+            |role| {
+                selection.as_ref().is_none_or(|selection| {
+                    selection
+                        .owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+                })
+            },
+            context,
+        )?;
+        Ok(Self {
+            construction,
+            static_modules,
+            partition_target_start,
+        })
+    }
+
+    /// Returns the state layout matching the modules this instance builds.
+    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
+        Ok(self.construction.definition.state_layout().clone())
+    }
+
+    /// Borrows the validated declaration retained before native construction.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.construction.definition
+    }
+
+    /// Borrows the shared rank-local geometry used by unit factories.
+    pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V3LocalGeometry>> {
+        self.construction.parallel_geometry.clone()
+    }
+
+    /// Installs the architecture-derived expert realization used by every unit factory.
+    pub fn install_expert_realization(
+        &mut self,
+        realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+    ) {
+        self.construction.expert_realization = Some(realization);
+    }
+
+    fn embedding_mut(&mut self) -> Result<&mut B::Embedding, Error> {
+        self.static_modules
+            .embeddings
+            .as_mut()
+            .ok_or_else(|| Error::backend("V3 does not own embedding storage"))
+    }
+    fn normalization_mut(&mut self) -> Result<&mut B::Normalization, Error> {
+        self.static_modules
+            .norm
+            .as_mut()
+            .ok_or_else(|| Error::backend("V3 does not own readout normalization"))
+    }
+    fn begin_input<S>(
+        &mut self,
+        input: EmbeddedInput<'_, B::Tensor>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: CompressedAttentionCache<B::Tensor>,
+    {
+        if parallel.is_some() && self.construction.parallel_geometry.is_none() {
+            return Err(Error::backend("V3 model was not built with local geometry"));
+        }
+        let expected = self.state_layout_impl()?;
+        if state.layout() != &expected {
+            return Err(Error::backend(format!(
+                "V3 runtime state layout {:?} does not match architecture layout {expected:?}",
+                state.layout()
+            )));
+        }
+        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
+            EmbeddedInput::Draft {
+                tokens,
+                hidden,
+                depth,
+            } => {
+                if depth >= self.construction.definition.prediction_groups().len() {
+                    return Err(Error::backend(format!(
+                        "V3 prediction depth {depth} is outside {} groups",
+                        self.construction.definition.prediction_groups().len()
+                    )));
+                }
+                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
+            }
+            EmbeddedInput::DsparkContext { .. } | EmbeddedInput::DsparkProposal { .. } => {
+                return Err(Error::backend(
+                    "DSpark input is only supported by DeepSeek-V4",
+                ));
+            }
+        };
+        let embedded = match parallel {
+            Some(parallel) => B::vocabulary_parallel_lookup(
+                self.embedding_mut()?,
+                tokens,
+                EmbeddingLookupPolicy::Strict,
+                parallel,
+                context,
+            )?,
+            None => self.embedding_mut()?.forward(tokens, context)?,
+        };
+        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
+        let sequence = embedded.dim(1);
+        let mask = if let Some(mask) = supplied_mask {
+            Some(mask.clone())
+        } else if matches!(mode, ForwardMode::Target) && sequence > 1 {
+            let offset = state.layer(0).map_err(Error::backend)?.offset();
+            Some(B::causal_mask(sequence, offset, None, context)?)
+        } else {
+            None
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                tokens: tokens.clone(),
+                embedded,
+                mask,
+                mode,
+                target_capture: None,
+                draft_logits: None,
+                draft_hidden: None,
+            },
+        })
+    }
+
+    /// Consumes the complete declaration, equations, and pinned resource aggregate.
+    pub fn into_model(self) -> Result<Model<B>, Error> {
+        ComponentAdapter::with_pinned_resources::<B>(self.construction.definition.clone(), self)
+            .map_err(Error::from)
+    }
+    /// Consumes exact partition ownership, retaining canonical resources and local state origin.
+    pub fn into_partition_model<G, A>(
+        mut self,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+    ) -> Result<Model<B>, Error> {
+        let selection = self.construction.definition.select_partition(partition)?;
+        self.partition_target_start = selection
+            .state()
+            .map_or(0, |state| state.global_layer_offset());
+        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
+            "embedding".into(),
+        )) {
+            self.static_modules.embeddings = None;
+        }
+        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
+            "norm".into(),
+        )) {
+            self.static_modules.norm = None;
+        }
+        if !selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(
+            "output".into(),
+        )) {
+            self.static_modules.lm_head = None;
+        }
+        ComponentAdapter::with_partition_resources::<B, _, _>(
+            self.construction.definition.clone(),
+            self,
+            partition,
+        )
+        .map_err(Error::from)
+    }
+
+    fn target_state_ordinal(&self, index: usize) -> Result<usize, Error> {
+        index
+            .checked_sub(self.partition_target_start)
+            .ok_or_else(|| {
+                Error::backend("V3 target unit precedes the selected partition state slice")
+            })
+    }
+
+    /// Returns the normalized V3 arguments.
+    pub const fn args(&self) -> &V3Args {
+        &self.construction.args
+    }
+
+    /// Returns the prediction depth count declared by the execution graph.
+    pub fn mtp_len(&self) -> usize {
+        self.construction.definition.prediction_groups().len()
+    }
+
+    /// Borrows pinned modules for neutral checkpoint binding.
+    pub const fn static_modules(&self) -> &PartitionStaticModules<B> {
+        &self.static_modules
+    }
+
+    /// Mutably borrows pinned modules for neutral checkpoint binding.
+    pub fn static_modules_mut(&mut self) -> &mut PartitionStaticModules<B> {
+        &mut self.static_modules
+    }
+
+    /// Constructs one target or prediction unit from this model's authoritative
+    /// global or rank-local geometry.
+    pub fn construct_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error> {
+        self.construction.construct_unit::<B>(group, index, context)
     }
 
     /// Starts a replicated target partition and returns its typed immutable
@@ -1084,7 +1125,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         };
         // A prepared target can omit prediction units from its own groups; the
         // typed extension supplies the admitted depth and prediction module.
-        let layer = (self.args.num_hidden_layers as usize)
+        let layer = (self.construction.args.num_hidden_layers as usize)
             .checked_add(depth)
             .ok_or_else(|| Error::backend("V3 prediction invocation index overflow"))?;
         let path = format!("model.layers.{layer}");
@@ -1135,7 +1176,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_with_provider(
                 hidden,
@@ -1150,7 +1191,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                 context,
             ),
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output = unit.forward_with_provider(
@@ -1197,7 +1239,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_parallel_with_provider(
                 hidden,
@@ -1213,7 +1255,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                 |value, context| B::sum_parallel(value, parallel, context),
             ),
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output = unit.forward_parallel_with_provider(
@@ -1309,7 +1352,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             ),
             Unit::Prediction(unit) if group > 0 => {
                 observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output = unit.forward_observed_with_provider(
@@ -1636,7 +1680,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<ModelStateIdentity, Self::Error> {
         state_identity(
-            &self.args,
+            &self.construction.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
@@ -1682,7 +1726,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         Ok(Some(vec![
             forward.tokens().dim(0),
             forward.tokens().dim(1),
-            self.args.hidden_size,
+            self.construction.args.hidden_size,
         ]))
     }
 }
@@ -1716,7 +1760,7 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.definition.prediction_groups().is_empty();
+        let target_only = self.construction.definition.prediction_groups().is_empty();
         eredu_runtime::inspection::ObservationHookSupport::internal(
             target_only,
             target_only,
@@ -1760,7 +1804,7 @@ where
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        super::component::begin_group(&self.definition, group, initial, dependencies)
+        super::component::begin_group(&self.construction.definition, group, initial, dependencies)
     }
     fn execute(
         &mut self,
@@ -1773,7 +1817,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         let group = address.group();
         let index = address.index();
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let cache = state
@@ -1782,7 +1826,8 @@ where
                 unit.forward(hidden, forward.mask.as_ref(), Some(cache), context)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output = unit.forward(
@@ -1885,7 +1930,7 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.definition.prediction_groups().is_empty();
+        let target_only = self.construction.definition.prediction_groups().is_empty();
         eredu_runtime::inspection::ObservationHookSupport::internal(
             target_only,
             target_only,
@@ -1934,7 +1979,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         let group = address.group();
         let index = address.index();
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => unit.forward_parallel(
                 hidden,
@@ -1948,7 +1993,8 @@ where
                 |value, context| B::sum_parallel(value, parallel, context),
             ),
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output = unit.forward_parallel(
@@ -2001,7 +2047,8 @@ where
             ),
             Unit::Prediction(unit) if group > 0 => {
                 observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output = unit.forward_parallel_observed(
@@ -2077,10 +2124,10 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn routed_unit_observations(&self) -> bool {
-        self.definition.prediction_groups().is_empty()
+        self.construction.definition.prediction_groups().is_empty()
     }
     fn routed_sparse_observations(&self) -> bool {
-        self.definition.prediction_groups().is_empty()
+        self.construction.definition.prediction_groups().is_empty()
     }
     fn execute_routed<P>(
         &mut self,
@@ -2134,10 +2181,10 @@ where
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
     fn parallel_routed_unit_observations(&self) -> bool {
-        self.definition.prediction_groups().is_empty()
+        self.construction.definition.prediction_groups().is_empty()
     }
     fn parallel_routed_sparse_observations(&self) -> bool {
-        self.definition.prediction_groups().is_empty()
+        self.construction.definition.prediction_groups().is_empty()
     }
     fn execute_parallel_routed<P>(
         &mut self,
@@ -2199,7 +2246,8 @@ where
             ),
             Unit::Prediction(unit) if group > 0 => {
                 observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output = unit.forward_parallel_observed_with_provider(
@@ -2242,7 +2290,7 @@ where
         &self,
         _tensor_parallel: bool,
     ) -> eredu_runtime::inspection::ObservationHookSupport {
-        let target_only = self.definition.prediction_groups().is_empty();
+        let target_only = self.construction.definition.prediction_groups().is_empty();
         eredu_runtime::inspection::ObservationHookSupport::internal(
             target_only,
             target_only,
@@ -2399,7 +2447,7 @@ where
         true
     }
     fn output_width(&self) -> i32 {
-        self.args.vocab_size
+        self.construction.args.vocab_size
     }
     fn begin_pipeline<'a, O>(
         &mut self,
