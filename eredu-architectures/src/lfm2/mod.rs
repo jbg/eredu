@@ -36,7 +36,7 @@ pub use parallel::{
     LocalGeometry, PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
 pub use partitioned::{
-    CompleteLfm2Geometry, CompleteLfm2Kernel, Lfm2Geometry, Lfm2Kernel, PartitionedLayeredModel,
+    project_parameters, CompleteLfm2Geometry, CompleteLfm2Kernel, Lfm2Geometry, Lfm2Kernel, PartitionedLayeredModel,
 };
 
 use crate::decoder::StaticModuleSpec;
@@ -63,7 +63,7 @@ pub fn component_definition(args: &ModelArgs) -> Result<eredu_runtime::Component
 
 /// Complete LFM2 execution through the shared typed component adapter.
 pub type LayeredModel<B> = eredu_runtime::ComponentAdapter<
-    eredu_runtime::ComponentDefinition,
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
     CompleteLfm2Kernel<B>,
     eredu_runtime::KernelParameterModules,
 >;

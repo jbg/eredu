@@ -9668,11 +9668,19 @@ supply exact canonical members and ownership before placement. Runtime expands
 selector resources and encoded projection companions through shared neutral
 geometry helpers. Routed partition preparation uses these declarations for both
 selected and transform-source layouts.
-Full LFM2 construction validates and retains the same component declaration
-before allocating pinned modules. Ordinary construction retains global state;
-tensor-parallel construction retains admitted local state and creates its pinned
-modules directly at that placement. Parameter discovery, execution addresses and
-unit counts project from this retained declaration.
+LFM2 complete, tensor-local and selected construction consumes the cold-admitted
+`Arc<ComponentDefinition>` through `CompleteLfm2Kernel::from_definition`,
+`from_parallel_definition` or `Lfm2Kernel::from_partition`. `lfm2::project_parameters`
+selects executable formats while preserving logical consumers and observation seams;
+identical projections reuse the allocation. Complete serial and tensor-local resources
+use one materializer. The complete and partitioned geometry views expose vocabulary,
+block and state ownership to one definition selector. It validates equation paths,
+state references, transport and hook ownership through runtime's execution contract,
+checks global or selected convolution/attention state, and verifies retained vocabulary
+and block placement. Shared partition selection validates canonical resources and
+state ownership before pinned allocation. Routed complete preparation and dense/routed
+partition preparation retain cold source/target definitions and independent layouts.
+Parameter discovery, execution addresses and unit counts project from that declaration.
 LFM2 derives expert ownership and local bank specifications directly from
 `ModelArgs`, optional validated `LocalGeometry` and rank topology. The operation
 has no backend type or native context. Replicated expert planning uses the same

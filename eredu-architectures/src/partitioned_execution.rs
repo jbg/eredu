@@ -9606,8 +9606,23 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: PartitionedArchitectureVisitor<B, S>,
 {
-    let parameters = crate::lfm2::dense_parameter_description(&selected_args)
+    if selected_args.has_sparse_moe_layers() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "dense LFM2 parameter topology does not accept routed layers".into(),
+        ));
+    }
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "LFM2 selection has no retained definition".into(),
+            )
+        })?;
+    let definition = crate::lfm2::project_parameters(&selected_args, &retained)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -9650,10 +9665,11 @@ where
                 crate::replicated_text::requirement_formats(selected.base().requirements()),
             )
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            let source_parameters = crate::lfm2::dense_parameter_description(&source_args)
+            let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
+            let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
                     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -9690,7 +9706,7 @@ where
             }
             let source_architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
                 source_args,
-                &source_parameters,
+                source_definition,
                 &source_partition,
                 context,
             )
@@ -9702,7 +9718,7 @@ where
         .transpose()?;
     let architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
         selected_args,
-        &parameters,
+        definition,
         &partition,
         context,
     )
@@ -10900,8 +10916,19 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: RoutedPartitionedProductionVisitor<B, S>,
 {
-    let parameters = crate::lfm2::parameter_description(&selected_args)
+    let retained = selected
+        .base()
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            DenseDecoderPartitionedDispatchError::Architecture(
+                "LFM2 selection has no retained definition".into(),
+            )
+        })?;
+    let definition = crate::lfm2::project_parameters(&selected_args, &retained)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -10957,8 +10984,9 @@ where
             crate::replicated_text::requirement_formats(selected.base().text().requirements()),
         )
         .map_err(error)?;
-        let source_parameters =
-            crate::lfm2::parameter_description(&source_args).map_err(|e| error(e.to_string()))?;
+        let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
+            .map_err(|e| error(e.to_string()))?;
+        let source_parameters = source_definition.parameters().clone();
         validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
@@ -11002,7 +11030,7 @@ where
         }
         let source = crate::lfm2::Lfm2Kernel::<B>::from_partition(
             source_args,
-            &source_parameters,
+            source_definition,
             &source_partition,
             context,
         )
@@ -11014,7 +11042,7 @@ where
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::lfm2::Lfm2Kernel::<B>::from_partition(
             selected_args,
-            &parameters,
+            definition,
             &partition,
             context,
         )
