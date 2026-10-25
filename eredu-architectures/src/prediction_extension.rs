@@ -4653,8 +4653,10 @@ where
             );
             let target_args =
                 crate::deepseek::v4_with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let parameters = crate::deepseek::parallel::v4_parameter_description(&target_args)
-                .map_err(|error| invalid(error.to_string()))?;
+            let definition =
+                crate::deepseek::v4::project_parameters(&target_args, extension.definition())
+                    .map_err(|error| invalid(error.to_string()))?;
+            let parameters = definition.parameters().clone();
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
                 .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v4_local_geometry(&target_args, &layout)
@@ -4668,11 +4670,10 @@ where
                         | eredu_runtime::WeightLoweringKind::DerivedTransform
                 )
             }) {
-                let source_parameters = crate::deepseek::parallel::v4_parameter_description(args)
-                    .map_err(|error| invalid(error.to_string()))?;
+                let source_parameters = extension.definition().parameters();
                 Some(std::sync::Arc::new(
                     crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                        &source_parameters,
+                        source_parameters,
                         &parameters,
                         tensor_rank,
                     )
@@ -4681,20 +4682,23 @@ where
             } else {
                 None
             };
-            let source = match &source_layout {
-                Some(layout) => crate::deepseek::v4::V4Kernel::<B>::new_parallel(
-                    args.clone(),
+            let source_geometry = source_layout
+                .as_ref()
+                .map(|layout| {
                     crate::deepseek::parallel::v4_local_geometry(args, layout)
-                        .map_err(|error| invalid(error.to_string()))?,
-                    source_context,
-                ),
-                None => crate::deepseek::v4::V4Kernel::<B>::new(args.clone(), source_context),
-            }
+                        .map_err(|error| invalid(error.to_string()))
+                })
+                .transpose()?;
+            let source = crate::deepseek::v4::V4UnitFactory::from_definition(
+                args.clone(),
+                extension.definition().clone(),
+                source_geometry,
+            )
             .map_err(|error| invalid(error.to_string()))?;
-            let local = crate::deepseek::v4::V4Kernel::<B>::new_parallel(
+            let local = crate::deepseek::v4::V4UnitFactory::from_definition(
                 target_args,
-                geometry,
-                execution_context,
+                definition,
+                Some(geometry),
             )
             .map_err(|error| invalid(error.to_string()))?;
             let target = usize::try_from(args.num_hidden_layers)
@@ -4709,10 +4713,10 @@ where
             for depth in 0..extension.depth() {
                 let ordinal = target + depth;
                 let source_unit = source
-                    .construct_unit(depth + 1, 0, source_context)
+                    .construct_unit::<B>(depth + 1, 0, source_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 let mut local_unit = local
-                    .construct_unit(depth + 1, 0, execution_context)
+                    .construct_unit::<B>(depth + 1, 0, execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 let policy = state_layout.layer(ordinal).cloned().ok_or_else(|| {
                     invalid(format!(
@@ -4766,15 +4770,18 @@ where
                 .map_err(|error| invalid(error.to_string()))?;
             if args.dspark.is_some() {
                 let strategy = DsparkPredictionStrategy::from_args(args)?;
-                let source_static =
-                    source.static_modules().dspark.clone().ok_or_else(|| {
-                        invalid("source DSpark model has no fused pinned modules")
+                let source_static = source
+                    .construct_dspark::<B>(source_context)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .ok_or_else(|| {
+                        invalid("source DSpark declaration has no fused pinned modules")
                     })?;
                 let local_static = local
-                    .static_modules()
-                    .dspark
-                    .clone()
-                    .ok_or_else(|| invalid("local DSpark model has no fused pinned modules"))?;
+                    .construct_dspark::<B>(execution_context)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .ok_or_else(|| {
+                        invalid("local DSpark declaration has no fused pinned modules")
+                    })?;
                 Ok(PreparedPredictionExtension::DeepSeekV4Dspark {
                     layout: std::sync::Arc::new(layout),
                     parameters: std::sync::Arc::new(parameters),

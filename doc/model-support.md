@@ -92,6 +92,13 @@ and external prediction preparation use its shared unit construction.
 consumers, observation seams and target/MTP state identities. Prediction-extension
 plans retain their complete validated declaration before target projection.
 
+Low-level DeepSeek-V4 `V4UnitFactory::from_definition` validates independent
+target/MTP/DSpark unit construction from a retained declaration and selected
+geometry. Kernels and external prediction preparation share this construction;
+DSpark retains its separately declared shared projections and heads.
+`deepseek::v4::project_parameters` preserves logical consumers, observation seams
+and state identities while selecting physical formats.
+
 Low-level Nemotron-H construction consumes a retained declaration through
 `CompleteNemotronKernel::from_definition`, `from_parallel_definition` or
 `NemotronKernel::from_partition`. `nemotron_h::component_definition` declares

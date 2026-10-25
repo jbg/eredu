@@ -1644,9 +1644,12 @@ fn select_definition(
             ));
         }
     }
-    super::component::validate(&definition, crate::transport::decoder(), |_, ordinal| {
-        format!("model.layers.{ordinal}")
-    })?;
+    super::component::validate(
+        &definition,
+        crate::transport::decoder(),
+        |_, ordinal| format!("model.layers.{ordinal}"),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
     if definition.state_layout() == &state {
         Ok(definition)
     } else {

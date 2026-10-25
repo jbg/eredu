@@ -8452,9 +8452,21 @@ Complete routed and dense/routed partition preparation retain source/target defi
 and independent layouts. Parameter discovery reads canonical parameter producers
 without constructing a throwaway execution definition.
 
+`V4UnitFactory` validates retained definitions, canonical parameters, observation
+ownership and global or selected pooling-attention state before native construction.
+V4 kernels delegate target, sequential MTP and fused DSpark unit construction to
+this factory. External V4 prediction preparation consumes the cold complete
+declaration and its physical-format projection, preserving source placement
+independently. It constructs prediction units without target embedding, final
+normalization, vocabulary output or target hyper-head resources. DSpark constructs
+its declared shared projections, hyper-head, Markov and confidence heads directly
+through the factory, under the ordinary shared-module residency and completion
+lifecycle. V4 parameter discovery uses the canonical parameter producer without
+constructing an execution definition.
+
 `PredictionExtensionPlan` retains a validated complete component declaration at cold
 admission, with matching extension kind and architecture. Its admission comparison
-includes that semantic contract alongside checkpoint provenance. V3 extension
+includes that semantic contract alongside checkpoint provenance. V3 and V4 extension
 materialization consumes this retained parent and projects selected formats and
 state; it keeps original source layout authority independently. Cold declarations
 for the other extension families remain available through the same plan interface.

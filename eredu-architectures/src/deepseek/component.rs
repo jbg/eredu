@@ -75,6 +75,11 @@ pub(super) fn validate(
     definition: &ComponentDefinition,
     target_transport: eredu_runtime::ArchitectureGroupTransport,
     path: impl Fn(ExecutionUnitAddress, usize) -> String,
+    observations: impl Fn(
+        ExecutionUnitAddress,
+        &ComponentUnit,
+        &eredu_runtime::UnitObservationBoundaries,
+    ) -> bool,
 ) -> Result<(), Error> {
     definition.validate_execution_contract(
         crate::decoder::TARGET_EXECUTION_GROUP,
@@ -82,7 +87,7 @@ pub(super) fn validate(
         &units(definition.parameters(), path),
         &transport(definition.parameters(), target_transport),
         &state_partition_plan(definition.parameters(), definition.state_layout()),
-        |_, _, boundaries| !boundaries.is_kernel_owned(),
+        observations,
     )?;
     Ok(())
 }

@@ -1422,9 +1422,8 @@ pub(super) fn v3_parameters(
 pub fn v4_parameter_description(
     args: &V4Args,
 ) -> Result<ArchitectureParameterDescription, eredu_nn::Error> {
-    Ok(super::v4::component_definition(args, None)?
-        .parameters()
-        .clone())
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    v4_parameters(args).map_err(eredu_nn::Error::backend_source)
 }
 
 pub(super) fn v4_parameters(

@@ -433,16 +433,133 @@ impl<T> ForwardContext<T> {
     }
 }
 
+/// Validated V4 unit and DSpark resource construction without target pinned modules.
+pub struct V4UnitFactory {
+    args: V4Args,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
+    parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
+}
+impl V4UnitFactory {
+    /// Retains the semantic definition and validates global or selected local geometry.
+    /// This step allocates no native modules.
+    pub fn from_definition(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<super::parallel::V4LocalGeometry>,
+    ) -> Result<Self, Error> {
+        let definition = select_definition(&args, definition, geometry.as_ref())?;
+        Ok(Self {
+            args,
+            definition,
+            parallel_geometry: geometry.map(Arc::new),
+            expert_realization: None,
+        })
+    }
+    fn require_operators<B>(&self) -> Result<(), Error>
+    where
+        B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    {
+        crate::operator_requirements::require::<B>(
+            "DeepSeek-V4",
+            if self.parallel_geometry.is_some() {
+                crate::operator_requirements::DEEPSEEK_V4
+                    .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL)
+            } else {
+                crate::operator_requirements::DEEPSEEK_V4
+            },
+        )
+    }
+    /// Constructs the declared fused-drafter projections and heads, when present.
+    pub fn construct_dspark<B>(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<DsparkStatic<B>>, Error>
+    where
+        B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    {
+        self.require_operators::<B>()?;
+        self.args
+            .dspark
+            .as_ref()
+            .map(|config| DsparkStatic::new(&self.args, config, context))
+            .transpose()
+    }
+    /// Constructs only the addressed target, sequential MTP or DSpark resource.
+    pub fn construct_unit<B>(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error>
+    where
+        B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    {
+        self.require_operators::<B>()?;
+        self.definition.unit(group, index)?;
+        let args = self
+            .parallel_geometry
+            .as_ref()
+            .map_or(&self.args, |geometry| geometry.args());
+        let owner_group = if group == 0 {
+            "target".to_owned()
+        } else {
+            format!("mtp.{}", group - 1)
+        };
+        let selected_spec = self
+            .expert_realization
+            .as_ref()
+            .and_then(|realization| realization.unit_spec(&owner_group, index))
+            .cloned();
+        if group == 0 && self.expert_realization.is_some() && selected_spec.is_none() {
+            return Err(Error::backend(format!(
+                "V4 expert realization has no bank for {owner_group}.{index}"
+            )));
+        }
+        let mut unit = if group == 0 {
+            let block = match selected_spec.clone() {
+                Some(spec) => V4Block::new_with_expert_spec(args, index, spec, context)?,
+                None => V4Block::new(args, index, context)?,
+            };
+            Unit::Target(block)
+        } else if self.args.dspark.is_some() {
+            let global =
+                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
+            Unit::Dspark(V4Block::new_at(
+                args,
+                global,
+                &format!("mtp.{}", group - 1),
+                None,
+                context,
+            )?)
+        } else {
+            Unit::Prediction(V4PredictionLayer::new(args, group - 1, context)?)
+        };
+        if group != 0 {
+            if let Some(realization) = &self.expert_realization {
+                let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
+                    Error::backend(format!(
+                        "V4 expert realization has no bank for {owner_group}.{index}"
+                    ))
+                })?;
+                let feed_forward = match &mut unit {
+                    Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
+                    Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
+                };
+                feed_forward.experts = B::grouped_gated_product(spec.clone(), context)?;
+            }
+        }
+        Ok(unit)
+    }
+}
+
 /// Thin V4 target-model architecture over the shared layered runtime.
 pub struct V4Kernel<B>
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
-    args: V4Args,
+    construction: V4UnitFactory,
     static_modules: StaticModules<B>,
-    definition: Arc<eredu_runtime::ComponentDefinition>,
-    parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
-    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
     partition_target_start: usize,
 }
 
@@ -547,7 +664,7 @@ where
         let boundary = self.routed_target_boundary(forward)?;
         if owns_output {
             let draft_hidden = complete_target_capture(
-                self.args.target_capture_policy.as_ref(),
+                self.construction.args.target_capture_policy.as_ref(),
                 hidden,
                 &boundary.captures.into_iter().map(Some).collect::<Vec<_>>(),
                 context,
@@ -563,7 +680,7 @@ where
                 &[
                     hidden.dim(0),
                     hidden.dim(1),
-                    self.args.hc_mult * self.args.hidden_size,
+                    self.construction.args.hc_mult * self.construction.args.hidden_size,
                 ],
                 context,
             )?;
@@ -582,8 +699,9 @@ where
             TargetPartitionInput::Tokens(tokens) => {
                 let embedded = self.lookup_tokens(tokens, parallel, context)?;
                 let embedded = instrumentation.apply("embedding", embedded)?;
-                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
                 let captures = (0..self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -591,7 +709,11 @@ where
                     .map(|_| {
                         B::Tensor::full_f32(
                             0.0,
-                            &[tokens.dim(0), tokens.dim(1), self.args.hidden_size],
+                            &[
+                                tokens.dim(0),
+                                tokens.dim(1),
+                                self.construction.args.hidden_size,
+                            ],
                             context,
                         )
                     })
@@ -606,8 +728,8 @@ where
                     &[
                         hidden.dim(0),
                         hidden.dim(1),
-                        self.args.hc_mult,
-                        self.args.hidden_size,
+                        self.construction.args.hc_mult,
+                        self.construction.args.hidden_size,
                     ],
                     context,
                 )?;
@@ -637,18 +759,13 @@ where
 
     /// Builds unloaded pinned V4 modules.
     pub fn new(args: V4Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "DeepSeek-V4",
-            crate::operator_requirements::DEEPSEEK_V4,
-        )?;
         let definition = Arc::new(component_definition(&args, None)?);
-        let text = TextStaticModules::from_spec(text_static_spec(&args), context)?;
+        let construction = V4UnitFactory::from_definition(args, definition, None)?;
+        construction.require_operators::<B>()?;
+        let text = TextStaticModules::from_spec(text_static_spec(&construction.args), context)?;
         Ok(Self {
-            definition,
-            static_modules: static_modules(&args, text, context)?,
-            args,
-            parallel_geometry: None,
-            expert_realization: None,
+            static_modules: static_modules(&construction, text, context)?,
+            construction,
             partition_target_start: 0,
         })
     }
@@ -659,24 +776,22 @@ where
         geometry: super::parallel::V4LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "DeepSeek-V4",
-            crate::operator_requirements::DEEPSEEK_V4
-                .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL),
-        )?;
         let definition = Arc::new(component_definition(&args, Some(&geometry))?);
+        let construction = V4UnitFactory::from_definition(args, definition, Some(geometry))?;
+        construction.require_operators::<B>()?;
+        let geometry = construction
+            .parallel_geometry
+            .as_ref()
+            .expect("selected parallel geometry");
         let text = TextStaticModules::from_parallel_spec(
-            text_static_spec(&args),
+            text_static_spec(&construction.args),
             geometry.embedding_range().clone(),
             Some(geometry.output_range().clone()),
             context,
         )?;
         Ok(Self {
-            definition,
-            static_modules: static_modules(&args, text, context)?,
-            args,
-            parallel_geometry: Some(Arc::new(geometry)),
-            expert_realization: None,
+            static_modules: static_modules(&construction, text, context)?,
+            construction,
             partition_target_start: 0,
         })
     }
@@ -691,13 +806,13 @@ where
     ) -> Result<B::Tensor, Error> {
         if group == 0 && matches!(forward.mode, ForwardMode::Target) {
             forward.target_capture = Some(complete_target_capture(
-                self.args.target_capture_policy.as_ref(),
+                self.construction.args.target_capture_policy.as_ref(),
                 hidden,
                 &forward.captures,
                 context,
             )?);
         }
-        if group == self.definition.prediction_groups().len()
+        if group == self.construction.definition.prediction_groups().len()
             && matches!(forward.mode, ForwardMode::DsparkProposal)
         {
             let dspark = self
@@ -737,7 +852,7 @@ where
 
     /// Consumes the complete semantic declaration, equations, and canonical pinned resources.
     pub fn into_model(self) -> Result<Model<B>, Error> {
-        ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
+        ComponentAdapter::with_pinned_resources::<B>(self.construction.definition.clone(), self)
             .map_err(Error::from)
     }
 
@@ -746,7 +861,7 @@ where
         mut self,
         partition: &eredu_runtime::ArchitecturePartition<G, A>,
     ) -> Result<Model<B>, Error> {
-        let selected = self.definition.select_partition(partition)?;
+        let selected = self.construction.definition.select_partition(partition)?;
         self.partition_target_start = selected
             .state()
             .map_or(0, |state| state.global_layer_offset());
@@ -771,7 +886,7 @@ where
             self.static_modules.dspark = None;
         }
         ComponentAdapter::with_partition_resources::<B, _, _>(
-            self.definition.clone(),
+            self.construction.definition.clone(),
             self,
             partition,
         )
@@ -780,17 +895,17 @@ where
 
     /// Returns the state layout matching the modules this instance builds.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        Ok(self.definition.state_layout().clone())
+        Ok(self.construction.definition.state_layout().clone())
     }
 
     /// Borrows the validated declaration retained before native construction.
     pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
-        &self.definition
+        &self.construction.definition
     }
 
     /// Borrows rank-local geometry for resident and streamed unit factories.
     pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V4LocalGeometry>> {
-        self.parallel_geometry.clone()
+        self.construction.parallel_geometry.clone()
     }
 
     /// Installs the architecture-derived expert realization used by every unit factory.
@@ -798,7 +913,7 @@ where
         &mut self,
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) {
-        self.expert_realization = Some(realization);
+        self.construction.expert_realization = Some(realization);
     }
 
     fn target_state_ordinal(&self, index: usize) -> Result<usize, Error> {
@@ -811,12 +926,12 @@ where
 
     /// Returns the normalized V4 arguments.
     pub const fn args(&self) -> &V4Args {
-        &self.args
+        &self.construction.args
     }
 
     /// Returns the prediction depth count declared by the execution graph.
     pub fn mtp_len(&self) -> usize {
-        self.definition.prediction_groups().len()
+        self.construction.definition.prediction_groups().len()
     }
 
     /// Returns the maximum number of draft tokens emitted by one proposal.
@@ -825,8 +940,8 @@ where
     /// block instead emits the checkpoint-declared block width, independently
     /// of the number of blocks used to compute it.
     pub fn draft_proposal_capacity(&self) -> usize {
-        self.args.dspark.as_ref().map_or_else(
-            || self.definition.prediction_groups().len(),
+        self.construction.args.dspark.as_ref().map_or_else(
+            || self.construction.definition.prediction_groups().len(),
             |config| {
                 usize::try_from(config.block_size).expect("validated DSpark block size is positive")
             },
@@ -851,60 +966,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
-        self.definition.unit(group, index)?;
-        let args = self
-            .parallel_geometry
-            .as_ref()
-            .map_or(&self.args, |geometry| geometry.args());
-        let owner_group = if group == 0 {
-            "target".to_owned()
-        } else {
-            format!("mtp.{}", group - 1)
-        };
-        let selected_spec = self
-            .expert_realization
-            .as_ref()
-            .and_then(|realization| realization.unit_spec(&owner_group, index))
-            .cloned();
-        if group == 0 && self.expert_realization.is_some() && selected_spec.is_none() {
-            return Err(Error::backend(format!(
-                "V4 expert realization has no bank for {owner_group}.{index}"
-            )));
-        }
-        let mut unit = if group == 0 {
-            let block = match selected_spec.clone() {
-                Some(spec) => V4Block::new_with_expert_spec(args, index, spec, context)?,
-                None => V4Block::new(args, index, context)?,
-            };
-            Unit::Target(block)
-        } else if self.args.dspark.is_some() {
-            let global =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
-            Unit::Dspark(V4Block::new_at(
-                args,
-                global,
-                &format!("mtp.{}", group - 1),
-                None,
-                context,
-            )?)
-        } else {
-            Unit::Prediction(V4PredictionLayer::new(args, group - 1, context)?)
-        };
-        if group != 0 {
-            if let Some(realization) = &self.expert_realization {
-                let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
-                    Error::backend(format!(
-                        "V4 expert realization has no bank for {owner_group}.{index}"
-                    ))
-                })?;
-                let feed_forward = match &mut unit {
-                    Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
-                    Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
-                };
-                feed_forward.experts = B::grouped_gated_product(spec.clone(), context)?;
-            }
-        }
-        Ok(unit)
+        self.construction.construct_unit::<B>(group, index, context)
     }
 
     fn lookup_tokens(
@@ -948,6 +1010,7 @@ where
     {
         let expected = match parallel {
             Some(_) => self
+                .construction
                 .parallel_geometry
                 .as_ref()
                 .ok_or_else(|| Error::backend("V4 model was not built with local geometry"))?
@@ -965,7 +1028,7 @@ where
             EmbeddedInput::Target { tokens, mask } => {
                 let embedded = self.lookup_tokens(tokens, parallel, context)?;
                 let embedded = instrumentation.apply("embedding", embedded)?;
-                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
                 (
                     tokens.clone(),
                     embedded,
@@ -979,7 +1042,8 @@ where
                 hidden,
                 depth,
             } => {
-                if self.args.dspark.is_some() || depth >= self.definition.prediction_groups().len()
+                if self.construction.args.dspark.is_some()
+                    || depth >= self.construction.definition.prediction_groups().len()
                 {
                     return Err(Error::backend(format!(
                         "V4 sequential prediction depth {depth} is unavailable"
@@ -994,7 +1058,7 @@ where
                 )
             }
             EmbeddedInput::DsparkContext { captures } => {
-                validate_dspark_target_capture(&self.args, captures)?;
+                validate_dspark_target_capture(&self.construction.args, captures)?;
                 let dspark = self
                     .static_modules
                     .dspark
@@ -1003,7 +1067,7 @@ where
                 let main = dspark
                     .main_norm
                     .forward(&dspark.main_projection.forward(captures, context)?, context)?;
-                let hidden = broadcast_streams::<B>(&main, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&main, &self.construction.args, context)?;
                 (
                     captures.clone(),
                     main,
@@ -1014,6 +1078,7 @@ where
             }
             EmbeddedInput::DsparkProposal { anchor, capacity } => {
                 let config = self
+                    .construction
                     .args
                     .dspark
                     .as_ref()
@@ -1033,7 +1098,7 @@ where
                     B::Tensor::concatenate(&[anchor.clone(), noise], 1, context)?
                 };
                 let embedded = self.lookup_tokens(&input_ids, parallel, context)?;
-                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
                 let mask = Some(dspark_bidirectional_mask::<B::Tensor>(capacity, context)?);
                 (
                     input_ids,
@@ -1055,6 +1120,7 @@ where
                 draft_logits: None,
                 draft_hidden: None,
                 captures: self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -1077,7 +1143,7 @@ where
             .as_mut()
             .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
             .forward(tokens, context)?;
-        broadcast_streams::<B>(&embedded, &self.args, context)
+        broadcast_streams::<B>(&embedded, &self.construction.args, context)
     }
 
     /// Applies vocabulary-parallel lookup and architecture-owned stream broadcast.
@@ -1098,7 +1164,7 @@ where
             parallel,
             context,
         )?;
-        broadcast_streams::<B>(&embedded, &self.args, context)
+        broadcast_streams::<B>(&embedded, &self.construction.args, context)
     }
 
     /// Collapses hyper streams, applies the final norm, and projects logits on
@@ -1556,8 +1622,8 @@ where
                 &[
                     hidden.dim(0),
                     hidden.dim(1),
-                    self.args.hc_mult,
-                    self.args.hidden_size,
+                    self.construction.args.hc_mult,
+                    self.construction.args.hidden_size,
                 ],
                 context,
             )
@@ -1577,7 +1643,7 @@ where
             &[
                 output.hidden.dim(0),
                 output.hidden.dim(1),
-                self.args.hc_mult * self.args.hidden_size,
+                self.construction.args.hc_mult * self.construction.args.hidden_size,
             ],
             context,
         )?;
@@ -1630,7 +1696,7 @@ where
         if units.len() != caches.len() {
             return Err(Error::backend("DSpark unit/cache count mismatch"));
         }
-        validate_dspark_target_capture(&self.args, captures)?;
+        validate_dspark_target_capture(&self.construction.args, captures)?;
         let dspark = self
             .static_modules
             .dspark
@@ -1639,7 +1705,7 @@ where
         let main = dspark
             .main_norm
             .forward(&dspark.main_projection.forward(captures, context)?, context)?;
-        let hidden = broadcast_streams::<B>(&main, &self.args, context)?;
+        let hidden = broadcast_streams::<B>(&main, &self.construction.args, context)?;
         for (unit, cache) in units.iter_mut().zip(caches) {
             let Unit::Dspark(unit) = unit.as_mut() else {
                 return Err(Error::backend("DSpark context received a non-DSpark unit"));
@@ -1705,6 +1771,7 @@ where
         I: crate::prediction_extension::invocation::PredictionModuleInvoker<B, Unit<B>, C>,
     {
         if self
+            .construction
             .args
             .target_capture_policy
             .as_ref()
@@ -1740,7 +1807,7 @@ where
         let main = instrumentation.apply("normalized", main)?;
         let hidden = instrumentation.apply(
             "streams",
-            broadcast_streams::<B>(&main, &self.args, context)?,
+            broadcast_streams::<B>(&main, &self.construction.args, context)?,
         )?;
         for (depth, (unit, cache)) in units.iter_mut().zip(caches).enumerate() {
             I::invoke(
@@ -1908,7 +1975,7 @@ where
         let embedded = instrumentation.apply("embedding", embedded)?;
         let mut hidden = instrumentation.apply(
             "input",
-            broadcast_streams::<B>(&embedded, &self.args, context)?,
+            broadcast_streams::<B>(&embedded, &self.construction.args, context)?,
         )?;
         for (depth, (unit, cache)) in units.iter_mut().zip(caches).enumerate() {
             hidden = I::invoke(
@@ -2171,6 +2238,7 @@ where
         ) -> Result<B::Tensor, Error>,
     {
         let config = self
+            .construction
             .args
             .dspark
             .as_ref()
@@ -2203,7 +2271,7 @@ where
             parallel,
             context,
         )?;
-        let mut hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+        let mut hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
         for (unit, cache) in units.iter_mut().zip(caches) {
             let Unit::Dspark(unit) = unit.as_mut() else {
                 return Err(Error::backend("DSpark proposal received a non-DSpark unit"));
@@ -2256,6 +2324,7 @@ where
         ) -> Result<B::Tensor, Error>,
     {
         let config = self
+            .construction
             .args
             .dspark
             .as_ref()
@@ -2284,7 +2353,7 @@ where
             .as_mut()
             .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
             .forward(&input_ids, context)?;
-        let mut hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+        let mut hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
         for (unit, cache) in units.iter_mut().zip(caches) {
             let Unit::Dspark(unit) = unit.as_mut() else {
                 return Err(Error::backend("DSpark proposal received a non-DSpark unit"));
@@ -2332,7 +2401,7 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_with_provider(
@@ -2349,7 +2418,7 @@ where
                     context,
                 )?;
                 capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
+                    self.construction.args.target_capture_policy.as_ref(),
                     index,
                     &hidden,
                     &mut forward.captures,
@@ -2362,7 +2431,8 @@ where
                     self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
                         Error::backend("V4 does not own vocabulary output storage")
                     })?;
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output =
@@ -2388,7 +2458,8 @@ where
                 Ok(output.hidden)
             }
             Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let cache = state
@@ -2446,7 +2517,7 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_parallel_with_provider(
@@ -2464,7 +2535,7 @@ where
                     |value, context| B::sum_parallel(value, parallel, context),
                 )?;
                 capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
+                    self.construction.args.target_capture_policy.as_ref(),
                     index,
                     &hidden,
                     &mut forward.captures,
@@ -2473,7 +2544,8 @@ where
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let head =
@@ -2505,7 +2577,8 @@ where
                 Ok(output.hidden)
             }
             Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let cache = state
@@ -2576,6 +2649,7 @@ where
                     observer,
                 )?;
                 if let Some(position) = self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -2588,7 +2662,8 @@ where
                 Ok(output)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let head =
@@ -2621,7 +2696,7 @@ where
                 observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
                 let output = <Self as ComponentEquations<B, S>>::execute(
                     self,
-                    self.definition.unit_address(group, index)?,
+                    self.construction.definition.unit_address(group, index)?,
                     unit,
                     hidden,
                     state,
@@ -2680,6 +2755,7 @@ where
                     observer,
                 )?;
                 if let Some(position) = self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -2692,7 +2768,8 @@ where
                 Ok(output)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output_head =
@@ -2725,7 +2802,8 @@ where
             }
             Unit::Dspark(unit) if group > 0 => {
                 observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let cache = state
@@ -2783,13 +2861,14 @@ fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
 }
 
 fn static_modules<B>(
-    args: &V4Args,
+    construction: &V4UnitFactory,
     text: TextStaticModules<B>,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<StaticModules<B>, Error>
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
+    let args = &construction.args;
     let hyper_head = HyperHead::new(
         HyperHeadSpec {
             streams: args.hc_mult,
@@ -2802,11 +2881,7 @@ where
         },
         context,
     )?;
-    let dspark = args
-        .dspark
-        .as_ref()
-        .map(|config| DsparkStatic::new(args, config, context))
-        .transpose()?;
+    let dspark = construction.construct_dspark::<B>(context)?;
     Ok(StaticModules {
         text: text.into(),
         hyper_head: Some(hyper_head),
@@ -3161,28 +3236,135 @@ pub fn component_definition(
         parameters,
         state,
         target_group_transport(),
-        |address, _ordinal| {
-            if address.group() == 0 {
-                format!("layers.{}", address.index())
-            } else {
-                format!("mtp.{}", address.group() - 1)
-            }
-        },
+        unit_path,
     )?;
-    let target_group = definition
-        .parameters()
-        .graph()
-        .group_index(definition.primary_group())
-        .expect("validated primary group");
     definition
         .map_unit_observation_boundaries(|address, boundaries| {
-            if address.group() == target_group || args.dspark.is_none() {
+            if kernel_observations(args, address) {
                 boundaries.clone().with_kernel_ownership()
             } else {
                 boundaries.clone()
             }
         })
         .map_err(Error::from)
+}
+
+fn unit_path(address: ExecutionUnitAddress, _ordinal: usize) -> String {
+    if address.group() == 0 {
+        format!("layers.{}", address.index())
+    } else {
+        format!("mtp.{}", address.group() - 1)
+    }
+}
+fn kernel_observations(args: &V4Args, address: ExecutionUnitAddress) -> bool {
+    address.group() == 0 || args.dspark.is_none()
+}
+
+/// Selects executable formats while preserving logical consumers and observation seams.
+pub fn project_parameters(
+    args: &V4Args,
+    definition: &Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    super::component::project_parameters(
+        "deepseek_v4",
+        super::parallel::v4_parameters(args).map_err(Error::backend_source)?,
+        definition,
+    )
+}
+fn invalid_definition(
+    definition: &eredu_runtime::ComponentDefinition,
+    resource: impl Into<String>,
+) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn select_definition(
+    args: &V4Args,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::parallel::V4LocalGeometry>,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    if definition.id() != "deepseek_v4" {
+        return Err(invalid_definition(
+            &definition,
+            "DeepSeek-V4 component identity",
+        ));
+    }
+    definition.validate_parameter_topology(
+        &super::parallel::v4_parameters(args).map_err(Error::backend_source)?,
+    )?;
+    let global = state_layout(args)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => global.clone(),
+    };
+    if definition.state_layout() != &global && definition.state_layout() != &state {
+        return Err(invalid_definition(
+            &definition,
+            "V4 retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained =
+            super::parallel::v4_local_geometry(args, layout).map_err(Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: args.vocab_size as usize,
+            local: 0..args.vocab_size as usize,
+        };
+        let selected = geometry.map_or(args, super::parallel::V4LocalGeometry::args);
+        let actual = retained.args();
+        if retained.state_layout() != &state
+            || retained.embedding_range()
+                != geometry.map_or(&full, super::parallel::V4LocalGeometry::embedding_range)
+            || retained.output_range()
+                != geometry.map_or(&full, super::parallel::V4LocalGeometry::output_range)
+            || actual.num_attention_heads != selected.num_attention_heads
+            || actual.o_groups != selected.o_groups
+            || actual.moe_intermediate_size != selected.moe_intermediate_size
+            || geometry.is_some_and(|geometry| {
+                retained.routed_expert_intermediate_range()
+                    != geometry.routed_expert_intermediate_range()
+                    || retained.shared_expert_intermediate_range()
+                        != geometry.shared_expert_intermediate_range()
+            })
+        {
+            return Err(invalid_definition(
+                &definition,
+                "V4 retained placement differs from selected geometry",
+            ));
+        }
+    }
+    super::component::validate(
+        &definition,
+        target_group_transport(),
+        unit_path,
+        |address, unit, boundaries| {
+            if kernel_observations(args, address) {
+                boundaries
+                    == &eredu_runtime::UnitObservationBoundaries::around(&unit.path)
+                        .with_kernel_ownership()
+            } else {
+                !boundaries.is_kernel_owned()
+            }
+        },
+    )?;
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(Arc::new)
+            .map_err(Error::from)
+    }
 }
 
 impl<B> ComponentKernel<B> for V4Kernel<B>
@@ -3207,7 +3389,7 @@ where
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<ModelStateIdentity, Self::Error> {
         state_identity(
-            &self.args,
+            &self.construction.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
@@ -3237,16 +3419,20 @@ where
         forward: &Self::ForwardContext,
     ) -> Result<Option<Vec<i32>>, Self::Error> {
         let input = forward.input_ids();
-        let shape = match &self.args.target_capture_policy {
+        let shape = match &self.construction.args.target_capture_policy {
             Some(policy) => vec![
                 input.dim(0),
                 input.dim(1),
                 i32::try_from(policy.len())
                     .map_err(|_| Error::backend("target capture count exceeds i32"))?
-                    .checked_mul(self.args.hidden_size)
+                    .checked_mul(self.construction.args.hidden_size)
                     .ok_or_else(|| Error::backend("target capture width overflowed"))?,
             ],
-            None => vec![input.dim(0), input.dim(1), self.args.hidden_size],
+            None => vec![
+                input.dim(0),
+                input.dim(1),
+                self.construction.args.hidden_size,
+            ],
         };
         Ok(Some(shape))
     }
@@ -3317,7 +3503,7 @@ where
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let complete = self.args.dspark.is_none();
+        let complete = self.construction.args.dspark.is_none();
         eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
     }
     fn begin<'a>(
@@ -3362,7 +3548,7 @@ where
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        super::component::begin_group(&self.definition, group, initial, dependencies)
+        super::component::begin_group(&self.construction.definition, group, initial, dependencies)
     }
     fn execute(
         &mut self,
@@ -3375,7 +3561,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         let group = address.group();
         let index = address.index();
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward(
@@ -3390,7 +3576,7 @@ where
                     context,
                 )?;
                 capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
+                    self.construction.args.target_capture_policy.as_ref(),
                     index,
                     &hidden,
                     &mut forward.captures,
@@ -3403,7 +3589,8 @@ where
                     self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
                         Error::backend("V4 does not own vocabulary output storage")
                     })?;
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output =
@@ -3427,7 +3614,8 @@ where
                 Ok(output.hidden)
             }
             Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let cache = state
@@ -3540,7 +3728,7 @@ where
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let complete = self.args.dspark.is_none();
+        let complete = self.construction.args.dspark.is_none();
         eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
     }
     fn begin_parallel<'a>(
@@ -3590,7 +3778,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         let group = address.group();
         let index = address.index();
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_parallel(
@@ -3606,7 +3794,7 @@ where
                     |value, context| B::sum_parallel(value, parallel, context),
                 )?;
                 capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
+                    self.construction.args.target_capture_policy.as_ref(),
                     index,
                     &hidden,
                     &mut forward.captures,
@@ -3615,7 +3803,8 @@ where
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let output =
@@ -3649,7 +3838,8 @@ where
                 Ok(output.hidden)
             }
             Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
                 let cache = state
@@ -3699,7 +3889,7 @@ where
     {
         let group = address.group();
         let index = address.index();
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         if let Unit::Target(block) = unit {
             if group != 0 {
                 return Err(Error::backend(
@@ -3721,6 +3911,7 @@ where
                 |value, context| B::sum_parallel(value, parallel, context),
             )?;
             if let Some(position) = self
+                .construction
                 .args
                 .target_capture_policy
                 .as_ref()
@@ -3737,8 +3928,10 @@ where
                     "V4 prediction unit selected in target group",
                 ));
             }
-            let layer =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
+            let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                .map_err(Error::backend)?
+                + group
+                - 1;
             let head = self
                 .static_modules
                 .text
@@ -3771,7 +3964,7 @@ where
             observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
             let output = <Self as ParallelComponentKernel<B, S>>::execute_parallel(
                 self,
-                self.definition.unit_address(group, index)?,
+                self.construction.definition.unit_address(group, index)?,
                 unit,
                 hidden,
                 state,
@@ -3855,10 +4048,10 @@ where
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
     fn routed_unit_observations(&self) -> bool {
-        self.args.dspark.is_none()
+        self.construction.args.dspark.is_none()
     }
     fn routed_sparse_observations(&self) -> bool {
-        self.args.dspark.is_none()
+        self.construction.args.dspark.is_none()
     }
     fn execute_routed<P>(
         &mut self,
@@ -3912,10 +4105,10 @@ where
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
     fn parallel_routed_unit_observations(&self) -> bool {
-        self.args.dspark.is_none()
+        self.construction.args.dspark.is_none()
     }
     fn parallel_routed_sparse_observations(&self) -> bool {
-        self.args.dspark.is_none()
+        self.construction.args.dspark.is_none()
     }
     fn execute_parallel_routed<P>(
         &mut self,
@@ -3959,7 +4152,7 @@ where
     {
         let group = address.group();
         let index = address.index();
-        self.definition.unit(group, index)?;
+        self.construction.definition.unit(group, index)?;
         if let Unit::Target(block) = unit {
             if group != 0 {
                 return Err(Error::backend(
@@ -3983,6 +4176,7 @@ where
                 |value, context| B::sum_parallel(value, parallel, context),
             )?;
             if let Some(position) = self
+                .construction
                 .args
                 .target_capture_policy
                 .as_ref()
@@ -3999,8 +4193,10 @@ where
                     "V4 prediction unit selected in target group",
                 ));
             }
-            let layer =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
+            let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                .map_err(Error::backend)?
+                + group
+                - 1;
             let head = self
                 .static_modules
                 .text
@@ -4059,7 +4255,7 @@ where
         &self,
         _tensor_parallel: bool,
     ) -> eredu_runtime::inspection::ObservationHookSupport {
-        let complete = self.args.dspark.is_none();
+        let complete = self.construction.args.dspark.is_none();
         eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
     }
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
@@ -4203,7 +4399,7 @@ where
         }
     }
     fn output_width(&self) -> i32 {
-        self.args.vocab_size
+        self.construction.args.vocab_size
     }
     fn tensor_vocabulary_sharded(&self) -> bool {
         true
