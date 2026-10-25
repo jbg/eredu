@@ -321,7 +321,7 @@ pub fn local_geometry(
 /// interval is materialized or used for admission on this rank.
 pub fn partition(
     config: &FamilyConfig,
-    parameters: &eredu_runtime::ArchitectureParameterDescription,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     layout: &LocalModelLayout,
     units: std::ops::Range<usize>,
     ownership: eredu_runtime::PartitionOwnership,
@@ -330,15 +330,10 @@ pub fn partition(
     ParallelPlanError,
 > {
     let geometry = local_geometry(config, layout, units.clone())?;
-    let definition = super::model::component_definition(config, Some(&geometry))
+    let definition = super::model::select_definition(config, definition, Some(&geometry))
         .map_err(|error| invalid(error.to_string()))?;
-    if parameters != definition.parameters() {
-        return Err(invalid(
-            "diffusion text partition changes canonical parameter ownership",
-        ));
-    }
     eredu_runtime::ArchitecturePartition::from_description(
-        parameters,
+        definition.parameters(),
         [(super::model::TEXT_EXECUTION_GROUP, units)],
         ownership,
         definition.state_layout(),

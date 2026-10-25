@@ -25,8 +25,15 @@ where
     selected_args.text.quantized_weights = None;
     let formats = crate::replicated_text::selected_formats(selected.base().text());
     selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
-    let parameters = crate::diffusion_gemma::parallel::parameter_description(&selected_args)
+    let retained = selected
+        .base()
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("shared iterative selection has no retained definition"))?;
+    let definition = crate::diffusion_gemma::model::project_parameters(&selected_args, &retained)
         .map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -55,7 +62,7 @@ where
         .ok_or_else(|| architecture("shared iterative partition has no context slots"))?;
     let partition = crate::diffusion_gemma::parallel::partition(
         &selected_args,
-        &parameters,
+        definition.clone(),
         &layout,
         owned.units(),
         selected.requirements().ownership().clone(),
@@ -68,12 +75,10 @@ where
                 | eredu_runtime::WeightLoweringKind::DerivedTransform
         )
     }) {
-        let source_parameters =
-            crate::diffusion_gemma::parallel::parameter_description(args).map_err(architecture)?;
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
+        let source_parameters = retained.parameters();
+        validate_transform_parameter_space(source_parameters, &parameters).map_err(architecture)?;
         let source_layout =
-            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+            derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
                 .map_err(architecture)?;
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
@@ -92,7 +97,7 @@ where
         .ok_or_else(|| architecture("source shared stack has no routed bank"))?;
         let source_partition = crate::diffusion_gemma::parallel::partition(
             args,
-            &source_parameters,
+            retained.clone(),
             &source_layout,
             owned.units(),
             selected.requirements().ownership().clone(),
@@ -107,6 +112,7 @@ where
         }
         let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
+            retained.clone(),
             &source_partition,
             context,
         )
@@ -124,6 +130,7 @@ where
     let effective_model_type = "diffusion_gemma".to_owned();
     let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
         selected_args,
+        definition,
         &partition,
         context,
     )
@@ -171,8 +178,14 @@ where
     selected_args.text.quantized_weights = None;
     let formats = crate::replicated_text::selected_formats(selected.base());
     selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
-    let parameters = crate::diffusion_gemma::parallel::parameter_description(&selected_args)
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("shared iterative selection has no retained definition"))?;
+    let definition = crate::diffusion_gemma::model::project_parameters(&selected_args, &retained)
         .map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -194,7 +207,7 @@ where
         .ok_or_else(|| architecture("shared iterative partition has no context slots"))?;
     let partition = crate::diffusion_gemma::parallel::partition(
         &selected_args,
-        &parameters,
+        definition.clone(),
         &layout,
         owned.units(),
         selected.requirements().ownership().clone(),
@@ -207,12 +220,10 @@ where
                 | eredu_runtime::WeightLoweringKind::DerivedTransform
         )
     }) {
-        let source_parameters =
-            crate::diffusion_gemma::parallel::parameter_description(args).map_err(architecture)?;
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
+        let source_parameters = retained.parameters();
+        validate_transform_parameter_space(source_parameters, &parameters).map_err(architecture)?;
         let source_layout =
-            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+            derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
                 .map_err(architecture)?;
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
@@ -224,7 +235,7 @@ where
         }
         let source_partition = crate::diffusion_gemma::parallel::partition(
             args,
-            &source_parameters,
+            retained.clone(),
             &source_layout,
             owned.units(),
             selected.requirements().ownership().clone(),
@@ -239,6 +250,7 @@ where
         }
         let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
+            retained.clone(),
             &source_partition,
             context,
         )
@@ -252,6 +264,7 @@ where
     let effective_model_type = "diffusion_gemma".to_owned();
     let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
         selected_args,
+        definition,
         &partition,
         context,
     )

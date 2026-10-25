@@ -12797,3 +12797,20 @@ allocation. Partition construction consumes those declarations and their state
 rules. Composite construction supplies an explicit child text declaration to the
 same materializers. Image assembly and cross-component state transport remain
 family-owned.
+
+DiffusionGemma text materializers consume the retained text declaration for
+complete, tensor-local and partitioned execution. `model::project_parameters`
+selects exact executable parameter geometry while retaining operation identities,
+mutable-state slots, observation seams and logical references. Unchanged formats
+reuse the retained allocation. Dense and routed preparation share the admitted
+source declaration with transformation sources and use the same projection for
+their selected resources.
+
+The family validates equation paths, state-slot references, transport and hook
+ownership before materializing native text modules. Canonical resource topology
+uses the shared runtime validator. Local geometry projects only the selected
+context dimensions, preserving global ordinals and the declaration's state rules.
+Feedback parameters remain independently declared input-owner resources. Routed
+bank plans, encoder visibility and transient refinement semantics remain family
+policies. Composite assembly supplies an explicit child text declaration to these
+same materializers.

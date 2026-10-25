@@ -105,7 +105,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
             &definition,
             partition.parameter_bindings(),
         )?;
-        let text = TextKernel::materialize(config.clone(), Some(geometry.text.clone()), context)?;
+        let text_definition = std::sync::Arc::new(
+            crate::diffusion_gemma::model::component_definition(&config, Some(&geometry.text))?,
+        );
+        let text = TextKernel::materialize(
+            config.clone(), text_definition, Some(geometry.text.clone()), context,
+        )?;
         let image = ImageStatic::materialize(
             &config,
             roles.contains("vision"),

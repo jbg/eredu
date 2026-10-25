@@ -631,12 +631,27 @@ where
     let identity = target.architecture_fingerprint();
     let capability =
         crate::capability::diffusion_gemma(&target).map_err(|error| error.to_string())?;
+    let retained = selected
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or("shared iterative selection has no retained definition")?;
     let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
-        .then(|| crate::diffusion_gemma::model::TextKernel::<B>::new(config.clone(), context))
+        .then(|| {
+            crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
+                config.clone(),
+                retained.clone(),
+                context,
+            )
+        })
         .transpose()
         .map_err(|error| error.to_string())?;
-    let architecture = crate::diffusion_gemma::model::TextKernel::<B>::new(target, context)
+    let definition = crate::diffusion_gemma::model::project_parameters(&target, &retained)
         .map_err(|error| error.to_string())?;
+    let architecture = crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
+        target, definition, context,
+    )
+    .map_err(|error| error.to_string())?;
     if expected.text().block_refinement()
         != eredu_runtime::ReplicatedTextArchitecture::<B, S>::block_refinement_geometry(
             &architecture,

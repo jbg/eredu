@@ -291,10 +291,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Model<B>, Error> {
         let definition = std::sync::Arc::new(component_definition(&config, None)?);
+        let text_definition =
+            std::sync::Arc::new(super::model::component_definition(&config, None)?);
         let kernel = Self {
             definition,
             statics: StaticModules {
-                text: TextKernel::materialize(config.clone(), None, context)?,
+                text: TextKernel::materialize(config.clone(), text_definition, None, context)?,
                 image: ImageStatic::new(&config, context)?,
             },
             config,

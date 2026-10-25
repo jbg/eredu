@@ -218,7 +218,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let mut resident = ResidentRuntime::<Model, Backend, State>::new(
-        TextKernel::<Backend>::new(config.clone(), stream)?,
+        TextKernel::<Backend>::from_definition(
+            config.clone(),
+            std::sync::Arc::new(diffusion_gemma::model::component_definition(&config, None)?),
+            stream,
+        )?,
         stream,
     )?;
     load(

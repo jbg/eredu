@@ -2369,8 +2369,19 @@ where
     validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     visitor.construction_started();
+    let retained = requirements.shared_component_definition().ok_or_else(|| {
+        ReplicatedTextDispatchError::Architecture(
+            "shared iterative selection has no retained definition".into(),
+        )
+    })?;
     let source = selected_uses_transform(&selected)
-        .then(|| crate::diffusion_gemma::model::TextKernel::<B>::new(config.clone(), context))
+        .then(|| {
+            crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
+                config.clone(),
+                retained.clone(),
+                context,
+            )
+        })
         .transpose()
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     let mut target = config.clone();
@@ -2381,8 +2392,12 @@ where
     let identity = target.architecture_fingerprint();
     let capability = crate::capability::diffusion_gemma(&target)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let architecture = crate::diffusion_gemma::model::TextKernel::<B>::new(target, context)
+    let definition = crate::diffusion_gemma::model::project_parameters(&target, &retained)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let architecture = crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
+        target, definition, context,
+    )
+    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     let prepared = prepare_architecture_handoff::<B, S, _>(
         architecture,
         source,

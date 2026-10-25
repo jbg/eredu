@@ -19,6 +19,7 @@ use eredu_runtime::PartitionComponentKernel as _;
 
 /// Stable identity of the shared encoder/refinement execution stack.
 pub const TEXT_EXECUTION_GROUP: &str = "shared_text";
+const TEXT_COMPONENT_ID: &str = "diffusion_gemma_text";
 
 /// Shared-stack placement, with decoder-only feedback retained on the input owner.
 pub(crate) fn text_transport() -> eredu_runtime::ArchitectureGroupTransport {
@@ -46,14 +47,9 @@ pub fn component_definition(
     };
     let layers = config.text.num_hidden_layers();
     eredu_runtime::ComponentDefinition::new(
-        "diffusion_gemma_text",
+        TEXT_COMPONENT_ID,
         super::parallel::parameter_description(config).map_err(Error::backend_source)?,
-        (0..layers)
-            .map(|index| eredu_runtime::ComponentUnit {
-                path: format!("model.decoder.layers.{index}"),
-                state: index..index + 1,
-            })
-            .collect(),
+        (0..layers).map(text_unit).collect(),
         vec![text_transport()],
         TEXT_EXECUTION_GROUP,
         vec![],
@@ -61,6 +57,91 @@ pub fn component_definition(
         text_state_partition_plan(layers),
     )
     .map_err(Error::from)
+}
+
+fn text_unit(index: usize) -> eredu_runtime::ComponentUnit {
+    eredu_runtime::ComponentUnit {
+        path: format!("model.decoder.layers.{index}"),
+        state: index..index + 1,
+    }
+}
+
+/// Projects exact executable formats without replacing retained invocation or state identities.
+pub fn project_parameters(
+    config: &FamilyConfig,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_text_identity(definition)?;
+    let parameters =
+        super::parallel::parameter_description(config).map_err(Error::backend_source)?;
+    if definition.parameters() == &parameters {
+        return Ok(definition.clone());
+    }
+    let uses = definition.parameter_uses().clone();
+    definition
+        .as_ref()
+        .clone()
+        .with_parameters(parameters, uses)
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+fn validate_text_identity(definition: &eredu_runtime::ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != TEXT_COMPONENT_ID {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "shared text component identity".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+pub(super) fn select_definition(
+    config: &FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::parallel::LocalGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_text_identity(&definition)?;
+    definition.validate_parameter_topology(
+        &super::parallel::parameter_description(config).map_err(Error::backend_source)?,
+    )?;
+    let layers = config.text.num_hidden_layers();
+    if definition.primary_group() != TEXT_EXECUTION_GROUP
+        || !definition.prediction_groups().is_empty()
+        || definition.group_transport(0)? != &text_transport()
+        || definition.state_partition_plan() != &text_state_partition_plan(layers)
+        || (0..layers).any(|index| {
+            !definition
+                .unit(0, index)
+                .is_ok_and(|unit| unit == &text_unit(index))
+                || !definition
+                    .unit_observation_boundaries(0, index)
+                    .is_ok_and(|boundary| !boundary.is_kernel_owned())
+        })
+    {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "shared text equation geometry".into(),
+        }
+        .into());
+    }
+    let state = match geometry {
+        Some(geometry) => geometry
+            .complete_state_layout(config)
+            .map_err(Error::backend_source)?,
+        None => super::state_layout(config).map_err(Error::backend_source)?,
+    };
+    if definition.state_layout() == &state {
+        Ok(definition)
+    } else {
+        definition
+            .as_ref()
+            .clone()
+            .with_state_layout(state)
+            .map(std::sync::Arc::new)
+            .map_err(Error::from)
+    }
 }
 
 fn text_state_partition_plan(layers: usize) -> eredu_runtime::ArchitectureStatePartitionPlan {
@@ -335,11 +416,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextKernel<B>
     }
 
     /// Materializes one complete text component over the retained declaration.
-    pub fn new(
+    pub fn from_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextModel<B>, Error> {
-        let kernel = Self::materialize(config, None, context)?;
+        let kernel = Self::materialize(config, definition, None, context)?;
         eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(
             std::sync::Arc::clone(&kernel.definition),
             kernel,
@@ -348,12 +430,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextKernel<B>
     }
 
     /// Materializes a tensor-local stack using the roles retained by its geometry.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: super::parallel::LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextModel<B>, Error> {
-        let definition = std::sync::Arc::new(component_definition(&config, Some(&geometry))?);
+        let definition = select_definition(&config, definition, Some(&geometry))?;
         let units = geometry.units();
         let mut roles = vec![];
         if geometry.embedding_range().is_some() {
@@ -390,16 +473,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextKernel<B>
     /// Constructs the exact canonical resources and independent local state selected by a partition.
     pub fn from_partition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<
             super::parallel::LocalGeometry,
             super::boundary::TextBoundarySchema,
         >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextModel<B>, Error> {
-        let definition = std::sync::Arc::new(component_definition(
-            &config,
-            Some(partition.local_geometry()),
-        )?);
+        let definition = select_definition(&config, definition, Some(partition.local_geometry()))?;
         Self::materialize_selected(config, partition, definition, context)
     }
 
@@ -454,10 +535,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextKernel<B>
     // Composite equations borrow the same kernel directly, under their enclosing component lifecycle.
     pub(super) fn materialize(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<super::parallel::LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = std::sync::Arc::new(component_definition(&config, geometry.as_ref())?);
+        let definition = select_definition(&config, definition, geometry.as_ref())?;
         let statics = match &geometry {
             Some(geometry) => TextStatic::new_parallel(&config, geometry, context)?,
             None => TextStatic::new(&config, context)?,
