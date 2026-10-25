@@ -12709,3 +12709,18 @@ take precedence over internal unit namespaces when assigning observation owners.
 Body residual captures and post-normalization output captures can therefore belong
 to different pipeline stages while shared parameters retain one canonical owner
 per physical placement. Local and other-rank inspection use one projection path.
+
+Composite cold admission consumes the same source-free component constructors as
+family execution. Nemotron Labs Diffusion, DiffusionGemma, Gemma 4, Inkling, Muse,
+Qwen3-VL and conditional Qwen hybrid project graph dependencies, unit counts,
+transport roles and canonical state from their validated definitions. Artifact
+normalization retains checkpoint naming, recipes and precision policy as separate
+inputs to the shared requirement builder.
+
+`CompositeTextRequirements` exposes graph, unit, transport and state views through
+its retained execution requirements. It stores no separate copies of those
+projections. The canonical component definition supplies invocation and state
+ownership; selected receiver-cache geometry remains an explicit architecture-owned
+state view. Gemma pipeline admission retains its declared receiver replicas through
+that view. Media processing, numerical equations and coupled scheduling remain
+family-owned.

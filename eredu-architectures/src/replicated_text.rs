@@ -4570,22 +4570,45 @@ fn replicated_text_requirements_for_config(
     replicated_text_requirements_for_structure(inspection, config, None)
 }
 
-type ReplicatedExecutionStructure = (
-    eredu_runtime::ExecutionGraph,
-    eredu_runtime::ExecutionUnitLayout,
-    Vec<eredu_runtime::ArchitectureGroupTransport>,
-    eredu_runtime::StateLayout,
-);
-
 fn replicated_text_requirements_for_structure(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     config: EligibleConfig<'_>,
-    structure: Option<ReplicatedExecutionStructure>,
+    component: Option<eredu_runtime::ComponentDefinition>,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
     let plan = inspection.architecture_plan();
     let normalized = artifact::normalize(inspection, &config)?;
-    let (execution_graph, execution_units, group_transports, state_layout) = match structure {
-        Some(structure) => structure,
+    let component = match (component, &config) {
+        (Some(component), _) => Some(component),
+        (None, EligibleConfig::Nanbeige(args)) => Some(
+            crate::decoder::decoder_component_definition(
+                *args,
+                crate::decoder::dense_parameter_description(*args).map_err(|error| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                })?,
+                crate::decoder::state_layout(*args).map_err(|error| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                })?,
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?,
+        ),
+        _ => None,
+    };
+    let (execution_graph, execution_units, group_transports, state_layout) = match &component {
+        Some(definition) => (
+            definition.parameters().graph().clone(),
+            definition.parameters().unit_layout().clone(),
+            (0..definition.parameters().graph().groups().len())
+                .map(|group| {
+                    definition
+                        .group_transport(group)
+                        .expect("declared transport")
+                        .clone()
+                })
+                .collect(),
+            definition.state_layout().clone(),
+        ),
         None => {
             let graph = eredu_runtime::ExecutionGraph::chain([config.execution_group()]).map_err(
                 |error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()),
@@ -4611,10 +4634,9 @@ fn replicated_text_requirements_for_structure(
     let floating_source = crate::preparation::prepared_floating_state_dtype_source(inspection)
         .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
     let state_partition_plan = match &config {
-        EligibleConfig::Muse(args) => Some(crate::muse::model::state_partition_plan(
-            args,
-            &state_layout,
-        )),
+        EligibleConfig::Muse(args) if component.is_none() => Some(
+            crate::muse::model::state_partition_plan(args, &state_layout),
+        ),
         _ => None,
     };
     let mut requirements = ReplicatedTextRequirements::new(
@@ -4646,15 +4668,7 @@ fn replicated_text_requirements_for_structure(
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
             })?;
     }
-    if let EligibleConfig::Nanbeige(args) = &config {
-        let definition = crate::decoder::decoder_component_definition(
-            *args,
-            crate::decoder::dense_parameter_description(*args).map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-            })?,
-            requirements.state_layout().clone(),
-        )
-        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
+    if let Some(definition) = component {
         requirements = requirements
             .with_component_definition(definition)
             .map_err(|error| {
@@ -6190,10 +6204,6 @@ pub enum CompositeTextDecoderStrategy {
 #[derive(Debug, Clone)]
 pub struct CompositeTextRequirements {
     architecture_identity: String,
-    execution_graph: eredu_runtime::ExecutionGraph,
-    execution_units: eredu_runtime::ExecutionUnitLayout,
-    group_transports: Vec<eredu_runtime::ArchitectureGroupTransport>,
-    state_layout: eredu_runtime::StateLayout,
     input_modalities: InputModalities,
     decoder: CompositeTextDecoderStrategy,
     raw_processor: bool,
@@ -6208,10 +6218,6 @@ pub struct CompositeTextRequirements {
 impl PartialEq for CompositeTextRequirements {
     fn eq(&self, other: &Self) -> bool {
         self.architecture_identity == other.architecture_identity
-            && self.execution_graph == other.execution_graph
-            && self.execution_units == other.execution_units
-            && self.group_transports == other.group_transports
-            && self.state_layout == other.state_layout
             && self.input_modalities == other.input_modalities
             && self.decoder == other.decoder
             && self.raw_processor == other.raw_processor
@@ -6241,10 +6247,6 @@ impl CompositeTextRequirements {
         partition_boundaries.validate(execution.execution_graph(), execution.execution_units())?;
         Ok(Self {
             architecture_identity,
-            execution_graph: execution.execution_graph().clone(),
-            execution_units: execution.execution_units().clone(),
-            group_transports: execution.group_transports().to_vec(),
-            state_layout: execution.state_layout().clone(),
             input_modalities,
             decoder: CompositeTextDecoderStrategy::Routed,
             raw_processor: inspection.architecture_plan().has_processor(),
@@ -6278,7 +6280,6 @@ impl CompositeTextRequirements {
             .routed
             .map(|routed| routed.with_state_layout(layout.clone()))
             .transpose()?;
-        self.state_layout = layout;
         Ok(self)
     }
 
@@ -6298,22 +6299,22 @@ impl CompositeTextRequirements {
 
     /// Canonical composite execution graph.
     pub const fn execution_graph(&self) -> &eredu_runtime::ExecutionGraph {
-        &self.execution_graph
+        self.execution.execution_graph()
     }
 
     /// Exact unit geometry in canonical group order.
     pub const fn execution_units(&self) -> &eredu_runtime::ExecutionUnitLayout {
-        &self.execution_units
+        self.execution.execution_units()
     }
 
     /// Architecture-owned transport, kind, and optional-root declarations.
     pub fn group_transports(&self) -> &[eredu_runtime::ArchitectureGroupTransport] {
-        &self.group_transports
+        self.execution.group_transports()
     }
 
     /// Complete target mutable-state geometry.
     pub const fn state_layout(&self) -> &eredu_runtime::StateLayout {
-        &self.state_layout
+        self.execution.state_layout()
     }
 
     /// Modalities admitted by the normalized architecture and artifact.
@@ -6963,273 +6964,22 @@ impl CompositeConfig<'_> {
         }
     }
 
-    fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
+    fn component_definition(&self) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
         match self {
             Self::NemotronLabsDiffusion(args) => {
-                crate::decoder::state_layout(*args).map_err(|error| error.to_string())
+                crate::nemotron_labs_diffusion::definition::composite(args, None)
             }
             Self::Diffusion(args) => {
-                crate::diffusion_gemma::state_layout(args).map_err(|error| error.to_string())
+                crate::diffusion_gemma::composite::component_definition(args, None)
             }
-            Self::Gemma4(args) => {
-                crate::gemma4::state_layout(&args.text).map_err(|error| error.to_string())
-            }
-            Self::Inkling(args) => {
-                let target =
-                    crate::inkling::state_layout(args).map_err(|error| error.to_string())?;
-                let prediction =
-                    crate::inkling::mtp_state_layout(args).map_err(|error| error.to_string())?;
-                crate::inkling::composite_state_layout(&target, prediction.as_ref())
-                    .map_err(|error| error.to_string())
-            }
-            Self::Muse(args) => crate::muse::state_layout(args).map_err(|error| error.to_string()),
-            Self::QwenVl(args) => {
-                crate::qwen::vl::state_layout(args).map_err(|error| error.to_string())
-            }
+            Self::Gemma4(args) => crate::gemma4::model::component_definition(args, None),
+            Self::Inkling(args) => crate::inkling::model::component_definition(args, None),
+            Self::Muse(args) => crate::muse::model::component_definition(args, None),
+            Self::QwenVl(args) => crate::qwen::vl::component_definition(args, None),
             Self::QwenHybrid(args) => {
-                crate::qwen::hybrid::state_layout(&args.text).map_err(|error| error.to_string())
+                crate::qwen::hybrid::conditional_component_definition(args, None)
             }
         }
-    }
-
-    fn graph_and_units(
-        &self,
-    ) -> Result<
-        (
-            eredu_runtime::ExecutionGraph,
-            eredu_runtime::ExecutionUnitLayout,
-            Vec<eredu_runtime::ArchitectureGroupTransport>,
-        ),
-        String,
-    > {
-        use eredu_runtime::{
-            ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-            ArchitectureMergeDestination, ArchitectureParallelSubgroup, ExecutionGraph,
-            ExecutionGroupSpec, ExecutionUnitLayout,
-        };
-        let media = |kind, roles: Vec<&str>| ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind,
-            first_owner_static_roles: roles.into_iter().map(str::to_owned).collect(),
-            last_owner_static_roles: Vec::new(),
-            merge_destination: ArchitectureMergeDestination::FirstPipelineOwner,
-            parallel_subgroup: Some(ArchitectureParallelSubgroup::TensorSharded),
-            request_optional: true,
-        };
-        let (graph, counts, transports) = match self {
-            Self::NemotronLabsDiffusion(args) => {
-                let (graph, _) = crate::nemotron_labs_diffusion::parallel::composite_graph(args)
-                    .map_err(|error| error.to_string())?;
-                (
-                    graph,
-                    vec![
-                        args.vision.as_ref().unwrap().num_hidden_layers as usize,
-                        1,
-                        args.num_hidden_layers() as usize,
-                    ],
-                    (0..3)
-                        .map(crate::nemotron_labs_diffusion::parallel::group_transport)
-                        .collect(),
-                )
-            }
-            Self::Diffusion(args) => {
-                let (graph, _) = crate::diffusion_gemma::composite::graph(args)
-                    .map_err(|error| error.to_string())?;
-                (
-                    graph,
-                    vec![
-                        args.vision
-                            .as_ref()
-                            .map_or(0, |v| v.num_hidden_layers as usize),
-                        args.text.num_hidden_layers(),
-                    ],
-                    vec![
-                        crate::diffusion_gemma::composite::vision_transport(),
-                        crate::diffusion_gemma::model::text_transport(),
-                    ],
-                )
-            }
-            Self::Gemma4(args) => {
-                let graph = ExecutionGraph::new(
-                    vec![
-                        ExecutionGroupSpec::root(crate::gemma4::model::VISION_EXECUTION_GROUP),
-                        ExecutionGroupSpec::root(crate::gemma4::model::AUDIO_EXECUTION_GROUP),
-                        ExecutionGroupSpec::with_dependencies(
-                            crate::gemma4::model::TEXT_EXECUTION_GROUP,
-                            [
-                                crate::gemma4::model::VISION_EXECUTION_GROUP,
-                                crate::gemma4::model::AUDIO_EXECUTION_GROUP,
-                            ],
-                        ),
-                    ],
-                    crate::gemma4::model::TEXT_EXECUTION_GROUP,
-                )
-                .map_err(|error| error.to_string())?;
-                let counts = vec![
-                    args.vision
-                        .as_ref()
-                        .map_or(0, |vision| vision.num_hidden_layers as usize),
-                    args.audio
-                        .as_ref()
-                        .map_or(0, |audio| audio.num_hidden_layers as usize),
-                    args.text.num_hidden_layers(),
-                ];
-                let decoder = ArchitectureGroupTransport {
-                    placement: ArchitectureGroupPlacement::Pipeline,
-                    kind: ArchitectureGroupKind::Decoder,
-                    first_owner_static_roles: vec![
-                        "embedding".into(),
-                        "per_layer_embedding".into(),
-                        "per_layer_projection".into(),
-                        "per_layer_norm".into(),
-                    ],
-                    last_owner_static_roles: if args.text.tie_word_embeddings {
-                        vec!["norm".into(), "embedding".into()]
-                    } else {
-                        vec!["norm".into(), "output".into()]
-                    },
-                    merge_destination: ArchitectureMergeDestination::LastOwner,
-                    parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
-                    request_optional: false,
-                };
-                (
-                    graph,
-                    counts,
-                    vec![
-                        crate::gemma4::pipeline::media_transport(args, 0),
-                        crate::gemma4::pipeline::media_transport(args, 1),
-                        decoder,
-                    ],
-                )
-            }
-            Self::Inkling(args) => {
-                let graph = ExecutionGraph::new(
-                    vec![
-                        ExecutionGroupSpec::root(crate::inkling::model::VISION_EXECUTION_GROUP),
-                        ExecutionGroupSpec::root(crate::inkling::model::AUDIO_EXECUTION_GROUP),
-                        ExecutionGroupSpec::with_dependencies(
-                            crate::inkling::model::TEXT_EXECUTION_GROUP,
-                            [
-                                crate::inkling::model::VISION_EXECUTION_GROUP,
-                                crate::inkling::model::AUDIO_EXECUTION_GROUP,
-                            ],
-                        ),
-                    ],
-                    crate::inkling::model::TEXT_EXECUTION_GROUP,
-                )
-                .map_err(|error| error.to_string())?;
-                let decoder = ArchitectureGroupTransport {
-                    placement: ArchitectureGroupPlacement::Pipeline,
-                    kind: ArchitectureGroupKind::Decoder,
-                    first_owner_static_roles: vec!["embedding".into(), "embedding_norm".into()],
-                    last_owner_static_roles: vec![
-                        "norm".into(),
-                        "output".into(),
-                        crate::inkling::model::MTP_STATIC_ROLE.into(),
-                    ],
-                    merge_destination: ArchitectureMergeDestination::LastOwner,
-                    parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
-                    request_optional: false,
-                };
-                (
-                    graph,
-                    vec![
-                        args.vision_config
-                            .as_ref()
-                            .map_or(0, |vision| vision.num_hidden_layers as usize),
-                        0,
-                        args.text_config.num_hidden_layers as usize,
-                    ],
-                    vec![
-                        media(ArchitectureGroupKind::VisionEncoder, vec!["vision"]),
-                        ArchitectureGroupTransport {
-                            placement: ArchitectureGroupPlacement::Pipeline,
-                            kind: ArchitectureGroupKind::AudioEncoder,
-                            first_owner_static_roles: vec!["audio".into()],
-                            last_owner_static_roles: Vec::new(),
-                            merge_destination: ArchitectureMergeDestination::FirstPipelineOwner,
-                            parallel_subgroup: None,
-                            request_optional: true,
-                        },
-                        decoder,
-                    ],
-                )
-            }
-            Self::Muse(args) => {
-                let graph =
-                    crate::muse::graph::execution_graph(args).map_err(|error| error.to_string())?;
-                let mut counts = vec![
-                    args.vision_config
-                        .as_ref()
-                        .map_or(0, |vision| vision.layer_count()),
-                    args.num_hidden_layers as usize,
-                ];
-                let mut transports = vec![
-                    crate::muse::model::vision_group_transport(args),
-                    crate::transport::decoder(),
-                ];
-                if let Some(audio) = &args.audio_config {
-                    counts.push(
-                        audio
-                            .execution_units()
-                            .map_err(|error| error.to_string())?
-                            .len(),
-                    );
-                    transports.push(crate::muse::model::audio_group_transport());
-                }
-                (graph, counts, transports)
-            }
-            Self::QwenVl(args) => {
-                let graph = ExecutionGraph::new(
-                    vec![
-                        ExecutionGroupSpec::root(crate::qwen::vl::VISION_EXECUTION_GROUP),
-                        ExecutionGroupSpec::with_dependencies(
-                            crate::qwen::vl::TEXT_EXECUTION_GROUP,
-                            [crate::qwen::vl::VISION_EXECUTION_GROUP],
-                        ),
-                    ],
-                    crate::qwen::vl::TEXT_EXECUTION_GROUP,
-                )
-                .map_err(|error| error.to_string())?;
-                (
-                    graph,
-                    vec![
-                        args.vision.layer_count(),
-                        args.text.num_hidden_layers as usize,
-                    ],
-                    vec![
-                        media(ArchitectureGroupKind::VisionEncoder, vec!["vision"]),
-                        crate::transport::decoder(),
-                    ],
-                )
-            }
-            Self::QwenHybrid(args) => {
-                let vision = args.vision.as_ref().ok_or_else(|| {
-                    "conditional Qwen composite omitted vision geometry".to_owned()
-                })?;
-                let graph = ExecutionGraph::new(
-                    vec![
-                        ExecutionGroupSpec::root(crate::qwen::hybrid::VISION_EXECUTION_GROUP),
-                        ExecutionGroupSpec::with_dependencies(
-                            crate::decoder::TARGET_EXECUTION_GROUP,
-                            [crate::qwen::hybrid::VISION_EXECUTION_GROUP],
-                        ),
-                    ],
-                    crate::decoder::TARGET_EXECUTION_GROUP,
-                )
-                .map_err(|error| error.to_string())?;
-                (
-                    graph,
-                    vec![vision.layer_count(), args.text.num_hidden_layers as usize],
-                    vec![
-                        media(ArchitectureGroupKind::VisionEncoder, vec!["vision"]),
-                        crate::transport::decoder(),
-                    ],
-                )
-            }
-        };
-        let units = ExecutionUnitLayout::new(&graph, counts).map_err(|error| error.to_string())?;
-        Ok((graph, units, transports))
     }
 }
 
@@ -7768,22 +7518,14 @@ fn derive_composite_text_requirements(
         }
         _ => {}
     }
-    let (execution_graph, execution_units, group_transports) = config
-        .graph_and_units()
-        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
-    let state_layout = config
-        .state_layout()
-        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    let definition = config
+        .component_definition()
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     let processor = composite_processor_requirements(inspection.architecture_plan(), &config)?;
     let mut execution = replicated_text_requirements_for_structure(
         inspection,
         config.requirement_config(),
-        Some((
-            execution_graph.clone(),
-            execution_units.clone(),
-            group_transports.clone(),
-            state_layout.clone(),
-        )),
+        Some(definition),
     )?;
     if let CompositeConfig::NemotronLabsDiffusion(args) = &config {
         execution = execution.with_block_refinement(args.generation_geometry());
@@ -7812,15 +7554,11 @@ fn derive_composite_text_requirements(
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture);
     }
     partition_boundaries
-        .validate(&execution_graph, &execution_units)
+        .validate(execution.execution_graph(), execution.execution_units())
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     Ok(CompositeTextRequirements {
         partition_boundaries,
         architecture_identity: config.architecture_identity(),
-        execution_graph,
-        execution_units,
-        group_transports,
-        state_layout,
         input_modalities: config.input_modalities(),
         decoder: if config.routed() {
             CompositeTextDecoderStrategy::Routed
