@@ -842,16 +842,12 @@ pub fn parameter_description(
     let owner_group = layout.group_id(0).expect("Kimi target group").clone();
     let hidden = args.hidden_size as usize;
     let mut formats = std::collections::BTreeMap::new();
-    let static_groups = super::static_spec(args).logical_pinned_parameter_groups(
+    let static_groups = super::static_spec(args).pinned_parameter_groups(
         "model.embed_tokens",
         "model.norm",
         "lm_head",
     )?;
-    let mut projections = static_groups
-        .iter()
-        .filter(|(_, group)| group.role() == ParameterRole::Vocabulary)
-        .flat_map(|(_, group)| group.members().iter().map(|member| member.target().to_owned()))
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut projections = std::collections::BTreeSet::new();
     let mut owned = static_groups
         .into_iter()
         .map(|(role, group)| {

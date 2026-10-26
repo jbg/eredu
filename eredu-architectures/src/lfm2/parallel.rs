@@ -824,25 +824,17 @@ pub fn parameter_description(
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [layers])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let statics = super::static_spec(args).logical_pinned_parameter_groups(
-        "model.embed_tokens",
-        "model.embedding_norm",
-        "lm_head",
-    )?;
-    let static_owners = statics
-        .iter()
+    let mut owned = super::static_spec(args)
+        .pinned_parameter_groups("model.embed_tokens", "model.embedding_norm", "lm_head")?
+        .into_iter()
         .map(|(role, group)| {
-            let owner = if *role == "embedding" && args.tie_word_embeddings {
+            let owner = if role == "embedding" && args.tie_word_embeddings {
                 ParameterGroupOwner::static_any_of(["embedding", "output"])
             } else {
-                ParameterGroupOwner::static_role(*role)
+                ParameterGroupOwner::static_role(role)
             };
-            (group.logical_name().to_owned(), owner)
+            OwnedParameterGroupSpec::new(owner, group)
         })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut groups = statics
-        .into_iter()
-        .map(|(_, group)| group)
         .collect::<Vec<_>>();
     let head_dim = usize::try_from(args.hidden_size / args.num_attention_heads)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 head width exceeds usize".into()))?;
@@ -852,6 +844,7 @@ pub fn parameter_description(
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 KV heads exceed usize".into()))?;
     let mut formats = std::collections::BTreeMap::new();
     for layer in 0..layers {
+        let mut groups = Vec::new();
         let root = format!("model.layers.{layer}");
         match args
             .layer_policy(layer)
@@ -1035,17 +1028,23 @@ pub fn parameter_description(
                 )?);
             }
         }
+        let owner = ParameterGroupOwner::execution_unit(
+            layout.group_id(0).expect("LFM2 group").clone(),
+            layer,
+        );
+        owned.extend(
+            groups
+                .into_iter()
+                .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
+        );
     }
-    let groups = eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
+    let owned = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
         let name = member.target();
         if let Some(format) = formats.get(name) {
             return Ok(Some(format.clone()));
         }
         let linear = name.ends_with(".weight")
-            && (name.contains("_proj.weight")
-                || name.contains("feed_forward.w")
-                || name == "lm_head.weight"
-                || name == "model.embed_tokens.weight");
+            && (name.contains("_proj.weight") || name.contains("feed_forward.w"));
         linear
             .then(|| {
                 crate::linear_format::standard_linear_format(
@@ -1056,28 +1055,10 @@ pub fn parameter_description(
             })
             .transpose()
     })?;
-    let mut owned = Vec::with_capacity(groups.len());
-    for group in groups.iter().cloned() {
-        let owner = if let Some(owner) = static_owners.get(group.logical_name()) {
-            owner.clone()
-        } else {
-            let name = group.logical_name();
-            let layer = name
-                .strip_prefix("model.layers.")
-                .and_then(|suffix| suffix.split('.').next())
-                .and_then(|layer| layer.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    ParallelPlanError::InvalidGroup(format!(
-                        "LFM2 group {name:?} has no layer owner"
-                    ))
-                })?;
-            ParameterGroupOwner::execution_unit(
-                layout.group_id(0).expect("LFM2 group").clone(),
-                layer,
-            )
-        };
-        owned.push(OwnedParameterGroupSpec::new(owner, group));
-    }
+    let groups = owned
+        .iter()
+        .map(|group| group.group().clone())
+        .collect::<Vec<_>>();
     ArchitectureParameterDescription::new(&graph, &layout, groups, owned)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
 }

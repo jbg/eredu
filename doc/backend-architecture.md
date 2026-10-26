@@ -8471,16 +8471,18 @@ tied vocabulary ownership. Kimi Linear projects those same static groups while
 retaining explicit canonical owners and its family projection-format admission set.
 The projection retains explicit embedding, normalization and output role identities;
 Kimi, Muse and LFM2 canonical static ownership does not depend on group order.
-DeepSeek V3 and V4 use these same logical groups while retaining their family FP8 defaults and admitted
-static formats. V4 hyper-head and DSpark geometry remain family declarations.
+DeepSeek V3 and V4 use these same logical groups while retaining their family
+FP8 defaults and admitted static formats. V4 hyper-head and DSpark geometry remain
+family declarations.
 Families supply semantic group identities and apply their admitted physical-format
 expansion once; packed shapes and companion metadata remain part of that family
 projection.
 
 `StaticModuleSpec::pinned_parameter_groups` projects complete physical vocabulary
 storage from the same admitted embedding and readout formats used for construction.
-Qwen hybrid, Nemotron-H and Muse use this projection for cold static catalogs;
-family code retains MTP consumers, tied owners and normalization arithmetic.
+Qwen hybrid, Nemotron-H, Muse, Kimi Linear and LFM2 use this projection for cold
+static catalogs. Families retain MTP consumers, tied owners and normalization
+arithmetic.
 Static companions expand once and remain outside later body-format declarations.
 Qwen hybrid retains its separate embedding and head FP8 admission policies.
 
@@ -8488,14 +8490,19 @@ Runtime `expand_linear_format_parameter_group` expands one atomic logical group
 and preserves its partition constraints and declared companions. Catalog expansion
 uses the same primitive. Families retain resource and canonical owner identities
 around that projection; Muse carries its role tags through format expansion, and
-LFM2 associates static owners with declared group identities. DeepSeek pinned
+LFM2 keeps its canonical static owners attached throughout. DeepSeek pinned
 format expansion likewise retains each resource role directly.
 
 `expand_owned_linear_format_parameter_groups` consumes canonical owned groups
 and projects their physical encodings through the same atomic-group primitive.
 Owners, shared consumers and replica requirements remain attached to each group.
-Kimi Linear, Qwen hybrid and Nemotron-H supply their admitted format callbacks;
+Kimi Linear, Qwen hybrid, Nemotron-H and LFM2 supply their admitted format callbacks;
 runtime owns the projection without reconstructing their family storage policy.
+
+LFM2 attaches each layer's canonical owner when declaring its body groups, then
+uses this same owned projection for physical formats. Ownership does not depend
+on parsing parameter paths. Static vocabulary storage retains its existing tied
+consumers and does not participate in body-format expansion.
 
 `StaticModuleSpec::embedding_format` retains the complete physical matrix encoding,
 including block-FP8 companions. Shared decoder configuration supplies its selected
