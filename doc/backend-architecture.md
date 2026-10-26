@@ -8526,6 +8526,18 @@ materialization paths. Diffusion Gemma uses its family-authored construction for
 both paths and appends its separate feedback groups; Gemma retains its own per-layer
 input resources.
 
+Moshi depth slices declare their embedding, temporal projection and audio readout
+once for complete and tensor-local construction. Runtime vocabulary placement
+materializes the independently selected embedding and readout; the temporal
+projection remains complete. The family retains its padded text/audio input
+cardinalities, distinct audio output cardinality, aligned decoder-block geometry,
+zero-sentinel lookup and frame-local state reuse. Both vocabulary selections are
+validated before native allocation. Dense TP2 construction is checked at two
+hidden widths against exact selected parameter shapes. MXFP4 TP2 geometry has a
+validation gap: attention-row validation compares packed physical input width
+with logical query width and rejects the selection. This check does not establish
+distributed numerical parity.
+
 Gemma 4 supplies its ordinary embedding, learned final norm and readout through
 one backend-neutral static construction. Cold catalogs, vocabulary geometry and
 ordinary/tensor-local materialization consume that declaration. Per-layer token

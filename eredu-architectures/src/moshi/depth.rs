@@ -4,7 +4,7 @@ use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator,
     LinearSpec, NeuralBackend, ParameterSpec, Tensor, VocabularyParallelRange,
 };
-use eredu_runtime::LayerRuntimeState;
+use eredu_runtime::{LayerRuntimeState, VocabularyModulePlacement};
 
 use super::{block, MoshiConfig, MoshiTransformerConfig};
 
@@ -31,66 +31,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let transformer = config.depth_transformer(index).map_err(Error::backend)?;
-        let prefix = format!("depformer.slices.{index}");
-        let input_vocabulary = if index == 0 {
-            config.text_vocabulary_size()
-        } else {
-            config.audio_vocabulary_size()
-        }
-        .checked_add(1)
-        .ok_or_else(|| Error::backend("Moshi depth input vocabulary overflowed"))?;
-        let embedding_name = format!("{prefix}.emb.weight");
-        let input_name = format!("{prefix}.linear_in.weight");
-        let output_name = format!("{prefix}.linear_out.weight");
-        let embedding = B::embedding(
-            EmbeddingSpec {
-                vocabulary: input_vocabulary,
-                dimensions: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &embedding_name,
-                    config.native_quantization().into(),
-                )?,
-            },
-            context,
-        )?;
-        let input = B::linear(
-            LinearSpec {
-                input: config.temporal().hidden_size(),
-                output: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(&input_name).map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    &input_name,
-                    config.native_quantization().into(),
-                )?,
-            },
-            context,
-        )?;
-        let output = B::linear(
-            LinearSpec {
-                input: transformer.hidden_size(),
-                output: config.audio_vocabulary_size(),
-                weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    &output_name,
-                    config.native_quantization().into(),
-                )?,
-            },
-            context,
-        )?;
-        let blocks = (0..transformer.num_hidden_layers() as usize)
-            .map(|layer| block::build::<B>(&transformer, layer, context))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            embedding,
-            input,
-            output,
-            blocks,
-            index,
-        })
+        Self::from_geometry(config, index, None, context)
     }
 
     /// Builds one rank-local depth slice with vocabulary-parallel edge modules.
@@ -98,6 +39,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         config: &MoshiConfig,
         index: usize,
         geometry: &super::LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::from_geometry(config, index, Some(geometry), context)
+    }
+
+    fn from_geometry(
+        config: &MoshiConfig,
+        index: usize,
+        geometry: Option<&super::LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let transformer = config.depth_transformer(index).map_err(Error::backend)?;
@@ -110,66 +60,79 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         .checked_add(1)
         .ok_or_else(|| Error::backend("Moshi depth input vocabulary overflowed"))?;
         let embedding_name = format!("{prefix}.emb.weight");
+        let input_name = format!("{prefix}.linear_in.weight");
         let output_name = format!("{prefix}.linear_out.weight");
-        let embedding = B::vocabulary_parallel_embedding(
-            EmbeddingSpec {
-                vocabulary: input_vocabulary,
-                dimensions: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &embedding_name,
-                    config.native_quantization().into(),
-                )?,
-            },
-            VocabularyParallelRange {
-                global_vocabulary: input_vocabulary as usize,
-                local: geometry
-                    .vocabulary_range(&embedding_name)
-                    .cloned()
-                    .ok_or_else(|| Error::backend("missing depth embedding range"))?,
-            },
-            context,
+        let embedding_spec = EmbeddingSpec {
+            vocabulary: input_vocabulary,
+            dimensions: transformer.hidden_size(),
+            weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
+            format: crate::linear_format::standard_linear_format(
+                &embedding_name,
+                config.native_quantization().into(),
+            )?,
+        };
+        let input_spec = LinearSpec {
+            input: config.temporal().hidden_size(),
+            output: transformer.hidden_size(),
+            weight: ParameterSpec::trainable(&input_name).map_err(Error::backend)?,
+            bias: None,
+            format: crate::linear_format::standard_linear_format(
+                &input_name,
+                config.native_quantization().into(),
+            )?,
+        };
+        let output_spec = LinearSpec {
+            input: transformer.hidden_size(),
+            output: config.audio_vocabulary_size(),
+            weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
+            bias: None,
+            format: crate::linear_format::standard_linear_format(
+                &output_name,
+                config.native_quantization().into(),
+            )?,
+        };
+        let placement = |name: &str, vocabulary, missing| -> Result<_, Error> {
+            Ok(match geometry {
+                None => VocabularyModulePlacement::Local,
+                Some(geometry) => {
+                    VocabularyModulePlacement::VocabularyParallel(VocabularyParallelRange {
+                        global_vocabulary: vocabulary as usize,
+                        local: geometry
+                            .vocabulary_range(name)
+                            .cloned()
+                            .ok_or_else(|| Error::backend(missing))?,
+                    })
+                }
+            })
+        };
+        let embedding = placement(
+            &embedding_name,
+            embedding_spec.vocabulary,
+            "missing depth embedding range",
         )?;
-        let input = B::linear(
-            LinearSpec {
-                input: config.temporal().hidden_size(),
-                output: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(format!("{prefix}.linear_in.weight"))
-                    .map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    &format!("{prefix}.linear_in.weight"),
-                    config.native_quantization().into(),
-                )?,
-            },
-            context,
+        let output = placement(
+            &output_name,
+            output_spec.output,
+            "missing depth output range",
         )?;
-        let output = B::vocabulary_parallel_linear(
-            LinearSpec {
-                input: transformer.hidden_size(),
-                output: config.audio_vocabulary_size(),
-                weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    &output_name,
-                    config.native_quantization().into(),
-                )?,
-            },
-            VocabularyParallelRange {
-                global_vocabulary: config.audio_vocabulary_size() as usize,
-                local: geometry
-                    .vocabulary_range(&output_name)
-                    .cloned()
-                    .ok_or_else(|| Error::backend("missing depth output range"))?,
-            },
-            context,
-        )?;
+        embedding.validate_rows(embedding_spec.vocabulary)?;
+        output.validate_rows(output_spec.output)?;
+        let embedding = embedding
+            .materialize_embedding::<B>(embedding_spec, context)?
+            .expect("depth slice owns its embedding");
+        let input = B::linear(input_spec, context)?;
+        let output = output
+            .materialize_linear::<B>(output_spec, context)?
+            .expect("depth slice owns its output");
         let blocks = (0..transformer.num_hidden_layers() as usize)
-            .map(|layer| {
-                let local = geometry
-                    .depth_config(&transformer, index, layer)
-                    .map_err(Error::backend)?;
-                block::build::<B>(&local, layer, context)
+            .map(|layer| match geometry {
+                None => block::build::<B>(&transformer, layer, context),
+                Some(geometry) => {
+                    let local = geometry
+                        .depth_config(&transformer, index, layer)
+                        .map_err(Error::backend)?;
+                    block::build::<B>(&local, layer, context)
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
