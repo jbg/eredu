@@ -798,8 +798,12 @@ where
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
     let requirements = selected.requirements().clone();
-    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::validate_checkpoint_handoff(
+        &requirements,
+        store.as_ref(),
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     visitor.construction_started();
     let prepared = prepare_architecture_handoff::<B, S, A>(
         architecture,
@@ -879,8 +883,12 @@ where
     let eligible = ordinary_eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::validate_checkpoint_handoff(
+        &requirements,
+        store.as_ref(),
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     visitor.construction_started();
     match eligible {
         EligibleConfig::Gemma2(args) => {
@@ -1137,173 +1145,6 @@ fn validate_plan_identity(
         return Err(
             "selected realization structure differs from the normalized architecture".into(),
         );
-    }
-    Ok(())
-}
-
-/// Source authority being validated; restricted primary views must not acquire auxiliaries.
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum StoreHandoffScope {
-    Primary,
-    Complete,
-}
-
-/// Projects an already admitted artifact onto the exact selected parameter role.
-/// Other roles retain their own source leases; native binding must not gain their
-/// catalog authority merely because they share an underlying checkpoint file.
-pub(crate) fn restrict_store_handoff(
-    requirements: &ReplicatedTextRequirements,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
-    scope: StoreHandoffScope,
-) -> Result<eredu_checkpoint::store::SharedCheckpointSource, String> {
-    validate_store_handoff(requirements, store.as_ref(), scope)?;
-    let keys = requirements
-        .parameters()
-        .iter()
-        .chain(
-            requirements
-                .auxiliary_parameters()
-                .iter()
-                .filter(|_| scope == StoreHandoffScope::Complete),
-        )
-        .flat_map(|parameter| parameter.sources().iter().cloned())
-        .collect::<BTreeSet<_>>();
-    Ok(Arc::new(
-        eredu_checkpoint::store::RestrictedCheckpointSource::including(
-            store,
-            "declared-execution-parameters",
-            keys,
-        )
-        .map_err(|error| error.to_string())?,
-    ))
-}
-
-pub(crate) fn validate_store_handoff(
-    requirements: &ReplicatedTextRequirements,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    scope: StoreHandoffScope,
-) -> Result<(), String> {
-    for parameter in requirements.parameters().iter().chain(
-        requirements
-            .auxiliary_parameters()
-            .iter()
-            .filter(|_| scope == StoreHandoffScope::Complete),
-    ) {
-        let derived = matches!(
-            parameter.presence(),
-            ReplicatedTextParameterPresence::Derived { .. }
-        );
-        let mut lowering_key = None;
-        let mut admitted_keys = BTreeSet::new();
-        for source in parameter.physical_sources() {
-            let key = source.catalog_key();
-            let actual = store.source_provenance(key).map_err(|error| {
-                format!("selected source catalog key {key:?} is unavailable: {error}")
-            })?;
-            let metadata = store.source_metadata(key).map_err(|error| {
-                format!("selected source metadata for {key:?} is unavailable: {error}")
-            })?;
-            if actual.catalog_key != key
-                || actual.physical_tensor != source.tensor()
-                || actual.backing_shard.as_deref() != Some(source.shard())
-                || actual.output != source.output()
-                || &actual.source_encoding != source.source_encoding()
-                || metadata.encoded_byte_len != source.encoded_byte_len()
-            {
-                return Err(format!(
-                    "selected physical provenance for catalog key {key:?} differs from the admitted store"
-                ));
-            }
-            if !derived
-                && parameter
-                    .source_encoding()
-                    .is_some_and(|expected| expected != source.source_encoding())
-            {
-                return Err(format!(
-                    "selected physical encoding for {:?} differs from the admitted store",
-                    parameter.name()
-                ));
-            }
-            lowering_key.get_or_insert(key);
-            admitted_keys.insert(key);
-        }
-        let selected_keys = parameter
-            .sources()
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        if parameter.has_lowering_source() && selected_keys != admitted_keys {
-            return Err(format!(
-                "selected source catalog for {:?} differs from admitted physical provenance",
-                parameter.name()
-            ));
-        }
-        if !derived {
-            if let Some(physical_shape) = parameter.physical_shape() {
-                let key = lowering_key.ok_or_else(|| {
-                    format!(
-                        "selected physical facts for {:?} have no provenance",
-                        parameter.name()
-                    )
-                })?;
-                let metadata = store
-                    .source_metadata(key)
-                    .map_err(|error| error.to_string())?;
-                if physical_shape != metadata.physical_shape.as_slice() {
-                    return Err(format!(
-                        "selected physical geometry for {:?} differs from the admitted store",
-                        parameter.name()
-                    ));
-                }
-            }
-        }
-    }
-    for (target, recipe) in requirements.derived_recipes() {
-        if scope == StoreHandoffScope::Primary
-            && requirements
-                .auxiliary_parameters()
-                .iter()
-                .any(|parameter| parameter.name() == target)
-        {
-            continue;
-        }
-        let parameter = requirements
-            .parameters()
-            .iter()
-            .chain(requirements.auxiliary_parameters())
-            .find(|parameter| parameter.name() == target)
-            .ok_or_else(|| format!("selected recipe target {target:?} is undeclared"))?;
-        if !matches!(
-            parameter.presence(),
-            ReplicatedTextParameterPresence::Derived { .. }
-        ) {
-            return Err(format!(
-                "selected recipe target {target:?} is not declared as derived"
-            ));
-        }
-        let inferred = recipe
-            .infer(store)
-            .map_err(|error| format!("selected recipe for {target:?} is invalid: {error}"))?;
-        let admitted_output = requirements
-            .derived_recipe_outputs()
-            .get(target)
-            .expect("validated recipe contract has one output per target");
-        if &inferred != admitted_output {
-            return Err(format!(
-                "selected recipe output for {target:?} differs from admitted metadata"
-            ));
-        }
-        let admitted = parameter
-            .physical_sources()
-            .iter()
-            .map(ReplicatedTextPhysicalSource::catalog_key)
-            .collect::<BTreeSet<_>>();
-        let consumed = recipe.source_keys().into_iter().collect::<BTreeSet<_>>();
-        if consumed != admitted {
-            return Err(format!(
-                "selected recipe sources for {target:?} differ from admitted provenance"
-            ));
-        }
     }
     Ok(())
 }
@@ -1728,8 +1569,12 @@ where
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::validate_checkpoint_handoff(
+        &requirements,
+        store.as_ref(),
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     match eligible {
         EligibleConfig::Lfm2(args) => {
             visitor.construction_started();
@@ -2055,8 +1900,12 @@ where
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::validate_checkpoint_handoff(
+        &requirements,
+        store.as_ref(),
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     macro_rules! visit_family {
         ($family:ty, $args:expr, $capability:path, $select:path, $identity:path) => {{
             visitor.construction_started();
@@ -2327,8 +2176,12 @@ where
             &EligibleConfig::NemotronLabsDiffusion(config),
         )
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-        validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        eredu_runtime::validate_checkpoint_handoff(
+            &requirements,
+            store.as_ref(),
+            eredu_runtime::SourceHandoffScope::Primary,
+        )
+        .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
         visitor.construction_started();
         let retained = requirements.shared_component_definition().ok_or_else(|| {
             ReplicatedTextDispatchError::Architecture(
@@ -2388,8 +2241,12 @@ where
     let requirements = selected.requirements().clone();
     validate_plan_identity(&requirements, &EligibleConfig::DiffusionGemma(config))
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::validate_checkpoint_handoff(
+        &requirements,
+        store.as_ref(),
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     visitor.construction_started();
     let retained = requirements.shared_component_definition().ok_or_else(|| {
         ReplicatedTextDispatchError::Architecture(
@@ -2606,8 +2463,12 @@ where
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::validate_checkpoint_handoff(
+        &requirements,
+        store.as_ref(),
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     let args = match eligible {
         EligibleConfig::QwenHybrid(args) => {
             let capability_estimate = crate::capability::qwen_hybrid_text(args)
@@ -7792,12 +7653,12 @@ where
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     V: CompositeTextArchitectureVisitor<B, S>,
 {
-    validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         requirements.execution(),
         store.as_ref(),
-        StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     let retained = requirements.inspection.clone();
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
@@ -8304,12 +8165,12 @@ where
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
     V: CompositePredictionTargetVisitor<B, S, M>,
 {
-    validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         requirements.execution(),
         store.as_ref(),
-        StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     let retained = requirements.inspection.clone();
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?

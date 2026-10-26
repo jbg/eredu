@@ -330,12 +330,12 @@ impl PreparedConditionalPartition {
             return Err(invalid("prediction requires a routed target"));
         };
         let source = self.prepared_target().artifact().clone();
-        let target_source = crate::replicated_text::restrict_store_handoff(
+        let target_source = eredu_runtime::restrict_checkpoint_handoff(
             execution.text().requirements(),
             source.clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         let provider_source = crate::partitioned_execution::qwen4_exp::prediction_provider_source(
             execution.text().requirements(),
             source,

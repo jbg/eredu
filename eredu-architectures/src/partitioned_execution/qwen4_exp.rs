@@ -187,12 +187,12 @@ impl PreparedTargetPartition {
                 ));
             }
         };
-        let source = crate::replicated_text::restrict_store_handoff(
+        let source = eredu_runtime::restrict_checkpoint_handoff(
             selected.base().text().requirements(),
             target.artifact().clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         // Tasks contain global canonical recipes; the native loader applies the
         // retained layout once. Passing already sliced recipes here would select twice.
         let model = model.into_partition_model(&partition).map_err(invalid)?;
@@ -242,11 +242,12 @@ pub(crate) fn prediction_provider_source(
                 .map_err(|error| error.to_string())?,
         )
     };
-    crate::replicated_text::restrict_store_handoff(
+    eredu_runtime::restrict_checkpoint_handoff(
         requirements,
         complete,
-        crate::replicated_text::StoreHandoffScope::Complete,
+        eredu_runtime::SourceHandoffScope::Complete,
     )
+    .map_err(|error| error.to_string())
 }
 
 /// Prediction banks replicate expert ownership across stage and expert groups;

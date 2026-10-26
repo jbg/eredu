@@ -250,12 +250,12 @@ impl SelectedTargetExecution {
         let Self { plan, selected, .. } = self;
         validate_selected_routed_handoff(&plan.requirements, &selected)
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
-        let execution_source = crate::replicated_text::restrict_store_handoff(
+        let execution_source = eredu_runtime::restrict_checkpoint_handoff(
             plan.requirements.text(),
             plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(PreparationError::Contract)?;
+        .map_err(|handoff| PreparationError::Contract(handoff.to_string()))?;
         let spec = plan
             .target
             .selected_spec(&selected)

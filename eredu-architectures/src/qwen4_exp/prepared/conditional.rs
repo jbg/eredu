@@ -477,12 +477,12 @@ impl SelectedConditionalExecution {
             .processor_requirements()
             .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
         let admission = self.ingress.admission_config().clone();
-        let provider_source = crate::replicated_text::restrict_store_handoff(
+        let provider_source = eredu_runtime::restrict_checkpoint_handoff(
             requirements.text(),
             self.selected.plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Complete,
+            eredu_runtime::SourceHandoffScope::Complete,
         )
-        .map_err(PreparedExecutionError::Architecture)?;
+        .map_err(|handoff| PreparedExecutionError::Architecture(handoff.to_string()))?;
         visitor.construction_started();
         let prediction = self
             .selected
@@ -535,12 +535,12 @@ impl SelectedConditionalExecution {
         let SelectedTargetExecution { plan, selected, .. } = self.selected;
         crate::routed_text::validate_selected_routed_handoff(&plan.requirements, &selected)
             .map_err(invalid)?;
-        let execution_source = crate::replicated_text::restrict_store_handoff(
+        let execution_source = eredu_runtime::restrict_checkpoint_handoff(
             plan.requirements.text(),
             plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         let source_vision = self.ingress.vision().config().clone();
         let spec = plan
             .target

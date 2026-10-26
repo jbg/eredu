@@ -609,11 +609,12 @@ where
         return Err("iterative routed construction requires grouped-bank selection".into());
     };
     validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
-    )?;
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|error| error.to_string())?;
     let config = diffusion_args(inspection).ok_or("missing admitted diffusion geometry")?;
     let mut target = config.clone();
     target.text.weight_quantization = None;
@@ -677,11 +678,12 @@ where
 {
     let expected = routed_text_requirements(inspection).map_err(|error| error.to_string())?;
     validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
-    )?;
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|error| error.to_string())?;
     let args = k2_horizon_args(inspection).ok_or("expected K2 Horizon configuration")?;
     let selected_args = crate::replicated_text::selected_k2_horizon_args(args, selected.text())?;
     let identity = crate::k2_horizon::prompt_cache_architecture_fingerprint(&selected_args);
@@ -725,12 +727,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -807,12 +809,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -886,12 +888,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -989,12 +991,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1100,12 +1102,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1207,12 +1209,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1310,12 +1312,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1414,12 +1416,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),

@@ -17,6 +17,11 @@ pub mod bounded_execution;
 pub mod cache;
 /// Bounded observation admission and collection.
 pub mod capture;
+mod checkpoint_handoff;
+pub use checkpoint_handoff::{
+    restrict_checkpoint_handoff, validate_checkpoint_handoff, SourceHandoffError, SourceHandoffScope,
+};
+
 /// Opaque groups, routes, and capability contracts for distributed mechanisms.
 pub mod communication;
 /// Typed multimodal component graphs and residency accounting.

@@ -8628,12 +8628,12 @@ where
             "partitioned admission belongs to a different architecture or artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         &expected,
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     match (
         inspection
             .architecture_plan()
@@ -8849,12 +8849,12 @@ where
                 "partitioned admission belongs to a different architecture or artifact".into(),
             ));
         }
-        crate::replicated_text::validate_store_handoff(
+        eredu_runtime::validate_checkpoint_handoff(
             &expected,
             store.as_ref(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
         return qwen_hybrid::prepare::<B, S, V>(args, selected, store, context, visitor);
     }
     if let Some(args) = match (safetensors, gguf) {
@@ -8871,12 +8871,12 @@ where
                 "partitioned admission belongs to a different architecture or artifact".into(),
             ));
         }
-        crate::replicated_text::validate_store_handoff(
+        eredu_runtime::validate_checkpoint_handoff(
             &expected,
             store.as_ref(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
         let selected_args = crate::replicated_text::selected_nemotron_h_args(args, selected.base())
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
         let source_args = selected
@@ -8912,12 +8912,12 @@ where
                 "partitioned admission belongs to a different architecture or artifact".into(),
             ));
         }
-        crate::replicated_text::validate_store_handoff(
+        eredu_runtime::validate_checkpoint_handoff(
             &expected,
             store.as_ref(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
         let selected_args =
             crate::replicated_text::selected_kimi_linear_args(args, selected.base())
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -8959,12 +8959,12 @@ where
             "partitioned admission belongs to a different architecture or artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         &expected,
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     let args = match (safetensors, gguf) {
         (Some(crate::configuration::SafetensorsModelConfig::Lfm2(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Lfm2(args))) => args,
@@ -9041,12 +9041,12 @@ where
                 "Qwen prediction target admission belongs to another artifact".into(),
             ));
         }
-        crate::replicated_text::validate_store_handoff(
+        eredu_runtime::validate_checkpoint_handoff(
             &expected,
             store.as_ref(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
         return qwen_hybrid::prepare_prediction::<B, S, M, V>(
             args, selected, extension, store, context, visitor,
         );
@@ -9079,12 +9079,12 @@ where
             "partitioned admission belongs to a different architecture or artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         &expected,
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     let selected_args = crate::replicated_text::selected_nemotron_h_args(args, selected.base())
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let source_args = selected
@@ -10098,12 +10098,12 @@ where
             "routed partition admission belongs to a different architecture or artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     if let Some(config) = crate::routed_text::diffusion_args(inspection) {
         return diffusion::prepare_routed::<B, S, _>(
             config,
@@ -10285,12 +10285,12 @@ where
             "DeepSeek-V4 routed admission belongs to a different artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     let Some(crate::configuration::SafetensorsModelConfig::DeepSeekV4(args)) = inspection
         .architecture_plan()
         .safetensors_architecture()
@@ -10349,12 +10349,12 @@ where
             "DeepSeek-V4 routed admission belongs to a different artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     let Some(crate::configuration::SafetensorsModelConfig::DeepSeekV4(args)) = inspection
         .architecture_plan()
         .safetensors_architecture()
@@ -10432,12 +10432,12 @@ where
                 "Qwen prediction target admission belongs to another artifact".into(),
             ));
         }
-        crate::replicated_text::validate_store_handoff(
+        eredu_runtime::validate_checkpoint_handoff(
             expected.text(),
             store.as_ref(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
         let extension = <crate::qwen::hybrid::LayeredModel<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
             .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
         return qwen_hybrid::prepare_routed::<B, S, _>(
@@ -10462,12 +10462,12 @@ where
             "DeepSeek-V3 routed admission belongs to a different artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     let args = match (
         inspection
             .architecture_plan()
@@ -10531,12 +10531,12 @@ where
             "ReLU-squared routed admission belongs to a different architecture or artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     let args = match (
         inspection
             .architecture_plan()
@@ -10617,12 +10617,12 @@ where
             "ReLU-squared routed prediction admission belongs to a different artifact".into(),
         ));
     }
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
     let args = match (
         inspection
             .architecture_plan()

@@ -3286,6 +3286,16 @@ Source-store binding checks provenance once per shared task for that handoff;
 unchanged member recipes reuse their inferred metadata, while transformed recipes
 require new inference.
 
+Runtime's `validate_checkpoint_handoff` compares admitted execution requirements
+with exact checkpoint provenance, encodings, geometry and recipe inputs.
+`restrict_checkpoint_handoff` applies that validation before granting the declared
+catalog view. `SourceHandoffScope::Primary` excludes auxiliary parameters and
+recipes; `Complete` includes the admitted auxiliaries. Neither scope grants
+neighboring payload authority or acquires payload leases. `SourceHandoffError`
+retains original checkpoint and recipe failures; architecture adapters keep their
+existing diagnostic translation. Family code owns the admission facts being
+validated, including checkpoint naming and source-format policy.
+
 SafeTensors shard-path admission belongs to `eredu-checkpoint`. Model-cache
 snapshots admit payload symlinks into repository-local blobs and the enclosing
 cache's shared `blobs` directory. The shared store does not authorize unrelated

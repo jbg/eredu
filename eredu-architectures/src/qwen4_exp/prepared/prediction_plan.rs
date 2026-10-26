@@ -309,12 +309,12 @@ impl SelectedTargetExecution {
             &self.selected,
         )
         .map_err(invalid)?;
-        crate::replicated_text::validate_store_handoff(
+        eredu_runtime::validate_checkpoint_handoff(
             self.plan.requirements.text(),
             self.plan.target.artifact.as_ref(),
-            crate::replicated_text::StoreHandoffScope::Complete,
+            eredu_runtime::SourceHandoffScope::Complete,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         crate::prediction_extension::PreparedQwen4PredictionWeights::new(
             prediction.artifact.clone(),
             &prediction.spec,
@@ -415,12 +415,12 @@ impl SelectedTargetExecution {
         // also owns prediction banks, whose physical recipes are auxiliary
         // parameters; give that provider the complete declared parameter view,
         // while retaining row tables and host controls in their separate roles.
-        let provider_source = crate::replicated_text::restrict_store_handoff(
+        let provider_source = eredu_runtime::restrict_checkpoint_handoff(
             self.plan.requirements.text(),
             self.plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Complete,
+            eredu_runtime::SourceHandoffScope::Complete,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         let (target, target_source) = self.prepare::<B, S>(context)?;
         Ok(PreparedPredictionExecution {
             target,

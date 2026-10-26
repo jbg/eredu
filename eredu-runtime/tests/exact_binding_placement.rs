@@ -1061,6 +1061,117 @@ fn exact_binding_does_not_reshard_selected_local_transform_output() {
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
 }
 
+#[test]
+fn checkpoint_handoff_preserves_primary_scope_and_exact_provenance() {
+    use eredu_runtime::{
+        restrict_checkpoint_handoff, validate_checkpoint_handoff, ArchitectureGroupKind,
+        ArchitectureGroupPlacement, ArchitectureGroupTransport, ArchitectureMergeDestination,
+        ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout, ParameterTransformConstraint,
+        ReplicatedTextParameterPresence, ReplicatedTextParameterRequirement,
+        ReplicatedTextRequirements, ReplicatedTextStateAccess, SourceHandoffError,
+        SourceHandoffScope,
+    };
+    use std::{collections::BTreeMap, sync::Arc};
+    let source = Arc::new(Source {
+        store: MemoryWeightStore::from_safetensors(
+            ["checkpoint.weight", "aux", "neighbor"]
+                .map(|key| (key.into(), safetensors::Dtype::F32, vec![1, 1], vec![0; 4])),
+        )
+        .unwrap(),
+        overlay: false,
+        leases: AtomicUsize::new(0),
+    });
+    let parameter = |name: &str, key: &str, shard: &str| {
+        let encoding = SourceTensorEncoding::Safetensors(StoredDtype::F32);
+        ReplicatedTextParameterRequirement::new(
+            name,
+            vec![key.into()],
+            vec![
+                ReplicatedTextPhysicalSource::new(key, key, shard, key, encoding.clone(), 4)
+                    .unwrap(),
+            ],
+            vec![],
+            Some(encoding),
+            Some(vec![1, 1]),
+            vec![1, 1],
+            LinearFormat::Dense,
+            ReplicatedTextParameterRole::LinearWeight,
+            ReplicatedTextParameterOwner::ExecutionUnit {
+                group: "decoder".into(),
+                unit: 0,
+            },
+            ReplicatedTextParameterPresence::Required,
+            ParameterTransformConstraint::None,
+        )
+        .unwrap()
+    };
+    let requirements = |shard| {
+        let graph =
+            ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+        let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+        ReplicatedTextRequirements::new(
+            "source-handoff",
+            eredu_nn::NeuralOperatorCapabilities::NONE,
+            graph,
+            units,
+            vec![ArchitectureGroupTransport {
+                placement: ArchitectureGroupPlacement::Pipeline,
+                kind: ArchitectureGroupKind::Decoder,
+                first_owner_static_roles: vec![],
+                last_owner_static_roles: vec![],
+                merge_destination: ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: None,
+                request_optional: false,
+            }],
+            eredu_runtime::StatelessComponentState::state_layout().unwrap(),
+            ReplicatedTextStateAccess::Stateless,
+            vec![parameter("weight", "checkpoint.weight", shard)],
+        )
+        .unwrap()
+        .with_auxiliary_parameters(
+            vec![parameter(
+                "prediction.weight",
+                "aux",
+                "/exact/model.safetensors",
+            )],
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+    };
+    let admitted = requirements("/exact/model.safetensors");
+    let primary =
+        restrict_checkpoint_handoff(&admitted, source.clone(), SourceHandoffScope::Primary)
+            .unwrap();
+    assert_eq!(primary.source_keys(), ["checkpoint.weight"]);
+    assert!(primary.source_metadata("aux").is_err());
+    assert!(primary.source_metadata("neighbor").is_err());
+    validate_checkpoint_handoff(&admitted, primary.as_ref(), SourceHandoffScope::Primary).unwrap();
+    let error =
+        validate_checkpoint_handoff(&admitted, primary.as_ref(), SourceHandoffScope::Complete)
+            .unwrap_err();
+    assert!(matches!(&error, SourceHandoffError::Provenance { key, .. } if key == "aux"));
+    assert!(std::error::Error::source(&error).is_some());
+    let complete =
+        restrict_checkpoint_handoff(&admitted, source.clone(), SourceHandoffScope::Complete)
+            .unwrap();
+    assert_eq!(complete.source_keys(), ["aux", "checkpoint.weight"]);
+    assert!(complete.source_metadata("neighbor").is_err());
+    assert!(matches!(
+        validate_checkpoint_handoff(
+            &requirements("/other/model.safetensors"),
+            source.as_ref(),
+            SourceHandoffScope::Primary
+        ),
+        Err(SourceHandoffError::Invalid(_))
+    ));
+    assert_eq!(
+        source.source_keys(),
+        ["aux", "checkpoint.weight", "neighbor"]
+    );
+    assert_eq!(source.leases.load(Ordering::SeqCst), 0);
+}
+
 mod component_preparation {
     use eredu_checkpoint::{
         recipe::DerivedWeightRecipe,
