@@ -295,49 +295,36 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
                 "Qwen target partition names another execution group",
             ));
         }
-        definition.select_partition(partition)?;
+        let selection = definition.select_partition(partition)?;
         let range = owned.global_units();
-        let stores = |role: &str| {
-            partition
-                .parameter_bindings()
-                .iter()
-                .any(|group| group.owner().accepts_static_role(role))
-        };
-        let (embedding, head, norm) = super::static_module_spec(&config).construction_specs()?;
-        let embeddings = stores("embedding")
-            .then(|| {
-                B::vocabulary_parallel_embedding(
-                    embedding,
-                    geometry.embedding_range().clone(),
-                    context,
+        let text = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
+            super::static_module_spec(&config),
+            Some((
+                geometry.embedding_range().clone(),
+                geometry.output_range().cloned(),
+            )),
+            |role| {
+                selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+            },
+            context,
+        )?;
+        let boundary = text
+            .norm
+            .map(|norm| {
+                crate::decoder::NormalizedBoundary::<B>::from_normalization(
+                    config.hidden_size,
+                    norm,
                 )
             })
             .transpose()?;
-        let boundary = stores("norm")
-            .then(|| crate::decoder::NormalizedBoundary::new(norm, context))
-            .transpose()?;
-        let lm_head = if stores("output") {
-            head.map(|spec| {
-                B::vocabulary_parallel_linear(
-                    spec,
-                    geometry.output_range().cloned().ok_or_else(|| {
-                        Error::backend("Qwen output owner has no selected vocabulary range")
-                    })?,
-                    context,
-                )
-            })
-            .transpose()?
-        } else {
-            None
-        };
         let kernel = Self {
             target_layers: definition.unit_count(0)?,
             prediction_steps: 0,
             config,
             static_modules: QwenStaticModules {
-                embeddings,
+                embeddings: text.embeddings,
                 boundary,
-                lm_head,
+                lm_head: text.lm_head,
                 prediction: None,
             },
             definition: std::sync::Arc::clone(&definition),

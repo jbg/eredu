@@ -1265,7 +1265,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
     ) -> Result<ConditionalLayeredModel<B>, Error> {
         let definition =
             super::select_conditional_definition(&parsed, definition, geometry.as_ref())?;
-        if let Some(partition) = partition {
+        let ownership = if let Some(partition) = partition {
             super::ConditionalPartitionLocalFoundation::from_partition(&parsed, partition)
                 .map_err(Error::backend_source)?;
             partition
@@ -1277,8 +1277,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
                     })?,
                 )
                 .map_err(Error::backend_source)?;
-            definition.select_partition(partition)?;
-        }
+            Some(definition.select_partition(partition)?)
+        } else {
+            None
+        };
         crate::operator_requirements::require::<B>(
             "Qwen hybrid conditional",
             crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
@@ -1289,48 +1291,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
                 eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
             )?;
         }
-        let stores = |role: &str| {
-            partition.is_none_or(|partition| {
-                partition
-                    .parameter_bindings()
-                    .iter()
-                    .any(|group| group.owner().accepts_static_role(role))
-            })
-        };
         let prediction_steps = definition.prediction_groups().len();
-        let (embedding, head, normalization) =
-            super::static_module_spec(&parsed.text).construction_specs()?;
-        let norm = stores("norm")
-            .then(|| {
-                crate::decoder::NormalizedBoundary::<B>::new(normalization, context)
-                    .map(|boundary| boundary.norm)
-            })
-            .transpose()?;
-        let embeddings = stores("embedding")
-            .then(|| match &geometry {
-                Some(geometry) => B::vocabulary_parallel_embedding(
-                    embedding,
+        let text = PartitionStaticModules::<B>::from_selected_spec(
+            super::static_module_spec(&parsed.text),
+            geometry.as_ref().map(|geometry| {
+                (
                     geometry.text().embedding_range().clone(),
-                    context,
-                ),
-                None => B::embedding(embedding, context),
-            })
-            .transpose()?;
-        let lm_head = if stores("output") {
-            head.map(|spec| match &geometry {
-                Some(geometry) => B::vocabulary_parallel_linear(
-                    spec,
-                    geometry.text().output_range().cloned().ok_or_else(|| {
-                        Error::backend("conditional Qwen output owner has no vocabulary range")
-                    })?,
-                    context,
-                ),
-                None => B::linear(spec, context),
-            })
-            .transpose()?
-        } else {
-            None
-        };
+                    geometry.text().output_range().cloned(),
+                )
+            }),
+            |role| {
+                ownership.as_ref().is_none_or(|selection| {
+                    selection
+                        .owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+                })
+            },
+            context,
+        )?;
         let prediction = (prediction_steps > 0)
             .then(|| super::PredictionShared::new(&parsed.text, context))
             .transpose()?;
@@ -1367,11 +1344,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
             parsed,
             definition: std::sync::Arc::clone(&definition),
             static_modules: ConditionalStaticModules {
-                text: PartitionStaticModules {
-                    embeddings,
-                    norm,
-                    lm_head,
-                },
+                text,
                 vision,
                 prediction,
             },

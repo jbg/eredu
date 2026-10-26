@@ -8415,6 +8415,13 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+Qwen hybrid text partitions and conditional construction consume canonical
+`ComponentSelection` storage ownership through the shared selected pinned-resource
+constructor. Conditional graphs retain their family vision selection and prediction
+resources. Text readout wraps the selected normalization in its ordinary boundary
+without allocating a second normalization module. Exact vocabulary ranges and the
+same family static specification serve complete and selected construction.
+
 Qwen hybrid uses one source-free static declaration for fixed and complete text
 execution, conditional text construction, parameter catalogs and output topology.
 Nemotron-H likewise shares parameter identities, dimensions, encodings and tied

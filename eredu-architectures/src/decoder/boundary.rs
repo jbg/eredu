@@ -44,6 +44,19 @@ impl<B: NeuralBackend> Clone for NormalizedBoundary<B> {
     }
 }
 impl<B: NeuralBackend> NormalizedBoundary<B> {
+    /// Retains an already materialized normalization without allocating another module.
+    pub(crate) fn from_normalization(
+        dimensions: i32,
+        norm: B::Normalization,
+    ) -> Result<Self, Error> {
+        if dimensions <= 0 {
+            return Err(Error::backend(
+                "normalization boundary width must be positive",
+            ));
+        }
+        Ok(Self { dimensions, norm })
+    }
+
     /// Constructs an ordinary boundary from its exact normalization policy.
     pub fn new(
         spec: eredu_nn::NormalizationConstructionSpec,
