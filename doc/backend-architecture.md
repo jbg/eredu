@@ -8515,6 +8515,12 @@ ranges before materialization. Diffusion Gemma declares these specifications onc
 for ordinary and selected construction; its conditioning, embedding scaling and
 refinement equations remain family-owned. Zero-offset learned normalization with
 FP32 scale arithmetic retains its typed policy, independently of the numeric offset.
+Logical and physical pinned catalogs project parameter identities and exact encoding
+companions from this validated construction, including the declared normalization
+weight. `StaticModuleSpec` supplies the same construction object to catalog and
+materialization paths. Diffusion Gemma uses its family-authored construction for
+both paths and appends its separate feedback groups; Gemma retains its own per-layer
+input resources.
 
 `ArchitectureParameterDescription::project_groups` selects named execution groups
 and explicit pinned roles. It preserves sparse global invocation indices,

@@ -17,9 +17,18 @@ pub fn static_parameter_groups(
     config: &FamilyConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let args = &config.text;
-    let mut groups = crate::gemma4::parallel::static_parameter_groups_at(args, "model.decoder")?;
-    let hidden =
-        usize::try_from(args.hidden_size).map_err(|_| invalid("invalid feedback hidden width"))?;
+    let mut groups = super::text::static_construction_specs(config)
+        .map_err(|error| invalid(error.to_string()))?
+        .pinned_parameter_groups(
+            "model.decoder.embed_tokens",
+            "model.decoder.norm",
+            "lm_head",
+        )?
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect::<Vec<_>>();
+    let hidden = usize::try_from(args.hidden_size)
+        .map_err(|_| invalid("invalid feedback hidden width"))?;
     let width = args
         .layer_policy(0)
         .ok_or_else(|| invalid("empty diffusion stack"))?

@@ -4076,6 +4076,106 @@ impl StaticModuleConstruction {
             normalization,
         })
     }
+
+    /// Projects logical embedding, normalization and readout resources before
+    /// encoding expansion. Families retain group names and format admission;
+    /// explicit resource roles remain independent of group ordering.
+    pub(crate) fn logical_pinned_parameter_groups(
+        &self,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+        let embedding = &self.embedding;
+        let head = &self.head;
+        let normalization_weight = match &self.normalization.scale {
+            eredu_nn::NormalizationScale::Learned(weight)
+            | eredu_nn::NormalizationScale::LearnedOffset { weight, .. } => weight,
+            eredu_nn::NormalizationScale::Unit => {
+                return Err(ParallelPlanError::InvalidGroup(
+                    "pinned normalization catalog requires a learned scale".into(),
+                ));
+            }
+        };
+        let group = |name: &str, role, target: &str, shape, sharding| {
+            ParameterGroupSpec::new(
+                name,
+                role,
+                [eredu_runtime::ParameterMemberSpec::new(
+                    target, shape, sharding,
+                )],
+            )
+        };
+        let mut groups = vec![
+            (
+                "embedding",
+                group(
+                    embedding_group,
+                    ParameterRole::Vocabulary,
+                    embedding.weight.id.as_str(),
+                    vec![embedding.vocabulary as usize, embedding.dimensions as usize],
+                    MemberSharding::Balanced { axis: 0 },
+                )?,
+            ),
+            (
+                "norm",
+                group(
+                    normalization_group,
+                    ParameterRole::Replicated,
+                    normalization_weight.id.as_str(),
+                    vec![embedding.dimensions as usize],
+                    MemberSharding::Replicated,
+                )?,
+            ),
+        ];
+        if let Some(head) = head {
+            let mut members = vec![eredu_runtime::ParameterMemberSpec::new(
+                head.weight.id.as_str(),
+                vec![head.output as usize, head.input as usize],
+                MemberSharding::Balanced { axis: 0 },
+            )];
+            if let Some(bias) = &head.bias {
+                members.push(eredu_runtime::ParameterMemberSpec::new(
+                    bias.id.as_str(),
+                    vec![head.output as usize],
+                    MemberSharding::Balanced { axis: 0 },
+                ));
+            }
+            groups.push((
+                "output",
+                ParameterGroupSpec::new(output_group, ParameterRole::Vocabulary, members)?,
+            ));
+        }
+        Ok(groups)
+    }
+
+    /// Projects physical pinned groups from the same admitted formats used by
+    /// construction. Resource roles survive encoding and companion expansion.
+    pub(crate) fn pinned_parameter_groups(
+        &self,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+        eredu_runtime::expand_tagged_linear_format_parameter_groups(
+            self.logical_pinned_parameter_groups(
+                embedding_group,
+                normalization_group,
+                output_group,
+            )?,
+            |member| {
+                let format = if member.target() == self.embedding.weight.id.as_str() {
+                    Some(self.embedding.format.clone())
+                } else {
+                    self.head
+                        .as_ref()
+                        .filter(|head| member.target() == head.weight.id.as_str())
+                        .map(|head| head.format.clone())
+                };
+                Ok(format)
+            },
+        )
+    }
 }
 
 /// Physical ownership and placement of one ordinary pinned vocabulary resource.
@@ -4137,91 +4237,28 @@ impl StaticModuleSpec {
         StaticModuleConstruction::new(embedding, head, normalization)
     }
 
-    /// Projects logical embedding, normalization and readout resources before
-    /// encoding expansion. Families retain group names and format admission;
-    /// explicit resource roles remain independent of group ordering.
+    /// Projects logical pinned roles from the validated construction declaration.
     pub(crate) fn logical_pinned_parameter_groups(
         &self,
         embedding_group: &str,
         normalization_group: &str,
         output_group: &str,
     ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-        let StaticModuleConstruction {
-            embedding, head, ..
-        } = self
-            .construction_specs()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let group = |name: &str, role, target: &str, shape, sharding| {
-            ParameterGroupSpec::new(
-                name,
-                role,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    target, shape, sharding,
-                )],
-            )
-        };
-        let mut groups = vec![
-            (
-                "embedding",
-                group(
-                    embedding_group,
-                    ParameterRole::Vocabulary,
-                    embedding.weight.id.as_str(),
-                    vec![embedding.vocabulary as usize, embedding.dimensions as usize],
-                    MemberSharding::Balanced { axis: 0 },
-                )?,
-            ),
-            (
-                "norm",
-                group(
-                    normalization_group,
-                    ParameterRole::Replicated,
-                    &self.normalization_weight,
-                    vec![embedding.dimensions as usize],
-                    MemberSharding::Replicated,
-                )?,
-            ),
-        ];
-        if let Some(head) = head {
-            groups.push((
-                "output",
-                group(
-                    output_group,
-                    ParameterRole::Vocabulary,
-                    head.weight.id.as_str(),
-                    vec![head.output as usize, head.input as usize],
-                    MemberSharding::Balanced { axis: 0 },
-                )?,
-            ));
-        }
-        Ok(groups)
+        self.construction_specs()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+            .logical_pinned_parameter_groups(embedding_group, normalization_group, output_group)
     }
 
-    /// Projects physical pinned groups from the same admitted formats used by
-    /// construction. Resource roles survive encoding and companion expansion.
+    /// Projects physical storage and companions from the same construction declaration.
     pub(crate) fn pinned_parameter_groups(
         &self,
         embedding_group: &str,
         normalization_group: &str,
         output_group: &str,
     ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-        eredu_runtime::expand_tagged_linear_format_parameter_groups(
-            self.logical_pinned_parameter_groups(
-                embedding_group,
-                normalization_group,
-                output_group,
-            )?,
-            |member| {
-                let format = if member.target() == self.embedding_weight {
-                    self.embedding_format
-                } else if member.target() == self.head_weight {
-                    self.head_format
-                } else {
-                    return Ok(None);
-                };
-                crate::linear_format::standard_parallel_linear_format(member, format)
-            },
-        )
+        self.construction_specs()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+            .pinned_parameter_groups(embedding_group, normalization_group, output_group)
     }
 
     /// Projects exact vocabulary intervals from declared physical storage.

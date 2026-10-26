@@ -369,37 +369,40 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for Tex
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B> {
-    fn construction_specs(config: &FamilyConfig) -> Result<StaticModuleConstruction, Error> {
-        let args = &config.text;
-        let key = "model.decoder.embed_tokens.weight";
-        let embedding = EmbeddingSpec {
-            vocabulary: args.vocab_size,
-            dimensions: args.hidden_size,
-            weight: ParameterSpec::trainable(key).map_err(Error::backend)?,
-            format: crate::linear_format::standard_linear_format(key, args.linear_format_for(key))?,
-        };
-        let head = (!args.tie_word_embeddings)
-            .then(|| -> Result<_, Error> {
-                Ok(LinearSpec {
-                    input: args.hidden_size,
-                    output: args.vocab_size,
-                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        "lm_head.weight",
-                        args.linear_format_for("lm_head.weight"),
-                    )?,
-                })
+/// Backend-neutral pinned specifications shared by cold catalogs and materialization.
+pub(super) fn static_construction_specs(
+    config: &FamilyConfig,
+) -> Result<StaticModuleConstruction, Error> {
+    let args = &config.text;
+    let key = "model.decoder.embed_tokens.weight";
+    let embedding = EmbeddingSpec {
+        vocabulary: args.vocab_size,
+        dimensions: args.hidden_size,
+        weight: ParameterSpec::trainable(key).map_err(Error::backend)?,
+        format: crate::linear_format::standard_linear_format(key, args.linear_format_for(key))?,
+    };
+    let head = (!args.tie_word_embeddings)
+        .then(|| -> Result<_, Error> {
+            Ok(LinearSpec {
+                input: args.hidden_size,
+                output: args.vocab_size,
+                weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
+                bias: None,
+                format: crate::linear_format::standard_linear_format(
+                    "lm_head.weight",
+                    args.linear_format_for("lm_head.weight"),
+                )?,
             })
-            .transpose()?;
-        let normalization = args.normalization(
-            args.hidden_size,
-            ParameterSpec::trainable("model.decoder.norm.weight").map_err(Error::backend)?,
-        );
-        StaticModuleConstruction::new(embedding, head, normalization)
-    }
+        })
+        .transpose()?;
+    let normalization = args.normalization(
+        args.hidden_size,
+        ParameterSpec::trainable("model.decoder.norm.weight").map_err(Error::backend)?,
+    );
+    StaticModuleConstruction::new(embedding, head, normalization)
+}
 
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B> {
     /// Declares pinned text parameters independently from layer residency.
     pub fn new(
         config: &FamilyConfig,
@@ -439,7 +442,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B>
             }
         };
         let modules = PartitionStaticModules::<B>::from_construction(
-            Self::construction_specs(config)?,
+            static_construction_specs(config)?,
             placement("embedding"),
             if args.tie_word_embeddings {
                 StaticModulePlacement::Omitted

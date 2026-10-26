@@ -908,15 +908,7 @@ fn local_axis(
 pub fn static_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    static_parameter_groups_at(args, "model.language_model")
-}
-
-/// Declares shared vocabulary/readout placement under an architecture-owned root.
-pub(crate) fn static_parameter_groups_at(
-    args: &ModelArgs,
-    root: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(pinned_parameter_groups_at(args, root)?
+    Ok(pinned_parameter_groups(args)?
         .into_iter()
         .map(|(_, group)| group)
         .collect())
@@ -926,13 +918,7 @@ pub(crate) fn static_parameter_groups_at(
 pub(crate) fn pinned_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    pinned_parameter_groups_at(args, "model.language_model")
-}
-
-fn pinned_parameter_groups_at(
-    args: &ModelArgs,
-    root: &str,
-) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+    let root = "model.language_model";
     let hidden = dim(args.hidden_size)?;
     let vocab = dim(args.vocab_size)?;
     let mut groups = vec![(
