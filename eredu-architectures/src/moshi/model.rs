@@ -13,6 +13,7 @@ use eredu_runtime::{
     LayerRuntimeState, LayeredForwardState, LayeredTraversalPoint, ParallelComponentKernel,
     ResettableRuntimeState, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionError,
     StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, TokenDomain,
+    VocabularyModulePlacement,
 };
 use std::sync::Arc;
 
@@ -144,7 +145,35 @@ pub struct StaticModules<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
     pub text_output: B::Linear,
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
+/// Backend-neutral construction inputs shared by parameter planning and allocation.
+pub(super) struct StaticConstruction {
+    pub(super) embeddings: Vec<NamedEmbeddingSpec>,
+    pub(super) output_norm: NormalizationConstructionSpec,
+    pub(super) text_output: LinearSpec,
+}
+
+impl StaticConstruction {
+    pub(super) fn new(config: &MoshiConfig) -> Result<Self, Error> {
+        Ok(Self {
+            embeddings: Self::embedding_specs(config)?,
+            output_norm: NormalizationConstructionSpec::learned(
+                config.temporal().hidden_size(),
+                config.temporal().rms_norm_epsilon(),
+                ParameterSpec::trainable("out_norm.weight").map_err(Error::backend)?,
+            ),
+            text_output: LinearSpec {
+                input: config.temporal().hidden_size(),
+                output: config.text_vocabulary_size(),
+                weight: ParameterSpec::trainable("text_linear.weight").map_err(Error::backend)?,
+                bias: None,
+                format: crate::linear_format::standard_linear_format(
+                    "text_linear.weight",
+                    config.native_quantization().into(),
+                )?,
+            },
+        })
+    }
+
     fn embedding_specs(config: &MoshiConfig) -> Result<Vec<NamedEmbeddingSpec>, Error> {
         let text_input_vocabulary = config
             .text_vocabulary_size()
@@ -192,95 +221,56 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
         Ok(embeddings)
     }
 
-    fn new(config: &MoshiConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let embeddings = MultiTableEmbedding::new(Self::embedding_specs(config)?, context)?;
-        let output_norm = B::normalization(
-            NormalizationConstructionSpec::learned(
-                config.temporal().hidden_size(),
-                config.temporal().rms_norm_epsilon(),
-                ParameterSpec::trainable("out_norm.weight").map_err(Error::backend)?,
-            ),
-            context,
-        )?;
-        let text_output = B::linear(
-            LinearSpec {
-                input: config.temporal().hidden_size(),
-                output: config.text_vocabulary_size(),
-                weight: ParameterSpec::trainable("text_linear.weight").map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    "text_linear.weight",
-                    config.native_quantization().into(),
-                )?,
-            },
-            context,
-        )?;
-        Ok(Self {
-            embeddings,
-            output_norm,
-            text_output,
-        })
-    }
+}
 
-    fn new_parallel(
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
+    fn from_geometry(
         config: &MoshiConfig,
-        geometry: &super::LocalGeometry,
+        geometry: Option<&super::LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let specs = Self::embedding_specs(config)?;
-        let ranges = std::iter::once("text_emb.weight".to_owned())
-            .chain(
-                (0..config.frame_schedule().total_audio_codebooks())
-                    .map(|index| format!("audio_embs.{index}.weight")),
-            )
-            .map(|target| {
-                let local = geometry
-                    .vocabulary_range(&target)
-                    .cloned()
-                    .ok_or_else(|| Error::backend(format!("missing local range for {target}")))?;
-                let global_vocabulary = specs
-                    .iter()
-                    .find(|spec| spec.embedding.weight.id.as_str() == target)
-                    .map(|spec| spec.embedding.vocabulary as usize)
-                    .ok_or_else(|| {
-                        Error::backend(format!("missing embedding spec for {target}"))
-                    })?;
-                Ok(VocabularyParallelRange {
-                    global_vocabulary,
-                    local,
+        let StaticConstruction {
+            embeddings: specs,
+            output_norm,
+            text_output,
+        } = StaticConstruction::new(config)?;
+        let output_placement = match geometry {
+            None => VocabularyModulePlacement::Local,
+            Some(geometry) => {
+                VocabularyModulePlacement::VocabularyParallel(VocabularyParallelRange {
+                    global_vocabulary: text_output.output as usize,
+                    local: geometry
+                        .vocabulary_range(text_output.weight.id.as_str())
+                        .cloned()
+                        .ok_or_else(|| Error::backend("missing local text output range"))?,
                 })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let embeddings = MultiTableEmbedding::new_vocabulary_parallel(specs, ranges, context)?;
-        let output_norm = B::normalization(
-            NormalizationConstructionSpec::learned(
-                config.temporal().hidden_size(),
-                config.temporal().rms_norm_epsilon(),
-                ParameterSpec::trainable("out_norm.weight").map_err(Error::backend)?,
-            ),
-            context,
-        )?;
-        let local = geometry
-            .vocabulary_range("text_linear.weight")
-            .cloned()
-            .ok_or_else(|| Error::backend("missing local text output range"))?;
-        let text_output = B::vocabulary_parallel_linear(
-            LinearSpec {
-                input: config.temporal().hidden_size(),
-                output: config.text_vocabulary_size(),
-                weight: ParameterSpec::trainable("text_linear.weight").map_err(Error::backend)?,
-                bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    "text_linear.weight",
-                    config.native_quantization().into(),
-                )?,
-            },
-            VocabularyParallelRange {
-                global_vocabulary: config.text_vocabulary_size() as usize,
-                local,
-            },
-            context,
-        )?;
+            }
+        };
+        output_placement.validate_rows(text_output.output)?;
+        let embeddings = match geometry {
+            None => MultiTableEmbedding::new(specs, context)?,
+            Some(geometry) => {
+                let ranges = specs
+                    .iter()
+                    .map(|spec| {
+                        let target = spec.embedding.weight.id.as_str();
+                        let range = VocabularyParallelRange {
+                            global_vocabulary: spec.embedding.vocabulary as usize,
+                            local: geometry.vocabulary_range(target).cloned().ok_or_else(|| {
+                                Error::backend(format!("missing local range for {target}"))
+                            })?,
+                        };
+                        range.validate_global_rows(spec.embedding.vocabulary)?;
+                        Ok(range)
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                MultiTableEmbedding::new_vocabulary_parallel(specs, ranges, context)?
+            }
+        };
+        let output_norm = B::normalization(output_norm, context)?;
+        let text_output = output_placement
+            .materialize_linear::<B>(text_output, context)?
+            .expect("Moshi owns its text output");
         Ok(Self {
             embeddings,
             output_norm,
@@ -463,10 +453,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
         parallel_execution_identity: Option<String>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let static_modules = match &parallel_geometry {
-            Some(geometry) => StaticModules::new_parallel(&config, geometry, context)?,
-            None => StaticModules::new(&config, context)?,
-        };
+        let static_modules =
+            StaticModules::from_geometry(&config, parallel_geometry.as_ref(), context)?;
         Ok(Self {
             definition,
             config,

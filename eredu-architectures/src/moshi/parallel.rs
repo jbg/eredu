@@ -470,38 +470,53 @@ pub fn parameter_contract(
         ));
         Ok(())
     };
-    add_static(
-        "embedding",
-        "text_emb".into(),
-        ParameterRole::Vocabulary,
-        "text_emb.weight".into(),
-        vec![text_vocabulary + 1, temporal_hidden],
-        MemberSharding::Balanced { axis: 0 },
-    )?;
-    for codebook in 0..config.frame_schedule().total_audio_codebooks() {
+    let construction = super::model::StaticConstruction::new(config)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    for spec in &construction.embeddings {
+        let embedding = &spec.embedding;
+        let target = embedding.weight.id.as_str();
         add_static(
             "embedding",
-            format!("audio_embs.{codebook}"),
+            target.trim_end_matches(".weight").into(),
             ParameterRole::Vocabulary,
-            format!("audio_embs.{codebook}.weight"),
-            vec![audio_vocabulary + 1, temporal_hidden],
+            target.into(),
+            vec![
+                dimension("embedding vocabulary", embedding.vocabulary)?,
+                dimension("embedding width", embedding.dimensions)?,
+            ],
             MemberSharding::Balanced { axis: 0 },
         )?;
     }
+    let normalization_weight = match &construction.output_norm.scale {
+        eredu_nn::NormalizationScale::Learned(weight)
+        | eredu_nn::NormalizationScale::LearnedOffset { weight, .. } => weight,
+        eredu_nn::NormalizationScale::Unit => {
+            return Err(ParallelPlanError::InvalidGroup(
+                "Moshi output normalization requires a learned scale".into(),
+            ));
+        }
+    };
     add_static(
         "norm",
         "out_norm".into(),
         ParameterRole::Replicated,
-        "out_norm.weight".into(),
-        vec![temporal_hidden],
+        normalization_weight.id.as_str().into(),
+        vec![dimension(
+            "normalization width",
+            construction.output_norm.dimensions,
+        )?],
         MemberSharding::Replicated,
     )?;
+    let output = &construction.text_output;
     add_static(
         "output",
         "text_linear".into(),
         ParameterRole::Vocabulary,
-        "text_linear.weight".into(),
-        vec![text_vocabulary, temporal_hidden],
+        output.weight.id.as_str().into(),
+        vec![
+            dimension("output vocabulary", output.output)?,
+            dimension("output width", output.input)?,
+        ],
         MemberSharding::Balanced { axis: 0 },
     )?;
 

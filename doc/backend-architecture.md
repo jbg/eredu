@@ -8526,6 +8526,14 @@ materialization paths. Diffusion Gemma uses its family-authored construction for
 both paths and appends its separate feedback groups; Gemma retains its own per-layer
 input resources.
 
+Moshi static construction retains one backend-neutral specification for ordered
+text/audio embedding tables, learned temporal normalization and text readout.
+Cold parameter contracts project their identities and logical shapes from these
+specifications before physical-format expansion. Complete and tensor-local
+materialization use the same constructor. Local table ranges resolve directly by
+the declared parameter identity; all vocabulary ranges are validated before any
+table is allocated. Input padding rows and the unpadded readout remain distinct.
+
 Moshi depth slices declare their embedding, temporal projection and audio readout
 once for complete and tensor-local construction. Runtime vocabulary placement
 materializes the independently selected embedding and readout; the temporal
