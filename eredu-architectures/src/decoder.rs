@@ -4199,6 +4199,54 @@ impl StaticModuleSpec {
         Ok((embedding, head, normalization))
     }
 
+    /// Projects ordinary logical parameter geometry before encoding expansion.
+    /// Families retain group identities and apply their admitted formats once.
+    pub(crate) fn logical_parameter_groups(
+        &self,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+        let (embedding, head, _) = self
+            .construction_specs()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let group = |name: &str, role, target: &str, shape, sharding| {
+            ParameterGroupSpec::new(
+                name,
+                role,
+                [eredu_runtime::ParameterMemberSpec::new(
+                    target, shape, sharding,
+                )],
+            )
+        };
+        let mut groups = vec![
+            group(
+                embedding_group,
+                ParameterRole::Vocabulary,
+                embedding.weight.id.as_str(),
+                vec![embedding.vocabulary as usize, embedding.dimensions as usize],
+                MemberSharding::Balanced { axis: 0 },
+            )?,
+            group(
+                normalization_group,
+                ParameterRole::Replicated,
+                &self.normalization_weight,
+                vec![embedding.dimensions as usize],
+                MemberSharding::Replicated,
+            )?,
+        ];
+        if let Some(head) = head {
+            groups.push(group(
+                output_group,
+                ParameterRole::Vocabulary,
+                head.weight.id.as_str(),
+                vec![head.output as usize, head.input as usize],
+                MemberSharding::Balanced { axis: 0 },
+            )?);
+        }
+        Ok(groups)
+    }
+
     /// Shared ordinary static-module specification before backend binding.
     pub(crate) fn from_config<C: Config>(config: &C) -> Self {
         let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());

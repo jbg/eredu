@@ -8464,6 +8464,13 @@ normalization; complete and partition profiles select the existing full-width F3
 reduction and scale multiplication. These arithmetic choices remain distinct
 without duplicating the resource description.
 
+`StaticModuleSpec::logical_parameter_groups` projects embedding, learned final
+normalization and untied readout geometry without native allocation. Muse and
+LFM2 cold catalogs use the same specification as pinned construction, including
+tied vocabulary ownership. Families supply semantic group identities and apply
+their admitted physical-format expansion once; packed shapes and companion
+metadata remain part of that family projection.
+
 `StaticModuleSpec::embedding_format` retains the complete physical matrix encoding,
 including block-FP8 companions. Shared decoder configuration supplies its selected
 `linear_format` directly; tied output inspection uses the same embedding encoding

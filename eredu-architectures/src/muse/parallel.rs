@@ -665,32 +665,11 @@ fn local_axis(
 pub fn static_parameter_groups(
     args: &DecoderConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let hidden = dim(args.hidden_size)?;
-    let vocabulary = dim(args.vocab_size)?;
-    let mut groups = vec![group(
+    let groups = super::text::static_spec(args).logical_parameter_groups(
         "model.embed_tokens",
-        ParameterRole::Vocabulary,
-        [(
-            "model.embed_tokens.weight",
-            vec![vocabulary, hidden],
-            MemberSharding::Balanced { axis: 0 },
-        )],
-    )?];
-    groups.push(replicated(
         "model.norm",
-        [("model.norm.weight", vec![hidden])],
-    )?);
-    if !args.tie_word_embeddings {
-        groups.push(group(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            [(
-                "lm_head.weight",
-                vec![vocabulary, hidden],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?);
-    }
+        "lm_head",
+    )?;
     expand_linear_format_parameter_groups(groups, |member| {
         standard_parallel_linear_format(member, args.linear_format_for(member.target()))
     })

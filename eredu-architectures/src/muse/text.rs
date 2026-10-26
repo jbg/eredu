@@ -1472,7 +1472,7 @@ pub struct StaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
 }
 
 /// Pinned resource geometry and formats for every vocabulary arithmetic policy.
-fn static_spec(args: &DecoderConfig) -> crate::decoder::StaticModuleSpec {
+pub(super) fn static_spec(args: &DecoderConfig) -> crate::decoder::StaticModuleSpec {
     crate::decoder::StaticModuleSpec {
         normalization_groups: match args.vocabulary_arithmetic() {
             VocabularyArithmetic::Backend => None,

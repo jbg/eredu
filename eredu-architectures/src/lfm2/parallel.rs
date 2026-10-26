@@ -824,35 +824,11 @@ pub fn parameter_description(
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [layers])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let mut groups = vec![ParameterGroupSpec::new(
+    let mut groups = super::static_spec(args).logical_parameter_groups(
         "model.embed_tokens",
-        ParameterRole::Vocabulary,
-        [ParameterMemberSpec::new(
-            "model.embed_tokens.weight",
-            vec![args.vocab_size as usize, args.hidden_size as usize],
-            MemberSharding::Balanced { axis: 0 },
-        )],
-    )?];
-    groups.push(ParameterGroupSpec::new(
         "model.embedding_norm",
-        ParameterRole::Replicated,
-        [ParameterMemberSpec::new(
-            "model.embedding_norm.weight",
-            vec![args.hidden_size as usize],
-            MemberSharding::Replicated,
-        )],
-    )?);
-    if !args.tie_word_embeddings {
-        groups.push(ParameterGroupSpec::new(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            [ParameterMemberSpec::new(
-                "lm_head.weight",
-                vec![args.vocab_size as usize, args.hidden_size as usize],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?);
-    }
+        "lm_head",
+    )?;
     let static_count = groups.len();
     let head_dim = usize::try_from(args.hidden_size / args.num_attention_heads)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 head width exceeds usize".into()))?;
