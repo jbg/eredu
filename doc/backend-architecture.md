@@ -8508,8 +8508,12 @@ convolution geometry remain component declarations. DeepSeek target/prediction
 catalogs and Muse audio units use the same constructor.
 
 Shared decoder `StaticModuleConstruction` retains validated embedding, readout and
-full normalization specifications before allocation. `StaticModulePlacement`
-selects each vocabulary resource independently as local, tensor-local or omitted.
+full normalization specifications before allocation. Runtime
+`VocabularyModulePlacement` selects each vocabulary resource independently as local,
+tensor-local or omitted and dispatches its typed embedding or projection spec to
+the backend. Each materialization validates its own global row count; components
+also validate coupled selections before allocating any resource. Family declarations
+retain input/output cardinality relationships and normalization policy.
 The shared selected allocator preserves canonical modules and checks vocabulary
 ranges before materialization. Diffusion Gemma declares these specifications once
 for ordinary and selected construction; its conditioning, embedding scaling and

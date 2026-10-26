@@ -32,6 +32,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
     LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelPlanError,
     ParameterGroupOwner, ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
+    VocabularyModulePlacement,
 };
 
 /// Narrows a causal decoder's position-independent readout before projection.
@@ -4245,21 +4246,6 @@ impl StaticModuleConstruction {
     }
 }
 
-/// Physical ownership and placement of one ordinary pinned vocabulary resource.
-pub(crate) enum StaticModulePlacement {
-    Omitted,
-    Local,
-    VocabularyParallel(VocabularyParallelRange),
-}
-impl StaticModulePlacement {
-    fn validate_rows(&self, rows: i32) -> Result<(), Error> {
-        if let Self::VocabularyParallel(range) = self {
-            range.validate_global_rows(rows)?;
-        }
-        Ok(())
-    }
-}
-
 impl StaticModuleSpec {
     pub(crate) fn construction_specs(&self) -> Result<StaticModuleConstruction, Error> {
         let embedding = EmbeddingSpec {
@@ -5264,23 +5250,23 @@ impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
         let embedding = if owns("embedding") {
             vocabulary
                 .as_ref()
-                .map_or(StaticModulePlacement::Local, |(range, _)| {
-                    StaticModulePlacement::VocabularyParallel(range.clone())
+                .map_or(VocabularyModulePlacement::Local, |(range, _)| {
+                    VocabularyModulePlacement::VocabularyParallel(range.clone())
                 })
         } else {
-            StaticModulePlacement::Omitted
+            VocabularyModulePlacement::Omitted
         };
         let norm = owns("norm");
         let head = if construction.head.is_some() && owns("output") {
             vocabulary
                 .as_ref()
-                .map_or(StaticModulePlacement::Local, |(_, range)| {
-                    StaticModulePlacement::VocabularyParallel(
+                .map_or(VocabularyModulePlacement::Local, |(_, range)| {
+                    VocabularyModulePlacement::VocabularyParallel(
                         range.clone().expect("validated output range"),
                     )
                 })
         } else {
-            StaticModulePlacement::Omitted
+            VocabularyModulePlacement::Omitted
         };
         Self::from_construction(construction, embedding, head, norm, context)
     }
@@ -5288,8 +5274,8 @@ impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
     /// Materializes validated resources with independently selected vocabulary owners.
     pub(crate) fn from_construction(
         construction: StaticModuleConstruction,
-        embedding: StaticModulePlacement,
-        head: StaticModulePlacement,
+        embedding: VocabularyModulePlacement,
+        head: VocabularyModulePlacement,
         owns_norm: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
@@ -5301,28 +5287,18 @@ impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
         embedding.validate_rows(embedding_spec.vocabulary)?;
         if let Some(spec) = &head_spec {
             head.validate_rows(spec.output)?;
-        } else if !matches!(head, StaticModulePlacement::Omitted) {
+        } else if !matches!(head, VocabularyModulePlacement::Omitted) {
             return Err(Error::backend(
                 "selected output has no vocabulary projection",
             ));
         }
-        let embeddings = match embedding {
-            StaticModulePlacement::Omitted => None,
-            StaticModulePlacement::Local => Some(B::embedding(embedding_spec, context)?),
-            StaticModulePlacement::VocabularyParallel(range) => Some(
-                B::vocabulary_parallel_embedding(embedding_spec, range, context)?,
-            ),
-        };
+        let embeddings = embedding.materialize_embedding::<B>(embedding_spec, context)?;
         let norm = owns_norm
             .then(|| B::normalization(normalization, context))
             .transpose()?;
-        let lm_head = match (head, head_spec) {
-            (StaticModulePlacement::Omitted, _) => None,
-            (StaticModulePlacement::Local, Some(spec)) => Some(B::linear(spec, context)?),
-            (StaticModulePlacement::VocabularyParallel(range), Some(spec)) => {
-                Some(B::vocabulary_parallel_linear(spec, range, context)?)
-            }
-            (_, None) => unreachable!("validated output ownership"),
+        let lm_head = match head_spec {
+            Some(spec) => head.materialize_linear::<B>(spec, context)?,
+            None => None,
         };
         Ok(Self {
             embeddings,

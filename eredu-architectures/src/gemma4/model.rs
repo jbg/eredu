@@ -2468,27 +2468,28 @@ pub(crate) mod model_text {
             geometry: Option<&super::super::LocalGeometry>,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<Self, Error> {
-            use crate::decoder::{PartitionStaticModules, StaticModulePlacement};
+            use crate::decoder::PartitionStaticModules;
+            use eredu_runtime::VocabularyModulePlacement;
             let per_layer_width = args.hidden_size_per_layer_input;
             let combined_width = per_layer_width
                 .checked_mul(args.num_hidden_layers() as i32)
                 .ok_or_else(|| Error::backend("Gemma 4 per-layer width overflowed"))?;
             let per_layer_embedding = "model.language_model.embed_tokens_per_layer.weight";
             let per_layer_projection = "model.language_model.per_layer_model_projection.weight";
-            let embedding = geometry.map_or(StaticModulePlacement::Local, |geometry| {
-                StaticModulePlacement::VocabularyParallel(geometry.embedding_range().clone())
+            let embedding = geometry.map_or(VocabularyModulePlacement::Local, |geometry| {
+                VocabularyModulePlacement::VocabularyParallel(geometry.embedding_range().clone())
             });
             let head = if args.tie_word_embeddings {
-                StaticModulePlacement::Omitted
+                VocabularyModulePlacement::Omitted
             } else if let Some(geometry) = geometry {
-                StaticModulePlacement::VocabularyParallel(
+                VocabularyModulePlacement::VocabularyParallel(
                     geometry
                         .output_range()
                         .cloned()
                         .ok_or_else(|| Error::backend("untied Gemma 4 output has no local range"))?,
                 )
             } else {
-                StaticModulePlacement::Local
+                VocabularyModulePlacement::Local
             };
             let ordinary = PartitionStaticModules::<B>::from_construction(
                 super::super::static_construction_specs(args)?,

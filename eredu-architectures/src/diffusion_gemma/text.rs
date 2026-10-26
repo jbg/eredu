@@ -5,14 +5,11 @@ use eredu_nn::{
     LinearSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
     ReadOnlyAttentionCache, ReadOnlyCache, Tensor, TensorElementType,
 };
-use eredu_runtime::{ExpertPass, ParameterProvider};
+use eredu_runtime::{ExpertPass, ParameterProvider, VocabularyModulePlacement};
 
 use super::FamilyConfig;
 use crate::{
-    decoder::{
-        ComponentInstrumentation, PartitionStaticModules, StaticModuleConstruction,
-        StaticModulePlacement,
-    },
+    decoder::{ComponentInstrumentation, PartitionStaticModules, StaticModuleConstruction},
     gemma4::{BlockInput, DenseBlock, ModelArgs},
 };
 
@@ -428,7 +425,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B>
     ) -> Result<Self, Error> {
         let args = &config.text;
         let placement = |role| match geometry {
-            None => StaticModulePlacement::Local,
+            None => VocabularyModulePlacement::Local,
             Some(geometry) => {
                 let range = match role {
                     "embedding" => geometry.embedding_range(),
@@ -436,8 +433,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B>
                     _ => unreachable!("declared vocabulary role"),
                 };
                 range.cloned().map_or(
-                    StaticModulePlacement::Omitted,
-                    StaticModulePlacement::VocabularyParallel,
+                    VocabularyModulePlacement::Omitted,
+                    VocabularyModulePlacement::VocabularyParallel,
                 )
             }
         };
@@ -445,7 +442,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B>
             static_construction_specs(config)?,
             placement("embedding"),
             if args.tie_word_embeddings {
-                StaticModulePlacement::Omitted
+                VocabularyModulePlacement::Omitted
             } else {
                 placement("output")
             },

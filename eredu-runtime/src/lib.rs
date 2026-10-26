@@ -607,3 +607,6 @@ mod unit_policy_view;
 pub use unit_policy_view::{
     ProjectedUnitLease, UnitPolicyView, UnitPolicyViewError, UnitProjection,
 };
+
+mod vocabulary_module;
+pub use vocabulary_module::VocabularyModulePlacement;
