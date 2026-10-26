@@ -8415,6 +8415,14 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+Muse text resources use the shared pinned constructor for ordinary, tensor-local
+and binding-selected construction. Its family static specification retains complete
+embedding/readout formats and selects native or full-width F32 final normalization
+from the vocabulary-arithmetic policy. Weightless embedding normalization,
+precision boundaries, output multiplication and softcapping remain Muse equations.
+The low-level binding constructor validates complete canonical resources before
+materialization; tied output retains its embedding owner.
+
 Qwen3-VL text resources use the shared selected pinned constructor for complete,
 tensor-local and partitioned construction. Canonical component storage ownership
 selects embedding, final normalization and readout, including tied output replicas;

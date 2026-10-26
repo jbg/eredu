@@ -1,7 +1,7 @@
 //! Backend-neutral Muse-Glimmer decoder equations.
 
 use eredu_nn::{
-    AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
+    AttentionCache, AttentionRequest, EmbeddingOperator, Error,
     GatedProductGroupLayout, GroupScoring, GroupedGatedProductOperator, GroupedGatedProductSpec,
     GroupedNeuralBackend, LinearOperator, LinearSpec, NormalizationConstructionSpec,
     NormalizationOperator, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
@@ -1471,20 +1471,27 @@ pub struct StaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
     logit_cap: f32,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
-    fn final_norm_spec(args: &DecoderConfig) -> Result<NormalizationConstructionSpec, Error> {
-        let spec = NormalizationConstructionSpec::learned(
-            args.hidden_size,
-            args.rms_norm_eps,
-            ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
-        );
-        match args.vocabulary_arithmetic() {
-            VocabularyArithmetic::Backend => Ok(spec),
-            VocabularyArithmetic::StageRounded | VocabularyArithmetic::Float32 => {
-                spec.with_groups(1)
-            }
-        }
+/// Pinned resource geometry and formats for every vocabulary arithmetic policy.
+fn static_spec(args: &DecoderConfig) -> crate::decoder::StaticModuleSpec {
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: match args.vocabulary_arithmetic() {
+            VocabularyArithmetic::Backend => None,
+            VocabularyArithmetic::StageRounded | VocabularyArithmetic::Float32 => Some(1),
+        },
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.rms_norm_eps,
+        normalization_offset: 0.0,
+        embedding_format: args.linear_format_for("model.embed_tokens.weight"),
+        head_format: args.linear_format_for("lm_head.weight"),
+        tied_head: args.tie_word_embeddings,
     }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
     /// Builds all canonical pinned resources for ordinary execution.
     pub fn new(
         args: &DecoderConfig,
@@ -1522,63 +1529,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         stores: impl Fn(&str) -> bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let embedding = "model.embed_tokens.weight";
-        let head = "lm_head.weight";
-        let embeddings = stores("embedding")
-            .then(|| {
-                let spec = EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        embedding,
-                        args.linear_format_for(embedding),
-                    )?,
-                };
-                match geometry {
-                    Some(geometry) => B::vocabulary_parallel_embedding(
-                        spec,
-                        geometry.embedding_range().clone(),
-                        context,
-                    ),
-                    None => B::embedding(spec, context),
-                }
-            })
-            .transpose()?;
-        let norm = stores("norm")
-            .then(|| B::normalization(Self::final_norm_spec(args)?, context))
-            .transpose()?;
-        let lm_head = (stores("output") && !args.tie_word_embeddings)
-            .then(|| {
-                let spec = LinearSpec {
-                    input: args.hidden_size,
-                    output: args.vocab_size,
-                    weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        head,
-                        args.linear_format_for(head),
-                    )?,
-                };
-                match geometry {
-                    Some(geometry) => B::vocabulary_parallel_linear(
-                        spec,
-                        geometry
-                            .output_range()
-                            .cloned()
-                            .ok_or_else(|| Error::backend("missing Muse-Glimmer output range"))?,
-                        context,
-                    ),
-                    None => B::linear(spec, context),
-                }
-            })
-            .transpose()?;
+        let resources = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
+            static_spec(args),
+            geometry.map(|geometry| {
+                (
+                    geometry.embedding_range().clone(),
+                    geometry.output_range().cloned(),
+                )
+            }),
+            stores,
+            context,
+        )?;
         Ok(Self {
-            resources: crate::decoder::PartitionStaticModules {
-                embeddings,
-                norm,
-                lm_head,
-            },
+            resources,
             tied_head: args.tie_word_embeddings,
             embedding_epsilon: args.rms_norm_eps,
             vocabulary_arithmetic: args.vocabulary_arithmetic(),
