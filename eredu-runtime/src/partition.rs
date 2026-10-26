@@ -568,6 +568,79 @@ impl ArchitectureParameterDescription {
             .collect()
     }
 
+    /// Projects named execution groups and pinned roles, preserving canonical owners,
+    /// sparse global unit indices and exact retained rank placement. Omitted graph
+    /// dependencies become caller-owned ingress; included dependencies stay unchanged.
+    pub fn project_groups(
+        &self,
+        graph: &ExecutionGraph,
+        pinned_roles: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, ArchitectureParameterError> {
+        let roles = pinned_roles
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
+        for role in &roles {
+            if !self
+                .groups
+                .iter()
+                .any(|group| group.owner().accepts_static_role(role))
+            {
+                return Err(ArchitectureParameterError::UnknownProjectedStaticRole(
+                    role.clone(),
+                ));
+            }
+        }
+        let layout = self.unit_layout.project_groups(graph)?;
+        for group in graph.groups() {
+            let parent = self.graph.group_index(group.id()).expect("projected group");
+            let dependencies = self.graph.groups()[parent]
+                .dependencies()
+                .iter()
+                .filter(|dependency| graph.group_index(dependency).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            if group.dependencies() != dependencies {
+                return Err(ArchitectureParameterError::InvalidProjectedDependencies(
+                    group.id().to_owned(),
+                ));
+            }
+        }
+        let groups = self.groups.iter().filter(|owned| match owned.owner() {
+            ParameterGroupOwner::ExecutionUnit { group, .. } => {
+                graph.group_index(group.as_str()).is_some()
+            }
+            ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => {
+                roles
+                    .iter()
+                    .any(|role| owned.owner().accepts_static_role(role))
+                    || consumers
+                        .iter()
+                        .any(|(group, _)| graph.group_index(group.as_str()).is_some())
+            }
+            ParameterGroupOwner::StaticRole(_) | ParameterGroupOwner::StaticAnyOf(_) => roles
+                .iter()
+                .any(|role| owned.owner().accepts_static_role(role)),
+        });
+        let mut selected = Self::from_owned(graph, &layout, groups.cloned())?;
+        if let Some((rank, retained)) = self.partition_layout() {
+            let mut local = crate::LocalModelLayout::default();
+            for group in selected.groups() {
+                for member in group.members() {
+                    local.insert(
+                        member.target().to_owned(),
+                        retained
+                            .tensor(member.target())
+                            .expect("validated retained parameter placement")
+                            .clone(),
+                    );
+                }
+            }
+            selected = selected.with_partition_layout(rank, local)?;
+        }
+        Ok(selected)
+    }
+
     /// Selects rank-owned groups without discarding their architecture owner.
     pub fn select_owned<G, A>(
         &self,
@@ -674,6 +747,15 @@ fn parameter_declarations(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitectureParameterError {
+    /// A projected pinned role is absent from the canonical declaration.
+    #[error("unknown projected static parameter role {0:?}")]
+    UnknownProjectedStaticRole(String),
+    /// A child graph changes dependencies between included execution groups.
+    #[error("projected dependencies differ for execution group {0:?}")]
+    InvalidProjectedDependencies(String),
+    /// Named group selection cannot preserve the canonical invocation layout.
+    #[error("invalid projected invocation layout: {0}")]
+    ProjectionLayout(#[from] crate::ExecutionUnitLayoutError),
     /// A leased resource has no consumers or repeats one logical consumer.
     #[error("architecture leased parameter owner has empty or repeated consumers")]
     InvalidUnitConsumers,

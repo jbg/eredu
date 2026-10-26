@@ -1,7 +1,6 @@
 //! Identity-based child declarations with caller-owned ingress boundaries.
 use super::*;
-use crate::{ArchitectureStatePartitionRule, ArchitectureStatePlacement, ParameterGroupOwner};
-use std::collections::BTreeSet;
+use crate::{ArchitectureStatePartitionRule, ArchitectureStatePlacement};
 
 impl ComponentDefinition {
     /// Projects complete named groups and pinned resources into a child component.
@@ -19,52 +18,24 @@ impl ComponentDefinition {
             component: id.clone(),
             resource,
         };
-        let roles = pinned_roles
-            .into_iter()
-            .map(Into::into)
-            .collect::<BTreeSet<_>>();
-        for role in &roles {
-            if !self
-                .parameters
-                .groups()
-                .iter()
-                .any(|group| group.owner().accepts_static_role(role))
-            {
-                return Err(invalid(format!("projected pinned role {role:?}")));
-            }
-        }
+        let parameters = self
+            .parameters
+            .project_groups(&graph, pinned_roles)
+            .map_err(|source| ComponentDefinitionError::Parameters {
+                component: id.clone(),
+                source,
+            })?;
+        let layout = parameters.unit_layout();
         let parent_groups = graph
             .groups()
             .iter()
             .map(|group| {
-                let parent = self
-                    .parameters
+                self.parameters
                     .graph()
                     .group_index(group.id())
-                    .ok_or_else(|| invalid(format!("projected group {:?}", group.id())))?;
-                let dependencies = self.parameters.graph().groups()[parent]
-                    .dependencies()
-                    .iter()
-                    .filter(|dependency| graph.group_index(dependency).is_some())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if group.dependencies() != dependencies {
-                    return Err(invalid(format!(
-                        "projected dependencies for {:?}",
-                        group.id()
-                    )));
-                }
-                Ok(parent)
+                    .expect("projected group")
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = self
-            .parameters
-            .unit_layout()
-            .project_groups(&graph)
-            .map_err(|source| ComponentDefinitionError::UnitLayout {
-                component: id.clone(),
-                source,
-            })?;
+            .collect::<Vec<_>>();
         let remap = |address: ExecutionUnitAddress| {
             let group = self.parameters.unit_layout().group_id(address.group())?;
             let group = graph.group_index(group.as_str())?;
@@ -72,56 +43,6 @@ impl ComponentDefinition {
                 .ordinal(group, address.index())
                 .and_then(|ordinal| layout.address(ordinal))
         };
-        let groups = self
-            .parameters
-            .groups()
-            .iter()
-            .filter(|owned| match owned.owner() {
-                ParameterGroupOwner::ExecutionUnit { group, .. } => {
-                    graph.group_index(group.as_str()).is_some()
-                }
-                ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => {
-                    roles
-                        .iter()
-                        .any(|role| owned.owner().accepts_static_role(role))
-                        || consumers
-                            .iter()
-                            .any(|(group, _)| graph.group_index(group.as_str()).is_some())
-                }
-                ParameterGroupOwner::StaticRole(_) | ParameterGroupOwner::StaticAnyOf(_) => roles
-                    .iter()
-                    .any(|role| owned.owner().accepts_static_role(role)),
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let parameter_error = |source| ComponentDefinitionError::Parameters {
-            component: id.clone(),
-            source,
-        };
-        let mut parameters = ArchitectureParameterDescription::new(
-            &graph,
-            &layout,
-            groups.iter().map(|group| group.group().clone()),
-            groups.clone(),
-        )
-        .map_err(parameter_error)?;
-        if let Some((rank, retained)) = self.parameters.partition_layout() {
-            let mut local = crate::LocalModelLayout::default();
-            for group in &groups {
-                for member in group.members() {
-                    local.insert(
-                        member.target().to_owned(),
-                        retained
-                            .tensor(member.target())
-                            .expect("validated retained parameter placement")
-                            .clone(),
-                    );
-                }
-            }
-            parameters = parameters
-                .with_partition_layout(rank, local)
-                .map_err(parameter_error)?;
-        }
         let mut rules = Vec::new();
         for rule in self.state_partition.rules() {
             rules.push(match rule.placement() {

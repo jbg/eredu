@@ -8507,6 +8507,15 @@ owned catalog. Per-layer leases, scalar replicas, recurrent/cache state and code
 convolution geometry remain component declarations. DeepSeek target/prediction
 catalogs and Muse audio units use the same constructor.
 
+`ArchitectureParameterDescription::project_groups` selects named execution groups
+and explicit pinned roles. It preserves sparse global invocation indices,
+canonical storage consumers and exact retained rank placement. Omitted dependencies
+form caller-owned ingress; dependencies between retained groups remain unchanged.
+Unknown roles/groups and changed dependencies produce typed parameter errors.
+Component child projection uses this same catalog projection, then retains its own
+state-owner, observation and transport mapping. Low-level RNNT predictor catalogs
+use the same named projection without rebuilding ownership or local ordinals.
+
 `PreparedComponent::prepare_physical_recipes` resolves canonical physical targets
 from a family-admitted recipe catalog. The caller supplies conversion policy and
 its missing-parameter error; runtime uses ordinary component preparation for

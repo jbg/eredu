@@ -37,28 +37,10 @@ fn graph() -> Result<ExecutionGraph, RnntError> {
 pub fn rnnt_predictor_parameter_description(
     dimensions: RnntDimensions,
 ) -> Result<ArchitectureParameterDescription, RnntError> {
-    dimensions.validate()?;
-    let graph = graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, vec![dimensions.predictor_layers])?;
-    let full = rnnt_parameter_description(dimensions)?;
-    let mut owned = Vec::new();
-    for item in full.groups() {
-        let ParameterGroupOwner::ExecutionUnit {
-            group, global_unit, ..
-        } = item.owner()
-        else {
-            continue;
-        };
-        if group.as_str() != GROUP {
-            continue;
-        }
-        let spec = item.group().clone();
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), *global_unit),
-            spec,
-        ));
-    }
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(rnnt_parameter_description(dimensions)?.project_groups(
+        &graph()?,
+        std::iter::empty::<String>(),
+    )?)
 }
 /// Global recurrent operations, independently leased layers and carry identities.
 pub fn rnnt_predictor_component_definition(

@@ -586,6 +586,29 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         .with_partition_layout(rank, retained)
         .unwrap();
     let pinned = pinned.with_parameters(parameters, []).unwrap();
+    use eredu_runtime::ArchitectureParameterError;
+    let parameters = pinned.parameters();
+    assert!(matches!(
+        parameters.project_groups(
+            &ExecutionGraph::chain(["first"]).unwrap(),
+            ["missing"],
+        ),
+        Err(ArchitectureParameterError::UnknownProjectedStaticRole(role)) if role == "missing"
+    ));
+    assert!(matches!(
+        parameters.project_groups(
+            &ExecutionGraph::chain(["missing"]).unwrap(),
+            std::iter::empty::<String>(),
+        ),
+        Err(ArchitectureParameterError::ProjectionLayout(_))
+    ));
+    assert!(matches!(
+        parameters.project_groups(
+            &ExecutionGraph::chain(["second", "first"]).unwrap(),
+            std::iter::empty::<String>(),
+        ),
+        Err(ArchitectureParameterError::InvalidProjectedDependencies(group)) if group == "second"
+    ));
     let without_pinned = pinned
         .project_groups(
             "without-neighbor",
