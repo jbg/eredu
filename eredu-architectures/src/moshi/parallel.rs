@@ -598,18 +598,15 @@ pub fn parameter_contract(
                 ),
             );
         }
-        let [group] =
-            eredu_runtime::expand_linear_format_parameter_groups(vec![group], |member| {
-                crate::linear_format::standard_parallel_linear_format(
-                    member,
-                    config
-                        .temporal()
-                        .weight_quantization(member.target())
-                        .into(),
-                )
-            })?
-            .try_into()
-            .expect("one Moshi group expands to one group");
+        let group = eredu_runtime::expand_linear_format_parameter_group(group, |member| {
+            crate::linear_format::standard_parallel_linear_format(
+                member,
+                config
+                    .temporal()
+                    .weight_quantization(member.target())
+                    .into(),
+            )
+        })?;
         for (target, (logical_shape, format, packed_axis, scale, affine_bias)) in declared {
             let primary = group
                 .members()

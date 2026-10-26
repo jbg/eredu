@@ -184,12 +184,10 @@ impl Declaration {
         }
         let group = ParameterGroupSpec::new(name, role, std::mem::take(&mut self.members))
             .map_err(Error::backend_source)?;
-        let mut groups =
-            eredu_runtime::expand_linear_format_parameter_groups(vec![group], |member| {
-                Ok(self.formats.get(member.target()).cloned())
-            })
-            .map_err(Error::backend_source)?;
-        Ok(groups.remove(0))
+        eredu_runtime::expand_linear_format_parameter_group(group, |member| {
+            Ok(self.formats.get(member.target()).cloned())
+        })
+        .map_err(Error::backend_source)
     }
 }
 

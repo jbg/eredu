@@ -121,11 +121,11 @@ impl Selections {
         .map_err(invalid)?;
         // Reuse the shared encoding rules for FP8 scale blocks, affine packing,
         // GGUF blocks and exact companion identities. Unaligned shards fail here.
-        let groups = eredu_runtime::expand_linear_format_parameter_groups(vec![group], |_| {
+        let group = eredu_runtime::expand_linear_format_parameter_group(group, |_| {
             Ok(Some(format.clone()))
         })
         .map_err(invalid)?;
-        for member in groups[0].members() {
+        for member in group.members() {
             let MemberSharding::Segmented { axis, segments } = member.sharding() else {
                 return Err(invalid("physical projection lost segmented placement"));
             };

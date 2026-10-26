@@ -8499,7 +8499,11 @@ and preserves its partition constraints and declared companions. Catalog expansi
 uses the same primitive. Families retain resource and canonical owner identities
 around that projection; Muse carries its role tags through format expansion, and
 LFM2 keeps its canonical static owners attached throughout. DeepSeek pinned
-format expansion likewise retains each resource role directly.
+format expansion likewise retains each resource role directly. Moshi matrix contracts,
+Qwen4 target catalogs and segmented geometry, Muse DSpark resources and Diffusion
+Gemma vision projection use the single-group projection directly. Their families
+retain matrix metadata, canonical owners and format admission; physical companion
+expansion preserves each atomic resource boundary.
 
 `expand_tagged_linear_format_parameter_groups` moves architecture-owned resource
 tags alongside atomic groups through physical expansion. Tags need no cloning or

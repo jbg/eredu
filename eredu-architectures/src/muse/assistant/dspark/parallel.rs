@@ -2,7 +2,7 @@
 use super::DsparkHeadDefinition;
 use eredu_nn::Error;
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, ArchitectureParameterDescription, ExecutionGraph,
+    expand_linear_format_parameter_group, ArchitectureParameterDescription, ExecutionGraph,
     ExecutionGroupId, MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner,
     ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
 };
@@ -39,7 +39,7 @@ impl DsparkHeadDefinition {
                 }),
             )
             .map_err(Error::backend_source)?;
-            let groups = expand_linear_format_parameter_groups(vec![group], |member| {
+            let group = expand_linear_format_parameter_group(group, |member| {
                 crate::linear_format::standard_parallel_linear_format(
                     member,
                     self.formats
@@ -54,11 +54,7 @@ impl DsparkHeadDefinition {
                 ExecutionGroupId::new(id).map_err(Error::backend_source)?,
                 0,
             );
-            owned.extend(
-                groups
-                    .into_iter()
-                    .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
-            );
+            owned.push(OwnedParameterGroupSpec::new(owner, group));
         }
         ArchitectureParameterDescription::new(
             &graph,

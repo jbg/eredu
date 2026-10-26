@@ -165,19 +165,17 @@ pub fn parameter_description(
         )],
     )
     .map_err(Error::backend_source)?;
-    for group in eredu_runtime::expand_linear_format_parameter_groups(vec![projection], |member| {
+    let projection = eredu_runtime::expand_linear_format_parameter_group(projection, |member| {
         crate::linear_format::standard_parallel_linear_format(
             member,
             config.text.linear_format_for(member.target()),
         )
     })
-    .map_err(Error::backend_source)?
-    {
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("vision_projection"),
-            group,
-        ));
-    }
+    .map_err(Error::backend_source)?;
+    owned.push(OwnedParameterGroupSpec::new(
+        ParameterGroupOwner::static_role("vision_projection"),
+        projection,
+    ));
     for index in 0..vision.num_hidden_layers as usize {
         for group in crate::gemma4::vision::parameters::layer_groups(
             vision,
