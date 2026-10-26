@@ -8,9 +8,7 @@ use crate::nemotron_h::{self, ModelArgs};
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype, RecipeError},
     store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
-    validation::{
-        validate_safetensors_plan, CatalogTensorMetadata, SafetensorsCatalog, StrictLoadFailure,
-    },
+    validation::{validate_safetensors_plan, CatalogTensorMetadata, StrictLoadFailure},
     StoredDtype,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -178,7 +176,7 @@ impl PreparedBackboneParameters {
         }
         let plan =
             nemotron_h::safetensors_plan(&args).map_err(BackbonePreparationError::Configuration)?;
-        validate_safetensors_plan(&OutputCatalog(catalog), &plan).into_loader_result()?;
+        validate_safetensors_plan(&catalog, &plan).into_loader_result()?;
         let inputs = parameters
             .values()
             .flat_map(|parameter| {
@@ -237,18 +235,6 @@ impl PreparedBackboneParameters {
             .filter(|(name, _)| name.starts_with(&prefix))
             .map(|(name, value)| (name.clone(), value.recipe.clone()))
             .collect())
-    }
-}
-
-struct OutputCatalog(BTreeMap<String, CatalogTensorMetadata>);
-
-impl SafetensorsCatalog for OutputCatalog {
-    fn keys(&self) -> Vec<String> {
-        self.0.keys().cloned().collect()
-    }
-
-    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
-        self.0.get(key).cloned().ok_or_else(|| key.into())
     }
 }
 

@@ -3021,6 +3021,10 @@ Portable crates split tensor-independent ownership by responsibility:
   the same parsed and admitted catalog but validate each opened payload header
   exactly and lazily, so selective loads detect every mismatch in a local shard
   without reading remote-only shards. None reinterpret `weight_map`.
+  Header-only schema validation consumes shared catalog implementations over
+  metadata maps, including retained `PreparedTensorSource` maps. These views
+  expose no payload authority; families supply schemas, precision policy and
+  provenance admission.
   `PreparedCheckpointSource` binds exact catalog, provenance, admitted shard
   identity snapshots, selections, and lease geometry without retaining a file
   descriptor per shard. After complete recipe and destination preflight, the
