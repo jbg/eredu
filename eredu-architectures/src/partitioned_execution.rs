@@ -5745,12 +5745,7 @@ where
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionedAdmission<R> {
     execution: R,
-    topology: ParallelRankTopology,
-    groups: Vec<eredu_runtime::PipelineGroupOwnership>,
-    ownership: PartitionOwnership,
-    publication_owner: usize,
-    state: Option<PartitionState>,
-    logical_parameter_targets: Vec<String>,
+    rank: eredu_runtime::PipelineRankProjection,
     activation_dtype: PipelineActivationDtype,
     boundary: ResolvedBoundaryWireSchema,
     boundary_routes: Vec<SelectedPartitionBoundaryRoute>,
@@ -5806,33 +5801,33 @@ impl<R> PartitionedAdmission<R> {
 
     /// Exact topology and local rank coordinates.
     pub const fn topology(&self) -> ParallelRankTopology {
-        self.topology
+        self.rank.topology()
     }
 
     /// Rank-local group/unit ownership in canonical architecture order.
     pub fn groups(&self) -> &[eredu_runtime::PipelineGroupOwnership] {
-        &self.groups
+        self.rank.groups()
     }
 
     /// Input, output, and static-role ownership for this rank.
     pub const fn ownership(&self) -> &PartitionOwnership {
-        &self.ownership
+        self.rank.ownership()
     }
 
     /// Authoritative final-output world rank in this data-parallel cohort.
     /// Selected from the output group's semantic merge ownership before binding.
     pub const fn publication_owner(&self) -> usize {
-        self.publication_owner
+        self.rank.publication_owner()
     }
 
     /// Exact rank-local mutable-state slice, if this rank owns state.
     pub const fn state(&self) -> Option<&PartitionState> {
-        self.state.as_ref()
+        self.rank.state()
     }
 
     /// Canonical logical parameter targets owned by this rank before TP/EP lowering.
     pub fn logical_parameter_targets(&self) -> &[String] {
-        &self.logical_parameter_targets
+        self.rank.parameter_targets()
     }
 
     /// Selected floating dtype for activation-valued boundary tensors.
@@ -5872,14 +5867,15 @@ impl<R> PartitionedAdmission<R> {
 
     /// Exact cache-placement topology derived from the admitted Cartesian rank.
     pub fn prompt_cache_topology(&self) -> Result<eredu_core::cache::PromptCacheTopology, String> {
-        let topology = self.topology.topology();
+        let rank = self.rank.topology();
+        let topology = rank.topology();
         eredu_core::cache::PromptCacheTopology::new(
             (topology.pipeline() > 1)
-                .then_some((topology.pipeline(), self.topology.pipeline_parallel_rank())),
+                .then_some((topology.pipeline(), rank.pipeline_parallel_rank())),
             (topology.tensor() > 1)
-                .then_some((topology.tensor(), self.topology.tensor_parallel_rank())),
+                .then_some((topology.tensor(), rank.tensor_parallel_rank())),
             (topology.expert() > 1)
-                .then_some((topology.expert(), self.topology.expert_parallel_rank())),
+                .then_some((topology.expert(), rank.expert_parallel_rank())),
             true,
         )
         .map_err(|error| error.to_string())
@@ -7339,15 +7335,9 @@ where
     let text = text(&execution);
     let rank = eredu_runtime::PipelineRankProjection::new(text, state_layout, topology, true)
         .map_err(|error| error.to_string())?;
-    let (groups, ownership, publication_owner, state, parameter_targets) = rank.into_parts();
     Ok(PartitionedAdmission {
         execution,
-        topology,
-        groups,
-        ownership,
-        publication_owner,
-        state,
-        logical_parameter_targets: parameter_targets,
+        rank,
         activation_dtype,
         boundary,
         boundary_routes,
@@ -7677,7 +7667,7 @@ impl<R, Q, G, W> BoundPartitionedAdmission<R, Q, G, W> {
 
     /// Exact topology and local semantic coordinates.
     pub const fn topology(&self) -> ParallelRankTopology {
-        self.selected.requirements.topology
+        self.selected.requirements.topology()
     }
 
     /// Selected opaque communication manifest.
@@ -8009,7 +7999,7 @@ where
     A::Error: std::fmt::Display,
     Q: TextRequirements,
 {
-    validate_partitioned_binding(&selected.requirements, &partition)?;
+    selected.requirements.validate_binding(&partition)?;
     partition
         .validate_architecture::<B, S, A>(&architecture)
         .map_err(|error| error.to_string())?;
@@ -8022,66 +8012,17 @@ where
     })
 }
 
-pub(crate) fn validate_partitioned_binding<Q, G, W>(
-    requirements: &PartitionedAdmission<Q>,
-    partition: &ArchitecturePartition<G, W>,
-) -> Result<(), String>
-where
-    Q: TextRequirements,
-{
-    if partition.graph() != requirements.execution_graph() {
-        return Err("concrete architecture execution graph differs from admission".into());
-    }
-    if partition.unit_layout() != requirements.execution_units() {
-        return Err("concrete architecture unit layout differs from admission".into());
-    }
-    if partition.ownership() != &requirements.ownership {
-        return Err(format!(
-            "concrete architecture ownership {:?} differs from admitted {:?}",
-            partition.ownership(),
-            requirements.ownership
-        ));
-    }
-    let actual_groups = partition
-        .groups()
-        .iter()
-        .map(|group| (group.group().clone(), group.global_units()))
-        .collect::<Vec<_>>();
-    let expected_groups = requirements
-        .groups
-        .iter()
-        .map(|group| (group.group().clone(), group.units()))
-        .collect::<Vec<_>>();
-    if actual_groups != expected_groups {
-        return Err(format!(
-            "concrete architecture groups {actual_groups:?} differ from admitted {expected_groups:?}"
-        ));
-    }
-    if partition.state() != requirements.state.as_ref() {
-        return Err(format!(
-            "concrete architecture state {:?} differs from admitted {:?}",
-            partition.state(),
-            requirements.state
-        ));
-    }
-    Ok(())
-}
-
-trait PartitionedExecutionRequirements {
-    fn execution_graph(&self) -> &eredu_runtime::ExecutionGraph;
-    fn execution_units(&self) -> &eredu_runtime::ExecutionUnitLayout;
-}
-
-impl<R> PartitionedExecutionRequirements for PartitionedAdmission<R>
-where
-    R: TextRequirements,
-{
-    fn execution_graph(&self) -> &eredu_runtime::ExecutionGraph {
-        self.execution.text().execution_graph()
-    }
-
-    fn execution_units(&self) -> &eredu_runtime::ExecutionUnitLayout {
-        self.execution.text().execution_units()
+impl<R> PartitionedAdmission<R> {
+    pub(crate) fn validate_binding<G, W>(
+        &self,
+        partition: &ArchitecturePartition<G, W>,
+    ) -> Result<(), String>
+    where
+        R: TextRequirements,
+    {
+        self.rank
+            .validate_partition(self.execution.text(), partition)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -9268,7 +9209,7 @@ where
         crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    validate_partitioned_binding(selected.requirements(), &partition)
+    selected.requirements().validate_binding(&partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
@@ -9311,7 +9252,7 @@ where
             .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-            validate_partitioned_binding(selected.requirements(), &source_partition)
+            selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             if source_partition.units().ne(partition.units()) {
                 return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -9426,7 +9367,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    validate_partitioned_binding(selected.requirements(), &partition)
+    selected.requirements().validate_binding(&partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
@@ -9474,7 +9415,7 @@ where
             .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-            validate_partitioned_binding(selected.requirements(), &source_partition)
+            selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             if source_partition.units().ne(partition.units()) {
                 return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -9582,7 +9523,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    validate_partitioned_binding(selected.requirements(), &partition)
+    selected.requirements().validate_binding(&partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
@@ -9627,7 +9568,7 @@ where
             .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-            validate_partitioned_binding(selected.requirements(), &source_partition)
+            selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             if source_partition.units().ne(partition.units()) {
                 return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -9731,7 +9672,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size()),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    validate_partitioned_binding(selected.requirements(), &partition)
+    selected.requirements().validate_binding(&partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
@@ -9781,7 +9722,7 @@ where
             .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-            validate_partitioned_binding(selected.requirements(), &source_partition)
+            selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             if source_partition.units().ne(partition.units()) {
                 return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -10735,7 +10676,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size()),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    validate_partitioned_binding(selected.requirements(), &partition)
+    selected.requirements().validate_binding(&partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let mut tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
@@ -10930,7 +10871,7 @@ where
             eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
         )
         .map_err(|e| error(e.to_string()))?;
-        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        selected.requirements().validate_binding(&source_partition).map_err(error)?;
         if source_partition.units().ne(partition.units()) {
             return Err(error(
                 "routed LFM2 transform source changed local unit addresses".into(),
@@ -11089,7 +11030,7 @@ where
             eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
         )
         .map_err(|e| error(e.to_string()))?;
-        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        selected.requirements().validate_binding(&source_partition).map_err(error)?;
         if source_partition.units().ne(partition.units()) {
             return Err(error(
                 "routed Kimi Linear transform source changed local unit addresses".into(),
@@ -11240,7 +11181,7 @@ where
             crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
         )
         .map_err(|e| error(e.to_string()))?;
-        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        selected.requirements().validate_binding(&source_partition).map_err(error)?;
         if source_partition.units().ne(partition.units()) {
             return Err(error(
                 "routed Nemotron transform source changed local unit addresses".into(),
@@ -11407,7 +11348,7 @@ where
             crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
         )
         .map_err(|e| error(e.to_string()))?;
-        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        selected.requirements().validate_binding(&source_partition).map_err(error)?;
         crate::deepseek::V3PartitionLocalFoundation::from_partition(
             &source_args,
             &source_partition,
@@ -11588,7 +11529,7 @@ where
                 .map_err(|e| error(e.to_string()))?,
         )
         .map_err(|e| error(e.to_string()))?;
-        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        selected.requirements().validate_binding(&source_partition).map_err(error)?;
         crate::deepseek::V4PartitionLocalFoundation::from_partition(
             &source_args,
             &source_partition,
@@ -11666,7 +11607,7 @@ where
     E: RoutedCollectiveSpec + crate::routed_text::RoutedGroupedSpec,
     V: FamilyRoutedPartitionVisitor<B, S, A>,
 {
-    validate_partitioned_binding(selected.requirements(), &partition)
+    selected.requirements().validate_binding(&partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let mut tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),

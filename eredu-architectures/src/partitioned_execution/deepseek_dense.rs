@@ -63,7 +63,7 @@ where
         crate::deepseek::v3::TargetBoundarySchema::from_args(&selected_args),
     )
     .map_err(architecture)?;
-    validate_partitioned_binding(selected.requirements(), &partition).map_err(architecture)?;
+    selected.requirements().validate_binding(&partition).map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -97,7 +97,7 @@ where
             crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
         if source_partition.units().ne(partition.units()) {
             return Err(architecture(

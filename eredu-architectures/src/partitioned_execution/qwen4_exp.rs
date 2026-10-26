@@ -101,7 +101,7 @@ impl PreparedTargetPartition {
             target.spec().boundary_schema().map_err(invalid)?,
         )
         .map_err(invalid)?;
-        validate_partitioned_binding(selected.requirements(), &partition).map_err(invalid)?;
+        selected.requirements().validate_binding(&partition).map_err(invalid)?;
         let state = partition
             .state()
             .ok_or_else(|| invalid("Flash-Next target partition has no state"))?;

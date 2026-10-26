@@ -51,7 +51,7 @@ where
         selected.requirements().ownership().clone(),
     )
     .map_err(|e| error(e.to_string()))?;
-    validate_partitioned_binding(selected.requirements(), &partition).map_err(error)?;
+    selected.requirements().validate_binding(&partition).map_err(error)?;
     let source_architecture = if selected.base().uses_weight_transform() {
         let source = args
             .with_checkpoint_formats(selected.base().requirements().native_quantized_formats())
@@ -68,7 +68,7 @@ where
             selected.requirements().ownership().clone(),
         )
         .map_err(|e| error(e.to_string()))?;
-        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        selected.requirements().validate_binding(&source_partition).map_err(error)?;
         let model = PartitionedTextKernel::<B>::from_partition(
             source,
             retained.clone(),

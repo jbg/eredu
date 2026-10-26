@@ -95,7 +95,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(architecture)?;
-    validate_partitioned_binding(selected.requirements(), &partition).map_err(architecture)?;
+    selected.requirements().validate_binding(&partition).map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -127,7 +127,7 @@ where
             eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
         if source_partition.units().ne(partition.units()) {
             return Err(architecture(
@@ -287,7 +287,7 @@ where
             eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
         if source_partition.units().ne(partition.units()) {
             return Err(architecture(

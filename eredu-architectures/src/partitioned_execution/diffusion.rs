@@ -96,7 +96,7 @@ where
             selected.requirements().ownership().clone(),
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
         if source_partition.units().ne(partition.units()) {
             return Err(architecture(
@@ -227,7 +227,7 @@ where
             selected.requirements().ownership().clone(),
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
         if source_partition.units().ne(partition.units()) {
             return Err(architecture(
@@ -255,7 +255,7 @@ where
         context,
     )
     .map_err(architecture)?;
-    validate_partitioned_binding(selected.requirements(), &partition).map_err(architecture)?;
+    selected.requirements().validate_binding(&partition).map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,

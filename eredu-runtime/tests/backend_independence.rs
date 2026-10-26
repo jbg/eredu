@@ -8165,6 +8165,31 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     assert_eq!(ownership_only.ownership(), ranks[1].ownership());
     assert!(ownership_only.state().is_none());
     assert!(ownership_only.parameter_targets().is_empty());
+    let state_plan = architecture.state_partition_plan(&state_layout);
+    let projected = ranks
+        .iter()
+        .map(|rank| {
+            ArchitecturePartition::from_description(
+                &parameters,
+                rank.groups()
+                    .iter()
+                    .map(|group| (group.group().as_str(), group.units())),
+                rank.ownership().clone(),
+                &state_layout,
+                &state_plan,
+                (),
+                NoAuxiliaryBoundarySchema::new(8),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for (rank, partition) in ranks.iter().zip(&projected) {
+        rank.validate_partition(&requirements, partition).unwrap();
+    }
+    assert!(matches!(
+        ranks[0].validate_partition(&requirements, &projected[1]),
+        Err(eredu_runtime::PipelineRankBindingError::Ownership { .. })
+    ));
     let owned_units = |rank: usize| {
         ranks[rank]
             .groups()

@@ -47,6 +47,41 @@ pub enum PipelineRankError {
     MissingPublicationOwner,
 }
 
+/// Constructed partition facts differ from the retained rank admission.
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineRankBindingError {
+    /// Canonical execution groups or dependencies differ.
+    #[error("concrete architecture execution graph differs from admission")]
+    Graph,
+    /// Global invocation identities or ordering differ.
+    #[error("concrete architecture unit layout differs from admission")]
+    Units,
+    /// Input, output or pinned-role ownership differs.
+    #[error("concrete architecture ownership {actual:?} differs from admitted {expected:?}")]
+    Ownership {
+        /// Constructed partition ownership.
+        actual: Box<PartitionOwnership>,
+        /// Retained rank ownership.
+        expected: Box<PartitionOwnership>,
+    },
+    /// Ordered group-global invocation intervals differ.
+    #[error("concrete architecture groups {actual:?} differ from admitted {expected:?}")]
+    Groups {
+        /// Constructed group identities and intervals.
+        actual: Vec<(crate::ExecutionGroupId, Range<usize>)>,
+        /// Retained group identities and intervals.
+        expected: Vec<(crate::ExecutionGroupId, Range<usize>)>,
+    },
+    /// Exact local state geometry or global offsets differ.
+    #[error("concrete architecture state {actual:?} differs from admitted {expected:?}")]
+    State {
+        /// Constructed mutable-state mapping.
+        actual: Box<Option<PartitionState>>,
+        /// Retained mutable-state mapping.
+        expected: Box<Option<PartitionState>>,
+    },
+}
+
 /// One architecture group interval and its semantic pipeline owner.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PipelineGroupOwnership {
@@ -74,7 +109,7 @@ impl PipelineGroupOwnership {
 
 /// Source-free local projection of groups, static roles, state and parameter consumers.
 /// This grants no checkpoint, native resource, execution or communication authority.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PipelineRankProjection {
     topology: ParallelRankTopology,
     groups: Vec<PipelineGroupOwnership>,
@@ -103,7 +138,7 @@ impl PipelineRankProjection {
         &self.groups
     }
     /// Declared input, output and static-role ownership.
-    pub fn ownership(&self) -> &PartitionOwnership {
+    pub const fn ownership(&self) -> &PartitionOwnership {
         &self.ownership
     }
     /// Global rank supplying the authoritative output.
@@ -111,13 +146,64 @@ impl PipelineRankProjection {
         self.publication_owner
     }
     /// Exact selected state geometry when state is requested.
-    pub fn state(&self) -> Option<&PartitionState> {
+    pub const fn state(&self) -> Option<&PartitionState> {
         self.state.as_ref()
     }
     /// Canonical logical parameter consumers retained on this rank.
     pub fn parameter_targets(&self) -> &[String] {
         &self.parameter_targets
     }
+    /// Validates a complete constructed partition against this retained admission.
+    /// The execution declaration is the one used to project this rank; geometry,
+    /// native bindings and communication authority remain separate contracts.
+    pub fn validate_partition<G, W>(
+        &self,
+        execution: &crate::ReplicatedTextRequirements,
+        partition: &crate::ArchitecturePartition<G, W>,
+    ) -> Result<(), PipelineRankBindingError> {
+        if partition.graph() != execution.execution_graph() {
+            return Err(PipelineRankBindingError::Graph);
+        }
+        if partition.unit_layout() != execution.execution_units() {
+            return Err(PipelineRankBindingError::Units);
+        }
+        if partition.ownership() != self.ownership() {
+            return Err(PipelineRankBindingError::Ownership {
+                actual: Box::new(partition.ownership().clone()),
+                expected: Box::new(self.ownership.clone()),
+            });
+        }
+        if partition.groups().len() != self.groups.len()
+            || partition
+                .groups()
+                .iter()
+                .zip(&self.groups)
+                .any(|(actual, expected)| {
+                    actual.group() != expected.group() || actual.global_units() != expected.units()
+                })
+        {
+            return Err(PipelineRankBindingError::Groups {
+                actual: partition
+                    .groups()
+                    .iter()
+                    .map(|group| (group.group().clone(), group.global_units()))
+                    .collect(),
+                expected: self
+                    .groups
+                    .iter()
+                    .map(|group| (group.group().clone(), group.units()))
+                    .collect(),
+            });
+        }
+        if partition.state() != self.state() {
+            return Err(PipelineRankBindingError::State {
+                actual: Box::new(partition.state().cloned()),
+                expected: Box::new(self.state.clone()),
+            });
+        }
+        Ok(())
+    }
+
     /// Consumes the projection for ordinary architecture/native construction.
     pub fn into_parts(
         self,

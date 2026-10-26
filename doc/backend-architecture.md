@@ -1079,8 +1079,14 @@ declared endpoints. Invalid placement returns typed group and geometry errors.
 Runtime's `PipelineRankProjection` applies declared first/last-owner static roles,
 replicated roles, parameter consumers and state rules to one actual Cartesian
 rank. It retains read-only `PipelineGroupOwnership` intervals, local state,
-publication rank and optional logical parameter targets. Construction consumes
-these shared parts; ownership-only inspection omits target names and state.
+publication rank and optional logical parameter targets. Partition admission
+retains this projection as one value, keeping its groups,
+ownership, state and publication metadata together. Ownership-only inspection
+omits target names and state. `validate_partition` compares constructed graph,
+global units, ownership, ordered group ranges and state against the retained
+admission. Mismatches return `PipelineRankBindingError`; successful validation
+does not allocate temporary group catalogs. Family-local geometry, native binding
+and communication checks remain separate.
 Families retain the declarations and selected mechanisms. State and ownership
 errors preserve their neutral causes; active embedded prediction uses its
 separate placement contract and is rejected explicitly by this base projection.

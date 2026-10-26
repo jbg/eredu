@@ -579,7 +579,9 @@ pub use parameter_coordinates::{
 mod materialization_index;
 pub use materialization_index::{MaterializationTaskIndex, MaterializationTaskIndexError};
 mod pipeline_rank;
-pub use pipeline_rank::{PipelineGroupOwnership, PipelineRankError, PipelineRankProjection};
+pub use pipeline_rank::{
+    PipelineGroupOwnership, PipelineRankBindingError, PipelineRankError, PipelineRankProjection,
+};
 mod pipeline_placement;
 pub use pipeline_placement::{
     balanced_pipeline_ranges, PipelinePlacementError, PipelinePlacementPlan, PipelineRoute,

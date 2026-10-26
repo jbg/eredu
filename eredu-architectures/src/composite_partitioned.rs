@@ -1677,10 +1677,7 @@ where
                 TextBoundarySchema::new(source_args.hidden_size()),
             )
             .map_err(|e| error(e.to_string()))?;
-            crate::partitioned_execution::validate_partitioned_binding(
-                selected.requirements(),
-                &source_partition,
-            )
+            selected.requirements().validate_binding(&source_partition)
             .map_err(error)?;
             if source_partition.units().ne(partition.units()) {
                 return Err(error(
