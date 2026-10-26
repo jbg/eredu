@@ -842,59 +842,34 @@ pub fn parameter_description(
     let owner_group = layout.group_id(0).expect("Kimi target group").clone();
     let hidden = args.hidden_size as usize;
     let mut formats = std::collections::BTreeMap::new();
-    let mut projections = std::collections::BTreeSet::new();
+    let static_groups = super::static_spec(args).logical_parameter_groups(
+        "model.embed_tokens",
+        "model.norm",
+        "lm_head",
+    )?;
+    let mut projections = static_groups
+        .iter()
+        .filter(|group| group.role() == ParameterRole::Vocabulary)
+        .flat_map(|group| group.members().iter().map(|member| member.target().to_owned()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let static_owners = [
+        if args.tie_word_embeddings {
+            ParameterGroupOwner::static_any_of(["embedding", "output"])
+        } else {
+            ParameterGroupOwner::static_role("embedding")
+        },
+        ParameterGroupOwner::static_role("norm"),
+        ParameterGroupOwner::static_role("output"),
+    ];
+    let mut owned = static_groups
+        .into_iter()
+        .zip(static_owners)
+        .map(|(group, owner)| OwnedParameterGroupSpec::new(owner, group))
+        .collect::<Vec<_>>();
     let mut projection = |name: String, output: usize, input: usize, sharding| {
         projections.insert(name.clone());
         ParameterMemberSpec::new(name, vec![output, input], sharding)
     };
-    let mut owned = Vec::new();
-    for (name, role, owner, member) in [
-        (
-            "model.embed_tokens",
-            ParameterRole::Vocabulary,
-            if args.tie_word_embeddings {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role("embedding")
-            },
-            projection(
-                "model.embed_tokens.weight".into(),
-                args.vocab_size as usize,
-                hidden,
-                MemberSharding::Balanced { axis: 0 },
-            ),
-        ),
-        (
-            "model.norm",
-            ParameterRole::Replicated,
-            ParameterGroupOwner::static_role("norm"),
-            ParameterMemberSpec::new(
-                "model.norm.weight",
-                vec![hidden],
-                MemberSharding::Replicated,
-            ),
-        ),
-    ] {
-        owned.push(OwnedParameterGroupSpec::new(
-            owner,
-            ParameterGroupSpec::new(name, role, [member])?,
-        ));
-    }
-    if !args.tie_word_embeddings {
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("output"),
-            ParameterGroupSpec::new(
-                "lm_head",
-                ParameterRole::Vocabulary,
-                [projection(
-                    "lm_head.weight".into(),
-                    args.vocab_size as usize,
-                    hidden,
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ));
-    }
     let sum = |name: &str, first: i32, second: i32| {
         first
             .checked_add(second)

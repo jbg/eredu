@@ -8467,7 +8467,9 @@ without duplicating the resource description.
 `StaticModuleSpec::logical_parameter_groups` projects embedding, learned final
 normalization and untied readout geometry without native allocation. Muse and
 LFM2 cold catalogs use the same specification as pinned construction, including
-tied vocabulary ownership. Families supply semantic group identities and apply
+tied vocabulary ownership. Kimi Linear projects those same static groups while
+retaining explicit canonical owners and its family projection-format admission set.
+Families supply semantic group identities and apply
 their admitted physical-format expansion once; packed shapes and companion
 metadata remain part of that family projection.
 
