@@ -878,45 +878,10 @@ impl<B: NeuralBackend> MultiTableEmbedding<B> {
         specs: impl IntoIterator<Item = NamedEmbeddingSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let specs = specs.into_iter().collect::<Vec<_>>();
-        if specs.is_empty() {
-            return Err(Error::backend(
-                "multi-table embedding sum requires at least one table",
-            ));
-        }
-        let mut names = std::collections::BTreeSet::new();
-        let mut dimensions = None;
-        let mut tables = Vec::with_capacity(specs.len());
-        for spec in specs {
-            if spec.name.trim().is_empty() || !names.insert(spec.name.clone()) {
-                return Err(Error::backend(format!(
-                    "multi-table embedding name {:?} is empty or duplicated",
-                    spec.name
-                )));
-            }
-            spec.lookup.validate()?;
-            if spec.embedding.vocabulary <= 0 || spec.embedding.dimensions <= 0 {
-                return Err(Error::backend(format!(
-                    "embedding table {:?} has invalid geometry vocabulary={} dimensions={}",
-                    spec.name, spec.embedding.vocabulary, spec.embedding.dimensions
-                )));
-            }
-            if dimensions
-                .replace(spec.embedding.dimensions)
-                .is_some_and(|expected| expected != spec.embedding.dimensions)
-            {
-                return Err(Error::backend(format!(
-                    "embedding table {:?} width {} differs from preceding width {:?}",
-                    spec.name, spec.embedding.dimensions, dimensions
-                )));
-            }
-            tables.push(NamedEmbedding {
-                embedding: B::embedding(spec.embedding, context)?,
-                name: spec.name,
-                lookup: spec.lookup,
-            });
-        }
-        Ok(Self { tables })
+        Self::from_specs(
+            specs.into_iter().map(|spec| (spec, ())).collect(),
+            |spec, ()| B::embedding(spec, context),
+        )
     }
 
     /// Builds rank-local vocabulary tables with validated global ownership.
@@ -935,28 +900,58 @@ impl<B: NeuralBackend> MultiTableEmbedding<B> {
                 "parallel multi-table embeddings require one range per table",
             ));
         }
+        for (spec, range) in specs.iter().zip(&ranges) {
+            range.validate_global_rows(spec.embedding.vocabulary)?;
+        }
+        Self::from_specs(specs.into_iter().zip(ranges).collect(), |spec, range| {
+            VocabularyModulePlacement::VocabularyParallel(range)
+                .materialize_embedding::<B>(spec, context)
+                .map(|embedding| embedding.expect("selected embedding table is owned"))
+        })
+    }
+
+    fn from_specs<P>(
+        specs: Vec<(NamedEmbeddingSpec, P)>,
+        mut materialize: impl FnMut(EmbeddingSpec, P) -> Result<B::Embedding, Error>,
+    ) -> Result<Self, Error> {
+        if specs.is_empty() {
+            return Err(Error::backend(
+                "multi-table embedding sum requires at least one table",
+            ));
+        }
         let mut names = std::collections::BTreeSet::new();
-        let mut dimensions = None;
-        let mut tables = Vec::with_capacity(specs.len());
-        for (spec, range) in specs.into_iter().zip(ranges) {
-            if spec.name.trim().is_empty() || !names.insert(spec.name.clone()) {
-                return Err(Error::backend(
-                    "parallel embedding name is empty or duplicated",
-                ));
+        let dimensions = specs[0].0.embedding.dimensions;
+        for (spec, _) in &specs {
+            if spec.name.trim().is_empty() || !names.insert(&spec.name) {
+                return Err(Error::backend(format!(
+                    "multi-table embedding name {:?} is empty or duplicated",
+                    spec.name
+                )));
             }
             spec.lookup.validate()?;
-            if dimensions
-                .replace(spec.embedding.dimensions)
-                .is_some_and(|expected| expected != spec.embedding.dimensions)
-            {
-                return Err(Error::backend("parallel embedding widths differ"));
+            if spec.embedding.vocabulary <= 0 || spec.embedding.dimensions <= 0 {
+                return Err(Error::backend(format!(
+                    "embedding table {:?} has invalid geometry vocabulary={} dimensions={}",
+                    spec.name, spec.embedding.vocabulary, spec.embedding.dimensions
+                )));
             }
-            tables.push(NamedEmbedding {
-                embedding: B::vocabulary_parallel_embedding(spec.embedding, range, context)?,
-                name: spec.name,
-                lookup: spec.lookup,
-            });
+            if spec.embedding.dimensions != dimensions {
+                return Err(Error::backend(format!(
+                    "embedding table {:?} width {} differs from preceding width {}",
+                    spec.name, spec.embedding.dimensions, dimensions
+                )));
+            }
         }
+        let tables = specs
+            .into_iter()
+            .map(|(spec, placement)| {
+                Ok(NamedEmbedding {
+                    embedding: materialize(spec.embedding, placement)?,
+                    name: spec.name,
+                    lookup: spec.lookup,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         Ok(Self { tables })
     }
 

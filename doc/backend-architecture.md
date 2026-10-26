@@ -8533,6 +8533,11 @@ specifications before physical-format expansion. Complete and tensor-local
 materialization use the same constructor. Local table ranges resolve directly by
 the declared parameter identity; all vocabulary ranges are validated before any
 table is allocated. Input padding rows and the unpadded readout remain distinct.
+Shared multi-table construction validates the complete ordered set of names,
+lookup policies and positive, equal widths before invoking any backend factory.
+Ordinary and vocabulary-parallel construction use that same pass and allocation
+loop; sharded tables use runtime vocabulary placement. Table order and lookup/sum
+equations remain architecture-owned.
 
 Moshi depth slices declare their embedding, temporal projection, audio readout
 and shared-block geometry once. Cold parameter contracts and complete/tensor-local
