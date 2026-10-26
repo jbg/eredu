@@ -1857,6 +1857,73 @@ mod component_preparation {
             );
             assert!(validate(&invalid, 6..11).is_err());
         }
+        assert_eq!(
+            eredu_runtime::balanced_parameter_group_range(
+                description.groups()[0].group(),
+                &layout,
+                0,
+                11
+            )
+            .unwrap(),
+            6..11,
+        );
+        let nv = eredu_runtime::expand_linear_format_parameter_group(
+            ParameterGroupSpec::new(
+                "nv",
+                ParameterRole::Vocabulary,
+                [ParameterMemberSpec::new(
+                    "nv.weight",
+                    [11, 64],
+                    MemberSharding::Balanced { axis: 0 },
+                )],
+            )
+            .unwrap(),
+            |_| {
+                Ok(Some(
+                    eredu_nn::LinearFormatSpec::nvfp4(
+                        eredu_nn::ParameterSpec::trainable("nv.scales").unwrap(),
+                        eredu_nn::ParameterSpec::trainable("nv.global").unwrap(),
+                    )
+                    .unwrap(),
+                ))
+            },
+        )
+        .unwrap();
+        let nv_owner = OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::execution_unit(units.group_id(0).unwrap().clone(), 0),
+            nv.clone(),
+        );
+        let nv_layout =
+            eredu_runtime::derive_partitioned_group_layout([&nv_owner], topology).unwrap();
+        assert_eq!(
+            eredu_runtime::balanced_parameter_group_range(&nv, &nv_layout, 0, 11).unwrap(),
+            6..11
+        );
+        validate_parameter_layout([&nv], &nv_layout, |_| {
+            Ok::<_, ParallelPlanError>(ParameterGroupSelection::BalancedAxis {
+                axis: 0,
+                global_extent: 11,
+                range: 6..11,
+            })
+        })
+        .unwrap();
+        assert!(eredu_runtime::balanced_parameter_group_range(&nv, &nv_layout, 0, 12).is_err());
+        let mut invalid = nv_layout.clone();
+        let scalar = nv_layout.tensor("nv.global").unwrap();
+        invalid.insert(
+            "nv.global".into(),
+            LocalTensorLayout::new(
+                scalar.logical_name(),
+                scalar.role(),
+                scalar.global_shape().to_vec(),
+                vec![1],
+                TensorPlacement::Replicated,
+                None,
+                None,
+                false,
+            ),
+        );
+        assert!(eredu_runtime::balanced_parameter_group_range(&nv, &invalid, 0, 11).is_err());
         let prepared = prepared.select(&layout).unwrap();
         assert_eq!(
             prepared

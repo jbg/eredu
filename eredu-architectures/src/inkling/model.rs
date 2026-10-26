@@ -15,6 +15,7 @@ pub type LayeredModel<B> = ComponentAdapter<
 >;
 
 mod parameters;
+pub(crate) use parameters::select_definition;
 pub use parameters::{component_definition, parameter_description, project_parameters};
 
 use std::sync::Arc;
@@ -649,20 +650,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
         definition: Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = parameters::select_definition(&args, definition, None)?;
-        crate::operator_requirements::require::<B>(
-            "Inkling",
-            crate::operator_requirements::INKLING,
-        )?;
-        let static_modules = StaticModules::materialize(&args, None, |_| true, context)?;
-        Ok(Self {
-            definition,
-            args,
-            static_modules,
-            parallel_geometry: None,
-            partition_state_offset: 0,
-            expert_realization: None,
-        })
+        Self::materialize(args, definition, None, |_| Ok(None), context)
     }
 
     /// Builds one planner-derived rank-local realization of the canonical graph.
@@ -672,20 +660,95 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
         geometry: Arc<LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = parameters::select_definition(&args, definition, Some(&geometry))?;
+        Self::materialize(args, definition, Some(geometry), |_| Ok(None), context)
+    }
+
+    /// Validates partition ownership and state before allocating selected pinned roles.
+    pub fn from_partition_definition<G, A>(
+        args: ModelArgs,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Arc<LocalGeometry>,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+        realization: Option<crate::ExpertRealizationPlan<super::ExpertBankRealization>>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredModel<B>, Error> {
+        let kernel = Self::materialize(
+            args,
+            definition,
+            Some(geometry),
+            |definition| Ok(Some(definition.select_partition(partition)?)),
+            context,
+        )?;
+        let kernel = match realization {
+            Some(realization) => kernel.with_expert_realization(realization)?,
+            None => kernel,
+        };
+        kernel.into_partition_model(partition)
+    }
+
+    fn materialize(
+        args: ModelArgs,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<Arc<LocalGeometry>>,
+        select: impl FnOnce(
+            &eredu_runtime::ComponentDefinition,
+        ) -> Result<Option<eredu_runtime::ComponentSelection>, Error>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let definition = parameters::select_definition(&args, definition, geometry.as_deref())?;
+        let selection = select(&definition)?;
+        let partition_state_offset = selection
+            .as_ref()
+            .map(|selection| Self::selected_state_offset(&args, selection))
+            .transpose()?
+            .unwrap_or(0);
         crate::operator_requirements::require::<B>(
             "Inkling",
             crate::operator_requirements::INKLING,
         )?;
-        let static_modules = StaticModules::materialize(&args, Some(&geometry), |_| true, context)?;
+        let static_modules = StaticModules::materialize(
+            &args,
+            geometry.as_deref(),
+            |role| {
+                selection.as_ref().is_none_or(|selection| {
+                    selection
+                        .owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+                })
+            },
+            context,
+        )?;
         Ok(Self {
             definition,
             args,
             static_modules,
-            parallel_geometry: Some(geometry),
-            partition_state_offset: 0,
+            parallel_geometry: geometry,
+            partition_state_offset,
             expert_realization: None,
         })
+    }
+
+    fn selected_state_offset(
+        args: &ModelArgs,
+        selection: &eredu_runtime::ComponentSelection,
+    ) -> Result<usize, Error> {
+        let offset = selection
+            .state()
+            .map_or(0, |state| state.global_layer_offset());
+        if offset >= args.text_config.num_hidden_layers as usize {
+            return Err(Error::backend(
+                "Inkling partition state offset is outside the target decoder",
+            ));
+        }
+        if args
+            .mtp_config
+            .as_ref()
+            .is_some_and(|prediction| prediction.num_nextn_predict_layers > 0)
+        {
+            return Err(Error::backend(
+                "partitioned Inkling cannot attach embedded-prediction state",
+            ));
+        }
+        Ok(offset)
     }
 
     fn local_state_ordinal(&self, global: usize) -> Result<usize, Error> {
@@ -725,24 +788,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
         partition: &eredu_runtime::ArchitecturePartition<G, A>,
     ) -> Result<LayeredModel<B>, Error> {
         let selection = self.definition.select_partition(partition)?;
-        let offset = selection
-            .state()
-            .map_or(0, |state| state.global_layer_offset());
-        if offset >= self.args.text_config.num_hidden_layers as usize {
-            return Err(Error::backend(
-                "Inkling partition state offset is outside the target decoder",
-            ));
-        }
-        if self
-            .args
-            .mtp_config
-            .as_ref()
-            .is_some_and(|prediction| prediction.num_nextn_predict_layers > 0)
-        {
-            return Err(Error::backend(
-                "partitioned Inkling cannot attach embedded-prediction state",
-            ));
-        }
+        let offset = Self::selected_state_offset(&self.args, &selection)?;
         self.partition_state_offset = offset;
         let roles: std::collections::BTreeSet<_> = partition
             .parameter_bindings()

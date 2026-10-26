@@ -373,7 +373,7 @@ pub use parameter_acquisition::{
     ParameterAcquisitionError, ParameterAcquisitionUnit,
 };
 pub use parameter_layout::{
-    derive_partitioned_group_layout, derive_partitioned_local_layout,
+    balanced_parameter_group_range, derive_partitioned_group_layout, derive_partitioned_local_layout,
     logical_parameter_group_range, retained_partition_layout, validate_parameter_layout,
     validate_tensor_parallel_layout, TensorParallelLayoutError, ParameterGroupSelection,
 };

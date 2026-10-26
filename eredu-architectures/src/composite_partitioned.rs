@@ -2902,28 +2902,21 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::InklingKernel::<B>::from_parallel_definition(
-                args.clone(),
-                definition,
-                std::sync::Arc::new(local),
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let definition =
+                crate::inkling::model::select_definition(&args, definition, Some(&local)).map_err(
+                    |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+                )?;
             let realization = if routed {
-                let realization = crate::inkling::expert_realization_plan(&architecture, rank)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?
-                    .ok_or_else(|| {
-                        CompositePartitionPreparationError::Architecture(
-                            "routed Inkling has no expert realization".into(),
-                        )
-                    })?;
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+                let realization =
+                    crate::inkling::expert_realization_plan(&args, Some(&local), rank)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            CompositePartitionPreparationError::Architecture(
+                                "routed Inkling has no expert realization".into(),
+                            )
+                        })?;
                 Some(realization)
             } else {
                 None
@@ -2934,17 +2927,21 @@ where
                     .iter()
                     .map(|(group, units)| (group.as_str(), units.clone())),
                 ownership.clone(),
-                architecture.definition().state_layout(),
-                architecture.definition().state_partition_plan(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
                 geometry.clone(),
                 eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let architecture = architecture
-                .into_partition_model(&partition)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+            let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
+                args.clone(),
+                definition,
+                std::sync::Arc::new(local),
+                &partition,
+                realization.clone(),
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let routed_execution = realization
                 .as_ref()
                 .map(|realization| {
@@ -3440,15 +3437,10 @@ where
     {
         return Err("Inkling transform source changed partition state or ownership".into());
     }
-    let mut architecture = crate::inkling::InklingKernel::<B>::from_parallel_definition(
-        source.clone(),
-        definition,
-        std::sync::Arc::new(local),
-        context,
-    )
-    .map_err(|error| error.to_string())?;
-    if source.text_config.has_sparse_moe_layers() {
-        let realization = crate::inkling::expert_realization_plan(&architecture, rank)
+    let definition = crate::inkling::model::select_definition(source, definition, Some(&local))
+        .map_err(|error| error.to_string())?;
+    let realization = if source.text_config.has_sparse_moe_layers() {
+        let realization = crate::inkling::expert_realization_plan(source, Some(&local), rank)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Inkling transform source has no expert realization".to_owned())?;
         routed_inkling_partition_foundation(
@@ -3459,16 +3451,16 @@ where
             rank,
             &realization,
         )?;
-        architecture = architecture
-            .with_expert_realization(realization)
-            .map_err(|error| error.to_string())?;
-    }
+        Some(realization)
+    } else {
+        None
+    };
     let partition = ArchitecturePartition::from_description(
         &parameters,
         ranges(),
         ownership.clone(),
-        architecture.definition().state_layout(),
-        architecture.definition().state_partition_plan(),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry,
         eredu_runtime::NoAuxiliaryBoundarySchema::new(source.text_config.hidden_size),
     )
@@ -3480,9 +3472,15 @@ where
         crate::inkling::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
     }
-    let architecture = architecture
-        .into_partition_model(&partition)
-        .map_err(|error| error.to_string())?;
+    let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
+        source.clone(),
+        definition,
+        std::sync::Arc::new(local),
+        &partition,
+        realization,
+        context,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 
@@ -3867,28 +3865,21 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::InklingKernel::<B>::from_parallel_definition(
-                args.clone(),
-                definition,
-                std::sync::Arc::new(local),
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let definition =
+                crate::inkling::model::select_definition(&args, definition, Some(&local)).map_err(
+                    |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+                )?;
             let realization = if routed {
-                let realization = crate::inkling::expert_realization_plan(&architecture, rank)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?
-                    .ok_or_else(|| {
-                        CompositePartitionPreparationError::Architecture(
-                            "routed Inkling has no expert realization".into(),
-                        )
-                    })?;
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+                let realization =
+                    crate::inkling::expert_realization_plan(&args, Some(&local), rank)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            CompositePartitionPreparationError::Architecture(
+                                "routed Inkling has no expert realization".into(),
+                            )
+                        })?;
                 Some(realization)
             } else {
                 None
@@ -3899,17 +3890,21 @@ where
                     .iter()
                     .map(|(group, units)| (group.as_str(), units.clone())),
                 ownership.clone(),
-                architecture.definition().state_layout(),
-                architecture.definition().state_partition_plan(),
+                definition.state_layout(),
+                definition.state_partition_plan(),
                 geometry.clone(),
                 eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let architecture = architecture
-                .into_partition_model(&partition)
-                .map_err(|error| {
-                    CompositePartitionPreparationError::Architecture(error.to_string())
-                })?;
+            let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
+                args.clone(),
+                definition,
+                std::sync::Arc::new(local),
+                &partition,
+                realization.clone(),
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let routed_execution = realization
                 .as_ref()
                 .map(|realization| {

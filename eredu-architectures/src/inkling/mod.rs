@@ -73,13 +73,17 @@ pub struct ExpertBankRealization {
 }
 
 /// Derives complete routed-expert ownership and both rank-local bank geometries.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &InklingKernel<B>,
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<ExpertBankRealization>>, eredu_nn::Error> {
-    let args = architecture.args();
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(args)
+            .map_err(eredu_nn::Error::backend_source)?;
+    }
     let sparse = args
         .text_config
         .layer_schedule
@@ -108,8 +112,7 @@ pub fn expert_realization_plan<
         if policy.feed_forward != FeedForwardPolicy::SparseMoe {
             continue;
         }
-        let local = architecture
-            .shared_parallel_geometry()
+        let local = geometry
             .and_then(|geometry| geometry.text_layer(layer).cloned())
             .unwrap_or_else(|| args.text_config.clone());
         let (routed, shared) =

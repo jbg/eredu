@@ -7,7 +7,7 @@ use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
     expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
     ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
-    PartitionState, StateLayout, TensorPlacement,
+    PartitionState, StateLayout,
 };
 
 use crate::linear_format::standard_parallel_linear_format;
@@ -309,10 +309,21 @@ pub fn local_geometry(
         .map_err(|error| invalid(error.to_string()))?;
     let prediction_state = prediction_state(args, state_layout.len())?;
     let vocabulary = dim(args.text_config.vocab_size)?;
+    let statics = pinned_parameter_groups(args)?;
+    let vocabulary_range = |role| -> Result<_, ParallelPlanError> {
+        let (_, group) = statics
+            .iter()
+            .find(|(resource, _)| *resource == role)
+            .ok_or_else(|| invalid(format!("Inkling has no declared {role} resource")))?;
+        Ok(VocabularyParallelRange {
+            global_vocabulary: vocabulary,
+            local: eredu_runtime::balanced_parameter_group_range(group, layout, 0, vocabulary)?,
+        })
+    };
     let geometry = LocalGeometry {
         text_layers,
-        embedding_range: vocabulary_range(layout, "model.embed_tokens", vocabulary)?,
-        output_range: vocabulary_range(layout, "lm_head", vocabulary)?,
+        embedding_range: vocabulary_range("embedding")?,
+        output_range: vocabulary_range("output")?,
         state_layout,
         prediction_state,
         vision_layers: args
@@ -457,56 +468,6 @@ fn prediction_state(
             PartitionState::new(layout, target_layers).map_err(|error| invalid(error.to_string()))
         })
         .transpose()
-}
-
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        if tensor.global_shape().first().copied() != Some(vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Inkling vocabulary member {target} has global shape {:?}, expected {vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "Inkling vocabulary member {target} has non-row placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Inkling vocabulary group {logical_name} has inconsistent selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary,
-        local: selected.ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!(
-                "missing local Inkling vocabulary layout for {logical_name}"
-            ))
-        })?,
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
 }
 
 /// Derives the construction geometry for one rank-local Inkling decoder layer.

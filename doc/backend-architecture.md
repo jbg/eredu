@@ -8539,6 +8539,29 @@ catalogs project those same logical groups, retaining embedding-normalization an
 media roles separately. Inkling owns assembly normalization, muP scaling, protocol
 vocabulary trimming, MTP and media construction.
 
+Inkling partition construction validates the retained definition, local geometry,
+canonical selected storage and state offset before materializing pinned modules.
+Target and transform-source preparation derive expert plans from configuration
+and optional local geometry without a native kernel. They construct the partition
+before native realization and supply its exact selection to the shared pinned
+constructor. Unsupported embedded-prediction partition state rejects before
+allocation. Consuming partition assembly retains its own validation for low-level
+callers that already hold a complete or tensor-local kernel.
+
+Runtime `balanced_parameter_group_range` extracts independent axis intervals from
+declared sharded members and validates every physical member against that range.
+Replicated companions, including scalar global scales, retain their complete
+geometry. Inkling vocabulary geometry uses this projection over its declared
+embedding and output groups. Full replicated storage remains distinct from
+row-sharded placement; neither interval nor tensor shape infers communicator
+admission. Shared axis-layout conformance covers aligned companions, scalar
+replicas and malformed selections.
+
+Neutral NVFP4 vocabulary geometry includes replicated global-scale companions.
+MLX packed embedding materialization does not expose the NVFP4 global-scale
+parameter. Native selected-vocabulary resource names and shapes are checked with
+MXFP4. NVFP4 embedding materialization and execution remain a native validation gap.
+
 `ComponentSelection::owns_storage` reports canonical parameter owners from the
 validated partition bindings, independently of logical invocation and mutable-state
 identity. The shared `PartitionStaticModules::from_selected_spec` constructor consumes

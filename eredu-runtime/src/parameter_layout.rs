@@ -163,6 +163,61 @@ pub fn logical_parameter_group_range(
         .ok_or_else(invalid)
 }
 
+/// Extracts and validates an independent balanced axis from its declared group.
+/// Replicated companions retain their complete shapes, independently of the axis.
+/// The layout may contain other groups; only this group's declared targets are read.
+pub fn balanced_parameter_group_range(
+    group: &crate::ParameterGroupSpec,
+    layout: &crate::LocalModelLayout,
+    axis: usize,
+    global_extent: usize,
+) -> Result<Range<usize>, crate::ParallelPlanError> {
+    let invalid = || {
+        crate::ParallelPlanError::InvalidGroup(format!(
+            "parameter group {:?} has no independent balanced axis {axis}",
+            group.logical_name(),
+        ))
+    };
+    if group.partition_units().is_some() {
+        return Err(invalid());
+    }
+    let anchor = group
+        .members()
+        .iter()
+        .find(|member| {
+            member.sharding() == &(crate::MemberSharding::Balanced { axis })
+                && member.global_shape().get(axis) == Some(&global_extent)
+        })
+        .ok_or_else(invalid)?;
+    let tensor = layout.tensor(anchor.target()).ok_or_else(invalid)?;
+    let (range, replicated) = match tensor.placement() {
+        crate::TensorPlacement::Range {
+            axis: selected,
+            start,
+            end,
+        } if *selected == axis => (*start..*end, false),
+        crate::TensorPlacement::Replicated => (0..global_extent, true),
+        _ => return Err(invalid()),
+    };
+    for member in group.members() {
+        let (mut placement, shape) =
+            resolve_balanced_member(member, axis, global_extent, &range)
+                .map_err(crate::ParallelPlanError::InvalidTensor)?;
+        if replicated {
+            placement = crate::TensorPlacement::Replicated;
+        }
+        let expected = local_tensor(group, member, shape, placement, None);
+        if layout.tensor(member.target()) != Some(&expected) {
+            return Err(crate::ParallelPlanError::InvalidTensor(format!(
+                "parameter {:?} differs from declared balanced group {:?}",
+                member.target(),
+                group.logical_name(),
+            )));
+        }
+    }
+    Ok(range)
+}
+
 /// Family-selected geometry validated against one declared physical parameter group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterGroupSelection {
@@ -170,8 +225,9 @@ pub enum ParameterGroupSelection {
     /// `None` selects a group containing only replicated members without a domain.
     Logical(Option<Range<usize>>),
     /// Explicit contiguous interval of an independently balanced tensor axis.
-    /// Every member declares the same axis and complete physical extent. Rank and
-    /// communicator admission remain separate: an uneven interval implies neither.
+    /// Every sharded member declares the same axis and complete physical extent;
+    /// declared replicas retain their full shapes. Rank and communicator admission
+    /// remain separate: an uneven interval implies neither.
     BalancedAxis {
         /// Declared tensor axis.
         axis: usize,
@@ -199,14 +255,18 @@ where
     let mut targets = std::collections::BTreeSet::new();
     for group in groups {
         let selected = select(group)?;
-        if matches!(selected, ParameterGroupSelection::BalancedAxis { .. })
-            && group.partition_units().is_some()
-        {
-            return Err(crate::ParallelPlanError::InvalidGroup(format!(
-                "parameter group {:?} declares a logical domain for independent axis selection",
-                group.logical_name(),
-            ))
-            .into());
+        if let ParameterGroupSelection::BalancedAxis { axis, .. } = &selected {
+            if group.partition_units().is_some()
+                || !group.members().iter().any(|member| {
+                    member.sharding() == &(crate::MemberSharding::Balanced { axis: *axis })
+                })
+            {
+                return Err(crate::ParallelPlanError::InvalidGroup(format!(
+                    "parameter group {:?} does not declare independent balanced axis {axis}",
+                    group.logical_name(),
+                ))
+                .into());
+            }
         }
         let logical = match &selected {
             ParameterGroupSelection::Logical(range) => range.clone(),
@@ -492,18 +552,27 @@ fn resolve_balanced_member(
     global_extent: usize,
     range: &Range<usize>,
 ) -> Result<(crate::TensorPlacement, Vec<usize>), String> {
-    if member.sharding() != &(crate::MemberSharding::Balanced { axis })
+    let replicated = member.sharding() == &crate::MemberSharding::Replicated;
+    if (!replicated
+        && (member.sharding() != &(crate::MemberSharding::Balanced { axis })
+            || member_axis(member, axis)? != global_extent))
         || global_extent == 0
-        || member_axis(member, axis)? != global_extent
         || range.is_empty()
         || range.end > global_extent
     {
         return Err(format!(
-            "tensor {:?} does not preserve axis {axis} extent {global_extent} selection {range:?}",
-            member.target(),
-        ));
+        "tensor {:?} does not preserve axis {axis} extent {global_extent} selection {range:?}",
+        member.target(),
+    ));
     }
-    Ok(ranged(member, axis, range.clone()))
+    if replicated {
+        Ok((
+            crate::TensorPlacement::Replicated,
+            member.global_shape().to_vec(),
+        ))
+    } else {
+        Ok(ranged(member, axis, range.clone()))
+    }
 }
 
 fn resolve_logical_member(
