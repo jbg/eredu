@@ -3639,11 +3639,6 @@ pub(crate) fn parameter_description_with_formats(
             .map_err(|_| ParallelPlanError::InvalidTensor(format!("decoder {name} exceeds usize")))
     };
     let hidden = dimension("hidden width", config.hidden_size())?;
-    let vocabulary = if include_vocabulary {
-        dimension("vocabulary", config.vocabulary_size())?
-    } else {
-        0
-    };
     let schedule = DecoderSchedule::new(config)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let query_heads = dimension("query-head count", config.num_attention_heads())?;
@@ -3671,53 +3666,38 @@ pub(crate) fn parameter_description_with_formats(
         .expect("dense decoder layout contains its text group")
         .clone();
     let root = config.parameter_root();
-    let embedding = format!("{root}.embed_tokens.weight");
-    let norm = format!("{root}.norm.weight");
-    let mut owned = Vec::new();
-    if include_vocabulary {
-        owned.push(OwnedParameterGroupSpec::new(
-            if config.tie_word_embeddings() {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role("embedding")
-            },
-            ParameterGroupSpec::new(
-                format!("{root}.embed_tokens"),
-                ParameterRole::Vocabulary,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    &embedding,
-                    vec![vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ));
-    }
-    owned.push(OwnedParameterGroupSpec::new(
-        ParameterGroupOwner::static_role("norm"),
-        ParameterGroupSpec::new(
-            format!("{root}.norm"),
-            ParameterRole::Replicated,
-            [eredu_runtime::ParameterMemberSpec::new(
-                norm,
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
-        )?,
-    ));
-    if include_vocabulary && !config.tie_word_embeddings() {
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("output"),
-            ParameterGroupSpec::new(
+    let statics = StaticModuleSpec::from_config(config);
+    let mut owned = if include_vocabulary {
+        statics
+            .logical_pinned_parameter_groups(
+                &format!("{root}.embed_tokens"),
+                &format!("{root}.norm"),
                 "lm_head",
-                ParameterRole::Vocabulary,
+            )?
+            .into_iter()
+            .map(|(role, group)| {
+                let owner = if role == "embedding" && statics.tied_head {
+                    ParameterGroupOwner::static_any_of(["embedding", "output"])
+                } else {
+                    ParameterGroupOwner::static_role(role)
+                };
+                OwnedParameterGroupSpec::new(owner, group)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_role("norm"),
+            ParameterGroupSpec::new(
+                format!("{root}.norm"),
+                ParameterRole::Replicated,
                 [eredu_runtime::ParameterMemberSpec::new(
-                    "lm_head.weight",
-                    vec![vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
+                    &statics.normalization_weight,
+                    vec![hidden],
+                    MemberSharding::Replicated,
                 )],
             )?,
-        ));
-    }
+        )]
+    };
 
     for (owner, consumers) in schedule.resources() {
         let operation = schedule
@@ -4021,22 +4001,9 @@ pub(crate) fn parameter_description_with_formats(
         }
     }
 
-    let mut expanded = Vec::with_capacity(owned.len());
-    for tagged in owned {
-        let owner = tagged.owner().clone();
-        let [group] = eredu_runtime::expand_linear_format_parameter_groups(
-            vec![tagged.into_group()],
-            |member| {
-                crate::linear_format::standard_parallel_linear_format(
-                    member,
-                    format(member.target()),
-                )
-            },
-        )?
-        .try_into()
-        .expect("one parameter group expands to one parameter group");
-        expanded.push(OwnedParameterGroupSpec::new(owner, group));
-    }
+    let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
+        crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
+    })?;
     let expected = expanded
         .iter()
         .map(|tagged| tagged.group().clone())

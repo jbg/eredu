@@ -8478,6 +8478,14 @@ Families supply semantic group identities and apply their admitted physical-form
 expansion once; packed shapes and companion metadata remain part of that family
 projection.
 
+The common decoder derives full vocabulary geometry from this same static
+specification and uses runtime's owned format projection for its complete catalog.
+Selected format callbacks retain routed and family-specific encoding policy.
+Supplied-embedding decoders project only final normalization and retain no
+vocabulary table or output head; VoiceChat's zero-vocabulary geometry remains
+valid for that operation. Shared block consumers and terminal normalization owners
+remain attached throughout physical expansion.
+
 `StaticModuleSpec::pinned_parameter_groups` projects complete physical vocabulary
 storage from the same admitted embedding and readout formats used for construction.
 Qwen hybrid, Nemotron-H, Muse, Kimi Linear and LFM2 use this projection for cold
