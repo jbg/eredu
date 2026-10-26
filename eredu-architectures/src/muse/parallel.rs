@@ -674,16 +674,11 @@ pub fn static_parameter_groups(
 pub(crate) fn static_resource_parameter_groups(
     args: &DecoderConfig,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    super::text::static_spec(args)
-        .logical_pinned_parameter_groups("model.embed_tokens", "model.norm", "lm_head")?
-        .into_iter()
-        .map(|(role, group)| {
-            eredu_runtime::expand_linear_format_parameter_group(group, |member| {
-                standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-            })
-            .map(|group| (role, group))
-        })
-        .collect()
+    super::text::static_spec(args).pinned_parameter_groups(
+        "model.embed_tokens",
+        "model.norm",
+        "lm_head",
+    )
 }
 
 /// Declares one decoder block's head, dense/expert, and replicated groups.

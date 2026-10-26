@@ -286,54 +286,18 @@ pub fn parameter_description(
     if config.tie_word_embeddings {
         roles.push("output");
     }
-    let embedding_format = crate::linear_format::standard_linear_format(
-        &statics.embedding_weight,
-        statics.embedding_format,
-    )
-    .map_err(invalid)?;
-    declaration
-        .formats
-        .insert(statics.embedding_weight.clone(), embedding_format);
-    let mut owned = vec![
-        OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_any_of(roles),
-            ParameterGroupSpec::new(
-                "model.embed_tokens",
-                ParameterRole::Vocabulary,
-                [ParameterMemberSpec::new(
-                    statics.embedding_weight,
-                    vec![statics.vocabulary as usize, statics.hidden_size as usize],
-                    S::Balanced { axis: 0 },
-                )],
-            )?,
-        ),
-        OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("norm"),
-            declaration.norm(
-                "model.norm",
-                &statics.normalization_weight,
-                statics.hidden_size,
-            )?,
-        ),
-    ];
-    if !config.tie_word_embeddings {
-        let members = declaration.linear(
-            super::block::linear_spec(
-                config,
-                "lm_head",
-                config.hidden_size,
-                config.vocab_size,
-                false,
-            )
-            .map_err(invalid)?,
-            S::Balanced { axis: 0 },
-            S::Replicated,
-        );
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("output"),
-            ParameterGroupSpec::new("lm_head", ParameterRole::Vocabulary, members)?,
-        ));
-    }
+    let mut owned = statics
+        .pinned_parameter_groups("model.embed_tokens", "model.norm", "lm_head")?
+        .into_iter()
+        .map(|(role, group)| {
+            let owner = if role == "embedding" {
+                ParameterGroupOwner::static_any_of(roles.clone())
+            } else {
+                ParameterGroupOwner::static_role(role)
+            };
+            OwnedParameterGroupSpec::new(owner, group)
+        })
+        .collect::<Vec<_>>();
     if steps > 0 {
         let consumers = (0..steps)
             .map(|depth| {

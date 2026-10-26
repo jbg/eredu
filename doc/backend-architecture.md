@@ -8477,6 +8477,13 @@ Families supply semantic group identities and apply their admitted physical-form
 expansion once; packed shapes and companion metadata remain part of that family
 projection.
 
+`StaticModuleSpec::pinned_parameter_groups` projects complete physical vocabulary
+storage from the same admitted embedding and readout formats used for construction.
+Qwen hybrid, Nemotron-H and Muse use this projection for cold static catalogs;
+family code retains MTP consumers, tied owners and normalization arithmetic.
+Static companions expand once and remain outside later body-format declarations.
+Qwen hybrid retains its separate embedding and head FP8 admission policies.
+
 Runtime `expand_linear_format_parameter_group` expands one atomic logical group
 and preserves its partition constraints and declared companions. Catalog expansion
 uses the same primitive. Families retain resource and canonical owner identities

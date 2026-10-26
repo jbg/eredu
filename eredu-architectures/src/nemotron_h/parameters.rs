@@ -339,44 +339,18 @@ pub fn parameter_description(
     if args.tie_word_embeddings {
         roles.push("output");
     }
-    let mut owned = vec![
-        OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_any_of(roles),
-            ParameterGroupSpec::new(
-                "model.embeddings",
-                ParameterRole::Vocabulary,
-                declaration.linear(
-                    "model.embeddings",
-                    args.vocab_size as usize,
-                    args.hidden_size as usize,
-                    false,
-                    S::Balanced { axis: 0 },
-                    S::Replicated,
-                )?,
-            )?,
-        ),
-        OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("norm"),
-            declaration.norm("model.norm_f", "model.norm_f.weight")?,
-        ),
-    ];
-    if !args.tie_word_embeddings {
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("output"),
-            ParameterGroupSpec::new(
-                "lm_head",
-                ParameterRole::Vocabulary,
-                declaration.linear(
-                    "lm_head",
-                    args.vocab_size as usize,
-                    args.hidden_size as usize,
-                    false,
-                    S::Balanced { axis: 0 },
-                    S::Replicated,
-                )?,
-            )?,
-        ));
-    }
+    let mut owned = super::static_spec(args, super::FinalNormalization::Native)
+        .pinned_parameter_groups("model.embeddings", "model.norm_f", "lm_head")?
+        .into_iter()
+        .map(|(role, group)| {
+            let owner = if role == "embedding" {
+                ParameterGroupOwner::static_any_of(roles.clone())
+            } else {
+                ParameterGroupOwner::static_role(role)
+            };
+            OwnedParameterGroupSpec::new(owner, group)
+        })
+        .collect::<Vec<_>>();
     for (group, count) in std::iter::once(layers)
         .chain(std::iter::repeat_n(pattern, steps))
         .enumerate()
