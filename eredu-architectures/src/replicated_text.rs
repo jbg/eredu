@@ -1110,11 +1110,11 @@ where
     if !changed {
         return Ok(retained);
     }
-    crate::decoder::project_parameters(
-        args,
-        &retained,
-        P::parameter_description(args).map_err(eredu_nn::Error::backend_source)?,
-    )
+    retained
+        .project_parameters_with_unit_paths(
+            P::parameter_description(args).map_err(eredu_nn::Error::backend_source)?,
+        )
+        .map_err(eredu_nn::Error::from)
 }
 
 pub(crate) fn selected_uses_transform(selected: &SelectedReplicatedTextRealization) -> bool {

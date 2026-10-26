@@ -1,5 +1,6 @@
 //! Validated component declarations and typed equation adapters.
 
+mod parameter_paths;
 mod projection;
 
 use crate::{

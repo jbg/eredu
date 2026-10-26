@@ -8615,10 +8615,15 @@ supply their F32 execution policy through this same preparation entry point.
 or validates a new physical catalog while preserving logical aliases, state and
 observation ownership. Runtime checks invocation/storage identity, primary owners
 and companion ownership through the same consuming projection used for explicit
-alias changes. Families retain component identity checks, format admission and any
-alias reconstruction; shared decoder projections supply their changed aliases to
-`with_parameters` directly. Replicated selection uses the same retained projection
-after validating complete local geometry.
+alias changes. Families retain component identity checks and format admission.
+`with_unit_parameter_paths` declares aliases for execution-unit storage whose
+canonical targets use the owner's declared unit path. Runtime projects the exact
+suffix under every consumer's declared path, including encoding companions.
+`project_parameters_with_unit_paths` validates selected ownership and rebuilds
+those aliases from the retained paths; shared decoder construction and replicated
+selection use these operations. Other naming schemes supply explicit uses through
+`with_parameter_uses` or `with_parameters`. State identities, observation ownership
+and transport remain retained across physical format changes.
 
 `ComponentDefinition::select_state_layout` consumes retained state-geometry
 selection. Identical geometry retains the declaration; changed geometry moves a

@@ -343,7 +343,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
     let shared_definition = ComponentDefinition::new(
         "shared-fixture",
         parameters,
-        ["first", "second.0", "second.1"]
+        ["first", "second.0", "shared"]
             .map(|path| ComponentUnit {
                 path: path.into(),
                 state: 0..0,
@@ -361,7 +361,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
     .unwrap();
     let uses = [0, 1].map(|index| {
         (
-            format!("second.{index}.weight"),
+            format!("{}.weight", if index == 0 { "second.0" } else { "shared" }),
             eredu_runtime::ComponentParameterUse {
                 invocation: shared_layout
                     .address(shared_layout.ordinal(1, index).unwrap())
@@ -387,7 +387,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         .with_parameter_uses([uses[0].clone(), uses[0].clone()])
         .is_err());
     let shared_definition = shared_definition
-        .with_parameter_uses(uses)
+        .with_unit_parameter_paths()
         .unwrap()
         .map_unit_observation_boundaries(|address, original| {
             if address.group() != 1 {
@@ -426,23 +426,6 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         )],
     )
     .unwrap();
-    let projected_uses = [0, 1]
-        .into_iter()
-        .flat_map(|index| {
-            let invocation = shared_layout
-                .address(shared_layout.ordinal(1, index).unwrap())
-                .unwrap();
-            ["weight", "scale"].map(move |suffix| {
-                (
-                    format!("second.{index}.{suffix}"),
-                    eredu_runtime::ComponentParameterUse {
-                        invocation,
-                        target: format!("shared.{suffix}"),
-                    },
-                )
-            })
-        })
-        .collect::<Vec<_>>();
     let renamed = eredu_runtime::ParameterGroupSpec::new(
         "shared",
         eredu_runtime::ParameterRole::Replicated,
@@ -463,7 +446,9 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         )],
     )
     .unwrap();
-    assert!(shared_definition.project_parameters(renamed).is_err());
+    assert!(shared_definition
+        .project_parameters_with_unit_paths(renamed)
+        .is_err());
     let packed = projected_parameters.groups()[0].group();
     let detached = [
         eredu_runtime::OwnedParameterGroupSpec::new(
@@ -500,14 +485,14 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         detached.clone(),
     )
     .unwrap();
-    assert!(shared_definition.project_parameters(detached).is_err());
+    assert!(shared_definition
+        .project_parameters_with_unit_paths(detached)
+        .is_err());
     let shared_definition = shared_definition
-        .project_parameters(projected_parameters)
+        .project_parameters_with_unit_paths(projected_parameters)
         .unwrap()
         .as_ref()
-        .clone()
-        .with_parameter_uses(projected_uses)
-        .unwrap();
+        .clone();
     struct SharedObservation(Vec<String>);
     impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for SharedObservation {
         fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Failure> {
