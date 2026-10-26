@@ -8956,6 +8956,11 @@ forwards generated reservations, routing/unit hooks and transaction callbacks ac
 neural/native error types and returns the original observer failure. Absence still
 uses ordinary methods. MLX only binds the complete observer set through its session;
 it adds no phase or family dispatch. Complete hook selection is supplied by each supported materialized extension.
+`MaterializedPredictionExecutor` requires explicit prefill and proposal equation
+hooks with optional instrumentation. Its shared ordinary methods invoke those
+hooks without an observer; its shared replay method uses the same prefill equation
+with committed hidden rows. Each executor retains its exact capability report,
+state membership, proposal algorithm and fused-operation semantics.
 Public capture budgets, phase/frontier attribution, effective query/overlay
 sources and distributed producer bindings are verified through the shared
 collector; the component-analysis guide records family-specific acceptance.

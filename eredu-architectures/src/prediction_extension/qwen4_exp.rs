@@ -345,22 +345,6 @@ where
         self.state.clone()
     }
 
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
     fn prefill_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -405,22 +389,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -453,21 +421,6 @@ where
                 observer,
             })
             .map(|output| (output.logits, output.capture))
-    }
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
     }
 }
 

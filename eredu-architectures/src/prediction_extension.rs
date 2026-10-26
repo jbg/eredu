@@ -1238,7 +1238,10 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>;
+        I: PredictionOperationInvoker<A, B, S>,
+    {
+        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
+    }
 
     /// Executes exactly one sequential proposal depth.
     fn logits<S, I>(
@@ -1252,10 +1255,13 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>;
+        I: PredictionOperationInvoker<A, B, S>,
+    {
+        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
+    }
 
-    /// Prefills with explicitly installed internal hooks. An absent observer
-    /// preserves the ordinary path without creating diagnostic tensors.
+    /// Required prefill equation path, with optional internal hooks. Ordinary
+    /// calls use the same path without creating diagnostic tensors.
     #[allow(clippy::too_many_arguments)]
     fn prefill_observed<S, I>(
         &mut self,
@@ -1269,18 +1275,10 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        if observer.is_some() {
-            return Err(I::invalid(
-                "selected prediction prefill has no internal observation path".into(),
-            ));
-        }
-        self.prefill::<S, I>(invoker, target_capture, hidden, tokens, lane)
-    }
+        I: PredictionOperationInvoker<A, B, S>;
 
-    /// Executes a proposal depth with admitted internal hooks. Outer proposal
-    /// observers alone do not imply support for this operation.
+    /// Required proposal equation path, with optional admitted internal hooks.
+    /// Runtime support reports retain the exact selected observation capability.
     #[allow(clippy::too_many_arguments)]
     fn logits_observed<S, I>(
         &mut self,
@@ -1294,15 +1292,7 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        if observer.is_some() {
-            return Err(I::invalid(
-                "selected prediction proposal has no internal observation path".into(),
-            ));
-        }
-        self.logits::<S, I>(invoker, hidden, token, draft_index, lane)
-    }
+        I: PredictionOperationInvoker<A, B, S>;
 
     /// Executes a fused proposal when selected by the architecture.
     fn fused_logits<S, I>(
@@ -1376,12 +1366,7 @@ where
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
         I: PredictionOperationInvoker<A, B, S>,
     {
-        if observer.is_some() {
-            return Err(I::invalid(
-                "selected prediction replay has no internal observation path".into(),
-            ));
-        }
-        self.advance::<S, I>(invoker, hidden, tokens, lane)
+        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
     }
 }
 
@@ -2594,23 +2579,6 @@ where
             .collect()
     }
 
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v3::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v3::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
     fn prefill_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -2650,23 +2618,6 @@ where
         Ok(())
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v3::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v3::Model<B>, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -2704,22 +2655,6 @@ where
             .map(|output| (output.logits, output.hidden))
     }
 
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v3::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v3::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
 }
 
 impl<B, M> executor_sealed::Sealed<crate::deepseek::v4::Model<B>>
@@ -2902,23 +2837,6 @@ where
         )
     }
 
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v4::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v4::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
     fn prefill_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -2985,23 +2903,6 @@ where
         }
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v4::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v4::Model<B>, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3042,23 +2943,6 @@ where
             }
             Self::Dspark { .. } => Err(I::invalid("DSpark uses fused prediction proposals".into())),
         }
-    }
-
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v4::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v4::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
     }
 
     fn fused_logits<S, I>(
@@ -3206,22 +3090,6 @@ where
         self.state.clone()
     }
 
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
     fn prefill_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3267,22 +3135,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3321,21 +3173,6 @@ where
             .map(|output| (output.logits, output.capture))
     }
 
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
 }
 
 impl<A, B, M> executor_sealed::Sealed<A> for MaterializedQwenHybridPrediction<B, M>
@@ -3421,22 +3258,6 @@ where
         self.state.clone()
     }
 
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
     fn prefill_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3482,22 +3303,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3530,21 +3335,7 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
+
 }
 
 impl<A, B, M> executor_sealed::Sealed<A> for MaterializedNemotronHPrediction<B, M>
@@ -3629,22 +3420,6 @@ where
         self.state.clone()
     }
 
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
     fn prefill_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3684,22 +3459,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3732,21 +3491,6 @@ where
             .map(|output| (output.logits, output.capture))
     }
 
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
 }
 
 struct V4DsparkContextOperation<'a, 'o, B, M>
