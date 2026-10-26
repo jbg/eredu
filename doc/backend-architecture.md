@@ -8506,6 +8506,12 @@ decoder layers, and PRVQ depths transfer their declared groups directly into thi
 owned catalog. Per-layer leases, scalar replicas, recurrent/cache state and codec
 convolution geometry remain component declarations. DeepSeek target/prediction
 catalogs and Muse audio units use the same constructor.
+`ComponentDefinition::project_owned_parameters` derives a physical ownership subset
+from a retained definition. Invocation/storage identities and selected primary
+owners stay exact; selection cannot introduce a primary or leave a logical use
+dangling. Encoding companions retain their declared primary owners. The existing
+exact parameter projector still requires every primary. Callers retain the complete
+definition when later selection needs resources omitted from a local view.
 `ArchitectureParameterDescription::members_by_target` borrows exact physical member
 specifications, including encoding companions, from that validated ownership.
 Moshi realtime lowering uses this view for source/execution matching without copying

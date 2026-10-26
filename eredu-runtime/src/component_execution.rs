@@ -147,6 +147,12 @@ pub struct ComponentDefinition {
     state_partition: ArchitectureStatePartitionPlan,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParameterOwnershipProjection {
+    Exact,
+    Subset,
+}
+
 impl ComponentDefinition {
     /// Validates every declared invocation and group reference without native resources.
     pub fn new(
@@ -448,22 +454,50 @@ impl ComponentDefinition {
         self: &std::sync::Arc<Self>,
         parameters: ArchitectureParameterDescription,
     ) -> Result<std::sync::Arc<Self>, ComponentDefinitionError> {
+        self.project_parameter_ownership(parameters, ParameterOwnershipProjection::Exact)
+    }
+
+    /// Selects owned physical resources from this retained canonical declaration.
+    /// Invocation/storage identities and every selected primary owner remain exact;
+    /// omitted primary resources cannot be reintroduced through the resulting subset.
+    /// Explicit logical uses must still resolve, so active aliases cannot dangle.
+    pub fn project_owned_parameters(
+        self: &std::sync::Arc<Self>,
+        parameters: ArchitectureParameterDescription,
+    ) -> Result<std::sync::Arc<Self>, ComponentDefinitionError> {
+        self.project_parameter_ownership(parameters, ParameterOwnershipProjection::Subset)
+    }
+
+    fn project_parameter_ownership(
+        self: &std::sync::Arc<Self>,
+        parameters: ArchitectureParameterDescription,
+        projection: ParameterOwnershipProjection,
+    ) -> Result<std::sync::Arc<Self>, ComponentDefinitionError> {
         if self.parameters == parameters {
             return Ok(self.clone());
         }
         let mut selected = self.as_ref().clone();
         let uses = std::mem::take(&mut selected.parameter_uses);
         selected
-            .with_parameters(parameters, uses)
+            .with_parameter_ownership(parameters, uses, projection)
             .map(std::sync::Arc::new)
     }
 
     /// Projects selected physical parameter geometry while retaining semantic identities.
     /// Families supply exact replacement uses, including changed encoding companions.
     pub fn with_parameters(
+        self,
+        parameters: ArchitectureParameterDescription,
+        uses: impl IntoIterator<Item = (String, ComponentParameterUse)>,
+    ) -> Result<Self, ComponentDefinitionError> {
+        self.with_parameter_ownership(parameters, uses, ParameterOwnershipProjection::Exact)
+    }
+
+    fn with_parameter_ownership(
         mut self,
         parameters: ArchitectureParameterDescription,
         uses: impl IntoIterator<Item = (String, ComponentParameterUse)>,
+        projection: ParameterOwnershipProjection,
     ) -> Result<Self, ComponentDefinitionError> {
         let invalid = |resource: &str| ComponentDefinitionError::Invalid {
             component: self.id.clone(),
@@ -490,7 +524,11 @@ impl ComponentDefinition {
         };
         let original = primaries(&self.parameters);
         let selected = primaries(&parameters);
-        if original != selected {
+        if (projection == ParameterOwnershipProjection::Exact && original.len() != selected.len())
+            || selected
+                .iter()
+                .any(|(target, owner)| original.get(target) != Some(owner))
+        {
             return Err(invalid("selected primary parameter ownership"));
         }
         for group in parameters.groups() {

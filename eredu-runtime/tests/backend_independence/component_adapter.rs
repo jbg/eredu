@@ -1400,9 +1400,89 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
         }
     )
     .is_err());
+    let extra = eredu_runtime::OwnedParameterGroupSpec::new(
+        eredu_runtime::ParameterGroupOwner::execution_unit(
+            declaration
+                .parameters()
+                .unit_layout()
+                .group_id(0)
+                .unwrap()
+                .clone(),
+            0,
+        ),
+        eredu_runtime::ParameterGroupSpec::new(
+            "optional-resource",
+            eredu_runtime::ParameterRole::Replicated,
+            [eredu_runtime::ParameterMemberSpec::new(
+                "optional.weight",
+                [1],
+                eredu_runtime::MemberSharding::Replicated,
+            )],
+        )
+        .unwrap(),
+    );
+    let root = std::sync::Arc::new(
+        ComponentDefinition::new(
+            declaration.id(),
+            ArchitectureParameterDescription::from_owned(
+                declaration.parameters().graph(),
+                declaration.parameters().unit_layout(),
+                declaration
+                    .parameters()
+                    .groups()
+                    .iter()
+                    .cloned()
+                    .chain([extra]),
+            )
+            .unwrap(),
+            vec![
+                declaration.unit(0, 0).unwrap().clone(),
+                declaration.unit(1, 0).unwrap().clone(),
+            ],
+            vec![
+                declaration.group_transport(0).unwrap().clone(),
+                declaration.group_transport(1).unwrap().clone(),
+            ],
+            declaration.primary_group(),
+            vec![],
+            declaration.state_layout().clone(),
+            declaration.state_partition_plan().clone(),
+        )
+        .unwrap(),
+    );
+    assert!(root
+        .project_parameters(declaration.parameters().clone())
+        .is_err());
+    let referenced = std::sync::Arc::new(
+        root.as_ref()
+            .clone()
+            .with_parameter_uses([(
+                "optional-use".into(),
+                eredu_runtime::ComponentParameterUse {
+                    invocation: declaration.parameters().unit_layout().address(0).unwrap(),
+                    target: "optional.weight".into(),
+                },
+            )])
+            .unwrap(),
+    );
+    assert!(referenced
+        .project_owned_parameters(declaration.parameters().clone())
+        .is_err());
+    let selected = root
+        .project_owned_parameters(declaration.parameters().clone())
+        .unwrap();
+    assert!(selected
+        .project_owned_parameters(root.parameters().clone())
+        .is_err());
+    let foreign = ArchitectureParameterDescription::from_owned(
+        declaration.parameters().graph(),
+        declaration.parameters().unit_layout(),
+        [refined],
+    )
+    .unwrap();
+    assert!(root.project_owned_parameters(foreign).is_err());
     let mut component =
-        ComponentAdapter::with_pinned_resources::<FakeBackend>(declaration.clone(), kernel())
-            .unwrap();
+        ComponentAdapter::with_pinned_resources::<FakeBackend>(selected, kernel()).unwrap();
     component.visit_static_parameters_mut(&mut Replace).unwrap();
     let input = FakeTensor(vec![7]);
     let mut state = StatelessComponentState::new().unwrap();
