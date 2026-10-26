@@ -1696,20 +1696,20 @@ fn weight_lowerings(
     source: &MoshiParameterContract,
     execution: &MoshiParameterContract,
 ) -> Result<Vec<RealtimeWeightLoweringRequirement>, MoshiRealtimeSelectionError> {
-    let source_members = parameter_members(source)?;
-    let execution_members = parameter_members(execution)?;
+    let source_members = source.description().members_by_target();
+    let execution_members = execution.description().members_by_target();
     execution_members
         .iter()
         .filter(|(_, member)| member.linear_companion().is_none())
         .map(|(target, target_member)| {
-            let source_member = source_members.get(target.as_str()).ok_or_else(|| {
+            let source_member = source_members.get(*target).ok_or_else(|| {
                 invalid_architecture(format!(
                     "execution parameter {target:?} has no source contract"
                 ))
             })?;
             match (
-                source.matrices().get(target.as_str()),
-                execution.matrices().get(target.as_str()),
+                source.matrices().get(*target),
+                execution.matrices().get(*target),
             ) {
                 (Some(source_matrix), Some(target_matrix)) => matrix_lowering(
                     preparation,
@@ -1740,8 +1740,8 @@ fn matrix_lowering(
     target_matrix: &super::MoshiMatrixContract,
     source_member: &eredu_runtime::ParameterMemberSpec,
     target_member: &eredu_runtime::ParameterMemberSpec,
-    source_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
-    target_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
+    source_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
+    target_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
 ) -> Result<RealtimeWeightLoweringRequirement, MoshiRealtimeSelectionError> {
     if source_matrix.logical_shape() != target_matrix.logical_shape()
         || source_member.global_shape() != source_matrix.physical_shape()
@@ -1814,8 +1814,8 @@ fn append_matrix_companion(
     primary: &str,
     source_target: Option<&str>,
     execution_target: Option<&str>,
-    source_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
-    execution_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
+    source_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
+    execution_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
     role: RealtimeWeightComponentRole,
     components: &mut Vec<RealtimeWeightComponentRequirement>,
 ) -> Result<(), MoshiRealtimeSelectionError> {
@@ -1999,29 +1999,6 @@ fn recipe_component(
         output: output.clone(),
         direct,
     })
-}
-
-fn parameter_members(
-    contract: &MoshiParameterContract,
-) -> Result<BTreeMap<String, eredu_runtime::ParameterMemberSpec>, MoshiRealtimeSelectionError> {
-    let mut members = BTreeMap::new();
-    for member in contract
-        .description()
-        .groups()
-        .iter()
-        .flat_map(|group| group.group().members())
-    {
-        if members
-            .insert(member.target().to_owned(), member.clone())
-            .is_some()
-        {
-            return Err(invalid_architecture(format!(
-                "parameter contract repeats target {:?}",
-                member.target()
-            )));
-        }
-    }
-    Ok(members)
 }
 
 fn validate_observations(

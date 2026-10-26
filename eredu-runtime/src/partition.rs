@@ -554,6 +554,19 @@ impl ArchitectureParameterDescription {
         &self.groups
     }
 
+    /// Borrows physical member specifications by their authoritative target names.
+    ///
+    /// Declaration validation guarantees unique ownership. The view includes
+    /// encoding companions and retains their exact metadata without copying it;
+    /// it grants no source, materialization or parameter-edit authority.
+    pub fn members_by_target(&self) -> BTreeMap<&str, &crate::ParameterMemberSpec> {
+        self.groups
+            .iter()
+            .flat_map(|owned| owned.group().members())
+            .map(|member| (member.target(), member))
+            .collect()
+    }
+
     /// Returns every physical target owned by groups with the supplied semantic role.
     ///
     /// Selection happens after architecture ownership has been assigned, so callers

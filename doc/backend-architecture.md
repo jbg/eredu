@@ -8506,6 +8506,11 @@ decoder layers, and PRVQ depths transfer their declared groups directly into thi
 owned catalog. Per-layer leases, scalar replicas, recurrent/cache state and codec
 convolution geometry remain component declarations. DeepSeek target/prediction
 catalogs and Muse audio units use the same constructor.
+`ArchitectureParameterDescription::members_by_target` borrows exact physical member
+specifications, including encoding companions, from that validated ownership.
+Moshi realtime lowering uses this view for source/execution matching without copying
+member metadata or repeating uniqueness validation. Recipe naming, format admission
+and lowering semantics remain family-owned; the view grants no source or edit authority.
 
 Shared decoder `StaticModuleConstruction` retains validated embedding, readout and
 full normalization specifications before allocation. Runtime
