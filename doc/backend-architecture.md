@@ -12094,8 +12094,15 @@ through the exact projector. Unit paths, state geometry, logical uses, observati
 seams and transport ownership stay retained across these selections. The root
 contains neutral metadata and shares the initial declaration; native modules and
 leases belong to the active materialization. Conditional target and transform-source
-planning derives placement from these declarations. Selected conditional construction validates ingress and
-placement, then constructs the tensor-local target and vision modules directly.
+planning derives placement from these declarations. Runtime
+`project_parameter_selection_layout` compiles their exact physical ranges into
+`LocalModelLayout`, checking canonical targets, owners, roles and independently
+declared local shapes. Fused segments preserve order and equal physical chunks
+retain their coordinate domains. Typed projection errors retain the affected target
+and their original cause through neutral error translation. Target and prediction
+use this same compiler; architecture code retains TP/EP recipes and exceptional
+head, expert and encoding geometry. Selected conditional construction validates
+ingress and placement, then constructs the tensor-local target and vision modules directly.
 The conditional target/vision definition retains global invocation paths, optional
 encoder dependencies and transport ownership through runtime parameter projection
 and local state selection. Expert localization uses the checked owned-resource

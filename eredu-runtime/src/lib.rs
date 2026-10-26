@@ -111,6 +111,8 @@ pub mod parallel;
 pub mod parameter;
 /// Physical rank-local parameter-layout lowering.
 pub mod parameter_layout;
+mod parameter_selection;
+pub use parameter_selection::{project_parameter_selection_layout, ParameterSelectionLayoutError};
 pub mod parameter_operations;
 /// Backend-neutral rank-local architecture ownership.
 pub mod partition;

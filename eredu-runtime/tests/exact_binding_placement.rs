@@ -581,16 +581,40 @@ fn exact_binding_places_each_rank_before_validating_its_local_slot() {
             BindingPlanError::ShapeMismatch { .. }
         ))
     ));
+    let catalog = |shape, role: &str| {
+        let graph = eredu_runtime::ExecutionGraph::chain(["decoder"]).unwrap();
+        let units = eredu_runtime::ExecutionUnitLayout::new(&graph, [1]).unwrap();
+        eredu_runtime::ArchitectureParameterDescription::from_owned(
+            &graph,
+            &units,
+            [eredu_runtime::OwnedParameterGroupSpec::new(
+                eredu_runtime::ParameterGroupOwner::static_role(role),
+                eredu_runtime::ParameterGroupSpec::new(
+                    "head",
+                    ParameterRole::ColumnProjection,
+                    [eredu_runtime::ParameterMemberSpec::new(
+                        "weight",
+                        shape,
+                        eredu_runtime::MemberSharding::Replicated,
+                    )],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap()
+    };
+    let global = catalog(vec![4, 2], "readout");
+    let local = catalog(vec![2, 2], "readout");
+    let selection = |ranges| std::collections::BTreeMap::from([("weight".to_owned(), ranges)]);
     for rank in 0..2 {
-        let layout = layout(
-            vec![4, 2],
-            vec![2, 2],
-            TensorPlacement::Shard {
-                axis: 0,
-                index: rank,
-                parts: 2,
-            },
-        );
+        let retained = selection(vec![TensorSelection::Range {
+            axis: 0,
+            start: rank * 2,
+            end: rank * 2 + 2,
+        }]);
+        let layout =
+            eredu_runtime::project_parameter_selection_layout(&retained, &global, Some(&local))
+                .unwrap();
         let bindings = bind(&source, &task, vec![2, 2], Some(&layout)).unwrap();
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].logical_target(), Some("weight"));
@@ -627,6 +651,74 @@ fn exact_binding_places_each_rank_before_validating_its_local_slot() {
     )
     .is_err());
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
+    // Fused physical ranges preserve their order through the actual binding plan.
+    let fused = selection(vec![
+        TensorSelection::Range {
+            axis: 0,
+            start: 2,
+            end: 3,
+        },
+        TensorSelection::Range {
+            axis: 0,
+            start: 0,
+            end: 1,
+        },
+    ]);
+    let layout =
+        eredu_runtime::project_parameter_selection_layout(&fused, &global, Some(&local))
+            .unwrap();
+    let bindings = bind(&source, &task, vec![2, 2], Some(&layout)).unwrap();
+    let selected = layout.tensor("weight").unwrap();
+    assert_eq!(
+        eredu_runtime::placement_selection(selected, selected.placement(), &[4, 2]).unwrap(),
+        TensorSelection::Indices {
+            axis: 0,
+            indices: vec![2, 0]
+        },
+    );
+    assert_eq!(
+        bindings[0]
+            .source_recipe()
+            .infer(&source as &dyn CheckpointSource)
+            .unwrap()
+            .shape(),
+        [2, 2]
+    );
+    assert_eq!(bindings[0].expected_bytes(), 16);
+    let repeated = selection(vec![
+        TensorSelection::Range {
+            axis: 0,
+            start: 0,
+            end: 2,
+        },
+        TensorSelection::Range {
+            axis: 0,
+            start: 1,
+            end: 3,
+        },
+    ]);
+    assert!(matches!(
+        eredu_runtime::project_parameter_selection_layout(&repeated, &global, None),
+        Err(eredu_runtime::ParameterSelectionLayoutError::RepeatedIndices(_))
+    ));
+    assert!(matches!(
+        eredu_runtime::project_parameter_selection_layout(
+            &fused,
+            &global,
+            Some(&catalog(vec![3, 2], "readout"))
+        ),
+        Err(eredu_runtime::ParameterSelectionLayoutError::LocalShape { .. })
+    ));
+    assert!(matches!(
+        eredu_runtime::project_parameter_selection_layout(
+            &fused,
+            &global,
+            Some(&catalog(vec![2, 2], "other"))
+        ),
+        Err(eredu_runtime::ParameterSelectionLayoutError::ChangedOwner(
+            _
+        ))
+    ));
 }
 
 #[test]

@@ -49,7 +49,8 @@ impl PredictionTensorPartition {
         global: &ArchitectureParameterDescription,
         local: &ArchitectureParameterDescription,
     ) -> Result<LocalModelLayout, Error> {
-        parallel_layout::local_layout(&self.selections, global, local)
+        eredu_runtime::project_parameter_selection_layout(&self.selections, global, Some(local))
+            .map_err(Error::from)
     }
     /// Projects physical prediction coordinates without constructing native modules.
     /// Prediction replicas outside the tensor group retain every expert.
@@ -57,7 +58,8 @@ impl PredictionTensorPartition {
         &self,
         global: &ArchitectureParameterDescription,
     ) -> Result<LocalModelLayout, Error> {
-        parallel_layout::project_local_layout(&self.selections, global, None)
+        eredu_runtime::project_parameter_selection_layout(&self.selections, global, None)
+            .map_err(Error::from)
     }
     /// Composes tensor ranges with exact balanced packed-expert ownership.
     pub fn local_expert_layout(
