@@ -8533,6 +8533,12 @@ specifications before physical-format expansion. Complete and tensor-local
 materialization use the same constructor. Local table ranges resolve directly by
 the declared parameter identity; all vocabulary ranges are validated before any
 table is allocated. Input padding rows and the unpadded readout remain distinct.
+Moshi local geometry consumes the retained parameter contract. Vocabulary groups
+and their canonical matrix identities project ranges through runtime whole-group
+balanced-axis validation, including companions, complete local/replicated storage
+and replication fallback. Expected vocabulary cardinalities derive from the same
+static and depth construction specifications. Block alignment and cache geometry
+remain family-owned; this projection does not add a complete execution mode.
 Shared multi-table construction validates the complete ordered set of names,
 lookup policies and positive, equal widths before invoking any backend factory.
 Ordinary and vocabulary-parallel construction use that same pass and allocation

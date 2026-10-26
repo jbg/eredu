@@ -15,7 +15,7 @@ use eredu_runtime::{
     OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
     ParameterMemberSpec, ParameterRole, PartitionOwnership, PartitionedExecutionPlan,
     PipelineActivationDtype, PipelineWireContract, StateLayout, StateSegmentLifetime,
-    StateSegmentSpec, TensorPlacement, TopologyCommunicationPlan,
+    StateSegmentSpec, TopologyCommunicationPlan,
 };
 
 use super::{
@@ -256,7 +256,7 @@ pub fn select_parallel_execution<'a>(
             "Moshi declared no tensor-parallel parameters".into(),
         ));
     }
-    let geometry = local_geometry(config, &layout, aliases)?;
+    let geometry = local_geometry(config, contract, &layout, aliases)?;
 
     let tokens = batch.checked_mul(sequence).ok_or_else(|| {
         ParallelPlanError::InvalidGroup("Moshi invocation element bound overflowed".into())
@@ -1162,10 +1162,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MoshiKernel<B> {
 
 /// Derives and validates all rank-local Moshi widths from a resolved placement.
 ///
+/// `contract` supplies canonical vocabulary groups and exact physical companions.
 /// `aliases` maps logical aliases to canonical owners. Every alias present in
 /// the model layout must have the same local shape and placement as its owner.
 pub fn local_geometry<'a>(
     config: &MoshiConfig,
+    contract: &MoshiParameterContract,
     layout: &eredu_runtime::LocalModelLayout,
     aliases: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<LocalGeometry, ParallelPlanError> {
@@ -1190,10 +1192,26 @@ pub fn local_geometry<'a>(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut vocabulary_ranges = BTreeMap::new();
-    for target in vocabulary_targets(config) {
-        let tensor = required_tensor(layout, &target)?;
-        let range = vocabulary_range(tensor, &target)?;
-        vocabulary_ranges.insert(target, range);
+    for owned in contract
+        .description()
+        .groups()
+        .iter()
+        .filter(|owned| owned.group().role() == ParameterRole::Vocabulary)
+    {
+        let group = owned.group();
+        let matrix = group
+            .members()
+            .iter()
+            .find_map(|member| contract.matrices().get(member.target()))
+            .ok_or_else(|| {
+                ParallelPlanError::InvalidGroup(format!(
+                    "Moshi vocabulary group {:?} has no declared matrix",
+                    group.logical_name()
+                ))
+            })?;
+        let rows = matrix.logical_shape()[0];
+        let range = eredu_runtime::balanced_parameter_group_range(group, layout, 0, rows)?;
+        vocabulary_ranges.insert(matrix.target().to_owned(), range);
     }
 
     let temporal_heads = temporal
@@ -1237,75 +1255,34 @@ pub fn local_geometry<'a>(
 fn vocabulary_global_rows(
     config: &MoshiConfig,
 ) -> Result<BTreeMap<String, usize>, ParallelPlanError> {
-    let text = usize::try_from(config.text_vocabulary_size()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("Moshi text vocabulary exceeds usize".into())
-    })?;
-    let audio = usize::try_from(config.audio_vocabulary_size()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("Moshi audio vocabulary exceeds usize".into())
-    })?;
-    let text_embedding = text.checked_add(1).ok_or_else(|| {
-        ParallelPlanError::InvalidGroup("Moshi text embedding vocabulary overflowed".into())
-    })?;
-    let audio_embedding = audio.checked_add(1).ok_or_else(|| {
-        ParallelPlanError::InvalidGroup("Moshi audio embedding vocabulary overflowed".into())
-    })?;
-    let mut rows = BTreeMap::from([
-        ("text_emb.weight".into(), text_embedding),
-        ("text_linear.weight".into(), text),
-    ]);
-    rows.extend(
-        (0..config.frame_schedule().total_audio_codebooks())
-            .map(|codebook| (format!("audio_embs.{codebook}.weight"), audio_embedding)),
-    );
+    let construction = super::model::StaticConstruction::new(config)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let mut rows = BTreeMap::new();
+    let mut add =
+        |weight: &eredu_nn::ParameterSpec, vocabulary| -> Result<(), ParallelPlanError> {
+            let vocabulary = usize::try_from(vocabulary).map_err(|_| {
+                ParallelPlanError::InvalidGroup("Moshi vocabulary exceeds usize".into())
+            })?;
+            rows.insert(weight.id.as_str().to_owned(), vocabulary);
+            Ok(())
+        };
+    for spec in &construction.embeddings {
+        add(&spec.embedding.weight, spec.embedding.vocabulary)?;
+    }
+    add(
+        &construction.text_output.weight,
+        construction.text_output.output,
+    )?;
     for slice in 0..config.frame_schedule().depth_audio_codebooks() {
-        rows.insert(
-            format!("depformer.slices.{slice}.emb.weight"),
-            if slice == 0 {
-                text_embedding
-            } else {
-                audio_embedding
-            },
-        );
-        rows.insert(format!("depformer.slices.{slice}.linear_out.weight"), audio);
+        let construction = super::depth::DepthConstruction::new(config, slice)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        add(
+            &construction.embedding.weight,
+            construction.embedding.vocabulary,
+        )?;
+        add(&construction.output.weight, construction.output.output)?;
     }
     Ok(rows)
-}
-
-fn vocabulary_targets(config: &MoshiConfig) -> Vec<String> {
-    let mut targets = vec!["text_emb.weight".into(), "text_linear.weight".into()];
-    targets.extend(
-        (0..config.frame_schedule().total_audio_codebooks())
-            .map(|codebook| format!("audio_embs.{codebook}.weight")),
-    );
-    for slice in 0..config.frame_schedule().depth_audio_codebooks() {
-        targets.push(format!("depformer.slices.{slice}.emb.weight"));
-        targets.push(format!("depformer.slices.{slice}.linear_out.weight"));
-    }
-    targets
-}
-
-fn vocabulary_range(
-    tensor: &eredu_runtime::LocalTensorLayout,
-    target: &str,
-) -> Result<Range<usize>, ParallelPlanError> {
-    match tensor.placement() {
-        TensorPlacement::Range {
-            axis: 0,
-            start,
-            end,
-        } if start < end => Ok(*start..*end),
-        TensorPlacement::Replicated => {
-            let vocabulary = tensor.global_shape().first().copied().ok_or_else(|| {
-                ParallelPlanError::InvalidTensor(format!(
-                    "Moshi vocabulary tensor {target} is scalar"
-                ))
-            })?;
-            Ok(0..vocabulary)
-        }
-        placement => Err(ParallelPlanError::InvalidTensor(format!(
-            "Moshi vocabulary tensor {target} has invalid placement {placement:?}"
-        ))),
-    }
 }
 
 fn local_block_geometry(
