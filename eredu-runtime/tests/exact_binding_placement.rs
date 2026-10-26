@@ -1005,10 +1005,10 @@ fn exact_binding_does_not_reshard_selected_local_transform_output() {
     let source = source(vec![2, 4], true);
     let task = task(&[4, 32], WeightLoweringKind::Transform, LinearFormat::MxFp4);
     use eredu_runtime::{
-        derive_partitioned_transform_source_layout, ArchitectureParameterDescription,
-        ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout, MemberSharding,
-        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-        TransformSourceLayoutError,
+        derive_partitioned_transform_source_layout, prepare_transform_source_layout,
+        ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
+        MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec,
+        ParameterMemberSpec, TransformSourceLayoutError,
     };
     let description = |units, width| {
         let graph =
@@ -1040,9 +1040,17 @@ fn exact_binding_does_not_reshard_selected_local_transform_output() {
     .unwrap();
     let source_parameters = description(1, 32);
     let target_parameters = description(1, 4);
-    let layout =
+    let unused = prepare_transform_source_layout(
+        [WeightLoweringKind::Direct, WeightLoweringKind::Derived],
+        || derive_partitioned_transform_source_layout(&source_parameters, &description(2, 4), rank),
+    )
+    .unwrap();
+    assert!(unused.is_none());
+    let layout = prepare_transform_source_layout([task.lowering()], || {
         derive_partitioned_transform_source_layout(&source_parameters, &target_parameters, rank)
-            .unwrap();
+    })
+    .unwrap()
+    .unwrap();
     assert!(matches!(
         derive_partitioned_transform_source_layout(&source_parameters, &description(2, 4), rank,),
         Err(TransformSourceLayoutError::ParameterSpaceMismatch)

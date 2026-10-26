@@ -10583,6 +10583,11 @@ direct loading and recipe-only derivation. Retained text selections expose this
 decision over their ordinary parameters; auxiliary prediction preparation inspects
 its own task set. Families and native materializers consume the same distinction
 for source-module construction, conversion grouping and residency accounting.
+`prepare_transform_source_layout` consumes that decision over the caller's admitted
+lowerings and invokes its typed geometry builder only when payload conversion is
+selected. The resulting layout has one retained shared owner. Ordinary rank-local
+projection and family-specific prediction geometry use this same preparation
+mechanism; no checkpoint authority or native materialization is selected here.
 `derive_partitioned_transform_source_layout` validates the source and target
 invocation graphs and unit addresses, lowers both retained declarations for the
 selected rank, and projects source coordinates. Its typed error distinguishes

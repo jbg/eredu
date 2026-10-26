@@ -4097,19 +4097,18 @@ where
                 .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v3_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
-                let source_parameters = extension.definition().parameters();
-                Some(std::sync::Arc::new(
+            let source_layout = eredu_runtime::prepare_transform_source_layout(
+                tasks.iter().map(|task| task.lowering()),
+                || {
+                    let source_parameters = extension.definition().parameters();
                     eredu_runtime::derive_partitioned_transform_source_layout(
                         source_parameters,
                         &parameters,
                         tensor_rank,
                     )
-                    .map_err(|error| invalid(error.to_string()))?,
-                ))
-            } else {
-                None
-            };
+                    .map_err(|error| invalid(error.to_string()))
+                },
+            )?;
             let source_geometry = source_layout
                 .as_ref()
                 .map(|layout| {
@@ -4210,19 +4209,18 @@ where
                 .map_err(|error| invalid(error.to_string()))?;
             let state_layout = crate::deepseek::v4::state_layout(geometry.args())
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
-                let source_parameters = extension.definition().parameters();
-                Some(std::sync::Arc::new(
+            let source_layout = eredu_runtime::prepare_transform_source_layout(
+                tasks.iter().map(|task| task.lowering()),
+                || {
+                    let source_parameters = extension.definition().parameters();
                     eredu_runtime::derive_partitioned_transform_source_layout(
                         source_parameters,
                         &parameters,
                         tensor_rank,
                     )
-                    .map_err(|error| invalid(error.to_string()))?,
-                ))
-            } else {
-                None
-            };
+                    .map_err(|error| invalid(error.to_string()))
+                },
+            )?;
             let source_geometry = source_layout
                 .as_ref()
                 .map(|layout| {
@@ -4521,18 +4519,17 @@ where
                 .map_err(invalid)?;
             let geometry = crate::nemotron_h::local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
-                Some(std::sync::Arc::new(
+            let source_layout = eredu_runtime::prepare_transform_source_layout(
+                tasks.iter().map(|task| task.lowering()),
+                || {
                     eredu_runtime::derive_partitioned_transform_source_layout(
                         &source_description,
                         &description,
                         tensor_rank,
                     )
-                    .map_err(|error| invalid(error.to_string()))?,
-                ))
-            } else {
-                None
-            };
+                    .map_err(|error| invalid(error.to_string()))
+                },
+            )?;
             let source_geometry = source_layout
                 .as_ref()
                 .map(|layout| crate::nemotron_h::local_geometry(args, layout))

@@ -386,7 +386,8 @@ pub use parameter_layout::{
     balanced_parameter_group_range, balanced_parameter_group_range_if_present,
     derive_partitioned_group_layout, derive_partitioned_local_layout,
     derive_partitioned_transform_source_layout, logical_parameter_group_range,
-    retained_partition_layout, validate_parameter_layout, validate_tensor_parallel_layout,
+    prepare_transform_source_layout, retained_partition_layout, validate_parameter_layout,
+    validate_tensor_parallel_layout,
     validate_transform_parameter_space, ParameterGroupSelection, TensorParallelLayoutError,
     TransformSourceLayoutError,
 };

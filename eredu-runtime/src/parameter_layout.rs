@@ -69,6 +69,20 @@ pub fn derive_partitioned_transform_source_layout(
     Ok(crate::derive_transform_source_layout(&source, &target)?)
 }
 
+/// Prepares one retained source layout only when admitted lowerings convert payloads.
+/// The caller supplies ordinary or exceptional geometry through the same typed
+/// builder. Direct loading and recipe-only derivation never invoke it.
+pub fn prepare_transform_source_layout<E>(
+    lowerings: impl IntoIterator<Item = crate::WeightLoweringKind>,
+    build: impl FnOnce() -> Result<crate::LocalModelLayout, E>,
+) -> Result<Option<std::sync::Arc<crate::LocalModelLayout>>, E> {
+    lowerings
+        .into_iter()
+        .any(crate::WeightLoweringKind::transforms_payload)
+        .then(|| build().map(std::sync::Arc::new))
+        .transpose()
+}
+
 /// Exact selected parameter placement does not match a tensor communicator.
 #[derive(Debug, thiserror::Error)]
 pub enum TensorParallelLayoutError {

@@ -535,21 +535,17 @@ where
                 let layout = partition
                     .local_layout(&parameters, &local)
                     .map_err(|error| invalid(error.to_string()))?;
-                let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
-                    Some(std::sync::Arc::new(
+                let source_layout = eredu_runtime::prepare_transform_source_layout(
+                    tasks.iter().map(|task| task.lowering()),
+                    || {
                         source_partition
                             .local_layout(
                                 &prediction_parameters::<B>(source_spec, context)?,
-                                &prediction_parameters::<B>(
-                                    source_partition.local_spec(),
-                                    context,
-                                )?,
+                                &prediction_parameters::<B>(source_partition.local_spec(), context)?,
                             )
-                            .map_err(|error| invalid(error.to_string()))?,
-                    ))
-                } else {
-                    None
-                };
+                            .map_err(|error| invalid(error.to_string()))
+                    },
+                )?;
                 (Some(std::sync::Arc::new(layout)), source_layout)
             }
             None => (None, None),
