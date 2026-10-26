@@ -848,7 +848,6 @@ where
         |_, _| Ok(MemberSharding::Replicated),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let mut expected = vec![shared.clone()];
     let mut owned = vec![OwnedParameterGroupSpec::new(
         ParameterGroupOwner::static_role("prediction_shared"),
         shared,
@@ -863,13 +862,12 @@ where
             |_, _| Ok(MemberSharding::Replicated),
         )
         .map_err(|error| invalid(error.to_string()))?;
-        expected.push(group.clone());
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), depth),
             group,
         ));
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| invalid(error.to_string()))
 }
 

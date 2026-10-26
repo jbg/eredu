@@ -101,18 +101,16 @@ pub fn parameter_description(
     let kinds = config.execution_units()?;
     let layout = ExecutionUnitLayout::new(&graph, [kinds.len()]).map_err(Error::backend)?;
     let owner = layout.group_id(0).expect("one audio group").clone();
-    let mut expected = Vec::new();
     let mut owned = Vec::new();
     for (index, kind) in kinds.into_iter().enumerate() {
         for group in unit_parameter_groups(config, kind)? {
-            expected.push(group.clone());
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(owner.clone(), index),
                 group,
             ));
         }
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned).map_err(Error::backend)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned).map_err(Error::backend)
 }
 
 /// Validated waveform units, independently leased parameters, and convolution histories.

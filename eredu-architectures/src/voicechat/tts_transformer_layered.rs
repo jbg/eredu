@@ -693,7 +693,6 @@ pub fn tts_transformer_parameter_description(
     let description = decoder::embedded_parameter_description(config)?;
     let graph = transformer_graph(config)?;
     let layout = ExecutionUnitLayout::new(&graph, [config.geometry().num_hidden_layers, 1])?;
-    let mut expected = Vec::new();
     let mut owned = Vec::new();
     for old in description.groups() {
         let (group, index) = match old.owner() {
@@ -706,7 +705,6 @@ pub fn tts_transformer_parameter_description(
             }
         };
         let spec = old.group().clone();
-        expected.push(spec.clone());
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(
                 layout.group_id(group).expect("declared group").clone(),
@@ -715,9 +713,7 @@ pub fn tts_transformer_parameter_description(
             spec,
         ));
     }
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 impl<B: NeuralBackend> ComponentKernel<B> for TransformerKernel<B> {
     type Input<'a> = TransformerInput<'a, B::Tensor>;

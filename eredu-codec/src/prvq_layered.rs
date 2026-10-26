@@ -436,7 +436,6 @@ pub fn quantizer_parameter_description(
     }
     let graph = quantizer_graph(geometry)?;
     let layout = ExecutionUnitLayout::new(&graph, vec![1; geometry.depth])?;
-    let mut expected = Vec::with_capacity(geometry.depth);
     let mut owned = Vec::with_capacity(geometry.depth);
     for depth in 0..geometry.depth {
         let spec = ParameterGroupSpec::partitioned(
@@ -461,13 +460,10 @@ pub fn quantizer_parameter_description(
                 layout.group_id(depth).expect("declared depth").clone(),
                 0,
             ),
-            spec.clone(),
+            spec,
         ));
-        expected.push(spec);
     }
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {

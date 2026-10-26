@@ -496,7 +496,6 @@ pub fn conditioning_parameter_description(
     let member = |name: &str, shape: Vec<usize>, sharding| {
         ParameterMemberSpec::new(format!("tts_model.tts_model.{name}"), shape, sharding)
     };
-    let mut expected = Vec::new();
     let mut owned = Vec::new();
     let mut push = |unit: usize, spec: ParameterGroupSpec| {
         owned.push(OwnedParameterGroupSpec::new(
@@ -504,9 +503,8 @@ pub fn conditioning_parameter_description(
                 layout.group_id(unit).expect("declared group").clone(),
                 0,
             ),
-            spec.clone(),
+            spec,
         ));
-        expected.push(spec);
     };
     push(
         0,
@@ -634,9 +632,7 @@ pub fn conditioning_parameter_description(
             ],
         )?,
     );
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {

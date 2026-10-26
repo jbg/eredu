@@ -367,11 +367,9 @@ pub fn perception_parameter_description(
     dimensions.subsampling.validate()?;
     let graph = perception_graph()?;
     let layout = ExecutionUnitLayout::new(&graph, [1, dimensions.layers, 1])?;
-    let mut expected = Vec::new();
     let mut owned = Vec::new();
     let mut add =
         |group: usize, index: usize, spec: ParameterGroupSpec| -> Result<(), PerceptionError> {
-            expected.push(spec.clone());
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(
                     layout.group_id(group).expect("declared group").clone(),
@@ -529,9 +527,7 @@ pub fn perception_parameter_description(
             ],
         )?,
     )?;
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 
 /// Resolves physical geometry using the shared symbolic placement compiler.

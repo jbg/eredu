@@ -335,13 +335,11 @@ pub fn mog_parameter_description(
     d.validate()?;
     let graph = mog_graph()?;
     let layout = ExecutionUnitLayout::new(&graph, [d.layers, 1, 1])?;
-    let mut expected = Vec::new();
     let mut owned = Vec::new();
     let member = |name: String, shape: Vec<usize>| {
         ParameterMemberSpec::new(name, shape, MemberSharding::Replicated)
     };
     let mut add = |group: usize, index: usize, spec: ParameterGroupSpec| -> Result<(), TtsError> {
-        expected.push(spec.clone());
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(
                 layout.group_id(group).expect("declared group").clone(),
@@ -448,9 +446,7 @@ pub fn mog_parameter_description(
             ],
         )?,
     )?;
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {

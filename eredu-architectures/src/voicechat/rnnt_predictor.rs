@@ -41,7 +41,6 @@ pub fn rnnt_predictor_parameter_description(
     let graph = graph()?;
     let layout = ExecutionUnitLayout::new(&graph, vec![dimensions.predictor_layers])?;
     let full = rnnt_parameter_description(dimensions)?;
-    let mut specs = Vec::new();
     let mut owned = Vec::new();
     for item in full.groups() {
         let ParameterGroupOwner::ExecutionUnit {
@@ -54,15 +53,12 @@ pub fn rnnt_predictor_parameter_description(
             continue;
         }
         let spec = item.group().clone();
-        specs.push(spec.clone());
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), *global_unit),
             spec,
         ));
     }
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, specs, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 /// Global recurrent operations, independently leased layers and carry identities.
 pub fn rnnt_predictor_component_definition(

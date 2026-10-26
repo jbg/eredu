@@ -8501,7 +8501,11 @@ second catalog for comparison. Runtime validates canonical layout, unique physic
 ownership and consistent logical consumers, then derives invocation-to-storage
 addressing. `ArchitectureParameterDescription::new` additionally compares ownership
 against an independently supplied parameter declaration; both use the same ownership
-validation and addressing implementation.
+validation and addressing implementation. VoiceChat components, EAR encoder and
+decoder layers, and PRVQ depths transfer their declared groups directly into this
+owned catalog. Per-layer leases, scalar replicas, recurrent/cache state and codec
+convolution geometry remain component declarations. DeepSeek target/prediction
+catalogs and Muse audio units use the same constructor.
 
 Runtime `expand_linear_format_parameter_group` expands one atomic logical group
 and preserves its partition constraints and declared companions. Catalog expansion
@@ -8510,9 +8514,10 @@ around that projection; Muse carries its role tags through format expansion, and
 LFM2 keeps its canonical static owners attached throughout. DeepSeek pinned
 format expansion likewise retains each resource role directly. Moshi matrix contracts,
 Qwen4 target catalogs and segmented geometry, Muse DSpark resources and Diffusion
-Gemma vision projection use the single-group projection directly. Their families
-retain matrix metadata, canonical owners and format admission; physical companion
-expansion preserves each atomic resource boundary.
+Gemma vision projection and the VoiceChat function head use the single-group
+projection directly. Their families retain matrix metadata, canonical owners and
+format admission; physical companion expansion preserves each atomic resource
+boundary.
 
 `expand_tagged_linear_format_parameter_groups` moves architecture-owned resource
 tags alongside atomic groups through physical expansion. Tags need no cloning or

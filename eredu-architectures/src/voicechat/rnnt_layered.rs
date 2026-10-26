@@ -605,7 +605,6 @@ fn rnnt_parameter_description_for_phases(
     d.validate()?;
     let graph = graph(phases)?;
     let layout = ExecutionUnitLayout::new(&graph, phases.iter().map(|phase| phase.units(d)))?;
-    let mut specs = Vec::new();
     let mut owned = Vec::new();
     let member = |name: String, shape: Vec<usize>| {
         let vocabulary = name == EMBEDDING || name.starts_with("stt_model.rnnt_joint.joint_net.2.");
@@ -675,7 +674,6 @@ fn rnnt_parameter_description_for_phases(
                 ParameterRole::Replicated
             };
             let spec = ParameterGroupSpec::new(name, role, members)?;
-            specs.push(spec.clone());
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(
                     layout
@@ -688,9 +686,7 @@ fn rnnt_parameter_description_for_phases(
             ));
         }
     }
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, specs, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {

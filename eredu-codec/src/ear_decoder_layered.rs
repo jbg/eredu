@@ -362,7 +362,6 @@ pub fn decoder_parameter_description(
     }
     let graph = decoder_graph()?;
     let layout = ExecutionUnitLayout::new(&graph, [specs.len()])?;
-    let mut expected = Vec::with_capacity(specs.len());
     let mut owned = Vec::with_capacity(specs.len());
     for spec in specs {
         let index = spec.layer();
@@ -430,13 +429,10 @@ pub fn decoder_parameter_description(
                 layout.group_id(0).expect("decoder group").clone(),
                 index,
             ),
-            group.clone(),
+            group,
         ));
-        expected.push(group);
     }
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 impl<B: NeuralBackend> ComponentKernel<B> for DecoderKernel<B> {
     type Input<'a> = &'a B::Tensor;

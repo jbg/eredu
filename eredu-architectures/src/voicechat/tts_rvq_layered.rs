@@ -655,7 +655,6 @@ pub fn rvq_parameter_description(
             MemberSharding::Partitioned { axis: 1 },
         )],
     )?;
-    let expected = vec![bank.clone(), projection.clone()];
     let owned = vec![
         OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(layout.group_id(0).expect("bank group").clone(), 0),
@@ -669,9 +668,7 @@ pub fn rvq_parameter_description(
             projection,
         ),
     ];
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
-    )?)
+    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {

@@ -1402,10 +1402,6 @@ fn deepseek_parameter_description(
         std::iter::once(targets).chain(std::iter::repeat_n(1, predictions)),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let mut expected = static_groups
-        .iter()
-        .map(|(_, group)| group.clone())
-        .collect::<Vec<_>>();
     let mut owned = static_groups
         .into_iter()
         .map(|(role, group)| {
@@ -1424,7 +1420,6 @@ fn deepseek_parameter_description(
             (flat - targets + 1, 0)
         };
         let groups = unit_groups(flat)?;
-        expected.extend(groups.iter().cloned());
         let owner = ParameterGroupOwner::execution_unit(
             layout
                 .group_id(group_index)
@@ -1438,7 +1433,7 @@ fn deepseek_parameter_description(
                 .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
         );
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| invalid(error.to_string()))
 }
 
