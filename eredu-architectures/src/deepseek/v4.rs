@@ -3400,16 +3400,9 @@ fn select_definition(
             }
         },
     )?;
-    if definition.state_layout() == &state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state)
-            .map(Arc::new)
-            .map_err(Error::from)
-    }
+    definition
+        .select_state_layout(&state)
+        .map_err(Error::from)
 }
 
 impl<B> ComponentKernel<B> for V4Kernel<B>

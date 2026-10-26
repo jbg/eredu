@@ -327,16 +327,9 @@ fn select_definition(
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
     let state = component_state(config, geometry)?;
-    if definition.state_layout() == &state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state)
-            .map(std::sync::Arc::new)
-            .map_err(Error::from)
-    }
+    definition
+        .select_state_layout(&state)
+        .map_err(Error::from)
 }
 
 /// Image parameters are replicated within a tensor group and cut per layer by PP.

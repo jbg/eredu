@@ -255,6 +255,21 @@ impl ComponentDefinition {
     pub fn state_layout(&self) -> &StateLayout {
         &self.state
     }
+    /// Selects architecture-authored local state geometry on a retained definition.
+    /// Identical geometry reuses the declaration; changed geometry consumes a unique
+    /// declaration or copies a shared one before validating slot identities and lifetimes.
+    pub fn select_state_layout(
+        self: std::sync::Arc<Self>,
+        state: &StateLayout,
+    ) -> Result<std::sync::Arc<Self>, ComponentDefinitionError> {
+        if self.state_layout() == state {
+            return Ok(self);
+        }
+        std::sync::Arc::unwrap_or_clone(self)
+            .with_state_layout(state.clone())
+            .map(std::sync::Arc::new)
+    }
+
     /// Retains invocation and state-slot identities with architecture-selected local geometry.
     /// Segment lifetimes, component roles, dtypes and residency stay unchanged.
     pub fn with_state_layout(self, state: StateLayout) -> Result<Self, ComponentDefinitionError> {

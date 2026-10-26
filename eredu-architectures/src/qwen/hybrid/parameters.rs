@@ -554,16 +554,9 @@ pub(crate) fn select_definition(
         &component_state_partition(parameters, definition.state_layout()),
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
-    if definition.state_layout() == &state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state)
-            .map(std::sync::Arc::new)
-            .map_err(eredu_nn::Error::from)
-    }
+    definition
+        .select_state_layout(&state)
+        .map_err(eredu_nn::Error::from)
 }
 
 pub(crate) fn conditional_execution_graph(
@@ -885,14 +878,7 @@ pub(crate) fn select_conditional_definition(
         &conditional_state_partition(parameters, definition.state_layout()),
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
-    if definition.state_layout() == &state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state)
-            .map(std::sync::Arc::new)
-            .map_err(eredu_nn::Error::from)
-    }
+    definition
+        .select_state_layout(&state)
+        .map_err(eredu_nn::Error::from)
 }

@@ -1953,19 +1953,11 @@ where
             } else {
                 None
             };
-            let definition = if definition.state_layout() == &geometry.complete_state {
-                definition
-            } else {
-                std::sync::Arc::new(
-                    definition
-                        .as_ref()
-                        .clone()
-                        .with_state_layout(geometry.complete_state.clone())
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?,
-                )
-            };
+            let definition = definition
+                .select_state_layout(&geometry.complete_state)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let partition = ArchitecturePartition::from_description(
                 &parameters,
                 groups
@@ -2085,22 +2077,12 @@ where
                     } else {
                         None
                     };
-                    let source_definition =
-                        if retained.state_layout() == &source_geometry.complete_state {
-                            retained.clone()
-                        } else {
-                            std::sync::Arc::new(
-                                retained
-                                    .as_ref()
-                                    .clone()
-                                    .with_state_layout(source_geometry.complete_state.clone())
-                                    .map_err(|error| {
-                                        CompositePartitionPreparationError::Architecture(
-                                            error.to_string(),
-                                        )
-                                    })?,
-                            )
-                        };
+                    let source_definition = retained
+                        .clone()
+                        .select_state_layout(&source_geometry.complete_state)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?;
                     let source_partition = ArchitecturePartition::from_description(
                         source_parameters,
                         groups

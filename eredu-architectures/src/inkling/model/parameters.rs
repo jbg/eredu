@@ -284,14 +284,7 @@ pub(crate) fn select_definition(
         &state_partition_plan(&state),
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
-    if definition.state_layout() == &state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state)
-            .map(std::sync::Arc::new)
-            .map_err(Error::from)
-    }
+    definition
+        .select_state_layout(&state)
+        .map_err(Error::from)
 }

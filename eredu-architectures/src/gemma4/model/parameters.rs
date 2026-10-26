@@ -362,16 +362,9 @@ fn project_state(
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     state: eredu_runtime::StateLayout,
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
-    if definition.state_layout() == &state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state)
-            .map(std::sync::Arc::new)
-            .map_err(Error::from)
-    }
+    definition
+        .select_state_layout(&state)
+        .map_err(Error::from)
 }
 
 pub(super) fn select_definition(

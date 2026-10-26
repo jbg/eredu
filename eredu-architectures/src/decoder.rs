@@ -5747,16 +5747,7 @@ where
             }
         }
         let geometry = partition.local_geometry().clone();
-        let definition = if definition.state_layout() == geometry.complete_state_layout() {
-            definition
-        } else {
-            std::sync::Arc::new(
-                definition
-                    .as_ref()
-                    .clone()
-                    .with_state_layout(geometry.complete_state_layout().clone())?,
-            )
-        };
+        let definition = definition.select_state_layout(geometry.complete_state_layout())?;
         validate_complete_definition(&args, &definition, geometry.complete_state_layout())?;
         let selection = definition.select_partition(partition)?;
         let static_modules = PartitionStaticModules::from_selected_spec(
@@ -6995,16 +6986,7 @@ where
             operator_requirements(&args),
         )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
-        let definition = if definition.state_layout() == geometry.state_layout() {
-            definition
-        } else {
-            std::sync::Arc::new(
-                definition
-                    .as_ref()
-                    .clone()
-                    .with_state_layout(geometry.state_layout().clone())?,
-            )
-        };
+        let definition = definition.select_state_layout(geometry.state_layout())?;
         validate_complete_definition(&args, &definition, geometry.state_layout())?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         let geometry = CompleteDecoderGeometry {

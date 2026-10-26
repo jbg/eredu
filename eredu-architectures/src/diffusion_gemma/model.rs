@@ -129,16 +129,9 @@ pub(super) fn select_definition(
             .map_err(Error::backend_source)?,
         None => super::state_layout(config).map_err(Error::backend_source)?,
     };
-    if definition.state_layout() == &state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state)
-            .map(std::sync::Arc::new)
-            .map_err(Error::from)
-    }
+    definition
+        .select_state_layout(&state)
+        .map_err(Error::from)
 }
 
 fn text_state_partition_plan(layers: usize) -> eredu_runtime::ArchitectureStatePartitionPlan {

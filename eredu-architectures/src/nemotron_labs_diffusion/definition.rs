@@ -332,14 +332,7 @@ pub(crate) fn select_composite(
     )?;
     validate_state(config, definition.state_layout(), definition.id())?;
     validate_state(config, state, definition.id())?;
-    if definition.state_layout() == state {
-        Ok(definition)
-    } else {
-        definition
-            .as_ref()
-            .clone()
-            .with_state_layout(state.clone())
-            .map(std::sync::Arc::new)
-            .map_err(Error::from)
-    }
+    definition
+        .select_state_layout(state)
+        .map_err(Error::from)
 }

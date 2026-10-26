@@ -1760,7 +1760,22 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
     let mut resident = ResidentRuntime::new(full, &()).unwrap();
     let mut fullstate = carry_state(carry_definition(&[0, 1, 2]).state_layout().clone());
     let mut stages = [0..1, 1..3].map(|range| {
-        let declaration = carry_definition(&[0, 1, 2]);
+        let original = std::sync::Arc::new(carry_definition(&[0, 1, 2]));
+        let selected_state = StateLayout::new(
+            LayerSchedule::new(
+                3,
+                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 2, 8).unwrap(); 3],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let declaration = if range.start == 0 {
+            original.clone().select_state_layout(&selected_state)
+        } else {
+            original.select_state_layout(&selected_state)
+        }
+        .unwrap();
+        let declaration = std::sync::Arc::unwrap_or_clone(declaration);
         let full = ComponentAdapter::new(
             declaration.clone(),
             CarryKernel::new(range.start, false),
@@ -1824,9 +1839,8 @@ fn component_partitions_preserve_repeated_advancement_and_local_carry_retention(
     )
     .unwrap();
     let selected = expected.state_layout().clone();
-    assert!(declaration
-        .clone()
-        .with_state_layout(selected.clone())
+    assert!(std::sync::Arc::new(declaration.clone())
+        .select_state_layout(&selected)
         .is_err());
     for invalid in [
         vec![eredu_runtime::StateSlotId(1), eredu_runtime::StateSlotId(1)],

@@ -8516,6 +8516,14 @@ alias reconstruction; shared decoder projections supply their changed aliases to
 `with_parameters` directly. Replicated selection uses the same retained projection
 after validating complete local geometry.
 
+`ComponentDefinition::select_state_layout` consumes retained state-geometry
+selection. Identical geometry retains the declaration; changed geometry moves a
+uniquely owned definition or copies a shared one before validating slot identities,
+lifetimes and component policies. Families validate allowable local dimensions,
+parameter placement and execution contracts before this shared projection. Decoder
+and composite partition construction use the same selection without reconstructing
+state or observation ownership.
+
 Runtime `expand_linear_format_parameter_group` expands one atomic logical group
 and preserves its partition constraints and declared companions. Catalog expansion
 uses the same primitive. Families retain resource and canonical owner identities
