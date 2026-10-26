@@ -3,15 +3,16 @@
 use eredu_architectures::voicechat::{
     perception::{PerceptionDimensions, PerceptionError, PerceptionOutput, PerceptionState},
     perception_layered::{
-        LayerwisePerception, PerceptionExecution, PerceptionKernel, PerceptionRuntimeState,
+        ParallelPerceptionExecution, PerceptionExecution, PerceptionKernel, PerceptionRuntimeState,
         PerceptionUnit,
     },
     perception_preparation::PreparedPerceptionBindings,
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    ArchitectureParameters, DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata,
-    LocalModelLayout, ResidencyReport, StateLayout,
+    ArchitectureParameters, ComponentAdapter, ComponentDefinition, DenseDiskStreamReport,
+    LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout,
+    ResidencyReport, StateLayout,
 };
 use safemlx::{Array, Stream};
 
@@ -28,9 +29,15 @@ use crate::{
 };
 
 type Unit = PerceptionUnit<MlxNeuralBackend>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, PerceptionKernel<MlxNeuralBackend>>,
+    MlxNeuralBackend,
+    PerceptionRuntimeState<MlxTensor>,
+    P,
+>;
 enum Execution {
-    Resident(LayerwisePerception<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwisePerception<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native perception over the selected shared resident or bounded parameter policy.
@@ -50,8 +57,8 @@ impl MlxPerception {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -61,7 +68,6 @@ impl MlxPerception {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -71,8 +77,8 @@ impl MlxPerception {
     /// Number of pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -94,16 +100,30 @@ impl PerceptionExecution<MlxNeuralBackend> for MlxPerception {
     ) -> Result<PerceptionOutput<MlxTensor>, PerceptionError> {
         match (&mut self.execution, &self.parallel) {
             (Execution::Resident(model), Some(parallel)) => {
-                model.forward_parallel(mel, drop_preencoded, previous, parallel, context)
+                ParallelPerceptionExecution::forward_parallel(
+                    model,
+                    mel,
+                    drop_preencoded,
+                    previous,
+                    parallel,
+                    context,
+                )
             }
             (Execution::Bounded(model), Some(parallel)) => {
-                model.forward_parallel(mel, drop_preencoded, previous, parallel, context)
+                ParallelPerceptionExecution::forward_parallel(
+                    model,
+                    mel,
+                    drop_preencoded,
+                    previous,
+                    parallel,
+                    context,
+                )
             }
             (Execution::Resident(model), None) => {
-                model.forward(mel, drop_preencoded, previous, context)
+                PerceptionExecution::forward(model, mel, drop_preencoded, previous, context)
             }
             (Execution::Bounded(model), None) => {
-                model.forward(mel, drop_preencoded, previous, context)
+                PerceptionExecution::forward(model, mel, drop_preencoded, previous, context)
             }
         }
     }
@@ -202,9 +222,9 @@ fn materialize(
                         std::marker::PhantomData::<PerceptionRuntimeState<MlxTensor>>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwisePerception::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwisePerception::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxPerception {

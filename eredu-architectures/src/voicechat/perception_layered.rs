@@ -908,65 +908,20 @@ where
     })
 }
 
-/// Ordinary shared layerwise runtime, with the same perception equations and state.
-pub struct LayerwisePerception<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, PerceptionUnit<B>>,
-{
-    runtime: LayerwiseRuntime<
+impl<B, P> PerceptionExecution<B>
+    for LayerwiseRuntime<
         ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
         B,
         PerceptionRuntimeState<B::Tensor>,
         P,
-    >,
-}
-impl<B, P> LayerwisePerception<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, PerceptionUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts the existing provider without constructing resident replacement units.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Shared runtime for parameter operations and diagnostics.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
-        B,
-        PerceptionRuntimeState<B::Tensor>,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Shared runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
-        B,
-        PerceptionRuntimeState<B::Tensor>,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
-impl<B, P> PerceptionExecution<B> for LayerwisePerception<B, P>
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, PerceptionUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> PerceptionDimensions {
-        self.runtime.architecture().kernel().dimensions()
+        self.architecture().kernel().dimensions()
     }
     fn forward(
         &mut self,
@@ -977,7 +932,6 @@ where
     ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError> {
         let mut state = PerceptionRuntimeState::from_state(self.dimensions(), previous)?;
         let (projected, forward) = self
-            .runtime
             .invoke_with_context(
                 PerceptionInput {
                     mel,
@@ -997,7 +951,27 @@ where
     }
 }
 
-impl<B, P> LayerwisePerception<B, P>
+/// Selected tensor-parallel perception with caller-owned complete-cache parents.
+/// The retained native mechanisms determine admitted rank-local construction.
+pub trait ParallelPerceptionExecution<B: NeuralBackend>: PerceptionExecution<B> {
+    /// Returns raw encoder features, language projections and unpublished candidate caches.
+    fn forward_parallel(
+        &mut self,
+        mel: &B::Tensor,
+        drop_preencoded: usize,
+        previous: &PerceptionState<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError>;
+}
+
+impl<B, P> ParallelPerceptionExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
+        B,
+        PerceptionRuntimeState<B::Tensor>,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, PerceptionUnit<B>>,
@@ -1005,7 +979,7 @@ where
 {
     /// Executes the selected tensor partition against a private complete-cache replica.
     /// Both raw encoder features and language projections use the same invocation.
-    pub fn forward_parallel(
+    fn forward_parallel(
         &mut self,
         mel: &B::Tensor,
         drop_preencoded: usize,
@@ -1015,7 +989,6 @@ where
     ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError> {
         let mut state = PerceptionRuntimeState::from_state(self.dimensions(), previous)?;
         let (projected, forward) = self
-            .runtime
             .forward_parallel_with_context_hook(
                 PerceptionInput {
                     mel,

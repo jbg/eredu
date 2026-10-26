@@ -701,8 +701,12 @@ retains normalized inputs and convolution retains post-GLU values in compact,
 bounded caches. `PerceptionKernel` declares ordered subsampling, Conformer
 and projection groups. Subsampling, each Conformer block and the final projection
 are independently materialized execution units; the graph has no learned static
-parameters. Resident `Perception` and provider-backed `LayerwisePerception` use
-these same equations through the ordinary runtime traversal. The pinned streaming
+parameters. Resident `Perception` and provider-backed execution use
+these same equations through the ordinary runtime traversal. `PerceptionExecution`
+and `ParallelPerceptionExecution` operate directly on the shared component runtime.
+Caller-owned `PerceptionState` retains published caches and frame frontiers;
+`PerceptionRuntimeState` owns each candidate transition until completion.
+The pinned streaming
 wrapper's F32 policy is the default. The portable speech precision policy also
 supports eligible F16/BF16 projections and convolutions while retaining F32
 normalization, residuals and streaming histories; component execution rejects
