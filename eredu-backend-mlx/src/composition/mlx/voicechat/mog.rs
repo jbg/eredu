@@ -2,13 +2,14 @@
 
 use eredu_architectures::voicechat::{
     tts_mog::{MogDimensions, MogPrediction, MogSample, TtsError},
-    tts_mog_layered::{LayerwiseMog, MogExecution, MogInput, MogKernel, MogUnit},
+    tts_mog_layered::{MogExecution, MogInput, MogKernel, MogUnit, ParallelMogExecution},
     tts_mog_preparation::{validate_parallel_communication, PreparedMogBindings},
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport,
+    ComponentAdapter, ComponentDefinition, DenseDiskStreamReport, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout, ResidencyReport,
+    StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
@@ -28,9 +29,15 @@ use crate::{
 };
 
 type Unit = MogUnit<MlxNeuralBackend>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, MogKernel<MlxNeuralBackend>>,
+    MlxNeuralBackend,
+    StatelessComponentState,
+    P,
+>;
 enum Execution {
-    Resident(LayerwiseMog<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwiseMog<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native EAR-TTS MoG over the selected shared resident or bounded parameter policy.
@@ -44,8 +51,8 @@ impl MlxMog {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -55,7 +62,6 @@ impl MlxMog {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -65,8 +71,8 @@ impl MlxMog {
     /// Number of pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -263,9 +269,9 @@ fn materialize(
                         std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwiseMog::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwiseMog::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxMog {

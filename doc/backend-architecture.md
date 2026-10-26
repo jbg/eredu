@@ -1972,8 +1972,13 @@ VoiceChat's `tts_mog` owns the offset RMS-normalized residual MLPs, post-stack
 classifier-free guidance, selected low-rank Gaussian mean and noise equations.
 `MogKernel` declares one unit per residual block, a separate final-normalization
 and logits head, and a selected-component bank containing residual/scale projections
-and low-rank means. `MogExecution::predict` executes only the residual and prediction
-groups; `selected` leases only the component bank and consumes the retained prediction
+and low-rank means. `MogExecution` implements prediction and selected sampling
+directly on `LayerwiseRuntime` over the shared component adapter. Native composition
+constructs that runtime and inspects its selected policy directly.
+`ParallelMogExecution` requires typed invocation and explicit guarded agreement;
+its convenience operations share prediction and sample result extraction.
+`MogExecution::predict` executes only the residual and prediction groups;
+`selected` leases only the component bank and consumes the retained prediction
 without rerunning those groups. Selected dense parameters use ordinary backend
 mechanisms; only the selected mixture is multiplied. The shared resident and
 layerwise traversals retain prediction, decisions, draws and all moment outputs

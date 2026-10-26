@@ -831,57 +831,6 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     }
 }
 
-/// MoG head using an ordinary prepared parameter policy and shared bounded traversal.
-pub struct LayerwiseMog<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, MogUnit<B>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >,
-}
-impl<B, P> LayerwiseMog<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, MogUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts the existing provider without materializing unused head parameters.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, MogKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing provider/runtime for diagnostics and parameter operations.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<TtsError, P>,
 ) -> TtsError {
@@ -897,14 +846,20 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
         }
     }
 }
-impl<B, P> MogExecution<B> for LayerwiseMog<B, P>
+impl<B, P> MogExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, MogUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> MogDimensions {
-        self.runtime.architecture().kernel().dimensions()
+        self.architecture().kernel().dimensions()
     }
     fn predict(
         &mut self,
@@ -914,7 +869,6 @@ where
     ) -> Result<MogPrediction<B::Tensor>, TtsError> {
         let mut state = StatelessComponentState::new()?;
         let (_, forward) = self
-            .runtime
             .invoke_with_context(MogInput::Predict { hidden, guidance }, &mut state, context)
             .map_err(runtime_error)?;
         forward.into_prediction()
@@ -929,7 +883,6 @@ where
     ) -> Result<MogSample<B::Tensor>, TtsError> {
         let mut state = StatelessComponentState::new()?;
         let (_, forward) = self
-            .runtime
             .invoke_with_context(
                 MogInput::Selected {
                     prediction,
@@ -945,37 +898,32 @@ where
     }
 }
 
-impl<B, P> LayerwiseMog<B, P>
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, MogUnit<B>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
-    /// Runs rank-local residual projections through the shared parallel traversal.
-    /// Guidance and mixture logits remain complete and replicated.
-    pub fn predict_parallel(
+/// Tensor-parallel MoG operations with typed prediction and selected-component results.
+/// Implementors supply invocation and guarded agreement through ordinary completion.
+pub trait ParallelMogExecution<B: DistributedNeuralBackend>: MogExecution<B> {
+    /// Invokes the selected operation while retaining its prediction, decisions and draws.
+    fn invoke_parallel(
+        &mut self,
+        input: MogInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, MogForward<B::Tensor>), TtsError>;
+
+    /// Runs residual projections and returns complete guided mixture logits.
+    fn predict_parallel(
         &mut self,
         hidden: &B::Tensor,
         guidance: f32,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogPrediction<B::Tensor>, TtsError> {
-        let mut state = StatelessComponentState::new()?;
-        let (_, forward) = self
-            .runtime
-            .forward_parallel_with_context_hook(
-                MogInput::Predict { hidden, guidance },
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map_err(runtime_error)?;
-        forward.into_prediction()
+        self.invoke_parallel(MogInput::Predict { hidden, guidance }, parallel, context)?
+            .1
+            .into_prediction()
     }
-    /// Evaluates coherent component shards using externally supplied shared decisions.
-    pub fn selected_parallel(
+
+    /// Evaluates coherent component shards with supplied shared decisions and draws.
+    fn selected_parallel(
         &mut self,
         prediction: &MogPrediction<B::Tensor>,
         mixture: &B::Tensor,
@@ -984,26 +932,64 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogSample<B::Tensor>, TtsError> {
-        let mut state = StatelessComponentState::new()?;
-        let (_, forward) = self
-            .runtime
-            .forward_parallel_with_context_hook(
-                MogInput::Selected {
-                    prediction,
-                    mixture,
-                    gaussian,
-                    noise_scale,
-                },
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map_err(runtime_error)?;
-        forward.into_sample()
+        self.invoke_parallel(
+            MogInput::Selected {
+                prediction,
+                mixture,
+                gaussian,
+                noise_scale,
+            },
+            parallel,
+            context,
+        )?
+        .1
+        .into_sample()
+    }
+
+    /// Executes retained tensor shards with acquisition and pre-reduction agreement.
+    fn invoke_parallel_guarded<H, F>(
+        &mut self,
+        input: MogInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        agree: F,
+    ) -> Result<(B::Tensor, MogForward<B::Tensor>), TtsError>
+    where
+        H: LayeredTraversalHook<B, MogForward<B::Tensor>, TtsError> + ?Sized,
+        F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, TtsError>;
+}
+
+impl<B, P> ParallelMogExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, MogKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, MogUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn invoke_parallel(
+        &mut self,
+        input: MogInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, MogForward<B::Tensor>), TtsError> {
+        self.forward_parallel_with_context_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |_, _, _| Ok(()),
+        )
+        .map_err(runtime_error)
     }
     /// Executes retained tensor shards with acquisition and pre-reduction agreement.
-    pub fn invoke_parallel_guarded<H, F>(
+    fn invoke_parallel_guarded<H, F>(
         &mut self,
         input: MogInput<'_, B::Tensor>,
         parallel: &B::ParallelContext,
@@ -1076,19 +1062,18 @@ where
                 "MoG participant normalization policy differs",
             ));
         }
-        self.runtime
-            .forward_parallel_with_unit_executor_and_traversal_hook(
-                input,
-                &mut StatelessComponentState::new()?,
-                parallel,
-                context,
-                |architecture, group, index, unit, hidden, _, forward, parallel, context| {
-                    architecture.kernel().forward_unit_guarded(
-                        group, index, unit, hidden, forward, parallel, context, &mut agree,
-                    )
-                },
-                hook,
-            )
-            .map_err(runtime_error)
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, _, forward, parallel, context| {
+                architecture.kernel().forward_unit_guarded(
+                    group, index, unit, hidden, forward, parallel, context, &mut agree,
+                )
+            },
+            hook,
+        )
+        .map_err(runtime_error)
     }
 }
