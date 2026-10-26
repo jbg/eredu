@@ -308,22 +308,12 @@ pub fn local_geometry(
     let state_layout = super::parallel_state_layout(args, &text_layers)
         .map_err(|error| invalid(error.to_string()))?;
     let prediction_state = prediction_state(args, state_layout.len())?;
-    let vocabulary = dim(args.text_config.vocab_size)?;
-    let statics = pinned_parameter_groups(args)?;
-    let vocabulary_range = |role| -> Result<_, ParallelPlanError> {
-        let (_, group) = statics
-            .iter()
-            .find(|(resource, _)| *resource == role)
-            .ok_or_else(|| invalid(format!("Inkling has no declared {role} resource")))?;
-        Ok(VocabularyParallelRange {
-            global_vocabulary: vocabulary,
-            local: eredu_runtime::balanced_parameter_group_range(group, layout, 0, vocabulary)?,
-        })
-    };
+    let (embedding_range, output_range) = super::static_spec(&args.text_config)
+        .vocabulary_ranges(layout, "model.embed_tokens", "model.norm", "lm_head")?;
     let geometry = LocalGeometry {
         text_layers,
-        embedding_range: vocabulary_range("embedding")?,
-        output_range: vocabulary_range("output")?,
+        embedding_range,
+        output_range: output_range.ok_or_else(|| invalid("Inkling declares an untied readout"))?,
         state_layout,
         prediction_state,
         vision_layers: args

@@ -8557,6 +8557,13 @@ row-sharded placement; neither interval nor tensor shape infers communicator
 admission. Shared axis-layout conformance covers aligned companions, scalar
 replicas and malformed selections.
 
+`StaticModuleSpec::vocabulary_ranges` projects embedding and independent readout
+intervals from its physical parameter groups through runtime's balanced-axis
+validation. LFM2, Kimi Linear, Nemotron-H and Inkling use this same geometry as
+pinned construction and cold catalogs. Tied readout has no independent output
+range. Family code retains recurrent, cache, prediction and collective geometry;
+replicated companions do not masquerade as vocabulary rows.
+
 Neutral NVFP4 vocabulary geometry includes replicated global-scale companions.
 MLX packed embedding materialization does not expose the NVFP4 global-scale
 parameter. Native selected-vocabulary resource names and shapes are checked with

@@ -5,7 +5,7 @@ use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LocalModelLayout,
     MemberSharding, OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
 };
 use std::ops::Range;
 
@@ -483,59 +483,6 @@ fn state_geometry(args: &ModelArgs, blocks: &[BlockGeometry]) -> Vec<LayerCacheG
         .collect()
 }
 
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    global_vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    let mut found = false;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        found = true;
-        if tensor.global_shape().first().copied() != Some(global_vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "LFM2 vocabulary member {target} has global shape {:?}, expected {global_vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..global_vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "LFM2 vocabulary member {target} has non-row placement {placement:?}"
-                )));
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "LFM2 vocabulary group {logical_name} has inconsistent companion selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    if !found {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "missing local LFM2 vocabulary layout for {logical_name}"
-        )));
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary,
-        local: selected.expect("a found LFM2 vocabulary member supplies a selection"),
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
-}
-
 /// Derives complete rank-local LFM2 construction geometry from one typed plan.
 pub fn local_geometry(
     args: &ModelArgs,
@@ -550,15 +497,8 @@ pub fn local_geometry(
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = state_layout_with_geometry(args, &state_geometry(args, &blocks))
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let global_vocabulary = usize::try_from(args.vocab_size).map_err(|_| {
-        ParallelPlanError::InvalidGroup("LFM2 vocabulary size exceeds usize".into())
-    })?;
-    let embedding_range = vocabulary_range(layout, "model.embed_tokens", global_vocabulary)?;
-    let output_range = if args.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", global_vocabulary)?)
-    };
+    let (embedding_range, output_range) = super::static_spec(args)
+        .vocabulary_ranges(layout, "model.embed_tokens", "model.embedding_norm", "lm_head")?;
     let geometry = LocalGeometry {
         blocks,
         embedding_range,

@@ -4251,6 +4251,44 @@ impl StaticModuleSpec {
         )
     }
 
+    /// Projects exact vocabulary intervals from declared physical storage.
+    /// Runtime validates row companions and replicas; tied readout retains one owner.
+    pub(crate) fn vocabulary_ranges(
+        &self,
+        layout: &LocalModelLayout,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<(VocabularyParallelRange, Option<VocabularyParallelRange>), ParallelPlanError> {
+        let groups =
+            self.pinned_parameter_groups(embedding_group, normalization_group, output_group)?;
+        let global_vocabulary = usize::try_from(self.vocabulary)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let range = |role| -> Result<_, ParallelPlanError> {
+            let (_, group) = groups
+                .iter()
+                .find(|(resource, _)| *resource == role)
+                .ok_or_else(|| {
+                    ParallelPlanError::InvalidGroup(format!(
+                        "static declaration has no {role} resource"
+                    ))
+                })?;
+            Ok(VocabularyParallelRange {
+                global_vocabulary,
+                local: eredu_runtime::balanced_parameter_group_range(
+                    group,
+                    layout,
+                    0,
+                    global_vocabulary,
+                )?,
+            })
+        };
+        Ok((
+            range("embedding")?,
+            (!self.tied_head).then(|| range("output")).transpose()?,
+        ))
+    }
+
     /// Shared ordinary static-module specification before backend binding.
     pub(crate) fn from_config<C: Config>(config: &C) -> Self {
         let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
