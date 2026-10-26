@@ -58,7 +58,7 @@ impl<'a, T> RnntProjectionInput<'a, T> {
 }
 impl<B, P> RnntProjectionExecution<B>
     for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        ComponentAdapter<ComponentDefinition, RnntKernel<B, false>>,
         B,
         StatelessComponentState,
         P,
@@ -185,7 +185,7 @@ pub trait ParallelRnntProjectionExecution<B: DistributedNeuralBackend>:
 
 impl<B, P> ParallelRnntProjectionExecution<B>
     for LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        ComponentAdapter<ComponentDefinition, RnntKernel<B, false>>,
         B,
         StatelessComponentState,
         P,

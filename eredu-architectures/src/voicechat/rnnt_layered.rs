@@ -312,19 +312,19 @@ struct ParallelRnnt<B: NeuralBackend> {
 }
 
 /// Canonical phase graph and independently materializable RNNT units.
-pub struct RnntKernel<B: NeuralBackend> {
+/// `PREDICTOR` selects recurrent ownership and the available execution contract;
+/// both profiles use the same phase equations and resource lifecycle.
+pub struct RnntKernel<B: NeuralBackend, const PREDICTOR: bool = true> {
     dimensions: RnntDimensions,
-    selection: RnntSelection,
     parallel: Option<ParallelRnnt<B>>,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> RnntKernel<B> {
+impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
     /// Validates geometry without allocating any native parameter.
     pub fn new(dimensions: RnntDimensions) -> Result<Self, RnntError> {
         dimensions.validate()?;
         Ok(Self {
             dimensions,
-            selection: RnntSelection::Complete,
             parallel: None,
             backend: PhantomData,
         })
@@ -337,16 +337,17 @@ impl<B: NeuralBackend> RnntKernel<B> {
     pub fn dimensions(&self) -> RnntDimensions {
         self.dimensions
     }
-    /// Selects only embedding and joint affines; no recurrent parameter is owned.
-    pub fn projections(dimensions: RnntDimensions) -> Result<Self, RnntError> {
-        let mut kernel = Self::new(dimensions)?;
-        kernel.selection = RnntSelection::Projections;
-        Ok(kernel)
+    fn selection() -> RnntSelection {
+        if PREDICTOR {
+            RnntSelection::Complete
+        } else {
+            RnntSelection::Projections
+        }
     }
     /// Couples selected family equations with one exact semantic declaration.
     pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, RnntError> {
         Ok(ComponentAdapter::new(
-            rnnt_definition_for_selection(self.dimensions, self.selection)?,
+            rnnt_definition_for_selection(self.dimensions, Self::selection())?,
             self,
         )?)
     }
@@ -444,8 +445,7 @@ impl<B: NeuralBackend> RnntKernel<B> {
             RnntInput::Prediction(input) => (3, input.clone(), None),
             RnntInput::Output(input) => (4, input.clone(), None),
         };
-        if !self
-            .selection
+        if !Self::selection()
             .phases()
             .iter()
             .any(|phase| phase.ordinal() == group)
@@ -689,7 +689,7 @@ fn rnnt_parameter_description_for_phases(
     Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
 }
 
-impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
+impl<B: NeuralBackend, const PREDICTOR: bool> ComponentKernel<B> for RnntKernel<B, PREDICTOR> {
     type Input<'a> = RnntInput<'a, B::Tensor>;
     type Unit = RnntUnit<B>;
     type ForwardContext = RnntForward<B::Tensor>;
@@ -711,11 +711,11 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
         }
         Ok(eredu_runtime::ModelStateIdentity::new(
             "nemotron_voicechat",
-            match self.selection {
+            match Self::selection() {
                 RnntSelection::Complete => "voicechat_rnnt",
                 RnntSelection::Projections => "rnnt_projections",
             },
-            match self.selection {
+            match Self::selection() {
                 RnntSelection::Complete => format!(
                     "{:?}:{:?}",
                     self.dimensions,
@@ -735,14 +735,14 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RnntUnit<B>, RnntError> {
         self.build_resource(
-            self.selection.phases()[address.group()],
+            Self::selection().phases()[address.group()],
             address.index(),
             context,
         )
     }
 
     fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        self.selection.phases()[group].ordinal() == forward.group
+        Self::selection().phases()[group].ordinal() == forward.group
     }
 
     fn retained_values<'a>(
@@ -760,7 +760,9 @@ impl<B: NeuralBackend> ComponentKernel<B> for RnntKernel<B> {
         roots.into_iter()
     }
 }
-impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for RnntKernel<B> {
+impl<B: NeuralBackend, const PREDICTOR: bool> ComponentEquations<B, StatelessComponentState>
+    for RnntKernel<B, PREDICTOR>
+{
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -801,7 +803,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for RnntKe
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
         self.execute_unit(
-            self.selection.phases()[address.group()].ordinal(),
+            Self::selection().phases()[address.group()].ordinal(),
             address.index(),
             unit,
             hidden,
@@ -832,57 +834,6 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for RnntKe
     }
 }
 
-/// RNNT neural mechanisms using the ordinary bounded parameter provider lifecycle.
-pub struct LayerwiseRnnt<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RnntUnit<B>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >,
-}
-impl<B, P> LayerwiseRnnt<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RnntUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact provider of independently materializable RNNT units.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Shared runtime and its retained provider accounting.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Shared runtime for provider inspection and parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 pub(crate) fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<RnntError, P>,
 ) -> RnntError {
@@ -898,27 +849,32 @@ pub(crate) fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
         }
     }
 }
-impl<B, P> RnntExecution<B> for LayerwiseRnnt<B, P>
+impl<B, P> RnntExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, RnntUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> RnntDimensions {
-        self.runtime.architecture().kernel().dimensions()
+        self.architecture().kernel().dimensions()
     }
     fn embed_token(
         &mut self,
         token: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.runtime
-            .invoke(
-                RnntInput::Embed(token),
-                &mut StatelessComponentState::new()?,
-                context,
-            )
-            .map_err(runtime_error)
+        self.invoke(
+            RnntInput::Embed(token),
+            &mut StatelessComponentState::new()?,
+            context,
+        )
+        .map_err(runtime_error)
     }
     fn predictor_step(
         &mut self,
@@ -926,81 +882,63 @@ where
         previous: Option<&RnntPredictionState<B::Tensor>>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RnntPredictionState<B::Tensor>, RnntError> {
-        self.runtime
-            .invoke_with_context(
-                RnntInput::Predict { input, previous },
-                &mut StatelessComponentState::new()?,
-                context,
-            )
-            .map_err(runtime_error)?
-            .1
-            .into_predictor()
+        self.invoke_with_context(
+            RnntInput::Predict { input, previous },
+            &mut StatelessComponentState::new()?,
+            context,
+        )
+        .map_err(runtime_error)?
+        .1
+        .into_predictor()
     }
     fn encode_frame(
         &mut self,
         encoder: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.runtime
-            .invoke(
-                RnntInput::Encode(encoder),
-                &mut StatelessComponentState::new()?,
-                context,
-            )
-            .map_err(runtime_error)
+        self.invoke(
+            RnntInput::Encode(encoder),
+            &mut StatelessComponentState::new()?,
+            context,
+        )
+        .map_err(runtime_error)
     }
     fn project_prediction(
         &mut self,
         prediction: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.runtime
-            .invoke(
-                RnntInput::Prediction(prediction),
-                &mut StatelessComponentState::new()?,
-                context,
-            )
-            .map_err(runtime_error)
+        self.invoke(
+            RnntInput::Prediction(prediction),
+            &mut StatelessComponentState::new()?,
+            context,
+        )
+        .map_err(runtime_error)
     }
     fn project_output(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
-        self.runtime
-            .invoke(
-                RnntInput::Output(hidden),
-                &mut StatelessComponentState::new()?,
-                context,
-            )
-            .map_err(runtime_error)
+        self.invoke(
+            RnntInput::Output(hidden),
+            &mut StatelessComponentState::new()?,
+            context,
+        )
+        .map_err(runtime_error)
     }
 }
 
-impl<B: DistributedNeuralBackend> RnntKernel<B> {
+impl<B: DistributedNeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
     /// Selects exact vocabulary shards and recurrent replicas without native allocation.
     pub fn new_parallel(
         dimensions: RnntDimensions,
         layout: &LocalModelLayout,
     ) -> Result<Self, RnntError> {
-        Self::new_parallel_selected(dimensions, layout, RnntSelection::Complete)
-    }
-    /// Retains exact projection-only placement with no predictor replicas.
-    pub fn projections_parallel(
-        dimensions: RnntDimensions,
-        layout: &LocalModelLayout,
-    ) -> Result<Self, RnntError> {
-        Self::new_parallel_selected(dimensions, layout, RnntSelection::Projections)
-    }
-    fn new_parallel_selected(
-        dimensions: RnntDimensions,
-        layout: &LocalModelLayout,
-        selection: RnntSelection,
-    ) -> Result<Self, RnntError> {
-        let description = rnnt_parameter_description_for_phases(dimensions, selection.phases())?;
+        let description =
+            rnnt_parameter_description_for_phases(dimensions, Self::selection().phases())?;
         let local = rnnt_local_dimensions_for_description(dimensions, layout, &description)?;
         let mut architecture = Self::new(dimensions)?;
-        architecture.selection = selection;
         architecture.parallel = Some(ParallelRnnt {
             local,
             layout: layout.clone(),
@@ -1034,8 +972,9 @@ impl<B: DistributedNeuralBackend> RnntKernel<B> {
         Ok(())
     }
 }
-impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
-    for RnntKernel<B>
+impl<B: DistributedNeuralBackend, const PREDICTOR: bool>
+    ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for RnntKernel<B, PREDICTOR>
 {
     fn begin_parallel<'a>(
         &mut self,
@@ -1058,7 +997,7 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RnntError> {
         self.execute_unit(
-            self.selection.phases()[address.group()].ordinal(),
+            Self::selection().phases()[address.group()].ordinal(),
             address.index(),
             unit,
             hidden,
@@ -1078,7 +1017,77 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
         self.finish(hidden, state, forward, context)
     }
 }
-impl<B, P> LayerwiseRnnt<B, P>
+/// Tensor-parallel RNNT phases with complete recurrent ownership.
+/// The typed invocation uses the shared resource and completion lifecycle.
+pub trait ParallelRnntExecution<B: DistributedNeuralBackend>: RnntExecution<B> {
+    /// Executes one selected phase and returns its unpublished request-local state.
+    fn invoke_parallel(
+        &mut self,
+        input: RnntInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, RnntForward<B::Tensor>), RnntError>;
+    /// Looks up and sums the selected vocabulary row across exact owners.
+    fn embed_token_parallel(
+        &mut self,
+        token: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        self.invoke_parallel(RnntInput::Embed(token), parallel, context)
+            .map(|(value, _)| value)
+    }
+    /// Advances fully replicated recurrent layers through the same leased traversal.
+    fn predictor_step_parallel(
+        &mut self,
+        input: &B::Tensor,
+        previous: Option<&RnntPredictionState<B::Tensor>>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RnntPredictionState<B::Tensor>, RnntError> {
+        self.invoke_parallel(RnntInput::Predict { input, previous }, parallel, context)?
+            .1
+            .into_predictor()
+    }
+    /// Applies the replicated perception projection in its learned precision.
+    fn encode_frame_parallel(
+        &mut self,
+        encoder: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        self.invoke_parallel(RnntInput::Encode(encoder), parallel, context)
+            .map(|(value, _)| value)
+    }
+    /// Applies the replicated predictor projection without another recurrent step.
+    fn project_prediction_parallel(
+        &mut self,
+        prediction: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        self.invoke_parallel(RnntInput::Prediction(prediction), parallel, context)
+            .map(|(value, _)| value)
+    }
+    /// Gathers complete logits, including the blank row, from uneven vocabulary owners.
+    fn project_output_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, RnntError> {
+        self.invoke_parallel(RnntInput::Output(hidden), parallel, context)
+            .map(|(value, _)| value)
+    }
+}
+
+impl<B, P> ParallelRnntExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RnntKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -1091,66 +1100,13 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, RnntForward<B::Tensor>), RnntError> {
-        self.runtime
-            .forward_parallel_with_context_hook(
-                input,
-                &mut StatelessComponentState::new()?,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map_err(runtime_error)
-    }
-    /// Looks up and sums the selected vocabulary row across exact owners.
-    pub fn embed_token_parallel(
-        &mut self,
-        token: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Embed(token), parallel, context)
-            .map(|(value, _)| value)
-    }
-    /// Advances fully replicated recurrent layers through the same leased traversal.
-    pub fn predictor_step_parallel(
-        &mut self,
-        input: &B::Tensor,
-        previous: Option<&RnntPredictionState<B::Tensor>>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<RnntPredictionState<B::Tensor>, RnntError> {
-        self.invoke_parallel(RnntInput::Predict { input, previous }, parallel, context)?
-            .1
-            .into_predictor()
-    }
-    /// Applies the replicated perception projection in its learned precision.
-    pub fn encode_frame_parallel(
-        &mut self,
-        encoder: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Encode(encoder), parallel, context)
-            .map(|(value, _)| value)
-    }
-    /// Applies the replicated predictor projection without another recurrent step.
-    pub fn project_prediction_parallel(
-        &mut self,
-        prediction: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Prediction(prediction), parallel, context)
-            .map(|(value, _)| value)
-    }
-    /// Gathers complete logits, including the blank row, from uneven vocabulary owners.
-    pub fn project_output_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.invoke_parallel(RnntInput::Output(hidden), parallel, context)
-            .map(|(value, _)| value)
+        self.forward_parallel_with_context_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |_, _, _| Ok(()),
+        )
+        .map_err(runtime_error)
     }
 }

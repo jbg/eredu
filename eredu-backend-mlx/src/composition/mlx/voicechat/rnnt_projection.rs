@@ -32,7 +32,7 @@ use safemlx::{Array, Stream};
 
 type Unit = RnntUnit<MlxNeuralBackend>;
 type Runtime<P> = LayerwiseRuntime<
-    ComponentAdapter<ComponentDefinition, RnntKernel<MlxNeuralBackend>>,
+    ComponentAdapter<ComponentDefinition, RnntKernel<MlxNeuralBackend, false>>,
     MlxNeuralBackend,
     StatelessComponentState,
     P,
@@ -230,9 +230,9 @@ fn materialize(
                 prepared.into_parts();
             let kernel = match local_layout.as_ref() {
                 Some(local) => {
-                    RnntKernel::<MlxNeuralBackend>::projections_parallel(dimensions, local)
+                    RnntKernel::<MlxNeuralBackend, false>::new_parallel(dimensions, local)
                 }
-                None => RnntKernel::<MlxNeuralBackend>::projections(dimensions),
+                None => RnntKernel::<MlxNeuralBackend, false>::new(dimensions),
             }
             .map_err(BackendFailure::from_error)?;
             let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)

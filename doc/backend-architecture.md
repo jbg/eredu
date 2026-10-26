@@ -978,11 +978,15 @@ Components without mutable state use shared stateless traversal metadata. RVQ re
 bank-to-projection embedding operation. PRVQ retains selected depth ranges and
 ordered residual subtraction. Their collective-bearing equations retain explicit
 rank agreement and transient input/candidate roots through ordinary completion.
-RNNT's complete and projection-only selections use one kernel and typed semantic
-phases. Each selection derives its graph, paths, unit counts and canonical
-parameter groups from those phases. Projection execution owns no recurrent
-parameters. `RnntProjectionExecution` implements its four operations directly on
-`LayerwiseRuntime` over the shared component adapter. The static
+RNNT's complete and projection-only selections use one kernel with a static
+predictor-ownership parameter and typed semantic phases. Each selection derives
+its graph, paths, unit counts and canonical parameter groups from those phases.
+Projection execution owns no recurrent
+parameters. `RnntExecution` applies directly to the complete shared component
+runtime; `RnntProjectionExecution` applies to its projection-only counterpart.
+Their kernel types keep these operation contracts distinct. The static
+`ParallelRnntExecution` capability retains full-phase invocation and recurrent
+candidate extraction through ordinary collective traversal. The static
 `ParallelRnntProjectionExecution` capability retains typed tensor invocation,
 cohort traversal hooks and the same vocabulary lookup/gather semantics. Native
 projection composition constructs that runtime and inspects its policy directly.
@@ -1338,7 +1342,7 @@ the returned local candidate only after commitment. The adapter includes the ful
 predictor step in rank agreement before parameter reads. This predictor primitive does
 not select a coupled speech session.
 
-`RnntKernel::projections` selects embedding and the three joint affines in a compact
+`RnntKernel<B, false>` selects embedding and the three joint affines in a compact
 four-unit provider. It reuses ordinary RNNT equations and exact vocabulary
 partitioning, while its seven-tensor source view excludes recurrent weights.
 Recurrent pipeline stages retain only their selected LSTM layers; projection
