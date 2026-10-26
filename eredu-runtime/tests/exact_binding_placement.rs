@@ -1912,9 +1912,21 @@ mod component_preparation {
         let nv_layout =
             eredu_runtime::derive_partitioned_group_layout([&nv_owner], topology).unwrap();
         assert_eq!(
-            eredu_runtime::balanced_parameter_group_range(&nv, &nv_layout, 0, 11).unwrap(),
-            6..11
+            eredu_runtime::balanced_parameter_group_range_if_present(&nv, &nv_layout, 0, 11).unwrap(),
+            Some(6..11)
         );
+        let mut orphan = LocalModelLayout::default();
+        assert!(
+            eredu_runtime::balanced_parameter_group_range_if_present(&nv, &orphan, 0, 11)
+                .unwrap()
+                .is_none()
+        );
+        assert!(eredu_runtime::balanced_parameter_group_range_if_present(&nv, &orphan, 0, 12).is_err());
+        orphan.insert(
+            "nv.global".into(),
+            nv_layout.tensor("nv.global").unwrap().clone(),
+        );
+        assert!(eredu_runtime::balanced_parameter_group_range_if_present(&nv, &orphan, 0, 11).is_err());
         validate_parameter_layout([&nv], &nv_layout, |_| {
             Ok::<_, ParallelPlanError>(ParameterGroupSelection::BalancedAxis {
                 axis: 0,

@@ -5,7 +5,7 @@ use crate::gemma4::ModelArgs;
 use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
     expand_linear_format_parameter_groups, LocalModelLayout, MemberSharding, ParallelPlanError,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
 };
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
@@ -217,37 +217,6 @@ impl LocalGeometry {
     }
 }
 
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    target: &str,
-    vocabulary: i32,
-) -> Result<Option<VocabularyParallelRange>, ParallelPlanError> {
-    let Some(tensor) = layout.tensor(target) else {
-        return Ok(None);
-    };
-    let local = match tensor.placement() {
-        TensorPlacement::Replicated => 0..vocabulary as usize,
-        TensorPlacement::Range {
-            axis: 0,
-            start,
-            end,
-        } => *start..*end,
-        _ => {
-            return Err(invalid(
-                "diffusion vocabulary placement must select complete rows",
-            ))
-        }
-    };
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary as usize,
-        local,
-    };
-    range
-        .validate_global_rows(vocabulary)
-        .map_err(|error| invalid(error.to_string()))?;
-    Ok(Some(range))
-}
-
 /// Derives local invocation geometry without duplicating shared parameters.
 pub fn local_geometry(
     config: &FamilyConfig,
@@ -309,18 +278,22 @@ pub fn local_geometry(
                 .ok_or_else(|| invalid("feedback local width is empty or exceeds i32"))
         })
         .transpose()?;
+    let (embedding, output) = super::text::static_construction_specs(config)
+        .map_err(|error| invalid(error.to_string()))?
+        .selected_vocabulary_ranges(
+            layout,
+            "model.decoder.embed_tokens",
+            "model.decoder.norm",
+            "lm_head",
+        )?;
     Ok(LocalGeometry {
         blocks,
         units,
         state,
         conditioning_width,
         norm: layout.tensor("model.decoder.norm.weight").is_some(),
-        embedding: vocabulary_range(
-            layout,
-            "model.decoder.embed_tokens.weight",
-            config.text.vocab_size,
-        )?,
-        output: vocabulary_range(layout, "lm_head.weight", config.text.vocab_size)?,
+        embedding,
+        output,
         fingerprint: config.architecture_fingerprint(),
     })
 }

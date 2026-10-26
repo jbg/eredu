@@ -4176,6 +4176,42 @@ impl StaticModuleConstruction {
             },
         )
     }
+
+    /// Projects only vocabulary resources physically retained by a selected layout.
+    pub(crate) fn selected_vocabulary_ranges(
+        &self,
+        layout: &LocalModelLayout,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<
+        (
+            Option<VocabularyParallelRange>,
+            Option<VocabularyParallelRange>,
+        ),
+        ParallelPlanError,
+    > {
+        let groups =
+            self.pinned_parameter_groups(embedding_group, normalization_group, output_group)?;
+        let global_vocabulary = self.embedding.vocabulary as usize;
+        let range = |role| -> Result<_, ParallelPlanError> {
+            let Some((_, group)) = groups.iter().find(|(resource, _)| *resource == role) else {
+                return Ok(None);
+            };
+            Ok(eredu_runtime::balanced_parameter_group_range_if_present(
+                group,
+                layout,
+                0,
+                global_vocabulary,
+            )?
+            .map(|local| VocabularyParallelRange {
+                global_vocabulary,
+                local,
+            }))
+        };
+        Ok((range("embedding")?, range("output")?))
+    }
+
 }
 
 /// Physical ownership and placement of one ordinary pinned vocabulary resource.
@@ -4270,32 +4306,29 @@ impl StaticModuleSpec {
         normalization_group: &str,
         output_group: &str,
     ) -> Result<(VocabularyParallelRange, Option<VocabularyParallelRange>), ParallelPlanError> {
-        let groups =
-            self.pinned_parameter_groups(embedding_group, normalization_group, output_group)?;
-        let global_vocabulary = usize::try_from(self.vocabulary)
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let range = |role| -> Result<_, ParallelPlanError> {
-            let (_, group) = groups
-                .iter()
-                .find(|(resource, _)| *resource == role)
-                .ok_or_else(|| {
-                    ParallelPlanError::InvalidGroup(format!(
-                        "static declaration has no {role} resource"
-                    ))
-                })?;
-            Ok(VocabularyParallelRange {
-                global_vocabulary,
-                local: eredu_runtime::balanced_parameter_group_range(
-                    group,
-                    layout,
-                    0,
-                    global_vocabulary,
-                )?,
+        let (embedding, output) = self
+            .construction_specs()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+            .selected_vocabulary_ranges(
+                layout,
+                embedding_group,
+                normalization_group,
+                output_group,
+            )?;
+        let required = |range: Option<VocabularyParallelRange>, role| {
+            range.ok_or_else(|| {
+                ParallelPlanError::InvalidGroup(format!(
+                    "static declaration has no local {role} resource"
+                ))
             })
         };
         Ok((
-            range("embedding")?,
-            (!self.tied_head).then(|| range("output")).transpose()?,
+            required(embedding, "embedding")?,
+            if self.tied_head {
+                None
+            } else {
+                Some(required(output, "output")?)
+            },
         ))
     }
 

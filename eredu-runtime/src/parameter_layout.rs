@@ -163,6 +163,53 @@ pub fn logical_parameter_group_range(
         .ok_or_else(invalid)
 }
 
+fn invalid_balanced_axis(
+    group: &crate::ParameterGroupSpec,
+    axis: usize,
+) -> crate::ParallelPlanError {
+    crate::ParallelPlanError::InvalidGroup(format!(
+        "parameter group {:?} has no independent balanced axis {axis}",
+        group.logical_name(),
+    ))
+}
+
+fn balanced_axis_anchor(
+    group: &crate::ParameterGroupSpec,
+    axis: usize,
+    global_extent: usize,
+) -> Result<&crate::ParameterMemberSpec, crate::ParallelPlanError> {
+    if group.partition_units().is_some() {
+        return Err(invalid_balanced_axis(group, axis));
+    }
+    group
+        .members()
+        .iter()
+        .find(|member| {
+            member.sharding() == &(crate::MemberSharding::Balanced { axis })
+                && member.global_shape().get(axis) == Some(&global_extent)
+        })
+        .ok_or_else(|| invalid_balanced_axis(group, axis))
+}
+
+/// Projects an optional physical group. A wholly absent group has no local range;
+/// any retained member requires the complete group and its aligned companions.
+pub fn balanced_parameter_group_range_if_present(
+    group: &crate::ParameterGroupSpec,
+    layout: &crate::LocalModelLayout,
+    axis: usize,
+    global_extent: usize,
+) -> Result<Option<Range<usize>>, crate::ParallelPlanError> {
+    balanced_axis_anchor(group, axis, global_extent)?;
+    if group
+        .members()
+        .iter()
+        .all(|member| layout.tensor(member.target()).is_none())
+    {
+        return Ok(None);
+    }
+    balanced_parameter_group_range(group, layout, axis, global_extent).map(Some)
+}
+
 /// Extracts and validates an independent balanced axis from its declared group.
 /// Complete local storage and replication retain their distinct placement facts.
 /// Replicated companions retain their complete shapes, independently of the axis.
@@ -173,23 +220,8 @@ pub fn balanced_parameter_group_range(
     axis: usize,
     global_extent: usize,
 ) -> Result<Range<usize>, crate::ParallelPlanError> {
-    let invalid = || {
-        crate::ParallelPlanError::InvalidGroup(format!(
-            "parameter group {:?} has no independent balanced axis {axis}",
-            group.logical_name(),
-        ))
-    };
-    if group.partition_units().is_some() {
-        return Err(invalid());
-    }
-    let anchor = group
-        .members()
-        .iter()
-        .find(|member| {
-            member.sharding() == &(crate::MemberSharding::Balanced { axis })
-                && member.global_shape().get(axis) == Some(&global_extent)
-        })
-        .ok_or_else(invalid)?;
+    let invalid = || invalid_balanced_axis(group, axis);
+    let anchor = balanced_axis_anchor(group, axis, global_extent)?;
     let tensor = layout.tensor(anchor.target()).ok_or_else(invalid)?;
     let range = match tensor.placement() {
         crate::TensorPlacement::Range {

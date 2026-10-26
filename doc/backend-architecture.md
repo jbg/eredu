@@ -8522,6 +8522,16 @@ materialization paths. Diffusion Gemma uses its family-authored construction for
 both paths and appends its separate feedback groups; Gemma retains its own per-layer
 input resources.
 
+Runtime `balanced_parameter_group_range_if_present` treats an entirely omitted
+physical group as unowned after validating its declared axis. If any member remains,
+the ordinary balanced-axis validator requires the primary and every companion with
+aligned placement.
+Validated static construction uses this projection for independently selected
+embedding/readout resources. Diffusion Gemma derives optional vocabulary geometry
+through this declaration; complete decoder vocabulary geometry requires its declared
+lookup/readout resources. Full local storage and replicas retain the shared placement
+checks.
+
 `ArchitectureParameterDescription::project_groups` selects named execution groups
 and explicit pinned roles. It preserves sparse global invocation indices,
 canonical storage consumers and exact retained rank placement. Omitted dependencies
