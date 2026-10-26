@@ -208,6 +208,32 @@ impl PreparedComponent<crate::ComponentDefinition> {
 }
 
 impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
+    /// Prepares canonical physical recipes from an admitted catalog. Only declared
+    /// targets are resolved; conversion policy and missing-target errors belong to
+    /// the caller. Source restriction, ownership and placement use ordinary preparation.
+    pub fn prepare_physical_recipes<E>(
+        id: impl Into<String>,
+        declaration: D,
+        source: SharedCheckpointSource,
+        recipes: &BTreeMap<String, DerivedWeightRecipe>,
+        conversion: Option<ComponentRecipeConversion>,
+        mut missing: impl FnMut(&str) -> E,
+    ) -> Result<Self, E>
+    where
+        E: From<ComponentPreparationError>,
+    {
+        Self::prepare(id, declaration, source, |member| {
+            let recipe = recipes
+                .get(member.target())
+                .cloned()
+                .ok_or_else(|| missing(member.target()))?;
+            Ok::<_, E>(ComponentRecipe::Physical {
+                recipe,
+                conversion: conversion.clone(),
+            })
+        })
+    }
+
     /// Resolves canonical targets using family-owned admitted recipe policy.
     /// No checkpoint payload is read.
     pub fn prepare<E, R>(

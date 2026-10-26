@@ -7,7 +7,7 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
+    BindingPlacementError, ComponentPreparationError, ComponentRecipeConversion,
     LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
@@ -112,24 +112,16 @@ impl PreparedRnntBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, DerivedWeightRecipe>,
     ) -> Result<Self, RnntPreparationError> {
-        let prepared = PreparedComponent::prepare(
+        let prepared = PreparedComponent::prepare_physical_recipes(
             "voicechat/rnnt/leased-units",
             definition,
             source,
-            |member| {
-                let name = member.target();
-                let recipe = parameters
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| RnntPreparationError::MissingParameter(name.into()))?;
-                Ok::<_, RnntPreparationError>(ComponentRecipe::Physical {
-                    recipe,
-                    conversion: Some(ComponentRecipeConversion {
-                        dtype: RecipeDtype::F32,
-                        from: &[RecipeDtype::F16, RecipeDtype::BF16],
-                    }),
-                })
-            },
+            parameters,
+            Some(ComponentRecipeConversion {
+                dtype: RecipeDtype::F32,
+                from: &[RecipeDtype::F16, RecipeDtype::BF16],
+            }),
+            |name| RnntPreparationError::MissingParameter(name.into()),
         )?;
         Ok(Self {
             dimensions,

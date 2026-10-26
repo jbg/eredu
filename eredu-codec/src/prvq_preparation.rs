@@ -7,7 +7,7 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
+    BindingPlacementError, ComponentPreparationError, ComponentRecipeConversion,
     LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
@@ -69,24 +69,16 @@ impl PreparedQuantizerBindings {
         parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, QuantizerPreparationError> {
         let definition = quantizer_component_definition(geometry, prefix)?;
-        let prepared = PreparedComponent::prepare(
+        let prepared = PreparedComponent::prepare_physical_recipes(
             "prvq/codebooks/leased-units",
             definition,
             source,
-            |member| {
-                let name = member.target();
-                let recipe = parameters
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| QuantizerPreparationError::MissingParameter(name.into()))?;
-                Ok::<_, QuantizerPreparationError>(ComponentRecipe::Physical {
-                    recipe,
-                    conversion: Some(ComponentRecipeConversion {
-                        dtype: RecipeDtype::F32,
-                        from: &[RecipeDtype::F16, RecipeDtype::BF16],
-                    }),
-                })
-            },
+            parameters,
+            Some(ComponentRecipeConversion {
+                dtype: RecipeDtype::F32,
+                from: &[RecipeDtype::F16, RecipeDtype::BF16],
+            }),
+            |name| QuantizerPreparationError::MissingParameter(name.into()),
         )?;
         Ok(Self {
             geometry,

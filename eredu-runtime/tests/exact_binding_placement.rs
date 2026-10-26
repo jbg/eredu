@@ -1497,16 +1497,23 @@ mod component_preparation {
             ]),
         )
         .unwrap();
-        PreparedComponent::prepare(
+        let recipes = (0..3)
+            .map(|index| {
+                (
+                    format!("weight.{index}"),
+                    DerivedWeightRecipe::source(format!("physical.{index}"), TensorSelection::Full),
+                )
+            })
+            .collect();
+        PreparedComponent::prepare_physical_recipes(
             "shared-contract",
             declaration,
             source,
-            |member| {
-                let index = member.target().strip_prefix("weight.").unwrap();
-                Ok::<_, ComponentPreparationError>(DerivedWeightRecipe::source(
-                    format!("physical.{index}"),
-                    TensorSelection::Full,
-                ))
+            &recipes,
+            None,
+            |target| ComponentPreparationError::Geometry {
+                component: "shared-contract".into(),
+                target: target.into(),
             },
         )
         .unwrap()

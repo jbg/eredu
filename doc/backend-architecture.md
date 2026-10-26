@@ -8507,6 +8507,13 @@ owned catalog. Per-layer leases, scalar replicas, recurrent/cache state and code
 convolution geometry remain component declarations. DeepSeek target/prediction
 catalogs and Muse audio units use the same constructor.
 
+`PreparedComponent::prepare_physical_recipes` resolves canonical physical targets
+from a family-admitted recipe catalog. The caller supplies conversion policy and
+its missing-parameter error; runtime uses ordinary component preparation for
+inferred geometry, canonical resources, exact source restriction and placement.
+Neighboring recipes grant no source authority. EAR encoder/decoder, PRVQ and RNNT
+supply their F32 execution policy through this same preparation entry point.
+
 `ComponentDefinition::project_parameters` reuses an identical retained declaration
 or validates a new physical catalog while preserving logical aliases, state and
 observation ownership. Runtime checks invocation/storage identity, primary owners

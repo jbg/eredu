@@ -7,7 +7,7 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ComponentRecipe, ComponentRecipeConversion,
+    BindingPlacementError, ComponentPreparationError, ComponentRecipeConversion,
     LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
 };
 
@@ -62,21 +62,16 @@ impl PreparedEncoderBindings {
         parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, EncoderPreparationError> {
         let definition = encoder_component_definition(&config, prefix)?;
-        let prepared =
-            PreparedComponent::prepare("ear/encoder/leased-units", definition, source, |member| {
-                let name = member.target();
-                let recipe = parameters
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| EncoderPreparationError::MissingParameter(name.into()))?;
-                Ok::<_, EncoderPreparationError>(ComponentRecipe::Physical {
-                    recipe,
-                    conversion: Some(ComponentRecipeConversion {
-                        dtype: RecipeDtype::F32,
-                        from: &[RecipeDtype::F16, RecipeDtype::BF16],
-                    }),
-                })
-            },
+        let prepared = PreparedComponent::prepare_physical_recipes(
+            "ear/encoder/leased-units",
+            definition,
+            source,
+            parameters,
+            Some(ComponentRecipeConversion {
+                dtype: RecipeDtype::F32,
+                from: &[RecipeDtype::F16, RecipeDtype::BF16],
+            }),
+            |name| EncoderPreparationError::MissingParameter(name.into()),
         )?;
         Ok(Self {
             config,
