@@ -2865,7 +2865,7 @@ where
     }
 }
 
-fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
+pub(super) fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
     StaticModuleSpec {
         normalization_groups: None,
         embedding_weight: "embed.weight".into(),

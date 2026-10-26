@@ -1121,39 +1121,11 @@ pub fn v3_static_parameter_groups(
 fn v3_pinned_parameter_groups(
     args: &V3Args,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    let groups = vec![
-        (
-            "embedding",
-            group(
-                "model.embed_tokens",
-                ParameterRole::Vocabulary,
-                [(
-                    "model.embed_tokens.weight",
-                    vec![dim(args.vocab_size)?, dim(args.hidden_size)?],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ),
-        (
-            "norm",
-            replicated(
-                "model.norm",
-                [("model.norm.weight", vec![dim(args.hidden_size)?])],
-            )?,
-        ),
-        (
-            "output",
-            group(
-                "lm_head",
-                ParameterRole::Vocabulary,
-                [(
-                    "lm_head.weight",
-                    vec![dim(args.vocab_size)?, dim(args.hidden_size)?],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ),
-    ];
+    let groups = v3::static_spec(args).logical_pinned_parameter_groups(
+        "model.embed_tokens",
+        "model.norm",
+        "lm_head",
+    )?;
     // Published V3 statics are dense even when the layer default is FP8.
     // Explicit admitted formats cover GGUF and transformed embedding/head data.
     expand_pinned_formats(groups, |name| {
@@ -1300,44 +1272,19 @@ fn v4_pinned_parameter_groups(
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
     let hidden = dim(args.hidden_size)?;
     let streams = dim(args.hc_mult)?;
-    let mut groups = vec![
-        (
-            "embedding",
-            group(
-                "embed",
-                ParameterRole::Vocabulary,
-                [(
-                    "embed.weight",
-                    vec![dim(args.vocab_size)?, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ),
-        ("norm", replicated("norm", [("norm.weight", vec![hidden])])?),
-        (
-            "output",
-            group(
-                "head",
-                ParameterRole::Vocabulary,
-                [(
-                    "head.weight",
-                    vec![dim(args.vocab_size)?, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ),
-        (
+    let mut groups =
+        v4::text_static_spec(args).logical_pinned_parameter_groups("embed", "norm", "head")?;
+    groups.push((
+        "hyper_head",
+        replicated(
             "hyper_head",
-            replicated(
-                "hyper_head",
-                [
-                    ("hc_head_fn", vec![streams, streams * hidden]),
-                    ("hc_head_base", vec![streams]),
-                    ("hc_head_scale", vec![1]),
-                ],
-            )?,
-        ),
-    ];
+            [
+                ("hc_head_fn", vec![streams, streams * hidden]),
+                ("hc_head_base", vec![streams]),
+                ("hc_head_scale", vec![1]),
+            ],
+        )?,
+    ));
     if let Some(config) = &args.dspark {
         let last = usize::try_from(args.num_nextn_predict_layers)
             .map_err(|_| invalid("V4 DSpark depth exceeds usize"))?

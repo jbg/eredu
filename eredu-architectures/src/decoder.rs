@@ -4199,14 +4199,15 @@ impl StaticModuleSpec {
         Ok((embedding, head, normalization))
     }
 
-    /// Projects ordinary logical parameter geometry before encoding expansion.
-    /// Families retain group identities and apply their admitted formats once.
-    pub(crate) fn logical_parameter_groups(
+    /// Projects logical embedding, normalization and readout resources before
+    /// encoding expansion. Families retain group names and format admission;
+    /// explicit resource roles remain independent of group ordering.
+    pub(crate) fn logical_pinned_parameter_groups(
         &self,
         embedding_group: &str,
         normalization_group: &str,
         output_group: &str,
-    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
         let (embedding, head, _) = self
             .construction_specs()
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
@@ -4220,29 +4221,38 @@ impl StaticModuleSpec {
             )
         };
         let mut groups = vec![
-            group(
-                embedding_group,
-                ParameterRole::Vocabulary,
-                embedding.weight.id.as_str(),
-                vec![embedding.vocabulary as usize, embedding.dimensions as usize],
-                MemberSharding::Balanced { axis: 0 },
-            )?,
-            group(
-                normalization_group,
-                ParameterRole::Replicated,
-                &self.normalization_weight,
-                vec![embedding.dimensions as usize],
-                MemberSharding::Replicated,
-            )?,
+            (
+                "embedding",
+                group(
+                    embedding_group,
+                    ParameterRole::Vocabulary,
+                    embedding.weight.id.as_str(),
+                    vec![embedding.vocabulary as usize, embedding.dimensions as usize],
+                    MemberSharding::Balanced { axis: 0 },
+                )?,
+            ),
+            (
+                "norm",
+                group(
+                    normalization_group,
+                    ParameterRole::Replicated,
+                    &self.normalization_weight,
+                    vec![embedding.dimensions as usize],
+                    MemberSharding::Replicated,
+                )?,
+            ),
         ];
         if let Some(head) = head {
-            groups.push(group(
-                output_group,
-                ParameterRole::Vocabulary,
-                head.weight.id.as_str(),
-                vec![head.output as usize, head.input as usize],
-                MemberSharding::Balanced { axis: 0 },
-            )?);
+            groups.push((
+                "output",
+                group(
+                    output_group,
+                    ParameterRole::Vocabulary,
+                    head.weight.id.as_str(),
+                    vec![head.output as usize, head.input as usize],
+                    MemberSharding::Balanced { axis: 0 },
+                )?,
+            ));
         }
         Ok(groups)
     }

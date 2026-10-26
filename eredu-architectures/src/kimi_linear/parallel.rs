@@ -842,29 +842,26 @@ pub fn parameter_description(
     let owner_group = layout.group_id(0).expect("Kimi target group").clone();
     let hidden = args.hidden_size as usize;
     let mut formats = std::collections::BTreeMap::new();
-    let static_groups = super::static_spec(args).logical_parameter_groups(
+    let static_groups = super::static_spec(args).logical_pinned_parameter_groups(
         "model.embed_tokens",
         "model.norm",
         "lm_head",
     )?;
     let mut projections = static_groups
         .iter()
-        .filter(|group| group.role() == ParameterRole::Vocabulary)
-        .flat_map(|group| group.members().iter().map(|member| member.target().to_owned()))
+        .filter(|(_, group)| group.role() == ParameterRole::Vocabulary)
+        .flat_map(|(_, group)| group.members().iter().map(|member| member.target().to_owned()))
         .collect::<std::collections::BTreeSet<_>>();
-    let static_owners = [
-        if args.tie_word_embeddings {
-            ParameterGroupOwner::static_any_of(["embedding", "output"])
-        } else {
-            ParameterGroupOwner::static_role("embedding")
-        },
-        ParameterGroupOwner::static_role("norm"),
-        ParameterGroupOwner::static_role("output"),
-    ];
     let mut owned = static_groups
         .into_iter()
-        .zip(static_owners)
-        .map(|(group, owner)| OwnedParameterGroupSpec::new(owner, group))
+        .map(|(role, group)| {
+            let owner = if role == "embedding" && args.tie_word_embeddings {
+                ParameterGroupOwner::static_any_of(["embedding", "output"])
+            } else {
+                ParameterGroupOwner::static_role(role)
+            };
+            OwnedParameterGroupSpec::new(owner, group)
+        })
         .collect::<Vec<_>>();
     let mut projection = |name: String, output: usize, input: usize, sharding| {
         projections.insert(name.clone());

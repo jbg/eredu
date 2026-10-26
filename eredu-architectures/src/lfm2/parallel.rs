@@ -824,11 +824,14 @@ pub fn parameter_description(
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [layers])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let mut groups = super::static_spec(args).logical_parameter_groups(
+    let mut groups = super::static_spec(args).logical_pinned_parameter_groups(
         "model.embed_tokens",
         "model.embedding_norm",
         "lm_head",
-    )?;
+    )?
+    .into_iter()
+    .map(|(_, group)| group)
+    .collect::<Vec<_>>();
     let static_count = groups.len();
     let head_dim = usize::try_from(args.hidden_size / args.num_attention_heads)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 head width exceeds usize".into()))?;
