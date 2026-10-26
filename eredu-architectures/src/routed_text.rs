@@ -270,11 +270,7 @@ fn selected_member_geometry(
                     parameter.logical_target()
                 ))
             })?;
-            let parameter_bytes = if matches!(
-                task.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            ) {
+            let parameter_bytes = if task.lowering().transforms_payload() {
                 if metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
                     && !matches!(
                         parameter.role(),
@@ -394,11 +390,7 @@ fn project_bank_members_with_tasks(
                     parameter.logical_target()
                 ))
             })?;
-            let transforms = matches!(
-                task.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            );
+            let transforms = task.lowering().transforms_payload();
             let selected_bytes = if transforms {
                 eredu_runtime::selected_addressable_parameter_bytes(task, metadata)
                     .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?
@@ -636,7 +628,7 @@ where
         .requirements()
         .shared_component_definition()
         .ok_or("shared iterative selection has no retained definition")?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
+    let source_architecture = selected.text().uses_weight_transform()
         .then(|| {
             crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
                 config.clone(),
@@ -934,7 +926,7 @@ where
         .ok_or_else(|| {
             RoutedTextPreparationError::Invalid("LFM2 selection has no retained definition".into())
         })?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
+    let source_architecture = text.uses_weight_transform()
         .then(|| {
             let definition = crate::lfm2::project_parameters(args, &retained)?;
             crate::lfm2::CompleteLfm2Kernel::<B>::from_definition(args.clone(), definition, context)
@@ -1041,7 +1033,7 @@ where
                 "Kimi Linear selection has no retained definition".into(),
             )
         })?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
+    let source_architecture = text.uses_weight_transform()
         .then(|| {
             let definition = crate::kimi_linear::project_parameters(args, &retained)?;
             crate::kimi_linear::CompleteKimiKernel::<B>::from_definition(
@@ -1156,7 +1148,7 @@ where
                 "Qwen hybrid selection has no retained definition".into(),
             )
         })?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
+    let source_architecture = text.uses_weight_transform()
         .then(|| {
             let definition = crate::qwen::hybrid::project_parameters(args, &retained)?;
             crate::qwen::hybrid::QwenKernel::<B>::from_definition(args.clone(), definition, context)
@@ -1257,7 +1249,7 @@ where
         .ok_or_else(|| {
             RoutedTextPreparationError::Invalid("V3 selection has no retained definition".into())
         })?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
+    let source_architecture = text.uses_weight_transform()
         .then(|| {
             let definition = crate::deepseek::v3::project_parameters(args, &retained)?;
             crate::deepseek::v3::V3Kernel::<B>::from_definition(args.clone(), definition, context)
@@ -1360,7 +1352,7 @@ where
         .ok_or_else(|| {
             RoutedTextPreparationError::Invalid("V4 selection has no retained definition".into())
         })?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
+    let source_architecture = text.uses_weight_transform()
         .then(|| {
             let definition = crate::deepseek::v4::project_parameters(args, &retained)?;
             crate::deepseek::v4::V4Kernel::<B>::from_definition(args.clone(), definition, context)
@@ -1466,7 +1458,7 @@ where
                 "Nemotron-H selection has no retained definition".into(),
             )
         })?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
+    let source_architecture = text.uses_weight_transform()
         .then(|| {
             let definition = crate::nemotron_h::project_parameters(args, &retained)?;
             crate::nemotron_h::CompleteNemotronKernel::<B>::from_definition(

@@ -35,7 +35,7 @@ use crate::{
     ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
     ReplicatedTextOutputSelection, ReplicatedTextParameterPresence, RoutedLayeredArchitecture,
     RuntimeState, SelectedReplicatedTextRealization, SelectedStateRealization, StateError,
-    SubmissionBackend, WeightLoweringKind,
+    SubmissionBackend,
 };
 
 use crate::parameter_operations::LayeredParameterOwner;
@@ -1965,12 +1965,7 @@ where
     if let Some(source) = source_architecture {
         validate_architecture_geometry::<A, B, S>(source, &selected)?;
     }
-    let has_transform = selected.parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    });
+    let has_transform = selected.uses_weight_transform();
     if has_transform != source_architecture.is_some() {
         return Err(
             "selected transform tasks and source-format architecture ownership disagree".into(),
@@ -5262,11 +5257,7 @@ where
                 eredu_checkpoint::LinearFormat::Dense
                 | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => return Ok(packed),
                 eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
-                    if matches!(
-                        selected_lowering,
-                        crate::WeightLoweringKind::Transform
-                            | crate::WeightLoweringKind::DerivedTransform
-                    ) {
+                    if selected_lowering.transforms_payload() {
                         return Err(format!(
                             "selected parameter {:?} cannot apply a load-time GGUF transform",
                             parameter.name()

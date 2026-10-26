@@ -835,11 +835,7 @@ impl SelectedExecution {
             )?;
             let native_peak = mechanisms.recipe_materialization_workspace(&recipe, source)?;
             record_group(task, native_peak)?;
-            if matches!(
-                task.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            ) {
+            if task.lowering().transforms_payload() {
                 let output = recipe.infer(source).map_err(|error| error.to_string())?;
                 conversion_outputs = conversion_outputs
                     .checked_add(
@@ -933,11 +929,7 @@ impl SelectedExecution {
                                         .ok_or("expert recipe workspace overflow")?,
                                 );
                             let output = recipe.infer(source).map_err(|e| e.to_string())?;
-                            if matches!(
-                                task.lowering(),
-                                eredu_runtime::WeightLoweringKind::Transform
-                                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-                            ) {
+                            if task.lowering().transforms_payload() {
                                 native_retained = native_retained
                                     .checked_add(
                                         eredu_runtime::selected_addressable_parameter_bytes(

@@ -17,7 +17,6 @@ mod units;
 use crate::{
     observe_and_intervene, ActivationObserver, ParameterBankAccess, ParameterBankKey,
     ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, RoutingObservation,
-    WeightLoweringKind,
 };
 pub use agreement::{
     AgreeingAddressableExpertProvider, AgreeingParameterProvider, ProviderAgreementRejected,
@@ -267,10 +266,7 @@ impl AddressableBankParameter {
                 parameter: task.name().to_owned(),
             });
         }
-        let transforms = matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        );
+        let transforms = task.lowering().transforms_payload();
         if !transforms && quantization_companions.is_some() {
             return Err(AddressableBankMemberError::InvalidParameter {
                 parameter: task.name().to_owned(),
@@ -900,10 +896,7 @@ pub fn selected_addressable_parameter_bytes(
     task: &ReplicatedTextMaterializationTask,
     metadata: &eredu_checkpoint::recipe::RecipeMetadata,
 ) -> Result<u64, AddressableBankMemberError> {
-    if !matches!(
-        task.lowering(),
-        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-    ) {
+    if !task.lowering().transforms_payload() {
         return Ok(metadata.byte_len());
     }
     let quantization = task.executable().weight_quantization().ok_or_else(|| {

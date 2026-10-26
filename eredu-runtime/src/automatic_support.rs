@@ -272,10 +272,7 @@ pub fn selected_parameter_resources_for_layout(
             continue;
         }
         let placement = layout.tensor(target).expect("resolved target");
-        let bytes = if matches!(
-            task.lowering(),
-            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-        ) {
+        let bytes = if task.lowering().transforms_payload() {
             let shape = task
                 .logical_shape()
                 .iter()
@@ -315,10 +312,7 @@ pub fn selected_parameter_resources_for_layout(
             )?
         };
         parameters.push((task.name(), task.owner(), bytes));
-        if matches!(
-            task.lowering(),
-            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-        ) {
+        if task.lowering().transforms_payload() {
             continue;
         }
         for companion in task.output_companions() {
@@ -395,10 +389,7 @@ fn task_parameter_bytes(
             task.owner(),
             selected_materialization_task_bytes(task)?,
         ));
-        if matches!(
-            task.lowering(),
-            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-        ) {
+        if task.lowering().transforms_payload() {
             continue;
         }
         for companion in task.output_companions() {

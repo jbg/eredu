@@ -100,6 +100,14 @@ pub enum WeightLoweringKind {
     DerivedTransform,
 }
 
+impl WeightLoweringKind {
+    /// Whether admitted payload materialization performs a format transformation.
+    /// Direct loading and recipe-only derivation do not select payload conversion.
+    pub const fn transforms_payload(self) -> bool {
+        matches!(self, Self::Transform | Self::DerivedTransform)
+    }
+}
+
 /// One exact weight lowering implemented by a backend.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WeightLoweringCapability {
@@ -2630,10 +2638,7 @@ impl ReplicatedTextMaterializationTask {
         scale: &str,
         affine_bias: Option<&str>,
     ) -> Result<Vec<ReplicatedTextOutputCompanion>, ReplicatedTextContractError> {
-        if !matches!(
-            self.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        ) {
+        if !self.lowering().transforms_payload() {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "task {:?} does not select a load-time transform",
                 self.name()
@@ -2951,12 +2956,7 @@ pub fn locally_materialized_replicated_text_outputs(
 ) -> BTreeSet<String> {
     tasks
         .iter()
-        .filter(|task| {
-            matches!(
-                task.lowering(),
-                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-            )
-        })
+        .filter(|task| task.lowering().transforms_payload())
         .flat_map(|task| {
             std::iter::once(task.name().to_owned()).chain(
                 task.output_companions()
@@ -2975,12 +2975,11 @@ pub fn group_replicated_text_transform_tasks(
     tasks: &[ReplicatedTextMaterializationTask],
 ) -> Result<Vec<ReplicatedTextTransformGroup>, ReplicatedTextContractError> {
     let mut groups = Vec::<ReplicatedTextTransformGroup>::new();
-    for (task_index, task) in tasks.iter().enumerate().filter(|(_, task)| {
-        matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    for (task_index, task) in tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.lowering().transforms_payload())
+    {
         let quantization = task.executable().weight_quantization().ok_or_else(|| {
             ReplicatedTextContractError::invalid(format!(
                 "selected materialization task {:?} has no packed output format",
@@ -3010,10 +3009,7 @@ pub fn group_replicated_text_transform_tasks(
 pub fn selected_materialization_task_bytes(
     task: &ReplicatedTextMaterializationTask,
 ) -> Result<u64, ReplicatedTextContractError> {
-    let transforms = matches!(
-        task.lowering(),
-        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-    );
+    let transforms = task.lowering().transforms_payload();
     if !transforms {
         if let Some(output) = task.derived_output() {
             return Ok(output.byte_len());
@@ -3219,10 +3215,7 @@ fn build_materialization_tasks(
         companion_names.insert(requirement.name().to_owned());
     }
     for task in &mut tasks {
-        let transforms = matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        );
+        let transforms = task.lowering().transforms_payload();
         let outputs = if transforms {
             let requirement = requirement_by_name.get(task.name()).ok_or_else(|| {
                 ReplicatedTextContractError::invalid(format!(
@@ -4040,6 +4033,13 @@ impl SelectedReplicatedTextRealization {
     /// Returns exact per-parameter realizations.
     pub fn parameters(&self) -> &[SelectedParameterRealization] {
         &self.parameters
+    }
+    /// Whether ordinary selected parameters require payload conversion.
+    /// Auxiliary prediction parameters retain their own independent task selection.
+    pub fn uses_weight_transform(&self) -> bool {
+        self.parameters
+            .iter()
+            .any(|parameter| parameter.lowering().transforms_payload())
     }
     /// Returns the authoritative exact materialization task sequence.
     pub fn materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {

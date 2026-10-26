@@ -1629,7 +1629,7 @@ where
     )
     .map_err(|e| error(e.to_string()))?;
     let source_architecture =
-        if crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+        if selected.base().execution().uses_weight_transform() {
             let source_args = source
                 .with_checkpoint_formats(crate::replicated_text::requirement_formats(
                     selected.requirements().execution().execution(),
@@ -2019,15 +2019,7 @@ where
                 if selected
                     .base()
                     .execution()
-                    .parameters()
-                    .iter()
-                    .any(|parameter| {
-                        matches!(
-                            parameter.lowering(),
-                            eredu_runtime::WeightLoweringKind::Transform
-                                | eredu_runtime::WeightLoweringKind::DerivedTransform
-                        )
-                    })
+                    .uses_weight_transform()
                 {
                     let source_parameters = retained.parameters();
                     let source_layout =
@@ -3009,7 +3001,7 @@ where
         + RuntimeStateComponents<B>
         + AuxiliaryConvolutionState<B::Tensor>,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source = qwen_vl_with_formats(
@@ -3110,7 +3102,7 @@ where
         + RuntimeStateComponents<B>
         + AuxiliaryConvolutionState<B::Tensor>,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source_args = crate::gemma4::with_checkpoint_formats(
@@ -3232,7 +3224,7 @@ fn muse_transform_source<B>(
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source_args = crate::muse::with_checkpoint_formats(
@@ -3343,7 +3335,7 @@ where
         + RuntimeStateComponents<B>
         + AuxiliaryConvolutionState<B::Tensor>,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source_args = crate::inkling::with_checkpoint_formats(

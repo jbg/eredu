@@ -583,10 +583,7 @@ where
             });
         }
         validate_exact_task_provenance(task, source)?;
-        let is_local_transform = matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        );
+        let is_local_transform = task.lowering().transforms_payload();
         if is_local_transform {
             locally_materialized.insert(target.clone());
         }
@@ -638,10 +635,7 @@ where
             } else if let Some(physical) = companion.catalog_source() {
                 validate_physical_source(physical, source)?;
                 DerivedWeightRecipe::source(physical.catalog_key(), TensorSelection::Full)
-            } else if matches!(
-                task.lowering(),
-                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-            ) || matches!(
+            } else if task.lowering().transforms_payload() || matches!(
                 task.source_encoding(),
                 eredu_checkpoint::SourceTensorEncoding::Gguf { .. }
             ) {
@@ -759,10 +753,7 @@ fn validate_exact_task_provenance(
     task: &ReplicatedTextMaterializationTask,
     source: &dyn CheckpointSource,
 ) -> Result<(), ModuleBindingPlanError> {
-    if matches!(
-        task.lowering(),
-        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-    ) {
+    if task.lowering().transforms_payload() {
         return Ok(());
     }
     let declared = task

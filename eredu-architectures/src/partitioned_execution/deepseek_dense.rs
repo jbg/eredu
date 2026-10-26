@@ -70,13 +70,7 @@ where
         &partition,
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().uses_weight_transform() {
         let source_args = crate::replicated_text::source_deepseek_v3_args(args, selected.base())
             .map_err(architecture)?;
         let source_definition = crate::deepseek::v3::project_parameters(&source_args, &retained)

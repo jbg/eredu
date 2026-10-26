@@ -8668,15 +8668,7 @@ where
         | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(args))) => {
             let source_args = selected
                 .base()
-                .parameters()
-                .iter()
-                .any(|p| {
-                    matches!(
-                        p.lowering(),
-                        eredu_runtime::WeightLoweringKind::Transform
-                            | eredu_runtime::WeightLoweringKind::DerivedTransform
-                    )
-                })
+                .uses_weight_transform()
                 .then(|| crate::replicated_text::source_nanbeige_args(args, selected.base()))
                 .transpose()
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -8700,15 +8692,7 @@ where
         | (None, Some(crate::configuration::GgufModelConfig::Gemma2(args))) => {
             let source_args = selected
                 .base()
-                .parameters()
-                .iter()
-                .any(|parameter| {
-                    matches!(
-                        parameter.lowering(),
-                        eredu_runtime::WeightLoweringKind::Transform
-                            | eredu_runtime::WeightLoweringKind::DerivedTransform
-                    )
-                })
+                .uses_weight_transform()
                 .then(|| crate::replicated_text::source_gemma2_args(args, selected.base()))
                 .transpose()
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -8733,15 +8717,7 @@ where
         | (None, Some(crate::configuration::GgufModelConfig::Llama(args))) => {
             let source_args = selected
                 .base()
-                .parameters()
-                .iter()
-                .any(|parameter| {
-                    matches!(
-                        parameter.lowering(),
-                        eredu_runtime::WeightLoweringKind::Transform
-                            | eredu_runtime::WeightLoweringKind::DerivedTransform
-                    )
-                })
+                .uses_weight_transform()
                 .then(|| crate::replicated_text::source_llama_args(args, selected.base()))
                 .transpose()
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -8768,15 +8744,7 @@ where
         {
             let source_args = selected
                 .base()
-                .parameters()
-                .iter()
-                .any(|parameter| {
-                    matches!(
-                        parameter.lowering(),
-                        eredu_runtime::WeightLoweringKind::Transform
-                            | eredu_runtime::WeightLoweringKind::DerivedTransform
-                    )
-                })
+                .uses_weight_transform()
                 .then(|| crate::replicated_text::source_qwen_args(args, selected.base()))
                 .transpose()
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -8802,15 +8770,7 @@ where
         {
             let source_args = selected
                 .base()
-                .parameters()
-                .iter()
-                .any(|parameter| {
-                    matches!(
-                        parameter.lowering(),
-                        eredu_runtime::WeightLoweringKind::Transform
-                            | eredu_runtime::WeightLoweringKind::DerivedTransform
-                    )
-                })
+                .uses_weight_transform()
                 .then(|| crate::replicated_text::source_k2_horizon_args(args, selected.base()))
                 .transpose()
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -8921,15 +8881,7 @@ where
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
         let source_args = selected
             .base()
-            .parameters()
-            .iter()
-            .any(|parameter| {
-                matches!(
-                    parameter.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            })
+            .uses_weight_transform()
             .then(|| args.clone());
         let capability_estimate =
             crate::capability::nemotron_h(&selected_args).map_err(|error| {
@@ -8971,15 +8923,7 @@ where
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
         let source_args = selected
             .base()
-            .parameters()
-            .iter()
-            .any(|parameter| {
-                matches!(
-                    parameter.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            })
+            .uses_weight_transform()
             .then(|| args.clone());
         let capability_estimate =
             crate::capability::kimi_linear(&selected_args).map_err(|error| {
@@ -9030,15 +8974,7 @@ where
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let source_args = selected
         .base()
-        .parameters()
-        .iter()
-        .any(|parameter| {
-            matches!(
-                parameter.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            )
-        })
+        .uses_weight_transform()
         .then(|| args.clone());
     let capability_estimate = crate::capability::lfm2(&selected_args)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
@@ -9153,15 +9089,7 @@ where
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let source_args = selected
         .base()
-        .parameters()
-        .iter()
-        .any(|parameter| {
-            matches!(
-                parameter.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            )
-        })
+        .uses_weight_transform()
         .then(|| args.clone());
     let capability_estimate = crate::capability::nemotron_h(&selected_args)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
@@ -10958,13 +10886,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::lfm2::with_checkpoint_formats(
             &source_args,
@@ -11123,13 +11045,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::kimi_linear::with_checkpoint_formats(
             &source_args,
@@ -11285,13 +11201,7 @@ where
         crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_definition = crate::nemotron_h::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
@@ -11453,13 +11363,7 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     crate::deepseek::V3PartitionLocalFoundation::from_partition(&selected_args, &partition)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args =
             crate::replicated_text::source_deepseek_v3_args(&selected_args, selected.base().text())
@@ -11639,13 +11543,7 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     crate::deepseek::V4PartitionLocalFoundation::from_partition(&selected_args, &partition)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args =
             crate::replicated_text::source_deepseek_v4_args(&selected_args, selected.base().text())

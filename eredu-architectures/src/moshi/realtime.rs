@@ -1238,12 +1238,11 @@ pub fn selected_moshi_lowering_summary(
     }
 
     let mut transform = None;
-    for lowering in selected.weight_lowerings().iter().filter(|lowering| {
-        matches!(
-            lowering.kind(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    for lowering in selected
+        .weight_lowerings()
+        .iter()
+        .filter(|lowering| lowering.kind().transforms_payload())
+    {
         let quantization = lowering
             .descriptor()
             .executable()
@@ -1295,12 +1294,7 @@ where
             "Moshi realtime topology and rank-local parallel plan differ".into(),
         ));
     }
-    let transforms = selected.weight_lowerings().iter().any(|lowering| {
-        matches!(
-            lowering.kind(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    });
+    let transforms = selected.weight_lowerings().iter().any(|lowering| lowering.kind().transforms_payload());
     let source_config = transforms.then(|| preparation.config().clone());
 
     visitor.construction_started();

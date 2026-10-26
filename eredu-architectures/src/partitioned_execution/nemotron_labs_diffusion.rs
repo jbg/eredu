@@ -52,7 +52,7 @@ where
     )
     .map_err(|e| error(e.to_string()))?;
     validate_partitioned_binding(selected.requirements(), &partition).map_err(error)?;
-    let source_architecture = if crate::replicated_text::selected_uses_transform(selected.base()) {
+    let source_architecture = if selected.base().uses_weight_transform() {
         let source = args
             .with_checkpoint_formats(crate::replicated_text::requirement_formats(
                 selected.base().requirements(),

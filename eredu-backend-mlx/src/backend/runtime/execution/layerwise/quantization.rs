@@ -705,10 +705,7 @@ where
     }
     let mut requested = BTreeMap::new();
     for task in tasks {
-        if !matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        ) {
+        if !task.lowering().transforms_payload() {
             return Err(Error::Quantization(format!(
                 "exact materialization task {:?} did not select a transform lowering",
                 task.name()
@@ -820,12 +817,10 @@ where
         }
     }
     let mut recipes = BTreeMap::new();
-    for task in tasks.iter().filter(|task| {
-        matches!(
-            task.lowering().kind(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    for task in tasks
+        .iter()
+        .filter(|task| task.lowering().kind().transforms_payload())
+    {
         let target = task.lowering().target().as_str();
         if task
             .lowering()

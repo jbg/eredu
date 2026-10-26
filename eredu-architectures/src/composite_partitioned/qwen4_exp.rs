@@ -172,7 +172,7 @@ impl PreparedConditionalPartition {
             ));
         }
         let source_architecture =
-            if crate::replicated_text::selected_uses_transform(execution.text()) {
+            if execution.text().uses_weight_transform() {
                 let source_vision = ingress.vision().config().clone();
                 let (source_tensor, source_parameters, source_layout, source_experts) =
                     local_geometry(&source_bound, &ingress, &source_vision, rank)

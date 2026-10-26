@@ -111,7 +111,7 @@ impl PreparedTargetPartition {
             .map_err(invalid)?;
 
         let source_architecture =
-            if crate::replicated_text::selected_uses_transform(selected.base().text()) {
+            if selected.base().text().uses_weight_transform() {
                 let source_bound = source_partition.source_bound_spec().clone();
                 let source_parameters = source_bound
                     .geometry()

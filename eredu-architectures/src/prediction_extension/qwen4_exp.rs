@@ -535,13 +535,7 @@ where
                 let layout = partition
                     .local_layout(&parameters, &local)
                     .map_err(|error| invalid(error.to_string()))?;
-                let source_layout = if tasks.iter().any(|task| {
-                    matches!(
-                        task.lowering(),
-                        eredu_runtime::WeightLoweringKind::Transform
-                            | eredu_runtime::WeightLoweringKind::DerivedTransform
-                    )
-                }) {
+                let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
                     Some(std::sync::Arc::new(
                         source_partition
                             .local_layout(

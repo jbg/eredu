@@ -4097,13 +4097,7 @@ where
                 .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v3_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| {
-                matches!(
-                    task.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            }) {
+            let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
                 let source_parameters = extension.definition().parameters();
                 Some(std::sync::Arc::new(
                     eredu_runtime::derive_partitioned_transform_source_layout(
@@ -4216,13 +4210,7 @@ where
                 .map_err(|error| invalid(error.to_string()))?;
             let state_layout = crate::deepseek::v4::state_layout(geometry.args())
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| {
-                matches!(
-                    task.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            }) {
+            let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
                 let source_parameters = extension.definition().parameters();
                 Some(std::sync::Arc::new(
                     eredu_runtime::derive_partitioned_transform_source_layout(
@@ -4533,13 +4521,7 @@ where
                 .map_err(invalid)?;
             let geometry = crate::nemotron_h::local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| {
-                matches!(
-                    task.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            }) {
+            let source_layout = if tasks.iter().any(|task| task.lowering().transforms_payload()) {
                 Some(std::sync::Arc::new(
                     eredu_runtime::derive_partitioned_transform_source_layout(
                         &source_description,

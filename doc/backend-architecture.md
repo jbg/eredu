@@ -10568,6 +10568,11 @@ source and target to native materialization. Backends consume that prepared
 handoff rather than reconstructing family configuration from target tensors.
 
 Transform source modules use the selected target's partition ownership. Runtime's
+`WeightLoweringKind::transforms_payload` distinguishes payload conversion from
+direct loading and recipe-only derivation. Retained text selections expose this
+decision over their ordinary parameters; auxiliary prediction preparation inspects
+its own task set. Families and native materializers consume the same distinction
+for source-module construction, conversion grouping and residency accounting.
 `derive_partitioned_transform_source_layout` validates the source and target
 invocation graphs and unit addresses, lowers both retained declarations for the
 selected rank, and projects source coordinates. Its typed error distinguishes

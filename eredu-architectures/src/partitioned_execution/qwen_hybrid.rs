@@ -102,13 +102,7 @@ where
         &partition,
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().uses_weight_transform() {
         let source_args = args.clone();
         let source_definition = crate::qwen::hybrid::project_parameters(&source_args, &retained)
             .map_err(architecture)?;
@@ -266,13 +260,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().text().uses_weight_transform() {
         let source_definition =
             crate::qwen::hybrid::project_parameters(args, &retained).map_err(architecture)?;
         let source_parameters = source_definition.parameters().clone();

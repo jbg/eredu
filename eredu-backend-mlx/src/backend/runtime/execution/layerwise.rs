@@ -12,7 +12,7 @@ use eredu_checkpoint::{
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
     RealtimeMaterializationTask, ReplicatedTextMaterializationTask, WeightBinding,
-    WeightLoweringKind, DENSE_TRANSFER_WINDOW,
+    DENSE_TRANSFER_WINDOW,
 };
 
 use std::{

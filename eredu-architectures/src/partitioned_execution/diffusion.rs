@@ -68,13 +68,7 @@ where
         selected.requirements().ownership().clone(),
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().text().uses_weight_transform() {
         let source_parameters = retained.parameters();
         let source_layout =
             derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
@@ -212,13 +206,7 @@ where
         selected.requirements().ownership().clone(),
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().uses_weight_transform() {
         let source_parameters = retained.parameters();
         let source_layout =
             derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)

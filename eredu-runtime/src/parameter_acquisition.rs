@@ -142,10 +142,7 @@ pub fn parameter_acquisition_units(
         let unit = &mut units[unit_index];
         unit.task_indices.push(index);
         let mut bytes = crate::selected_materialization_task_bytes(task)?;
-        if !matches!(
-            task.lowering(),
-            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-        ) {
+        if !task.lowering().transforms_payload() {
             for companion in task.output_companions() {
                 let companion_bytes = companion
                     .derived_output()
@@ -303,10 +300,7 @@ pub fn local_parameter_acquisition_units(
             let task = &tasks[*index];
             let primary = metadata(task.name(), task.source_recipe()?, layout, source)?;
             let mut bytes = crate::selected_addressable_parameter_bytes(task, &primary)?;
-            if !matches!(
-                task.lowering(),
-                crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-            ) {
+            if !task.lowering().transforms_payload() {
                 for companion in task.output_companions() {
                     let recipe = if let Some(task) = companion.materialization_task() {
                         task.source_recipe()?
