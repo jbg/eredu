@@ -1,8 +1,6 @@
 //! Exact physical placement over retained tensor-rank selections.
 use super::*;
-use eredu_runtime::{
-    ArchitectureParameterDescription, LocalModelLayout, LocalTensorLayout, TensorPlacement,
-};
+use eredu_runtime::{ArchitectureParameterDescription, LocalModelLayout};
 
 impl TargetTensorPartition {
     /// Projects global parameters into the independently described local module shapes.
@@ -149,82 +147,24 @@ fn project_expert_layout<'a>(
             }
         }
     }
-    let local: Option<BTreeMap<_, _>> = expert_local.map(|expert_local| {
-        expert_local
-            .groups()
-            .iter()
-            .flat_map(|group| {
-                group
-                    .members()
-                    .iter()
-                    .map(move |member| (member.target(), (group, member)))
-            })
-            .collect()
-    });
-    if local
-        .as_ref()
-        .is_some_and(|local| local.len() != tensor.len())
-    {
-        return Err(invalid(
-            "expert placement changed the canonical parameter identities",
-        ));
-    }
-    let mut layout = LocalModelLayout::default();
-    for (name, tp) in tensor.tensors() {
-        let member = if let Some(local) = &local {
-            let (group, member) = local
-                .get(name)
-                .ok_or_else(|| invalid("local expert parameter absent"))?;
-            if group.group().logical_name() != tp.logical_name()
-                || group.group().role() != tp.role()
+    let mut ranges = BTreeMap::new();
+    if expert_ranks > 1 {
+        for name in experts {
+            if tensor
+                .tensor(&name)
+                .and_then(|tp| tp.global_shape().first())
+                .copied()
+                != Some(global_experts)
             {
-                return Err(invalid(format!(
-                    "expert placement changed the owner of {name}"
-                )));
-            }
-            Some(*member)
-        } else {
-            None
-        };
-        let mut shape = tp.local_shape().to_vec();
-        let ep_range = if expert_ranks > 1 && experts.contains(name) {
-            if tp.global_shape().first().copied() != Some(global_experts) {
                 return Err(invalid(format!(
                     "expert parameter {name} has an invalid group axis"
                 )));
             }
-            Some(range.clone())
-        } else {
-            None
-        };
-        if let Some(range) = &ep_range {
-            shape[0] = range.len();
+            ranges.insert(name, (0, range.clone()));
         }
-        if member.is_some_and(|member| shape != member.global_shape()) {
-            return Err(invalid(format!(
-                "parameter {name} expert-local shape differs from retained selection {shape:?}"
-            )));
-        }
-        let mut placed = LocalTensorLayout::new(
-            tp.logical_name(),
-            tp.role(),
-            tp.global_shape().to_vec(),
-            shape,
-            tp.placement().clone(),
-            tp.logical_units(),
-            tp.logical_range().cloned(),
-            false,
-        );
-        if let Some(range) = ep_range {
-            placed = placed.with_additional_placement(TensorPlacement::Range {
-                axis: 0,
-                start: range.start,
-                end: range.end,
-            });
-        }
-        layout.insert(name.to_owned(), placed);
     }
-    Ok(layout)
+    eredu_runtime::project_additional_parameter_ranges(&tensor, &ranges, expert_local)
+        .map_err(Error::from)
 }
 
 /// The runtime traverses lexical injections and decoder layers as distinct units.

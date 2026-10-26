@@ -35,6 +35,9 @@ pub enum ParameterSelectionLayoutError {
     /// Physical ranges split axes, are empty or exceed the declared shape.
     #[error("parameter {0} has an invalid physical range")]
     InvalidRange(String),
+    /// Independent physical selections cannot select the same axis twice.
+    #[error("parameter {0} already selects this physical axis")]
+    OverlappingAxis(String),
     /// The complete selected physical width cannot be represented.
     #[error("parameter {0} selected width overflowed")]
     WidthOverflow(String),
@@ -211,4 +214,97 @@ fn member_index(
                 .map(move |member| (member.target(), (group, member)))
         })
         .collect()
+}
+
+/// Composes independent checkpoint-global ranges with an existing physical layout.
+/// Each target declares an axis and a nonempty range on an otherwise unselected axis.
+/// Primary coordinate domains, chunk geometry and prior independent placements remain
+/// retained. An optional local catalog validates exact targets, group roles and shapes.
+/// This projects metadata only; ordinary binding applies the composed placements once.
+pub fn project_additional_parameter_ranges(
+    tensor: &LocalModelLayout,
+    ranges: &BTreeMap<String, (usize, std::ops::Range<usize>)>,
+    local: Option<&ArchitectureParameterDescription>,
+) -> Result<LocalModelLayout, ParameterSelectionLayoutError> {
+    let local = local.map(member_index);
+    if local.as_ref().is_some_and(|local| {
+        local.len() != tensor.len() || local.keys().any(|name| !tensor.contains(name))
+    }) {
+        return Err(ParameterSelectionLayoutError::Targets);
+    }
+    if let Some(name) = ranges.keys().find(|name| !tensor.contains(name)) {
+        return Err(ParameterSelectionLayoutError::UnknownTarget(
+            name.to_owned(),
+        ));
+    }
+    let mut layout = LocalModelLayout::default();
+    for (name, selected) in tensor.tensors() {
+        let member = local.as_ref().map(|local| local[name]);
+        if member.is_some_and(|(group, _)| {
+            group.group().logical_name() != selected.logical_name()
+                || group.group().role() != selected.role()
+        }) {
+            return Err(ParameterSelectionLayoutError::ChangedOwner(name.to_owned()));
+        }
+        let mut shape = selected.local_shape().to_vec();
+        let additional = if let Some((axis, range)) = ranges.get(name) {
+            let width = selected
+                .global_shape()
+                .get(*axis)
+                .copied()
+                .ok_or_else(|| ParameterSelectionLayoutError::InvalidAxis(name.to_owned()))?;
+            if range.start >= range.end || range.end > width {
+                return Err(ParameterSelectionLayoutError::InvalidRange(name.to_owned()));
+            }
+            let selects_axis = |placement: &TensorPlacement| match placement {
+                TensorPlacement::Range { axis: existing, .. }
+                | TensorPlacement::Shard { axis: existing, .. }
+                | TensorPlacement::Indices { axis: existing, .. } => existing == axis,
+                _ => false,
+            };
+            if shape.get(*axis) != Some(&width)
+                || selects_axis(selected.placement())
+                || selected.additional_placements().iter().any(selects_axis)
+            {
+                return Err(ParameterSelectionLayoutError::OverlappingAxis(
+                    name.to_owned(),
+                ));
+            }
+            shape[*axis] = range.len();
+            Some(TensorPlacement::Range {
+                axis: *axis,
+                start: range.start,
+                end: range.end,
+            })
+        } else {
+            None
+        };
+        if member.is_some_and(|(_, member)| member.global_shape() != shape) {
+            return Err(ParameterSelectionLayoutError::LocalShape {
+                target: name.to_owned(),
+                expected: shape,
+            });
+        }
+        let mut placed = LocalTensorLayout::new(
+            selected.logical_name(),
+            selected.role(),
+            selected.global_shape().to_vec(),
+            shape,
+            selected.placement().clone(),
+            selected.logical_units(),
+            selected.logical_range().cloned(),
+            selected.fell_back_to_replication(),
+        )
+        .with_partition_chunk_size(selected.partition_chunk_size());
+        for placement in selected
+            .additional_placements()
+            .iter()
+            .cloned()
+            .chain(additional)
+        {
+            placed = placed.with_additional_placement(placement);
+        }
+        layout.insert(name.to_owned(), placed);
+    }
+    Ok(layout)
 }

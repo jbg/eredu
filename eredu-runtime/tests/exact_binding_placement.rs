@@ -732,7 +732,7 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
             "experts",
             ParameterRole::ExpertIntermediate,
             vec![4, 8, 2],
-            vec![2, 4, 2],
+            vec![4, 4, 2],
             TensorPlacement::Shard {
                 axis: 1,
                 index: 1,
@@ -741,13 +741,40 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
             None,
             None,
             false,
-        )
-        .with_additional_placement(TensorPlacement::Range {
-            axis: 0,
-            start: 2,
-            end: 4,
-        }),
+        ),
     );
+    let ranges =
+        |axis, range| std::collections::BTreeMap::from([("weight".to_owned(), (axis, range))]);
+    let layout =
+        eredu_runtime::project_additional_parameter_ranges(&layout, &ranges(0, 2..4), None)
+            .unwrap();
+    assert!(matches!(
+        eredu_runtime::project_additional_parameter_ranges(&layout, &ranges(0, 0..2), None),
+        Err(eredu_runtime::ParameterSelectionLayoutError::OverlappingAxis(_))
+    ));
+    assert!(matches!(
+        eredu_runtime::project_additional_parameter_ranges(&layout, &ranges(1, 0..4), None),
+        Err(eredu_runtime::ParameterSelectionLayoutError::OverlappingAxis(_))
+    ));
+    assert!(matches!(
+        eredu_runtime::project_additional_parameter_ranges(&layout, &ranges(2, 1..3), None),
+        Err(eredu_runtime::ParameterSelectionLayoutError::InvalidRange(
+            _
+        ))
+    ));
+    let composed =
+        eredu_runtime::project_additional_parameter_ranges(&layout, &ranges(2, 1..2), None)
+            .unwrap();
+    let composed_bindings = bind(&source, &task, vec![2, 4, 1], Some(&composed)).unwrap();
+    assert_eq!(
+        composed_bindings[0]
+            .source_recipe()
+            .infer(&source as &dyn CheckpointSource)
+            .unwrap()
+            .shape(),
+        [2, 4, 1]
+    );
+    assert_eq!(composed_bindings[0].expected_bytes(), 32);
     let bindings = bind(&source, &task, vec![2, 4, 2], Some(&layout)).unwrap();
     assert_eq!(
         bindings[0]
@@ -920,15 +947,19 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
     use eredu_runtime::parameter_operations::{
         prepare_bank_parameter_replacements, BankParameterReplacementFacts,
     };
-    let replacement =
-        prepare_bank_parameter_replacements(&parameters[0].members, &members, true, |parameter| {
+    let replacement = prepare_bank_parameter_replacements(
+        &parameters[0].members,
+        &members,
+        true,
+        |parameter| {
             (parameter == "weight").then_some(BankParameterReplacementFacts {
                 leading_dimension: Some(2),
                 element_type: Some(eredu_nn::TensorElementType::F16),
                 byte_len: 32,
             })
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     let (selected, effective_bytes) = replacement.into_parts();
     assert_eq!(selected, BTreeSet::from(["weight".to_owned()]));
     assert_eq!(effective_bytes.values().copied().sum::<u64>(), 32);

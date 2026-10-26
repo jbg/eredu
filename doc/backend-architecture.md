@@ -12100,8 +12100,13 @@ planning derives placement from these declarations. Runtime
 declared local shapes. Fused segments preserve order and equal physical chunks
 retain their coordinate domains. Typed projection errors retain the affected target
 and their original cause through neutral error translation. Target and prediction
-use this same compiler; architecture code retains TP/EP recipes and exceptional
-head, expert and encoding geometry. Selected conditional construction validates
+use this same compiler. Runtime `project_additional_parameter_ranges` composes
+independent physical axes with that retained layout, validates optional local
+catalog geometry, and preserves prior placements and coordinate metadata. It
+rejects overlapping physical axes and invalid or unknown target ranges before
+binding applies the selections. Architecture code identifies packed expert
+resources, admits their expert realization, and retains TP/EP recipes and
+exceptional head, expert and encoding geometry. Selected conditional construction validates
 ingress and placement, then constructs the tensor-local target and vision modules directly.
 The conditional target/vision definition retains global invocation paths, optional
 encoder dependencies and transport ownership through runtime parameter projection
