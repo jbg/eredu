@@ -448,9 +448,6 @@ pub fn parameter_contract(
         .group_id(1)
         .expect("Moshi layout contains the depth group")
         .clone();
-    let temporal_hidden = dimension("temporal hidden width", config.temporal().hidden_size())?;
-    let text_vocabulary = dimension("text vocabulary", config.text_vocabulary_size())?;
-    let audio_vocabulary = dimension("audio vocabulary", config.audio_vocabulary_size())?;
     let mut owned = Vec::new();
 
     let mut add_static = |owner: &str,
@@ -529,46 +526,49 @@ pub fn parameter_contract(
         }
     }
     for slice in 0..depth_slices {
-        let transformer = config
-            .depth_transformer(slice)
+        let construction = super::depth::DepthConstruction::new(config, slice)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let hidden = dimension("depth hidden width", transformer.hidden_size())?;
-        let prefix = format!("depformer.slices.{slice}");
-        let input_vocabulary = if slice == 0 {
-            text_vocabulary
-        } else {
-            audio_vocabulary
-        } + 1;
+        let transformer = construction.transformer;
+        let embedding = construction.embedding;
+        let input = construction.input;
+        let output = construction.output;
         let owner = ParameterGroupOwner::execution_unit(depth_group.clone(), slice);
-        let mut groups = vec![
-            ParameterGroupSpec::new(
-                format!("{prefix}.emb"),
+        let declarations = [
+            (
+                &embedding.weight,
                 ParameterRole::Vocabulary,
-                [ParameterMemberSpec::new(
-                    format!("{prefix}.emb.weight"),
-                    vec![input_vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-            ParameterGroupSpec::new(
-                format!("{prefix}.linear_in"),
+                [embedding.vocabulary, embedding.dimensions],
+                MemberSharding::Balanced { axis: 0 },
+            ),
+            (
+                &input.weight,
                 ParameterRole::Replicated,
-                [ParameterMemberSpec::new(
-                    format!("{prefix}.linear_in.weight"),
-                    vec![hidden, temporal_hidden],
-                    MemberSharding::Replicated,
-                )],
-            )?,
-            ParameterGroupSpec::new(
-                format!("{prefix}.linear_out"),
+                [input.output, input.input],
+                MemberSharding::Replicated,
+            ),
+            (
+                &output.weight,
                 ParameterRole::Vocabulary,
-                [ParameterMemberSpec::new(
-                    format!("{prefix}.linear_out.weight"),
-                    vec![audio_vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
+                [output.output, output.input],
+                MemberSharding::Balanced { axis: 0 },
+            ),
         ];
+        let mut groups = Vec::new();
+        for (weight, role, shape, sharding) in declarations {
+            let target = weight.id.as_str();
+            groups.push(ParameterGroupSpec::new(
+                target.trim_end_matches(".weight"),
+                role,
+                [ParameterMemberSpec::new(
+                    target,
+                    shape
+                        .into_iter()
+                        .map(|value| dimension("depth matrix dimension", value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    sharding,
+                )],
+            )?);
+        }
         for layer in 0..dimension("depth layer count", transformer.num_hidden_layers())? {
             groups.extend(symbolic_block_parameter_groups(&transformer, layer)?);
         }

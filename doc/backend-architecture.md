@@ -8534,9 +8534,10 @@ materialization use the same constructor. Local table ranges resolve directly by
 the declared parameter identity; all vocabulary ranges are validated before any
 table is allocated. Input padding rows and the unpadded readout remain distinct.
 
-Moshi depth slices declare their embedding, temporal projection and audio readout
-once for complete and tensor-local construction. Runtime vocabulary placement
-materializes the independently selected embedding and readout; the temporal
+Moshi depth slices declare their embedding, temporal projection, audio readout
+and shared-block geometry once. Cold parameter contracts and complete/tensor-local
+construction consume these backend-neutral specifications. Runtime vocabulary
+placement materializes the independently selected embedding and readout; the temporal
 projection remains complete. The family retains its padded text/audio input
 cardinalities, distinct audio output cardinality, aligned decoder-block geometry,
 zero-sentinel lookup and frame-local state reuse. Both vocabulary selections are

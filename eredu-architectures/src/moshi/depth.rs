@@ -8,6 +8,66 @@ use eredu_runtime::{LayerRuntimeState, VocabularyModulePlacement};
 
 use super::{block, MoshiConfig, MoshiTransformerConfig};
 
+/// One slice's neutral edge resources and shared-block geometry.
+pub(super) struct DepthConstruction {
+    pub(super) transformer: MoshiTransformerConfig,
+    pub(super) embedding: EmbeddingSpec,
+    pub(super) input: LinearSpec,
+    pub(super) output: LinearSpec,
+}
+
+impl DepthConstruction {
+    pub(super) fn new(config: &MoshiConfig, index: usize) -> Result<Self, Error> {
+        let transformer = config.depth_transformer(index).map_err(Error::backend)?;
+        let prefix = format!("depformer.slices.{index}");
+        let input_vocabulary = if index == 0 {
+            config.text_vocabulary_size()
+        } else {
+            config.audio_vocabulary_size()
+        }
+        .checked_add(1)
+        .ok_or_else(|| Error::backend("Moshi depth input vocabulary overflowed"))?;
+        let embedding_name = format!("{prefix}.emb.weight");
+        let input_name = format!("{prefix}.linear_in.weight");
+        let output_name = format!("{prefix}.linear_out.weight");
+        let embedding = EmbeddingSpec {
+            vocabulary: input_vocabulary,
+            dimensions: transformer.hidden_size(),
+            weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
+            format: crate::linear_format::standard_linear_format(
+                &embedding_name,
+                config.native_quantization().into(),
+            )?,
+        };
+        let input = LinearSpec {
+            input: config.temporal().hidden_size(),
+            output: transformer.hidden_size(),
+            weight: ParameterSpec::trainable(&input_name).map_err(Error::backend)?,
+            bias: None,
+            format: crate::linear_format::standard_linear_format(
+                &input_name,
+                config.native_quantization().into(),
+            )?,
+        };
+        let output = LinearSpec {
+            input: transformer.hidden_size(),
+            output: config.audio_vocabulary_size(),
+            weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
+            bias: None,
+            format: crate::linear_format::standard_linear_format(
+                &output_name,
+                config.native_quantization().into(),
+            )?,
+        };
+        Ok(Self {
+            transformer,
+            embedding,
+            input,
+            output,
+        })
+    }
+}
+
 /// One ordered codebook slice with its own projections and shared decoder blocks.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -50,47 +110,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         geometry: Option<&super::LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let transformer = config.depth_transformer(index).map_err(Error::backend)?;
-        let prefix = format!("depformer.slices.{index}");
-        let input_vocabulary = if index == 0 {
-            config.text_vocabulary_size()
-        } else {
-            config.audio_vocabulary_size()
-        }
-        .checked_add(1)
-        .ok_or_else(|| Error::backend("Moshi depth input vocabulary overflowed"))?;
-        let embedding_name = format!("{prefix}.emb.weight");
-        let input_name = format!("{prefix}.linear_in.weight");
-        let output_name = format!("{prefix}.linear_out.weight");
-        let embedding_spec = EmbeddingSpec {
-            vocabulary: input_vocabulary,
-            dimensions: transformer.hidden_size(),
-            weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-            format: crate::linear_format::standard_linear_format(
-                &embedding_name,
-                config.native_quantization().into(),
-            )?,
-        };
-        let input_spec = LinearSpec {
-            input: config.temporal().hidden_size(),
-            output: transformer.hidden_size(),
-            weight: ParameterSpec::trainable(&input_name).map_err(Error::backend)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(
-                &input_name,
-                config.native_quantization().into(),
-            )?,
-        };
-        let output_spec = LinearSpec {
-            input: transformer.hidden_size(),
-            output: config.audio_vocabulary_size(),
-            weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(
-                &output_name,
-                config.native_quantization().into(),
-            )?,
-        };
+        let DepthConstruction {
+            transformer,
+            embedding: embedding_spec,
+            input: input_spec,
+            output: output_spec,
+        } = DepthConstruction::new(config, index)?;
         let placement = |name: &str, vocabulary, missing| -> Result<_, Error> {
             Ok(match geometry {
                 None => VocabularyModulePlacement::Local,
@@ -106,12 +131,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             })
         };
         let embedding = placement(
-            &embedding_name,
+            embedding_spec.weight.id.as_str(),
             embedding_spec.vocabulary,
             "missing depth embedding range",
         )?;
         let output = placement(
-            &output_name,
+            output_spec.weight.id.as_str(),
             output_spec.output,
             "missing depth output range",
         )?;
