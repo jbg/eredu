@@ -1938,9 +1938,14 @@ use the same ordered equations; range requests skip unselected depths through
 the shared execution graph. Quantization retains the original latent, residual
 and selected codes through completion. Decode adds means in depth order, and
 range encoding starts from the supplied residual without subtracting an implicit
-prefix. `QuantizerExecution` connects either provider to waveform decoding and
-the finite encoder used for fixed-Aria startup. Both borrow the same quantizer
-owner. Cold `PreparedQuantizerBindings` restricts exact source recipes to codec
+prefix. `QuantizerExecution` implements range operations directly on
+`LayerwiseRuntime` over the shared component adapter, connecting resident or
+bounded providers to waveform decoding and the finite encoder used for fixed-Aria
+startup. Both borrow the same quantizer owner. `ParallelQuantizerExecution` requires
+typed invocation and guarded channel-collective participation; its range operations
+share typed result extraction through the same runtime lifecycle. Ordinary calls
+on a selected parallel runtime retain the explicit guarded-execution requirement.
+Native composition constructs the shared runtime and inspects its policy directly. Cold `PreparedQuantizerBindings` restricts exact source recipes to codec
 codebooks and accounts for F32 conversion; native binding consumes that plan
 through the existing parameter policies.
 

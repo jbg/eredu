@@ -740,57 +740,6 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     }
 }
 
-/// Residual quantization using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseQuantizer<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >,
-}
-impl<B, P> LayerwiseQuantizer<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact codebook unit policy.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<Error, P>,
 ) -> Error {
@@ -807,14 +756,20 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-impl<B, P> QuantizerExecution<B> for LayerwiseQuantizer<B, P>
+impl<B, P> QuantizerExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, Codebook<B::Tensor>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn validate_coordinated_execution(&self) -> Result<(), Error> {
-        if self.runtime.architecture().kernel().is_parallel() {
+        if self.architecture().kernel().is_parallel() {
             Err(invalid(
                 "parallel PRVQ requires guarded collective execution",
             ))
@@ -823,7 +778,7 @@ where
         }
     }
     fn geometry(&self) -> Geometry {
-        self.runtime.architecture().kernel().geometry()
+        self.architecture().kernel().geometry()
     }
     fn decode_range(
         &mut self,
@@ -832,8 +787,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke(QuantizerInput::Decode { codes, range }, &mut state, context)
+        self.invoke(QuantizerInput::Decode { codes, range }, &mut state, context)
             .map_err(runtime_error)
     }
     fn quantize_range(
@@ -844,51 +798,46 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Quantized<B::Tensor>, Error> {
         let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke_with_context(
-                QuantizerInput::Quantize {
-                    latent,
-                    range,
-                    metric,
-                },
-                &mut state,
-                context,
-            )
-            .map_err(runtime_error)?
-            .1
-            .into_quantized()
+        self.invoke_with_context(
+            QuantizerInput::Quantize {
+                latent,
+                range,
+                metric,
+            },
+            &mut state,
+            context,
+        )
+        .map_err(runtime_error)?
+        .1
+        .into_quantized()
     }
 }
 
-impl<B, P> LayerwiseQuantizer<B, P>
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
-    /// Decodes selected codebooks locally and publishes the full channels within the final lease.
-    pub fn decode_range_parallel(
+/// Tensor-parallel range operations over independently leased residual codebooks.
+/// Implementors supply typed invocation and guarded channel-collective participation.
+pub trait ParallelQuantizerExecution<B: DistributedNeuralBackend>: QuantizerExecution<B> {
+    /// Invokes a selected depth range with request-local roots retained to completion.
+    fn invoke_parallel(
+        &mut self,
+        input: QuantizerInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error>;
+
+    /// Publishes full decoded channels while the final selected codebook stays leased.
+    fn decode_range_parallel(
         &mut self,
         codes: &B::Tensor,
         range: Range<usize>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                QuantizerInput::Decode { codes, range },
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
+        self.invoke_parallel(QuantizerInput::Decode { codes, range }, parallel, context)
             .map(|(output, _)| output)
-            .map_err(runtime_error)
     }
-    /// Reduces channel distance scores before each categorical decision and returns global results.
-    pub fn quantize_range_parallel(
+
+    /// Reduces distance scores before each categorical decision and retains global results.
+    fn quantize_range_parallel(
         &mut self,
         latent: &B::Tensor,
         range: Range<usize>,
@@ -896,25 +845,63 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Quantized<B::Tensor>, Error> {
-        let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                QuantizerInput::Quantize {
-                    latent,
-                    range,
-                    metric,
-                },
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map_err(runtime_error)?
-            .1
-            .into_quantized()
+        self.invoke_parallel(
+            QuantizerInput::Quantize {
+                latent,
+                range,
+                metric,
+            },
+            parallel,
+            context,
+        )?
+        .1
+        .into_quantized()
+    }
+
+    /// Runs channel shards with shared acquisition and collective-preparation gates.
+    fn invoke_parallel_guarded<H, F>(
+        &mut self,
+        input: QuantizerInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        agree: F,
+    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error>
+    where
+        H: LayeredTraversalHook<B, QuantizerForward<B::Tensor>, Error> + ?Sized,
+        F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, Error>;
+}
+
+impl<B, P> ParallelQuantizerExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn invoke_parallel(
+        &mut self,
+        input: QuantizerInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error> {
+        self.forward_parallel_with_context_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |_, _, _| Ok(()),
+        )
+        .map_err(runtime_error)
     }
     /// Runs channel shards with shared acquisition and local collective-preparation gates.
-    pub fn invoke_parallel_guarded<H, F>(
+    fn invoke_parallel_guarded<H, F>(
         &mut self,
         input: QuantizerInput<'_, B::Tensor>,
         parallel: &B::ParallelContext,
@@ -957,19 +944,18 @@ where
         if !agree(descriptor, true, context)? {
             return Err(invalid("PRVQ participants selected different invocations"));
         }
-        self.runtime
-            .forward_parallel_with_unit_executor_and_traversal_hook(
-                input,
-                &mut StatelessComponentState::new()?,
-                parallel,
-                context,
-                |architecture, group, index, unit, hidden, _, forward, parallel, context| {
-                    architecture.kernel().forward_unit_guarded(
-                        group, index, unit, hidden, forward, parallel, context, &mut agree,
-                    )
-                },
-                hook,
-            )
-            .map_err(runtime_error)
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, _, forward, parallel, context| {
+                architecture.kernel().forward_unit_guarded(
+                    group, index, unit, hidden, forward, parallel, context, &mut agree,
+                )
+            },
+            hook,
+        )
+        .map_err(runtime_error)
     }
 }
