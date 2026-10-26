@@ -45,6 +45,23 @@ where
         ordinal: usize,
         module: &mut M::Module<U>,
     ) -> Result<(), Self::Error>;
+
+    /// Visits an ordered physical sequence from its declared first ordinal.
+    /// Shared modules remain separate calls in the surrounding topology.
+    fn visit_units<'a, U>(
+        &mut self,
+        first: usize,
+        units: impl IntoIterator<Item = &'a mut M::Module<U>>,
+    ) -> Result<(), Self::Error>
+    where
+        U: Parameterized<B::Tensor> + 'a,
+        M::Module<U>: 'a,
+    {
+        for (index, module) in units.into_iter().enumerate() {
+            self.visit::<U>(first + index, module)?;
+        }
+        Ok(())
+    }
 }
 
 use eredu_core::{cache::LayerCachePolicy, ParallelRankTopology, ParallelTopology};
@@ -950,6 +967,22 @@ where
     ) -> Result<Self::Module<M>, Self::Error>
     where
         M: Parameterized<B::Tensor>;
+
+    /// Materializes ordered units through their independent resource lifecycles.
+    /// Stops at the first error without acquiring later units.
+    fn materialize_units<U>(
+        context: &mut Self::Context<'_>,
+        units: impl IntoIterator<Item = PreparedPredictionUnit<U>>,
+        layout: Option<&LocalModelLayout>,
+    ) -> Result<Vec<Self::Module<U>>, Self::Error>
+    where
+        U: Parameterized<B::Tensor>,
+    {
+        units
+            .into_iter()
+            .map(|unit| Self::materialize_module(context, unit, layout))
+            .collect()
+    }
 
     /// Realizes one architecture-selected pooling-attention cache policy.
     fn pooling_state(
@@ -2531,10 +2564,7 @@ where
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        for (ordinal, module) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::deepseek::v3::Unit<B>>(ordinal, module)?;
-        }
-        Ok(())
+        visitor.visit_units::<crate::deepseek::v3::Unit<B>>(0, self.units.iter_mut())
     }
 
     fn supports_internal_observations(&self) -> bool {
@@ -2668,10 +2698,7 @@ where
                 (1, units)
             }
         };
-        for (ordinal, module) in units.iter_mut().enumerate() {
-            visitor.visit::<crate::deepseek::v4::Unit<B>>(offset + ordinal, module)?;
-        }
-        Ok(())
+        visitor.visit_units::<crate::deepseek::v4::Unit<B>>(offset, units.iter_mut())
     }
 
     fn supports_internal_observations(&self) -> bool {
@@ -2975,10 +3002,7 @@ where
         if let Some(shared) = self.shared.as_mut() {
             visitor.visit::<crate::inkling::MtpShared<B>>(0, shared)?;
         }
-        for (depth, unit) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::inkling::MtpDepth<B>>(depth + 1, unit)?;
-        }
-        Ok(())
+        visitor.visit_units::<crate::inkling::MtpDepth<B>>(1, self.units.iter_mut())
     }
 
     fn depth(&self) -> usize {
@@ -3107,10 +3131,7 @@ where
         visitor: &mut V,
     ) -> Result<(), V::Error> {
         visitor.visit::<crate::qwen::hybrid::PredictionShared<B>>(0, &mut self.shared)?;
-        for (ordinal, module) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::qwen::hybrid::PredictionUnit<B>>(ordinal + 1, module)?;
-        }
-        Ok(())
+        visitor.visit_units::<crate::qwen::hybrid::PredictionUnit<B>>(1, self.units.iter_mut())
     }
 
     fn depth(&self) -> usize {
@@ -3233,10 +3254,10 @@ where
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        for (ordinal, module) in self.groups.iter_mut().flatten().enumerate() {
-            visitor.visit::<crate::nemotron_h::PredictionUnit<B>>(ordinal, module)?;
-        }
-        Ok(())
+        visitor.visit_units::<crate::nemotron_h::PredictionUnit<B>>(
+            0,
+            self.groups.iter_mut().flatten(),
+        )
     }
 
     fn depth(&self) -> usize {
@@ -3830,10 +3851,7 @@ where
         match self {
             Self::DeepSeekV3 { layout, units, .. } => {
                 Ok(MaterializedPredictionExtension::DeepSeekV3 {
-                    units: units
-                        .into_iter()
-                        .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                        .collect::<Result<_, _>>()?,
+                    units: M::materialize_units(context, units, Some(&layout))?,
                 })
             }
             Self::DeepSeekV4 {
@@ -3842,10 +3860,7 @@ where
                 state,
                 ..
             } => Ok(MaterializedPredictionExtension::DeepSeekV4 {
-                units: units
-                    .into_iter()
-                    .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                    .collect::<Result<_, _>>()?,
+                units: M::materialize_units(context, units, Some(&layout))?,
                 state: state
                     .into_iter()
                     .map(|(ordinal, policy)| M::pooling_state(context, ordinal, policy))
@@ -3862,10 +3877,7 @@ where
                 Ok(MaterializedPredictionExtension::DeepSeekV4Dspark {
                     strategy,
                     static_modules: M::materialize_module(context, static_modules, Some(&layout))?,
-                    units: units
-                        .into_iter()
-                        .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                        .collect::<Result<_, _>>()?,
+                    units: M::materialize_units(context, units, Some(&layout))?,
                     state: state
                         .into_iter()
                         .map(|(ordinal, policy)| M::pooling_state(context, ordinal, policy))
@@ -3882,10 +3894,7 @@ where
                 shared: shared
                     .map(|shared| M::materialize_module(context, shared, Some(&layout)))
                     .transpose()?,
-                units: units
-                    .into_iter()
-                    .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                    .collect::<Result<_, _>>()?,
+                units: M::materialize_units(context, units, Some(&layout))?,
                 state: M::model_state(context, state)?,
             }),
             Self::QwenHybrid {
@@ -3896,10 +3905,7 @@ where
                 ..
             } => Ok(MaterializedPredictionExtension::QwenHybrid {
                 shared: M::materialize_module(context, shared, Some(&layout))?,
-                units: units
-                    .into_iter()
-                    .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                    .collect::<Result<_, _>>()?,
+                units: M::materialize_units(context, units, Some(&layout))?,
                 state: M::model_state(context, state)?,
             }),
             Self::NemotronH {
@@ -3910,12 +3916,7 @@ where
             } => Ok(MaterializedPredictionExtension::NemotronH {
                 groups: groups
                     .into_iter()
-                    .map(|units| {
-                        units
-                            .into_iter()
-                            .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                            .collect::<Result<_, _>>()
-                    })
+                    .map(|units| M::materialize_units(context, units, Some(&layout)))
                     .collect::<Result<_, _>>()?,
                 state: M::model_state(context, state)?,
             }),

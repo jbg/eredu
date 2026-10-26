@@ -268,10 +268,7 @@ where
         visitor: &mut V,
     ) -> Result<(), V::Error> {
         visitor.visit::<crate::qwen4_exp::mtp::PredictionShared<B>>(0, &mut self.shared)?;
-        for (ordinal, module) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::qwen4_exp::mtp::PredictionUnit<B>>(ordinal + 1, module)?;
-        }
-        Ok(())
+        visitor.visit_units::<crate::qwen4_exp::mtp::PredictionUnit<B>>(1, self.units.iter_mut())
     }
 
     fn depth(&self) -> usize {
@@ -728,11 +725,7 @@ where
         M: PredictionExtensionMaterializer<B>,
     {
         let shared = M::materialize_module(context, self.shared, self.layout.as_deref())?;
-        let units = self
-            .units
-            .into_iter()
-            .map(|unit| M::materialize_module(context, unit, self.layout.as_deref()))
-            .collect::<Result<_, _>>()?;
+        let units = M::materialize_units(context, self.units, self.layout.as_deref())?;
         Ok((shared, units))
     }
 }

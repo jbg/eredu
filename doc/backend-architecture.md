@@ -9081,6 +9081,11 @@ module in stable physical-owner order, distinct from proposal depth or lane-stat
 position. The architecture enumerates sequential, fused and grouped modules;
 backends do not reconstruct their family membership. Shared target embeddings and
 heads remain with the target owner and are borrowed by prediction execution.
+The visitor's shared ordered-unit traversal starts at the architecture-declared
+ordinal, preserving optional shared owners and flattened group order.
+Prediction materialization likewise uses one ordered-unit loop over the existing
+single-module mechanism. Shared modules remain explicit, each unit keeps its own
+residency lifecycle, and the first failure prevents later unit acquisition.
 
 MLX retains exact prepared binding metadata and materialization tasks beside each
 prediction module. `PreparedParameterLocation::Prediction` routes bounded queries
