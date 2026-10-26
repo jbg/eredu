@@ -11890,7 +11890,10 @@ identity. Equal names and shapes do not authorize a replacement source. Native b
 rechecks mechanism facts but cannot reselect mechanisms or replace sources.
 
 `PreparedRowLookup` pairs the source range with `RowLookupSpec`, an optional
-`PreparedRowScale`, and finite limits. `PreparedRowLookups` checks table identities,
+`PreparedRowScale`, and finite limits. Scalar companions use checkpoint
+`PreparedCheckpointSource::retain` to pin their exact supplied source set,
+metadata and provenance before row descriptor admission, without payload reads.
+`PreparedRowLookups` checks table identities,
 unit ownership, bank namespaces and range prefixes. Cold admission validates source
 encoding, scalar identity, one-row access and maximum acquisition/planning/output bounds.
 The largest permitted acquisition must fit the device cache. Missing mechanisms,
