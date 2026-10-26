@@ -8470,12 +8470,19 @@ LFM2 cold catalogs use the same specification as pinned construction, including
 tied vocabulary ownership. Kimi Linear projects those same static groups while
 retaining explicit canonical owners and its family projection-format admission set.
 The projection retains explicit embedding, normalization and output role identities;
-Kimi canonical ownership does not depend on group order. DeepSeek V3 and V4 use
-these same logical groups while retaining their family FP8 defaults and admitted
+Kimi, Muse and LFM2 canonical static ownership does not depend on group order.
+DeepSeek V3 and V4 use these same logical groups while retaining their family FP8 defaults and admitted
 static formats. V4 hyper-head and DSpark geometry remain family declarations.
 Families supply semantic group identities and apply their admitted physical-format
 expansion once; packed shapes and companion metadata remain part of that family
 projection.
+
+Runtime `expand_linear_format_parameter_group` expands one atomic logical group
+and preserves its partition constraints and declared companions. Catalog expansion
+uses the same primitive. Families retain resource and canonical owner identities
+around that projection; Muse carries its role tags through format expansion, and
+LFM2 associates static owners with declared group identities. DeepSeek pinned
+format expansion likewise retains each resource role directly.
 
 `StaticModuleSpec::embedding_format` retains the complete physical matrix encoding,
 including block-FP8 companions. Shared decoder configuration supplies its selected

@@ -14,27 +14,24 @@ pub(crate) fn describe(args: &DecoderConfig) -> Result<ArchitectureParameterDesc
     }
     let layout =
         ExecutionUnitLayout::new(&graph, counts.iter().copied()).map_err(Error::backend)?;
-    let text_static = static_parameter_groups(args).map_err(Error::backend)?;
+    let text_static = crate::muse::parallel::static_resource_parameter_groups(args)
+        .map_err(Error::backend)?;
     let vision_static = crate::muse::parallel::vision_static_resource_groups(args)
         .map_err(Error::backend_source)?;
     let mut expected = text_static
         .iter()
+        .map(|(_, group)| group)
         .chain(vision_static.iter().map(|(_, group)| group))
         .cloned()
         .collect::<Vec<_>>();
     let mut owned = text_static
         .into_iter()
-        .enumerate()
-        .map(|(index, group)| {
+        .map(|(role, group)| {
             OwnedParameterGroupSpec::new(
-                if index == 0 && args.tie_word_embeddings {
+                if role == "embedding" && args.tie_word_embeddings {
                     ParameterGroupOwner::static_any_of(["embedding", "output"])
                 } else {
-                    ParameterGroupOwner::static_role(match index {
-                        0 => "embedding",
-                        1 => "norm",
-                        _ => "output",
-                    })
+                    ParameterGroupOwner::static_role(role)
                 },
                 group,
             )

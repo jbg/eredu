@@ -665,14 +665,25 @@ fn local_axis(
 pub fn static_parameter_groups(
     args: &DecoderConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let groups = super::text::static_spec(args)
-        .logical_pinned_parameter_groups("model.embed_tokens", "model.norm", "lm_head")?
+    Ok(static_resource_parameter_groups(args)?
         .into_iter()
         .map(|(_, group)| group)
-        .collect::<Vec<_>>();
-    expand_linear_format_parameter_groups(groups, |member| {
-        standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-    })
+        .collect())
+}
+
+pub(crate) fn static_resource_parameter_groups(
+    args: &DecoderConfig,
+) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+    super::text::static_spec(args)
+        .logical_pinned_parameter_groups("model.embed_tokens", "model.norm", "lm_head")?
+        .into_iter()
+        .map(|(role, group)| {
+            eredu_runtime::expand_linear_format_parameter_group(group, |member| {
+                standard_parallel_linear_format(member, args.linear_format_for(member.target()))
+            })
+            .map(|group| (role, group))
+        })
+        .collect()
 }
 
 /// Declares one decoder block's head, dense/expert, and replicated groups.

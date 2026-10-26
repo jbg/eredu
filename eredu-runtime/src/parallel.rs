@@ -1069,30 +1069,42 @@ pub fn partition_chunk_range(
 /// in the same atomic parameter group.
 pub fn expand_linear_format_parameter_groups(
     groups: Vec<ParameterGroupSpec>,
-    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+    declaration: impl Fn(
+        &ParameterMemberSpec,
+    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     groups
         .into_iter()
-        .map(|group| {
-            let mut members = Vec::new();
-            for source in group.members() {
-                members.extend(match declaration(source)? {
-                    Some(declaration) => expand_linear_format_member(source, &declaration)?,
-                    None => vec![source.clone()],
-                });
-            }
-            let expanded = match group.partition_units() {
-                Some(units) => partitioned_group_with_preferred_units(
-                    group.logical_name(),
-                    group.role(),
-                    units,
-                    members,
-                ),
-                None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
-            }?;
-            expanded.with_partition_unit_assignment(group.partition_unit_assignment())
-        })
+        .map(|group| expand_linear_format_parameter_group(group, &declaration))
         .collect()
+}
+
+/// Expands one atomic group while callers retain its resource or ownership identity.
+/// Physical companions and partition constraints follow the same projection as
+/// ordinary parameter catalogs.
+pub fn expand_linear_format_parameter_group(
+    group: ParameterGroupSpec,
+    declaration: impl Fn(
+        &ParameterMemberSpec,
+    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let mut members = Vec::new();
+    for source in group.members() {
+        members.extend(match declaration(source)? {
+            Some(declaration) => expand_linear_format_member(source, &declaration)?,
+            None => vec![source.clone()],
+        });
+    }
+    let expanded = match group.partition_units() {
+        Some(units) => partitioned_group_with_preferred_units(
+            group.logical_name(),
+            group.role(),
+            units,
+            members,
+        ),
+        None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
+    }?;
+    expanded.with_partition_unit_assignment(group.partition_unit_assignment())
 }
 
 fn partitioned_group_with_preferred_units(

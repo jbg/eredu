@@ -824,15 +824,26 @@ pub fn parameter_description(
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [layers])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let mut groups = super::static_spec(args).logical_pinned_parameter_groups(
+    let statics = super::static_spec(args).logical_pinned_parameter_groups(
         "model.embed_tokens",
         "model.embedding_norm",
         "lm_head",
-    )?
-    .into_iter()
-    .map(|(_, group)| group)
-    .collect::<Vec<_>>();
-    let static_count = groups.len();
+    )?;
+    let static_owners = statics
+        .iter()
+        .map(|(role, group)| {
+            let owner = if *role == "embedding" && args.tie_word_embeddings {
+                ParameterGroupOwner::static_any_of(["embedding", "output"])
+            } else {
+                ParameterGroupOwner::static_role(*role)
+            };
+            (group.logical_name().to_owned(), owner)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut groups = statics
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect::<Vec<_>>();
     let head_dim = usize::try_from(args.hidden_size / args.num_attention_heads)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 head width exceeds usize".into()))?;
     let hidden = usize::try_from(args.hidden_size)
@@ -1046,16 +1057,9 @@ pub fn parameter_description(
             .transpose()
     })?;
     let mut owned = Vec::with_capacity(groups.len());
-    for (index, group) in groups.iter().cloned().enumerate() {
-        let owner = if index < static_count {
-            match index {
-                0 if args.tie_word_embeddings => {
-                    ParameterGroupOwner::static_any_of(["embedding", "output"])
-                }
-                0 => ParameterGroupOwner::static_role("embedding"),
-                1 => ParameterGroupOwner::static_role("norm"),
-                _ => ParameterGroupOwner::static_role("output"),
-            }
+    for group in groups.iter().cloned() {
+        let owner = if let Some(owner) = static_owners.get(group.logical_name()) {
+            owner.clone()
         } else {
             let name = group.logical_name();
             let layer = name
