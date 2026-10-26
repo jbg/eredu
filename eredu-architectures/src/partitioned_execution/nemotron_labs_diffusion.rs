@@ -59,10 +59,9 @@ where
             ))
             .map_err(|e| error(e.to_string()))?;
         let description = retained.parameters();
-        validate_transform_parameter_space(description, parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(description, parameters, rank)
-                .map_err(error)?;
+                .map_err(|failure| error(failure.to_string()))?;
         let source_partition = parallel::partition(
             &source,
             &retained,

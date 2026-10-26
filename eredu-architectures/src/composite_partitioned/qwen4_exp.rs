@@ -177,12 +177,12 @@ impl PreparedConditionalPartition {
                 let (source_tensor, source_parameters, source_layout, source_experts) =
                     local_geometry(&source_bound, &ingress, &source_vision, rank)
                         .map_err(invalid)?;
-                if crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                if eredu_runtime::derive_partitioned_transform_source_layout(
                     &source_parameters,
                     &parameters,
                     rank,
                 )
-                .map_err(invalid)?
+                .map_err(|error| invalid(error.to_string()))?
                     != source_layout
                 {
                     return Err(invalid(

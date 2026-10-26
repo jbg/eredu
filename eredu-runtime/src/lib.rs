@@ -380,8 +380,10 @@ pub use parameter_acquisition::{
 pub use parameter_layout::{
     balanced_parameter_group_range, balanced_parameter_group_range_if_present,
     derive_partitioned_group_layout, derive_partitioned_local_layout,
-    logical_parameter_group_range, retained_partition_layout, validate_parameter_layout,
-    validate_tensor_parallel_layout, TensorParallelLayoutError, ParameterGroupSelection,
+    derive_partitioned_transform_source_layout, logical_parameter_group_range,
+    retained_partition_layout, validate_parameter_layout, validate_tensor_parallel_layout,
+    validate_transform_parameter_space, ParameterGroupSelection, TensorParallelLayoutError,
+    TransformSourceLayoutError,
 };
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,

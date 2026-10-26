@@ -25,7 +25,8 @@ use eredu_nn::{
     Tensor as _,
 };
 use eredu_runtime::{
-    derive_partitioned_local_layout, retained_partition_layout, ArchitectureBoundary,
+    derive_partitioned_local_layout, derive_partitioned_transform_source_layout,
+    retained_partition_layout, validate_transform_parameter_space, ArchitectureBoundary,
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitecturePartition,
     BoundaryDimensionContract, BoundaryRoleContract, BoundaryWireSchema, CommunicationCapabilities,
     CommunicationCompletionPolicy, CommunicationGroupRequirements, CommunicationManifest,
@@ -8337,21 +8338,6 @@ impl TextRequirements for CompositeTextRequirements {
     }
 }
 
-/// Retains the target's semantic ownership while constructing source-format
-/// modules for pointwise conversion of the same canonical parameters.
-pub(crate) fn derive_partitioned_transform_source_layout(
-    source: &eredu_runtime::ArchitectureParameterDescription,
-    target: &eredu_runtime::ArchitectureParameterDescription,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<eredu_runtime::LocalModelLayout, String> {
-    validate_transform_parameter_space(source, target)?;
-    eredu_runtime::derive_transform_source_layout(
-        &derive_partitioned_local_layout(source, topology)?,
-        &derive_partitioned_local_layout(target, topology)?,
-    )
-    .map_err(|error| error.to_string())
-}
-
 /// Exact architecture-owned partition constructed from a prior admission.
 pub struct PreparedPartitionedArchitecture<B, A, G, D = eredu_runtime::NoAuxiliaryBoundarySchema> {
     prepared: PreparedPartitionedAdmission<
@@ -9371,9 +9357,7 @@ where
             let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            validate_transform_parameter_space(&source_parameters, &parameters)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             let source_geometry = crate::nemotron_h::partition_local_geometry(
                 &source_args,
                 &source_layout,
@@ -9536,9 +9520,7 @@ where
             let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            validate_transform_parameter_space(&source_parameters, &parameters)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             let source_geometry = crate::kimi_linear::partition_local_geometry(
                 &source_args,
                 &source_layout,
@@ -9694,9 +9676,7 @@ where
             let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            validate_transform_parameter_space(&source_parameters, &parameters)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             let source_geometry =
                 crate::lfm2::partition_local_geometry(&source_args, &source_layout, owned.units())
                     .map_err(|error| {
@@ -9845,9 +9825,7 @@ where
             let source_parameters = source_definition.parameters();
             let source_layout =
                 derive_partitioned_transform_source_layout(source_parameters, parameters, rank)
-                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            validate_transform_parameter_space(source_parameters, parameters)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             let source_geometry = crate::decoder::partition_local_geometry(
                 &source_args,
                 source_parameters.invocations(),
@@ -9942,19 +9920,6 @@ where
             store,
         )
         .map_err(DenseDecoderPartitionedDispatchError::Visitor)
-}
-
-pub(crate) fn validate_transform_parameter_space(
-    source: &eredu_runtime::ArchitectureParameterDescription,
-    target: &eredu_runtime::ArchitectureParameterDescription,
-) -> Result<(), String> {
-    if source.graph() != target.graph() || source.unit_layout() != target.unit_layout() {
-        return Err(
-            "source and target transform execution-unit addresses differ before local construction"
-                .into(),
-        );
-    }
-    Ok(())
 }
 
 fn validate_transform_task_owner(
@@ -11009,10 +10974,9 @@ where
         let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(error)?;
+                .map_err(|failure| error(failure.to_string()))?;
         let source_local = crate::lfm2::local_geometry(&source_args, &source_layout)
             .map_err(|e| error(e.to_string()))?;
         if source_local.state_layout() != &complete_state {
@@ -11175,10 +11139,9 @@ where
         let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(error)?;
+                .map_err(|failure| error(failure.to_string()))?;
         let source_local = crate::kimi_linear::local_geometry(&source_args, &source_layout)
             .map_err(|e| error(e.to_string()))?;
         if source_local.state_layout() != &complete_state {
@@ -11333,10 +11296,9 @@ where
         let source_definition = crate::nemotron_h::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(error)?;
+                .map_err(|failure| error(failure.to_string()))?;
         let source_local = crate::nemotron_h::local_geometry(&source_args, &source_layout)
             .map_err(|e| error(e.to_string()))?;
         if source_local.state_layout() != &complete_state {
@@ -11505,10 +11467,9 @@ where
         let source_definition = crate::deepseek::v3::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(error)?;
+                .map_err(|failure| error(failure.to_string()))?;
         let source_local =
             crate::deepseek::parallel::v3_local_geometry(&source_args, &source_layout)
                 .map_err(|e| error(e.to_string()))?;
@@ -11692,10 +11653,9 @@ where
         let source_definition = crate::deepseek::v4::project_parameters(&source_args, &retained)
             .map_err(|e| error(e.to_string()))?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(error)?;
+                .map_err(|failure| error(failure.to_string()))?;
         let source_local =
             crate::deepseek::parallel::v4_local_geometry(&source_args, &source_layout)
                 .map_err(|e| error(e.to_string()))?;
@@ -12798,8 +12758,9 @@ where
             let source_parameters = source.parameter_description(context).map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
             })?;
-            validate_transform_parameter_space(&source_parameters, &parameters)
-                .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+            validate_transform_parameter_space(&source_parameters, &parameters).map_err(|error| {
+                eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+            })?;
             retained_layout::validate(&source_parameters, source_layout)
                 .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
         }

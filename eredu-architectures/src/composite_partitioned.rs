@@ -1107,12 +1107,14 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
                 })?;
                 if source_parameters.graph() != parameters.graph()
                     || source_parameters.unit_layout() != parameters.unit_layout()
-                    || crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                    || eredu_runtime::derive_partitioned_transform_source_layout(
                         &source_parameters,
                         &parameters,
                         topology_rank,
                     )
-                    .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?
+                    .map_err(|error| {
+                        eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+                    })?
                         != source_layout
                 {
                     return Err(eredu_runtime::PartitionedSessionPreparationError::Contract(
@@ -1635,12 +1637,12 @@ where
                 .map_err(|e| error(e.to_string()))?;
             let source_parameters = retained.parameters();
             let source_layout =
-                crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                eredu_runtime::derive_partitioned_transform_source_layout(
                     source_parameters,
                     &parameters,
                     selected.requirements().topology(),
                 )
-                .map_err(error)?;
+                .map_err(|failure| error(failure.to_string()))?;
             let source_geometry = partition::geometry(
                 &source_args,
                 source_layout.clone(),
@@ -2028,18 +2030,9 @@ where
                     })
                 {
                     let source_parameters = retained.parameters();
-                    crate::partitioned_execution::validate_transform_parameter_space(
-                        source_parameters,
-                        &parameters,
-                    )
-                    .map_err(CompositePartitionPreparationError::Architecture)?;
                     let source_layout =
-                        crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                            source_parameters,
-                            &parameters,
-                            rank,
-                        )
-                        .map_err(CompositePartitionPreparationError::Architecture)?;
+                        eredu_runtime::derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
+                            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
                     let source_text = crate::diffusion_gemma::parallel::local_geometry(
                         source,
                         &source_layout,
@@ -3043,11 +3036,8 @@ where
         return Err("Qwen3-VL transform source changed execution-unit addresses".into());
     }
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
-        &parameters,
-        target_parameters,
-        rank,
-    )?;
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
+            .map_err(|error| error.to_string())?;
     let local = crate::qwen::vl::local_geometry(&source, &layout).map_err(|e| e.to_string())?;
     let ranges = || {
         selected
@@ -3149,11 +3139,8 @@ where
         return Err("Gemma 4 transform source changed execution-unit addresses".into());
     }
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
-        &parameters,
-        target_parameters,
-        rank,
-    )?;
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
+            .map_err(|error| error.to_string())?;
     let local =
         crate::gemma4::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {
@@ -3270,11 +3257,8 @@ where
         return Err("Muse-Glimmer transform source changed execution-unit addresses".into());
     }
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
-        &parameters,
-        target_parameters,
-        rank,
-    )?;
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
+            .map_err(|error| error.to_string())?;
     let local = crate::muse::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {
         selected
@@ -3384,11 +3368,8 @@ where
         return Err("Inkling transform source changed execution-unit addresses".into());
     }
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
-        &parameters,
-        target_parameters,
-        rank,
-    )?;
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
+            .map_err(|error| error.to_string())?;
     let local =
         crate::inkling::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {

@@ -24,6 +24,51 @@ pub fn derive_partitioned_local_layout(
     )
 }
 
+/// Source-format geometry cannot preserve a selected transform's execution ownership.
+#[derive(Debug, thiserror::Error)]
+pub enum TransformSourceLayoutError {
+    /// Source and target declarations disagree on logical invocation addresses.
+    #[error(
+        "source and target transform execution-unit addresses differ before local construction"
+    )]
+    ParameterSpaceMismatch,
+    /// The source declaration cannot realize the selected rank.
+    #[error("{0}")]
+    SourcePlacement(String),
+    /// The target declaration cannot realize the selected rank.
+    #[error("{0}")]
+    TargetPlacement(String),
+    /// The target's exact cuts cannot be represented in source coordinates.
+    #[error(transparent)]
+    Projection(#[from] crate::ParallelPlanError),
+}
+
+/// Validates the logical invocation space before constructing conversion resources.
+pub fn validate_transform_parameter_space(
+    source: &crate::ArchitectureParameterDescription,
+    target: &crate::ArchitectureParameterDescription,
+) -> Result<(), TransformSourceLayoutError> {
+    if source.graph() != target.graph() || source.unit_layout() != target.unit_layout() {
+        return Err(TransformSourceLayoutError::ParameterSpaceMismatch);
+    }
+    Ok(())
+}
+
+/// Retains target ownership while constructing source-format coordinates for
+/// pointwise conversion of the same canonical parameters. No resources are loaded.
+pub fn derive_partitioned_transform_source_layout(
+    source: &crate::ArchitectureParameterDescription,
+    target: &crate::ArchitectureParameterDescription,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<crate::LocalModelLayout, TransformSourceLayoutError> {
+    validate_transform_parameter_space(source, target)?;
+    let source = derive_partitioned_local_layout(source, topology)
+        .map_err(TransformSourceLayoutError::SourcePlacement)?;
+    let target = derive_partitioned_local_layout(target, topology)
+        .map_err(TransformSourceLayoutError::TargetPlacement)?;
+    Ok(crate::derive_transform_source_layout(&source, &target)?)
+}
+
 /// Exact selected parameter placement does not match a tensor communicator.
 #[derive(Debug, thiserror::Error)]
 pub enum TensorParallelLayoutError {

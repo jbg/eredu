@@ -527,24 +527,6 @@ fn source(shape: Vec<usize>, overlay: bool) -> Source {
     }
 }
 
-fn layout(global: Vec<usize>, local: Vec<usize>, placement: TensorPlacement) -> LocalModelLayout {
-    let mut layout = LocalModelLayout::default();
-    layout.insert(
-        "weight".into(),
-        LocalTensorLayout::new(
-            "head",
-            ParameterRole::ColumnProjection,
-            global,
-            local,
-            placement,
-            None,
-            None,
-            false,
-        ),
-    );
-    layout
-}
-
 fn bind(
     source: &Source,
     task: &ReplicatedTextMaterializationTask,
@@ -1022,15 +1004,49 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
 fn exact_binding_does_not_reshard_selected_local_transform_output() {
     let source = source(vec![2, 4], true);
     let task = task(&[4, 32], WeightLoweringKind::Transform, LinearFormat::MxFp4);
-    let layout = layout(
-        vec![4, 32],
-        vec![2, 32],
-        TensorPlacement::Shard {
-            axis: 0,
-            index: 1,
-            parts: 2,
-        },
-    );
+    use eredu_runtime::{
+        derive_partitioned_transform_source_layout, ArchitectureParameterDescription,
+        ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout, MemberSharding,
+        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+        TransformSourceLayoutError,
+    };
+    let description = |units, width| {
+        let graph =
+            ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+        let units = ExecutionUnitLayout::new(&graph, [units]).unwrap();
+        ArchitectureParameterDescription::from_owned(
+            &graph,
+            &units,
+            [OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(units.group_id(0).unwrap().clone(), 0),
+                ParameterGroupSpec::new(
+                    "head",
+                    ParameterRole::ColumnProjection,
+                    [ParameterMemberSpec::new(
+                        "weight",
+                        vec![4, width],
+                        MemberSharding::Balanced { axis: 0 },
+                    )],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap()
+    };
+    let rank = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+        1,
+    )
+    .unwrap();
+    let source_parameters = description(1, 32);
+    let target_parameters = description(1, 4);
+    let layout =
+        derive_partitioned_transform_source_layout(&source_parameters, &target_parameters, rank)
+            .unwrap();
+    assert!(matches!(
+        derive_partitioned_transform_source_layout(&source_parameters, &description(2, 4), rank,),
+        Err(TransformSourceLayoutError::ParameterSpaceMismatch)
+    ));
     let bindings = bind(&source, &task, vec![2, 4], Some(&layout)).unwrap();
     assert_eq!(bindings[0].checkpoint_key(), "weight");
     assert_eq!(bindings[0].selection(), &TensorSelection::Full);

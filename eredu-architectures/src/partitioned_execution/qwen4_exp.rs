@@ -118,7 +118,7 @@ impl PreparedTargetPartition {
                     .parameter_description()
                     .map_err(invalid)?;
                 validate_transform_parameter_space(&source_parameters, &parameters)
-                    .map_err(invalid)?;
+                    .map_err(|error| invalid(error.to_string()))?;
                 let mut source_model = TargetKernel::<B>::new_tensor_parallel(
                     source_bound,
                     source_partition.partition().clone(),

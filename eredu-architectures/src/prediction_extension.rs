@@ -4106,12 +4106,12 @@ where
             }) {
                 let source_parameters = extension.definition().parameters();
                 Some(std::sync::Arc::new(
-                    crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                    eredu_runtime::derive_partitioned_transform_source_layout(
                         source_parameters,
                         &parameters,
                         tensor_rank,
                     )
-                    .map_err(invalid)?,
+                    .map_err(|error| invalid(error.to_string()))?,
                 ))
             } else {
                 None
@@ -4225,12 +4225,12 @@ where
             }) {
                 let source_parameters = extension.definition().parameters();
                 Some(std::sync::Arc::new(
-                    crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                    eredu_runtime::derive_partitioned_transform_source_layout(
                         source_parameters,
                         &parameters,
                         tensor_rank,
                     )
-                    .map_err(invalid)?,
+                    .map_err(|error| invalid(error.to_string()))?,
                 ))
             } else {
                 None
@@ -4541,12 +4541,12 @@ where
                 )
             }) {
                 Some(std::sync::Arc::new(
-                    crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                    eredu_runtime::derive_partitioned_transform_source_layout(
                         &source_description,
                         &description,
                         tensor_rank,
                     )
-                    .map_err(invalid)?,
+                    .map_err(|error| invalid(error.to_string()))?,
                 ))
             } else {
                 None

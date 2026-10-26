@@ -113,11 +113,9 @@ where
         let source_definition = crate::qwen::hybrid::project_parameters(&source_args, &retained)
             .map_err(architecture)?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry = crate::qwen::hybrid::local_geometry(&source_args, &source_layout)
             .map_err(architecture)?;
         if source_geometry.state_layout() != &complete_state {
@@ -278,11 +276,9 @@ where
         let source_definition =
             crate::qwen::hybrid::project_parameters(args, &retained).map_err(architecture)?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::qwen::hybrid::local_geometry(args, &source_layout).map_err(architecture)?;
         if source_geometry.state_layout() != &complete_state {

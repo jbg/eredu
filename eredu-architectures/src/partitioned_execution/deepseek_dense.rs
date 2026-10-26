@@ -82,11 +82,9 @@ where
         let source_definition = crate::deepseek::v3::project_parameters(&source_args, &retained)
             .map_err(architecture)?;
         let source_parameters = source_definition.parameters().clone();
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::deepseek::parallel::v3_local_geometry(&source_args, &source_layout)
                 .map_err(architecture)?;

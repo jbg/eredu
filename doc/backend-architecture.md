@@ -10568,6 +10568,12 @@ source and target to native materialization. Backends consume that prepared
 handoff rather than reconstructing family configuration from target tensors.
 
 Transform source modules use the selected target's partition ownership. Runtime's
+`derive_partitioned_transform_source_layout` validates the source and target
+invocation graphs and unit addresses, lowers both retained declarations for the
+selected rank, and projects source coordinates. Its typed error distinguishes
+invocation mismatch, source or target placement rejection, and physical projection
+failure. Families retain source-format policy and additional state/media geometry
+checks; architecture error adapters preserve their existing diagnostic messages.
 `derive_transform_source_layout` maps those exact cuts into the source encoding
 with checked axis scaling, preserving logical ranges and independent expert
 placements. Architecture constructors use the resulting geometry for both

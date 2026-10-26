@@ -76,10 +76,9 @@ where
         )
     }) {
         let source_parameters = retained.parameters();
-        validate_transform_parameter_space(source_parameters, &parameters).map_err(architecture)?;
         let source_layout =
             derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
                 .map_err(architecture)?;
@@ -221,10 +220,9 @@ where
         )
     }) {
         let source_parameters = retained.parameters();
-        validate_transform_parameter_space(source_parameters, &parameters).map_err(architecture)?;
         let source_layout =
             derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
                 .map_err(architecture)?;
