@@ -601,12 +601,14 @@ impl VisionStaticSelection {
         }
     }
 
-    /// Resolves exact native resources from admitted canonical component bindings.
+    /// Resolves native resources from the retained component and admitted canonical bindings.
     pub fn from_parameter_bindings(
         args: &super::DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<&super::LocalGeometry>,
         bindings: &[eredu_runtime::OwnedParameterGroupSpec],
     ) -> Result<Self, Error> {
-        let definition = super::component_definition(args, None)?;
+        let definition = super::model::select_definition(args, definition, geometry)?;
         let config = args
             .vision_config
             .clone()

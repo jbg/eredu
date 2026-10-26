@@ -1510,14 +1510,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         Self::materialize(args, Some(geometry), |_| true, context)
     }
 
-    /// Materializes only complete canonical text resources present in the selected bindings.
+    /// Materializes complete canonical text resources from the retained component and bindings.
     pub fn from_parameter_bindings(
         args: &DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: Option<&LocalGeometry>,
         bindings: &[eredu_runtime::OwnedParameterGroupSpec],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let definition = super::component_definition(args, geometry)?;
+        let definition = super::model::select_definition(args, definition, geometry)?;
         let roles =
             definition.select_complete_pinned_roles(bindings, &["embedding", "norm", "output"])?;
         Self::materialize(args, geometry, |role| roles.contains(role), context)

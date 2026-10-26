@@ -1218,6 +1218,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
         let text = match partition {
             Some(partition) => TextStaticModules::from_parameter_bindings(
                 &args,
+                definition.clone(),
                 geometry.as_ref(),
                 partition.parameter_bindings(),
                 context,
@@ -1232,6 +1233,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B>
                 let selected = match partition {
                     Some(partition) => super::VisionStaticSelection::from_parameter_bindings(
                         &args,
+                        definition.clone(),
+                        geometry.as_ref(),
                         partition.parameter_bindings(),
                     )?,
                     None => super::VisionStaticSelection::all(config.clone()),

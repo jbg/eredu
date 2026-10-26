@@ -8415,6 +8415,14 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+Muse text and vision binding constructors consume the retained
+`Arc<ComponentDefinition>` and selected geometry. They validate that retained
+family contract and project exact canonical pinned groups; they do not reconstruct
+a separate execution declaration. Composite materialization passes the same parent
+to both low-level operations, preserving observation seams, source-format ownership
+and TP-local state. Foreign components and incompatible geometry reject before
+native construction.
+
 Muse text resources use the shared pinned constructor for ordinary, tensor-local
 and binding-selected construction. Its family static specification retains complete
 embedding/readout formats and selects native or full-width F32 final normalization

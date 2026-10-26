@@ -688,7 +688,10 @@ Low-level Muse construction takes an explicit retained component declaration via
 `MuseKernel::from_definition`, `from_parallel_definition` or `from_partition`.
 `muse::model::project_parameters` selects physical formats while retaining logical
 consumers, state ownership and observation seams. The same parent is consumed by
-complete and partitioned preparation for both Spark and Glimmer.
+complete and partitioned preparation for both Spark and Glimmer. Text and vision
+`from_parameter_bindings` operations also consume the retained declaration and
+selected geometry, preserving canonical binding validation without rebuilding the
+execution graph.
 
 The [pinned inventory](../validation/fixtures/muse-spark/inventory.json) records
 complete revisions, publisher file sizes/hashes and reference-source identities.
