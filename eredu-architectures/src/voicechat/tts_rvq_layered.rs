@@ -1030,57 +1030,6 @@ fn validate_codes<T: Tensor>(codes: &T) -> Result<(), TtsError> {
     Ok(())
 }
 
-/// RVQ feedback using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseRvq<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RvqUnit<B>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >,
-}
-impl<B, P> LayerwiseRvq<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RvqUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact bank/projection unit policy.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<TtsError, P>,
 ) -> TtsError {
@@ -1096,14 +1045,20 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
         }
     }
 }
-impl<B, P> RvqExecution<B> for LayerwiseRvq<B, P>
+impl<B, P> RvqExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, RvqUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> RvqDimensions {
-        self.runtime.architecture().kernel().dimensions()
+        self.architecture().kernel().dimensions()
     }
     fn depthsum(
         &mut self,
@@ -1111,8 +1066,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
         let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke(RvqInput::Sum(codes), &mut state, context)
+        self.invoke(RvqInput::Sum(codes), &mut state, context)
             .map_err(runtime_error)
     }
     fn embed_codes(
@@ -1121,8 +1075,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
         let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke(RvqInput::Embed(codes), &mut state, context)
+        self.invoke(RvqInput::Embed(codes), &mut state, context)
             .map_err(runtime_error)
     }
     fn advance(
@@ -1132,87 +1085,109 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
         let mut runtime_state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke_with_context(
-                RvqInput::Advance { state, latent },
-                &mut runtime_state,
-                context,
-            )
-            .map_err(runtime_error)?
-            .1
-            .into_state()
+        self.invoke_with_context(
+            RvqInput::Advance { state, latent },
+            &mut runtime_state,
+            context,
+        )
+        .map_err(runtime_error)?
+        .1
+        .into_state()
     }
 }
 
-impl<B, P> LayerwiseRvq<B, P>
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RvqUnit<B>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
+/// Tensor-parallel RVQ operations over ordinary resource and completion lifecycles.
+/// Implementors supply typed invocation and guarded collective participation;
+/// convenience operations share the same invocation and candidate result.
+pub trait ParallelRvqExecution<B: DistributedNeuralBackend>: RvqExecution<B> {
+    /// Executes a typed operation with its request-local roots retained to completion.
+    fn invoke_parallel(
+        &mut self,
+        input: RvqInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, RvqForward<B::Tensor>), TtsError>;
+
     /// Publishes complete latent feedback from coherent channel shards.
-    pub fn depthsum_parallel(
+    fn depthsum_parallel(
         &mut self,
         codes: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                RvqInput::Sum(codes),
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
+        self.invoke_parallel(RvqInput::Sum(codes), parallel, context)
             .map(|(output, _)| output)
-            .map_err(runtime_error)
     }
+
     /// Reduces the shared projection's rank-local input-channel products.
-    pub fn embed_codes_parallel(
+    fn embed_codes_parallel(
         &mut self,
         codes: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                RvqInput::Embed(codes),
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
+        self.invoke_parallel(RvqInput::Embed(codes), parallel, context)
             .map(|(output, _)| output)
-            .map_err(runtime_error)
     }
-    /// Selects shared codes from globally reduced distances before local residual subtraction.
-    pub fn advance_parallel(
+
+    /// Selects globally agreed codes before local residual subtraction.
+    fn advance_parallel(
         &mut self,
         state: &RefinementState<B::Tensor>,
         latent: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
-        let mut runtime_state = StatelessComponentState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                RvqInput::Advance { state, latent },
-                &mut runtime_state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map_err(runtime_error)?
+        self.invoke_parallel(RvqInput::Advance { state, latent }, parallel, context)?
             .1
             .into_state()
     }
+
+    /// Coordinates operation identity and provider lifecycle before collectives.
+    fn invoke_parallel_guarded<H, F>(
+        &mut self,
+        input: RvqInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        agree: F,
+    ) -> Result<(B::Tensor, RvqForward<B::Tensor>), TtsError>
+    where
+        H: LayeredTraversalHook<B, RvqForward<B::Tensor>, TtsError> + ?Sized,
+        F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, TtsError>;
+}
+
+impl<B, P> ParallelRvqExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, RvqUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn invoke_parallel(
+        &mut self,
+        input: RvqInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, RvqForward<B::Tensor>), TtsError> {
+        self.forward_parallel_with_context_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |_, _, _| Ok(()),
+        )
+        .map_err(runtime_error)
+    }
     /// Coordinates operation identity, provider lifecycle and all local preparation
     /// before the selected tensor-parallel collectives.
-    pub fn invoke_parallel_guarded<H, F>(
+    fn invoke_parallel_guarded<H, F>(
         &mut self,
         input: RvqInput<'_, B::Tensor>,
         parallel: &B::ParallelContext,
@@ -1272,19 +1247,18 @@ where
                 }
             }
         }
-        self.runtime
-            .forward_parallel_with_unit_executor_and_traversal_hook(
-                input,
-                &mut StatelessComponentState::new()?,
-                parallel,
-                context,
-                |architecture, group, index, unit, hidden, _, forward, parallel, context| {
-                    architecture.kernel().forward_unit_guarded(
-                        group, index, unit, hidden, forward, parallel, context, &mut agree,
-                    )
-                },
-                hook,
-            )
-            .map_err(runtime_error)
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, _, forward, parallel, context| {
+                architecture.kernel().forward_unit_guarded(
+                    group, index, unit, hidden, forward, parallel, context, &mut agree,
+                )
+            },
+            hook,
+        )
+        .map_err(runtime_error)
     }
 }

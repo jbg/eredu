@@ -1988,9 +1988,13 @@ component resources through completion.
 `RvqKernel` declares separate resources for the canonical stacked feedback bank
 and its single latent-to-hidden projection. Ordered depth sums and residual quantization lease
 only the bank; embedded feedback also executes the projection. `RvqExecution`
-shares those operations and the refinement schedule across resident and bounded
-providers. Prompt ingress and each refinement iteration use the same projection
-identity. The bank remains one independently materialized checkpoint parameter:
+implements those operations and the refinement schedule directly on the shared
+`LayerwiseRuntime` over `ComponentAdapter` and `RvqKernel`, across resident and bounded
+providers. `ParallelRvqExecution` supplies typed parallel invocation, shared
+convenience operations and guarded collective participation through the same
+runtime lifecycle. Native composition constructs the shared runtime and inspects
+its selected policy directly. Prompt ingress and each refinement iteration use
+the same projection identity. The bank remains one independently materialized checkpoint parameter:
 its released `[31, 1024, 512]` F32 representation costs 62 MiB. Residency admission
 charges that full bank and conversion workspace; it does not assume per-depth
 streaming. Neither unit belongs to a permanently pinned static role.
