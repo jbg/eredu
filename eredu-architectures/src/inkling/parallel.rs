@@ -607,40 +607,18 @@ pub(super) fn pinned_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
     let hidden = dim(args.text_config.hidden_size)?;
-    let vocabulary = dim(args.text_config.vocab_size)?;
-    let mut groups = vec![
-        (
-            "embedding",
-            group(
-                "model.embed_tokens",
-                ParameterRole::Vocabulary,
-                [(
-                    "model.embed_tokens.weight",
-                    vec![vocabulary, hidden],
-                    balanced(0),
-                )],
-            )?,
-        ),
-        (
-            "embedding_norm",
-            replicated(
-                "model.embed_norm",
-                [("model.embed_norm.weight", vec![hidden])],
-            )?,
-        ),
-        (
-            "norm",
-            replicated("model.norm", [("model.norm.weight", vec![hidden])])?,
-        ),
-        (
-            "output",
-            group(
-                "lm_head",
-                ParameterRole::Vocabulary,
-                [("lm_head.weight", vec![vocabulary, hidden], balanced(0))],
-            )?,
-        ),
-    ];
+    let embedding_norm = replicated(
+        "model.embed_norm",
+        [("model.embed_norm.weight", vec![hidden])],
+    )?;
+    let mut groups = super::static_spec(&args.text_config)
+        .logical_pinned_parameter_groups("model.embed_tokens", "model.norm", "lm_head")?
+        .into_iter()
+        .flat_map(|(role, group)| {
+            std::iter::once((role, group))
+                .chain((role == "embedding").then(|| ("embedding_norm", embedding_norm.clone())))
+        })
+        .collect::<Vec<_>>();
     if let Some(audio) = &args.audio_config {
         let audio_vocabulary = dim(audio.num_codebooks)?
             .checked_mul(dim(audio.codebook_size)?)
@@ -1024,10 +1002,6 @@ fn member(
 
 const fn partitioned(axis: usize) -> MemberSharding {
     MemberSharding::Partitioned { axis }
-}
-
-const fn balanced(axis: usize) -> MemberSharding {
-    MemberSharding::Balanced { axis }
 }
 
 fn dim(value: i32) -> Result<usize, ParallelPlanError> {

@@ -21,9 +21,8 @@ use std::sync::Arc;
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    AuxiliaryConvolutionState, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error,
-    GroupedNeuralBackend, Index, LinearSpec, NormalizationConstructionSpec, NormalizationOperator,
-    ParameterSpec, Parameterized, Tensor,
+    AuxiliaryConvolutionState, EmbeddingLookupPolicy, EmbeddingOperator, Error,
+    GroupedNeuralBackend, Index, NormalizationOperator, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
@@ -91,117 +90,50 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
             .as_mut()
             .ok_or_else(|| Error::backend("Inkling does not own pinned resource output"))
     }
-    fn new(args: &ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let text = &args.text_config;
-        let norm = |name: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    text.hidden_size,
-                    text.rms_norm_eps,
-                    ParameterSpec::trainable(name).map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
-        Ok(Self {
-            embeddings: Some(B::embedding(
-                EmbeddingSpec {
-                    vocabulary: text.vocab_size,
-                    dimensions: text.hidden_size,
-                    weight: ParameterSpec::trainable("model.embed_tokens.weight")
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        "model.embed_tokens.weight",
-                        text.linear_format_for("model.embed_tokens.weight"),
-                    )?,
-                },
-                context,
-            )?),
-            embedding_norm: Some(norm("model.embed_norm.weight")?),
-            final_norm: Some(norm("model.norm.weight")?),
-            output: Some(B::linear(
-                LinearSpec {
-                    input: text.hidden_size,
-                    output: text.vocab_size,
-                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        "lm_head.weight",
-                        text.linear_format_for("lm_head.weight"),
-                    )?,
-                },
-                context,
-            )?),
-            mtp: MtpModel::new(args, context)?,
-            audio: args
-                .audio_config
-                .as_ref()
-                .map(|audio| AudioTower::new(audio, context))
-                .transpose()?,
-            vision: args
-                .vision_config
-                .as_ref()
-                .map(|vision| VisionStatic::new(vision, context))
-                .transpose()?,
-        })
-    }
-
-    fn new_parallel(
+    fn materialize(
         args: &ModelArgs,
-        geometry: &LocalGeometry,
+        geometry: Option<&LocalGeometry>,
+        owns: impl Fn(&str) -> bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let text = &args.text_config;
-        let norm = |name: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    text.hidden_size,
-                    text.rms_norm_eps,
-                    ParameterSpec::trainable(name).map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
+        let common = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
+            super::static_spec(&args.text_config),
+            geometry.map(|geometry| {
+                (
+                    geometry.embedding_range().clone(),
+                    Some(geometry.output_range().clone()),
+                )
+            }),
+            &owns,
+            context,
+        )?;
         Ok(Self {
-            embeddings: Some(B::vocabulary_parallel_embedding(
-                EmbeddingSpec {
-                    vocabulary: text.vocab_size,
-                    dimensions: text.hidden_size,
-                    weight: ParameterSpec::trainable("model.embed_tokens.weight")
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        "model.embed_tokens.weight",
-                        text.linear_format_for("model.embed_tokens.weight"),
-                    )?,
-                },
-                geometry.embedding_range().clone(),
-                context,
-            )?),
-            embedding_norm: Some(norm("model.embed_norm.weight")?),
-            final_norm: Some(norm("model.norm.weight")?),
-            output: Some(B::vocabulary_parallel_linear(
-                LinearSpec {
-                    input: text.hidden_size,
-                    output: text.vocab_size,
-                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        "lm_head.weight",
-                        text.linear_format_for("lm_head.weight"),
-                    )?,
-                },
-                geometry.output_range().clone(),
-                context,
-            )?),
-            mtp: MtpModel::new(args, context)?,
+            embeddings: common.embeddings,
+            embedding_norm: owns("embedding_norm")
+                .then(|| {
+                    B::normalization(
+                        super::text::embedding_norm_spec(&args.text_config)?,
+                        context,
+                    )
+                })
+                .transpose()?,
+            final_norm: common.norm,
+            output: common.lm_head,
+            mtp: if owns("mtp") {
+                MtpModel::new(args, context)?
+            } else {
+                None
+            },
             audio: args
                 .audio_config
                 .as_ref()
+                .filter(|_| owns("audio"))
                 .map(|audio| AudioTower::new(audio, context))
                 .transpose()?,
             vision: args
                 .vision_config
                 .as_ref()
+                .filter(|_| owns("vision"))
                 .map(|vision| VisionStatic::new(vision, context))
                 .transpose()?,
         })
@@ -722,7 +654,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
             "Inkling",
             crate::operator_requirements::INKLING,
         )?;
-        let static_modules = StaticModules::new(&args, context)?;
+        let static_modules = StaticModules::materialize(&args, None, |_| true, context)?;
         Ok(Self {
             definition,
             args,
@@ -745,7 +677,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> InklingKernel
             "Inkling",
             crate::operator_requirements::INKLING,
         )?;
-        let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
+        let static_modules = StaticModules::materialize(&args, Some(&geometry), |_| true, context)?;
         Ok(Self {
             definition,
             args,

@@ -8531,6 +8531,14 @@ normalization and untied head ownership, including tied-embedding replicas on
 output partitions. Parameter identities, normalization policy and exact vocabulary
 ranges come from the shared specification and retained geometry.
 
+Inkling declares vocabulary geometry, independent readout and final normalization
+in one source-free static specification. Complete and tensor-local component
+construction use the shared selected pinned constructor; standalone `TextModel`
+uses the same specification through ordinary shared decoder construction. Cold
+catalogs project those same logical groups, retaining embedding-normalization and
+media roles separately. Inkling owns assembly normalization, muP scaling, protocol
+vocabulary trimming, MTP and media construction.
+
 `ComponentSelection::owns_storage` reports canonical parameter owners from the
 validated partition bindings, independently of logical invocation and mutable-state
 identity. The shared `PartitionStaticModules::from_selected_spec` constructor consumes

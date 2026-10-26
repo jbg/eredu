@@ -46,6 +46,23 @@ pub use text::{
 };
 pub use vision::{VisionLayer, VisionStatic, VisionTower};
 
+/// Common vocabulary and final-normalization declaration for every text owner.
+pub(crate) fn static_spec(args: &TextArgs) -> crate::decoder::StaticModuleSpec {
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: None,
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.rms_norm_eps,
+        normalization_offset: 0.0,
+        embedding_format: args.linear_format_for("model.embed_tokens.weight"),
+        head_format: args.linear_format_for("lm_head.weight"),
+        tied_head: false,
+    }
+}
+
 /// Rank-local construction specifications for one Inkling sparse unit.
 #[derive(Debug, Clone)]
 pub struct ExpertBankRealization {
