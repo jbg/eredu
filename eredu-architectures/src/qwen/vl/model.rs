@@ -1404,7 +1404,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredModel<B>, Error> {
         let definition = super::select_definition(&args, definition, geometry.as_ref())?;
-        if let Some(partition) = partition {
+        let ownership = if let Some(partition) = partition {
             super::PartitionLocalFoundation::from_partition(&args, partition)
                 .map_err(Error::backend_source)?;
             let complete = geometry.as_ref().ok_or_else(|| {
@@ -1414,53 +1414,30 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
                 .local_geometry()
                 .validate_complete_geometry(&args, complete)
                 .map_err(Error::backend_source)?;
-            definition.select_partition(partition)?;
-        }
+            Some(definition.select_partition(partition)?)
+        } else {
+            None
+        };
         crate::operator_requirements::require::<B>(
             "Qwen3-VL",
             crate::operator_requirements::QWEN_VL,
         )?;
-        let stores = |role: &str| {
-            partition.is_none_or(|partition| {
-                partition
-                    .parameter_bindings()
-                    .iter()
-                    .any(|group| group.owner().accepts_static_role(role))
-            })
-        };
-        let (embedding, head, normalization) =
-            crate::decoder::StaticModuleSpec::from_config(&args.text).construction_specs()?;
-        let embeddings = stores("embedding")
-            .then(|| match &geometry {
-                Some(geometry) => B::vocabulary_parallel_embedding(
-                    embedding,
+        let text = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
+            crate::decoder::StaticModuleSpec::from_config(&args.text),
+            geometry.as_ref().map(|geometry| {
+                (
                     geometry.text().embedding_range().clone(),
-                    context,
-                ),
-                None => B::embedding(embedding, context),
-            })
-            .transpose()?;
-        let norm = stores("norm")
-            .then(|| {
-                crate::decoder::NormalizedBoundary::<B>::new(normalization, context)
-                    .map(|boundary| boundary.norm)
-            })
-            .transpose()?;
-        let lm_head = if stores("output") {
-            head.map(|spec| match &geometry {
-                Some(geometry) => B::vocabulary_parallel_linear(
-                    spec,
-                    geometry.text().output_range().cloned().ok_or_else(|| {
-                        Error::backend("Qwen3-VL output owner has no vocabulary range")
-                    })?,
-                    context,
-                ),
-                None => B::linear(spec, context),
-            })
-            .transpose()?
-        } else {
-            None
-        };
+                    geometry.text().output_range().cloned(),
+                )
+            }),
+            |role| {
+                ownership.as_ref().is_none_or(|selection| {
+                    selection
+                        .owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+                })
+            },
+            context,
+        )?;
         let selection = match partition {
             Some(partition) => crate::qwen::vision::VisionStaticSelection::from_parameter_bindings(
                 args.vision.clone(),
@@ -1490,14 +1467,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
             args,
             definition: std::sync::Arc::clone(&definition),
             owns_input: partition.is_none_or(|partition| partition.ownership().owns_input()),
-            static_modules: StaticModules {
-                text: crate::decoder::PartitionStaticModules {
-                    embeddings,
-                    norm,
-                    lm_head,
-                },
-                vision,
-            },
+            static_modules: StaticModules { text, vision },
             parallel_geometry: geometry.map(std::sync::Arc::new),
             partition_geometry: partition
                 .map(|partition| std::sync::Arc::new(partition.local_geometry().clone())),

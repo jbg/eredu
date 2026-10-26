@@ -8415,6 +8415,14 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+Qwen3-VL text resources use the shared selected pinned constructor for complete,
+tensor-local and partitioned construction. Canonical component storage ownership
+selects embedding, final normalization and readout, including tied output replicas;
+family-declared text formats and exact vocabulary ranges remain authoritative.
+Vision roots continue to use the family vision selection, including partial
+DeepStack ownership. Media assembly, position-delta state and transport remain
+Qwen3-VL semantics.
+
 Qwen hybrid text partitions and conditional construction consume canonical
 `ComponentSelection` storage ownership through the shared selected pinned-resource
 constructor. Conditional graphs retain their family vision selection and prediction
