@@ -1107,6 +1107,24 @@ pub fn expand_linear_format_parameter_group(
     expanded.with_partition_unit_assignment(group.partition_unit_assignment())
 }
 
+/// Projects physical storage for canonical owned groups without rebuilding their
+/// ownership, sharing or replica-consumer declarations.
+pub fn expand_owned_linear_format_parameter_groups(
+    groups: Vec<crate::OwnedParameterGroupSpec>,
+    declaration: impl Fn(
+        &ParameterMemberSpec,
+    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+) -> Result<Vec<crate::OwnedParameterGroupSpec>, ParallelPlanError> {
+    groups
+        .into_iter()
+        .map(|owned| {
+            let owner = owned.owner().clone();
+            expand_linear_format_parameter_group(owned.into_group(), &declaration)
+                .map(|group| crate::OwnedParameterGroupSpec::new(owner, group))
+        })
+        .collect()
+}
+
 fn partitioned_group_with_preferred_units(
     logical_name: impl Into<String>,
     role: ParameterRole,

@@ -8484,6 +8484,12 @@ around that projection; Muse carries its role tags through format expansion, and
 LFM2 associates static owners with declared group identities. DeepSeek pinned
 format expansion likewise retains each resource role directly.
 
+`expand_owned_linear_format_parameter_groups` consumes canonical owned groups
+and projects their physical encodings through the same atomic-group primitive.
+Owners, shared consumers and replica requirements remain attached to each group.
+Kimi Linear, Qwen hybrid and Nemotron-H supply their admitted format callbacks;
+runtime owns the projection without reconstructing their family storage policy.
+
 `StaticModuleSpec::embedding_format` retains the complete physical matrix encoding,
 including block-FP8 companions. Shared decoder configuration supplies its selected
 `linear_format` directly; tied output inspection uses the same embedding encoding

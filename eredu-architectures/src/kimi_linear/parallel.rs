@@ -1110,33 +1110,22 @@ pub fn parameter_description(
             )
         }));
     }
-    let mut expanded = Vec::with_capacity(owned.len());
-    for owner in owned {
-        let groups = eredu_runtime::expand_linear_format_parameter_groups(
-            vec![owner.group().clone()],
-            |member| {
-                let name = member.target();
-                if let Some(format) = formats.get(name) {
-                    return Ok(Some(format.clone()));
-                }
-                projections
-                    .contains(name)
-                    .then(|| {
-                        crate::linear_format::standard_linear_format(
-                            name,
-                            args.weight_quantization_for(name).into(),
-                        )
-                        .map_err(invalid)
-                    })
-                    .transpose()
-            },
-        )?;
-        expanded.extend(
-            groups
-                .into_iter()
-                .map(|group| OwnedParameterGroupSpec::new(owner.owner().clone(), group)),
-        );
-    }
+    let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
+        let name = member.target();
+        if let Some(format) = formats.get(name) {
+            return Ok(Some(format.clone()));
+        }
+        projections
+            .contains(name)
+            .then(|| {
+                crate::linear_format::standard_linear_format(
+                    name,
+                    args.weight_quantization_for(name).into(),
+                )
+                .map_err(invalid)
+            })
+            .transpose()
+    })?;
     ArchitectureParameterDescription::new(
         &graph,
         &layout,

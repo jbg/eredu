@@ -442,18 +442,9 @@ pub fn parameter_description(
             );
         }
     }
-    let mut expanded = Vec::with_capacity(owned.len());
-    for group in owned {
-        let groups = eredu_runtime::expand_linear_format_parameter_groups(
-            vec![group.group().clone()],
-            |member| Ok(declaration.formats.get(member.target()).cloned()),
-        )?;
-        expanded.extend(
-            groups
-                .into_iter()
-                .map(|expanded| OwnedParameterGroupSpec::new(group.owner().clone(), expanded)),
-        );
-    }
+    let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
+        Ok(declaration.formats.get(member.target()).cloned())
+    })?;
     ArchitectureParameterDescription::new(
         &graph,
         &layout,
