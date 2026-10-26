@@ -549,6 +549,8 @@ pub struct TargetKernel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     #[parameter(skip)]
     partition_state: eredu_runtime::PartitionState,
     #[parameter(skip)]
+    parameter_root: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    #[parameter(skip)]
     definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     pub(crate) statics: BoundaryModules<B, ResidualBoundary<B>>,
 }
@@ -560,6 +562,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetKernel<
             state_fingerprint: self.state_fingerprint.clone(),
             tensor_partition: self.tensor_partition.clone(),
             partition_state: self.partition_state.clone(),
+            parameter_root: self.parameter_root.clone(),
             definition: self.definition.clone(),
             statics: self.statics.clone(),
         }
@@ -628,6 +631,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
             state_fingerprint,
             tensor_partition: None,
             partition_state,
+            parameter_root: definition.clone(),
             definition,
             statics: statics.into(),
         })
@@ -652,11 +656,12 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
         self.tensor_partition.as_ref()
     }
 
+    /// Selects global bindings from the retained complete parameter declaration.
     pub(crate) fn with_global_parameters(
         mut self,
         parameters: eredu_runtime::ArchitectureParameterDescription,
     ) -> Result<Self, Error> {
-        self.definition = std::sync::Arc::new(self.spec.definition_with_parameters(parameters)?);
+        self.definition = self.parameter_root.project_parameters(parameters)?;
         Ok(self)
     }
 

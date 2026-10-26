@@ -202,7 +202,7 @@ impl TargetSpec {
         self.definition_with_parameters(self.declare_parameters()?)
     }
 
-    pub(super) fn definition_with_parameters(
+    fn definition_with_parameters(
         &self,
         parameters: ArchitectureParameterDescription,
     ) -> Result<eredu_runtime::ComponentDefinition, Error> {
@@ -228,7 +228,7 @@ impl TargetSpec {
         .map_err(Error::from)
     }
 
-    fn declare_parameters(&self) -> Result<ArchitectureParameterDescription, Error> {
+    pub(super) fn declare_parameters(&self) -> Result<ArchitectureParameterDescription, Error> {
         self.limits.validate_for_config(&self.config)?;
         self.state_layout()?;
         let graph = ExecutionGraph::chain([crate::decoder::TARGET_EXECUTION_GROUP])

@@ -12087,8 +12087,14 @@ Tensor/expert placement uses global,
 tensor-local and expert-local declarations; `TargetSpec::with_expert_realization`
 consumes geometry and validates the exact admitted expert identities before
 returning the local specification. Native target updates use the same selection
-operation. Conditional target and transform-source planning derives placement
-from these declarations. Selected conditional construction validates ingress and
+operation. The target retains a complete component definition as its parameter
+root alongside the active ownership view. Expert-local parameters project through
+runtime `project_owned_parameters`; global bindings project from the complete root
+through the exact projector. Unit paths, state geometry, logical uses, observation
+seams and transport ownership stay retained across these selections. The root
+contains neutral metadata and shares the initial declaration; native modules and
+leases belong to the active materialization. Conditional target and transform-source
+planning derives placement from these declarations. Selected conditional construction validates ingress and
 placement, then constructs the tensor-local target and vision modules directly.
 
 `DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse.

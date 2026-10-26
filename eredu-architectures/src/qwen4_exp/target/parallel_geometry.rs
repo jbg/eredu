@@ -542,12 +542,13 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
     ) -> Result<Self, Error> {
         let local = self.spec.clone().with_expert_realization(realization)?;
         let definition = if self.definition.parameters().partition_layout().is_some() {
-            local.definition_with_parameters(self.definition.parameters().clone())?
+            self.definition.clone()
         } else {
-            local.definition()?
+            self.parameter_root
+                .project_owned_parameters(local.declare_parameters()?)?
         };
         self.spec = local;
-        self.definition = std::sync::Arc::new(definition);
+        self.definition = definition;
         Ok(self)
     }
 }
