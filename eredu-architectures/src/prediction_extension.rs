@@ -16,6 +16,11 @@ mod placement;
 pub(crate) mod residency;
 mod resources;
 mod snapshot;
+mod state_lifecycle;
+pub use state_lifecycle::{
+    ModelPredictionStateProfile, PoolingPredictionStateProfile, PredictionStateLifecycle,
+    SequentialPredictionStateProfile,
+};
 use invocation::prediction_invocation;
 pub use invocation::PredictionInvocation;
 pub(crate) use placement::PredictionPlacementSlot;
@@ -1105,6 +1110,8 @@ where
 {
     /// Exact mutable state retained for one speculative lane.
     type LaneState: Clone + 'static;
+    /// Static state-membership and lifecycle declaration for this lane.
+    type StateProfile: PredictionStateLifecycle<B, M, State = Self::LaneState>;
 
     /// Completes every retained lane value plus the actual phase outputs. The
     /// architecture supplies state membership; the backend settles native work.
@@ -1113,7 +1120,9 @@ where
         state: &mut Self::LaneState,
         outputs: &[&B::Tensor],
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure>;
+    ) -> Result<(), eredu_core::BackendFailure> {
+        Self::StateProfile::complete_state(state, outputs, context)
+    }
 
     /// Visits every materialized prediction parameter owner exactly once in
     /// stable ordinal order. Shared target parameters remain with the target.
@@ -1125,26 +1134,26 @@ where
     /// Observes architecture-owned state membership through native mechanisms.
     fn memory_observation(
         &self,
-        _state: &Self::LaneState,
-        _additional: u64,
+        state: &Self::LaneState,
+        additional: u64,
     ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        None
+        Self::StateProfile::memory_observation(state, additional)
     }
 
     /// Complete prediction-lane copy bound with architecture-owned membership.
     fn snapshot_estimate(
         &self,
-        _state: &Self::LaneState,
+        state: &Self::LaneState,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
+        Self::StateProfile::snapshot_estimate(state)
     }
     /// Copies every prediction state member into durable independent storage.
     fn snapshot(
         &self,
-        _state: &Self::LaneState,
-        _context: &<B::Tensor as Tensor>::Context,
+        state: &Self::LaneState,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        Ok(None)
+        Self::StateProfile::snapshot(state, context)
     }
 
     /// Returns the proposal depth exposed to the scheduler.
@@ -2516,21 +2525,7 @@ where
     M::SequentialState: 'static,
 {
     type LaneState = Vec<M::SequentialState>;
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
-    }
+    type StateProfile = SequentialPredictionStateProfile;
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
         &mut self,
@@ -2540,29 +2535,6 @@ where
             visitor.visit::<crate::deepseek::v3::Unit<B>>(ordinal, module)?;
         }
         Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        snapshot::sequence_estimate(state, M::sequential_snapshot_estimate)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        snapshot::sequence_memory(state, |state| {
-            M::sequential_memory_observation(state, additional)
-        })
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        snapshot::sequence_copy(state, |state| M::sequential_snapshot(state, context))
     }
 
     fn supports_internal_observations(&self) -> bool {
@@ -2679,21 +2651,7 @@ where
     M::PoolingState: 'static,
 {
     type LaneState = Vec<M::PoolingState>;
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
-    }
+    type StateProfile = PoolingPredictionStateProfile;
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
         &mut self,
@@ -2714,29 +2672,6 @@ where
             visitor.visit::<crate::deepseek::v4::Unit<B>>(offset + ordinal, module)?;
         }
         Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        snapshot::sequence_estimate(state, M::pooling_snapshot_estimate)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        snapshot::sequence_memory(state, |state| {
-            M::pooling_memory_observation(state, additional)
-        })
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        snapshot::sequence_copy(state, |state| M::pooling_snapshot(state, context))
     }
 
     fn supports_internal_observations(&self) -> bool {
@@ -3027,25 +2962,10 @@ where
     A: InklingPredictionTarget<B>,
 {
     type LaneState = M::ModelState;
+    type StateProfile = ModelPredictionStateProfile;
 
     fn supports_internal_observations(&self) -> bool {
         true
-    }
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .prediction_layers_mut()
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
     }
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -3059,27 +2979,6 @@ where
             visitor.visit::<crate::inkling::MtpDepth<B>>(depth + 1, unit)?;
         }
         Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        M::model_memory_observation(state, additional)
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        M::model_snapshot(state, context)
     }
 
     fn depth(&self) -> usize {
@@ -3197,25 +3096,10 @@ where
     A: QwenHybridPredictionTarget<B>,
 {
     type LaneState = M::ModelState;
+    type StateProfile = ModelPredictionStateProfile;
 
     fn supports_internal_observations(&self) -> bool {
         true
-    }
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .prediction_layers_mut()
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
     }
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -3227,27 +3111,6 @@ where
             visitor.visit::<crate::qwen::hybrid::PredictionUnit<B>>(ordinal + 1, module)?;
         }
         Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        M::model_memory_observation(state, additional)
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        M::model_snapshot(state, context)
     }
 
     fn depth(&self) -> usize {
@@ -3360,25 +3223,10 @@ where
     A: NemotronHPredictionTarget<B>,
 {
     type LaneState = M::ModelState;
+    type StateProfile = ModelPredictionStateProfile;
 
     fn supports_internal_observations(&self) -> bool {
         true
-    }
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .prediction_layers_mut()
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
     }
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -3389,27 +3237,6 @@ where
             visitor.visit::<crate::nemotron_h::PredictionUnit<B>>(ordinal, module)?;
         }
         Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        M::model_memory_observation(state, additional)
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        M::model_snapshot(state, context)
     }
 
     fn depth(&self) -> usize {

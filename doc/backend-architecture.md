@@ -9134,9 +9134,13 @@ wraps the entire prediction prefill, proposal or replay invocation; one prefill
 may execute several prediction depths under that transaction. Each typed operation
 also agrees checkpoint success before entering its own execution collectives.
 
-`MaterializedPredictionExecutor::complete_state` enumerates exact retained lane
-values and actual output dependencies. Sequential, pooling and model-state profiles
-reuse neutral runtime retention contracts. `PredictionExtensionMaterializer`
+`MaterializedPredictionExecutor` selects a typed `PredictionStateLifecycle` profile
+whose state type matches its existing lane owner. Its shared completion, memory,
+snapshot estimate and snapshot methods delegate through that profile. Sequential,
+pooling and model-state profiles enumerate exact retained lane values and actual
+output dependencies using neutral runtime retention contracts. Cache-list snapshots
+retain checked host-container accounting and propagate unavailable estimates or
+copies. `PredictionExtensionMaterializer`
 settles that iterator using native completion and deferred validation resources;
 it does not interpret a family or rebuild state geometry. Observed proposals
 retain their actual logits and hidden output until completion. Prefill and replay
