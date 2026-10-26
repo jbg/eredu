@@ -1042,57 +1042,6 @@ fn validate_input<T: Tensor>(
     Ok(shape[1])
 }
 
-/// Existing bounded provider and traversal for either transformer stack.
-pub struct LayerwiseTransformer<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, TransformerUnit<B>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
-        B,
-        TransformerStateMarker<B>,
-        P,
-    >,
-}
-impl<B, P> LayerwiseTransformer<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, TransformerUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact already-prepared unit policy without allocating duplicate parameters.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
-        B,
-        TransformerStateMarker<B>,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing shared runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
-        B,
-        TransformerStateMarker<B>,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<TransformerError, P>,
 ) -> TransformerError {
@@ -1108,14 +1057,20 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
         }
     }
 }
-impl<B, P> TransformerExecution<B> for LayerwiseTransformer<B, P>
+impl<B, P> TransformerExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+        B,
+        TransformerStateMarker<B>,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, TransformerUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn config(&self) -> &TransformerConfig {
-        self.runtime.architecture().kernel().config()
+        self.architecture().kernel().config()
     }
     fn forward_encoder(
         &mut self,
@@ -1126,20 +1081,25 @@ where
         let mut empty = [];
         let mut state =
             TransformerRuntimeState::<B, NoTransformerCache<B>>::new(self.config(), &mut empty)?;
-        self.runtime
-            .forward_with_state(
-                TransformerInput {
-                    embedded,
-                    key_mask: Some(key_mask),
-                },
-                &mut state,
-                context,
-            )
-            .map_err(runtime_error)
+        self.forward_with_state(
+            TransformerInput {
+                embedded,
+                key_mask: Some(key_mask),
+            },
+            &mut state,
+            context,
+        )
+        .map_err(runtime_error)
     }
 }
 
-impl<B, P, C> CausalTransformerExecution<B, [C]> for LayerwiseTransformer<B, P>
+impl<B, P, C> CausalTransformerExecution<B, [C]>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+        B,
+        TransformerStateMarker<B>,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, TransformerUnit<B>>,
@@ -1156,27 +1116,52 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
         let mut state = TransformerRuntimeState::<B, C>::new(self.config(), caches)?;
-        self.runtime
-            .forward_with_state(
-                TransformerInput {
-                    embedded,
-                    key_mask: None,
-                },
-                &mut state,
-                context,
-            )
-            .map_err(runtime_error)
+        self.forward_with_state(
+            TransformerInput {
+                embedded,
+                key_mask: None,
+            },
+            &mut state,
+            context,
+        )
+        .map_err(runtime_error)
     }
 }
 
-impl<B, P> LayerwiseTransformer<B, P>
+/// Selected rank-local transformer operations over explicit caller-owned caches.
+pub trait ParallelTransformerExecution<B: NeuralBackend>: TransformerExecution<B> {
+    /// Advances the selected causal stack using its local cache geometry.
+    fn forward_causal_parallel<C: AttentionCache<B::Tensor> + RuntimeLayerState<B>>(
+        &mut self,
+        embedded: &B::Tensor,
+        caches: &mut [C],
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, TransformerError>;
+    /// Runs character attention with the retained padding and local masks.
+    fn forward_encoder_parallel(
+        &mut self,
+        embedded: &B::Tensor,
+        key_mask: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, TransformerError>;
+}
+
+impl<B, P> ParallelTransformerExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, TransformerKernel<B>>,
+        B,
+        TransformerStateMarker<B>,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, TransformerUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     /// Runs the selected rank-local causal stack through shared bounded traversal.
-    pub fn forward_causal_parallel<C: AttentionCache<B::Tensor> + RuntimeLayerState<B>>(
+    fn forward_causal_parallel<C: AttentionCache<B::Tensor> + RuntimeLayerState<B>>(
         &mut self,
         embedded: &B::Tensor,
         caches: &mut [C],
@@ -1184,23 +1169,22 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TransformerError> {
         let mut state = TransformerRuntimeState::<B, C>::for_architecture(
-            self.runtime.architecture().kernel(),
+            self.architecture().kernel(),
             caches,
         )?;
-        self.runtime
-            .forward_parallel_with_state(
-                TransformerInput {
-                    embedded,
-                    key_mask: None,
-                },
-                &mut state,
-                parallel,
-                context,
-            )
-            .map_err(runtime_error)
+        self.forward_parallel_with_state(
+            TransformerInput {
+                embedded,
+                key_mask: None,
+            },
+            &mut state,
+            parallel,
+            context,
+        )
+        .map_err(runtime_error)
     }
     /// Runs rank-local character attention with the same padding and local masks.
-    pub fn forward_encoder_parallel(
+    fn forward_encoder_parallel(
         &mut self,
         embedded: &B::Tensor,
         key_mask: &B::Tensor,
@@ -1209,19 +1193,18 @@ where
     ) -> Result<B::Tensor, TransformerError> {
         let mut empty = [];
         let mut state = TransformerRuntimeState::<B, NoTransformerCache<B>>::for_architecture(
-            self.runtime.architecture().kernel(),
+            self.architecture().kernel(),
             &mut empty,
         )?;
-        self.runtime
-            .forward_parallel_with_state(
-                TransformerInput {
-                    embedded,
-                    key_mask: Some(key_mask),
-                },
-                &mut state,
-                parallel,
-                context,
-            )
-            .map_err(runtime_error)
+        self.forward_parallel_with_state(
+            TransformerInput {
+                embedded,
+                key_mask: Some(key_mask),
+            },
+            &mut state,
+            parallel,
+            context,
+        )
+        .map_err(runtime_error)
     }
 }

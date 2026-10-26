@@ -3,15 +3,16 @@
 use eredu_architectures::voicechat::{
     tts_transformer::TransformerConfig,
     tts_transformer_layered::{
-        CausalTransformerExecution, LayerwiseTransformer, TransformerError, TransformerExecution,
-        TransformerKernel, TransformerStateMarker, TransformerUnit,
+        CausalTransformerExecution, ParallelTransformerExecution, TransformerError,
+        TransformerExecution, TransformerKernel, TransformerStateMarker, TransformerUnit,
     },
     tts_transformer_preparation::PreparedTtsTransformerBindings,
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    ArchitectureParameters, DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata,
-    LocalModelLayout, ResidencyReport, StateLayout,
+    ArchitectureParameters, ComponentAdapter, ComponentDefinition, DenseDiskStreamReport,
+    LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout,
+    ResidencyReport, StateLayout,
 };
 use safemlx::{Array, Stream};
 
@@ -28,9 +29,15 @@ use crate::{
 };
 
 type Unit = TransformerUnit<MlxNeuralBackend>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, TransformerKernel<MlxNeuralBackend>>,
+    MlxNeuralBackend,
+    TransformerStateMarker<MlxNeuralBackend>,
+    P,
+>;
 enum Execution {
-    Resident(LayerwiseTransformer<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwiseTransformer<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native EAR-TTS transformer over the selected shared resident or bounded parameter policy.
@@ -52,8 +59,8 @@ impl MlxTtsTransformer {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -63,7 +70,6 @@ impl MlxTtsTransformer {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -73,8 +79,8 @@ impl MlxTtsTransformer {
     /// Number of pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -233,9 +239,9 @@ fn materialize(
                         std::marker::PhantomData::<TransformerStateMarker<MlxNeuralBackend>>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwiseTransformer::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwiseTransformer::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxTtsTransformer {

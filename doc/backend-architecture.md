@@ -2410,6 +2410,11 @@ attention caches and validate frontiers/capacity before mutation.
 `TransformerKernel` supplies equations for both stacks through `ComponentAdapter`,
 with one independently leased unit per block and a separate final-normalization
 unit. Resident, bounded and selected pipeline execution use this declaration.
+`TransformerExecution`, `CausalTransformerExecution` and the static parallel
+operation contract apply directly to the shared component runtime. Callers retain
+causal cache ownership and rollback authority; `TransformerRuntimeState` borrows
+those caches for each invocation. Native composition retains the selected policy,
+cache layout and stream-bound immutable-parameter certificate.
 Typed equation hooks accept either borrowed caches or owned candidate storage;
 normalization-only stages own no attention slots. The shared adapter owns graph,
 address and local state mapping and empty pinned parameter visitation. The shared decoder's
