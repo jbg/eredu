@@ -8550,6 +8550,8 @@ callers that already hold a complete or tensor-local kernel.
 
 Runtime `balanced_parameter_group_range` extracts independent axis intervals from
 declared sharded members and validates every physical member against that range.
+Complete local storage retains local authority, and recorded replication fallback
+remains a placement fact. Partial local tensors cannot stand in for a full interval.
 Replicated companions, including scalar global scales, retain their complete
 geometry. Inkling vocabulary geometry uses this projection over its declared
 embedding and output groups. Full replicated storage remains distinct from
@@ -8560,10 +8562,10 @@ replicas and malformed selections.
 `StaticModuleSpec::vocabulary_ranges` projects embedding and independent readout
 intervals from its physical parameter groups through runtime's balanced-axis
 validation. Common complete and partitioned decoders, LFM2, Kimi Linear,
-Nemotron-H and Inkling use this same geometry as pinned construction and cold
-catalogs. Tied readout has no independent output range. Family code retains
-recurrent, cache, prediction and collective geometry;
-replicated companions do not masquerade as vocabulary rows.
+Nemotron-H, Inkling, Muse and Qwen hybrid use this same geometry as pinned
+construction and cold catalogs. Tied readout has no independent output range.
+Family code retains recurrent, cache, prediction and collective geometry; replicated
+companions do not masquerade as vocabulary rows.
 
 Neutral NVFP4 vocabulary geometry includes replicated global-scale companions.
 MLX packed embedding materialization does not expose the NVFP4 global-scale

@@ -164,6 +164,7 @@ pub fn logical_parameter_group_range(
 }
 
 /// Extracts and validates an independent balanced axis from its declared group.
+/// Complete local storage and replication retain their distinct placement facts.
 /// Replicated companions retain their complete shapes, independently of the axis.
 /// The layout may contain other groups; only this group's declared targets are read.
 pub fn balanced_parameter_group_range(
@@ -190,24 +191,34 @@ pub fn balanced_parameter_group_range(
         })
         .ok_or_else(invalid)?;
     let tensor = layout.tensor(anchor.target()).ok_or_else(invalid)?;
-    let (range, replicated) = match tensor.placement() {
+    let range = match tensor.placement() {
         crate::TensorPlacement::Range {
             axis: selected,
             start,
             end,
-        } if *selected == axis => (*start..*end, false),
-        crate::TensorPlacement::Replicated => (0..global_extent, true),
+        } if *selected == axis => *start..*end,
+        crate::TensorPlacement::Replicated | crate::TensorPlacement::Local => 0..global_extent,
         _ => return Err(invalid()),
     };
+    let complete = range == (0..global_extent);
     for member in group.members() {
+        let actual = layout.tensor(member.target()).ok_or_else(invalid)?;
         let (mut placement, shape) =
             resolve_balanced_member(member, axis, global_extent, &range)
                 .map_err(crate::ParallelPlanError::InvalidTensor)?;
-        if replicated {
-            placement = crate::TensorPlacement::Replicated;
+        if (complete || member.sharding() == &crate::MemberSharding::Replicated)
+            && matches!(
+                actual.placement(),
+                crate::TensorPlacement::Local | crate::TensorPlacement::Replicated
+            )
+        {
+            placement = actual.placement().clone();
         }
-        let expected = local_tensor(group, member, shape, placement, None);
-        if layout.tensor(member.target()) != Some(&expected) {
+        let fallback = complete
+            && placement == crate::TensorPlacement::Replicated
+            && actual.fell_back_to_replication();
+        let expected = local_tensor(group, member, shape, placement, None, fallback);
+        if actual != &expected {
             return Err(crate::ParallelPlanError::InvalidTensor(format!(
                 "parameter {:?} differs from declared balanced group {:?}",
                 member.target(),
@@ -284,7 +295,7 @@ where
                 } => resolve_balanced_member(member, *axis, *global_extent, range),
             }
             .map_err(crate::ParallelPlanError::InvalidTensor)?;
-            let expected = local_tensor(group, member, shape, placement, logical.clone());
+            let expected = local_tensor(group, member, shape, placement, logical.clone(), false);
             if !targets.insert(member.target()) {
                 return Err(crate::ParallelPlanError::InvalidTensor(format!(
                     "parameter {:?} has duplicate physical ownership",
@@ -427,7 +438,7 @@ fn local_layout_groups<'a>(
                 resolve_member(member, group.partition_units(), member_rank, member_parts)?
             };
             let mut tensor =
-                local_tensor(group, member, local_shape, placement, logical_range.clone());
+                local_tensor(group, member, local_shape, placement, logical_range.clone(), false);
             if tensor_parts > 1 {
                 if let Some(range) = &packed_expert_range {
                     tensor = tensor.with_additional_placement(crate::TensorPlacement::Range {
@@ -449,6 +460,7 @@ fn local_tensor(
     shape: Vec<usize>,
     placement: crate::TensorPlacement,
     logical: Option<Range<usize>>,
+    fell_back_to_replication: bool,
 ) -> crate::LocalTensorLayout {
     crate::LocalTensorLayout::new(
         group.logical_name(),
@@ -458,7 +470,7 @@ fn local_tensor(
         placement,
         group.partition_units(),
         logical,
-        false,
+        fell_back_to_replication,
     )
     .with_partition_chunk_size(match member.sharding() {
         crate::MemberSharding::PartitionedChunks { chunk_size, .. }

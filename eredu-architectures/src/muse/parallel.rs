@@ -5,7 +5,7 @@ use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
     expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
     ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
-    StateLayout, TensorPlacement,
+    StateLayout,
 };
 use std::ops::Range;
 
@@ -404,13 +404,8 @@ pub fn local_geometry(
         .map(|layer| local_decoder_config(args, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = local_state_layout(&text_blocks)?;
-    let vocabulary = dim(args.vocab_size)?;
-    let embedding_range = vocabulary_range(layout, "model.embed_tokens", vocabulary)?;
-    let output_range = if args.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
+    let (embedding_range, output_range) = super::text::static_spec(args)
+        .vocabulary_ranges(layout, "model.embed_tokens", "model.norm", "lm_head")?;
     let geometry = LocalGeometry {
         text_blocks,
         embedding_range,
@@ -537,56 +532,6 @@ fn local_state_layout(blocks: &[DecoderConfig]) -> Result<StateLayout, ParallelP
         LayerSchedule::new(layers.len(), layers).map_err(|error| invalid(error.to_string()))?,
     )
     .map_err(|error| invalid(error.to_string()))
-}
-
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        if tensor.global_shape().first().copied() != Some(vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Muse-Glimmer vocabulary member {target} has global shape {:?}, expected {vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated | TensorPlacement::Local => 0..vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "Muse-Glimmer vocabulary member {target} has non-row placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Muse-Glimmer vocabulary group {logical_name} has inconsistent selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary,
-        local: selected.ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!(
-                "missing local Muse-Glimmer vocabulary layout for {logical_name}"
-            ))
-        })?,
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
 }
 
 /// Derives rank-local text construction geometry from the semantic placement.

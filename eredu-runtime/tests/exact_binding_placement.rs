@@ -1924,6 +1924,73 @@ mod component_preparation {
             ),
         );
         assert!(eredu_runtime::balanced_parameter_group_range(&nv, &invalid, 0, 11).is_err());
+        let full_storage = |placement: TensorPlacement, fallback| {
+            let mut full = nv_layout.clone();
+            for (target, tensor) in nv_layout.tensors() {
+                full.insert(
+                    target.into(),
+                    LocalTensorLayout::new(
+                        tensor.logical_name(),
+                        tensor.role(),
+                        tensor.global_shape().to_vec(),
+                        tensor.global_shape().to_vec(),
+                        placement.clone(),
+                        tensor.logical_units(),
+                        tensor.logical_range().cloned(),
+                        fallback,
+                    )
+                    .with_partition_chunk_size(tensor.partition_chunk_size()),
+                );
+            }
+            full
+        };
+        for (placement, fallback) in [
+            (TensorPlacement::Local, false),
+            (TensorPlacement::Replicated, false),
+            (TensorPlacement::Replicated, true),
+        ] {
+            let full = full_storage(placement, fallback);
+            assert_eq!(
+                eredu_runtime::balanced_parameter_group_range(&nv, &full, 0, 11).unwrap(),
+                0..11
+            );
+        }
+        let mut full = full_storage(TensorPlacement::Local, false);
+        let scalar = full.tensor("nv.global").unwrap();
+        full.insert(
+            "nv.global".into(),
+            LocalTensorLayout::new(
+                scalar.logical_name(),
+                scalar.role(),
+                vec![],
+                vec![],
+                TensorPlacement::Replicated,
+                None,
+                None,
+                false,
+            ),
+        );
+        assert_eq!(
+            eredu_runtime::balanced_parameter_group_range(&nv, &full, 0, 11).unwrap(),
+            0..11
+        );
+        let weight = full.tensor("nv.weight").unwrap();
+        let mut partial = weight.global_shape().to_vec();
+        partial[0] = 5;
+        full.insert(
+            "nv.weight".into(),
+            LocalTensorLayout::new(
+                weight.logical_name(),
+                weight.role(),
+                weight.global_shape().to_vec(),
+                partial,
+                TensorPlacement::Local,
+                None,
+                None,
+                false,
+            ),
+        );
+        assert!(eredu_runtime::balanced_parameter_group_range(&nv, &full, 0, 11).is_err());
         let prepared = prepared.select(&layout).unwrap();
         assert_eq!(
             prepared

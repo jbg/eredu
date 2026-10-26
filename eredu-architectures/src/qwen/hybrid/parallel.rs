@@ -5,7 +5,6 @@ use std::ops::Range;
 use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
     ArchitecturePartition, LocalModelLayout, ParallelPlanError, PartitionOwnership, StateLayout,
-    TensorPlacement,
 };
 
 use super::{
@@ -99,12 +98,8 @@ pub fn local_geometry(
     let prediction = (0..predictions)
         .map(|depth| local_unit_config(config, depth + 1, 0, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let embedding_range = vocabulary_range(layout, "model.embed_tokens", config.vocab_size)?;
-    let output_range = if config.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", config.vocab_size)?)
-    };
+    let (embedding_range, output_range) = super::static_module_spec(config)
+        .vocabulary_ranges(layout, "model.embed_tokens", "model.norm", "lm_head")?;
     let state_layout = local_state_layout(config, &target, &prediction)?;
     let geometry = LocalGeometry {
         target,
@@ -145,58 +140,6 @@ fn local_state_layout(
             }),
     );
     state_layout_with_geometry(config, &geometry).map_err(|error| invalid(error.to_string()))
-}
-
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    vocabulary: i32,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let vocabulary =
-        usize::try_from(vocabulary).map_err(|_| invalid("Qwen hybrid vocabulary is negative"))?;
-    let mut selected = None;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        if tensor.global_shape().first().copied() != Some(vocabulary) {
-            return Err(invalid(format!(
-                "Qwen hybrid vocabulary member {target} has global shape {:?}",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated | TensorPlacement::Local => 0..vocabulary,
-            placement => {
-                return Err(invalid(format!(
-                    "Qwen hybrid vocabulary member {target} has placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(invalid(format!(
-                "Qwen hybrid vocabulary group {logical_name} is inconsistent"
-            )));
-        }
-        selected = Some(range);
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary,
-        local: selected.ok_or_else(|| {
-            invalid(format!(
-                "missing local Qwen hybrid vocabulary layout for {logical_name}"
-            ))
-        })?,
-    };
-    range
-        .validate()
-        .map_err(|error| invalid(error.to_string()))?;
-    Ok(range)
 }
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
