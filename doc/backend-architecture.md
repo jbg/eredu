@@ -8539,6 +8539,11 @@ balanced-axis validation, including companions, complete local/replicated storag
 and replication fallback. Expected vocabulary cardinalities derive from the same
 static and depth construction specifications. Block alignment and cache geometry
 remain family-owned; this projection does not add a complete execution mode.
+Moshi rank-local construction selects state geometry on the retained component
+definition through runtime `select_state_layout`. Temporal invocation slots,
+shared frame-local depth slots, state lifetimes, canonical parameter identities
+and transport ownership remain part of that declaration. Parallel selection
+retains this definition through realtime materialization instead of rebuilding it.
 Shared multi-table construction validates the complete ordered set of names,
 lookup policies and positive, equal widths before invoking any backend factory.
 Ordinary and vocabulary-parallel construction use that same pass and allocation

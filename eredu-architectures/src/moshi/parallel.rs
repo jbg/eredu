@@ -217,7 +217,7 @@ pub fn select_parallel_execution<'a>(
     completion: CommunicationCompletionPolicy,
     aliases: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<MoshiParallelSelection, ParallelPlanError> {
-    let definition = contract.definition();
+    let definition = contract.definition.clone();
     let parameters = definition.parameters();
     let topology = rank.topology();
     if topology.data() != 1
@@ -394,10 +394,9 @@ pub fn select_parallel_execution<'a>(
         rank.tensor_parallel_rank(),
         rank.tensor_parallel_size()
     );
-    let definition = std::sync::Arc::new(
-        super::model::definition_with_parameters(config, Some(&geometry), parameters.clone())
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
-    );
+    let definition = definition
+        .select_state_layout(geometry.state_layout())
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     Ok(MoshiParallelSelection {
         definition,
         topology,
@@ -648,7 +647,7 @@ pub fn parameter_contract(
     let description = ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let definition = std::sync::Arc::new(
-        super::model::definition_with_parameters(config, None, description)
+        super::model::definition_with_parameters(config, description)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     );
     Ok(MoshiParameterContract {

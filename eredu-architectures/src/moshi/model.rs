@@ -31,28 +31,23 @@ pub fn component_definition(
     let definition = super::parallel::parameter_contract(config)
         .map_err(Error::backend)?
         .into_definition();
-    match geometry {
-        None => Ok(Arc::unwrap_or_clone(definition)),
+    let definition = match geometry {
+        None => definition,
         Some(geometry) => {
-            definition_with_parameters(config, Some(geometry), definition.parameters().clone())
+            geometry.validate_for(config).map_err(Error::backend)?;
+            definition.select_state_layout(geometry.state_layout())?
         }
-    }
+    };
+    Ok(Arc::unwrap_or_clone(definition))
 }
 
 pub(super) fn definition_with_parameters(
     config: &MoshiConfig,
-    geometry: Option<&super::LocalGeometry>,
     parameters: eredu_runtime::ArchitectureParameterDescription,
 ) -> Result<ComponentDefinition, Error> {
     config.temporal().validate_config()?;
     config.depth_template().validate_config()?;
-    let state = match geometry {
-        Some(geometry) => {
-            geometry.validate_for(config).map_err(Error::backend)?;
-            geometry.state_layout().clone()
-        }
-        None => state_layout(config)?,
-    };
+    let state = state_layout(config)?;
     let temporal = config.temporal().num_hidden_layers() as usize;
     let depth = config.depth_template().num_hidden_layers() as usize;
     let units = (0..temporal)
