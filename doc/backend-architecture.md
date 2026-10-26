@@ -8507,6 +8507,15 @@ owned catalog. Per-layer leases, scalar replicas, recurrent/cache state and code
 convolution geometry remain component declarations. DeepSeek target/prediction
 catalogs and Muse audio units use the same constructor.
 
+Shared decoder `StaticModuleConstruction` retains validated embedding, readout and
+full normalization specifications before allocation. `StaticModulePlacement`
+selects each vocabulary resource independently as local, tensor-local or omitted.
+The shared selected allocator preserves canonical modules and checks vocabulary
+ranges before materialization. Diffusion Gemma declares these specifications once
+for ordinary and selected construction; its conditioning, embedding scaling and
+refinement equations remain family-owned. Zero-offset learned normalization with
+FP32 scale arithmetic retains its typed policy, independently of the numeric offset.
+
 `ArchitectureParameterDescription::project_groups` selects named execution groups
 and explicit pinned roles. It preserves sparse global invocation indices,
 canonical storage consumers and exact retained rank placement. Omitted dependencies

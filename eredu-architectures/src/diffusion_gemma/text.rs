@@ -9,7 +9,10 @@ use eredu_runtime::{ExpertPass, ParameterProvider};
 
 use super::FamilyConfig;
 use crate::{
-    decoder::ComponentInstrumentation,
+    decoder::{
+        ComponentInstrumentation, PartitionStaticModules, StaticModuleConstruction,
+        StaticModulePlacement,
+    },
     gemma4::{BlockInput, DenseBlock, ModelArgs},
 };
 
@@ -367,56 +370,42 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for Tex
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B> {
+    fn construction_specs(config: &FamilyConfig) -> Result<StaticModuleConstruction, Error> {
+        let args = &config.text;
+        let key = "model.decoder.embed_tokens.weight";
+        let embedding = EmbeddingSpec {
+            vocabulary: args.vocab_size,
+            dimensions: args.hidden_size,
+            weight: ParameterSpec::trainable(key).map_err(Error::backend)?,
+            format: crate::linear_format::standard_linear_format(key, args.linear_format_for(key))?,
+        };
+        let head = (!args.tie_word_embeddings)
+            .then(|| -> Result<_, Error> {
+                Ok(LinearSpec {
+                    input: args.hidden_size,
+                    output: args.vocab_size,
+                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
+                    bias: None,
+                    format: crate::linear_format::standard_linear_format(
+                        "lm_head.weight",
+                        args.linear_format_for("lm_head.weight"),
+                    )?,
+                })
+            })
+            .transpose()?;
+        let normalization = args.normalization(
+            args.hidden_size,
+            ParameterSpec::trainable("model.decoder.norm.weight").map_err(Error::backend)?,
+        );
+        StaticModuleConstruction::new(embedding, head, normalization)
+    }
+
     /// Declares pinned text parameters independently from layer residency.
     pub fn new(
         config: &FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let args = &config.text;
-        let key = "model.decoder.embed_tokens.weight";
-        Ok(Self {
-            embeddings: Some(B::embedding(
-                EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable(key).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        key,
-                        args.linear_format_for(key),
-                    )?,
-                },
-                context,
-            )?),
-            norm: Some(B::normalization(
-                args.normalization(
-                    args.hidden_size,
-                    ParameterSpec::trainable("model.decoder.norm.weight")
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?),
-            head: (!args.tie_word_embeddings)
-                .then(|| {
-                    B::linear(
-                        LinearSpec {
-                            input: args.hidden_size,
-                            output: args.vocab_size,
-                            weight: ParameterSpec::trainable("lm_head.weight")
-                                .map_err(Error::backend)?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                "lm_head.weight",
-                                args.linear_format_for("lm_head.weight"),
-                            )?,
-                        },
-                        context,
-                    )
-                })
-                .transpose()?,
-            conditioning: Some(SelfConditioning::new(args, context)?),
-            embedding_scale: (args.hidden_size as f32).sqrt(),
-            softcap: args.final_logit_softcapping,
-        })
+        Self::materialize(config, None, context)
     }
 
     /// Declares vocabulary-owned tables and feedback units from exact local geometry.
@@ -426,67 +415,52 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextStatic<B>
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         geometry.validate_for(config).map_err(Error::backend)?;
+        Self::materialize(config, Some(geometry), context)
+    }
+
+    fn materialize(
+        config: &FamilyConfig,
+        geometry: Option<&super::parallel::LocalGeometry>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let args = &config.text;
-        let key = "model.decoder.embed_tokens.weight";
-        let embeddings = geometry
-            .embedding_range()
-            .map(|range| {
-                B::vocabulary_parallel_embedding(
-                    EmbeddingSpec {
-                        vocabulary: args.vocab_size,
-                        dimensions: args.hidden_size,
-                        weight: ParameterSpec::trainable(key).map_err(Error::backend)?,
-                        format: crate::linear_format::standard_linear_format(
-                            key,
-                            args.linear_format_for(key),
-                        )?,
-                    },
-                    range.clone(),
-                    context,
+        let placement = |role| match geometry {
+            None => StaticModulePlacement::Local,
+            Some(geometry) => {
+                let range = match role {
+                    "embedding" => geometry.embedding_range(),
+                    "output" => geometry.output_range(),
+                    _ => unreachable!("declared vocabulary role"),
+                };
+                range.cloned().map_or(
+                    StaticModulePlacement::Omitted,
+                    StaticModulePlacement::VocabularyParallel,
                 )
-            })
-            .transpose()?;
-        let head = if args.tie_word_embeddings {
-            None
-        } else if let Some(range) = geometry.output_range() {
-            let key = "lm_head.weight";
-            Some(B::vocabulary_parallel_linear(
-                LinearSpec {
-                    input: args.hidden_size,
-                    output: args.vocab_size,
-                    weight: ParameterSpec::trainable(key).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        key,
-                        args.linear_format_for(key),
-                    )?,
-                },
-                range.clone(),
-                context,
-            )?)
-        } else {
-            None
+            }
         };
-        Ok(Self {
-            embeddings,
-            head,
-            norm: geometry
-                .owns_norm()
-                .then(|| {
-                    B::normalization(
-                        args.normalization(
-                            args.hidden_size,
-                            ParameterSpec::trainable("model.decoder.norm.weight")
-                                .map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
-                })
-                .transpose()?,
-            conditioning: geometry
+        let modules = PartitionStaticModules::<B>::from_construction(
+            Self::construction_specs(config)?,
+            placement("embedding"),
+            if args.tie_word_embeddings {
+                StaticModulePlacement::Omitted
+            } else {
+                placement("output")
+            },
+            geometry.is_none_or(|geometry| geometry.owns_norm()),
+            context,
+        )?;
+        let conditioning = match geometry {
+            None => Some(SelfConditioning::new(args, context)?),
+            Some(geometry) => geometry
                 .conditioning_width()
                 .map(|width| SelfConditioning::new_with_width(args, width, context))
                 .transpose()?,
+        };
+        Ok(Self {
+            embeddings: modules.embeddings,
+            norm: modules.norm,
+            head: modules.lm_head,
+            conditioning,
             embedding_scale: (args.hidden_size as f32).sqrt(),
             softcap: args.final_logit_softcapping,
         })
