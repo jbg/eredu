@@ -122,6 +122,20 @@ pub trait ParallelFunctionHeadExecution<B: DistributedNeuralBackend>:
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError>;
+    /// Projects both vocabulary heads from one retained normalized backbone result.
+    fn project_channels_parallel(
+        &mut self,
+        normalized: &B::Tensor,
+        backbone: &mut StaticModules<B>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<DualChannelLogits<B::Tensor>, ChannelError> {
+        self.validate_parallel_projection(normalized, parallel)?;
+        let agent = backbone.project_normalized_parallel(normalized, parallel, context)?;
+        let function = self.project_parallel(normalized, parallel, context)?;
+        validate_logits(&agent, &function, self.dimensions().vocabulary)?;
+        Ok(DualChannelLogits { agent, function })
+    }
 }
 impl<B: DistributedNeuralBackend> ParallelFunctionHeadExecution<B> for FunctionHead<B> {
     fn validate_parallel_projection(
@@ -607,57 +621,6 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     }
 }
 
-/// Neural function head using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseFunctionHead<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, FunctionHead<B>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >,
-}
-impl<B, P> LayerwiseFunctionHead<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, FunctionHead<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact function head unit policy.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<ChannelError, P>,
 ) -> ChannelError {
@@ -674,18 +637,23 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-impl<B, P> FunctionHeadExecution<B> for LayerwiseFunctionHead<B, P>
+impl<B, P> FunctionHeadExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, FunctionHead<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> FunctionHeadDimensions {
-        self.runtime.architecture().kernel().dimensions()
+        self.architecture().kernel().dimensions()
     }
     fn validate_projection(&self, normalized: &B::Tensor) -> Result<(), ChannelError> {
-        self.runtime
-            .architecture()
+        self.architecture()
             .kernel()
             .validate_replicated_projection(normalized)
     }
@@ -695,34 +663,47 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
         let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke(normalized, &mut state, context)
+        self.invoke(normalized, &mut state, context)
             .map_err(runtime_error)
     }
 }
 
-impl<B, P> LayerwiseFunctionHead<B, P>
+/// Cohort-guarded function readout through ordinary provider and completion hooks.
+/// This capability requires explicit agreement in addition to tensor projection.
+pub trait GuardedFunctionHeadExecution<B: DistributedNeuralBackend>:
+    ParallelFunctionHeadExecution<B>
+{
+    /// Coordinates input admission, provider lifecycle and leased ownership before
+    /// the independently selected function-vocabulary collective.
+    fn project_parallel_guarded<H, F>(
+        &mut self,
+        normalized: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        agree: F,
+    ) -> Result<B::Tensor, ChannelError>
+    where
+        H: LayeredTraversalHook<B, (), ChannelError> + ?Sized,
+        F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, ChannelError>;
+}
+
+impl<B, P> GuardedFunctionHeadExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, FunctionHead<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
-    /// Projects and gathers function logits through the existing bounded traversal.
-    pub fn project_parallel(
-        &mut self,
-        normalized: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, ChannelError> {
-        let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke_parallel(normalized, &mut state, parallel, context)
-            .map_err(runtime_error)
-    }
     /// Coordinates input admission, provider lifecycle and leased ownership before
     /// the independently selected function-vocabulary collective.
-    pub fn project_parallel_guarded<H, F>(
+    fn project_parallel_guarded<H, F>(
         &mut self,
         normalized: &B::Tensor,
         parallel: &B::ParallelContext,
@@ -735,8 +716,7 @@ where
         F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, ChannelError>,
     {
         let prepared = (|| {
-            self.runtime
-                .architecture()
+            self.architecture()
                 .kernel()
                 .validate_parallel_projection(normalized, parallel)?;
             Ok::<_, ChannelError>(StatelessComponentState::new()?)
@@ -751,62 +731,49 @@ where
         );
         let mut state = prepared?;
         agreement?;
-        self.runtime
-            .forward_parallel_with_unit_executor_and_traversal_hook(
-                normalized,
-                &mut state,
-                parallel,
-                context,
-                |architecture, group, index, unit, hidden, _, _, parallel, context| {
-                    let valid = architecture.kernel().validate_parallel_unit(unit);
-                    let accepted = agree(
-                        [
-                            0x46554e4348554e49,
-                            group as u64,
-                            index as u64,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ],
-                        valid.is_ok(),
-                        context,
-                    );
-                    valid?;
-                    if !accepted? {
-                        return Err(ChannelError::Configuration(
-                            "function-head peer rejected leased unit",
-                        ));
-                    }
-                    unit.project_parallel_guarded(hidden, parallel, context, &mut agree)
-                },
-                hook,
-            )
-            .map(|(output, _)| output)
-            .map_err(runtime_error)
-    }
-
-    /// Projects both vocabulary heads from one retained normalized backbone result.
-    pub fn project_channels_parallel(
-        &mut self,
-        normalized: &B::Tensor,
-        backbone: &mut StaticModules<B>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<DualChannelLogits<B::Tensor>, ChannelError> {
-        self.runtime
-            .architecture()
-            .kernel()
-            .validate_parallel_projection(normalized, parallel)?;
-        let agent = backbone.project_normalized_parallel(normalized, parallel, context)?;
-        let function = self.project_parallel(normalized, parallel, context)?;
-        validate_logits(&agent, &function, self.dimensions().vocabulary)?;
-        Ok(DualChannelLogits { agent, function })
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            normalized,
+            &mut state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, _, _, parallel, context| {
+                let valid = architecture.kernel().validate_parallel_unit(unit);
+                let accepted = agree(
+                    [
+                        0x46554e4348554e49,
+                        group as u64,
+                        index as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    valid.is_ok(),
+                    context,
+                );
+                valid?;
+                if !accepted? {
+                    return Err(ChannelError::Configuration(
+                        "function-head peer rejected leased unit",
+                    ));
+                }
+                unit.project_parallel_guarded(hidden, parallel, context, &mut agree)
+            },
+            hook,
+        )
+        .map(|(output, _)| output)
+        .map_err(runtime_error)
     }
 }
 
-impl<B, P> ParallelFunctionHeadExecution<B> for LayerwiseFunctionHead<B, P>
+impl<B, P> ParallelFunctionHeadExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, FunctionHeadKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -818,8 +785,7 @@ where
         normalized: &B::Tensor,
         parallel: &B::ParallelContext,
     ) -> Result<(), ChannelError> {
-        self.runtime
-            .architecture()
+        self.architecture()
             .kernel()
             .validate_parallel_projection(normalized, parallel)
     }
@@ -829,6 +795,8 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ChannelError> {
-        LayerwiseFunctionHead::project_parallel(self, normalized, parallel, context)
+        let mut state = StatelessComponentState::new()?;
+        self.invoke_parallel(normalized, &mut state, parallel, context)
+            .map_err(runtime_error)
     }
 }

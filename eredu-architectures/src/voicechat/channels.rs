@@ -745,20 +745,6 @@ impl<B: DistributedNeuralBackend> FunctionHead<B> {
             context,
         )?)
     }
-    /// Projects both vocabulary shards and gathers full logits through existing collectives.
-    pub fn project_channels_parallel(
-        &mut self,
-        normalized: &B::Tensor,
-        backbone: &mut StaticModules<B>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<DualChannelLogits<B::Tensor>, ChannelError> {
-        self.validate_parallel_projection(normalized, parallel)?;
-        let agent = backbone.project_normalized_parallel(normalized, parallel, context)?;
-        let function = self.project_parallel(normalized, parallel, context)?;
-        validate_logits(&agent, &function, self.vocabulary)?;
-        Ok(DualChannelLogits { agent, function })
-    }
 }
 pub(super) fn agree_parallel_projection<B, F>(
     dimensions: super::function_head_layered::FunctionHeadDimensions,

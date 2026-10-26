@@ -1242,6 +1242,10 @@ and completion authority in vocabulary mechanisms and architecture agreements.
 `FunctionHeadExecution` supplies the same readout to ordinary and controlled
 coupled execution. Its shared dual-head method projects agent and function logits
 from one retained normalized tensor, without a second Nemotron traversal.
+`ParallelFunctionHeadExecution` owns the corresponding shared parallel dual-head
+method for direct modules and prepared providers. Prepared function-head operations
+implement these capabilities directly on `LayerwiseRuntime` over the component
+adapter. Native composition constructs that runtime and inspects its policy directly.
 `FunctionHeadKernel` declares one independently leased projection unit and
 no static learned parameters. Shape, hidden width and floating dtype are checked
 before provider acquisition; the shared traversal retains input and output through
@@ -1261,7 +1265,9 @@ before payload reads. Guarded projection agrees full hidden shape, dtype and
 logical dimensions, then uses the existing layered traversal hook for parameter
 acquisition and completion. Leased-unit identity is agreed before local projection;
 the shared MLX vocabulary primitive agrees local multiplication success before
-entering its gather. Resident and bounded providers use this same guarded path.
+entering its gather. `GuardedFunctionHeadExecution` requires explicit cohort
+agreement and traversal hooks in addition to ordinary parallel projection.
+Resident and bounded providers use this same guarded path.
 A local failure retains its original source, and acquired peer leases remain
 owned by ordinary abort/completion handling. These checks protect the head's
 collectives; they do not guard operations inside the Nemotron backbone.
