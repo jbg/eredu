@@ -1803,9 +1803,14 @@ carry identities. `DecoderKernel` supplies the same streaming neural equations t
 owns graph, parameter visitation and local state-root mapping. Upsampling
 convolutions, ConvNeXt blocks and the output projection are independent units with no learned static parameters. Each unit
 retains its candidate convolution carry through completion; a failed traversal
-does not replace the supplied parent state. `DecoderExecution` connects these
-providers to `AudioDecoder` and VoiceChat speech composition. Initial state and
-neural finish depend only on geometry, so spectral drain loads no neural weights.
+does not replace the supplied parent state. `DecoderExecution` implements these
+transitions directly on `LayerwiseRuntime` over the shared component adapter and
+`DecoderRuntimeState`, connecting providers to `AudioDecoder` and VoiceChat speech
+composition. Caller-owned `DecoderState` stays separate from parameter residency.
+`ParallelDecoderExecution` requires the same ordered transition with selected local
+parameters and global candidate carry. Native composition constructs this runtime
+and inspects its policy directly. Initial state and neural finish depend only on
+geometry, so spectral drain loads no neural weights.
 Codec-owned `PreparedDecoderBindings` validates exact recipes, restricts retained
 source authority and accounts for F32 conversions. VoiceChat projects its admitted
 decoder component into that contract; MLX supplies the ordinary resident,

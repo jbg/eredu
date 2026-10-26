@@ -687,57 +687,6 @@ impl<B: DistributedNeuralBackend>
         self.finish(hidden, state, forward, context)
     }
 }
-/// Neural decoder using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseDecoder<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, DecoderUnit<B::Tensor>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
-        B,
-        DecoderRuntimeState<B::Tensor>,
-        P,
-    >,
-}
-impl<B, P> LayerwiseDecoder<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, DecoderUnit<B::Tensor>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact decoder unit policy.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
-        B,
-        DecoderRuntimeState<B::Tensor>,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
-        B,
-        DecoderRuntimeState<B::Tensor>,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<Error, P>,
 ) -> Error {
@@ -754,14 +703,20 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-impl<B, P> DecoderExecution<B> for LayerwiseDecoder<B, P>
+impl<B, P> DecoderExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
+        B,
+        DecoderRuntimeState<B::Tensor>,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, DecoderUnit<B::Tensor>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn config(&self) -> &DecoderConfig {
-        self.runtime.architecture().kernel().config()
+        self.architecture().kernel().config()
     }
     fn step(
         &mut self,
@@ -771,14 +726,32 @@ where
     ) -> Result<(B::Tensor, DecoderState<B::Tensor>), Error> {
         let mut state = DecoderRuntimeState::from_state(self.config(), parent)?;
         let output = self
-            .runtime
             .invoke(latent, &mut state, context)
             .map_err(runtime_error)?;
         Ok((output, state.into_state()))
     }
 }
 
-impl<B, P> LayerwiseDecoder<B, P>
+/// Tensor-parallel neural decoding with caller-owned immutable parent carry.
+/// Implementors publish output and candidate carry only through ordinary completion.
+pub trait ParallelDecoderExecution<B: DistributedNeuralBackend>: DecoderExecution<B> {
+    /// Executes ordered local parameters into a complete unpublished candidate.
+    fn step_parallel(
+        &mut self,
+        latent: &B::Tensor,
+        parent: &DecoderState<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, DecoderState<B::Tensor>), Error>;
+}
+
+impl<B, P> ParallelDecoderExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, DecoderKernel<B>>,
+        B,
+        DecoderRuntimeState<B::Tensor>,
+        P,
+    >
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -786,7 +759,7 @@ where
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     /// Executes the same ordered transition with local parameters and global candidate carry.
-    pub fn step_parallel(
+    fn step_parallel(
         &mut self,
         latent: &B::Tensor,
         parent: &DecoderState<B::Tensor>,
@@ -795,7 +768,6 @@ where
     ) -> Result<(B::Tensor, DecoderState<B::Tensor>), Error> {
         let mut state = DecoderRuntimeState::from_state(self.config(), parent)?;
         let output = self
-            .runtime
             .forward_parallel_with_context_hook(latent, &mut state, parallel, context, |_, _, _| {
                 Ok(())
             })
