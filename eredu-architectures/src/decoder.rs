@@ -32,7 +32,6 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
     LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelPlanError,
     ParameterGroupOwner, ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
-    TensorPlacement,
 };
 
 /// Narrows a causal decoder's position-independent readout before projection.
@@ -1174,16 +1173,13 @@ where
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let vocabulary = usize::try_from(config.vocabulary_size()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder vocabulary size exceeds usize".into())
-    })?;
-    let embedding_name = format!("{}.embed_tokens", config.parameter_root());
-    let embedding_range = vocabulary_range(layout, &embedding_name, vocabulary)?;
-    let output_range = if config.tie_word_embeddings() {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
+    let root = config.parameter_root();
+    let (embedding_range, output_range) = StaticModuleSpec::from_config(config).vocabulary_ranges(
+        layout,
+        &format!("{root}.embed_tokens"),
+        &format!("{root}.norm"),
+        "lm_head",
+    )?;
     let geometry = LocalGeometry {
         blocks,
         embedding_range,
@@ -1193,59 +1189,6 @@ where
     };
     geometry.validate_for(config)?;
     Ok(geometry)
-}
-
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    global_vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected: Option<std::ops::Range<usize>> = None;
-    let mut found = false;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        found = true;
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..global_vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "vocabulary member {target} has non-row placement {placement:?}"
-                )));
-            }
-        };
-        if tensor.global_shape().first().copied() != Some(global_vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "vocabulary member {target} has global shape {:?}, expected {global_vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        if selected.as_ref().is_some_and(|selected| selected != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "vocabulary group {logical_name} has inconsistent companion selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    if !found {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "missing local vocabulary layout for {logical_name}"
-        )));
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary,
-        local: selected.expect("a found vocabulary member supplies a selection"),
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
 }
 
 /// Declares the complete mutable-state geometry consumed by resident or bounded execution.
@@ -6040,18 +5983,13 @@ where
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let vocabulary = usize::try_from(config.vocabulary_size())
-        .map_err(|_| ParallelPlanError::InvalidGroup("decoder vocabulary exceeds usize".into()))?;
-    let embedding_range = vocabulary_range(
+    let root = config.parameter_root();
+    let (embedding_range, output_range) = StaticModuleSpec::from_config(config).vocabulary_ranges(
         layout,
-        &format!("{}.embed_tokens", config.parameter_root()),
-        vocabulary,
+        &format!("{root}.embed_tokens"),
+        &format!("{root}.norm"),
+        "lm_head",
     )?;
-    let output_range = if config.tie_word_embeddings() {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
     Ok(PartitionLocalGeometry {
         owned_state: schedule.state_range(owned_units.clone()),
         owned_units,

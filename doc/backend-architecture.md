@@ -8559,9 +8559,10 @@ replicas and malformed selections.
 
 `StaticModuleSpec::vocabulary_ranges` projects embedding and independent readout
 intervals from its physical parameter groups through runtime's balanced-axis
-validation. LFM2, Kimi Linear, Nemotron-H and Inkling use this same geometry as
-pinned construction and cold catalogs. Tied readout has no independent output
-range. Family code retains recurrent, cache, prediction and collective geometry;
+validation. Common complete and partitioned decoders, LFM2, Kimi Linear,
+Nemotron-H and Inkling use this same geometry as pinned construction and cold
+catalogs. Tied readout has no independent output range. Family code retains
+recurrent, cache, prediction and collective geometry;
 replicated companions do not masquerade as vocabulary rows.
 
 Neutral NVFP4 vocabulary geometry includes replicated global-scale companions.
