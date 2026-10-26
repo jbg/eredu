@@ -977,7 +977,12 @@ rank agreement and transient input/candidate roots through ordinary completion.
 RNNT's complete and projection-only selections use one kernel and typed semantic
 phases. Each selection derives its graph, paths, unit counts and canonical
 parameter groups from those phases. Projection execution owns no recurrent
-parameters. The resident RNNT consumes the same kernel as bounded execution;
+parameters. `RnntProjectionExecution` implements its four operations directly on
+`LayerwiseRuntime` over the shared component adapter. The static
+`ParallelRnntProjectionExecution` capability retains typed tensor invocation,
+cohort traversal hooks and the same vocabulary lookup/gather semantics. Native
+projection composition constructs that runtime and inspects its policy directly.
+The resident RNNT consumes the same kernel as bounded execution;
 caller-owned LSTM parent and candidate state remains separate from parameter
 leases, including repeated cached predictor steps.
 Perception declares subsampling, independently leased Conformer layers and projection
