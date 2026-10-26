@@ -2,14 +2,15 @@
 
 use eredu_codec::{
     ear_encoder::{EncoderConfig, EncoderUnit},
-    ear_encoder_layered::{EncoderExecution, EncoderKernel, LayerwiseEncoder},
+    ear_encoder_layered::{EncoderExecution, EncoderKernel, ParallelEncoderExecution},
     ear_encoder_preparation::PreparedEncoderBindings,
     Error,
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport, StatelessComponentState,
+    ComponentAdapter, ComponentDefinition, DenseDiskStreamReport, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout, ResidencyReport,
+    StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
@@ -26,9 +27,15 @@ use crate::{
 };
 
 type Unit = EncoderUnit<MlxTensor>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, EncoderKernel<MlxNeuralBackend>>,
+    MlxNeuralBackend,
+    StatelessComponentState,
+    P,
+>;
 enum Execution {
-    Resident(LayerwiseEncoder<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwiseEncoder<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native EAR neural encoder over the selected shared resident or bounded parameter policy.
@@ -42,8 +49,8 @@ impl MlxEarEncoder {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -53,7 +60,6 @@ impl MlxEarEncoder {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -63,8 +69,8 @@ impl MlxEarEncoder {
     /// Number of pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -79,13 +85,17 @@ impl EncoderExecution<MlxNeuralBackend> for MlxEarEncoder {
     fn forward(&mut self, spectrum: &MlxTensor, context: &Stream) -> Result<MlxTensor, Error> {
         match (&mut self.execution, &self.parallel) {
             (Execution::Resident(model), Some(parallel)) => {
-                model.forward_parallel(spectrum, parallel, context)
+                ParallelEncoderExecution::forward_parallel(model, spectrum, parallel, context)
             }
             (Execution::Bounded(model), Some(parallel)) => {
-                model.forward_parallel(spectrum, parallel, context)
+                ParallelEncoderExecution::forward_parallel(model, spectrum, parallel, context)
             }
-            (Execution::Resident(model), None) => model.forward(spectrum, context),
-            (Execution::Bounded(model), None) => model.forward(spectrum, context),
+            (Execution::Resident(model), None) => {
+                EncoderExecution::forward(model, spectrum, context)
+            }
+            (Execution::Bounded(model), None) => {
+                EncoderExecution::forward(model, spectrum, context)
+            }
         }
     }
 }
@@ -177,9 +187,9 @@ fn materialize(
                         std::marker::PhantomData::<StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwiseEncoder::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwiseEncoder::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxEarEncoder {

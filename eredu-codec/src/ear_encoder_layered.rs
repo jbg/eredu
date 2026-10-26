@@ -549,57 +549,6 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
         self.finish(hidden, state, forward, context)
     }
 }
-/// Neural encoder using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseEncoder<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, EncoderUnit<B::Tensor>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >,
-}
-impl<B, P> LayerwiseEncoder<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, EncoderUnit<B::Tensor>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact encoder unit policy.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<Error, P>,
 ) -> Error {
@@ -616,14 +565,20 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-impl<B, P> EncoderExecution<B> for LayerwiseEncoder<B, P>
+impl<B, P> EncoderExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, EncoderUnit<B::Tensor>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn config(&self) -> &EncoderConfig {
-        self.runtime.architecture().kernel().config()
+        self.architecture().kernel().config()
     }
     fn forward(
         &mut self,
@@ -631,13 +586,30 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .invoke(spectrum, &mut state, context)
+        self.invoke(spectrum, &mut state, context)
             .map_err(runtime_error)
     }
 }
 
-impl<B, P> LayerwiseEncoder<B, P>
+/// Tensor-parallel finite encoding over the selected rank-local parameter geometry.
+/// Implementors provide the complete transition through ordinary unit completion.
+pub trait ParallelEncoderExecution<B: DistributedNeuralBackend>: EncoderExecution<B> {
+    /// Executes selected shards and publishes complete frame-major latent vectors.
+    fn forward_parallel(
+        &mut self,
+        spectrum: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>;
+}
+
+impl<B, P> ParallelEncoderExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, EncoderKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: DistributedNeuralBackend
         + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -645,22 +617,21 @@ where
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     /// Executes the finite transition with rank-local parameters and full boundary activations.
-    pub fn forward_parallel(
+    fn forward_parallel(
         &mut self,
         spectrum: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                spectrum,
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map(|(output, _)| output)
-            .map_err(runtime_error)
+        self.forward_parallel_with_context_hook(
+            spectrum,
+            &mut state,
+            parallel,
+            context,
+            |_, _, _| Ok(()),
+        )
+        .map(|(output, _)| output)
+        .map_err(runtime_error)
     }
 }

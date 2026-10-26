@@ -1871,8 +1871,12 @@ costs from learned encoder units.
 downsampler independently through the same traversal as the resident encoder.
 It declares no learned static parameters or persistent encoder carry. The final
 frame-major transpose runs inside the last unit before its completion, so a
-failed invocation returns no partial latent or codes. `EncoderExecution` connects
-these providers to finite waveform encoding and fixed-Aria preparation. The
+failed invocation returns no partial latent or codes. `EncoderExecution` implements
+the finite transition directly on `LayerwiseRuntime` over the shared component
+adapter, connecting these providers to waveform encoding and fixed-Aria preparation.
+`ParallelEncoderExecution` requires the same complete transition over selected
+rank-local geometry. Native composition constructs the shared runtime and inspects
+its policy directly; the resident neural module retains its typed unit construction. The
 encoder finishes before the shared quantizer provider runs; codebooks are not
 duplicated. Codec-owned `PreparedEncoderBindings` validates per-unit recipes and
 F32 conversions against a restricted source view. VoiceChat supplies the retained
