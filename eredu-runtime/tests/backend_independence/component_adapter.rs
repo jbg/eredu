@@ -257,7 +257,7 @@ fn definition(pinned: bool) -> ComponentDefinition {
         )
     });
     let parameters =
-        ArchitectureParameterDescription::new(&graph, &layout, groups.clone(), owned).unwrap();
+        ArchitectureParameterDescription::from_owned(&graph, &layout, owned).unwrap();
     let transport = ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::Projector,

@@ -112,13 +112,7 @@ fn declare_parameters(
             ));
         }
     }
-    ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        groups.iter().map(|g| g.group().clone()),
-        groups.clone(),
-    )
-    .map_err(Error::backend)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, groups).map_err(Error::backend)
 }
 
 fn vision_transport() -> ArchitectureGroupTransport {

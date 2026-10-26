@@ -18,12 +18,6 @@ pub(crate) fn describe(args: &DecoderConfig) -> Result<ArchitectureParameterDesc
         .map_err(Error::backend)?;
     let vision_static = crate::muse::parallel::vision_static_resource_groups(args)
         .map_err(Error::backend_source)?;
-    let mut expected = text_static
-        .iter()
-        .map(|(_, group)| group)
-        .chain(vision_static.iter().map(|(_, group)| group))
-        .cloned()
-        .collect::<Vec<_>>();
     let mut owned = text_static
         .into_iter()
         .map(|(role, group)| {
@@ -71,7 +65,6 @@ pub(crate) fn describe(args: &DecoderConfig) -> Result<ArchitectureParameterDesc
                 }
                 _ => unreachable!(),
             };
-            expected.extend(groups.iter().cloned());
             owned.extend(groups.into_iter().map(|group| {
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::execution_unit(owner_group.clone(), index),
@@ -80,7 +73,7 @@ pub(crate) fn describe(args: &DecoderConfig) -> Result<ArchitectureParameterDesc
             }));
         }
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned).map_err(Error::backend)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned).map_err(Error::backend)
 }
 
 /// Validates Muse's logical units, canonical storage and independent mutable state

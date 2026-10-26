@@ -79,11 +79,7 @@ pub fn parameter_description(args: &ModelArgs) -> Result<ArchitectureParameterDe
                 _ => None,
             }),
     );
-    let expected = owned
-        .iter()
-        .map(|group| group.group().clone())
-        .collect::<Vec<_>>();
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(Error::backend_source)
 }
 

@@ -56,12 +56,7 @@ impl DsparkHeadDefinition {
             );
             owned.push(OwnedParameterGroupSpec::new(owner, group));
         }
-        ArchitectureParameterDescription::new(
-            &graph,
-            &self.layout,
-            owned.iter().map(|group| group.group().clone()),
-            owned.clone(),
-        )
-        .map_err(Error::backend_source)
+        ArchitectureParameterDescription::from_owned(&graph, &self.layout, owned)
+            .map_err(Error::backend_source)
     }
 }

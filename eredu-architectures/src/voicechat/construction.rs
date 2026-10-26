@@ -353,11 +353,10 @@ impl SpeechConstructionPlan {
         if groups.is_empty() {
             return Err(ConstructionError::Unit(id));
         }
-        Ok(ArchitectureParameterDescription::new(
+        Ok(ArchitectureParameterDescription::from_owned(
             description.graph(),
             description.unit_layout(),
-            groups.iter().map(|owned| owned.group().clone()),
-            groups.clone(),
+            groups,
         )?)
     }
 

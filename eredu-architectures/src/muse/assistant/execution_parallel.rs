@@ -125,11 +125,10 @@ impl MuseAssistantDefinition {
                 .to_owned()
         }))
         .map_err(Error::backend_source)?;
-        let description = ArchitectureParameterDescription::new(
+        let description = ArchitectureParameterDescription::from_owned(
             &graph,
             definition.unit_layout(),
-            groups.iter().map(|group| group.group().clone()),
-            groups.clone(),
+            groups,
         )
         .map_err(Error::backend_source)?;
         let layout = derive_partitioned_local_layout(&description, rank).map_err(Error::backend)?;

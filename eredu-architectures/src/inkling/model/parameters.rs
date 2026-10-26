@@ -37,12 +37,6 @@ fn declare_parameters(args: &ModelArgs) -> Result<ArchitectureParameterDescripti
     let static_groups =
         crate::inkling::parallel::pinned_parameter_groups(args).map_err(Error::backend)?;
     let mtp_groups = mtp_parameter_groups(args).map_err(Error::backend)?;
-    let mut expected = static_groups
-        .iter()
-        .map(|(_, group)| group)
-        .chain(&mtp_groups)
-        .cloned()
-        .collect::<Vec<_>>();
     let mut owned = static_groups
         .into_iter()
         .map(|(role, group)| {
@@ -73,7 +67,6 @@ fn declare_parameters(args: &ModelArgs) -> Result<ArchitectureParameterDescripti
                 layer_parameter_groups(args, index)
             }
             .map_err(Error::backend)?;
-            expected.extend(groups.iter().cloned());
             owned.extend(groups.into_iter().map(|group| {
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::execution_unit(owner_group.clone(), index),
@@ -82,7 +75,7 @@ fn declare_parameters(args: &ModelArgs) -> Result<ArchitectureParameterDescripti
             }));
         }
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned).map_err(Error::backend)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned).map_err(Error::backend)
 }
 
 pub(super) fn group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {

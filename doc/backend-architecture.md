@@ -8494,6 +8494,15 @@ arithmetic.
 Static companions expand once and remain outside later body-format declarations.
 Qwen hybrid retains its separate embedding and head FP8 admission policies.
 
+`ArchitectureParameterDescription::from_owned` validates the canonical owned
+parameter declaration directly. Families and composites use it when parameter
+metadata and storage ownership come from the same declaration, without cloning a
+second catalog for comparison. Runtime validates canonical layout, unique physical
+ownership and consistent logical consumers, then derives invocation-to-storage
+addressing. `ArchitectureParameterDescription::new` additionally compares ownership
+against an independently supplied parameter declaration; both use the same ownership
+validation and addressing implementation.
+
 Runtime `expand_linear_format_parameter_group` expands one atomic logical group
 and preserves its partition constraints and declared companions. Catalog expansion
 uses the same primitive. Families retain resource and canonical owner identities

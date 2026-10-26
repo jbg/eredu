@@ -142,13 +142,8 @@ pub fn composite_parameter_description(
             ));
         }
     }
-    ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        owned.iter().map(|group| group.group().clone()),
-        owned.clone(),
-    )
-    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
 }
 
 /// Counts shared base groups once and gives each adapter matrix the same layer owner.
@@ -192,13 +187,8 @@ pub fn parameter_description(
             parameters,
         ));
     }
-    ArchitectureParameterDescription::new(
-        base.graph(),
-        base.unit_layout(),
-        owned.iter().map(|g| g.group().clone()),
-        owned.clone(),
-    )
-    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
+    ArchitectureParameterDescription::from_owned(base.graph(), base.unit_layout(), owned)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
 }
 
 /// Exact Pixtral head/channel transforms. Both branch norms remain replicated

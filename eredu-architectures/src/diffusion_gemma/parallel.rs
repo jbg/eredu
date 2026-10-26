@@ -411,13 +411,8 @@ pub fn parameter_description(
             ));
         }
     }
-    eredu_runtime::ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        owned.iter().map(|owned| owned.group().clone()),
-        owned.clone(),
-    )
-    .map_err(|error| invalid(error.to_string()))
+    eredu_runtime::ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 /// Exact image-stack cuts and rank-local shared text state.

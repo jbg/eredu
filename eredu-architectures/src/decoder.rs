@@ -3947,11 +3947,7 @@ pub(crate) fn parameter_description_with_formats(
     let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
         crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
     })?;
-    let expected = expanded
-        .iter()
-        .map(|tagged| tagged.group().clone())
-        .collect::<Vec<_>>();
-    ArchitectureParameterDescription::new(&graph, &layout, expected, expanded)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
 }
 

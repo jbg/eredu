@@ -630,11 +630,7 @@ pub fn parameter_contract(
         }
         expanded.push(OwnedParameterGroupSpec::new(owner, group));
     }
-    let expected = expanded
-        .iter()
-        .map(|tagged| tagged.group().clone())
-        .collect::<Vec<_>>();
-    let description = ArchitectureParameterDescription::new(&graph, &layout, expected, expanded)
+    let description = ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let definition = std::sync::Arc::new(
         super::model::definition_with_parameters(config, None, description)

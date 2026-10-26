@@ -281,12 +281,7 @@ impl TargetSpec {
                 declaration.group(&unit.path(), ParameterRole::Replicated)?,
             ));
         }
-        ArchitectureParameterDescription::new(
-            &graph,
-            &layout,
-            groups.iter().map(|g| g.group().clone()),
-            groups.clone(),
-        )
-        .map_err(Error::backend_source)
+        ArchitectureParameterDescription::from_owned(&graph, &layout, groups)
+            .map_err(Error::backend_source)
     }
 }

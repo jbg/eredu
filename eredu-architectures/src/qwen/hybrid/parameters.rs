@@ -346,16 +346,7 @@ pub fn parameter_description(
     let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
         Ok(declaration.formats.get(member.target()).cloned())
     })?;
-    ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        expanded
-            .iter()
-            .map(|group| group.group().clone())
-            .collect::<Vec<_>>(),
-        expanded,
-    )
-    .map_err(invalid)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded).map_err(invalid)
 }
 
 /// Declares one target or prediction unit from normalized global geometry.
@@ -650,16 +641,8 @@ pub fn conditional_parameter_description(
                 }),
         );
     }
-    ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        owned
-            .iter()
-            .map(|group| group.group().clone())
-            .collect::<Vec<_>>(),
-        owned,
-    )
-    .map_err(eredu_nn::Error::backend)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
+        .map_err(eredu_nn::Error::backend)
 }
 
 /// Validates conditional invocation, transport and text/MTP state ownership before materialization.

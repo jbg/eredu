@@ -190,13 +190,8 @@ pub fn parameter_description(
             ));
         }
     }
-    ArchitectureParameterDescription::new(
-        &graph,
-        &units,
-        owned.iter().map(|n| n.group().clone()),
-        owned.clone(),
-    )
-    .map_err(Error::backend_source)
+    ArchitectureParameterDescription::from_owned(&graph, &units, owned)
+        .map_err(Error::backend_source)
 }
 
 const COMPONENT_ID: &str = "diffusion_gemma_composite";

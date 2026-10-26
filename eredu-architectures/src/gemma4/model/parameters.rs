@@ -49,13 +49,8 @@ fn declare_parameters(args: &FamilyConfig) -> Result<ArchitectureParameterDescri
     ];
     let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
     let mut owned = text_static_parameter_ownership(&args.text).map_err(Error::backend)?;
-    let mut expected = owned
-        .iter()
-        .map(|owned| owned.group().clone())
-        .collect::<Vec<_>>();
     {
         let mut add_static = |role: &'static str, groups: Vec<_>| {
-            expected.extend(groups.iter().cloned());
             owned.extend(groups.into_iter().map(|group| {
                 OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role(role), group)
             }));
@@ -123,7 +118,6 @@ fn declare_parameters(args: &FamilyConfig) -> Result<ArchitectureParameterDescri
                 _ => layer_parameter_groups(&args.text, index),
             }
             .map_err(Error::backend)?;
-            expected.extend(groups.iter().cloned());
             owned.extend(groups.into_iter().map(|group| {
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::execution_unit(owner_group.clone(), index),
@@ -132,7 +126,7 @@ fn declare_parameters(args: &FamilyConfig) -> Result<ArchitectureParameterDescri
             }));
         }
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned).map_err(Error::backend)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned).map_err(Error::backend)
 }
 pub(super) fn group_transport(
     args: &FamilyConfig,

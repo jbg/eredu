@@ -332,7 +332,27 @@ impl ArchitectureParameterDescription {
         validate_canonical_layout(graph, layout)
             .map_err(|error| ArchitectureParameterError::InvalidLayout(error.to_string()))?;
         let expected = parameter_declarations(expected)?;
-        let groups = groups.into_iter().collect::<Vec<_>>();
+        Self::validate_ownership(graph, layout, Some(expected), groups.into_iter().collect())
+    }
+
+    /// Validates a canonical owned declaration without duplicating its parameter catalog.
+    /// Use [`Self::new`] when ownership must match independently declared parameters.
+    pub fn from_owned(
+        graph: &ExecutionGraph,
+        layout: &ExecutionUnitLayout,
+        groups: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+    ) -> Result<Self, ArchitectureParameterError> {
+        validate_canonical_layout(graph, layout)
+            .map_err(|error| ArchitectureParameterError::InvalidLayout(error.to_string()))?;
+        Self::validate_ownership(graph, layout, None, groups.into_iter().collect())
+    }
+
+    fn validate_ownership(
+        graph: &ExecutionGraph,
+        layout: &ExecutionUnitLayout,
+        expected: Option<BTreeMap<String, ExpectedParameter>>,
+        groups: Vec<OwnedParameterGroupSpec>,
+    ) -> Result<Self, ArchitectureParameterError> {
         let mut actual = BTreeMap::new();
         for tagged in &groups {
             tagged.owner().validate(graph, layout)?;
@@ -346,23 +366,25 @@ impl ArchitectureParameterDescription {
                 }
             }
         }
-        let actual_targets = actual.keys().cloned().collect::<BTreeSet<_>>();
-        let expected_targets = expected.keys().cloned().collect::<BTreeSet<_>>();
-        if let Some(target) = expected_targets.difference(&actual_targets).next() {
-            return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
-        }
-        if let Some(target) = actual_targets.difference(&expected_targets).next() {
-            return Err(ArchitectureParameterError::UnexpectedOwnership(
-                target.clone(),
-            ));
-        }
-        for tagged in &groups {
-            for member in tagged.members() {
-                if !expected[member.target()].matches(tagged.group(), member) {
-                    return Err(ArchitectureParameterError::InconsistentDeclaration {
-                        target: member.target().to_owned(),
-                        group: tagged.logical_name().to_owned(),
-                    });
+        if let Some(expected) = expected {
+            let actual_targets = actual.keys().cloned().collect::<BTreeSet<_>>();
+            let expected_targets = expected.keys().cloned().collect::<BTreeSet<_>>();
+            if let Some(target) = expected_targets.difference(&actual_targets).next() {
+                return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
+            }
+            if let Some(target) = actual_targets.difference(&expected_targets).next() {
+                return Err(ArchitectureParameterError::UnexpectedOwnership(
+                    target.clone(),
+                ));
+            }
+            for tagged in &groups {
+                for member in tagged.members() {
+                    if !expected[member.target()].matches(tagged.group(), member) {
+                        return Err(ArchitectureParameterError::InconsistentDeclaration {
+                            target: member.target().to_owned(),
+                            group: tagged.logical_name().to_owned(),
+                        });
+                    }
                 }
             }
         }

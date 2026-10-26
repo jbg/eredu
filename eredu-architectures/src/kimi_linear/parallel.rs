@@ -1062,16 +1062,8 @@ pub fn parameter_description(
             })
             .transpose()
     })?;
-    ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        expanded
-            .iter()
-            .map(|group| group.group().clone())
-            .collect::<Vec<_>>(),
-        expanded,
-    )
-    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
+    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
 }
 
 /// Declares vocabulary and replicated final-normalization groups.

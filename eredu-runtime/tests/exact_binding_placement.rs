@@ -996,6 +996,15 @@ mod component_preparation {
                 Err(ArchitectureParameterError::InconsistentDeclaration { target, .. }) if target == "weight"
             ));
         }
+        let binding = OwnedParameterGroupSpec::new(owner.clone(), expected.clone());
+        assert!(matches!(
+            ArchitectureParameterDescription::from_owned(
+                &graph,
+                &layout,
+                [binding.clone(), binding],
+            ),
+            Err(ArchitectureParameterError::DuplicateOwnership { target, .. }) if target == "weight"
+        ));
         let companion =
             ParameterMemberSpec::new("scale", vec![4], MemberSharding::Partitioned { axis: 0 });
         let expected = ParameterGroupSpec::partitioned(
@@ -1428,7 +1437,7 @@ mod component_preparation {
                 )
             })
             .collect::<Vec<_>>();
-        ArchitectureParameterDescription::new(&graph, &layout, groups, owned).unwrap()
+        ArchitectureParameterDescription::from_owned(&graph, &layout, owned).unwrap()
     }
 
     fn state_layout(heads: i32) -> eredu_runtime::StateLayout {

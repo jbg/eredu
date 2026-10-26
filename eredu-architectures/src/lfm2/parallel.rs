@@ -995,11 +995,7 @@ pub fn parameter_description(
             })
             .transpose()
     })?;
-    let groups = owned
-        .iter()
-        .map(|group| group.group().clone())
-        .collect::<Vec<_>>();
-    ArchitectureParameterDescription::new(&graph, &layout, groups, owned)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
 }
 

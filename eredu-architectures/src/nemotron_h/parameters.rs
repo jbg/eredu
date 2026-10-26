@@ -419,16 +419,7 @@ pub fn parameter_description(
     let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
         Ok(declaration.formats.get(member.target()).cloned())
     })?;
-    ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        expanded
-            .iter()
-            .map(|g| g.group().clone())
-            .collect::<Vec<_>>(),
-        expanded,
-    )
-    .map_err(invalid)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded).map_err(invalid)
 }
 
 /// Validates parameter, invocation, transport and state views as one retained definition.
