@@ -9519,6 +9519,14 @@ vocabulary projection. The generic replicated decoder reuses its existing
 prediction capture and readout helpers. Source construction selects text or
 conditional parameter descriptions before deriving the same text/MTP geometry.
 
+Materialized prediction owners each define one consuming `TryFrom` conversion
+from the architecture-owned extension enum. A rejected conversion returns the
+unmodified extension. The sealed `MaterializedPredictionTarget` contract applies
+this conversion through one pairing implementation and translates rejection with
+the target's declared mismatch context. Full, partitioned and replicated targets
+declare their exact extension type; pairing moves existing module and state
+owners without cloning, rematerialization or equation execution.
+
 Prepared Qwen hybrid prediction executors borrow the ordinary target embedding
 and output head and thread internal observers through the shared fusion/decoder
 driver in prefill, proposal and accepted-token replay. Discovery places each

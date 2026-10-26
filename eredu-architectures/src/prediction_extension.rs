@@ -1539,6 +1539,129 @@ where
     pub state: M::ModelState,
 }
 
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedDeepSeekV3Prediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::DeepSeekV3 { units } => {
+                Ok(MaterializedDeepSeekV3Prediction { units })
+            }
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedDeepSeekV4Prediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::DeepSeekV4 { units, state } => {
+                Ok(MaterializedDeepSeekV4Prediction::Sequential { units, state })
+            }
+            MaterializedPredictionExtension::DeepSeekV4Dspark {
+                strategy,
+                static_modules,
+                units,
+                state,
+            } => Ok(MaterializedDeepSeekV4Prediction::Dspark {
+                strategy,
+                static_modules,
+                units,
+                state,
+            }),
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedInklingPrediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::Inkling {
+                units,
+                shared,
+                state,
+            } => Ok(MaterializedInklingPrediction {
+                units,
+                shared,
+                state,
+            }),
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedQwenHybridPrediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::QwenHybrid {
+                units,
+                shared,
+                state,
+            } => Ok(MaterializedQwenHybridPrediction {
+                units,
+                shared,
+                state,
+            }),
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedNemotronHPrediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::NemotronH { groups, state } => {
+                Ok(MaterializedNemotronHPrediction { groups, state })
+            }
+            extension => Err(extension),
+        }
+    }
+}
+
 pub(crate) trait NemotronHPredictionTarget<B>
 where
     B: BlockwiseAttentionBackend
@@ -3762,9 +3885,16 @@ where
 {
     /// Target-specific extension shape retained after pairing.
     type Extension<M>: MaterializedPredictionExecutor<Self, B, M>
+        + TryFrom<
+            MaterializedPredictionExtension<B, M>,
+            Error = MaterializedPredictionExtension<B, M>,
+        >
     where
         M: PredictionExtensionMaterializer<B>,
         Self: Sized;
+
+    /// Exact target context reported when the materialized family does not match.
+    const PAIRING_MISMATCH: &'static str;
 
     /// Consumes and validates the architecture-owned materialized extension.
     fn pair_prediction_extension<M>(
@@ -3772,7 +3902,10 @@ where
     ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
     where
         M: PredictionExtensionMaterializer<B>,
-        Self: Sized;
+        Self: Sized,
+    {
+        Self::Extension::<M>::try_from(extension).map_err(|_| invalid(Self::PAIRING_MISMATCH))
+    }
 }
 
 macro_rules! sealed_prediction_target {
@@ -3835,21 +3968,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::DeepSeekV3 { units } => {
-                Ok(MaterializedDeepSeekV3Prediction { units })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the DeepSeek-V3 target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the DeepSeek-V3 target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::deepseek::v4::Model<B>
@@ -3864,32 +3984,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::DeepSeekV4 { units, state } => {
-                Ok(MaterializedDeepSeekV4Prediction::Sequential { units, state })
-            }
-            MaterializedPredictionExtension::DeepSeekV4Dspark {
-                strategy,
-                static_modules,
-                units,
-                state,
-            } => Ok(MaterializedDeepSeekV4Prediction::Dspark {
-                strategy,
-                static_modules,
-                units,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the DeepSeek-V4 target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the DeepSeek-V4 target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::nemotron_h::PartitionedLayeredModel<B>
@@ -3904,21 +4000,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::NemotronH { groups, state } => {
-                Ok(MaterializedNemotronHPrediction { groups, state })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Nemotron-H target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Nemotron-H target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::nemotron_h::LayeredModel<B>
@@ -3933,21 +4016,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::NemotronH { groups, state } => {
-                Ok(MaterializedNemotronHPrediction { groups, state })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Nemotron-H target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Nemotron-H target";
 }
 
 impl<B, P: 'static> MaterializedPredictionTarget<B>
@@ -3967,21 +4037,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::NemotronH { groups, state } => {
-                Ok(MaterializedNemotronHPrediction { groups, state })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the replicated Nemotron-H target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the replicated Nemotron-H target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::inkling::LayeredModel<B>
@@ -3996,27 +4053,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::Inkling {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedInklingPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Inkling target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Inkling target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::qwen::hybrid::ConditionalLayeredModel<B>
@@ -4031,27 +4069,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the conditional Qwen target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the conditional Qwen target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::qwen::hybrid::LayeredModel<B>
@@ -4066,27 +4085,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Qwen text target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Qwen text target";
 }
 
 impl<B, P: 'static> MaterializedPredictionTarget<B>
@@ -4106,27 +4106,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Qwen text target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Qwen text target";
 }
 
 /// Architecture-owned mutable lane-state geometry for one materialized
