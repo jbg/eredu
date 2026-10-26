@@ -476,15 +476,8 @@ pub fn project_parameters(
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
     validate_text_identity(definition)?;
     let parameters = parameter_description(config).map_err(eredu_nn::Error::backend)?;
-    if definition.parameters() == &parameters {
-        return Ok(definition.clone());
-    }
-    let uses = definition.parameter_uses().clone();
     definition
-        .as_ref()
-        .clone()
-        .with_parameters(parameters, uses)
-        .map(std::sync::Arc::new)
+        .project_parameters(parameters)
         .map_err(eredu_nn::Error::from)
 }
 fn validate_text_identity(
@@ -786,15 +779,8 @@ pub fn project_conditional_parameters(
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
     validate_conditional_identity(definition)?;
     let parameters = conditional_parameter_description(parsed)?;
-    if definition.parameters() == &parameters {
-        return Ok(definition.clone());
-    }
-    let uses = definition.parameter_uses().clone();
     definition
-        .as_ref()
-        .clone()
-        .with_parameters(parameters, uses)
-        .map(std::sync::Arc::new)
+        .project_parameters(parameters)
         .map_err(eredu_nn::Error::from)
 }
 

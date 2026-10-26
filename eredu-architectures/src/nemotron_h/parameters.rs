@@ -519,15 +519,8 @@ pub fn project_parameters(
 ) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, eredu_nn::Error> {
     validate_identity(definition)?;
     let parameters = parameter_description(args).map_err(eredu_nn::Error::backend_source)?;
-    if definition.parameters() == &parameters {
-        return Ok(definition.clone());
-    }
-    let uses = definition.parameter_uses().clone();
     definition
-        .as_ref()
-        .clone()
-        .with_parameters(parameters, uses)
-        .map(std::sync::Arc::new)
+        .project_parameters(parameters)
         .map_err(eredu_nn::Error::from)
 }
 pub(super) fn select_definition(

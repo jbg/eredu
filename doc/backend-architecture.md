@@ -8507,6 +8507,15 @@ owned catalog. Per-layer leases, scalar replicas, recurrent/cache state and code
 convolution geometry remain component declarations. DeepSeek target/prediction
 catalogs and Muse audio units use the same constructor.
 
+`ComponentDefinition::project_parameters` reuses an identical retained declaration
+or validates a new physical catalog while preserving logical aliases, state and
+observation ownership. Runtime checks invocation/storage identity, primary owners
+and companion ownership through the same consuming projection used for explicit
+alias changes. Families retain component identity checks, format admission and any
+alias reconstruction; shared decoder projections supply their changed aliases to
+`with_parameters` directly. Replicated selection uses the same retained projection
+after validating complete local geometry.
+
 Runtime `expand_linear_format_parameter_group` expands one atomic logical group
 and preserves its partition constraints and declared companions. Catalog expansion
 uses the same primitive. Families retain resource and canonical owner identities

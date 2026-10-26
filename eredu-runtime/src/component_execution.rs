@@ -425,6 +425,24 @@ impl ComponentDefinition {
         Ok(())
     }
 
+    /// Projects physical parameters while retaining logical aliases, state and observations.
+    /// An identical catalog reuses the retained definition. Changed catalogs undergo
+    /// the same ownership and companion checks as [`Self::with_parameters`].
+    /// Families that change logical aliases supply them through that consuming method.
+    pub fn project_parameters(
+        self: &std::sync::Arc<Self>,
+        parameters: ArchitectureParameterDescription,
+    ) -> Result<std::sync::Arc<Self>, ComponentDefinitionError> {
+        if self.parameters == parameters {
+            return Ok(self.clone());
+        }
+        let mut selected = self.as_ref().clone();
+        let uses = std::mem::take(&mut selected.parameter_uses);
+        selected
+            .with_parameters(parameters, uses)
+            .map(std::sync::Arc::new)
+    }
+
     /// Projects selected physical parameter geometry while retaining semantic identities.
     /// Families supply exact replacement uses, including changed encoding companions.
     pub fn with_parameters(

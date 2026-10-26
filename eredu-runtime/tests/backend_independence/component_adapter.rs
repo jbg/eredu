@@ -400,6 +400,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
             }
         })
         .unwrap();
+    let shared_definition = std::sync::Arc::new(shared_definition);
     let source_group = shared_definition.parameters().groups()[0].clone();
     let selected_group = eredu_runtime::expand_linear_format_parameter_groups(
         vec![source_group.group().clone()],
@@ -462,10 +463,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         )],
     )
     .unwrap();
-    assert!(shared_definition
-        .clone()
-        .with_parameters(renamed, projected_uses.clone())
-        .is_err());
+    assert!(shared_definition.project_parameters(renamed).is_err());
     let packed = projected_parameters.groups()[0].group();
     let detached = [
         eredu_runtime::OwnedParameterGroupSpec::new(
@@ -502,12 +500,13 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         detached.clone(),
     )
     .unwrap();
-    assert!(shared_definition
-        .clone()
-        .with_parameters(detached, projected_uses.clone())
-        .is_err());
+    assert!(shared_definition.project_parameters(detached).is_err());
     let shared_definition = shared_definition
-        .with_parameters(projected_parameters, projected_uses)
+        .project_parameters(projected_parameters)
+        .unwrap()
+        .as_ref()
+        .clone()
+        .with_parameter_uses(projected_uses)
         .unwrap();
     struct SharedObservation(Vec<String>);
     impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for SharedObservation {

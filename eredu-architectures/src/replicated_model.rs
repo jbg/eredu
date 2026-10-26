@@ -193,15 +193,8 @@ fn select_definition(
             .with_partition_layout(rank, selected)
             .map_err(Error::backend_source)?;
     }
-    if definition.parameters() == &parameters {
-        return Ok(definition);
-    }
-    let uses = definition.parameter_uses().clone();
     definition
-        .as_ref()
-        .clone()
-        .with_parameters(parameters, uses)
-        .map(Arc::new)
+        .project_parameters(parameters)
         .map_err(Error::from)
 }
 

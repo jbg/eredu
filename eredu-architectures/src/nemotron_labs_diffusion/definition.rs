@@ -19,15 +19,8 @@ pub fn project_text_parameters(
     validate_text_identity(definition)?;
     let parameters =
         super::parallel::parameter_description(config).map_err(Error::backend_source)?;
-    if definition.parameters() == &parameters {
-        return Ok(definition.clone());
-    }
-    let uses = definition.parameter_uses().clone();
     definition
-        .as_ref()
-        .clone()
-        .with_parameters(parameters, uses)
-        .map(std::sync::Arc::new)
+        .project_parameters(parameters)
         .map_err(Error::from)
 }
 
@@ -276,15 +269,8 @@ pub fn project_composite_parameters(
     validate_composite_identity(definition)?;
     let parameters =
         super::parallel::composite_parameter_description(config).map_err(Error::backend_source)?;
-    if definition.parameters() == &parameters {
-        return Ok(definition.clone());
-    }
-    let uses = definition.parameter_uses().clone();
     definition
-        .as_ref()
-        .clone()
-        .with_parameters(parameters, uses)
-        .map(std::sync::Arc::new)
+        .project_parameters(parameters)
         .map_err(Error::from)
 }
 
