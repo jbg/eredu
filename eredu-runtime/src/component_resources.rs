@@ -4,7 +4,11 @@ use crate::{
     StaticParameterVisitor, StaticParameterVisitorMut,
 };
 use eredu_nn::{NeuralBackend, Parameterized};
-use std::{borrow::Borrow, collections::BTreeSet};
+use std::{
+    borrow::Borrow,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+};
 
 /// Semantic role traversal and aggregate roots for a kernel's pinned resources.
 /// Equations borrow these same resources directly from the kernel.
@@ -148,6 +152,110 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K, KernelParameterMo
     }
 }
 
+/// Selects complete pinned resources from family-declared canonical groups.
+/// Groups carrying the same resource identity must coexist; independent resources
+/// within a role stay independently selectable. Bindings may refine a canonical
+/// storage owner, but cannot change its parameter geometry or select a group twice.
+/// Groups outside the requested role scope belong to sibling components.
+pub fn select_complete_pinned_resources<'a, R: Ord + Debug>(
+    component: &str,
+    declared: impl IntoIterator<Item = (R, &'a crate::OwnedParameterGroupSpec)>,
+    bindings: &[crate::OwnedParameterGroupSpec],
+    roles: &[&str],
+) -> Result<BTreeSet<R>, ComponentDefinitionError> {
+    let declared = declared.into_iter().collect::<Vec<_>>();
+    let selected = select_pinned_groups(
+        component,
+        declared.iter().map(|(_, group)| *group),
+        bindings,
+        roles,
+        crate::ParameterGroupOwner::refines_storage_owner,
+    )?;
+    complete_pinned_resources(component, declared, &selected)
+}
+
+fn select_pinned_groups<'a>(
+    component: &str,
+    declared: impl IntoIterator<Item = &'a crate::OwnedParameterGroupSpec>,
+    bindings: &[crate::OwnedParameterGroupSpec],
+    roles: &[&str],
+    ownership: impl Fn(&crate::ParameterGroupOwner, &crate::ParameterGroupOwner) -> bool,
+) -> Result<Vec<&'a crate::OwnedParameterGroupSpec>, ComponentDefinitionError> {
+    let invalid = |resource| ComponentDefinitionError::Invalid {
+        component: component.into(),
+        resource,
+    };
+    if roles.iter().any(|role| role.trim().is_empty()) {
+        return Err(invalid("empty pinned role".into()));
+    }
+    let declared = declared.into_iter().collect::<Vec<_>>();
+    let mut canonical = BTreeMap::new();
+    for &group in &declared {
+        for member in group.members() {
+            if canonical
+                .insert(member.target(), group)
+                .is_some_and(|previous| previous != group)
+            {
+                return Err(invalid(format!(
+                    "conflicting pinned parameter {}",
+                    member.target()
+                )));
+            }
+        }
+    }
+    let mut selected = BTreeSet::new();
+    for binding in bindings.iter().filter(|binding| {
+        roles
+            .iter()
+            .any(|role| binding.owner().accepts_static_role(role))
+    }) {
+        let index = declared
+            .iter()
+            .position(|group| {
+                group.group() == binding.group() && ownership(group.owner(), binding.owner())
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "incompatible pinned group {}",
+                    binding.group().logical_name()
+                ))
+            })?;
+        if !selected.insert(index) {
+            return Err(invalid(format!(
+                "duplicate pinned group {}",
+                binding.group().logical_name()
+            )));
+        }
+    }
+    Ok(selected.into_iter().map(|index| declared[index]).collect())
+}
+
+fn complete_pinned_resources<'a, R: Ord + Debug>(
+    component: &str,
+    declared: impl IntoIterator<Item = (R, &'a crate::OwnedParameterGroupSpec)>,
+    selected: &[&crate::OwnedParameterGroupSpec],
+) -> Result<BTreeSet<R>, ComponentDefinitionError> {
+    let mut counts = BTreeMap::<R, (usize, usize)>::new();
+    for (resource, group) in declared {
+        let count = counts.entry(resource).or_default();
+        count.0 += usize::from(selected.contains(&group));
+        count.1 += 1;
+    }
+    let mut present = BTreeSet::new();
+    for (resource, (selected, total)) in counts {
+        if selected != 0 {
+            if selected != total {
+                return Err(ComponentDefinitionError::Invalid {
+                    component: component.into(),
+                    resource: format!("incomplete pinned resource {resource:?}"),
+                });
+            }
+            present.insert(resource);
+        }
+    }
+    Ok(present)
+}
+
 impl ComponentDefinition {
     /// Resolves a scoped subset of complete canonical pinned groups.
     /// Other roles and execution units belong to sibling components. Independent
@@ -157,37 +265,13 @@ impl ComponentDefinition {
         bindings: &[crate::OwnedParameterGroupSpec],
         roles: &[&str],
     ) -> Result<Vec<&'a crate::OwnedParameterGroupSpec>, ComponentDefinitionError> {
-        let invalid = |resource| ComponentDefinitionError::Invalid {
-            component: self.id().to_owned(),
-            resource,
-        };
-        if roles.iter().any(|role| role.trim().is_empty()) {
-            return Err(invalid("empty pinned role".into()));
-        }
-        let declared = self.parameters().groups();
-        let mut selected = BTreeSet::new();
-        for binding in bindings.iter().filter(|binding| {
-            roles
-                .iter()
-                .any(|role| binding.owner().accepts_static_role(role))
-        }) {
-            let index = declared
-                .iter()
-                .position(|group| group == binding)
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "incompatible pinned group {}",
-                        binding.group().logical_name()
-                    ))
-                })?;
-            if !selected.insert(index) {
-                return Err(invalid(format!(
-                    "duplicate pinned group {}",
-                    binding.group().logical_name()
-                )));
-            }
-        }
-        Ok(selected.into_iter().map(|index| &declared[index]).collect())
+        select_pinned_groups(
+            self.id(),
+            self.parameters().groups(),
+            bindings,
+            roles,
+            |declared, selected| declared == selected,
+        )
     }
 
     /// Resolves optional pinned modules whose canonical groups must coexist as one resource.
@@ -200,27 +284,18 @@ impl ComponentDefinition {
         bindings: &[crate::OwnedParameterGroupSpec],
         roles: &[&str],
     ) -> Result<BTreeSet<String>, ComponentDefinitionError> {
-        let invalid = |resource| ComponentDefinitionError::Invalid {
-            component: self.id().to_owned(),
-            resource,
-        };
         let selected = self.select_pinned_groups(bindings, roles)?;
-        let declared = self.parameters().groups();
-        let mut present = BTreeSet::new();
-        for &role in roles {
-            let groups = declared
-                .iter()
-                .filter(|binding| binding.owner().accepts_static_role(role));
-            let total = groups.clone().count();
-            let count = groups.filter(|binding| selected.contains(binding)).count();
-            if count != 0 {
-                if count != total {
-                    return Err(invalid(format!("incomplete pinned resource {role}")));
-                }
-                present.insert(role.to_owned());
-            }
-        }
-        Ok(present)
+        complete_pinned_resources(
+            self.id(),
+            roles.iter().flat_map(|role| {
+                self.parameters()
+                    .groups()
+                    .iter()
+                    .filter(move |binding| binding.owner().accepts_static_role(role))
+                    .map(move |binding| ((*role).to_owned(), binding))
+            }),
+            &selected,
+        )
     }
 }
 

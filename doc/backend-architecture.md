@@ -8431,6 +8431,15 @@ precision boundaries, output multiplication and softcapping remain Muse equation
 The low-level binding constructor validates complete canonical resources before
 materialization; tied output retains its embedding owner.
 
+`select_complete_pinned_resources` validates family-declared resource groups in
+runtime. Groups with one resource identity coexist; separate resources within a
+storage role remain independently selectable. It checks parameter geometry,
+canonical storage-owner refinements, duplicates and incomplete resources while
+excluding sibling roles. Exact declaration projections use the same membership
+and completeness mechanisms with strict owner matching. Qwen vision declares
+only the ingress, merger and DeepStack group associations; runtime owns their
+binding validation and complete-resource selection.
+
 Qwen3-VL text resources use the shared selected pinned constructor for complete,
 tensor-local and partitioned construction. Canonical component storage ownership
 selects embedding, final normalization and readout, including tied output replicas;

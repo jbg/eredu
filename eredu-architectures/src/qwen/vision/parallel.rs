@@ -259,45 +259,14 @@ impl VisionStaticSelection {
         bindings: &[eredu_runtime::OwnedParameterGroupSpec],
     ) -> Result<Self, ParallelPlanError> {
         let declared = static_resource_groups(&config, root, execution_group, role)?;
-        let mut selected = std::collections::BTreeSet::new();
-        for binding in bindings
-            .iter()
-            .filter(|group| group.owner().accepts_static_role(role))
-        {
-            if !declared.iter().any(|(_, group)| {
-                group.group() == binding.group()
-                    && group.owner().refines_storage_owner(binding.owner())
-            }) {
-                return Err(invalid(format!(
-                    "vision {root:?}: incompatible pinned group {}",
-                    binding.group().logical_name()
-                )));
-            }
-            if !selected.insert(binding.group().logical_name()) {
-                return Err(invalid(format!(
-                    "vision {root:?}: duplicate pinned group {}",
-                    binding.group().logical_name()
-                )));
-            }
-        }
-        let mut resources = std::collections::BTreeMap::<_, (usize, usize)>::new();
-        for (resource, group) in declared {
-            let counts = resources.entry(resource).or_default();
-            counts.0 += usize::from(selected.contains(group.group().logical_name()));
-            counts.1 += 1;
-        }
-        for (resource, (present, total)) in &resources {
-            if *present != 0 && present != total {
-                return Err(invalid(format!(
-                    "vision {root:?}: incomplete pinned resource {resource:?}"
-                )));
-            }
-        }
-        let owns = |resource| {
-            resources
-                .get(&resource)
-                .is_some_and(|(present, _)| *present > 0)
-        };
+        let resources = eredu_runtime::select_complete_pinned_resources(
+            &format!("vision {root:?}"),
+            declared.iter().map(|(resource, group)| (*resource, group)),
+            bindings,
+            &[role],
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let owns = |resource| resources.contains(&resource);
         let deepstack = (0..config.deepstack_layer_count())
             .map(|bank| owns(StaticResource::DeepStack(bank)))
             .collect();

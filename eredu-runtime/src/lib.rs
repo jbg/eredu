@@ -34,7 +34,8 @@ mod component_routed;
 pub use component_routed::{ParallelRoutedComponentKernel, RoutedComponentKernel};
 mod component_resources;
 pub use component_resources::{
-    ComponentPinnedResources, ComponentResourceAccess, KernelParameterModules,
+    select_complete_pinned_resources, ComponentPinnedResources, ComponentResourceAccess,
+    KernelParameterModules,
 };
 mod component_partition;
 pub use component_partition::{

@@ -1181,7 +1181,11 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
             assert_eq!(role, "readout");
             struct Slot;
             impl<'a> ParameterVisitorMut<'a, FakeTensor> for Slot {
-                fn visit_mut(&mut self, _: eredu_nn::ParameterMetadata, value: &'a mut FakeTensor) {
+                fn visit_mut(
+                    &mut self,
+                    _: eredu_nn::ParameterMetadata,
+                    value: &'a mut FakeTensor,
+                ) {
                     *value = FakeTensor(vec![42]);
                 }
             }
@@ -1271,6 +1275,94 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
             .len(),
         1
     );
+    // Native resource boundaries can be finer than a storage role, while each
+    // resource's groups must coexist. Local roles can refine a canonical alias.
+    let coupled = [
+        ("table", &complete_groups[0]),
+        ("table", &complete_groups[1]),
+    ];
+    let independent = [
+        ("table", &complete_groups[0]),
+        ("bias", &complete_groups[1]),
+    ];
+    let refined = eredu_runtime::OwnedParameterGroupSpec::new(
+        eredu_runtime::ParameterGroupOwner::static_role("embedding"),
+        complete_groups[0].group().clone(),
+    );
+    assert!(eredu_runtime::select_complete_pinned_resources(
+        complete.id(),
+        coupled,
+        std::slice::from_ref(&refined),
+        &["embedding"],
+    )
+    .is_err());
+    assert_eq!(
+        eredu_runtime::select_complete_pinned_resources(
+            complete.id(),
+            independent,
+            std::slice::from_ref(&refined),
+            &["embedding"],
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<Vec<_>>(),
+        ["table"]
+    );
+    // Exact declaration projection still rejects a changed owner. Two conflicting
+    // canonical owners cannot be declared for one physical group either.
+    assert!(complete
+        .select_pinned_groups(std::slice::from_ref(&refined), &["embedding"])
+        .is_err());
+    assert!(eredu_runtime::select_complete_pinned_resources(
+        complete.id(),
+        [("table", &complete_groups[0]), ("other", &refined)],
+        &[],
+        &["embedding"],
+    )
+    .is_err());
+    // Group labels can repeat; canonical parameter targets identify storage.
+    let repeated_label = eredu_runtime::OwnedParameterGroupSpec::new(
+        complete_groups[1].owner().clone(),
+        eredu_runtime::ParameterGroupSpec::new(
+            complete_groups[0].group().logical_name(),
+            eredu_runtime::ParameterRole::Replicated,
+            complete_groups[1].members().iter().cloned(),
+        )
+        .unwrap(),
+    );
+    let repeated_groups = [complete_groups[0].clone(), repeated_label];
+    let repeated = ArchitectureParameterDescription::new(
+        declaration.parameters().graph(),
+        declaration.parameters().unit_layout(),
+        repeated_groups
+            .iter()
+            .map(|binding| binding.group().clone()),
+        repeated_groups.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        eredu_runtime::select_complete_pinned_resources(
+            complete.id(),
+            repeated.groups().iter().enumerate(),
+            repeated.groups(),
+            &["embedding"],
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    let sibling = eredu_runtime::OwnedParameterGroupSpec::new(
+        eredu_runtime::ParameterGroupOwner::static_role("sibling"),
+        complete_groups[1].group().clone(),
+    );
+    assert!(eredu_runtime::select_complete_pinned_resources(
+        complete.id(),
+        independent,
+        &[sibling],
+        &["embedding"],
+    )
+    .unwrap()
+    .is_empty());
     let kernel = || Kernel {
         fail: false,
         pinned: Some(FakeModule {
@@ -1308,12 +1400,13 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
         )
         .unwrap();
     // A cut cannot silently retain a readout replica that it does not own.
-    assert!(
-        ComponentAdapter::with_pinned_resources::<FakeBackend>(declaration.clone(), kernel())
-            .unwrap()
-            .select_partition(&partition)
-            .is_err()
-    );
+    assert!(ComponentAdapter::with_pinned_resources::<FakeBackend>(
+        declaration.clone(),
+        kernel()
+    )
+    .unwrap()
+    .select_partition(&partition)
+    .is_err());
     ComponentAdapter::with_partition_resources::<FakeBackend, _, _>(
         declaration.clone(),
         Kernel {
@@ -1334,8 +1427,12 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
             declaration.parameters(),
         )
         .unwrap();
-    ComponentAdapter::with_partition_resources::<FakeBackend, _, _>(declaration, kernel(), &tied)
-        .unwrap();
+    ComponentAdapter::with_partition_resources::<FakeBackend, _, _>(
+        declaration,
+        kernel(),
+        &tied,
+    )
+    .unwrap();
 }
 
 // A mutable fixture uses global invocation addresses and independently sliced carry.
