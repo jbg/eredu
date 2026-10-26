@@ -2452,104 +2452,7 @@ pub(crate) mod model_text {
             args: &ModelArgs,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<Self, Error> {
-            let embedding = "model.language_model.embed_tokens.weight";
-            let per_layer_width =
-                args.hidden_size_per_layer_input * args.num_hidden_layers() as i32;
-            let per_layer_embedding = "model.language_model.embed_tokens_per_layer.weight";
-            let per_layer_projection = "model.language_model.per_layer_model_projection.weight";
-            let head = "lm_head.weight";
-            Ok(Self {
-                embeddings: Some(B::embedding(
-                    EmbeddingSpec {
-                        vocabulary: args.vocab_size,
-                        dimensions: args.hidden_size,
-                        weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                        format: crate::linear_format::standard_linear_format(
-                            embedding,
-                            args.linear_format_for(embedding),
-                        )?,
-                    },
-                    context,
-                )?),
-                per_layer_embeddings: (args.hidden_size_per_layer_input > 0)
-                    .then(|| {
-                        B::embedding(
-                            EmbeddingSpec {
-                                vocabulary: args
-                                    .vocab_size_per_layer_input
-                                    .unwrap_or(args.vocab_size),
-                                dimensions: per_layer_width,
-                                weight: ParameterSpec::trainable(per_layer_embedding)
-                                    .map_err(Error::backend)?,
-                                format: crate::linear_format::standard_linear_format(
-                                    per_layer_embedding,
-                                    args.linear_format_for(per_layer_embedding),
-                                )?,
-                            },
-                            context,
-                        )
-                    })
-                    .transpose()?,
-                per_layer_projection: (args.hidden_size_per_layer_input > 0)
-                    .then(|| {
-                        B::linear(
-                            LinearSpec {
-                                input: args.hidden_size,
-                                output: per_layer_width,
-                                weight: ParameterSpec::trainable(per_layer_projection)
-                                    .map_err(Error::backend)?,
-                                bias: None,
-                                format: crate::linear_format::standard_linear_format(
-                                    per_layer_projection,
-                                    args.linear_format_for(per_layer_projection),
-                                )?,
-                            },
-                            context,
-                        )
-                    })
-                    .transpose()?,
-                per_layer_norm: (args.hidden_size_per_layer_input > 0)
-                    .then(|| {
-                        B::normalization(
-                            NormalizationConstructionSpec::learned(
-                                args.hidden_size_per_layer_input,
-                                args.rms_norm_eps,
-                                ParameterSpec::trainable(
-                                    "model.language_model.per_layer_projection_norm.weight",
-                                )
-                                .map_err(Error::backend)?,
-                            ),
-                            context,
-                        )
-                    })
-                    .transpose()?,
-                norm: Some(B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        args.hidden_size,
-                        args.rms_norm_eps,
-                        ParameterSpec::trainable("model.language_model.norm.weight")
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )?),
-                head: (!args.tie_word_embeddings)
-                    .then(|| {
-                        B::linear(
-                            LinearSpec {
-                                input: args.hidden_size,
-                                output: args.vocab_size,
-                                weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
-                                bias: None,
-                                format: crate::linear_format::standard_linear_format(
-                                    head,
-                                    args.linear_format_for(head),
-                                )?,
-                            },
-                            context,
-                        )
-                    })
-                    .transpose()?,
-            })
+            Self::materialize(args, None, context)
         }
 
         pub(super) fn new_parallel(
@@ -2557,35 +2460,50 @@ pub(crate) mod model_text {
             geometry: &super::super::LocalGeometry,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<Self, Error> {
-            let embedding = "model.language_model.embed_tokens.weight";
+            Self::materialize(args, Some(geometry), context)
+        }
+
+        fn materialize(
+            args: &ModelArgs,
+            geometry: Option<&super::super::LocalGeometry>,
+            context: &<B::Tensor as Tensor>::Context,
+        ) -> Result<Self, Error> {
+            use crate::decoder::{PartitionStaticModules, StaticModulePlacement};
             let per_layer_width = args.hidden_size_per_layer_input;
             let combined_width = per_layer_width
                 .checked_mul(args.num_hidden_layers() as i32)
                 .ok_or_else(|| Error::backend("Gemma 4 per-layer width overflowed"))?;
             let per_layer_embedding = "model.language_model.embed_tokens_per_layer.weight";
             let per_layer_projection = "model.language_model.per_layer_model_projection.weight";
-            let head = "lm_head.weight";
+            let embedding = geometry.map_or(StaticModulePlacement::Local, |geometry| {
+                StaticModulePlacement::VocabularyParallel(geometry.embedding_range().clone())
+            });
+            let head = if args.tie_word_embeddings {
+                StaticModulePlacement::Omitted
+            } else if let Some(geometry) = geometry {
+                StaticModulePlacement::VocabularyParallel(
+                    geometry
+                        .output_range()
+                        .cloned()
+                        .ok_or_else(|| Error::backend("untied Gemma 4 output has no local range"))?,
+                )
+            } else {
+                StaticModulePlacement::Local
+            };
+            let ordinary = PartitionStaticModules::<B>::from_construction(
+                super::super::static_construction_specs(args)?,
+                embedding,
+                head,
+                true,
+                context,
+            )?;
             Ok(Self {
-                embeddings: Some(B::vocabulary_parallel_embedding(
-                    EmbeddingSpec {
-                        vocabulary: args.vocab_size,
-                        dimensions: args.hidden_size,
-                        weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                        format: crate::linear_format::standard_linear_format(
-                            embedding,
-                            args.linear_format_for(embedding),
-                        )?,
-                    },
-                    geometry.embedding_range().clone(),
-                    context,
-                )?),
+                embeddings: ordinary.embeddings,
                 per_layer_embeddings: (per_layer_width > 0)
                     .then(|| {
                         B::embedding(
                             EmbeddingSpec {
-                                vocabulary: args
-                                    .vocab_size_per_layer_input
-                                    .unwrap_or(args.vocab_size),
+                                vocabulary: args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
                                 dimensions: combined_width,
                                 weight: ParameterSpec::trainable(per_layer_embedding)
                                     .map_err(Error::backend)?,
@@ -2631,35 +2549,8 @@ pub(crate) mod model_text {
                         )
                     })
                     .transpose()?,
-                norm: Some(B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        args.hidden_size,
-                        args.rms_norm_eps,
-                        ParameterSpec::trainable("model.language_model.norm.weight")
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )?),
-                head: if args.tie_word_embeddings {
-                    None
-                } else {
-                    Some(B::vocabulary_parallel_linear(
-                        LinearSpec {
-                            input: args.hidden_size,
-                            output: args.vocab_size,
-                            weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                head,
-                                args.linear_format_for(head),
-                            )?,
-                        },
-                        geometry.output_range().cloned().ok_or_else(|| {
-                            Error::backend("untied Gemma 4 output has no local range")
-                        })?,
-                        context,
-                    )?)
-                },
+                norm: ordinary.norm,
+                head: ordinary.lm_head,
             })
         }
 

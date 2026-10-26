@@ -529,56 +529,6 @@ fn aggregate_local_text(
     Ok(local)
 }
 
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        if tensor.global_shape().first().copied() != Some(vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Gemma 4 vocabulary member {target} has global shape {:?}, expected {vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "Gemma 4 vocabulary member {target} has non-row placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Gemma 4 vocabulary group {logical_name} has inconsistent selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary,
-        local: selected.ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!(
-                "missing local Gemma 4 vocabulary layout for {logical_name}"
-            ))
-        })?,
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
-}
-
 fn local_per_layer_range(
     args: &ModelArgs,
     layout: &LocalModelLayout,
@@ -648,14 +598,14 @@ pub fn local_geometry(
         per_layer_range.end - per_layer_range.start,
     )?;
     let state_layout = state_layout(&local_text).map_err(|error| invalid(error.to_string()))?;
-    let vocabulary = dim(args.text.vocab_size)?;
-    let embedding_range =
-        vocabulary_range(layout, "model.language_model.embed_tokens", vocabulary)?;
-    let output_range = if args.text.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
+    let (embedding_range, output_range) = super::static_construction_specs(&args.text)
+        .map_err(|error| invalid(error.to_string()))?
+        .vocabulary_ranges(
+            layout,
+            "model.language_model.embed_tokens",
+            "model.language_model.norm",
+            "lm_head",
+        )?;
     let geometry = LocalGeometry {
         text_blocks,
         embedding_range,
@@ -920,25 +870,20 @@ pub(crate) fn pinned_parameter_groups(
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
     let root = "model.language_model";
     let hidden = dim(args.hidden_size)?;
-    let vocab = dim(args.vocab_size)?;
-    let mut groups = vec![(
-        "embedding",
-        group(
-            format!("{root}.embed_tokens"),
-            ParameterRole::Vocabulary,
-            [(
-                format!("{root}.embed_tokens.weight"),
-                vec![vocab, hidden],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?,
-    )];
+    let ordinary = super::static_construction_specs(args)
+        .map_err(|error| invalid(error.to_string()))?
+        .pinned_parameter_groups(
+            "model.language_model.embed_tokens",
+            "model.language_model.norm",
+            "lm_head",
+        )?;
+    let mut extra = Vec::new();
     if args.hidden_size_per_layer_input > 0 {
         let per_layer = dim(args.hidden_size_per_layer_input)?;
         let combined = per_layer
             .checked_mul(args.num_hidden_layers())
             .ok_or_else(|| invalid("Gemma per-layer embedding width overflow"))?;
-        groups.push((
+        extra.push((
             "per_layer_embedding",
             replicated(
                 format!("{root}.per_layer_embedding"),
@@ -951,7 +896,7 @@ pub(crate) fn pinned_parameter_groups(
                 )],
             )?,
         ));
-        groups.push((
+        extra.push((
             "per_layer_projection",
             replicated(
                 format!("{root}.per_layer_projection"),
@@ -961,7 +906,7 @@ pub(crate) fn pinned_parameter_groups(
                 )],
             )?,
         ));
-        groups.push((
+        extra.push((
             "per_layer_norm",
             replicated(
                 format!("{root}.per_layer_projection_norm"),
@@ -972,30 +917,18 @@ pub(crate) fn pinned_parameter_groups(
             )?,
         ));
     }
-    groups.push((
-        "norm",
-        replicated(
-            format!("{root}.norm"),
-            [(format!("{root}.norm.weight"), vec![hidden])],
-        )?,
-    ));
-    if !args.tie_word_embeddings {
-        groups.push((
-            "output",
-            group(
-                "lm_head",
-                ParameterRole::Vocabulary,
-                [(
-                    "lm_head.weight".into(),
-                    vec![vocab, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ));
-    }
-    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
+    let extra = eredu_runtime::expand_tagged_linear_format_parameter_groups(extra, |member| {
         standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-    })
+    })?;
+    let mut extra = extra.into_iter();
+    let mut groups = Vec::new();
+    for (role, group) in ordinary {
+        groups.push((role, group));
+        if role == "embedding" {
+            groups.extend(extra.by_ref());
+        }
+    }
+    Ok(groups)
 }
 
 /// Declares one decoder layer's head, MLP, expert, media, and replicated groups.

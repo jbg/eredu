@@ -4212,6 +4212,37 @@ impl StaticModuleConstruction {
         Ok((range("embedding")?, range("output")?))
     }
 
+    /// Projects exact vocabulary intervals from declared physical storage.
+    /// Runtime validates row companions and replicas; tied readout retains one owner.
+    pub(crate) fn vocabulary_ranges(
+        &self,
+        layout: &LocalModelLayout,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<(VocabularyParallelRange, Option<VocabularyParallelRange>), ParallelPlanError> {
+        let (embedding, output) = self.selected_vocabulary_ranges(
+            layout,
+            embedding_group,
+            normalization_group,
+            output_group,
+        )?;
+        let required = |range: Option<VocabularyParallelRange>, role| {
+            range.ok_or_else(|| {
+                ParallelPlanError::InvalidGroup(format!(
+                    "static declaration has no local {role} resource"
+                ))
+            })
+        };
+        Ok((
+            required(embedding, "embedding")?,
+            if self.head.is_none() {
+                None
+            } else {
+                Some(required(output, "output")?)
+            },
+        ))
+    }
 }
 
 /// Physical ownership and placement of one ordinary pinned vocabulary resource.
@@ -4306,30 +4337,9 @@ impl StaticModuleSpec {
         normalization_group: &str,
         output_group: &str,
     ) -> Result<(VocabularyParallelRange, Option<VocabularyParallelRange>), ParallelPlanError> {
-        let (embedding, output) = self
-            .construction_specs()
+        self.construction_specs()
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
-            .selected_vocabulary_ranges(
-                layout,
-                embedding_group,
-                normalization_group,
-                output_group,
-            )?;
-        let required = |range: Option<VocabularyParallelRange>, role| {
-            range.ok_or_else(|| {
-                ParallelPlanError::InvalidGroup(format!(
-                    "static declaration has no local {role} resource"
-                ))
-            })
-        };
-        Ok((
-            required(embedding, "embedding")?,
-            if self.tied_head {
-                None
-            } else {
-                Some(required(output, "output")?)
-            },
-        ))
+            .vocabulary_ranges(layout, embedding_group, normalization_group, output_group)
     }
 
     /// Shared ordinary static-module specification before backend binding.

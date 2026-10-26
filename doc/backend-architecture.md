@@ -8522,6 +8522,13 @@ materialization paths. Diffusion Gemma uses its family-authored construction for
 both paths and appends its separate feedback groups; Gemma retains its own per-layer
 input resources.
 
+Gemma 4 supplies its ordinary embedding, learned final norm and readout through
+one backend-neutral static construction. Cold catalogs, vocabulary geometry and
+ordinary/tensor-local materialization consume that declaration. Per-layer token
+inputs, projection and normalization retain their family-specific geometry and
+separate resource roles, inserted by semantic identity alongside ordinary roles.
+Cached attention sharing, media assembly and readout arithmetic remain family-owned.
+
 Runtime `balanced_parameter_group_range_if_present` treats an entirely omitted
 physical group as unowned after validating its declared axis. If any member remains,
 the ordinary balanced-axis validator requires the primary and every companion with
