@@ -1875,16 +1875,7 @@ fn expand_pinned_formats(
     groups: Vec<(&'static str, ParameterGroupSpec)>,
     format: impl Fn(&str) -> LinearFormat,
 ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-    groups
-        .into_iter()
-        .map(|(role, group)| {
-            eredu_runtime::expand_linear_format_parameter_group(group, |member| {
-                crate::linear_format::standard_parallel_linear_format(
-                    member,
-                    format(member.target()),
-                )
-            })
-            .map(|group| (role, group))
-        })
-        .collect()
+    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
+        crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
+    })
 }

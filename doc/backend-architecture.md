@@ -8501,6 +8501,12 @@ around that projection; Muse carries its role tags through format expansion, and
 LFM2 keeps its canonical static owners attached throughout. DeepSeek pinned
 format expansion likewise retains each resource role directly.
 
+`expand_tagged_linear_format_parameter_groups` moves architecture-owned resource
+tags alongside atomic groups through physical expansion. Tags need no cloning or
+ordering, and runtime assigns them no family meaning. Muse vision, Qwen vision,
+Gemma 4, Inkling, DeepSeek and shared static catalogs use this projection while
+retaining their own resource associations, canonical owners and format admission.
+
 `expand_owned_linear_format_parameter_groups` consumes canonical owned groups
 and projects their physical encodings through the same atomic-group primitive.
 Owners, shared consumers and replica requirements remain attached to each group.

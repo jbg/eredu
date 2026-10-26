@@ -4232,22 +4232,23 @@ impl StaticModuleSpec {
         normalization_group: &str,
         output_group: &str,
     ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
-        self.logical_pinned_parameter_groups(embedding_group, normalization_group, output_group)?
-            .into_iter()
-            .map(|(role, group)| {
-                eredu_runtime::expand_linear_format_parameter_group(group, |member| {
-                    let format = if member.target() == self.embedding_weight {
-                        self.embedding_format
-                    } else if member.target() == self.head_weight {
-                        self.head_format
-                    } else {
-                        return Ok(None);
-                    };
-                    crate::linear_format::standard_parallel_linear_format(member, format)
-                })
-                .map(|group| (role, group))
-            })
-            .collect()
+        eredu_runtime::expand_tagged_linear_format_parameter_groups(
+            self.logical_pinned_parameter_groups(
+                embedding_group,
+                normalization_group,
+                output_group,
+            )?,
+            |member| {
+                let format = if member.target() == self.embedding_weight {
+                    self.embedding_format
+                } else if member.target() == self.head_weight {
+                    self.head_format
+                } else {
+                    return Ok(None);
+                };
+                crate::linear_format::standard_parallel_linear_format(member, format)
+            },
+        )
     }
 
     /// Shared ordinary static-module specification before backend binding.

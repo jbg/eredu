@@ -367,21 +367,18 @@ fn static_resource_groups(
                 .map(|group| (resource, OwnedParameterGroupSpec::new(owner.clone(), group))),
         );
     }
-    let mut expanded = Vec::with_capacity(groups.len());
-    for (resource, group) in groups {
-        expanded.extend(
-            declaration
-                .expand(vec![group.group().clone()])?
-                .into_iter()
-                .map(|expanded| {
-                    (
-                        resource,
-                        OwnedParameterGroupSpec::new(group.owner().clone(), expanded),
-                    )
-                }),
-        );
-    }
-    Ok(expanded)
+    let tagged = groups.into_iter().map(|(resource, group)| {
+        let owner = group.owner().clone();
+        ((resource, owner), group.into_group())
+    });
+    Ok(
+        eredu_runtime::expand_tagged_linear_format_parameter_groups(tagged, |member| {
+            Ok(declaration.formats.get(member.target()).cloned())
+        })?
+        .into_iter()
+        .map(|((resource, owner), group)| (resource, OwnedParameterGroupSpec::new(owner, group)))
+        .collect(),
+    )
 }
 
 /// Resolves local main/deepstack merger intermediate widths.

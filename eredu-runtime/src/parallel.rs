@@ -1107,6 +1107,22 @@ pub fn expand_linear_format_parameter_group(
     expanded.with_partition_unit_assignment(group.partition_unit_assignment())
 }
 
+/// Projects physical groups while retaining caller-owned typed resource tags.
+/// Tags move with their group and require neither cloning nor ordering.
+pub fn expand_tagged_linear_format_parameter_groups<Tag>(
+    groups: impl IntoIterator<Item = (Tag, ParameterGroupSpec)>,
+    declaration: impl Fn(
+        &ParameterMemberSpec,
+    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+) -> Result<Vec<(Tag, ParameterGroupSpec)>, ParallelPlanError> {
+    groups
+        .into_iter()
+        .map(|(tag, group)| {
+            expand_linear_format_parameter_group(group, &declaration).map(|group| (tag, group))
+        })
+        .collect()
+}
+
 /// Projects physical storage for canonical owned groups without rebuilding their
 /// ownership, sharing or replica-consumer declarations.
 pub fn expand_owned_linear_format_parameter_groups(

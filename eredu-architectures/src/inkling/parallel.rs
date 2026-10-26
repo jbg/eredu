@@ -669,25 +669,17 @@ pub(super) fn pinned_parameter_groups(
             )?,
         ));
     }
-    let mut expanded = Vec::new();
-    for (role, group) in groups {
-        expanded.extend(
-            expand_linear_format_parameter_groups(vec![group], |member| {
-                let name = member.target();
-                let format = if name.starts_with("visual.") {
-                    args.vision_config
-                        .as_ref()
-                        .map_or(LinearFormat::Dense, |config| config.linear_format_for(name))
-                } else {
-                    args.text_config.linear_format_for(name)
-                };
-                standard_parallel_linear_format(member, format)
-            })?
-            .into_iter()
-            .map(|group| (role, group)),
-        );
-    }
-    Ok(expanded)
+    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
+        let name = member.target();
+        let format = if name.starts_with("visual.") {
+            args.vision_config
+                .as_ref()
+                .map_or(LinearFormat::Dense, |config| config.linear_format_for(name))
+        } else {
+            args.text_config.linear_format_for(name)
+        };
+        standard_parallel_linear_format(member, format)
+    })
 }
 
 /// Declares one replicated Inkling vision execution unit.

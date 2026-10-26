@@ -1096,15 +1096,9 @@ fn declared_vision_groups(
             ],
         )?,
     ));
-    let mut expanded = Vec::new();
-    for (owner, group) in groups {
-        for group in expand_linear_format_parameter_groups(vec![group], |member| {
-            standard_parallel_linear_format(member, config.linear_format_for(member.target()))
-        })? {
-            expanded.push((owner, group));
-        }
-    }
-    Ok(expanded)
+    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
+        standard_parallel_linear_format(member, config.linear_format_for(member.target()))
+    })
 }
 
 /// Vision units whose owners need each pinned static module. Every vision

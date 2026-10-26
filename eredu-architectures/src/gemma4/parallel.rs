@@ -1007,17 +1007,9 @@ fn pinned_parameter_groups_at(
             )?,
         ));
     }
-    let mut expanded = Vec::new();
-    for (role, group) in groups {
-        expanded.extend(
-            expand_linear_format_parameter_groups(vec![group], |member| {
-                standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-            })?
-            .into_iter()
-            .map(|group| (role, group)),
-        );
-    }
-    Ok(expanded)
+    eredu_runtime::expand_tagged_linear_format_parameter_groups(groups, |member| {
+        standard_parallel_linear_format(member, args.linear_format_for(member.target()))
+    })
 }
 
 /// Declares one decoder layer's head, MLP, expert, media, and replicated groups.

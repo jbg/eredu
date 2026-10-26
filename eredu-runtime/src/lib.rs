@@ -348,7 +348,8 @@ pub use media_load_request::{MediaExecutionPolicy, MediaExecutionPolicyError, Me
 pub use parallel::{
     aligned_partition_units, aligned_partition_units_with_tail, derive_transform_source_layout,
     expand_linear_format_parameter_group, expand_linear_format_parameter_groups,
-    expand_owned_linear_format_parameter_groups, module_parameter_group,
+    expand_owned_linear_format_parameter_groups, expand_tagged_linear_format_parameter_groups,
+    module_parameter_group,
     packed_gated_product_logical_group, packed_relu2_logical_group, partition_chunk_range,
     partition_parameter_group_chunks, partitioned_module_parameter_group,
     partitioned_projection_group, projection_parameter_group, segmented_projection_group,
