@@ -2579,8 +2579,14 @@ share one `embed_code` parameter. The frozen speaker projection explicitly uses
 the stored matrix orientation; learned speech equations remain outside MLX.
 
 `ConditioningKernel` leases character parameters, ingress parameters and
-gated fusion as three separate units, with no learned static leases. Character
-lookup and pooling/flag projection are separate invocations around the selected
+gated fusion as three separate units, with no learned static leases. Prepared
+conditioning implements `ConditioningExecution` directly on `LayerwiseRuntime`
+over the shared component adapter; native composition constructs that runtime
+and inspects its policy directly. The resident conditioning module shares the
+same phase methods and retains its learned-module construction and visitation.
+`ParallelConditioningExecution` requires typed invocation over the selected
+communicator, with character, ingress and fusion conveniences sharing that lifecycle.
+Character lookup and pooling/flag projection are separate invocations around the selected
 character transformer. Prompt/decode ingress consumes feedback only after the
 selected RVQ provider completes. These boundaries avoid retaining a conditioning
 lease while another provider runs. Empty character selections skip both character

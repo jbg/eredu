@@ -844,57 +844,6 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Condit
     }
 }
 
-/// Conditioning using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseConditioning<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, ConditioningUnit<B>>,
-{
-    runtime: LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    >,
-}
-impl<B, P> LayerwiseConditioning<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, ConditioningUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact conditioning unit policy.
-    pub fn new(
-        architecture: ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
-        policy: P,
-    ) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<
-        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
-        B,
-        StatelessComponentState,
-        P,
-    > {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<TtsError, P>,
 ) -> TtsError {
@@ -1006,9 +955,9 @@ impl<B: NeuralBackend> Parameterized<B::Tensor> for ResidentConditioning<B> {
 }
 
 macro_rules! conditioning_methods {
-    ($map:expr) => {
+    ($map:expr $(, $field:ident)?) => {
         fn dimensions(&self) -> ConditioningDimensions {
-            self.runtime.architecture().kernel().dimensions()
+            self $(.$field)?.architecture().kernel().dimensions()
         }
         fn character_embed(
             &mut self,
@@ -1016,7 +965,7 @@ macro_rules! conditioning_methods {
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, TtsError> {
             let mut state = StatelessComponentState::new()?;
-            self.runtime
+            self $(.$field)?
                 .invoke(
                     ConditioningInput::CharacterEmbed(batch.clone()),
                     &mut state,
@@ -1031,7 +980,7 @@ macro_rules! conditioning_methods {
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, TtsError> {
             let mut state = StatelessComponentState::new()?;
-            self.runtime
+            self $(.$field)?
                 .invoke(
                     ConditioningInput::CharacterFinish(batch.clone(), hidden.clone()),
                     &mut state,
@@ -1049,7 +998,7 @@ macro_rules! conditioning_methods {
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<ConditioningLanes<B::Tensor>, TtsError> {
             let mut state = StatelessComponentState::new()?;
-            self.runtime
+            self $(.$field)?
                 .invoke_with_context(
                     ConditioningInput::Prefill {
                         embedded: embedded.clone(),
@@ -1073,7 +1022,7 @@ macro_rules! conditioning_methods {
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<ConditioningLanes<B::Tensor>, TtsError> {
             let mut state = StatelessComponentState::new()?;
-            self.runtime
+            self $(.$field)?
                 .invoke_with_context(
                     ConditioningInput::Decode {
                         embedded: embedded.clone(),
@@ -1094,7 +1043,7 @@ macro_rules! conditioning_methods {
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, TtsError> {
             let mut state = StatelessComponentState::new()?;
-            self.runtime
+            self $(.$field)?
                 .invoke(
                     ConditioningInput::Fuse(audio.clone(), text.clone()),
                     &mut state,
@@ -1105,9 +1054,15 @@ macro_rules! conditioning_methods {
     };
 }
 impl<B: NeuralBackend> ConditioningExecution<B> for ResidentConditioning<B> {
-    conditioning_methods!(std::convert::identity);
+    conditioning_methods!(std::convert::identity, runtime);
 }
-impl<B, P> ConditioningExecution<B> for LayerwiseConditioning<B, P>
+impl<B, P> ConditioningExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, ConditioningUnit<B>>,
@@ -1276,28 +1231,22 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     }
 }
 
-impl<B, P> LayerwiseConditioning<B, P>
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, ConditioningUnit<B>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
+/// Tensor-parallel conditioning phases over independently leased learned units.
+/// Implementors supply typed invocation; phase conveniences retain inputs and lanes
+/// through that same ordinary completion lifecycle.
+pub trait ParallelConditioningExecution<B: DistributedNeuralBackend>:
+    ConditioningExecution<B>
 {
+    /// Executes a selected phase with the retained rank-local geometry and communicator.
     fn invoke_parallel(
         &mut self,
         input: ConditioningInput<B::Tensor>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, ConditioningForward<B::Tensor>), TtsError> {
-        let mut state = StatelessComponentState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(input, &mut state, parallel, context, |_, _, _| {
-                Ok(())
-            })
-            .map_err(runtime_error)
-    }
+    ) -> Result<(B::Tensor, ConditioningForward<B::Tensor>), TtsError>;
+
     /// Looks up and gathers the complete character backbone input.
-    pub fn character_embed_parallel(
+    fn character_embed_parallel(
         &mut self,
         batch: &CharacterBatch,
         parallel: &B::ParallelContext,
@@ -1311,7 +1260,7 @@ where
         .map(|(output, _)| output)
     }
     /// Gathers pooled projections before scatter and replicated flag additions.
-    pub fn character_finish_parallel(
+    fn character_finish_parallel(
         &mut self,
         batch: &CharacterBatch,
         hidden: &B::Tensor,
@@ -1327,7 +1276,7 @@ where
     }
     /// Gathers projected speaker codes before BOS substitution and guidance duplication.
     #[allow(clippy::too_many_arguments)]
-    pub fn prefill_embedded_parallel(
+    fn prefill_embedded_parallel(
         &mut self,
         embedded: &B::Tensor,
         layout: &PromptLayout,
@@ -1352,7 +1301,7 @@ where
         .into_lanes()
     }
     /// Creates replicated decode guidance lanes under the selected rank-local lifecycle.
-    pub fn decode_embedded_parallel(
+    fn decode_embedded_parallel(
         &mut self,
         embedded: &B::Tensor,
         conditioning: Option<&B::Tensor>,
@@ -1373,7 +1322,7 @@ where
         .into_lanes()
     }
     /// Gathers both affine projections before the feature gate and global RMSNorm.
-    pub fn fuse_parallel(
+    fn fuse_parallel(
         &mut self,
         audio: &B::Tensor,
         text: &B::Tensor,
@@ -1386,5 +1335,32 @@ where
             context,
         )
         .map(|(output, _)| output)
+    }
+}
+
+impl<B, P> ParallelConditioningExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, ConditioningKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, ConditioningUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn invoke_parallel(
+        &mut self,
+        input: ConditioningInput<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, ConditioningForward<B::Tensor>), TtsError> {
+        let mut state = StatelessComponentState::new()?;
+        self.forward_parallel_with_context_hook(input, &mut state, parallel, context, |_, _, _| {
+            Ok(())
+        })
+        .map_err(runtime_error)
     }
 }
