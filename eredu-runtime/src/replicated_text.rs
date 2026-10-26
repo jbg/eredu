@@ -1,11 +1,11 @@
 //! Selection contracts for replicated text architectures.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
-use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
+use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization};
 use eredu_core::{
     cache::{StateComponentPolicy, StateTensorDtype},
     checkpoint::TensorDtype,
@@ -1732,6 +1732,36 @@ impl ReplicatedTextRequirements {
     pub fn with_additional_operators(mut self, operators: NeuralOperatorCapabilities) -> Self {
         self.operators = self.operators.union(operators);
         self
+    }
+
+    /// Ordinary admitted formats that use quantized native operators.
+    /// Auxiliary requirements retain their independent catalog and source scope.
+    pub fn native_quantized_formats(&self) -> HashMap<String, WeightQuantization> {
+        self.parameters()
+            .iter()
+            .filter_map(|parameter| {
+                parameter
+                    .native_executable()
+                    .weight_quantization()
+                    .map(|format| (parameter.name().to_owned(), format))
+            })
+            .collect()
+    }
+
+    /// Admitted linear and embedding formats, including dense matrices.
+    pub fn native_matrix_formats(&self) -> HashMap<String, LinearFormat> {
+        self.matrix_parameters()
+            .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
+            .collect()
+    }
+
+    fn matrix_parameters(&self) -> impl Iterator<Item = &ReplicatedTextParameterRequirement> {
+        self.parameters().iter().filter(|parameter| {
+            matches!(
+                parameter.role(),
+                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
+            )
+        })
     }
 
     /// Returns required optional neural-operation semantics.
@@ -4034,6 +4064,37 @@ impl SelectedReplicatedTextRealization {
     pub fn parameters(&self) -> &[SelectedParameterRealization] {
         &self.parameters
     }
+    /// Ordinary selected formats that use quantized executable operators.
+    /// This reports the retained selection rather than the source-native formats.
+    pub fn quantized_formats(&self) -> HashMap<String, WeightQuantization> {
+        self.parameters()
+            .iter()
+            .filter_map(|parameter| {
+                parameter
+                    .executable()
+                    .weight_quantization()
+                    .map(|format| (parameter.name().to_owned(), format))
+            })
+            .collect()
+    }
+
+    /// Selected formats for matrix identities in an explicit admitted scope.
+    /// Only selected ordinary parameters are projected; dense entries are retained.
+    pub fn matrix_formats_for(
+        &self,
+        requirements: &ReplicatedTextRequirements,
+    ) -> HashMap<String, LinearFormat> {
+        let matrices = requirements
+            .matrix_parameters()
+            .map(ReplicatedTextParameterRequirement::name)
+            .collect::<BTreeSet<_>>();
+        self.parameters()
+            .iter()
+            .filter(|parameter| matrices.contains(parameter.name()))
+            .map(|parameter| (parameter.name().to_owned(), parameter.executable()))
+            .collect()
+    }
+
     /// Whether ordinary selected parameters require payload conversion.
     /// Auxiliary prediction parameters retain their own independent task selection.
     pub fn uses_weight_transform(&self) -> bool {

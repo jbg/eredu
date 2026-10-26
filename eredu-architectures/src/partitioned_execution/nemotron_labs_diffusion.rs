@@ -20,7 +20,7 @@ where
     use crate::nemotron_labs_diffusion::{parallel, partitioned::PartitionedTextKernel};
     let error = |message: String| DenseDecoderPartitionedDispatchError::Architecture(message);
     let target = args
-        .with_checkpoint_formats(crate::replicated_text::selected_formats(selected.base()))
+        .with_checkpoint_formats(selected.base().quantized_formats())
         .map_err(|e| error(e.to_string()))?;
     let retained = selected
         .base()
@@ -54,9 +54,7 @@ where
     validate_partitioned_binding(selected.requirements(), &partition).map_err(error)?;
     let source_architecture = if selected.base().uses_weight_transform() {
         let source = args
-            .with_checkpoint_formats(crate::replicated_text::requirement_formats(
-                selected.base().requirements(),
-            ))
+            .with_checkpoint_formats(selected.base().requirements().native_quantized_formats())
             .map_err(|e| error(e.to_string()))?;
         let description = retained.parameters();
         let source_layout =

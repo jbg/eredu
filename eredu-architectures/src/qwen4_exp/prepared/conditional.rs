@@ -270,10 +270,8 @@ impl SelectedConditionalExecution {
     fn selected_vision_config(&self) -> crate::qwen::vision::VisionConfig {
         let mut vision = self.ingress.vision().config().clone();
         vision.linear_formats.clear();
-        for (name, format) in crate::replicated_text::selected_matrix_formats(
-            self.selected.selected.text().requirements(),
-            self.selected.selected.text(),
-        ) {
+        let text = self.selected.selected.text();
+        for (name, format) in text.matrix_formats_for(text.requirements()) {
             if name.starts_with("model.visual.") {
                 vision.linear_formats.insert(name, format);
             }

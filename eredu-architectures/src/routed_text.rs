@@ -619,7 +619,7 @@ where
     let mut target = config.clone();
     target.text.weight_quantization = None;
     target.text.quantized_weights = None;
-    let formats = crate::replicated_text::selected_formats(selected.text());
+    let formats = selected.text().quantized_formats();
     target.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
     let identity = target.architecture_fingerprint();
     let capability =

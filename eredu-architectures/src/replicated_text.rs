@@ -1149,70 +1149,11 @@ fn validate_plan_identity(
     Ok(())
 }
 
-pub(crate) fn selected_formats(
-    selected: &SelectedReplicatedTextRealization,
-) -> HashMap<String, WeightQuantization> {
-    selected
-        .parameters()
-        .iter()
-        .filter_map(|parameter| {
-            parameter
-                .executable()
-                .weight_quantization()
-                .map(|format| (parameter.name().to_owned(), format))
-        })
-        .collect()
-}
-
-pub(crate) fn requirement_formats(
-    requirements: &ReplicatedTextRequirements,
-) -> HashMap<String, WeightQuantization> {
-    requirements
-        .parameters()
-        .iter()
-        .filter_map(|parameter| {
-            parameter
-                .native_executable()
-                .weight_quantization()
-                .map(|format| (parameter.name().to_owned(), format))
-        })
-        .collect()
-}
-
-pub(crate) fn selected_matrix_formats(
-    requirements: &ReplicatedTextRequirements,
-    selected: &SelectedReplicatedTextRealization,
-) -> HashMap<String, LinearFormat> {
-    let matrices = requirement_matrix_formats(requirements);
-    selected
-        .parameters()
-        .iter()
-        .filter(|parameter| matrices.contains_key(parameter.name()))
-        .map(|parameter| (parameter.name().to_owned(), parameter.executable()))
-        .collect()
-}
-
-fn requirement_matrix_formats(
-    requirements: &ReplicatedTextRequirements,
-) -> HashMap<String, LinearFormat> {
-    requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| {
-            matches!(
-                parameter.role(),
-                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
-            )
-        })
-        .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
-        .collect()
-}
-
 pub(crate) fn selected_gemma2_args(
     args: &crate::gemma2::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::gemma2::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1224,7 +1165,7 @@ pub(crate) fn selected_llama_args(
     args: &crate::llama::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::llama::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1236,7 +1177,7 @@ pub(crate) fn selected_nanbeige_args(
     args: &crate::nanbeige::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::nanbeige::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1248,7 +1189,7 @@ pub(crate) fn source_nanbeige_args(
     args: &crate::nanbeige::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::nanbeige::ModelArgs, String> {
-    let formats = requirement_formats(selected.requirements());
+    let formats = selected.requirements().native_quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1260,7 +1201,7 @@ pub(crate) fn source_gemma2_args(
     args: &crate::gemma2::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::gemma2::ModelArgs, String> {
-    let formats = requirement_formats(selected.requirements());
+    let formats = selected.requirements().native_quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1272,7 +1213,7 @@ pub(crate) fn source_llama_args(
     args: &crate::llama::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::llama::ModelArgs, String> {
-    let formats = requirement_formats(selected.requirements());
+    let formats = selected.requirements().native_quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1311,7 +1252,7 @@ pub(crate) fn selected_qwen_args(
     args: &crate::qwen::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::qwen::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1323,7 +1264,7 @@ pub(crate) fn source_qwen_args(
     args: &crate::qwen::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::qwen::ModelArgs, String> {
-    let formats = requirement_formats(selected.requirements());
+    let formats = selected.requirements().native_quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1335,7 +1276,7 @@ pub(crate) fn selected_gpt_oss_args(
     args: &crate::gpt_oss::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::gpt_oss::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1347,7 +1288,7 @@ pub(crate) fn selected_lfm2_args(
     args: &crate::lfm2::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::lfm2::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1359,7 +1300,7 @@ pub(crate) fn selected_kimi_linear_args(
     args: &crate::kimi_linear::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::kimi_linear::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1371,7 +1312,7 @@ pub(crate) fn selected_nemotron_h_args(
     args: &crate::nemotron_h::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::nemotron_h::ModelArgs, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1383,7 +1324,7 @@ pub(crate) fn selected_qwen_hybrid_args(
     args: &crate::qwen::hybrid::HybridConfig,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::qwen::hybrid::HybridConfig, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     let mut target = args.clone();
     if !formats.is_empty() {
         target.linear_formats = formats
@@ -1428,7 +1369,7 @@ pub(crate) fn selected_deepseek_v4_args(
     args: &crate::deepseek::V4Args,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::deepseek::V4Args, String> {
-    let formats = selected_formats(selected);
+    let formats = selected.quantized_formats();
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -2199,7 +2140,7 @@ where
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let target = config
-            .with_checkpoint_formats(selected_formats(&selected))
+            .with_checkpoint_formats(selected.quantized_formats())
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let identity = target.architecture_fingerprint();
         let capability = crate::capability::nemotron_labs_diffusion(&target, false)
@@ -2266,7 +2207,7 @@ where
     let mut target = config.clone();
     target.text.weight_quantization = None;
     target.text.quantized_weights = None;
-    let formats = selected_formats(&selected);
+    let formats = selected.quantized_formats();
     target.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
     let identity = target.architecture_fingerprint();
     let capability = crate::capability::diffusion_gemma(&target)
@@ -7663,11 +7604,11 @@ where
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
         .ok_or(ReplicatedTextIneligibility::Unrelated)?;
-    let source_linear_formats = requirement_matrix_formats(requirements.execution());
+    let source_linear_formats = requirements.execution().native_matrix_formats();
     let target_linear_formats =
-        selected_matrix_formats(requirements.execution(), selected.execution());
-    let source_formats = requirement_formats(requirements.execution());
-    let target_formats = selected_formats(selected.execution());
+        selected.execution().matrix_formats_for(requirements.execution());
+    let source_formats = requirements.execution().native_quantized_formats();
+    let target_formats = selected.execution().quantized_formats();
     let has_transform = selected.execution().uses_weight_transform();
     visitor.construction_started();
     let construction = CompositeTextConstruction::<B, S, V> {
@@ -8175,11 +8116,11 @@ where
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
         .ok_or(ReplicatedTextIneligibility::Unrelated)?;
-    let source_linear_formats = requirement_matrix_formats(requirements.execution());
+    let source_linear_formats = requirements.execution().native_matrix_formats();
     let target_linear_formats =
-        selected_matrix_formats(requirements.execution(), selected.execution());
-    let source_formats = requirement_formats(requirements.execution());
-    let target_formats = selected_formats(selected.execution());
+        selected.execution().matrix_formats_for(requirements.execution());
+    let source_formats = requirements.execution().native_quantized_formats();
+    let target_formats = selected.execution().quantized_formats();
     let has_transform = selected.execution().uses_weight_transform();
     visitor.construction_started();
     macro_rules! visit_constructed_prediction_target {

@@ -279,7 +279,7 @@ impl CompatibleExternalAssistantPreparation {
         };
         let args = muse::with_checkpoint_formats(
             args,
-            crate::replicated_text::selected_formats(execution.text_realization()),
+            execution.text_realization().quantized_formats(),
         )
         .map_err(invalid_assistant)?;
         let parameters = muse::component_definition(&args, None)

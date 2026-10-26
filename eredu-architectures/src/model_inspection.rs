@@ -427,7 +427,7 @@ fn record_rank_resources(
         let (parameters, layers, kv_width) = if let Some(config) = muse {
             let config = crate::muse::with_checkpoint_formats(
                 config,
-                crate::replicated_text::selected_formats(selected.text_realization()),
+                selected.text_realization().quantized_formats(),
             )?;
             let parameters = crate::muse::component_definition(&config, None)
                 .map_err(|error| error.to_string())?
@@ -441,9 +441,7 @@ fn record_rank_resources(
         } else if let Some(config) = nemotron {
             use crate::decoder::Config;
             let config = config
-                .with_checkpoint_formats(crate::replicated_text::selected_formats(
-                    selected.text_realization(),
-                ))
+                .with_checkpoint_formats(selected.text_realization().quantized_formats())
                 .map_err(|e| e.to_string())?;
             let parameters = if config.vision.is_some() {
                 crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&config)

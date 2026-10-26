@@ -10583,6 +10583,12 @@ direct loading and recipe-only derivation. Retained text selections expose this
 decision over their ordinary parameters; auxiliary prediction preparation inspects
 its own task set. Families and native materializers consume the same distinction
 for source-module construction, conversion grouping and residency accounting.
+Requirements expose source-native quantized and matrix format catalogs; retained
+selections expose executable quantized formats and matrix formats within an
+explicit admitted requirement scope. Runtime filters matrix identities using
+borrowed canonical names and retains dense matrix entries. Family configuration,
+inspection and construction consume these same projections without reconstructing
+format catalogs or extending them to auxiliary parameter scopes.
 `prepare_transform_source_layout` consumes that decision over the caller's admitted
 lowerings and invokes its typed geometry builder only when payload conversion is
 selected. The resulting layout has one retained shared owner. Ordinary rank-local

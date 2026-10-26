@@ -23,7 +23,7 @@ where
     let mut selected_args = args.clone();
     selected_args.text.weight_quantization = None;
     selected_args.text.quantized_weights = None;
-    let formats = crate::replicated_text::selected_formats(selected.base().text());
+    let formats = selected.base().text().quantized_formats();
     selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
     let retained = selected
         .base()
@@ -169,7 +169,7 @@ where
     let mut selected_args = args.clone();
     selected_args.text.weight_quantization = None;
     selected_args.text.quantized_weights = None;
-    let formats = crate::replicated_text::selected_formats(selected.base());
+    let formats = selected.base().quantized_formats();
     selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
     let retained = selected
         .base()

@@ -328,10 +328,8 @@ pub(super) fn target_spec_from_formats(
 ) -> Result<TargetSpec, Error> {
     use crate::routed_text::RoutedGroupedPlan;
     let formats = selected.map(|selected| {
-        crate::replicated_text::selected_matrix_formats(
-            selected.text().requirements(),
-            selected.text(),
-        )
+        let text = selected.text();
+        text.matrix_formats_for(text.requirements())
     });
     let experts = selected
         .map(|selected| {

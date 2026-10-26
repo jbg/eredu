@@ -123,10 +123,8 @@ impl PreparedConditionalPartition {
         let bound = target.selected_bound_spec(execution).map_err(invalid)?;
         let mut vision = ingress.vision().config().clone();
         vision.linear_formats.clear();
-        for (name, format) in crate::replicated_text::selected_matrix_formats(
-            execution.text().requirements(),
-            execution.text(),
-        ) {
+        let text = execution.text();
+        for (name, format) in text.matrix_formats_for(text.requirements()) {
             if name.starts_with("model.visual.") {
                 vision.linear_formats.insert(name, format);
             }

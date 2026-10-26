@@ -9438,7 +9438,7 @@ where
         .map(|source_args| {
             let source_args = crate::kimi_linear::with_checkpoint_formats(
                 &source_args,
-                crate::replicated_text::requirement_formats(selected.base().requirements()),
+                selected.base().requirements().native_quantized_formats(),
             )
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)
@@ -9594,7 +9594,7 @@ where
         .map(|source_args| {
             let source_args = crate::lfm2::with_checkpoint_formats(
                 &source_args,
-                crate::replicated_text::requirement_formats(selected.base().requirements()),
+                selected.base().requirements().native_quantized_formats(),
             )
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
@@ -10890,7 +10890,7 @@ where
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::lfm2::with_checkpoint_formats(
             &source_args,
-            crate::replicated_text::requirement_formats(selected.base().text().requirements()),
+            selected.base().text().requirements().native_quantized_formats(),
         )
         .map_err(error)?;
         let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
@@ -11049,7 +11049,7 @@ where
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::kimi_linear::with_checkpoint_formats(
             &source_args,
-            crate::replicated_text::requirement_formats(selected.base().text().requirements()),
+            selected.base().text().requirements().native_quantized_formats(),
         )
         .map_err(error)?;
         let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)

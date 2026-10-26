@@ -24,8 +24,8 @@ use crate::partitioned_execution::{
     prepare_partitioned, PreparedPartitionedAdmission, SelectedPartitionedAdmission,
 };
 use crate::replicated_text::{
-    composite_config, qwen_hybrid_composite_with_formats, qwen_vl_with_formats, selected_formats,
-    selected_matrix_formats, CompositeConfig, CompositeTextRequirements,
+    composite_config, qwen_hybrid_composite_with_formats, qwen_vl_with_formats, CompositeConfig,
+    CompositeTextRequirements,
     SelectedCompositeTextRealization,
 };
 
@@ -1565,7 +1565,7 @@ where
     use crate::nemotron_labs_diffusion::{composite::partition, partitioned::TextBoundarySchema};
     let error = |message: String| CompositePartitionPreparationError::Architecture(message);
     let args = source
-        .with_checkpoint_formats(selected_formats(selected.base().execution()))
+        .with_checkpoint_formats(selected.base().execution().quantized_formats())
         .map_err(|e| error(e.to_string()))?;
     let retained = selected
         .base()
@@ -1631,9 +1631,9 @@ where
     let source_architecture =
         if selected.base().execution().uses_weight_transform() {
             let source_args = source
-                .with_checkpoint_formats(crate::replicated_text::requirement_formats(
-                    selected.requirements().execution().execution(),
-                ))
+                .with_checkpoint_formats(
+                    selected.requirements().execution().execution().native_quantized_formats(),
+                )
                 .map_err(|e| error(e.to_string()))?;
             let source_parameters = retained.parameters();
             let source_layout =
@@ -1800,11 +1800,11 @@ where
         ));
     }
 
-    let target_formats = selected_formats(selected.base().execution());
-    let target_linear_formats = selected_matrix_formats(
-        selected.requirements().execution().execution(),
-        selected.base().execution(),
-    );
+    let target_formats = selected.base().execution().quantized_formats();
+    let target_linear_formats = selected
+        .base()
+        .execution()
+        .matrix_formats_for(selected.requirements().execution().execution());
     let config = composite_config(
         selected
             .requirements()
@@ -3006,9 +3006,7 @@ where
     }
     let source = qwen_vl_with_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        )
+        selected.requirements().execution().execution().native_quantized_formats()
         .into_iter()
         .map(|(name, format)| (name, format.into()))
         .collect(),
@@ -3107,9 +3105,7 @@ where
     }
     let source_args = crate::gemma4::with_checkpoint_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        ),
+        selected.requirements().execution().execution().native_quantized_formats(),
     )?;
     let source = &source_args;
     let sparse =
@@ -3229,9 +3225,7 @@ where
     }
     let source_args = crate::muse::with_checkpoint_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        ),
+        selected.requirements().execution().execution().native_quantized_formats(),
     )?;
     let source = &source_args;
     let retained = selected
@@ -3340,9 +3334,7 @@ where
     }
     let source_args = crate::inkling::with_checkpoint_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        ),
+        selected.requirements().execution().execution().native_quantized_formats(),
     )?;
     let source = &source_args;
     let retained = selected
@@ -3477,11 +3469,11 @@ where
             "selected composite decoder strategy differs from its requirements".into(),
         ));
     }
-    let target_formats = selected_formats(selected.base().execution());
-    let target_linear_formats = selected_matrix_formats(
-        selected.requirements().execution().execution(),
-        selected.base().execution(),
-    );
+    let target_formats = selected.base().execution().quantized_formats();
+    let target_linear_formats = selected
+        .base()
+        .execution()
+        .matrix_formats_for(selected.requirements().execution().execution());
     let config = composite_config(
         selected
             .requirements()
