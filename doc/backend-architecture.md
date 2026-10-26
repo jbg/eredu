@@ -8415,6 +8415,15 @@ prediction frontier and target-capture policy retain their separate family seman
 Catalog validation errors use the neutral neural error and retain their original
 source.
 
+Qwen hybrid uses one source-free static declaration for fixed and complete text
+execution, conditional text construction, parameter catalogs and output topology.
+Nemotron-H likewise shares parameter identities, dimensions, encodings and tied
+ownership across fixed, complete and partition construction. Its family declaration
+accepts an explicit final-normalization choice: the fixed profile selects native
+normalization; complete and partition profiles select the existing full-width F32
+reduction and scale multiplication. These arithmetic choices remain distinct
+without duplicating the resource description.
+
 `StaticModuleSpec::embedding_format` retains the complete physical matrix encoding,
 including block-FP8 companions. Shared decoder configuration supplies its selected
 `linear_format` directly; tied output inspection uses the same embedding encoding

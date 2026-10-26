@@ -15,7 +15,7 @@ use eredu_runtime::{
 };
 
 use crate::{
-    decoder::{DecoderStaticResources, StaticModuleSpec, StaticModules},
+    decoder::{DecoderStaticResources, StaticModules},
     hybrid_decoder::HybridStaticModules,
 };
 
@@ -197,7 +197,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
         let definition = super::select_definition(&config, definition, geometry.as_ref())?;
         let target_layers = definition.unit_count(0)?;
         let prediction_steps = definition.prediction_groups().len();
-        let spec = static_module_spec(&config);
+        let spec = super::static_module_spec(&config);
         let base = match &geometry {
             Some(geometry) => StaticModules::from_parallel_spec(
                 spec,
@@ -303,7 +303,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
                 .iter()
                 .any(|group| group.owner().accepts_static_role(role))
         };
-        let (embedding, head, norm) = static_module_spec(&config).construction_specs()?;
+        let (embedding, head, norm) = super::static_module_spec(&config).construction_specs()?;
         let embeddings = stores("embedding")
             .then(|| {
                 B::vocabulary_parallel_embedding(
@@ -745,26 +745,6 @@ pub fn state_identity(
         topology,
     )
     .map_err(Error::backend)
-}
-
-/// Shared static construction consumed by ordinary execution and cold topology.
-pub(super) fn static_module_spec(config: &HybridConfig) -> StaticModuleSpec {
-    StaticModuleSpec {
-        normalization_groups: None,
-        embedding_weight: "model.embed_tokens.weight".into(),
-        normalization_weight: "model.norm.weight".into(),
-        head_weight: "lm_head.weight".into(),
-        vocabulary: config.vocab_size,
-        hidden_size: config.hidden_size,
-        normalization_epsilon: config.rms_norm_eps,
-        normalization_offset: 1.0,
-        embedding_format: config
-            .linear_format("model.embed_tokens.weight")
-            .weight_quantization()
-            .into(),
-        head_format: config.linear_format("lm_head.weight"),
-        tied_head: config.tie_word_embeddings,
-    }
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ComponentKernel<B>

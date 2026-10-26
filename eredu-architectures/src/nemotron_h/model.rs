@@ -13,9 +13,7 @@ use super::{
     state_layout, Block, EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator,
     PredictionUnit, RetainedValues, TargetReadout,
 };
-use crate::decoder::{
-    ComponentInstrumentation, DecoderStaticResources, StaticModuleSpec, StaticModules,
-};
+use crate::decoder::{ComponentInstrumentation, DecoderStaticResources, StaticModules};
 use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
 
 /// One target or appended prediction physical unit.
@@ -336,12 +334,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         };
         let static_modules = match &geometry {
             Some(geometry) => StaticModules::from_parallel_spec(
-                Self::static_spec(&args),
+                super::static_spec(&args, super::FinalNormalization::Float32),
                 geometry.embedding_range().clone(),
                 geometry.output_range().cloned(),
                 context,
             )?,
-            None => StaticModules::from_spec(Self::static_spec(&args), context)?,
+            None => StaticModules::from_spec(
+                super::static_spec(&args, super::FinalNormalization::Float32),
+                context,
+            )?,
         };
         Self::with_selected_resources(args, definition, static_modules, geometry)
     }
@@ -371,24 +372,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemot
         };
         eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
             .map_err(Error::from)
-    }
-
-    pub(super) fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
-        let embedding_name = "model.embeddings.weight";
-        StaticModuleSpec {
-            // One full-width group keeps reduction and learned scale in F32.
-            normalization_groups: Some(1),
-            embedding_weight: embedding_name.into(),
-            normalization_weight: "model.norm_f.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: args.vocab_size,
-            hidden_size: args.hidden_size,
-            normalization_epsilon: args.layer_norm_epsilon,
-            normalization_offset: 0.0,
-            embedding_format: args.weight_quantization_for(embedding_name).into(),
-            head_format: args.weight_quantization_for("lm_head.weight").into(),
-            tied_head: args.tie_word_embeddings,
-        }
     }
 
     /// Returns normalized architecture policy.

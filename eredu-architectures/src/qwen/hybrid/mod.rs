@@ -193,3 +193,23 @@ pub fn expert_realization_plan(
         .map(Some)
         .map_err(eredu_nn::Error::backend)
 }
+
+/// Shared static construction consumed by ordinary execution and cold topology.
+pub(crate) fn static_module_spec(config: &HybridConfig) -> crate::decoder::StaticModuleSpec {
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: None,
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: config.vocab_size,
+        hidden_size: config.hidden_size,
+        normalization_epsilon: config.rms_norm_eps,
+        normalization_offset: 1.0,
+        embedding_format: config
+            .linear_format("model.embed_tokens.weight")
+            .weight_quantization()
+            .into(),
+        head_format: config.linear_format("lm_head.weight"),
+        tied_head: config.tie_word_embeddings,
+    }
+}

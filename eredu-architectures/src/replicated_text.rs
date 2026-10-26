@@ -400,20 +400,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
         crate::nemotron_h::component_definition(config, None)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        let embedding = "model.embeddings.weight";
-        crate::decoder::StaticModuleSpec {
-            normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.norm_f.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: config.vocab_size,
-            hidden_size: config.hidden_size,
-            normalization_epsilon: config.layer_norm_epsilon,
-            normalization_offset: 0.0,
-            embedding_format: config.weight_quantization_for(embedding).into(),
-            head_format: config.weight_quantization_for("lm_head.weight").into(),
-            tied_head: config.tie_word_embeddings,
-        }
+        crate::nemotron_h::static_spec(config, crate::nemotron_h::FinalNormalization::Native)
     }
 
     fn state_identity(
@@ -493,22 +480,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
         crate::qwen::hybrid::component_definition(config, None)
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::decoder::StaticModuleSpec {
-            normalization_groups: None,
-            embedding_weight: "model.embed_tokens.weight".into(),
-            normalization_weight: "model.norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: config.vocab_size,
-            hidden_size: config.hidden_size,
-            normalization_epsilon: config.rms_norm_eps,
-            normalization_offset: 1.0,
-            embedding_format: config
-                .linear_format("model.embed_tokens.weight")
-                .weight_quantization()
-                .into(),
-            head_format: config.linear_format("lm_head.weight"),
-            tied_head: config.tie_word_embeddings,
-        }
+        crate::qwen::hybrid::static_module_spec(config)
     }
 
     fn state_identity(

@@ -281,7 +281,7 @@ pub fn parameter_description(
     )
     .map_err(invalid)?;
     let mut declaration = Declaration::default();
-    let statics = super::model::static_module_spec(config);
+    let statics = super::static_module_spec(config);
     let mut roles = vec!["embedding", "mtp"];
     if config.tie_word_embeddings {
         roles.push("output");

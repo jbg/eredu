@@ -259,3 +259,33 @@ pub fn state_identity(
     )
     .map_err(eredu_nn::Error::backend)
 }
+
+/// Final-normalization arithmetic selected by execution profiles.
+pub(crate) enum FinalNormalization {
+    Native,
+    Float32,
+}
+
+pub(crate) fn static_spec(
+    args: &ModelArgs,
+    normalization: FinalNormalization,
+) -> crate::decoder::StaticModuleSpec {
+    let embedding_name = "model.embeddings.weight";
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: match normalization {
+            FinalNormalization::Native => None,
+            // One full-width group keeps reduction and learned scale in F32.
+            FinalNormalization::Float32 => Some(1),
+        },
+        embedding_weight: embedding_name.into(),
+        normalization_weight: "model.norm_f.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.layer_norm_epsilon,
+        normalization_offset: 0.0,
+        embedding_format: args.weight_quantization_for(embedding_name).into(),
+        head_format: args.weight_quantization_for("lm_head.weight").into(),
+        tied_head: args.tie_word_embeddings,
+    }
+}

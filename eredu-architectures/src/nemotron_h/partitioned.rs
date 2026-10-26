@@ -100,7 +100,7 @@ where
         )?;
         let selection = definition.select_partition(partition)?;
         let static_modules = PartitionStaticModules::from_selected_spec(
-            super::CompleteNemotronKernel::<B>::static_spec(&args),
+            super::static_spec(&args, super::FinalNormalization::Float32),
             Some((
                 geometry.embedding_range().clone(),
                 geometry.output_range().cloned(),

@@ -1299,7 +1299,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
         };
         let prediction_steps = definition.prediction_groups().len();
         let (embedding, head, normalization) =
-            super::model::static_module_spec(&parsed.text).construction_specs()?;
+            super::static_module_spec(&parsed.text).construction_specs()?;
         let norm = stores("norm")
             .then(|| {
                 crate::decoder::NormalizedBoundary::<B>::new(normalization, context)
