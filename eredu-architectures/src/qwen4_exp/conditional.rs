@@ -46,14 +46,7 @@ pub fn definition(
     target: &ComponentDefinition,
     vision: &VisionConfig,
 ) -> Result<ComponentDefinition, Error> {
-    definition_with_parameters(target, vision, declare_parameters(target, vision)?)
-}
-
-fn definition_with_parameters(
-    target: &ComponentDefinition,
-    vision: &VisionConfig,
-    parameters: ArchitectureParameterDescription,
-) -> Result<ComponentDefinition, Error> {
+    let parameters = declare_parameters(target, vision)?;
     let mut units = (0..target.unit_count(TARGET_INDEX)?)
         .map(|index| {
             target

@@ -12096,6 +12096,13 @@ contains neutral metadata and shares the initial declaration; native modules and
 leases belong to the active materialization. Conditional target and transform-source
 planning derives placement from these declarations. Selected conditional construction validates ingress and
 placement, then constructs the tensor-local target and vision modules directly.
+The conditional target/vision definition retains global invocation paths, optional
+encoder dependencies and transport ownership through runtime parameter projection
+and local state selection. Expert localization uses the checked owned-resource
+subset when parameter ownership is local; an admitted partition layout retains its
+global binding authority. Encoder state stays stateless and target slot identities
+keep their selected global offsets. Media admission and tower equations remain
+architecture-owned.
 
 `DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse.
 Shared `StaticModules` owns vocabulary parameters, collectives and readout

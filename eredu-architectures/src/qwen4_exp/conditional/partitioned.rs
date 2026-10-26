@@ -27,14 +27,15 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
             ));
         }
         validate_ingress(spec.geometry(), &ingress, &vision)?;
-        let parameters = parameter_description(&spec.geometry().definition()?, &vision)?
+        let definition = std::sync::Arc::new(definition(&spec.geometry().definition()?, &vision)?);
+        let parameters = definition
+            .parameters()
+            .clone()
             .with_partition_layout(topology, layout.clone())
             .map_err(Error::backend)?;
-        let definition = std::sync::Arc::new(definition_with_parameters(
-            &target.local_spec().definition()?,
-            &vision,
-            parameters,
-        )?);
+        let definition = definition
+            .project_parameters(parameters)?
+            .select_state_layout(&target.local_spec().state_layout()?)?;
         let blocks = (0..vision.layer_count())
             .map(|index| {
                 crate::qwen::vision::local_block_geometry(&vision, "model.visual", index, layout)
@@ -109,16 +110,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
         realization: &crate::ExpertRealizationPlan<GroupedGatedProductSpec>,
     ) -> Result<Self, Error> {
         self.modules.target = self.modules.target.with_expert_realization(realization)?;
-        let parameters = if self.definition.parameters().partition_layout().is_some() {
-            self.definition.parameters().clone()
-        } else {
-            declare_parameters(self.modules.target.definition(), &self.vision)?
-        };
-        self.definition = std::sync::Arc::new(definition_with_parameters(
-            self.modules.target.definition(),
-            &self.vision,
-            parameters,
-        )?);
+        if self.definition.parameters().partition_layout().is_none() {
+            self.definition = self
+                .definition
+                .project_owned_parameters(declare_parameters(
+                    self.modules.target.definition(),
+                    &self.vision,
+                )?)?;
+        }
         Ok(self)
     }
 
