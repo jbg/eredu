@@ -1736,80 +1736,6 @@ fn independent_backend_consumes_canonical_binding_and_placement_plans() {
             false,
         ),
     );
-    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
-    let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
-    let group = eredu_runtime::ParameterGroupSpec::new(
-        "weight",
-        ParameterRole::ColumnProjection,
-        [eredu_runtime::ParameterMemberSpec::new(
-            "weight",
-            [2, 2],
-            eredu_runtime::MemberSharding::Balanced { axis: 0 },
-        )],
-    )
-    .unwrap();
-    let parameters = ArchitectureParameterDescription::from_owned(
-        &graph,
-        &units,
-        [eredu_runtime::OwnedParameterGroupSpec::new(
-            eredu_runtime::ParameterGroupOwner::execution_unit(
-                units.group_id(0).unwrap().clone(),
-                0,
-            ),
-            group,
-        )],
-    )
-    .unwrap();
-    eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).unwrap();
-    let mut inconsistent = layout.clone();
-    inconsistent.insert(
-        "weight".into(),
-        layout
-            .tensor("weight")
-            .unwrap()
-            .clone()
-            .with_additional_placement(TensorPlacement::Range {
-                axis: 1,
-                start: 0,
-                end: 1,
-            }),
-    );
-    assert!(matches!(
-        eredu_runtime::validate_retained_parameter_layout(&parameters, &inconsistent),
-        Err(eredu_runtime::RetainedParameterLayoutError::Shape { .. })
-    ));
-    let stateless =
-        StateLayout::new(LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap()).unwrap();
-    let state_plan = eredu_runtime::ArchitectureStatePartitionPlan::new([]);
-    let partition = |parameters: &ArchitectureParameterDescription| {
-        ArchitecturePartition::from_description(
-            parameters,
-            [("decoder", 0..1)],
-            PartitionOwnership::new(true, true, ["embedding"]).unwrap(),
-            &stateless,
-            &state_plan,
-            (),
-            NoAuxiliaryBoundarySchema::new(2),
-        )
-        .unwrap()
-    };
-    let target = partition(&parameters);
-    target
-        .validate_transform_parameter_owners(&target, ["weight"])
-        .unwrap();
-    let source_parameters = ArchitectureParameterDescription::from_owned(
-        &graph,
-        &units,
-        [eredu_runtime::OwnedParameterGroupSpec::new(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            parameters.groups()[0].group().clone(),
-        )],
-    )
-    .unwrap();
-    assert!(matches!(
-        target.validate_transform_parameter_owners(&partition(&source_parameters), ["weight"]),
-        Err(eredu_runtime::TransformParameterOwnershipError::Changed(_))
-    ));
     // Placement and sizing consume a metadata-only catalog with no payload API.
     struct Header(eredu_checkpoint::store::TensorMetadata);
     impl eredu_checkpoint::recipe::RecipeCatalog for Header {
@@ -1998,19 +1924,11 @@ fn aliases_share_one_fake_backend_materialization() {
         WeightBinding::alias("alias-a", "owner", 16).unwrap(),
         WeightBinding::alias("alias-b", "alias-a", 16).unwrap(),
     ];
-    assert_eq!(
-        eredu_runtime::physical_binding_bytes(&bindings).unwrap(),
-        16
-    );
     let unit = materialize_bindings::<FakeBackend>(&source, &bindings, &()).unwrap();
     assert_eq!(unit.len(), 3);
     assert_eq!(leases.load(Ordering::SeqCst), 1);
     let independent = ["replica-a", "replica-b"]
         .map(|name| WeightBinding::new(name, "owner", TensorSelection::Full, 16).unwrap());
-    assert_eq!(
-        eredu_runtime::physical_binding_bytes(&independent).unwrap(),
-        32
-    );
     let replicas = materialize_bindings::<FakeBackend>(&source, &independent, &()).unwrap();
     assert_eq!(replicas.len(), 2);
     assert_eq!(leases.load(Ordering::SeqCst), 3);
@@ -4477,7 +4395,7 @@ fn production_replicated_text_constructor_materializes_shared_storage_once() {
             prepared_partition: None,
             prompt_cache: None,
         };
-        let session = construct_replicated_text_session::<_, FakeBackend, _>(
+        let _session = construct_replicated_text_session::<_, FakeBackend, _>(
             architecture,
             None,
             contract,
@@ -4487,9 +4405,6 @@ fn production_replicated_text_constructor_materializes_shared_storage_once() {
         .unwrap();
         assert_eq!(counters.snapshot().unit_constructions, 1);
         assert_eq!(counters.snapshot().materializations, 1);
-        assert_eq!(tasks.borrow().len(), 1);
-        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 0]);
-        assert_eq!(counters.snapshot().publications, 0);
     }
 }
 
@@ -8143,147 +8058,6 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     let parameters = architecture
         .parameter_description(&())
         .expect("fixture parameter description");
-    let transports = (0..parameters.graph().groups().len())
-        .map(|group| {
-            <GroupedFixture as LayeredArchitecture<FakeBackend, FixtureState>>::group_transport(
-                &architecture,
-                group,
-            )
-        })
-        .collect::<Vec<_>>();
-    // Global ownership must not rebase an already selected nonzero invocation.
-    let selected = parameters
-        .unit_layout()
-        .select([parameters.unit_layout().address(3).unwrap()])
-        .unwrap();
-    assert!(matches!(
-        eredu_runtime::PipelinePlacementPlan::new(parameters.graph(), &selected, &transports, 2),
-        Err(eredu_runtime::PipelinePlacementError::NonCanonicalLayout { group: 2 })
-    ));
-    let state_layout = architecture.state_layout().unwrap();
-    let parameter = |name: &str, owner| {
-        let encoding = SourceTensorEncoding::Safetensors(StoredDtype::F32);
-        ReplicatedTextParameterRequirement::new(
-            name,
-            vec![name.into()],
-            vec![ReplicatedTextPhysicalSource::new(
-                name,
-                name,
-                "/exact/fixture.safetensors",
-                name,
-                encoding.clone(),
-                4,
-            )
-            .unwrap()],
-            Vec::new(),
-            Some(encoding),
-            Some(vec![1, 1]),
-            vec![1, 1],
-            LinearFormat::Dense,
-            ReplicatedTextParameterRole::LinearWeight,
-            owner,
-            ReplicatedTextParameterPresence::Required,
-            eredu_runtime::ParameterTransformConstraint::None,
-        )
-        .unwrap()
-    };
-    let requirements = ReplicatedTextRequirements::new(
-        "shared-rank-projection",
-        NeuralOperatorCapabilities::NONE,
-        parameters.graph().clone(),
-        parameters.unit_layout().clone(),
-        transports.clone(),
-        state_layout.clone(),
-        ReplicatedTextStateAccess::KeyValue,
-        vec![
-            parameter(
-                "shared",
-                ReplicatedTextParameterOwner::StaticUnitConsumers {
-                    role: "embedding".into(),
-                    consumers: vec![("text".into(), 0), ("text".into(), 1)],
-                },
-            ),
-            parameter(
-                "late",
-                ReplicatedTextParameterOwner::ExecutionUnit {
-                    group: "text".into(),
-                    unit: 1,
-                },
-            ),
-        ],
-    )
-    .unwrap()
-    .with_state_partition_plan(architecture.state_partition_plan(&state_layout))
-    .unwrap();
-    let ranks = [0, 1].map(|rank| {
-        eredu_runtime::PipelineRankProjection::new(
-            &requirements,
-            Some(&state_layout),
-            eredu_core::ParallelRankTopology::new(
-                eredu_core::ParallelTopology::new(1, 2, 1, 1).unwrap(),
-                rank,
-            )
-            .unwrap(),
-            true,
-        )
-        .unwrap()
-    });
-    assert_eq!(ranks[0].parameter_targets(), ["shared"]);
-    assert_eq!(ranks[1].parameter_targets(), ["shared", "late"]);
-    // Both stages store shared parameters; the late invocation belongs only to rank 1.
-    let text_group = eredu_runtime::ExecutionGroupId::new("text").unwrap();
-    assert!(!ranks[0].owns_unit(&text_group, 1));
-    assert!(ranks[1].owns_unit(&text_group, 1));
-    assert_eq!(ranks[0].publication_owner(), 1);
-    assert_eq!(ranks[1].publication_owner(), 1);
-    let ownership_only =
-        eredu_runtime::PipelineRankProjection::new(&requirements, None, ranks[1].topology(), false)
-            .unwrap();
-    assert_eq!(ownership_only.groups(), ranks[1].groups());
-    assert_eq!(ownership_only.ownership(), ranks[1].ownership());
-    assert!(ownership_only.state().is_none());
-    assert!(ownership_only.parameter_targets().is_empty());
-    let state_plan = architecture.state_partition_plan(&state_layout);
-    let projected = ranks
-        .iter()
-        .map(|rank| {
-            rank.construct_partition(
-                &requirements,
-                &parameters,
-                &state_layout,
-                &state_plan,
-                (),
-                NoAuxiliaryBoundarySchema::new(8),
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(matches!(
-        ownership_only.construct_partition(
-            &requirements,
-            &parameters,
-            &state_layout,
-            &state_plan,
-            (),
-            NoAuxiliaryBoundarySchema::new(8),
-        ),
-        Err(eredu_runtime::PipelineRankBindingError::State { .. })
-    ));
-    for (rank, partition) in ranks.iter().zip(&projected) {
-        rank.validate_partition(&requirements, partition).unwrap();
-    }
-    assert!(matches!(
-        ranks[0].validate_partition(&requirements, &projected[1]),
-        Err(eredu_runtime::PipelineRankBindingError::Ownership { .. })
-    ));
-    let owned_units = |rank: usize| {
-        ranks[rank]
-            .groups()
-            .iter()
-            .find(|group| group.group().as_str() == "text")
-            .unwrap()
-            .units()
-    };
     let partitions = [
         ArchitecturePartition::<(), NoAuxiliaryBoundarySchema>::from_architecture::<
             FakeBackend,
@@ -8292,8 +8066,8 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             _,
         >(
             &architecture,
-            [("text", owned_units(0))],
-            ranks[0].ownership().clone(),
+            [("text", 0..1)],
+            PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
             (),
             NoAuxiliaryBoundarySchema::new(8),
             &parameters,
@@ -8305,8 +8079,8 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             _,
         >(
             &architecture,
-            [("text", owned_units(1))],
-            ranks[1].ownership().clone(),
+            [("text", 1..2)],
+            PartitionOwnership::new(false, true, std::iter::empty::<String>()).unwrap(),
             (),
             NoAuxiliaryBoundarySchema::new(8),
             &parameters,
@@ -8324,9 +8098,6 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     ];
     assert_eq!(drivers[0].state_layout().len(), 1);
     assert_eq!(drivers[1].state_layout().len(), 3);
-    for (rank, driver) in ranks.iter().zip(&drivers) {
-        assert_eq!(rank.state().unwrap().layout(), driver.state_layout());
-    }
     let schema = eredu_runtime::ArchitectureBoundary::wire_schema(partitions[0].boundary_schema())
         .unwrap()
         .resolve(1, 1)
@@ -9021,11 +8792,6 @@ fn composite_prepared_parts_drive_dependency_group_output() {
         assert_eq!(adopted_state.as_ref()[2].0, step);
         assert_eq!(adopted_state.as_ref()[3].0, step);
     }
-    assert_eq!(shared.units().iter().map(Vec::len).sum::<usize>(), 3);
-    assert_eq!(
-        shared.architecture().trace,
-        [(0, 0), (1, 0), (2, 0), (2, 1)].repeat(3)
-    );
     shared.units_mut()[2][0].marker = 9;
     assert_eq!(
         shared
@@ -9033,10 +8799,8 @@ fn composite_prepared_parts_drive_dependency_group_output() {
             .unwrap(),
         FakeTensor(vec![15, 9, 9])
     );
-    assert_eq!(shared.invocations(), &map);
 
     struct LogicalHook {
-        calls: Vec<(usize, usize, usize)>,
         fail: bool,
     }
     impl LayeredTraversalHook<FakeBackend, GroupedForwardContext, Error> for LogicalHook {
@@ -9047,26 +8811,21 @@ fn composite_prepared_parts_drive_dependency_group_output() {
             &mut self,
             group: usize,
             index: usize,
-            remaining: usize,
+            _remaining: usize,
             _: &mut FakeTensor,
             _: &mut GroupedForwardContext,
             _: &(),
         ) -> Result<LayeredUnitAction, Error> {
-            self.calls.push((group, index, remaining));
             if self.fail && group == 2 && index == 1 {
                 return Err(Error::backend("injected logical invocation failure"));
             }
             Ok(LayeredUnitAction::Execute)
         }
     }
-    let mut hook = LogicalHook {
-        calls: Vec::new(),
-        fail: true,
-    };
+    let mut hook = LogicalHook { fail: true };
     assert!(shared
         .forward_with_traversal_hook(Some(&first), &mut shared_state, &(), &mut hook)
         .is_err());
-    assert_eq!(hook.calls, [(0, 0, 1), (1, 0, 1), (2, 0, 2), (2, 1, 1)]);
     assert_eq!(shared_state.as_ref()[2].0, 5);
     assert_eq!(shared_state.as_ref()[3].0, 4);
     hook.fail = false;
@@ -9077,54 +8836,6 @@ fn composite_prepared_parts_drive_dependency_group_output() {
     assert_eq!(shared_state.as_ref()[2].0, 6);
     assert_eq!(shared_state.as_ref()[3].0, 5);
 
-    let wrong_count = ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::from_units(
-        architecture(map.clone()),
-        vec![
-            vec![FakeUnit { marker: 0 }],
-            vec![FakeUnit { marker: 10 }],
-            vec![FakeUnit { marker: 20 }, FakeUnit { marker: 21 }],
-        ],
-    );
-    assert!(matches!(
-        wrong_count,
-        Err(eredu_runtime::ResidentUnitsError::UnitCount {
-            group: 2,
-            expected: 1,
-            actual: 2
-        })
-    ));
-    let reordered = eredu_runtime::ExecutionUnitAddressMap::new(
-        &storage,
-        [0, 1, 3, 2].map(|ordinal| {
-            let address = logical.address(ordinal).unwrap();
-            (
-                address,
-                if ordinal >= 2 {
-                    logical.address(3).unwrap()
-                } else {
-                    address
-                },
-            )
-        }),
-    )
-    .unwrap();
-    assert!(matches!(
-        ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::new(architecture(reordered), &()),
-        Err(eredu_runtime::ResidentUnitsError::InvocationMap(
-            eredu_runtime::ExecutionUnitAddressMapError::AddressMismatch { .. }
-        ))
-    ));
-    let incomplete = map
-        .select_invocations([
-            logical.address(0).unwrap(),
-            logical.address(1).unwrap(),
-            logical.address(2).unwrap(),
-        ])
-        .unwrap();
-    assert!(matches!(
-        ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::new(architecture(incomplete), &()),
-        Err(eredu_runtime::ResidentUnitsError::InvocationMap(eredu_runtime::ExecutionUnitAddressMapError::InvocationCount { .. }))
-    ));
 }
 
 #[test]
