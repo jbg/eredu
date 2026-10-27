@@ -129,11 +129,6 @@ where
         .map_err(architecture)?;
         selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "dense Qwen hybrid transform source changed local unit addresses",
-            ));
-        }
         let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             source_args,
             source_definition,
@@ -289,11 +284,6 @@ where
         .map_err(architecture)?;
         selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "routed Qwen hybrid transform source changed local unit addresses",
-            ));
-        }
         let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             args.clone(),
             source_definition,

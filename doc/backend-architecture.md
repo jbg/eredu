@@ -1085,8 +1085,10 @@ ownership, state and publication metadata together. Ownership-only inspection
 omits target names and state. `validate_partition` compares constructed graph,
 global units, ownership, ordered group ranges and state against the retained
 admission. Mismatches return `PipelineRankBindingError`; successful validation
-does not allocate temporary group catalogs. Family-local geometry, native binding
-and communication checks remain separate.
+does not allocate temporary group catalogs. A partition derives its local unit
+addresses from the validated complete unit layout and ordered group ranges;
+source and target partitions using those same facts have the same addresses.
+Family-local geometry, native binding and communication checks remain separate.
 Families retain the declarations and selected mechanisms. State and ownership
 errors preserve their neutral causes; active embedded prediction uses its
 separate placement contract and is rejected explicitly by this base projection.
@@ -10605,7 +10607,8 @@ invocation graphs and unit addresses, lowers both retained declarations for the
 selected rank, and projects source coordinates. Its typed error distinguishes
 invocation mismatch, source or target placement rejection, and physical projection
 failure. Families retain source-format policy and additional state/media geometry
-checks; architecture error adapters preserve their existing diagnostic messages.
+checks. Composite source constructors report invocation and placement failures
+through this shared typed error.
 `derive_transform_source_layout` maps those exact cuts into the source encoding
 with checked axis scaling, preserving logical ranges and independent expert
 placements. Architecture constructors use the resulting geometry for both

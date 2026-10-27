@@ -1679,11 +1679,6 @@ where
             .map_err(|e| error(e.to_string()))?;
             selected.requirements().validate_binding(&source_partition)
             .map_err(error)?;
-            if source_partition.units().ne(partition.units()) {
-                return Err(error(
-                    "shared-backbone transform source changes local unit addresses".into(),
-                ));
-            }
             let model = partition::SelectedCompositeKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -3017,11 +3012,6 @@ where
     let definition =
         crate::qwen::vl::project_parameters(&source, &retained).map_err(|e| e.to_string())?;
     let parameters = definition.parameters().clone();
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Qwen3-VL transform source changed execution-unit addresses".into());
-    }
     let rank = selected.requirements().topology();
     let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
             .map_err(|error| error.to_string())?;
@@ -3118,11 +3108,6 @@ where
     let definition = crate::gemma4::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
     let parameters = definition.parameters().clone();
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Gemma 4 transform source changed execution-unit addresses".into());
-    }
     let rank = selected.requirements().topology();
     let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
             .map_err(|error| error.to_string())?;
@@ -3234,11 +3219,6 @@ where
     let definition = crate::muse::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
     let parameters = definition.parameters().clone();
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Muse-Glimmer transform source changed execution-unit addresses".into());
-    }
     let rank = selected.requirements().topology();
     let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
             .map_err(|error| error.to_string())?;
@@ -3343,11 +3323,6 @@ where
     let definition = crate::inkling::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
     let parameters = definition.parameters().clone();
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Inkling transform source changed execution-unit addresses".into());
-    }
     let rank = selected.requirements().topology();
     let layout = eredu_runtime::derive_partitioned_transform_source_layout(&parameters, target_parameters, rank)
             .map_err(|error| error.to_string())?;

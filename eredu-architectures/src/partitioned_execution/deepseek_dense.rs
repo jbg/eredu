@@ -99,11 +99,6 @@ where
         .map_err(architecture)?;
         selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "dense V3 transform source changed local unit addresses",
-            ));
-        }
         let model = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
             source_args,
             source_definition,

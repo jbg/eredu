@@ -98,11 +98,6 @@ where
         .map_err(architecture)?;
         selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "transform source changed shared unit addresses",
-            ));
-        }
         let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
             retained.clone(),
@@ -229,11 +224,6 @@ where
         .map_err(architecture)?;
         selected.requirements().validate_binding(&source_partition)
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "transform source changed shared unit addresses",
-            ));
-        }
         let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
             retained.clone(),

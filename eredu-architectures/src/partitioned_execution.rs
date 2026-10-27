@@ -9254,11 +9254,6 @@ where
             })?;
             selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            if source_partition.units().ne(partition.units()) {
-                return Err(DenseDecoderPartitionedDispatchError::Architecture(
-                    "Nemotron-H transform source changed local unit addresses".into(),
-                ));
-            }
             let source_architecture = crate::nemotron_h::NemotronKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9417,11 +9412,6 @@ where
             })?;
             selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            if source_partition.units().ne(partition.units()) {
-                return Err(DenseDecoderPartitionedDispatchError::Architecture(
-                    "Kimi Linear transform source changed local unit addresses".into(),
-                ));
-            }
             let source_architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9570,11 +9560,6 @@ where
             })?;
             selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            if source_partition.units().ne(partition.units()) {
-                return Err(DenseDecoderPartitionedDispatchError::Architecture(
-                    "LFM2 transform source changed local unit addresses".into(),
-                ));
-            }
             let source_architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9724,12 +9709,6 @@ where
             })?;
             selected.requirements().validate_binding(&source_partition)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            if source_partition.units().ne(partition.units()) {
-                return Err(DenseDecoderPartitionedDispatchError::Architecture(
-                    "source and target transform local unit addresses differ before construction"
-                        .into(),
-                ));
-            }
             for task in &tasks {
                 let target_owner = partition.parameter_bindings().iter().find_map(|binding| {
                     binding
@@ -10872,11 +10851,6 @@ where
         )
         .map_err(|e| error(e.to_string()))?;
         selected.requirements().validate_binding(&source_partition).map_err(error)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(error(
-                "routed LFM2 transform source changed local unit addresses".into(),
-            ));
-        }
         let source = crate::lfm2::Lfm2Kernel::<B>::from_partition(
             source_args,
             source_definition,
@@ -11031,11 +11005,6 @@ where
         )
         .map_err(|e| error(e.to_string()))?;
         selected.requirements().validate_binding(&source_partition).map_err(error)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(error(
-                "routed Kimi Linear transform source changed local unit addresses".into(),
-            ));
-        }
         let source = crate::kimi_linear::KimiKernel::<B>::from_partition(
             source_args,
             source_definition,
@@ -11182,11 +11151,6 @@ where
         )
         .map_err(|e| error(e.to_string()))?;
         selected.requirements().validate_binding(&source_partition).map_err(error)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(error(
-                "routed Nemotron transform source changed local unit addresses".into(),
-            ));
-        }
         let source = crate::nemotron_h::NemotronKernel::<B>::from_partition(
             source_args,
             source_definition,
@@ -11354,11 +11318,6 @@ where
             &source_partition,
         )
         .map_err(|e| error(e.to_string()))?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(error(
-                "routed V3 transform source changed local unit addresses".into(),
-            ));
-        }
         let mut source = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
             source_args,
             source_definition,
@@ -11535,11 +11494,6 @@ where
             &source_partition,
         )
         .map_err(|e| error(e.to_string()))?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(error(
-                "routed V4 transform source changed local unit addresses".into(),
-            ));
-        }
         let mut source = crate::deepseek::v4::V4Kernel::<B>::from_partition_definition(
             source_args,
             source_definition,
