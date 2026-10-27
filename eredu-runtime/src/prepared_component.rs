@@ -639,25 +639,20 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     ) -> Result<PreparedComponent<P>, ComponentPreparationError> {
         let id = id.into();
         let description = declaration.parameters();
-        for address in (0..description.unit_layout().len()).map(|ordinal| {
-            description
-                .unit_layout()
-                .address(ordinal)
-                .expect("declared invocation")
-        }) {
-            let group = description
-                .unit_layout()
-                .group_id(address.group())
-                .expect("declared group");
-            let original = (0..self.unit_layout().group_count())
-                .find(|&index| self.unit_layout().group_id(index) == Some(group));
-            if original
-                .is_none_or(|index| self.unit_layout().ordinal(index, address.index()).is_none())
-            {
-                return Err(ComponentPreparationError::InvalidProjection {
-                    component: id,
-                    target: format!("invocation {}:{}", group.as_str(), address.index()),
-                });
+        let layout = description.unit_layout();
+        let retained = self.unit_layout();
+        for group in 0..layout.group_count() {
+            let name = layout.group_id(group).expect("declared group");
+            let original =
+                (0..retained.group_count()).find(|&index| retained.group_id(index) == Some(name));
+            for ordinal in layout.group_range(group).expect("declared group") {
+                let address = layout.address(ordinal).expect("declared invocation");
+                if original.is_none_or(|index| retained.ordinal(index, address.index()).is_none()) {
+                    return Err(ComponentPreparationError::InvalidProjection {
+                        component: id,
+                        target: format!("invocation {}:{}", name.as_str(), address.index()),
+                    });
+                }
             }
         }
         let members = self
