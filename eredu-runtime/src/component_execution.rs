@@ -1336,13 +1336,12 @@ impl<D: Borrow<ComponentDefinition>, K> ComponentAdapter<D, K> {
                 resource: "leased component adapter contains pinned parameters".into(),
             });
         }
-        Ok(Self {
+        Ok(Self::from_resources(
             definition,
             kernel,
-            resources: EmptyParameterModule,
-            resource_roles: Default::default(),
-            selection: None,
-        })
+            EmptyParameterModule,
+            Default::default(),
+        ))
     }
 }
 impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
