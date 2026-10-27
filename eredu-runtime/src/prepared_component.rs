@@ -326,14 +326,14 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                         }
                         .into());
                     }
-                    targets.insert(member.target().to_owned());
+                    targets.insert(member.target());
                 }
             }
             let bindings = bindings
                 .into_iter()
                 .map(|binding| {
                     let target = binding.name().to_owned();
-                    if !targets.contains(&target) {
+                    if !targets.contains(target.as_str()) {
                         return Err(ComponentPreparationError::Geometry {
                             component: id.clone(),
                             target,
@@ -455,13 +455,8 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         bindings: impl Iterator<Item = &'a WeightBinding>,
     ) -> Result<SharedCheckpointSource, ComponentPreparationError> {
         let inputs = bindings
-            .flat_map(|binding| {
-                binding
-                    .checkpoint_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(WeightBinding::checkpoint_keys)
+            .map(str::to_owned)
             .collect();
         Ok(Arc::new(RestrictedCheckpointSource::including(
             self.source.clone(),
@@ -782,13 +777,8 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             .iter()
             .flatten()
             .chain(pinned.values().flatten())
-            .flat_map(|binding| {
-                binding
-                    .checkpoint_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(WeightBinding::checkpoint_keys)
+            .map(str::to_owned)
             .collect();
         let source = Arc::new(RestrictedCheckpointSource::including(
             self.source,
@@ -840,13 +830,8 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             .iter()
             .flatten()
             .chain(self.pinned.values().flatten())
-            .flat_map(|binding| {
-                binding
-                    .checkpoint_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(WeightBinding::checkpoint_keys)
+            .map(str::to_owned)
             .collect();
         self.source = Arc::new(RestrictedCheckpointSource::including(
             self.source,
