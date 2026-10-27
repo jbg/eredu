@@ -76,17 +76,22 @@ pub fn prepare_bank_parameter_replacements(
     let mut member_bytes = catalog.clone();
     let mut parameters = BTreeSet::new();
     if active {
-        let mut counts = BTreeMap::new();
-        for member in members {
-            *counts.entry(member.parameter.as_str()).or_insert(0usize) += 1;
-        }
         let mut replacements = BTreeMap::new();
         for member in members {
-            let facts = *replacements
+            replacements
                 .entry(member.parameter.as_str())
-                .or_insert_with(|| replacement(&member.parameter));
-            let Some(facts) = facts else { continue };
-            let count = counts[member.parameter.as_str()];
+                .or_insert((0usize, None))
+                .0 += 1;
+        }
+        for member in members {
+            let (count, facts) = replacements
+                .get_mut(member.parameter.as_str())
+                .expect("counted parameter");
+            // Cache missing replacements as well as present ones.
+            let Some(facts) = *facts.get_or_insert_with(|| replacement(&member.parameter)) else {
+                continue;
+            };
+            let count = *count;
             if facts.leading_dimension != i32::try_from(count).ok()
                 || !matches!(
                     facts.element_type,
@@ -113,8 +118,10 @@ pub fn prepare_bank_parameter_replacements(
                     parameter: member.parameter.clone(),
                     key: member.key,
                 })?;
-            parameters.insert(member.parameter.clone());
         }
+        parameters.extend(replacements.into_iter().filter_map(|(name, (_, facts))| {
+            facts.flatten().map(|_| name.to_owned())
+        }));
     }
     Ok(PreparedBankParameterReplacements {
         parameters,
