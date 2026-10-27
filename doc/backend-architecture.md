@@ -1150,6 +1150,9 @@ and restricts the admitted executable-byte catalog using validated member covera
 `PreparedComponent` borrows the retained declaration's logical unit layout until
 explicit unit selection supplies a restricted view. Initial preparation and
 identity projection do not clone an unchanged complete layout.
+Unit-only consuming handoffs return the retained declaration alongside placement,
+invocation mapping, restricted source and independently leased bindings. Callers
+explicitly discard declaration metadata they do not retain.
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
 source authority to the recipes' physical inputs. Before recipe preparation,

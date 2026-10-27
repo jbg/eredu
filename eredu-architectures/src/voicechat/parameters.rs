@@ -256,7 +256,7 @@ fn project_description(
             Ok(recipe)
         },
     )?;
-    let (_, _, source, units) = prepared.into_unit_parts()?;
+    let (_, _, _, source, units) = prepared.into_declared_unit_parts()?;
     let mut bindings = units.into_iter().flatten().collect::<Vec<_>>();
     bindings.sort_by(|a, b| a.name().cmp(b.name()));
     Ok(PreparedSpeechParameterUnit {

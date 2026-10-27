@@ -889,24 +889,6 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             self.units,
         ))
     }
-
-    /// Transfers exact unit-only authority to existing materialization drivers.
-    pub fn into_unit_parts(
-        self,
-    ) -> Result<
-        (
-            Option<LocalModelLayout>,
-            crate::ExecutionUnitAddressMap,
-            SharedCheckpointSource,
-            Vec<Vec<WeightBinding>>,
-        ),
-        ComponentPreparationError,
-    > {
-        if !self.pinned.is_empty() {
-            return Err(ComponentPreparationError::PinnedResources(self.id));
-        }
-        Ok((self.local_layout, self.invocations, self.source, self.units))
-    }
 }
 
 // Placement and precision change physical byte counts; aliases keep referring to
