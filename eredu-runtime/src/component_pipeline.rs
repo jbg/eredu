@@ -226,9 +226,9 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
                 group.local_index().expect("validated tensor rank"),
             )
             .map_err(|_| Contract("invalid tensor rank"))?;
-            let expected = crate::derive_partitioned_local_layout(description, topology)
+            let expected = crate::parameter_layout::partitioned_local_layout(description, topology)
                 .map_err(|_| Contract("tensor parameter placement cannot be derived"))?;
-            if local_layout != Some(&expected) {
+            if local_layout != Some(expected.as_ref()) {
                 return Err(Contract(
                     "tensor group differs from retained parameter placement",
                 ));

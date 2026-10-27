@@ -1,6 +1,6 @@
 //! Physical parameter-layout lowering over architecture-authored neutral declarations.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 /// Strictly lowers an architecture-owned parameter description to one rank's
 /// tensor- and expert-parallel placement.
@@ -12,8 +12,16 @@ pub fn derive_partitioned_local_layout(
     description: &crate::ArchitectureParameterDescription,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::LocalModelLayout, String> {
+    partitioned_local_layout(description, topology).map(Cow::into_owned)
+}
+
+// Borrow authored placement; allocate only when lowering an unbound declaration.
+pub(crate) fn partitioned_local_layout(
+    description: &crate::ArchitectureParameterDescription,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<Cow<'_, crate::LocalModelLayout>, String> {
     if let Some(layout) = retained_partition_layout(description, topology)? {
-        return Ok(layout.clone());
+        return Ok(Cow::Borrowed(layout));
     }
     local_layout(
         description,
@@ -22,6 +30,7 @@ pub fn derive_partitioned_local_layout(
         topology.expert_parallel_rank(),
         topology.expert_parallel_size(),
     )
+    .map(Cow::Owned)
 }
 
 /// Source-format geometry cannot preserve a selected transform's execution ownership.
@@ -62,9 +71,9 @@ pub fn derive_partitioned_transform_source_layout(
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::LocalModelLayout, TransformSourceLayoutError> {
     validate_transform_parameter_space(source, target)?;
-    let source = derive_partitioned_local_layout(source, topology)
+    let source = partitioned_local_layout(source, topology)
         .map_err(TransformSourceLayoutError::SourcePlacement)?;
-    let target = derive_partitioned_local_layout(target, topology)
+    let target = partitioned_local_layout(target, topology)
         .map_err(TransformSourceLayoutError::TargetPlacement)?;
     Ok(crate::derive_transform_source_layout(&source, &target)?)
 }
@@ -126,13 +135,13 @@ pub fn validate_tensor_parallel_layout(
             component: component.into(),
             source,
         })?;
-    let expected = derive_partitioned_local_layout(description, topology).map_err(|reason| {
+    let expected = partitioned_local_layout(description, topology).map_err(|reason| {
         TensorParallelLayoutError::Placement {
             component: component.into(),
             reason,
         }
     })?;
-    if selected != &expected {
+    if selected != expected.as_ref() {
         return Err(TensorParallelLayoutError::Mismatch {
             component: component.into(),
         });
