@@ -1221,7 +1221,14 @@ branches without repeating perception. `MlxComponentPipeline` supplies native
 binding, transport, phase agreement, completion and commit for both perception
 and TTS wrappers. Output preparation participates in all-rank failure agreement;
 its exposed tensors and candidate caches remain retained through exact completion
-before commitment. These component pipelines do not select the full coupled
+before commitment. Cold component constructors return runtime's
+`ComponentPipelinePreparationError<E>`, preserving the typed family geometry error
+and the original communication, local-agreement, capability and manifest errors.
+`PipelineBindingError::into_preparation` applies the family-authored diagnostic label
+once; contract messages retain that component context. EAR encoder/decoder and
+VoiceChat perception, predictor and transformer constructors use this shared error
+boundary without family-specific translation matches.
+These component pipelines do not select the full coupled
 VoiceChat graph or distribute its conversational policy.
 Shared MLX policy preparation omits static residency units when their binding set
 is empty. Resident conversion retains the actual static leases and reports their

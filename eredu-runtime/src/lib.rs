@@ -135,7 +135,8 @@ mod pipeline_executor;
 pub mod replicated_execution;
 mod tensor_wave;
 pub use component_pipeline::{
-    validate_component_pipeline, validate_component_pipeline_ranges, PipelineBindingError,
+    validate_component_pipeline, validate_component_pipeline_ranges, ComponentPipelinePreparationError,
+    PipelineBindingError,
 };
 pub use pipeline_executor::{
     validate_pipeline_local_agreement, OrdinaryPipelinePartitionUnitStrategy,

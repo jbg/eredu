@@ -8,33 +8,10 @@ use super::{
 };
 use eredu_core::CollectiveGroupId;
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
-    PartitionExecutionError, PartitionedExecutionPlan, PipelineActivationDtype,
-    PipelineBindingError,
+    ComponentPipelinePreparationError, ArchitectureBoundary, ArchitectureGroupKind,
+    ArchitecturePartition, CommunicationManifest, PartitionedExecutionPlan,
+    PipelineActivationDtype, PipelineBindingError,
 };
-
-/// Invalid retained predictor geometry or communication selection, before native allocation.
-#[derive(Debug, thiserror::Error)]
-pub enum RnntPredictorPipelinePreparationError {
-    /// RNNT-owned geometry, state or boundary validation failed.
-    #[error(transparent)]
-    Rnnt(#[from] RnntError),
-    /// Shared pipeline authority or completion validation failed.
-    #[error(transparent)]
-    Communication(#[from] PartitionExecutionError),
-    /// The tensor cohort cannot propagate local preparation or lease failures.
-    #[error(transparent)]
-    LocalAgreement(#[from] eredu_runtime::PipelineLocalAgreementError),
-    /// Exact output publication cannot cover its declared tensor payload.
-    #[error(transparent)]
-    Capability(#[from] eredu_runtime::CommunicationCapabilityError),
-    /// An exact communication requirement could not be represented.
-    #[error(transparent)]
-    Manifest(#[from] eredu_runtime::CommunicationManifestError),
-    /// The selected source, stage or route contract differs from predictor ownership.
-    #[error("invalid RNNT predictor pipeline selection: {0}")]
-    Contract(&'static str),
-}
 
 /// Exact source recipes, global cuts and distributed authority for one streaming stage.
 /// This does not select the surrounding transcription policy or conversational scheduler.
@@ -58,17 +35,17 @@ impl PreparedRnntPredictorPipelineBindings {
         plan: PartitionedExecutionPlan,
         tensor_group: Option<CollectiveGroupId>,
         activation_dtype: PipelineActivationDtype,
-    ) -> Result<Self, RnntPredictorPipelinePreparationError> {
-        use RnntPredictorPipelinePreparationError::Contract;
-        validate_rnnt_predictor_partition(
-            bindings.definition(),
-            bindings.dimensions(),
-            &partition,
-        )?;
+    ) -> Result<Self, ComponentPipelinePreparationError<RnntError>> {
+        let contract = |reason| ComponentPipelinePreparationError::Contract {
+            component: "RNNT predictor",
+            reason,
+        };
+        validate_rnnt_predictor_partition(bindings.definition(), bindings.dimensions(), &partition)
+            .map_err(ComponentPipelinePreparationError::Component)?;
         if cuts.dimensions() != bindings.dimensions()
             || activation_dtype != PipelineActivationDtype::Float32
         {
-            return Err(Contract(
+            return Err(contract(
                 "predictor cuts or F32 activation precision differ",
             ));
         }
@@ -81,15 +58,7 @@ impl PreparedRnntPredictorPipelineBindings {
             &plan,
             tensor_group,
         )
-        .map_err(|error| match error {
-            PipelineBindingError::Communication(error) => {
-                RnntPredictorPipelinePreparationError::Communication(error)
-            }
-            PipelineBindingError::LocalAgreement(error) => {
-                RnntPredictorPipelinePreparationError::LocalAgreement(error)
-            }
-            PipelineBindingError::Contract(message) => Contract(message),
-        })?;
+        .map_err(|error| error.into_preparation("RNNT predictor"))?;
         eredu_runtime::validate_component_pipeline(
             bindings.definition().parameters(),
             &partition,
@@ -110,15 +79,7 @@ impl PreparedRnntPredictorPipelineBindings {
                     .map_err(|_| PipelineBindingError::Contract("invalid predictor route geometry"))
             },
         )
-        .map_err(|error| match error {
-            PipelineBindingError::Communication(error) => {
-                RnntPredictorPipelinePreparationError::Communication(error)
-            }
-            PipelineBindingError::LocalAgreement(error) => {
-                RnntPredictorPipelinePreparationError::LocalAgreement(error)
-            }
-            PipelineBindingError::Contract(message) => Contract(message),
-        })?;
+        .map_err(|error| error.into_preparation("RNNT predictor"))?;
         // Route-role bounds are admitted by their exact boundary contracts.
         // The published row is separate and needs its own concrete payload bound.
         let publication = plan.publication().expect("validated predictor publication");

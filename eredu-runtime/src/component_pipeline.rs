@@ -21,6 +21,51 @@ pub enum PipelineBindingError {
     #[error("component pipeline binding: {0}")]
     Contract(&'static str),
 }
+/// Failure preparing one typed component pipeline before native resources exist.
+/// Family geometry remains typed; shared mechanism failures retain their original sources.
+#[derive(Debug, thiserror::Error)]
+pub enum ComponentPipelinePreparationError<E> {
+    /// Family-declared geometry, state or boundary is invalid.
+    #[error(transparent)]
+    Component(E),
+    /// Shared pipeline authority or completion validation failed.
+    #[error(transparent)]
+    Communication(#[from] PartitionExecutionError),
+    /// The tensor cohort cannot propagate local failures safely.
+    #[error(transparent)]
+    LocalAgreement(#[from] crate::PipelineLocalAgreementError),
+    /// Publication cannot cover its declared payload.
+    #[error(transparent)]
+    Capability(#[from] crate::CommunicationCapabilityError),
+    /// An exact communication requirement cannot be represented.
+    #[error(transparent)]
+    Manifest(#[from] crate::CommunicationManifestError),
+    /// Retained selection disagrees with the component's contract.
+    #[error("invalid {component} pipeline selection: {reason}")]
+    Contract {
+        /// Architecture-authored component label for diagnostics.
+        component: &'static str,
+        /// Exact failed contract.
+        reason: &'static str,
+    },
+}
+
+impl PipelineBindingError {
+    /// Adds family-authored diagnostic context without changing the original source.
+    pub fn into_preparation<E>(
+        self,
+        component: &'static str,
+    ) -> ComponentPipelinePreparationError<E> {
+        match self {
+            Self::Communication(error) => ComponentPipelinePreparationError::Communication(error),
+            Self::LocalAgreement(error) => ComponentPipelinePreparationError::LocalAgreement(error),
+            Self::Contract(reason) => {
+                ComponentPipelinePreparationError::Contract { component, reason }
+            }
+        }
+    }
+}
+
 /// Validates exact retained parameters, stage ownership, collective topology and wire geometry.
 /// `boundary_schema` supplies the architecture's declaration for each directed
 /// route, independently of that route's manifest contract. Uniform-width

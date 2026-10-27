@@ -6,26 +6,10 @@ use super::{
 };
 use eredu_core::CollectiveGroupId;
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
-    PartitionExecutionError, PartitionedExecutionPlan, PipelineActivationDtype,
+    ComponentPipelinePreparationError, ArchitectureBoundary, ArchitectureGroupKind,
+    ArchitecturePartition, CommunicationManifest, PartitionedExecutionPlan,
+    PipelineActivationDtype,
 };
-
-/// Invalid stage, source geometry or communication selection, before native allocation.
-#[derive(Debug, thiserror::Error)]
-pub enum PerceptionPipelinePreparationError {
-    /// Family equations or local state geometry differ.
-    #[error(transparent)]
-    Perception(#[from] PerceptionError),
-    /// Generic communication selection is inconsistent.
-    #[error(transparent)]
-    Communication(#[from] PartitionExecutionError),
-    /// The tensor cohort cannot propagate local preparation or lease failures.
-    #[error(transparent)]
-    LocalAgreement(#[from] eredu_runtime::PipelineLocalAgreementError),
-    /// Selected source, stage or transport authority differs.
-    #[error("invalid perception pipeline selection: {0}")]
-    Contract(&'static str),
-}
 
 /// Retained source recipes and exact partition/transport authority.
 /// This component selection does not advertise a coupled distributed session.
@@ -46,23 +30,27 @@ impl PreparedPerceptionPipelineBindings {
         plan: PartitionedExecutionPlan,
         tensor_group: Option<CollectiveGroupId>,
         activation_dtype: PipelineActivationDtype,
-    ) -> Result<Self, PerceptionPipelinePreparationError> {
-        use PerceptionPipelinePreparationError::Contract;
+    ) -> Result<Self, ComponentPipelinePreparationError<PerceptionError>> {
+        let contract = |reason| ComponentPipelinePreparationError::Contract {
+            component: "perception",
+            reason,
+        };
         validate_perception_partition(
             bindings.definition(),
             bindings.dimensions(),
             bindings.local_layout(),
             &partition,
-        )?;
+        )
+        .map_err(ComponentPipelinePreparationError::Component)?;
         if activation_dtype != PipelineActivationDtype::Float32 {
-            return Err(Contract("perception requires Float32 activation transport"));
+            return Err(contract("perception requires Float32 activation transport"));
         }
         for route in plan.routes() {
             if !matches!(
                 (route.source_group, route.destination_group),
                 (0, 1) | (1, 1) | (1, 2)
             ) {
-                return Err(Contract(
+                return Err(contract(
                     "route does not carry a subsampled perception boundary",
                 ));
             }
@@ -92,15 +80,7 @@ impl PreparedPerceptionPipelineBindings {
                 })
             },
         )
-        .map_err(|error| match error {
-            eredu_runtime::PipelineBindingError::Communication(error) => {
-                PerceptionPipelinePreparationError::Communication(error)
-            }
-            eredu_runtime::PipelineBindingError::LocalAgreement(error) => {
-                PerceptionPipelinePreparationError::LocalAgreement(error)
-            }
-            eredu_runtime::PipelineBindingError::Contract(message) => Contract(message),
-        })?;
+        .map_err(|error| error.into_preparation("perception"))?;
         Ok(Self {
             bindings,
             partition,
