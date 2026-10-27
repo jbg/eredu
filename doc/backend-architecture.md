@@ -1141,6 +1141,12 @@ admission, recipe, precision, geometry and communication failures.
 `ComponentSelection` retains selected global invocation addresses in canonical
 order. Binary lookup resolves group/unit identities without retaining a second
 complete global layout; dense vector positions do not become invocation identities.
+Incremental unit preparation reads invocation and residency facts from the same
+retained resource owner returned by `finish`; the builder retains no second copy.
+Resource selection borrows binding target names for its temporary alias-owner
+index. Any retained claimant keeps the target available; aliases whose only
+ordinary owners are discarded fail before resources move. Bank admission consumes
+and restricts the admitted executable-byte catalog using validated member coverage.
 `PreparedComponent` borrows the retained declaration's logical unit layout until
 explicit unit selection supplies a restricted view. Initial preparation and
 identity projection do not clone an unchanged complete layout.

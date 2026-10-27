@@ -86,11 +86,8 @@ impl AddressableBankPreparation {
             &selected.transformations,
             source,
         )?;
-        let expected: BTreeMap<_, _> = selected
-            .entries
-            .iter()
-            .map(|entry| (entry.key(), selected.expected_bytes[&entry.key()]))
-            .collect();
+        let mut expected = selected.expected_bytes;
+        expected.retain(|key, _| selected.placements.contains_key(key));
         plan_addressable_bank_residency(
             selected
                 .entries

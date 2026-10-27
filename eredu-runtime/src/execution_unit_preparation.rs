@@ -1,6 +1,6 @@
 //! Incremental admission of independently leased execution-unit resources.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_core::residency::{MemoryTier, OffloadError, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy};
 
@@ -101,26 +101,16 @@ impl PreparedExecutionUnitResources {
                 .expect("retained resource");
             retained[ordinal] = true;
         }
-        let identity = |binding: &WeightBinding| {
-            binding
-                .logical_target()
-                .unwrap_or(binding.name())
-                .to_owned()
-        };
-        let all = self
-            .definitions
-            .iter()
-            .flat_map(|unit| unit.bindings())
-            .map(identity)
-            .collect::<BTreeSet<_>>();
-        let selected = self
-            .definitions
-            .iter()
-            .zip(&retained)
-            .filter(|(_, keep)| **keep)
-            .flat_map(|(unit, _)| unit.bindings())
-            .map(identity)
-            .collect::<BTreeSet<_>>();
+        let mut targets = BTreeMap::new();
+        for (unit, &keep) in self.definitions.iter().zip(&retained) {
+            for binding in unit.bindings() {
+                let target = binding.logical_target().unwrap_or(binding.name());
+                targets
+                    .entry(target)
+                    .and_modify(|selected| *selected |= keep)
+                    .or_insert(keep);
+            }
+        }
         for binding in self
             .definitions
             .iter()
@@ -129,7 +119,7 @@ impl PreparedExecutionUnitResources {
             .flat_map(|(unit, _)| unit.bindings())
         {
             if let Some(owner) = binding.alias_of() {
-                if all.contains(owner) && !selected.contains(owner) {
+                if targets.get(owner) == Some(&false) {
                     return Err(ExecutionUnitPreparationError::DiscardedAliasOwner {
                         alias: binding.name().to_owned(),
                         owner: owner.to_owned(),
@@ -183,8 +173,6 @@ impl PreparedExecutionUnitResources {
 /// No checkpoint payload, backend tensor, stream or completion is required.
 pub struct ExecutionUnitResourcePreparation<'a> {
     namespace: &'a str,
-    invocations: &'a crate::ExecutionUnitAddressMap,
-    residency: LayerWeightResidency,
     resources: PreparedExecutionUnitResources,
 }
 
@@ -192,14 +180,12 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
     /// Starts admission for exact invocation references and their physical owners.
     pub fn new(
         namespace: &'a str,
-        invocations: &'a crate::ExecutionUnitAddressMap,
+        invocations: &crate::ExecutionUnitAddressMap,
         residency: LayerWeightResidency,
     ) -> Self {
         let layout = invocations.storage_layout();
         Self {
             namespace,
-            invocations,
-            residency,
             resources: PreparedExecutionUnitResources {
                 invocations: invocations.clone(),
                 residency,
@@ -228,36 +214,37 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
             + From<ResidencyDeclarationError>
             + From<OffloadError>,
     {
-        let ordinal = self.resources.unit_ids.len();
-        let address = self.invocations.storage_layout().address(ordinal).ok_or(
-            ExecutionUnitPreparationError::UnitCount {
-                expected: self.invocations.storage_layout().len(),
+        let resources = &mut self.resources;
+        let ordinal = resources.unit_ids.len();
+        let address = resources
+            .invocations
+            .storage_layout()
+            .address(ordinal)
+            .ok_or(ExecutionUnitPreparationError::UnitCount {
+                expected: resources.invocations.storage_layout().len(),
                 actual: ordinal + 1,
-            },
-        )?;
+            })?;
         let bytes = physical_binding_bytes(&bindings)?;
-        self.resources.parameter_bytes = self.resources.parameter_bytes.checked_add(bytes).ok_or(
+        resources.parameter_bytes = resources.parameter_bytes.checked_add(bytes).ok_or(
             ExecutionUnitPreparationError::ArithmeticOverflow {
                 address,
                 context: "execution parameter bytes",
             },
         )?;
         let host_bytes = host_capacity(&bindings)?;
-        self.resources.total_host_bytes =
-            self.resources
-                .total_host_bytes
-                .checked_add(host_bytes)
-                .ok_or(ExecutionUnitPreparationError::ArithmeticOverflow {
-                    address,
-                    context: "host unit capacity",
-                })?;
-        self.resources.maximum_host_bytes = self.resources.maximum_host_bytes.max(host_bytes);
-        self.resources.source_keys.extend(
+        resources.total_host_bytes = resources.total_host_bytes.checked_add(host_bytes).ok_or(
+            ExecutionUnitPreparationError::ArithmeticOverflow {
+                address,
+                context: "host unit capacity",
+            },
+        )?;
+        resources.maximum_host_bytes = resources.maximum_host_bytes.max(host_bytes);
+        resources.source_keys.extend(
             bindings
                 .iter()
                 .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
         );
-        let group = self
+        let group = resources
             .invocations
             .storage_layout()
             .group_id(address.group())
@@ -268,12 +255,12 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
             group.as_str(),
             address.index()
         ))?;
-        self.resources
+        resources
             .definitions
             .push(OffloadUnit::new(id.clone(), bindings)?);
-        let resident = self.residency.is_fully_resident();
-        let dense = self.residency.dense().is_some();
-        self.resources.specs.push(OffloadUnitSpec::new(
+        let resident = resources.residency.is_fully_resident();
+        let dense = resources.residency.dense().is_some();
+        resources.specs.push(OffloadUnitSpec::new(
             id.clone(),
             bytes,
             if resident {
@@ -291,17 +278,18 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
                 MemoryTier::Host
             },
         )?);
-        self.resources.unit_ids.push(id);
-        self.resources.unit_bytes.push(bytes);
-        self.resources.host_bytes.push(host_bytes);
+        resources.unit_ids.push(id);
+        resources.unit_bytes.push(bytes);
+        resources.host_bytes.push(host_bytes);
         Ok(self)
     }
 
     /// Completes admission only when every selected physical owner has bindings.
     pub fn finish(self) -> Result<PreparedExecutionUnitResources, ExecutionUnitPreparationError> {
-        if self.resources.unit_ids.len() != self.invocations.storage_layout().len() {
+        let expected = self.resources.invocations.storage_layout().len();
+        if self.resources.unit_ids.len() != expected {
             return Err(ExecutionUnitPreparationError::UnitCount {
-                expected: self.invocations.storage_layout().len(),
+                expected,
                 actual: self.resources.unit_ids.len(),
             });
         }
