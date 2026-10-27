@@ -10,10 +10,7 @@ use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
     store::{CheckpointSource, RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Failure preparing exact component resources without allocating native values.
 #[derive(Debug, thiserror::Error)]
@@ -305,7 +302,6 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 .map(|binding| (binding.name(), binding))
                 .chain(plan.aliases().map(|(alias, owner)| (alias.name(), owner)))
                 .collect::<BTreeMap<_, _>>();
-            let mut targets = BTreeSet::new();
             for group in description
                 .groups()
                 .iter()
@@ -326,19 +322,12 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                         }
                         .into());
                     }
-                    targets.insert(member.target());
                 }
             }
             let bindings = bindings
                 .into_iter()
                 .map(|binding| {
                     let target = binding.name().to_owned();
-                    if !targets.contains(target.as_str()) {
-                        return Err(ComponentPreparationError::Geometry {
-                            component: id.clone(),
-                            target,
-                        });
-                    }
                     binding
                         .with_logical_target(target)
                         .map_err(RecipeBindingError::from)
