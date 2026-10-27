@@ -8716,7 +8716,9 @@ use the same named projection without rebuilding ownership or local ordinals.
 `PreparedComponent::prepare_physical_recipes` resolves canonical physical targets
 through a borrowed lookup into the family-admitted catalog, cloning only used
 recipes into retained bindings. Codec and RNNT handoff use this lookup without
-constructing temporary recipe catalogs. The caller supplies component scoping,
+constructing temporary recipe catalogs. VoiceChat codec handoff retains each
+codec's concrete failure in one `CodecPreparationError<E>` representation, with
+shared missing-source and geometry variants. The caller supplies component scoping,
 conversion policy and its missing-parameter error; runtime uses ordinary preparation for
 inferred geometry, canonical resources, exact source restriction and placement.
 Neighboring recipes grant no source authority. EAR encoder/decoder, PRVQ and RNNT

@@ -6,9 +6,12 @@
 use std::collections::BTreeMap;
 
 use eredu_codec::{
-    ear_decoder_layered::DecoderExecution, ear_decoder_preparation::PreparedDecoderBindings,
-    ear_encoder_layered::EncoderExecution, ear_encoder_preparation::PreparedEncoderBindings,
-    prvq_layered::QuantizerExecution, prvq_preparation::PreparedQuantizerBindings,
+    ear_decoder_layered::DecoderExecution,
+    ear_decoder_preparation::{DecoderPreparationError, PreparedDecoderBindings},
+    ear_encoder_layered::EncoderExecution,
+    ear_encoder_preparation::{EncoderPreparationError, PreparedEncoderBindings},
+    prvq_layered::QuantizerExecution,
+    prvq_preparation::{PreparedQuantizerBindings, QuantizerPreparationError},
 };
 use eredu_core::BackendFailure;
 use eredu_nn::{NeuralBackend, Tensor};
@@ -19,8 +22,7 @@ use super::{
     assembly::{AssemblyError, LearnedSpeechComponents, SpeechProviderParts},
     checkpoint::Component,
     codec_preparation::{
-        prepare_neural_decoder, prepare_neural_encoder, prepare_quantizer,
-        CodecDecoderPreparationError, CodecEncoderPreparationError, CodecQuantizerPreparationError,
+        prepare_neural_decoder, prepare_neural_encoder, prepare_quantizer, CodecPreparationError,
     },
     construction::{ConstructionError, SpeechConstructionPlan},
     function_head_layered::FunctionHeadExecution,
@@ -80,13 +82,13 @@ pub enum ProviderConstructionError {
     Rvq(#[from] RvqPreparationError),
     /// Codec encoder recipes are invalid.
     #[error(transparent)]
-    Encoder(#[from] CodecEncoderPreparationError),
+    Encoder(#[from] CodecPreparationError<EncoderPreparationError>),
     /// Codec decoder recipes are invalid.
     #[error(transparent)]
-    Decoder(#[from] CodecDecoderPreparationError),
+    Decoder(#[from] CodecPreparationError<DecoderPreparationError>),
     /// Codec quantizer recipes are invalid.
     #[error(transparent)]
-    Quantizer(#[from] CodecQuantizerPreparationError),
+    Quantizer(#[from] CodecPreparationError<QuantizerPreparationError>),
     /// RNNT recipes or geometry are invalid.
     #[error(transparent)]
     Rnnt(#[from] RnntPreparationError),
