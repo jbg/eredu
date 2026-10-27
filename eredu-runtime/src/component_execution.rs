@@ -505,7 +505,9 @@ impl ComponentDefinition {
         {
             return Err(invalid("selected parameter invocation or storage identity"));
         }
-        let primaries = |description: &ArchitectureParameterDescription| {
+        fn primaries(
+            description: &ArchitectureParameterDescription,
+        ) -> std::collections::BTreeMap<&str, &crate::ParameterGroupOwner> {
             description
                 .groups()
                 .iter()
@@ -514,10 +516,10 @@ impl ComponentDefinition {
                         .members()
                         .iter()
                         .filter(|member| member.linear_companion().is_none())
-                        .map(move |member| (member.target().to_owned(), group.owner().clone()))
+                        .map(move |member| (member.target(), group.owner()))
                 })
-                .collect::<std::collections::BTreeMap<_, _>>()
-        };
+                .collect()
+        }
         let original = primaries(&self.parameters);
         let selected = primaries(&parameters);
         if (projection == ParameterOwnershipProjection::Exact && original.len() != selected.len())
@@ -530,7 +532,8 @@ impl ComponentDefinition {
         for group in parameters.groups() {
             for member in group.members() {
                 match (member.linear_companion(), member.linear_companion_of()) {
-                    (Some(_), Some(primary)) if selected.get(primary) == Some(group.owner()) => {}
+                    (Some(_), Some(primary))
+                        if selected.get(primary).copied() == Some(group.owner()) => {}
                     (None, None) => {}
                     _ => {
                         return Err(invalid(&format!(
