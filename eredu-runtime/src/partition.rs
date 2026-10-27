@@ -381,12 +381,10 @@ impl ArchitectureParameterDescription {
             }
         }
         if let Some(expected) = expected {
-            let actual_targets = actual.keys().cloned().collect::<BTreeSet<_>>();
-            let expected_targets = expected.keys().cloned().collect::<BTreeSet<_>>();
-            if let Some(target) = expected_targets.difference(&actual_targets).next() {
+            if let Some(target) = expected.keys().find(|target| !actual.contains_key(*target)) {
                 return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
             }
-            if let Some(target) = actual_targets.difference(&expected_targets).next() {
+            if let Some(target) = actual.keys().find(|target| !expected.contains_key(*target)) {
                 return Err(ArchitectureParameterError::UnexpectedOwnership(
                     target.clone(),
                 ));
