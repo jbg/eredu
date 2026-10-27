@@ -1087,7 +1087,9 @@ replicated roles, parameter consumers and state rules to one actual Cartesian
 rank. It retains read-only `PipelineGroupOwnership` intervals, local state,
 publication rank and optional logical parameter targets. Partition admission
 retains this projection as one value, keeping its groups,
-ownership, state and publication metadata together. Ownership-only inspection
+ownership, state and publication metadata together. Parameter and component
+inspection borrow the exact execution requirements and rank projection through
+one shared view. Ownership-only inspection
 omits target names and state. `owns_unit` tests logical invocation ranges independently
 of parameter storage; shared consumers on other stages do not become local invocations.
 Peer component inspection uses this ownership-only projection. Explicit unit observation

@@ -8012,6 +8012,18 @@ where
 }
 
 impl<R> PartitionedAdmission<R> {
+    pub(crate) fn ownership_view(
+        &self,
+    ) -> (
+        &eredu_runtime::ReplicatedTextRequirements,
+        &eredu_runtime::PipelineRankProjection,
+    )
+    where
+        R: TextRequirements,
+    {
+        (self.execution.text(), &self.rank)
+    }
+
     pub(crate) fn construct_partition<G, W>(
         &self,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
@@ -8111,8 +8123,11 @@ pub(crate) struct PartitionedUnitObservation {
 /// Projects another rank from the same retained global requirements. This uses
 /// exactly the ownership compiler used by admission, without state allocation,
 /// source resolution, communication realization or execution-class reselection.
-pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
-    admission: &PartitionedAdmission<R>,
+pub(crate) fn selected_component_layout_for_rank(
+    ownership: (
+        &eredu_runtime::ReplicatedTextRequirements,
+        &eredu_runtime::PipelineRankProjection,
+    ),
     descriptor: &eredu_core::ArchitectureDescriptor,
     parameters: &eredu_runtime::ArchitectureParameterDescription,
     global_rank: usize,
@@ -8124,7 +8139,8 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
     crate::component_partition::ComponentPartitionError,
 > {
     use crate::component_partition::{ComponentPartitionError, ComponentPartitionLayout};
-    let topology = ParallelRankTopology::new(admission.topology().topology(), global_rank)
+    let (execution, admitted_rank) = ownership;
+    let topology = ParallelRankTopology::new(admitted_rank.topology().topology(), global_rank)
         .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?;
     let derived;
     let layout = if let Some(layout) = authored {
@@ -8135,16 +8151,12 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
         &derived
     };
     let projected_rank;
-    let rank = if topology == admission.topology() {
-        &admission.rank
+    let rank = if topology == admitted_rank.topology() {
+        admitted_rank
     } else {
-        projected_rank = eredu_runtime::PipelineRankProjection::new(
-            admission.execution.text(),
-            None,
-            topology,
-            false,
-        )
-        .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?;
+        projected_rank =
+            eredu_runtime::PipelineRankProjection::new(execution, None, topology, false)
+                .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?;
         &projected_rank
     };
     let mut result = ComponentPartitionLayout::from_ownership(
@@ -8156,7 +8168,7 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
         rank.groups(),
         rank.publication_owner(),
         routed,
-        admission.execution.text().component_definition(),
+        execution.component_definition(),
     )?;
     for point in unit_observations {
         let declared = parameters
@@ -8173,6 +8185,7 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
     }
     Ok(result)
 }
+
 
 impl TextRequirements for eredu_runtime::ReplicatedTextRequirements {
     fn text(&self) -> &eredu_runtime::ReplicatedTextRequirements {

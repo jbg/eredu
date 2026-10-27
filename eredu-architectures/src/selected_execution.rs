@@ -355,6 +355,26 @@ impl SelectedExecution {
         )
     }
 
+    fn partitioned_ownership(
+        &self,
+    ) -> Option<(
+        &ReplicatedTextRequirements,
+        &eredu_runtime::PipelineRankProjection,
+    )> {
+        Some(match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => {
+                selected.requirements().ownership_view()
+            }
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                selected.requirements().ownership_view()
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                selected.requirements().ownership_view()
+            }
+            _ => return None,
+        })
+    }
+
     pub(crate) fn parameter_partition_layout_with_index(
         &self,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
@@ -370,22 +390,10 @@ impl SelectedExecution {
         let authored = self
             .authored_layout(parameters, global_rank)
             .map_err(eredu_core::parameters::ParameterError::Unsupported)?;
-        let (execution, topology) = match self.kind.as_ref() {
-            SelectedExecutionKind::PartitionedDense(selected) => (
-                selected.requirements().execution(),
-                selected.requirements().topology(),
-            ),
-            SelectedExecutionKind::PartitionedRouted(selected) => (
-                selected.requirements().execution().text(),
-                selected.requirements().topology(),
-            ),
-            SelectedExecutionKind::PartitionedComposite(selected) => (
-                selected.requirements().execution().execution(),
-                selected.requirements().topology(),
-            ),
-            _ => return Ok(None),
+        let Some((execution, rank)) = self.partitioned_ownership() else {
+            return Ok(None);
         };
-        let topology = eredu_core::ParallelRankTopology::new(topology.topology(), global_rank)
+        let topology = eredu_core::ParallelRankTopology::new(rank.topology().topology(), global_rank)
             .map_err(|error| eredu_core::parameters::ParameterError::Invalid(error.to_string()))?;
         eredu_runtime::derive_rank_parameter_member_layout(
             execution,
@@ -441,45 +449,19 @@ impl SelectedExecution {
             .transpose()
             .map_err(crate::component_partition::ComponentPartitionError::ParameterLayout)?
             .unwrap_or_default();
-        match self.kind.as_ref() {
-            SelectedExecutionKind::PartitionedDense(selected) => {
-                selected_component_layout_for_rank(
-                    selected.requirements(),
-                    descriptor,
-                    parameters,
-                    global_rank,
-                    self.routed_realization(),
-                    authored.as_ref(),
-                    &units,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedRouted(selected) => {
-                selected_component_layout_for_rank(
-                    selected.requirements(),
-                    descriptor,
-                    parameters,
-                    global_rank,
-                    self.routed_realization(),
-                    authored.as_ref(),
-                    &units,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedComposite(selected) => {
-                selected_component_layout_for_rank(
-                    selected.requirements(),
-                    descriptor,
-                    parameters,
-                    global_rank,
-                    self.routed_realization(),
-                    authored.as_ref(),
-                    &units,
-                )
-                .map(Some)
-            }
-            _ => Ok(None),
-        }
+        let Some(ownership) = self.partitioned_ownership() else {
+            return Ok(None);
+        };
+        selected_component_layout_for_rank(
+            ownership,
+            descriptor,
+            parameters,
+            global_rank,
+            self.routed_realization(),
+            authored.as_ref(),
+            &units,
+        )
+        .map(Some)
     }
 
     /// Compiles one reusable set of component layouts for the whole retained
