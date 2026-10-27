@@ -241,19 +241,11 @@ impl ParameterGroupOwner {
         ownership: &PartitionOwnership,
         owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
     ) -> bool {
-        match self {
-            Self::StaticRole(role) => ownership.stores_static_role(role),
-            Self::StaticAnyOf(roles) => roles.iter().any(|role| ownership.stores_static_role(role)),
-            Self::StaticUnitConsumers { role, consumers } => {
-                ownership.replicated_static_roles().contains(role)
-                    || consumers
-                        .iter()
-                        .any(|(group, unit)| owns_unit(group, *unit))
-            }
-            Self::ExecutionUnit {
-                group, consumers, ..
-            } => consumers.iter().any(|unit| owns_unit(group, *unit)),
-        }
+        ownership
+            .replicated_static_roles()
+            .iter()
+            .any(|role| self.accepts_static_role(role))
+            || self.is_owned_by(ownership, owns_unit)
     }
 
     /// Returns the canonical static storage role, independently of its consumers.
@@ -674,10 +666,7 @@ impl ArchitectureParameterDescription {
         partition: &ArchitecturePartition<G, A>,
     ) -> Vec<OwnedParameterGroupSpec> {
         self.stored_groups(partition.ownership(), |group, unit| {
-            partition
-                .groups()
-                .iter()
-                .any(|owned| owned.group() == group && owned.contains(unit))
+            partition.owns_unit(group.as_str(), unit)
         })
         .cloned()
         .collect()
