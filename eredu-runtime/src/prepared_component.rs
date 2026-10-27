@@ -943,20 +943,20 @@ fn retain_aliases(
     selected: &mut [WeightBinding],
 ) -> Result<(), ComponentPreparationError> {
     let plan = WeightBindingPlan::new(original).map_err(RecipeBindingError::from)?;
-    let owners = plan
-        .aliases()
-        .map(|(alias, owner)| (alias.name().to_owned(), owner.name().to_owned()))
-        .collect::<BTreeMap<_, _>>();
     let bytes = selected
         .iter()
-        .map(|binding| (binding.name().to_owned(), binding.expected_bytes()))
+        .map(|binding| (binding.name(), binding.expected_bytes()))
+        .collect::<BTreeMap<_, _>>();
+    let aliases = plan
+        .aliases()
+        .map(|(alias, owner)| (alias.name(), bytes[owner.name()]))
         .collect::<BTreeMap<_, _>>();
     for binding in selected.iter_mut() {
-        if let Some(owner) = owners.get(binding.name()) {
+        if let Some(&bytes) = aliases.get(binding.name()) {
             let mut alias = WeightBinding::alias(
                 binding.name(),
                 binding.alias_of().expect("validated alias"),
-                bytes[owner],
+                bytes,
             )
             .map_err(RecipeBindingError::from)?
             .with_storage_layout(binding.storage_layout());
