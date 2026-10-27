@@ -312,7 +312,7 @@ impl ComponentDefinition {
     }
 
     fn project_state_layout(
-        self,
+        mut self,
         state: StateLayout,
         materialized: &std::collections::BTreeSet<usize>,
     ) -> Result<Self, ComponentDefinitionError> {
@@ -340,19 +340,14 @@ impl ComponentDefinition {
                 resource: "selected state identities or lifetimes".into(),
             });
         }
-        let mut selected = Self::new(
-            self.id,
-            self.parameters,
-            self.units,
-            self.transport,
-            self.primary,
-            self.prediction,
-            state,
-            self.state_partition,
-        )?;
-        selected.unit_observations = self.unit_observations;
-        selected.parameter_uses = self.parameter_uses;
-        Ok(selected)
+        self.state_partition
+            .validate(&state, self.parameters.unit_layout())
+            .map_err(|source| ComponentDefinitionError::StatePartition {
+                component: self.id.clone(),
+                source,
+            })?;
+        self.state = state;
+        Ok(self)
     }
     /// Validates equation resource topology against a family-authored declaration.
     /// Retained rank placement is separate authority and is not reconstructed here.
