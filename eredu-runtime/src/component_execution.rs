@@ -554,6 +554,7 @@ impl ComponentDefinition {
         uses: impl IntoIterator<Item = (String, ComponentParameterUse)>,
     ) -> Result<Self, ComponentDefinitionError> {
         let mut declared = std::collections::BTreeMap::new();
+        let mut owners = None;
         for (logical, usage) in uses {
             let address = usage.invocation;
             let invalid = || ComponentDefinitionError::Invalid {
@@ -566,16 +567,17 @@ impl ComponentDefinition {
                 .unit_layout()
                 .group_id(address.group())
                 .expect("validated group");
-            let owned = self
-                .parameters
-                .groups()
-                .iter()
-                .find(|owned| {
-                    owned
-                        .members()
+            let owned = owners
+                .get_or_insert_with(|| {
+                    self.parameters
+                        .groups()
                         .iter()
-                        .any(|member| member.target() == usage.target)
+                        .flat_map(|owned| {
+                            owned.members().iter().map(move |member| (member.target(), owned))
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
                 })
+                .get(usage.target.as_str())
                 .ok_or_else(&invalid)?;
             let admitted = match owned.owner() {
                 crate::ParameterGroupOwner::ExecutionUnit {
