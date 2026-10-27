@@ -1139,6 +1139,9 @@ admission, recipe, precision, geometry and communication failures.
 `ComponentSelection` retains selected global invocation addresses in canonical
 order. Binary lookup resolves group/unit identities without retaining a second
 complete global layout; dense vector positions do not become invocation identities.
+`PreparedComponent` borrows the retained declaration's logical unit layout until
+explicit unit selection supplies a restricted view. Initial preparation and
+identity projection do not clone an unchanged complete layout.
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
 source authority to the recipes' physical inputs. Before recipe preparation,

@@ -198,7 +198,7 @@ pub struct PreparedComponent<D: ComponentPreparationDeclaration> {
     declaration: D,
     source: SharedCheckpointSource,
     units: Vec<Vec<WeightBinding>>,
-    unit_layout: ExecutionUnitLayout,
+    selected_units: Option<ExecutionUnitLayout>,
     invocations: crate::ExecutionUnitAddressMap,
     pinned: BTreeMap<ParameterStorageId, Vec<WeightBinding>>,
     local_layout: Option<LocalModelLayout>,
@@ -360,14 +360,13 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 pinned.insert(owner, bindings);
             }
         }
-        let unit_layout = description.unit_layout().clone();
         let invocations = description.invocations().clone();
         Ok(Self {
             id,
             declaration,
             source,
             units,
-            unit_layout,
+            selected_units: None,
             invocations,
             pinned,
             local_layout: None,
@@ -417,7 +416,9 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
 
     /// Selected canonical unit addresses, independent of dense local storage order.
     pub fn unit_layout(&self) -> &ExecutionUnitLayout {
-        &self.unit_layout
+        self.selected_units
+            .as_ref()
+            .unwrap_or_else(|| self.declaration.parameters().unit_layout())
     }
 
     /// Selected logical consumers and their canonical physical owners.
@@ -431,7 +432,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         address: ExecutionUnitAddress,
     ) -> Result<SharedCheckpointSource, ComponentPreparationError> {
         let ordinal = self
-            .unit_layout
+            .unit_layout()
             .ordinal(address.group(), address.index())
             .ok_or(crate::ExecutionUnitLayoutError::UnknownSelectedAddress {
                 group: address.group(),
@@ -680,10 +681,10 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 .unit_layout()
                 .group_id(address.group())
                 .expect("declared group");
-            let original = (0..self.unit_layout.group_count())
-                .find(|&index| self.unit_layout.group_id(index) == Some(group));
+            let original = (0..self.unit_layout().group_count())
+                .find(|&index| self.unit_layout().group_id(index) == Some(group));
             if original
-                .is_none_or(|index| self.unit_layout.ordinal(index, address.index()).is_none())
+                .is_none_or(|index| self.unit_layout().ordinal(index, address.index()).is_none())
             {
                 return Err(ComponentPreparationError::InvalidProjection {
                     component: id,
@@ -794,14 +795,13 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             &id,
             inputs,
         )?);
-        let unit_layout = description.unit_layout().clone();
         let invocations = description.invocations().clone();
         Ok(PreparedComponent {
             id,
             declaration,
             source,
             units,
-            unit_layout,
+            selected_units: None,
             invocations,
             pinned,
             local_layout,
@@ -816,7 +816,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         addresses: impl IntoIterator<Item = ExecutionUnitAddress>,
     ) -> Result<Self, ComponentPreparationError> {
         let addresses = addresses.into_iter().collect::<Vec<_>>();
-        let selected = self.unit_layout.select(addresses.iter().copied())?;
+        let selected = self.unit_layout().select(addresses.iter().copied())?;
         let invocations = self.invocations.select_invocations(addresses)?;
         let mut retained = self.units.into_iter().map(Some).collect::<Vec<_>>();
         self.units = (0..invocations.storage_layout().len())
@@ -833,7 +833,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 retained[original].take().expect("unique selected address")
             })
             .collect();
-        self.unit_layout = selected;
+        self.selected_units = Some(selected);
         self.invocations = invocations;
         let inputs = self
             .units
