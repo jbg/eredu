@@ -6652,11 +6652,13 @@ execution. A request with `data > 1` reaches neutral architecture
 selection and fails there before payload or native communication realization;
 concrete topology adapters do not erase or reject that axis independently.
 
-`ArchitecturePartition` is publicly constructed only through
-`from_architecture`, which derives its execution graph and unit layout from the
-concrete neutral architecture. Backend placement code supplies rank-local
-ranges and ownership, but cannot substitute a caller-built topology that only
-resembles the architecture it will execute.
+`ArchitecturePartition::from_description` constructs rank-local ownership from
+architecture-authored parameter, state and boundary declarations without native
+resources. `from_architecture` validates the parameter declaration against the
+concrete neutral architecture, derives its state plan and uses the same
+construction path. Backend placement code supplies rank-local ranges and
+ownership, but cannot substitute a caller-built topology that only resembles the
+architecture it will execute.
 Balanced unit ranges are only a placement default. When an architecture
 declares dependency-safe pipeline ranges—for example, to keep a shared-state
 publisher and consumer together—composition installs those exact contiguous

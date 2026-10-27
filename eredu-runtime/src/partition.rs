@@ -1849,37 +1849,20 @@ impl<G, A> ArchitecturePartition<G, A> {
         N: Into<String>,
         A: ArchitectureBoundary,
     {
-        let (graph, unit_layout) = canonical_architecture_layout::<B, S, M>(architecture)?;
-        boundary_schema.wire_schema()?;
-        if parameters.graph() != &graph {
-            return Err(ArchitecturePartitionError::ArchitectureGraphMismatch);
-        }
-        if parameters.unit_layout() != &unit_layout {
-            return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
-        }
         parameters.validate_architecture::<B, S, M>(architecture)?;
         let complete_state = architecture
             .state_layout()
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
         let plan = architecture.state_partition_plan(&complete_state);
-        let mut partition = Self::new(
-            graph,
-            unit_layout,
+        Self::from_description(
+            parameters,
             group_ranges,
             ownership,
-            None,
+            &complete_state,
+            &plan,
             local_geometry,
             boundary_schema,
-            std::iter::empty(),
-        )?;
-        partition.state = partition
-            .resolve_state_partition(&complete_state, &plan)
-            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
-        partition.invocations = parameters
-            .invocations()
-            .select_invocations(partition.units())?;
-        partition.parameter_bindings = parameters.select_owned(&partition);
-        Ok(partition)
+        )
     }
 
     /// Creates an authoritative partition from architecture-authored static declarations.
