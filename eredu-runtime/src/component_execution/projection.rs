@@ -68,26 +68,21 @@ impl ComponentDefinition {
                 }
             });
         }
-        let units = parent_groups
+        let (units, observations) = parent_groups
             .iter()
             .flat_map(|&group| {
                 self.parameters
                     .unit_layout()
                     .group_range(group)
                     .expect("declared group")
-                    .map(|ordinal| self.units[ordinal].clone())
+                    .map(|ordinal| {
+                        (
+                            self.units[ordinal].clone(),
+                            self.unit_observations[ordinal].clone(),
+                        )
+                    })
             })
-            .collect();
-        let observations = parent_groups
-            .iter()
-            .flat_map(|&group| {
-                self.parameters
-                    .unit_layout()
-                    .group_range(group)
-                    .expect("declared group")
-                    .map(|ordinal| self.unit_observations[ordinal].clone())
-            })
-            .collect();
+            .unzip();
         let transport = parent_groups
             .iter()
             .map(|&group| self.transport[group].clone())
