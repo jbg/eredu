@@ -91,22 +91,10 @@ impl AuxiliaryWeightRequirements {
         let requirements = self.checked_add_module(bytes, host, shared).ok_or(
             crate::BoundedResidencySizingError::ArithmeticOverflow("auxiliary residency bytes"),
         )?;
-        let resident = residency.is_fully_resident();
-        let spec = OffloadUnitSpec::new(
+        let spec = residency.parameter_unit_spec(
             definition.id().clone(),
             bytes,
-            if resident {
-                ResidencyPolicy::Pinned
-            } else {
-                ResidencyPolicy::Cacheable
-            },
-            if resident {
-                MemoryTier::Device
-            } else if residency.dense().is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
+            ResidencyPolicy::Cacheable,
         )?;
         Ok((requirements, spec))
     }
@@ -844,6 +832,21 @@ impl Default for WeightResidency {
 }
 
 impl LayerWeightResidency {
+    /// Declares one physical resource, retaining its explicit host-phase lifetime.
+    pub(crate) fn parameter_unit_spec(
+        self,
+        id: OffloadUnitId,
+        bytes: u64,
+        host_policy: ResidencyPolicy,
+    ) -> Result<OffloadUnitSpec, OffloadError> {
+        let (policy, tier) = match self {
+            Self::FullyResident => (ResidencyPolicy::Pinned, MemoryTier::Device),
+            Self::LayerwiseHost(_) => (host_policy, MemoryTier::Host),
+            Self::DenseDiskStream(_) => (ResidencyPolicy::Cacheable, MemoryTier::Disk),
+        };
+        OffloadUnitSpec::new(id, bytes, policy, tier)
+    }
+
     /// Returns the checkpoint shard/reader cache bound carried by this policy.
     pub const fn max_cached_shards(self) -> usize {
         match self {

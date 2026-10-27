@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eredu_core::residency::{MemoryTier, OffloadError, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy};
+use eredu_core::residency::{OffloadError, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy};
 
 use crate::{
     physical_binding_bytes, ExecutionUnitAddress, LayerWeightResidency, OffloadUnit,
@@ -258,25 +258,10 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
         resources
             .definitions
             .push(OffloadUnit::new(id.clone(), bindings)?);
-        let resident = resources.residency.is_fully_resident();
-        let dense = resources.residency.dense().is_some();
-        resources.specs.push(OffloadUnitSpec::new(
+        resources.specs.push(resources.residency.parameter_unit_spec(
             id.clone(),
             bytes,
-            if resident {
-                ResidencyPolicy::Pinned
-            } else if dense {
-                ResidencyPolicy::Cacheable
-            } else {
-                ResidencyPolicy::Windowed
-            },
-            if resident {
-                MemoryTier::Device
-            } else if dense {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
+            ResidencyPolicy::Windowed,
         )?);
         resources.unit_ids.push(id);
         resources.unit_bytes.push(bytes);
