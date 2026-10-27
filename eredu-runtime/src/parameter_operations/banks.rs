@@ -4,7 +4,7 @@ use crate::ParameterBankKey;
 use eredu_checkpoint::recipe::RecipeMetadata;
 use eredu_core::parameters::ParameterError;
 use eredu_nn::ParameterMetadata;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// One physical member of an architecture-declared grouped parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,11 +137,11 @@ pub fn prepare_bank_parameter_slots(
         let mut materialized = first.materialized.clone();
         materialized.shape[0] = members.len();
         materialized.byte_len = 0;
-        let mut seen = BTreeSet::new();
+        let mut previous = None;
         for member in &members {
             if member.key.bank() != bank
                 || member.key.unit() != unit
-                || !seen.insert(member.key)
+                || previous.replace(member.key) == Some(member.key)
                 || member.materialized.shape != first.materialized.shape
                 || member.materialized.dtype != first.materialized.dtype
                 || member.materialized.byte_len != first.materialized.byte_len
@@ -165,10 +165,17 @@ pub fn prepare_bank_parameter_slots(
             members,
         });
     }
+    // Grouped parameters are emitted in canonical name order.
+    let find_parameter = |id: &str| {
+        output
+            .binary_search_by(|parameter| parameter.slot.parameter.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &output[index])
+    };
     for declaration in declarations {
         if let Some(owner) = &declaration.linear_companion_of {
-            if output.iter().any(|p| p.slot.parameter.id == *owner)
-                && !output.iter().any(|p| p.slot.parameter.id == declaration.id)
+            if find_parameter(owner.as_str()).is_some()
+                && find_parameter(declaration.id.as_str()).is_none()
             {
                 return Err(ParameterError::Missing(declaration.id.as_str().into()));
             }
@@ -176,9 +183,7 @@ pub fn prepare_bank_parameter_slots(
     }
     for parameter in &output {
         if let Some(owner) = &parameter.slot.parameter.linear_companion_of {
-            let owner = output
-                .iter()
-                .find(|candidate| candidate.slot.parameter.id == *owner)
+            let owner = find_parameter(owner.as_str())
                 .ok_or_else(|| ParameterError::Missing(owner.as_str().into()))?;
             if parameter
                 .members
