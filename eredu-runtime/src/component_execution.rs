@@ -1428,18 +1428,10 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
             return true;
         }
         let layout = definition.parameters.unit_layout();
-        let Some(units) = layout.group_range(group) else {
+        let Some(mut units) = layout.group_range(group) else {
             return false;
         };
-        units
-            .filter_map(|ordinal| layout.address(ordinal))
-            .any(|address| {
-                !definition
-                    .unit(group, address.index())
-                    .expect("declared unit")
-                    .state
-                    .is_empty()
-            })
+        units.any(|ordinal| !definition.units[ordinal].state.is_empty())
     }
     /// Constructs the ordinary local-stage traversal from declared state consumers.
     pub fn into_partition_runtime<B, S, G, A, P>(
