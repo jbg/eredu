@@ -76,14 +76,13 @@ impl ParameterMemberIndex {
         }
     }
 
-    fn output<'a>(
+    fn output(
         &self,
-        tasks: &'a [ReplicatedTextMaterializationTask],
         parameter: &str,
     ) -> Result<
         (
-            &'a ReplicatedTextMaterializationTask,
-            Option<&'a ReplicatedTextOutputCompanion>,
+            &ReplicatedTextMaterializationTask,
+            Option<&ReplicatedTextOutputCompanion>,
         ),
         ParameterError,
     > {
@@ -92,20 +91,19 @@ impl ParameterMemberIndex {
             .get(parameter)
             .ok_or_else(|| ParameterError::Missing(parameter.into()))?
             .ok_or_else(|| invalid("parameter identity resolves to multiple selected tasks"))?;
-        let task = &tasks[task];
+        let task = &self.tasks[task];
         Ok((
             task,
             companion.map(|index| &task.output_companions()[index]),
         ))
     }
 
-    fn member<'a>(
+    fn member(
         &self,
-        parameters: &'a ArchitectureParameterDescription,
         task: &ReplicatedTextMaterializationTask,
         companion: Option<&ReplicatedTextOutputCompanion>,
         parameter: &str,
-    ) -> Result<(&'a OwnedParameterGroupSpec, &'a ParameterMemberSpec), ParameterError> {
+    ) -> Result<(&OwnedParameterGroupSpec, &ParameterMemberSpec), ParameterError> {
         let primary = companion.map_or(task.name(), ReplicatedTextOutputCompanion::name);
         let mut found = self.members.get(primary).copied();
         if companion.is_none() {
@@ -121,7 +119,7 @@ impl ParameterMemberIndex {
             }
         }
         let (group, member) = found.ok_or_else(|| ParameterError::Missing(parameter.into()))?;
-        let group = &parameters.groups()[group];
+        let group = &self.parameters.groups()[group];
         Ok((group, &group.members()[member]))
     }
 }
@@ -166,11 +164,11 @@ fn resolve_parameter_member_inner<'a>(
     tasks: &'a [crate::ReplicatedTextMaterializationTask],
     parameters: &'a crate::ArchitectureParameterDescription,
     parameter: &str,
-    index: Option<&ParameterMemberIndex>,
+    index: Option<&'a ParameterMemberIndex>,
 ) -> Result<ResolvedParameterMember<'a>, eredu_core::parameters::ParameterError> {
     use eredu_core::parameters::ParameterError;
     let (task, companion) = if let Some(index) = index {
-        index.output(tasks, parameter)?
+        index.output(parameter)?
     } else {
         let mut matching = tasks
             .iter()
@@ -206,7 +204,7 @@ fn resolve_parameter_member_inner<'a>(
         return Err(invalid("selected effective parameter geometry is invalid"));
     }
     let (group, member) = if let Some(index) = index {
-        index.member(parameters, task, companion, parameter)?
+        index.member(task, companion, parameter)?
     } else {
         let mut matching = parameters
             .groups()
