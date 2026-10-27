@@ -105,11 +105,12 @@ pub(crate) fn execution_unit_window_bytes(
         return Ok(0);
     }
     let mut largest = 0;
+    // Storage owners never cross groups, so each group's counters start unused.
+    let mut counts = vec![0usize; unit_bytes.len()];
     for group in 0..invocations.storage_layout().group_count() {
         let sequence = invocations
             .group_storage_ordinals(group)
             .expect("validated invocation group");
-        let mut counts = vec![0usize; unit_bytes.len()];
         let mut total = 0u64;
         for (position, &storage) in sequence.iter().enumerate() {
             if position >= depth {
