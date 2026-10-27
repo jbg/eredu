@@ -253,11 +253,14 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     {
         let id = id.into();
         let description = declaration.parameters();
-        let mut recipes =
-            BTreeMap::<ParameterStorageId, BTreeMap<String, DerivedWeightRecipe>>::new();
-        let mut aliases = BTreeMap::<ParameterStorageId, Vec<RecipeAlias>>::new();
+        let mut resources = BTreeMap::<ParameterStorageId, ParameterResourceRecipes>::new();
         for owned in description.groups() {
-            let owner = ParameterStorageId::from_owner(owned.owner());
+            let resource = resources
+                .entry(ParameterStorageId::from_owner(owned.owner()))
+                .or_insert_with(|| ParameterResourceRecipes {
+                    outputs: BTreeMap::new(),
+                    aliases: Vec::new(),
+                });
             for member in owned.members() {
                 match resolve(member)?.into() {
                     ComponentRecipe::Physical { recipe, conversion } => {
@@ -267,28 +270,16 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                             }
                             None => recipe,
                         };
-                        recipes
-                            .entry(owner.clone())
-                            .or_default()
-                            .insert(member.target().into(), recipe);
+                        resource.outputs.insert(member.target().into(), recipe);
                     }
                     ComponentRecipe::Alias(target) => {
-                        aliases
-                            .entry(owner.clone())
-                            .or_default()
+                        resource
+                            .aliases
                             .push(RecipeAlias::new(member.target(), target));
-                        recipes.entry(owner.clone()).or_default();
                     }
                 }
             }
         }
-        let resources = recipes
-            .into_iter()
-            .map(|(owner, outputs)| {
-                let aliases = aliases.remove(&owner).unwrap_or_default();
-                (owner, ParameterResourceRecipes { outputs, aliases })
-            })
-            .collect();
         let (source, resources) = prepare_resource_bindings(source, &id, resources)
             .map_err(ComponentPreparationError::from)?;
         let mut units = vec![Vec::new(); description.invocations().storage_layout().len()];
