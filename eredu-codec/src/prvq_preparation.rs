@@ -2,13 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use eredu_checkpoint::{
-    recipe::RecipeDtype,
-    store::{SharedCheckpointSource, StoreError},
-};
+use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ComponentRecipeConversion,
-    LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
+    ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
+    WeightBinding,
 };
 
 use crate::{prvq::Geometry, prvq_layered::quantizer_component_definition};
@@ -32,15 +29,6 @@ pub enum QuantizerPreparationError {
     /// A required parameter is missing from the selected component.
     #[error("PRVQ parameter {0} is missing")]
     MissingParameter(String),
-    /// Source restriction failed.
-    #[error(transparent)]
-    Source(#[from] StoreError),
-    /// Exact recipe binding cannot be represented.
-    #[error(transparent)]
-    Binding(#[from] RecipeBindingError),
-    /// Shared physical placement cannot be applied to an exact recipe.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
     /// Tensor topology or retained placement is inconsistent.
     #[error("invalid PRVQ tensor partition: {0}")]
     Parallel(String),

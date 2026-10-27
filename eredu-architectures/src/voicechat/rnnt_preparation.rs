@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
-    store::{SharedCheckpointSource, StoreError},
+    store::SharedCheckpointSource,
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ComponentRecipeConversion,
-    LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
+    ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
+    WeightBinding,
 };
 
 use super::{
@@ -31,15 +31,6 @@ pub enum RnntPreparationError {
     /// A required retained component or parameter is absent.
     #[error(transparent)]
     Parameters(#[from] SpeechParameterError),
-    /// The restricted source could not be retained.
-    #[error(transparent)]
-    Source(#[from] StoreError),
-    /// A validated recipe cannot be represented by a runtime binding.
-    #[error(transparent)]
-    Binding(#[from] RecipeBindingError),
-    /// A recipe cannot realize the selected physical tensor placement.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
     /// Tensor topology or a repeated placement selection is inconsistent.
     #[error("invalid RNNT tensor partition: {0}")]
     Parallel(String),

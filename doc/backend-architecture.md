@@ -1133,6 +1133,9 @@ the combined report. A later failure retains earlier completed overlays; the
 single-group mechanism owns native completion and failed-resource retirement.
 Format grouping and task identities remain runtime contracts.
 
+Shared source restriction, binding and placement failures propagate through
+`ComponentPreparationError`. Family preparation errors add their active source
+admission, recipe, precision, geometry and communication failures.
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
 source authority to the recipes' physical inputs. Before recipe preparation,

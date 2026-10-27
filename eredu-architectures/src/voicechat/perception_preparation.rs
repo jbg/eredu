@@ -2,13 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use eredu_checkpoint::{
-    recipe::RecipeError,
-    store::{SharedCheckpointSource, StoreError},
-};
+use eredu_checkpoint::{recipe::RecipeError, store::SharedCheckpointSource};
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, LocalModelLayout, PreparedComponent,
-    RecipeBindingError, WeightBinding,
+    ComponentPreparationError, LocalModelLayout, PreparedComponent, RecipeBindingError,
+    WeightBinding,
 };
 
 use super::{
@@ -34,18 +31,12 @@ pub enum PerceptionPreparationError {
     /// A required parameter is missing from the selected component.
     #[error(transparent)]
     Parameters(#[from] SpeechParameterError),
-    /// Source restriction failed.
-    #[error(transparent)]
-    Source(#[from] StoreError),
     /// A recipe disagrees with its exact source metadata.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
     /// Exact recipe binding cannot be represented.
     #[error(transparent)]
     Binding(#[from] RecipeBindingError),
-    /// Exact recipes cannot realize the selected tensor placement.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
 }
 
 /// Cold bindings for subsampling, each Conformer block, and final projection.

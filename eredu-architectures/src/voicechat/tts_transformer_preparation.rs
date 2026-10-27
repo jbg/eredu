@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, LocalModelLayout, PreparedComponent,
-    RecipeBindingError, WeightBinding,
+    ComponentPreparationError, LocalModelLayout, PreparedComponent, RecipeBindingError,
+    WeightBinding,
 };
 
 use super::{
@@ -53,9 +53,6 @@ pub enum TtsTransformerPreparationError {
     /// Exact recipe binding cannot be represented.
     #[error(transparent)]
     Binding(#[from] RecipeBindingError),
-    /// The exact rank-local recipe placement is invalid.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
     /// An admitted parameter disagrees with architecture or recipe geometry.
     #[error("VoiceChat TTS transformer parameter {0} has inconsistent geometry")]
     Geometry(String),

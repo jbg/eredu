@@ -2,13 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use eredu_checkpoint::{
-    recipe::RecipeDtype,
-    store::{SharedCheckpointSource, StoreError},
-};
+use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
 use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, ComponentRecipeConversion,
-    LocalModelLayout, PreparedComponent, RecipeBindingError, WeightBinding,
+    ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
+    WeightBinding,
 };
 
 use crate::{ear_encoder::EncoderConfig, ear_encoder_layered::encoder_component_definition};
@@ -25,15 +22,6 @@ pub enum EncoderPreparationError {
     /// A required parameter is missing from the selected component.
     #[error("EAR encoder parameter {0} is missing")]
     MissingParameter(String),
-    /// Source restriction failed.
-    #[error(transparent)]
-    Source(#[from] StoreError),
-    /// Exact recipe binding cannot be represented.
-    #[error(transparent)]
-    Binding(#[from] RecipeBindingError),
-    /// Shared physical placement cannot be applied to an exact recipe.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
 }
 
 /// Cold bindings for each input-projection, ConvNeXt and downsampling unit.

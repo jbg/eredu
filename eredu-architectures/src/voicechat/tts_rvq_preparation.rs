@@ -4,12 +4,9 @@ use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
-    store::{SharedCheckpointSource, StoreError},
+    store::SharedCheckpointSource,
 };
-use eredu_runtime::{
-    BindingPlacementError, ComponentPreparationError, LocalModelLayout, PreparedComponent,
-    RecipeBindingError, WeightBinding,
-};
+use eredu_runtime::{ComponentPreparationError, LocalModelLayout, PreparedComponent, WeightBinding};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
@@ -38,18 +35,9 @@ pub enum RvqPreparationError {
     /// A required parameter is missing from the selected component.
     #[error(transparent)]
     Parameters(#[from] SpeechParameterError),
-    /// Source restriction failed.
-    #[error(transparent)]
-    Source(#[from] StoreError),
     /// A recipe disagrees with its exact source metadata.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
-    /// Exact recipe binding cannot be represented.
-    #[error(transparent)]
-    Binding(#[from] RecipeBindingError),
-    /// Shared physical placement cannot be applied to an exact recipe.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
     /// Tensor topology or retained placement is inconsistent.
     #[error("invalid RVQ tensor partition: {0}")]
     Parallel(String),
