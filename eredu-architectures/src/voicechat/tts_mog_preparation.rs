@@ -149,15 +149,7 @@ impl PreparedMogBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), MogPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(MogPreparationError::Parallel(
-                "MoG component selection requires a tensor-only topology".into(),
-            ));
-        }
-        let layout = self.prepared.parallel_layout(topology)?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

@@ -1147,7 +1147,12 @@ recipes already producing that dtype unchanged, applies an explicitly allowed ca
 once, and rejects other representations with a typed component/parameter error.
 EAR encoder, decoder, PRVQ and RNNT declare their F32 execution requirement and
 allow F16/BF16 conversion through this contract. Ordinary recipe inference supplies
-the conversion workspace and binding-byte bounds. `parallel_layout` projects the
+the conversion workspace and binding-byte bounds. `tensor_parallel_layout` admits
+one tensor cohort, rejecting pipeline, expert or data dimensions through typed
+`ComponentPreparationError::TensorOnlyTopology` facts before layout derivation.
+VoiceChat and codec component selectors use this shared admission, then validate
+their own geometry and apply consuming placement. Explicit partition construction
+retains its separate ownership contract. `parallel_layout` projects the
 requested topology from the retained parameter declaration and checks any retained
 selection. Speech and codec selectors use this projection rather than reconstruct
 parameter catalogs from configuration. Families retain their topology limits and

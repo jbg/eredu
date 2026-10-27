@@ -46,9 +46,6 @@ pub enum PerceptionPreparationError {
     /// Exact recipes cannot realize the selected tensor placement.
     #[error(transparent)]
     Placement(#[from] BindingPlacementError),
-    /// The shared planner rejected the selected tensor topology.
-    #[error("invalid perception tensor partition: {0}")]
-    Parallel(String),
 }
 
 /// Cold bindings for subsampling, each Conformer block, and final projection.
@@ -136,15 +133,7 @@ impl PreparedPerceptionBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), PerceptionPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(PerceptionPreparationError::Parallel(
-                "complete-stack perception selection requires a tensor-only topology".into(),
-            ));
-        }
-        let layout = self.prepared.parallel_layout(topology)?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
     /// Applies exact selected tensor placements without changing retained source authority.

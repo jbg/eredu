@@ -1979,8 +1979,8 @@ mod component_preparation {
     fn axis_layout_admission_keeps_companions_aligned_and_replicas_whole() {
         use super::{AtomicUsize, Ordering, Source};
         use eredu_runtime::{
-            derive_partitioned_local_layout, validate_parameter_layout, LocalModelLayout,
-            LocalTensorLayout, ParallelPlanError, ParameterGroupSelection, TensorPlacement,
+            validate_parameter_layout, LocalModelLayout, LocalTensorLayout, ParallelPlanError,
+            ParameterGroupSelection, TensorPlacement,
         };
         let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("units")], "units").unwrap();
         let units = ExecutionUnitLayout::new(&graph, [2]).unwrap();
@@ -2076,7 +2076,16 @@ mod component_preparation {
             1,
         )
         .unwrap();
-        let layout = derive_partitioned_local_layout(description, topology).unwrap();
+        let layout = prepared.tensor_parallel_layout(topology).unwrap();
+        let pipeline = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(2, 2, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepared.tensor_parallel_layout(pipeline),
+            Err(ComponentPreparationError::TensorOnlyTopology { .. })
+        ));
         eredu_runtime::validate_tensor_parallel_layout("axis-contract", description, &layout, 2, 1)
             .unwrap();
         assert!(matches!(

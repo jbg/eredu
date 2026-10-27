@@ -48,15 +48,7 @@ impl PreparedRnntPredictorBindings {
         mut self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), RnntPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(RnntPreparationError::Parallel(
-                "predictor replica selection requires a tensor-only topology".into(),
-            ));
-        }
-        let layout = self.prepared.parallel_layout(topology)?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         self.prepared = self.prepared.select(&layout)?;
         Ok((self, layout))
     }

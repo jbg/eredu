@@ -49,6 +49,14 @@ pub enum ComponentPreparationError {
         /// Exact neutral planner failure.
         reason: String,
     },
+    /// Component tensor selection cannot own pipeline, expert or data dimensions.
+    #[error("component {component:?} tensor selection requires a tensor-only topology, got {topology:?}")]
+    TensorOnlyTopology {
+        /// Retained component identity.
+        component: String,
+        /// Rejected exact rank topology.
+        topology: eredu_core::ParallelRankTopology,
+    },
     /// A selected placement cannot be applied.
     #[error(transparent)]
     Placement(#[from] BindingPlacementError),
@@ -541,6 +549,25 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             ));
         }
         Ok(layout)
+    }
+
+    /// Admits a component's tensor cohort before deriving its exact placement.
+    /// Pipeline, expert and data ownership require an enclosing partition selection.
+    /// Family geometry validation and consuming recipe placement remain separate.
+    pub fn tensor_parallel_layout(
+        &self,
+        topology: eredu_core::ParallelRankTopology,
+    ) -> Result<LocalModelLayout, ComponentPreparationError> {
+        if topology.pipeline_parallel_size() != 1
+            || topology.expert_parallel_size() != 1
+            || topology.data_parallel_size() != 1
+        {
+            return Err(ComponentPreparationError::TensorOnlyTopology {
+                component: self.id.clone(),
+                topology,
+            });
+        }
+        self.parallel_layout(topology)
     }
 
     /// Applies placement once. Reusing the same selection retains the recipes;

@@ -34,9 +34,6 @@ pub enum DecoderPreparationError {
     /// Shared physical placement cannot be applied to an exact recipe.
     #[error(transparent)]
     Placement(#[from] BindingPlacementError),
-    /// Tensor topology or retained placement is inconsistent.
-    #[error("invalid EAR decoder tensor partition: {0}")]
-    Parallel(String),
 }
 
 /// Cold bindings for each upsampling, ConvNeXt and output-projection unit.
@@ -86,15 +83,7 @@ impl PreparedDecoderBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), DecoderPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(DecoderPreparationError::Parallel(
-                "EAR decoder component selection requires a tensor-only topology".into(),
-            ));
-        }
-        let layout = self.prepared.parallel_layout(topology)?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

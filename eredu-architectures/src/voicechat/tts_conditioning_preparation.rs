@@ -43,9 +43,6 @@ pub enum ConditioningPreparationError {
     /// Shared physical placement cannot be applied to an exact recipe.
     #[error(transparent)]
     Placement(#[from] BindingPlacementError),
-    /// Tensor topology or retained placement is inconsistent.
-    #[error("invalid conditioning tensor partition: {0}")]
-    Parallel(String),
     /// An admitted parameter disagrees with architecture or recipe geometry.
     #[error("VoiceChat TTS conditioning parameter {0} has inconsistent geometry")]
     Geometry(String),
@@ -138,15 +135,7 @@ impl PreparedConditioningBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), ConditioningPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(ConditioningPreparationError::Parallel(
-                "conditioning component selection requires a tensor-only topology".into(),
-            ));
-        }
-        let layout = self.prepared.parallel_layout(topology)?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

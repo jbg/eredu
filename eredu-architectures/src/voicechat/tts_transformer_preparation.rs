@@ -56,9 +56,6 @@ pub enum TtsTransformerPreparationError {
     /// The exact rank-local recipe placement is invalid.
     #[error(transparent)]
     Placement(#[from] BindingPlacementError),
-    /// Shared partition planning rejected the selected rank topology.
-    #[error("invalid TTS transformer tensor partition: {0}")]
-    Parallel(String),
     /// An admitted parameter disagrees with architecture or recipe geometry.
     #[error("VoiceChat TTS transformer parameter {0} has inconsistent geometry")]
     Geometry(String),
@@ -162,15 +159,7 @@ impl PreparedTtsTransformerBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), TtsTransformerPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(TtsTransformerPreparationError::Parallel(
-                "complete-stack component selection requires a tensor-only topology".into(),
-            ));
-        }
-        let layout = self.prepared.parallel_layout(topology)?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 
