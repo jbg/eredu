@@ -91,17 +91,16 @@ impl PreparedTargetPartition {
             .map_err(invalid)?;
         let complete_state = model.definition().state_layout().clone();
         let state_plan = crate::transport::pipeline_state(0, &complete_state);
-        let partition = ArchitecturePartition::from_description(
-            &parameters,
-            [(crate::decoder::TARGET_EXECUTION_GROUP, owned_units.clone())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            tensor.clone(),
-            target.spec().boundary_schema().map_err(invalid)?,
-        )
-        .map_err(invalid)?;
-        selected.requirements().validate_binding(&partition).map_err(invalid)?;
+        let partition = selected
+            .requirements()
+            .construct_partition(
+                &parameters,
+                &complete_state,
+                &state_plan,
+                tensor.clone(),
+                target.spec().boundary_schema().map_err(invalid)?,
+            )
+            .map_err(invalid)?;
         let state = partition
             .state()
             .ok_or_else(|| invalid("Flash-Next target partition has no state"))?;

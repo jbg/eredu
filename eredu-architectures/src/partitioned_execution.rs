@@ -8013,6 +8013,28 @@ where
 }
 
 impl<R> PartitionedAdmission<R> {
+    pub(crate) fn construct_partition<G, W>(
+        &self,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        complete_state: &eredu_runtime::StateLayout,
+        state_plan: &eredu_runtime::ArchitectureStatePartitionPlan,
+        local_geometry: G,
+        boundary_schema: W,
+    ) -> Result<ArchitecturePartition<G, W>, eredu_runtime::PipelineRankBindingError>
+    where
+        R: TextRequirements,
+        W: eredu_runtime::ArchitectureBoundary,
+    {
+        self.rank.construct_partition(
+            self.execution.text(),
+            parameters,
+            complete_state,
+            state_plan,
+            local_geometry,
+            boundary_schema,
+        )
+    }
+
     pub(crate) fn validate_binding<G, W>(
         &self,
         partition: &ArchitecturePartition<G, W>,
@@ -9199,18 +9221,16 @@ where
             })?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    selected.requirements().validate_binding(&partition)
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -9240,20 +9260,16 @@ where
                     "Nemotron-H transform source changed rank-local state geometry".into(),
                 ));
             }
-            let source_partition = ArchitecturePartition::from_description(
-                &source_parameters,
-                [(owned.group().as_str(), owned.units())],
-                selected.requirements().ownership().clone(),
-                &complete_state,
-                &state_plan,
-                source_geometry,
-                crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
-            )
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
-            selected.requirements().validate_binding(&source_partition)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_partition = selected
+                .requirements()
+                .construct_partition(
+                    &source_parameters,
+                    &complete_state,
+                    &state_plan,
+                    source_geometry,
+                    crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
+                )
+                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             let source_architecture = crate::nemotron_h::NemotronKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9352,18 +9368,16 @@ where
             })?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    selected.requirements().validate_binding(&partition)
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -9398,20 +9412,16 @@ where
                     "Kimi Linear transform source changed rank-local state geometry".into(),
                 ));
             }
-            let source_partition = ArchitecturePartition::from_description(
-                &source_parameters,
-                [(owned.group().as_str(), owned.units())],
-                selected.requirements().ownership().clone(),
-                &complete_state,
-                &state_plan,
-                source_geometry,
-                eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
-            )
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
-            selected.requirements().validate_binding(&source_partition)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_partition = selected
+                .requirements()
+                .construct_partition(
+                    &source_parameters,
+                    &complete_state,
+                    &state_plan,
+                    source_geometry,
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+                )
+                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             let source_architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9503,18 +9513,16 @@ where
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    selected.requirements().validate_binding(&partition)
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -9546,20 +9554,16 @@ where
                     "LFM2 transform source changed rank-local state geometry".into(),
                 ));
             }
-            let source_partition = ArchitecturePartition::from_description(
-                &source_parameters,
-                [(owned.group().as_str(), owned.units())],
-                selected.requirements().ownership().clone(),
-                &complete_state,
-                &state_plan,
-                source_geometry,
-                eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
-            )
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
-            selected.requirements().validate_binding(&source_partition)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_partition = selected
+                .requirements()
+                .construct_partition(
+                    &source_parameters,
+                    &complete_state,
+                    &state_plan,
+                    source_geometry,
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+                )
+                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             let source_architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9647,18 +9651,16 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = definition.state_partition_plan();
-    let partition = ArchitecturePartition::from_description(
-        parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        state_plan,
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size()),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    selected.requirements().validate_binding(&partition)
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            parameters,
+            &complete_state,
+            state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size()),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         parameters,
@@ -9695,20 +9697,16 @@ where
                         .into(),
                 ));
             }
-            let source_partition = ArchitecturePartition::from_description(
-                source_parameters,
-                [(owned.group().as_str(), owned.units())],
-                selected.requirements().ownership().clone(),
-                &source_geometry.complete_state_layout().clone(),
-                state_plan,
-                source_geometry,
-                eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size()),
-            )
-            .map_err(|error| {
-                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
-            })?;
-            selected.requirements().validate_binding(&source_partition)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_partition = selected
+                .requirements()
+                .construct_partition(
+                    source_parameters,
+                    &source_geometry.complete_state_layout().clone(),
+                    state_plan,
+                    source_geometry,
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size()),
+                )
+                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
             for task in &tasks {
                 let target_owner = partition.parameter_bindings().iter().find_map(|binding| {
                     binding
@@ -10645,18 +10643,16 @@ where
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = definition.state_partition_plan();
-    let partition = ArchitecturePartition::from_description(
-        parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        state_plan,
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size()),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    selected.requirements().validate_binding(&partition)
-        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            parameters,
+            &complete_state,
+            state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size()),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let mut tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         parameters,
@@ -10796,16 +10792,16 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::lfm2::with_checkpoint_formats(
@@ -10840,17 +10836,16 @@ where
             &source_plan,
         )
         .map_err(|e| error(e.to_string()))?;
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry,
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
-        )
-        .map_err(|e| error(e.to_string()))?;
-        selected.requirements().validate_binding(&source_partition).map_err(error)?;
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry,
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+            )
+            .map_err(|e| error(e.to_string()))?;
         let source = crate::lfm2::Lfm2Kernel::<B>::from_partition(
             source_args,
             source_definition,
@@ -10950,16 +10945,16 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::kimi_linear::with_checkpoint_formats(
@@ -10994,17 +10989,16 @@ where
             &source_plan,
         )
         .map_err(|e| error(e.to_string()))?;
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry,
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
-        )
-        .map_err(|e| error(e.to_string()))?;
-        selected.requirements().validate_binding(&source_partition).map_err(error)?;
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry,
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+            )
+            .map_err(|e| error(e.to_string()))?;
         let source = crate::kimi_linear::KimiKernel::<B>::from_partition(
             source_args,
             source_definition,
@@ -11101,16 +11095,16 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = geometry.complete_state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = if selected.base().text().uses_weight_transform() {
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_definition = crate::nemotron_h::project_parameters(&source_args, &retained)
@@ -11140,17 +11134,16 @@ where
             &source_plan,
         )
         .map_err(|e| error(e.to_string()))?;
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry,
-            crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
-        )
-        .map_err(|e| error(e.to_string()))?;
-        selected.requirements().validate_binding(&source_partition).map_err(error)?;
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry,
+                crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
+            )
+            .map_err(|e| error(e.to_string()))?;
         let source = crate::nemotron_h::NemotronKernel::<B>::from_partition(
             source_args,
             source_definition,
@@ -11256,16 +11249,16 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let complete_state = local.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        crate::deepseek::v3::TargetBoundarySchema::from_args(&selected_args),
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            crate::deepseek::v3::TargetBoundarySchema::from_args(&selected_args),
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     crate::deepseek::V3PartitionLocalFoundation::from_partition(&selected_args, &partition)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = if selected.base().text().uses_weight_transform() {
@@ -11302,17 +11295,16 @@ where
             &source_plan,
         )
         .map_err(|e| error(e.to_string()))?;
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry,
-            crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
-        )
-        .map_err(|e| error(e.to_string()))?;
-        selected.requirements().validate_binding(&source_partition).map_err(error)?;
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry,
+                crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
+            )
+            .map_err(|e| error(e.to_string()))?;
         crate::deepseek::V3PartitionLocalFoundation::from_partition(
             &source_args,
             &source_partition,
@@ -11431,16 +11423,16 @@ where
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
     let boundary = crate::deepseek::v4::TargetBoundarySchema::from_args(&selected_args)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry,
-        boundary,
-    )
-    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry,
+            boundary,
+        )
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     crate::deepseek::V4PartitionLocalFoundation::from_partition(&selected_args, &partition)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = if selected.base().text().uses_weight_transform() {
@@ -11477,18 +11469,17 @@ where
             &source_plan,
         )
         .map_err(|e| error(e.to_string()))?;
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry,
-            crate::deepseek::v4::TargetBoundarySchema::from_args(&source_args)
-                .map_err(|e| error(e.to_string()))?,
-        )
-        .map_err(|e| error(e.to_string()))?;
-        selected.requirements().validate_binding(&source_partition).map_err(error)?;
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry,
+                crate::deepseek::v4::TargetBoundarySchema::from_args(&source_args)
+                    .map_err(|e| error(e.to_string()))?,
+            )
+            .map_err(|e| error(e.to_string()))?;
         crate::deepseek::V4PartitionLocalFoundation::from_partition(
             &source_args,
             &source_partition,

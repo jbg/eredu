@@ -53,17 +53,16 @@ where
         .map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry.clone(),
-        crate::deepseek::v3::TargetBoundarySchema::from_args(&selected_args),
-    )
-    .map_err(architecture)?;
-    selected.requirements().validate_binding(&partition).map_err(architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry.clone(),
+            crate::deepseek::v3::TargetBoundarySchema::from_args(&selected_args),
+        )
+        .map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -87,17 +86,15 @@ where
                 "dense V3 transform source changed local state geometry",
             ));
         }
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry.clone(),
-            crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
-        )
-        .map_err(architecture)?;
-        selected.requirements().validate_binding(&source_partition)
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry.clone(),
+                crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
+            )
             .map_err(architecture)?;
         let model = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
             source_args,

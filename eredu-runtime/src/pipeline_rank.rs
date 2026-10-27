@@ -47,9 +47,12 @@ pub enum PipelineRankError {
     MissingPublicationOwner,
 }
 
-/// Constructed partition facts differ from the retained rank admission.
+/// Partition construction or binding disagrees with the retained rank admission.
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineRankBindingError {
+    /// The declared groups, state or boundary cannot form a valid partition.
+    #[error(transparent)]
+    Partition(#[from] crate::ArchitecturePartitionError),
     /// Canonical execution groups or dependencies differ.
     #[error("concrete architecture execution graph differs from admission")]
     Graph,
@@ -153,6 +156,34 @@ impl PipelineRankProjection {
     pub fn parameter_targets(&self) -> &[String] {
         &self.parameter_targets
     }
+    /// Constructs a partition using exactly this rank's admitted groups and ownership.
+    /// Family declarations supply parameters, state geometry and transport; the result
+    /// is checked against the retained execution and local state before it is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn construct_partition<G, W: crate::ArchitectureBoundary>(
+        &self,
+        execution: &crate::ReplicatedTextRequirements,
+        parameters: &crate::ArchitectureParameterDescription,
+        complete_state: &crate::StateLayout,
+        state_plan: &crate::ArchitectureStatePartitionPlan,
+        local_geometry: G,
+        boundary_schema: W,
+    ) -> Result<crate::ArchitecturePartition<G, W>, PipelineRankBindingError> {
+        let partition = crate::ArchitecturePartition::from_description(
+            parameters,
+            self.groups
+                .iter()
+                .map(|group| (group.group().as_str(), group.units())),
+            self.ownership.clone(),
+            complete_state,
+            state_plan,
+            local_geometry,
+            boundary_schema,
+        )?;
+        self.validate_partition(execution, &partition)?;
+        Ok(partition)
+    }
+
     /// Validates a complete constructed partition against this retained admission.
     /// The execution declaration is the one used to project this rank; geometry,
     /// native bindings and communication authority remain separate contracts.

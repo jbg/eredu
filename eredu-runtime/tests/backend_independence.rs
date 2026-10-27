@@ -8169,12 +8169,9 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     let projected = ranks
         .iter()
         .map(|rank| {
-            ArchitecturePartition::from_description(
+            rank.construct_partition(
+                &requirements,
                 &parameters,
-                rank.groups()
-                    .iter()
-                    .map(|group| (group.group().as_str(), group.units())),
-                rank.ownership().clone(),
                 &state_layout,
                 &state_plan,
                 (),
@@ -8183,6 +8180,17 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             .unwrap()
         })
         .collect::<Vec<_>>();
+    assert!(matches!(
+        ownership_only.construct_partition(
+            &requirements,
+            &parameters,
+            &state_layout,
+            &state_plan,
+            (),
+            NoAuxiliaryBoundarySchema::new(8),
+        ),
+        Err(eredu_runtime::PipelineRankBindingError::State { .. })
+    ));
     for (rank, partition) in ranks.iter().zip(&projected) {
         rank.validate_partition(&requirements, partition).unwrap();
     }

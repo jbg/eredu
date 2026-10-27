@@ -1089,6 +1089,11 @@ does not allocate temporary group catalogs. A partition derives its local unit
 addresses from the validated complete unit layout and ordered group ranges;
 source and target partitions using those same facts have the same addresses.
 Family-local geometry, native binding and communication checks remain separate.
+`construct_partition` uses the retained group ranges and ownership directly, with
+family-supplied parameter, state and boundary declarations. It returns a partition
+only after construction and admission checks succeed. Construction failures retain
+their neutral source through `PipelineRankBindingError`; an ownership-only inspection
+projection cannot grant unadmitted mutable state.
 Families retain the declarations and selected mechanisms. State and ownership
 errors preserve their neutral causes; active embedded prediction uses its
 separate placement contract and is rejected explicitly by this base projection.

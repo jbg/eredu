@@ -1602,20 +1602,16 @@ where
         Some(geometry.local_layout()),
     )
     .map_err(|e| error(e.to_string()))?;
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        selected
-            .requirements()
-            .groups()
-            .iter()
-            .map(|group| (group.group().as_str(), group.units())),
-        selected.requirements().ownership().clone(),
-        definition.state_layout(),
-        definition.state_partition_plan(),
-        geometry.clone(),
-        TextBoundarySchema::new(args.hidden_size()),
-    )
-    .map_err(|e| error(e.to_string()))?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry.clone(),
+            TextBoundarySchema::new(args.hidden_size()),
+        )
+        .map_err(|e| error(e.to_string()))?;
     if selected.requirements().state() != partition.state() {
         return Err(error(
             "constructed shared-backbone partition state differs from cold admission".into(),
@@ -1663,22 +1659,16 @@ where
                 Some(source_geometry.local_layout()),
             )
             .map_err(|e| error(e.to_string()))?;
-            let source_partition = ArchitecturePartition::from_description(
-                source_parameters,
-                selected
-                    .requirements()
-                    .groups()
-                    .iter()
-                    .map(|group| (group.group().as_str(), group.units())),
-                partition.ownership().clone(),
-                source_definition.state_layout(),
-                source_definition.state_partition_plan(),
-                source_geometry,
-                TextBoundarySchema::new(source_args.hidden_size()),
-            )
-            .map_err(|e| error(e.to_string()))?;
-            selected.requirements().validate_binding(&source_partition)
-            .map_err(error)?;
+            let source_partition = selected
+                .requirements()
+                .construct_partition(
+                    source_parameters,
+                    source_definition.state_layout(),
+                    source_definition.state_partition_plan(),
+                    source_geometry,
+                    TextBoundarySchema::new(source_args.hidden_size()),
+                )
+                .map_err(|e| error(e.to_string()))?;
             let model = partition::SelectedCompositeKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -1952,18 +1942,16 @@ where
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let partition = ArchitecturePartition::from_description(
-                &parameters,
-                groups
-                    .iter()
-                    .map(|group| (group.group().as_str(), group.units())),
-                selected.requirements().ownership().clone(),
-                definition.state_layout(),
-                definition.state_partition_plan(),
-                geometry.clone(),
-                crate::diffusion_gemma::composite::BoundarySchema::new(args.text.hidden_size),
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    crate::diffusion_gemma::composite::BoundarySchema::new(args.text.hidden_size),
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if selected.requirements().state() != partition.state() {
                 return Err(CompositePartitionPreparationError::Architecture(
                     "constructed composite partition state differs from cold admission".into(),
@@ -2060,22 +2048,16 @@ where
                         .map_err(|error| {
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?;
-                    let source_partition = ArchitecturePartition::from_description(
-                        source_parameters,
-                        groups
-                            .iter()
-                            .map(|group| (group.group().as_str(), group.units())),
-                        partition.ownership().clone(),
-                        source_definition.state_layout(),
-                        source_definition.state_partition_plan(),
-                        source_geometry,
-                        crate::diffusion_gemma::composite::BoundarySchema::new(
-                            source.text.hidden_size,
-                        ),
-                    )
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+                    let source_partition = selected
+                        .requirements()
+                        .construct_partition(
+                            source_parameters,
+                            source_definition.state_layout(),
+                            source_definition.state_partition_plan(),
+                            source_geometry,
+                            crate::diffusion_gemma::composite::BoundarySchema::new(source.text.hidden_size),
+                        )
+                        .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
                     let mut source_model =
                         crate::diffusion_gemma::composite::CompositeKernel::<B>::from_partition(
                             source.clone(),
@@ -2211,18 +2193,16 @@ where
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?;
             }
-            let partition = ArchitecturePartition::from_description(
-                &parameters,
-                group_ranges
-                    .iter()
-                    .map(|(group, units)| (group.as_str(), units.clone())),
-                ownership.clone(),
-                geometry.complete_state_layout(),
-                &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
-                geometry.clone(),
-                crate::gemma4::TextBoundarySchema::from_partition_args(&args.text, &geometry),
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    geometry.complete_state_layout(),
+                    &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
+                    geometry.clone(),
+                    crate::gemma4::TextBoundarySchema::from_partition_args(&args.text, &geometry),
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let architecture = architecture
                 .into_partition_model(&partition)
                 .map_err(|error| {
@@ -2364,18 +2344,16 @@ where
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let partition = ArchitecturePartition::from_description(
-                definition.parameters(),
-                group_ranges
-                    .iter()
-                    .map(|(group, units)| (group.as_str(), units.clone())),
-                ownership.clone(),
-                definition.state_layout(),
-                definition.state_partition_plan(),
-                geometry.clone(),
-                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if selected.requirements().state() != partition.state() {
                 return Err(CompositePartitionPreparationError::Architecture(
                     "constructed Muse partition state differs from cold admission".into(),
@@ -2552,18 +2530,16 @@ where
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let partition = ArchitecturePartition::from_description(
-                definition.parameters(),
-                group_ranges
-                    .iter()
-                    .map(|(group, units)| (group.as_str(), units.clone())),
-                ownership.clone(),
-                definition.state_layout(),
-                definition.state_partition_plan(),
-                geometry.clone(),
-                crate::qwen::vl::PipelineBoundarySchema::from_args(&args),
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    crate::qwen::vl::PipelineBoundarySchema::from_args(&args),
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let architecture = crate::qwen::vl::VlKernel::<B>::from_partition(
                 args.clone(),
                 definition,
@@ -2711,18 +2687,16 @@ where
                 &args,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let partition = ArchitecturePartition::from_description(
-                definition.parameters(),
-                group_ranges
-                    .iter()
-                    .map(|(group, units)| (group.as_str(), units.clone())),
-                ownership.clone(),
-                definition.state_layout(),
-                definition.state_partition_plan(),
-                geometry.clone(),
-                boundary,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    boundary,
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
                 args.clone(),
                 definition,
@@ -2880,18 +2854,16 @@ where
             } else {
                 None
             };
-            let partition = ArchitecturePartition::from_description(
-                &parameters,
-                group_ranges
-                    .iter()
-                    .map(|(group, units)| (group.as_str(), units.clone())),
-                ownership.clone(),
-                definition.state_layout(),
-                definition.state_partition_plan(),
-                geometry.clone(),
-                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
                 args.clone(),
                 definition,
@@ -3048,19 +3020,16 @@ where
     }
     let definition = crate::qwen::vl::select_definition(&source, definition, Some(&local))
         .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_description(
-        definition.parameters(),
-        ranges(),
-        ownership.clone(),
-        definition.state_layout(),
-        definition.state_partition_plan(),
-        geometry,
-        crate::qwen::vl::PipelineBoundarySchema::from_args(&source),
-    )
-    .map_err(|error| error.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Qwen3-VL transform source changed selected state".into());
-    }
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            definition.parameters(),
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry,
+            crate::qwen::vl::PipelineBoundarySchema::from_args(&source),
+        )
+        .map_err(|error| error.to_string())?;
     crate::qwen::vl::PartitionLocalFoundation::from_partition(&source, &partition)
         .map_err(|e| e.to_string())?;
     let architecture = crate::qwen::vl::VlKernel::<B>::from_partition(
@@ -3166,19 +3135,16 @@ where
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        ranges(),
-        ownership.clone(),
-        geometry.complete_state_layout(),
-        &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
-        geometry.clone(),
-        crate::gemma4::TextBoundarySchema::from_partition_args(&source.text, &geometry),
-    )
-    .map_err(|error| error.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Gemma 4 transform source changed selected state".into());
-    }
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            geometry.complete_state_layout(),
+            &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
+            geometry.clone(),
+            crate::gemma4::TextBoundarySchema::from_partition_args(&source.text, &geometry),
+        )
+        .map_err(|error| error.to_string())?;
     if !sparse {
         crate::gemma4::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
@@ -3254,19 +3220,16 @@ where
     }
     let definition = crate::muse::model::select_definition(source, definition, Some(&local))
         .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_description(
-        definition.parameters(),
-        ranges(),
-        ownership.clone(),
-        definition.state_layout(),
-        definition.state_partition_plan(),
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(source.hidden_size),
-    )
-    .map_err(|error| error.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Muse-Glimmer transform source changed selected state".into());
-    }
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            definition.parameters(),
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(source.hidden_size),
+        )
+        .map_err(|error| error.to_string())?;
     crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
         .map_err(|error| error.to_string())?;
     let mut architecture = crate::muse::MuseKernel::<B>::from_partition(
@@ -3374,19 +3337,16 @@ where
     } else {
         None
     };
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        ranges(),
-        ownership.clone(),
-        definition.state_layout(),
-        definition.state_partition_plan(),
-        geometry,
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(source.text_config.hidden_size),
-    )
-    .map_err(|error| error.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Inkling transform source changed selected state".into());
-    }
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(source.text_config.hidden_size),
+        )
+        .map_err(|error| error.to_string())?;
     if !source.text_config.has_sparse_moe_layers() {
         crate::inkling::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
@@ -3633,18 +3593,16 @@ where
                 &args,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let partition = ArchitecturePartition::from_description(
-                definition.parameters(),
-                group_ranges
-                    .iter()
-                    .map(|(group, units)| (group.as_str(), units.clone())),
-                ownership.clone(),
-                definition.state_layout(),
-                definition.state_partition_plan(),
-                geometry.clone(),
-                boundary,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    boundary,
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
                 args.clone(),
                 definition,
@@ -3803,18 +3761,16 @@ where
             } else {
                 None
             };
-            let partition = ArchitecturePartition::from_description(
-                &parameters,
-                group_ranges
-                    .iter()
-                    .map(|(group, units)| (group.as_str(), units.clone())),
-                ownership.clone(),
-                definition.state_layout(),
-                definition.state_partition_plan(),
-                geometry.clone(),
-                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
+                )
+                .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
                 args.clone(),
                 definition,

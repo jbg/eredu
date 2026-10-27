@@ -85,17 +85,16 @@ where
         crate::qwen::hybrid::local_geometry(&selected_args, &layout).map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry.clone(),
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(architecture)?;
-    selected.requirements().validate_binding(&partition).map_err(architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry.clone(),
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -117,17 +116,15 @@ where
                 "dense Qwen hybrid transform source changed local state geometry",
             ));
         }
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
-        )
-        .map_err(architecture)?;
-        selected.requirements().validate_binding(&source_partition)
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry.clone(),
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+            )
             .map_err(architecture)?;
         let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             source_args,
@@ -245,16 +242,16 @@ where
             .map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry.clone(),
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry.clone(),
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(architecture)?;
     let source_architecture = if selected.base().text().uses_weight_transform() {
         let source_definition =
             crate::qwen::hybrid::project_parameters(args, &retained).map_err(architecture)?;
@@ -272,17 +269,15 @@ where
         let source_plan =
             crate::qwen::hybrid::partition_expert_realization_plan(args, &source_geometry, rank)
                 .map_err(architecture)?;
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
-        )
-        .map_err(architecture)?;
-        selected.requirements().validate_binding(&source_partition)
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry.clone(),
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+            )
             .map_err(architecture)?;
         let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             args.clone(),
