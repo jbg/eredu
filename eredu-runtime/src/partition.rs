@@ -371,7 +371,7 @@ impl ArchitectureParameterDescription {
         for tagged in &groups {
             tagged.owner().validate(graph, layout)?;
             for member in tagged.group().members() {
-                if let Some(previous) = actual.insert(member.target().to_owned(), tagged.owner()) {
+                if let Some(previous) = actual.insert(member.target(), tagged.owner()) {
                     return Err(ArchitectureParameterError::DuplicateOwnership {
                         target: member.target().to_owned(),
                         first: previous.clone(),
@@ -381,12 +381,15 @@ impl ArchitectureParameterDescription {
             }
         }
         if let Some(expected) = expected {
-            if let Some(target) = expected.keys().find(|target| !actual.contains_key(*target)) {
+            if let Some(target) = expected
+                .keys()
+                .find(|target| !actual.contains_key(target.as_str()))
+            {
                 return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
             }
-            if let Some(target) = actual.keys().find(|target| !expected.contains_key(*target)) {
+            if let Some(target) = actual.keys().find(|target| !expected.contains_key(**target)) {
                 return Err(ArchitectureParameterError::UnexpectedOwnership(
-                    target.clone(),
+                    target.to_string(),
                 ));
             }
             for tagged in &groups {
@@ -623,10 +626,8 @@ impl ArchitectureParameterDescription {
             let dependencies = self.graph.groups()[parent]
                 .dependencies()
                 .iter()
-                .filter(|dependency| graph.group_index(dependency).is_some())
-                .cloned()
-                .collect::<Vec<_>>();
-            if group.dependencies() != dependencies {
+                .filter(|dependency| graph.group_index(dependency).is_some());
+            if !group.dependencies().iter().eq(dependencies) {
                 return Err(ArchitectureParameterError::InvalidProjectedDependencies(
                     group.id().to_owned(),
                 ));
