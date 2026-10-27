@@ -118,12 +118,19 @@ impl AddressableBankPreparation {
         entries: Vec<AddressableBankEntry>,
         source: &C,
     ) -> Result<PreparedSelectedAddressableBank, AddressableBankPreparationError> {
-        let expected_keys: BTreeSet<_> = self.expected.keys().copied().collect();
         let actual_keys: BTreeSet<_> = entries.iter().map(AddressableBankEntry::key).collect();
-        if expected_keys != actual_keys {
+        if !self.expected.keys().eq(actual_keys.iter()) {
             return Err(AddressableBankPreparationError::MemberCoverage {
-                missing: expected_keys.difference(&actual_keys).copied().collect(),
-                unexpected: actual_keys.difference(&expected_keys).copied().collect(),
+                missing: self
+                    .expected
+                    .keys()
+                    .filter(|key| !actual_keys.contains(*key))
+                    .copied()
+                    .collect(),
+                unexpected: actual_keys
+                    .into_iter()
+                    .filter(|key| !self.expected.contains_key(key))
+                    .collect(),
             });
         }
         for entry in &entries {
