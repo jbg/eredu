@@ -204,18 +204,6 @@ impl ParameterGroupOwner {
         })
     }
 
-    fn is_local_partition_parts(
-        &self,
-        groups: &[PartitionGroup],
-        ownership: &PartitionOwnership,
-    ) -> bool {
-        self.is_stored_by(ownership, |group, unit| {
-            groups
-                .iter()
-                .any(|owned| owned.group() == group && owned.contains(unit))
-        })
-    }
-
     /// Tests static consumers and unit ownership without constructing a module.
     pub fn is_owned_by(
         &self,
@@ -1895,10 +1883,8 @@ impl<G, A> ArchitecturePartition<G, A> {
             unit_layout,
             group_ranges,
             ownership,
-            None,
             local_geometry,
             boundary_schema,
-            std::iter::empty(),
         )?;
         partition.state = partition
             .resolve_state_partition(complete_state, state_plan)
@@ -1907,19 +1893,15 @@ impl<G, A> ArchitecturePartition<G, A> {
         Ok(partition)
     }
 
-    /// Creates one validated rank-local architecture partition after the
-    /// authoritative architecture topology has already been derived.
-    #[allow(clippy::too_many_arguments)]
+    /// Selects rank-local topology before declaration-owned state and bindings attach.
     fn new<S>(
         invocations: &crate::ExecutionUnitAddressMap,
         graph: ExecutionGraph,
         unit_layout: ExecutionUnitLayout,
         group_ranges: impl IntoIterator<Item = (S, Range<usize>)>,
         ownership: PartitionOwnership,
-        state: Option<PartitionState>,
         local_geometry: G,
         boundary_schema: A,
-        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
     ) -> Result<Self, ArchitecturePartitionError>
     where
         S: Into<String>,
@@ -1964,26 +1946,6 @@ impl<G, A> ArchitecturePartition<G, A> {
         }
         groups.sort_by_key(PartitionGroup::group_index);
 
-        let parameter_bindings = parameter_bindings.into_iter().collect::<Vec<_>>();
-        let mut targets = BTreeSet::new();
-        for binding in &parameter_bindings {
-            if !binding
-                .owner()
-                .is_local_partition_parts(&groups, &ownership)
-            {
-                return Err(ArchitecturePartitionError::NonLocalParameterOwner(
-                    binding.owner().clone(),
-                ));
-            }
-            for member in binding.members() {
-                if !targets.insert(member.target().to_owned()) {
-                    return Err(ArchitecturePartitionError::DuplicateParameterTarget(
-                        member.target().to_owned(),
-                    ));
-                }
-            }
-        }
-
         invocations.validate_layout(&unit_layout)?;
         let invocations = invocations.select_invocations(groups.iter().flat_map(|group| {
             group
@@ -1997,10 +1959,10 @@ impl<G, A> ArchitecturePartition<G, A> {
             invocations,
             groups,
             ownership,
-            state,
+            state: None,
             local_geometry,
             boundary_schema,
-            parameter_bindings,
+            parameter_bindings: Vec::new(),
         })
     }
 
@@ -2880,12 +2842,6 @@ pub enum ArchitecturePartitionError {
         /// Local state-layer count.
         layers: usize,
     },
-    /// Two semantic parameter groups claim the same physical target.
-    #[error("architecture partition repeats parameter target {0:?}")]
-    DuplicateParameterTarget(String),
-    /// A supplied parameter owner is not part of this rank-local partition.
-    #[error("architecture partition includes non-local parameter owner {0:?}")]
-    NonLocalParameterOwner(ParameterGroupOwner),
 }
 
 #[cfg(test)]
@@ -3000,10 +2956,12 @@ mod tests {
             layout,
             [("prediction", 0..2), ("primary", 1..4)],
             PartitionOwnership::new(true, false, ["embedding", "normalization"]).unwrap(),
-            Some(PartitionState::new(state_layout(2), 7).unwrap()),
             Geometry("local"),
             Boundary { route: 3 },
-            [
+        )
+        .map(|mut partition| {
+            partition.state = Some(PartitionState::new(state_layout(2), 7).unwrap());
+            partition.parameter_bindings = Vec::from([
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::static_role("embedding"),
                     parameter("model.embed_tokens", "model.embed_tokens.weight"),
@@ -3015,8 +2973,9 @@ mod tests {
                     ),
                     parameter("model.layers.1", "model.layers.1.weight"),
                 ),
-            ],
-        )
+            ]);
+            partition
+        })
         .unwrap()
     }
 
@@ -3031,10 +2990,8 @@ mod tests {
             layout(&graph),
             [("primary", primary)],
             ownership,
-            None,
             (),
             (),
-            [],
         )
         .unwrap()
     }
@@ -3500,35 +3457,6 @@ mod tests {
     }
 
     #[test]
-    fn partition_rejects_parameter_owner_outside_local_unit_ranges() {
-        let graph = graph();
-        let error = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
-            graph.clone(),
-            layout(&graph),
-            [("primary", 1..4)],
-            PartitionOwnership::new(false, false, ["embedding"]).unwrap(),
-            None,
-            (),
-            (),
-            [OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::execution_unit(
-                    ExecutionGroupId::new("prediction").unwrap(),
-                    0,
-                ),
-                parameter("prediction", "prediction.weight"),
-            )],
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ArchitecturePartitionError::NonLocalParameterOwner(
-                ParameterGroupOwner::ExecutionUnit { .. }
-            )
-        ));
-    }
-
-    #[test]
     fn parameter_description_rejects_missing_duplicate_and_out_of_range_ownership() {
         let embedding = parameter("embedding", "model.embed_tokens.weight");
         let layer = parameter("layer", "model.layers.1.weight");
@@ -3722,10 +3650,8 @@ mod tests {
             layout(&mismatched_graph),
             [("primary", 0..1)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -3739,10 +3665,8 @@ mod tests {
             layout(&graph),
             [("missing", 0..1)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert_eq!(
@@ -3756,10 +3680,8 @@ mod tests {
             layout(&graph),
             [("primary", 0..1), ("primary", 1..2)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert_eq!(
@@ -3777,10 +3699,8 @@ mod tests {
             layout(&graph),
             [("primary", 2..2)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -3794,10 +3714,8 @@ mod tests {
             layout(&graph),
             [("prediction", 1..4)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -3817,41 +3735,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_empty_static_roles_and_duplicate_parameter_targets() {
-        assert_eq!(
-            PartitionOwnership::new(false, false, [" "]).unwrap_err(),
-            ArchitecturePartitionError::EmptyStaticRole
-        );
-
-        let graph = graph();
-        let error = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
-            graph.clone(),
-            layout(&graph),
-            [("primary", 0..1)],
-            PartitionOwnership::new(false, false, ["embedding", "normalization"]).unwrap(),
-            None,
-            (),
-            (),
-            [
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::static_role("embedding"),
-                    parameter("first", "shared.weight"),
-                ),
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::static_role("normalization"),
-                    parameter("second", "shared.weight"),
-                ),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            ArchitecturePartitionError::DuplicateParameterTarget("shared.weight".into())
-        );
-    }
-
     fn layered_partition(
         storage_state: Range<usize>,
         owns_input: bool,
@@ -3864,14 +3747,16 @@ mod tests {
             layout,
             [("decoder", 1..3)],
             PartitionOwnership::new(owns_input, false, std::iter::empty::<String>()).unwrap(),
-            Some(
+            (),
+            (),
+        )
+        .map(|mut partition| {
+            partition.state = Some(
                 PartitionState::new(state_layout(storage_state.len()), storage_state.start)
                     .unwrap(),
-            ),
-            (),
-            (),
-            std::iter::empty(),
-        )
+            );
+            partition
+        })
         .unwrap()
     }
 
@@ -3907,11 +3792,13 @@ mod tests {
             layout,
             [("vision", 0..1), ("decoder", 0..2)],
             PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
-            Some(PartitionState::new(state_layout(1), 1).unwrap()),
             (),
             (),
-            std::iter::empty(),
         )
+        .map(|mut partition| {
+            partition.state = Some(PartitionState::new(state_layout(1), 1).unwrap());
+            partition
+        })
         .unwrap();
 
         let vision =
@@ -3927,10 +3814,8 @@ mod tests {
             ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
             [("vision", 0..1)],
             PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap();
         assert_eq!(

@@ -6658,8 +6658,9 @@ resources. `from_architecture` validates the parameter declaration against the
 concrete neutral architecture, derives its state plan and uses the same
 construction path. Partition preparation projects the declaration's retained
 invocation-to-storage map directly, preserving shared owners outside the selected
-logical-unit range. Independent-storage callers use the runtime's identity-map
-constructor. Backend placement code supplies rank-local ranges and ownership,
+logical-unit range. Partition preparation derives mutable state and parameter
+bindings from the validated declarations. Independent-storage callers use the
+runtime's identity-map constructor. Backend placement code supplies rank-local ranges and ownership,
 but cannot substitute a caller-built topology that only resembles the
 architecture it will execute.
 Balanced unit ranges are only a placement default. When an architecture
