@@ -9708,30 +9708,14 @@ where
                     eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size()),
                 )
                 .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-            for task in &tasks {
-                let target_owner = partition.parameter_bindings().iter().find_map(|binding| {
-                    binding
-                        .group()
-                        .members()
-                        .iter()
-                        .any(|member| member.target() == task.name())
-                        .then(|| binding.owner().clone())
-                });
-                let source_owner =
-                    source_partition
-                        .parameter_bindings()
-                        .iter()
-                        .find_map(|binding| {
-                            binding
-                                .group()
-                                .members()
-                                .iter()
-                                .any(|member| member.target() == task.name())
-                                .then(|| binding.owner().clone())
-                        });
-                validate_transform_task_owner(task.name(), source_owner, target_owner)
-                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-            }
+            partition
+                .validate_transform_parameter_owners(
+                    &source_partition,
+                    tasks.iter().map(|task| task.name()),
+                )
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_architecture = crate::decoder::DecoderKernel::<B, C, P>::from_partition(
                 source_args,
                 source_definition,
@@ -9767,23 +9751,6 @@ where
             store,
         )
         .map_err(DenseDecoderPartitionedDispatchError::Visitor)
-}
-
-fn validate_transform_task_owner(
-    task: &str,
-    source: Option<eredu_runtime::ParameterGroupOwner>,
-    target: Option<eredu_runtime::ParameterGroupOwner>,
-) -> Result<(), String> {
-    let target = target
-        .ok_or_else(|| format!("selected transform task {task:?} has no target partition owner"))?;
-    let source = source
-        .ok_or_else(|| format!("selected transform task {task:?} has no source partition owner"))?;
-    if source != target {
-        return Err(format!(
-            "selected transform task {task:?} changed its source/target owner address"
-        ));
-    }
-    Ok(())
 }
 
 /// Returns whether the normalized architecture has an exact partition constructor.

@@ -10613,6 +10613,12 @@ match the declaration; ordered additional and primary placements produce the exa
 retained local shape. Missing, undeclared or inconsistent tensors return typed
 `RetainedParameterLayoutError` values before native materialization. Family geometry
 and rank-placement admission remain separate checks.
+Partitions resolve canonical physical targets to borrowed `ParameterGroupOwner`
+identities. `validate_transform_parameter_owners` checks admitted conversion tasks
+against both partitions and rejects missing or changed storage owners with typed
+`TransformParameterOwnershipError` values. Logical consumers and physically required
+replicas retain their declaration identities; validation does not clone owner
+catalogs or merge independently leased resources.
 `derive_partitioned_transform_source_layout` validates the source and target
 invocation graphs and unit addresses, lowers both retained declarations for the
 selected rank, and projects source coordinates. Its typed error distinguishes

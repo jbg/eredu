@@ -403,7 +403,7 @@ pub use partition::{
     LayeredPartitionDriver, LayeredPartitionError, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema,
     OwnedParameterGroupSpec, ParameterGroupOwner, PartitionGroup, PartitionOwnership,
     PartitionState, PipelineActivationDtype, PipelineWireContract, ResolvedBoundaryTensorSpec,
-    ResolvedBoundaryWireSchema,
+    ResolvedBoundaryWireSchema, TransformParameterOwnershipError,
 };
 pub use partitioned_execution::{
     CommunicationTensorMetadata, DistributedExecutionPhase, LayerwiseTraversalPartitionExecutor,

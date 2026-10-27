@@ -269,6 +269,20 @@ impl ParameterGroupOwner {
     }
 }
 
+/// Source-format conversion changes canonical ownership of a selected parameter.
+#[derive(Debug, thiserror::Error)]
+pub enum TransformParameterOwnershipError {
+    /// The selected output has no target partition owner.
+    #[error("selected transform task {0:?} has no target partition owner")]
+    MissingTarget(String),
+    /// The selected output has no source partition owner.
+    #[error("selected transform task {0:?} has no source partition owner")]
+    MissingSource(String),
+    /// Source and target assign the same parameter to different storage owners.
+    #[error("selected transform task {0:?} changed its source/target owner address")]
+    Changed(String),
+}
+
 /// One neutral parameter group tagged with its architecture-owned location.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct OwnedParameterGroupSpec {
@@ -2067,6 +2081,40 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Returns input, output, and static-module ownership.
     pub const fn ownership(&self) -> &PartitionOwnership {
         &self.ownership
+    }
+
+    /// Resolves the unique canonical storage owner of a selected physical target.
+    /// Logical consumers and replicated storage retain their declared owner identity.
+    pub fn parameter_owner(&self, target: &str) -> Option<&ParameterGroupOwner> {
+        self.parameter_bindings.iter().find_map(|binding| {
+            binding
+                .members()
+                .iter()
+                .any(|member| member.target() == target)
+                .then(|| binding.owner())
+        })
+    }
+
+    /// Checks that conversion resources keep the selected outputs' canonical owners.
+    /// Targets are supplied by admitted materialization tasks; this neither changes
+    /// ownership nor combines independent storage resources into one residency unit.
+    pub fn validate_transform_parameter_owners<'a, H, W>(
+        &self,
+        source: &ArchitecturePartition<H, W>,
+        targets: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), TransformParameterOwnershipError> {
+        for name in targets {
+            let target = self
+                .parameter_owner(name)
+                .ok_or_else(|| TransformParameterOwnershipError::MissingTarget(name.into()))?;
+            let source = source
+                .parameter_owner(name)
+                .ok_or_else(|| TransformParameterOwnershipError::MissingSource(name.into()))?;
+            if source != target {
+                return Err(TransformParameterOwnershipError::Changed(name.into()));
+            }
+        }
+        Ok(())
     }
 
     /// Returns rank-local state geometry when this partition owns mutable state.

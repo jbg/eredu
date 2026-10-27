@@ -1778,6 +1778,38 @@ fn independent_backend_consumes_canonical_binding_and_placement_plans() {
         eredu_runtime::validate_retained_parameter_layout(&parameters, &inconsistent),
         Err(eredu_runtime::RetainedParameterLayoutError::Shape { .. })
     ));
+    let stateless =
+        StateLayout::new(LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap()).unwrap();
+    let state_plan = eredu_runtime::ArchitectureStatePartitionPlan::new([]);
+    let partition = |parameters: &ArchitectureParameterDescription| {
+        ArchitecturePartition::from_description(
+            parameters,
+            [("decoder", 0..1)],
+            PartitionOwnership::new(true, true, ["embedding"]).unwrap(),
+            &stateless,
+            &state_plan,
+            (),
+            NoAuxiliaryBoundarySchema::new(2),
+        )
+        .unwrap()
+    };
+    let target = partition(&parameters);
+    target
+        .validate_transform_parameter_owners(&target, ["weight"])
+        .unwrap();
+    let source_parameters = ArchitectureParameterDescription::from_owned(
+        &graph,
+        &units,
+        [eredu_runtime::OwnedParameterGroupSpec::new(
+            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
+            parameters.groups()[0].group().clone(),
+        )],
+    )
+    .unwrap();
+    assert!(matches!(
+        target.validate_transform_parameter_owners(&partition(&source_parameters), ["weight"]),
+        Err(eredu_runtime::TransformParameterOwnershipError::Changed(_))
+    ));
     // Placement and sizing consume a metadata-only catalog with no payload API.
     struct Header(eredu_checkpoint::store::TensorMetadata);
     impl eredu_checkpoint::recipe::RecipeCatalog for Header {
