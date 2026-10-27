@@ -85,7 +85,7 @@ impl PreparedTargetPartition {
                 rank.expert_parallel_size(),
             )
             .map_err(invalid)?;
-        retained_layout::validate(&parameters, &layout).map_err(invalid)?;
+        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(invalid)?;
         parameters = parameters
             .with_partition_layout(rank, layout.clone())
             .map_err(invalid)?;

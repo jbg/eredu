@@ -1736,6 +1736,48 @@ fn independent_backend_consumes_canonical_binding_and_placement_plans() {
             false,
         ),
     );
+    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+    let group = eredu_runtime::ParameterGroupSpec::new(
+        "weight",
+        ParameterRole::ColumnProjection,
+        [eredu_runtime::ParameterMemberSpec::new(
+            "weight",
+            [2, 2],
+            eredu_runtime::MemberSharding::Balanced { axis: 0 },
+        )],
+    )
+    .unwrap();
+    let parameters = ArchitectureParameterDescription::from_owned(
+        &graph,
+        &units,
+        [eredu_runtime::OwnedParameterGroupSpec::new(
+            eredu_runtime::ParameterGroupOwner::execution_unit(
+                units.group_id(0).unwrap().clone(),
+                0,
+            ),
+            group,
+        )],
+    )
+    .unwrap();
+    eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).unwrap();
+    let mut inconsistent = layout.clone();
+    inconsistent.insert(
+        "weight".into(),
+        layout
+            .tensor("weight")
+            .unwrap()
+            .clone()
+            .with_additional_placement(TensorPlacement::Range {
+                axis: 1,
+                start: 0,
+                end: 1,
+            }),
+    );
+    assert!(matches!(
+        eredu_runtime::validate_retained_parameter_layout(&parameters, &inconsistent),
+        Err(eredu_runtime::RetainedParameterLayoutError::Shape { .. })
+    ));
     // Placement and sizing consume a metadata-only catalog with no payload API.
     struct Header(eredu_checkpoint::store::TensorMetadata);
     impl eredu_checkpoint::recipe::RecipeCatalog for Header {

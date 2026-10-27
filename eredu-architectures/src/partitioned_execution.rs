@@ -7,7 +7,6 @@ mod nemotron_labs_diffusion;
 mod parameter_access;
 pub(crate) mod qwen4_exp;
 mod qwen_hybrid;
-mod retained_layout;
 
 use std::{
     borrow::Borrow,
@@ -8437,8 +8436,9 @@ where
             .map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
             })?;
-        retained_layout::validate(&parameters, &layout)
-            .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(|error| {
+            eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+        })?;
         if let Some((source, source_layout)) = source_architecture.as_ref() {
             let source_parameters = source.parameter_description(context).map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
@@ -8450,8 +8450,9 @@ where
                     "selected transform source changed the execution-unit address space".into(),
                 ));
             }
-            retained_layout::validate(&source_parameters, source_layout)
-                .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+            eredu_runtime::validate_retained_parameter_layout(&source_parameters, source_layout).map_err(
+                |error| eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string()),
+            )?;
         }
         eredu_runtime::prepare_partitioned_session_runtime::<_, B, _, S, _, _, FactoryError, _>(
             architecture,
@@ -12536,8 +12537,9 @@ where
             .map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
             })?;
-        retained_layout::validate(&parameters, &layout)
-            .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(|error| {
+            eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+        })?;
         if let Some((source, source_layout)) = source_architecture.as_ref() {
             let source_parameters = source.parameter_description(context).map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
@@ -12545,8 +12547,9 @@ where
             validate_transform_parameter_space(&source_parameters, &parameters).map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
             })?;
-            retained_layout::validate(&source_parameters, source_layout)
-                .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+            eredu_runtime::validate_retained_parameter_layout(&source_parameters, source_layout).map_err(
+                |error| eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string()),
+            )?;
         }
         let excluded = if matches!(
             bank_residency,

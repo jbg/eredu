@@ -10607,6 +10607,12 @@ lowerings and invokes its typed geometry builder only when payload conversion is
 selected. The resulting layout has one retained shared owner. Ordinary rank-local
 projection and family-specific prediction geometry use this same preparation
 mechanism; no checkpoint authority or native materialization is selected here.
+`validate_retained_parameter_layout` checks complete retained physical layouts
+without replanning ownership. Canonical targets, global shape, group name and role
+match the declaration; ordered additional and primary placements produce the exact
+retained local shape. Missing, undeclared or inconsistent tensors return typed
+`RetainedParameterLayoutError` values before native materialization. Family geometry
+and rank-placement admission remain separate checks.
 `derive_partitioned_transform_source_layout` validates the source and target
 invocation graphs and unit addresses, lowers both retained declarations for the
 selected rank, and projects source coordinates. Its typed error distinguishes
