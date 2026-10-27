@@ -220,21 +220,21 @@ impl PreparedAddressableBankResidency {
         policy: eredu_core::residency::ResidencyPolicy,
         initial_tier: eredu_core::residency::MemoryTier,
     ) -> Result<Self, AddressableBankResidencyError> {
-        let entries: Vec<_> = entries.into_iter().collect();
+        let entries = entries.into_iter();
+        let mut catalog = std::collections::BTreeMap::new();
+        let mut definitions = Vec::with_capacity(entries.size_hint().0);
         let plan = plan_addressable_bank_residency(
-            entries.iter().map(|entry| (entry.key(), entry.bytes())),
+            entries.map(|entry| {
+                let (key, unit, bytes) = entry.into_parts();
+                catalog.insert(key, bytes);
+                definitions.push(unit);
+                (key, bytes)
+            }),
             &rows,
             config,
             policy,
             initial_tier,
         )?;
-        let mut catalog = std::collections::BTreeMap::new();
-        let mut definitions = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let (key, unit, bytes) = entry.into_parts();
-            catalog.insert(key, bytes);
-            definitions.push(unit);
-        }
         Ok(Self {
             catalog,
             definitions,
