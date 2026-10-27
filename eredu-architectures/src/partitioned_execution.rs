@@ -25,7 +25,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     derive_partitioned_local_layout, derive_partitioned_transform_source_layout,
-    retained_partition_layout, validate_transform_parameter_space, ArchitectureBoundary,
+    validate_transform_parameter_space, ArchitectureBoundary,
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitecturePartition,
     BoundaryDimensionContract, BoundaryRoleContract, BoundaryWireSchema, CommunicationCapabilities,
     CommunicationCompletionPolicy, CommunicationGroupRequirements, CommunicationManifest,
@@ -8051,17 +8051,6 @@ pub(crate) trait TextRequirements {
     fn text(&self) -> &eredu_runtime::ReplicatedTextRequirements;
 }
 
-fn charge(
-    reservation: &mut impl eredu_core::capture::CaptureReservation,
-    host_bytes: u64,
-) -> Result<(), eredu_core::parameters::ParameterError> {
-    reservation.reserve_quota(eredu_core::capture::CaptureUsage {
-        host_bytes,
-        ..Default::default()
-    })?;
-    Ok(())
-}
-
 fn invalid(message: &str) -> eredu_core::parameters::ParameterError {
     eredu_core::parameters::ParameterError::Invalid(message.into())
 }
@@ -8107,91 +8096,6 @@ pub(crate) fn prediction_parameter_layout_for_rank(
         placement,
         true,
         layout.as_deref(),
-        reservation,
-    )
-}
-
-pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
-    admission: &PartitionedAdmission<R>,
-    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
-    parameters: &eredu_runtime::ArchitectureParameterDescription,
-    parameter: &str,
-    global_rank: usize,
-    index: Option<&eredu_runtime::ParameterMemberIndex>,
-    authored: Option<&eredu_runtime::LocalModelLayout>,
-    reservation: &mut impl eredu_core::capture::CaptureReservation,
-) -> Result<eredu_runtime::ParameterPartitionLayout, eredu_core::parameters::ParameterError> {
-    use eredu_core::parameters::ParameterError;
-    let topology = ParallelRankTopology::new(admission.topology().topology(), global_rank)
-        .map_err(|error| invalid(&error.to_string()))?;
-    if parameters.graph() != admission.execution.text().execution_graph()
-        || parameters.unit_layout() != admission.execution.text().execution_units()
-    {
-        return Err(invalid(
-            "parameter declaration differs from retained execution",
-        ));
-    }
-    let resolved = match index {
-        Some(index) => index.resolve(parameter)?,
-        None => eredu_runtime::resolve_parameter_member(tasks, parameters, parameter)?,
-    };
-    let group = resolved.group();
-    let member = resolved.member();
-    let text = admission.execution.text();
-    // Prepay rank metadata, including transient ownership ranges and role strings.
-    // Parameter target strings are deliberately excluded from this projection.
-    let mut bytes = 1024u64
-        .checked_add(member.target().len() as u64)
-        .ok_or(ParameterError::Overflow)?;
-    for group in text.execution_graph().groups() {
-        bytes = bytes
-            .checked_add(group.id().len() as u64)
-            .ok_or(ParameterError::Overflow)?;
-    }
-    for transport in text.group_transports() {
-        bytes = bytes
-            .checked_add(512)
-            .and_then(|n| {
-                n.checked_add((topology.pipeline_parallel_size() as u64).checked_mul(64)?)
-            })
-            .ok_or(ParameterError::Overflow)?;
-        for role in transport
-            .first_owner_static_roles
-            .iter()
-            .chain(&transport.last_owner_static_roles)
-        {
-            bytes = bytes
-                .checked_add(128)
-                .and_then(|n| n.checked_add((role.len() as u64).checked_mul(4)?))
-                .ok_or(ParameterError::Overflow)?;
-        }
-    }
-    for role in text.replicated_static_roles() {
-        bytes = bytes
-            .checked_add(128)
-            .and_then(|bytes| bytes.checked_add((role.len() as u64).checked_mul(4)?))
-            .ok_or(ParameterError::Overflow)?;
-    }
-    charge(reservation, bytes)?;
-    let rank = eredu_runtime::PipelineRankProjection::new(text, None, topology, false)
-        .map_err(|error| invalid(&error.to_string()))?;
-    let owns = parameters.stores_owner(group.owner(), rank.ownership(), |id, unit| {
-        rank.groups()
-            .iter()
-            .any(|owned| owned.group() == id && owned.units().contains(&unit))
-    });
-    let retained = match authored {
-        Some(layout) => Some(layout),
-        None => {
-            retained_partition_layout(parameters, topology).map_err(ParameterError::Unsupported)?
-        }
-    };
-    eredu_runtime::derive_parameter_member_layout(
-        resolved,
-        topology,
-        topology,
-        owns,
-        retained,
         reservation,
     )
 }

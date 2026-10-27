@@ -366,53 +366,38 @@ impl SelectedExecution {
         Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
     > {
-        use crate::partitioned_execution::selected_parameter_layout_for_rank;
         let tasks = self.text_realization().materialization_tasks();
         let authored = self
             .authored_layout(parameters, global_rank)
             .map_err(eredu_core::parameters::ParameterError::Unsupported)?;
-        match self.kind.as_ref() {
-            SelectedExecutionKind::PartitionedDense(selected) => {
-                selected_parameter_layout_for_rank(
-                    selected.requirements(),
-                    tasks,
-                    parameters,
-                    parameter,
-                    global_rank,
-                    index,
-                    authored.as_ref(),
-                    reservation,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedRouted(selected) => {
-                selected_parameter_layout_for_rank(
-                    selected.requirements(),
-                    tasks,
-                    parameters,
-                    parameter,
-                    global_rank,
-                    index,
-                    authored.as_ref(),
-                    reservation,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedComposite(selected) => {
-                selected_parameter_layout_for_rank(
-                    selected.requirements(),
-                    tasks,
-                    parameters,
-                    parameter,
-                    global_rank,
-                    index,
-                    authored.as_ref(),
-                    reservation,
-                )
-                .map(Some)
-            }
-            _ => Ok(None),
-        }
+        let (execution, topology) = match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => (
+                selected.requirements().execution(),
+                selected.requirements().topology(),
+            ),
+            SelectedExecutionKind::PartitionedRouted(selected) => (
+                selected.requirements().execution().text(),
+                selected.requirements().topology(),
+            ),
+            SelectedExecutionKind::PartitionedComposite(selected) => (
+                selected.requirements().execution().execution(),
+                selected.requirements().topology(),
+            ),
+            _ => return Ok(None),
+        };
+        let topology = eredu_core::ParallelRankTopology::new(topology.topology(), global_rank)
+            .map_err(|error| eredu_core::parameters::ParameterError::Invalid(error.to_string()))?;
+        eredu_runtime::derive_rank_parameter_member_layout(
+            execution,
+            topology,
+            tasks,
+            parameters,
+            parameter,
+            index,
+            authored.as_ref(),
+            reservation,
+        )
+        .map(Some)
     }
 
     /// Describes global scalar component coordinates for this retained partition.

@@ -1067,6 +1067,12 @@ encoding blocks into effective scalar coordinates and prepays metadata budgets;
 companions use their own scalar geometry. Architectures retain semantic placement
 and pipeline ownership policy. Resolution inspects metadata and grants
 no parameter value, editing, checkpoint or native resource authority.
+`derive_rank_parameter_member_layout` applies the retained execution declaration's
+pipeline ownership to this same coordinate compiler. It validates graph and global
+unit identities and prepays transient rank metadata before projecting ownership.
+Canonical storage consumers determine whether the parameter is local; authored
+placement and indexed lookup remain explicit inputs. Dense, routed and composite
+inspection use this shared mechanism without granting loaded parameter authority.
 Runtime's `PipelinePlacementPlan` validates complete canonical graph/layout
 identities and declared transport coverage before projecting pipeline owners.
 Sequential groups share one balanced invocation sequence; ordinary groups balance
@@ -8162,9 +8168,9 @@ or unused projections do not refund them.
 
 Architecture `PreparedModelDiscovery::parameter_partition_layout_for_rank`
 resolves the selected task, its declared aliases and emitted companions against the parameter topology
-retained by construction. It reuses the production pipeline-ownership compiler and
-delegates atomic parameter-group lowering and effective coordinate projection to
-runtime's `derive_parameter_member_layout`. The shared compiler consumes selected
+retained by construction. Runtime's `derive_rank_parameter_member_layout` applies
+production pipeline ownership, atomic parameter-group lowering and effective
+coordinate projection under prepaid metadata budgets. The shared compiler consumes selected
 packing-axis and encoding facts to convert complete physical quantization blocks
 to effective scalar coordinates. Fused segments, ordered expert axes, absent
 pipeline owners and shared static consumers retain their distinct meanings. FP8's uncompressed axes preserve uneven scalar ranges.

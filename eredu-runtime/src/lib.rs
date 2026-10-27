@@ -578,7 +578,8 @@ mod parameter_bank;
 mod parameter_acquisition;
 mod parameter_coordinates;
 pub use parameter_coordinates::{
-    derive_parameter_coordinates, derive_parameter_member_layout, ParameterPartitionLayout,
+    derive_parameter_coordinates, derive_parameter_member_layout, derive_rank_parameter_member_layout,
+    ParameterPartitionLayout,
 };
 mod materialization_index;
 pub use materialization_index::{MaterializationTaskIndex, MaterializationTaskIndexError};

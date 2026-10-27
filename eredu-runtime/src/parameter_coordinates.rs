@@ -350,3 +350,82 @@ pub fn derive_parameter_member_layout(
         coordinates,
     })
 }
+
+/// Derives one admitted parameter's coordinates on an actual Cartesian rank.
+/// Ownership projection and all transient rank metadata are charged before they
+/// are allocated. Family-authored physical placement is retained without replanning;
+/// absent placement lowers only the requested canonical parameter group.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_rank_parameter_member_layout(
+    execution: &crate::ReplicatedTextRequirements,
+    topology: ParallelRankTopology,
+    tasks: &[crate::ReplicatedTextMaterializationTask],
+    parameters: &crate::ArchitectureParameterDescription,
+    parameter: &str,
+    index: Option<&crate::ParameterMemberIndex>,
+    authored: Option<&crate::LocalModelLayout>,
+    reservation: &mut impl CaptureReservation,
+) -> Result<ParameterPartitionLayout, ParameterError> {
+    if parameters.graph() != execution.execution_graph()
+        || parameters.unit_layout() != execution.execution_units()
+    {
+        return Err(invalid(
+            "parameter declaration differs from retained execution",
+        ));
+    }
+    let resolved = match index {
+        Some(index) => index.resolve(parameter)?,
+        None => crate::resolve_parameter_member(tasks, parameters, parameter)?,
+    };
+    let group = resolved.group();
+    let member = resolved.member();
+    let text = execution;
+    // Prepay rank metadata, including transient ownership ranges and role strings.
+    // Parameter target strings are deliberately excluded from this projection.
+    let mut bytes = 1024u64
+        .checked_add(member.target().len() as u64)
+        .ok_or(ParameterError::Overflow)?;
+    for group in text.execution_graph().groups() {
+        bytes = bytes
+            .checked_add(group.id().len() as u64)
+            .ok_or(ParameterError::Overflow)?;
+    }
+    for transport in text.group_transports() {
+        bytes = bytes
+            .checked_add(512)
+            .and_then(|n| {
+                n.checked_add((topology.pipeline_parallel_size() as u64).checked_mul(64)?)
+            })
+            .ok_or(ParameterError::Overflow)?;
+        for role in transport
+            .first_owner_static_roles
+            .iter()
+            .chain(&transport.last_owner_static_roles)
+        {
+            bytes = bytes
+                .checked_add(128)
+                .and_then(|n| n.checked_add((role.len() as u64).checked_mul(4)?))
+                .ok_or(ParameterError::Overflow)?;
+        }
+    }
+    for role in text.replicated_static_roles() {
+        bytes = bytes
+            .checked_add(128)
+            .and_then(|bytes| bytes.checked_add((role.len() as u64).checked_mul(4)?))
+            .ok_or(ParameterError::Overflow)?;
+    }
+    charge(reservation, bytes)?;
+    let rank = crate::PipelineRankProjection::new(text, None, topology, false)
+        .map_err(|error| invalid(&error.to_string()))?;
+    let owns = parameters.stores_owner(group.owner(), rank.ownership(), |id, unit| {
+        rank.groups()
+            .iter()
+            .any(|owned| owned.group() == id && owned.units().contains(&unit))
+    });
+    let retained = match authored {
+        Some(layout) => Some(layout),
+        None => crate::retained_partition_layout(parameters, topology)
+            .map_err(ParameterError::Unsupported)?,
+    };
+    crate::derive_parameter_member_layout(resolved, topology, topology, owns, retained, reservation)
+}
