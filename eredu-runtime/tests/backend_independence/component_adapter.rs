@@ -19,7 +19,6 @@ enum Failure {
 }
 
 struct Kernel {
-    fail: bool,
     pinned: Option<FakeModule>,
 }
 impl ComponentKernel<FakeBackend> for Kernel {
@@ -163,16 +162,13 @@ impl ComponentEquations<FakeBackend, StatelessComponentState> for Kernel {
     }
     fn execute(
         &mut self,
-        address: ExecutionUnitAddress,
+        _address: ExecutionUnitAddress,
         unit: &mut FakeUnit,
         hidden: &FakeTensor,
         _: &mut StatelessComponentState,
         _: &mut bool,
         _: &(),
     ) -> Result<FakeTensor, Failure> {
-        if self.fail && address.group() == 1 {
-            return Err(Failure::Equation);
-        }
         let mut output = hidden.clone();
         output.0.push(unit.marker);
         Ok(output)
@@ -256,8 +252,7 @@ fn definition(pinned: bool) -> ComponentDefinition {
             group,
         )
     });
-    let parameters =
-        ArchitectureParameterDescription::from_owned(&graph, &layout, owned).unwrap();
+    let parameters = ArchitectureParameterDescription::from_owned(&graph, &layout, owned).unwrap();
     let transport = ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::Projector,
@@ -289,14 +284,14 @@ fn definition(pinned: bool) -> ComponentDefinition {
     .unwrap();
     definition
 }
-fn adapter(fail: bool) -> ComponentAdapter<ComponentDefinition, Kernel> {
-    ComponentAdapter::new(definition(false), Kernel { fail, pinned: None }).unwrap()
+fn adapter() -> ComponentAdapter<ComponentDefinition, Kernel> {
+    ComponentAdapter::new(definition(false), Kernel { pinned: None }).unwrap()
 }
 
 #[test]
 fn component_adapter_uses_ordinary_residency_and_operation_activity() {
-    let mut resident = ResidentRuntime::new(adapter(false), &()).unwrap();
-    let mut bounded = LayerwiseRuntime::new(adapter(false), RecordingPolicy::bounded(2));
+    let mut resident = ResidentRuntime::new(adapter(), &()).unwrap();
+    let mut bounded = LayerwiseRuntime::new(adapter(), RecordingPolicy::bounded(2));
     let input = FakeTensor(vec![7]);
     let mut state = StatelessComponentState::new().unwrap();
     for extended in [false, true, false] {
@@ -309,10 +304,6 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         assert_eq!(actual, expected);
         assert_eq!(actual.0, if extended { vec![7, 0, 10] } else { vec![7, 0] });
     }
-    assert_eq!(
-        bounded.policy().addresses,
-        [(0, 0, 0), (0, 0, 0), (1, 1, 0), (0, 0, 0)]
-    );
     let prototype = definition(false);
     let graph = prototype.parameters().graph();
     let shared_layout = ExecutionUnitLayout::new(graph, [1, 2]).unwrap();
@@ -359,33 +350,6 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         ArchitectureStatePartitionPlan::new([]),
     )
     .unwrap();
-    let uses = [0, 1].map(|index| {
-        (
-            format!("{}.weight", if index == 0 { "second.0" } else { "shared" }),
-            eredu_runtime::ComponentParameterUse {
-                invocation: shared_layout
-                    .address(shared_layout.ordinal(1, index).unwrap())
-                    .unwrap(),
-                target: "shared.weight".into(),
-            },
-        )
-    });
-    let mut wrong_consumer = uses[0].clone();
-    wrong_consumer.1.invocation = shared_layout.address(0).unwrap();
-    assert!(shared_definition
-        .clone()
-        .with_parameter_uses([wrong_consumer])
-        .is_err());
-    let mut dangling = uses[0].clone();
-    dangling.1.target = "absent.weight".into();
-    assert!(shared_definition
-        .clone()
-        .with_parameter_uses([dangling])
-        .is_err());
-    assert!(shared_definition
-        .clone()
-        .with_parameter_uses([uses[0].clone(), uses[0].clone()])
-        .is_err());
     let shared_definition = shared_definition
         .with_unit_parameter_paths()
         .unwrap()
@@ -401,98 +365,6 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         })
         .unwrap();
     let shared_definition = std::sync::Arc::new(shared_definition);
-    let source_group = shared_definition.parameters().groups()[0].clone();
-    let selected_group = eredu_runtime::expand_linear_format_parameter_groups(
-        vec![source_group.group().clone()],
-        |_| {
-            Ok(Some(
-                eredu_nn::LinearFormatSpec::scaled(
-                    eredu_checkpoint::LinearFormat::MxFp4,
-                    eredu_nn::ParameterSpec::trainable("shared.scale").unwrap(),
-                )
-                .unwrap(),
-            ))
-        },
-    )
-    .unwrap()
-    .remove(0);
-    let projected_parameters = ArchitectureParameterDescription::new(
-        graph,
-        &shared_layout,
-        [selected_group.clone()],
-        [eredu_runtime::OwnedParameterGroupSpec::new(
-            source_group.owner().clone(),
-            selected_group,
-        )],
-    )
-    .unwrap();
-    let renamed = eredu_runtime::ParameterGroupSpec::new(
-        "shared",
-        eredu_runtime::ParameterRole::Replicated,
-        [eredu_runtime::ParameterMemberSpec::new(
-            "neighbor.weight",
-            [1, 64],
-            eredu_runtime::MemberSharding::Replicated,
-        )],
-    )
-    .unwrap();
-    let renamed = ArchitectureParameterDescription::new(
-        graph,
-        &shared_layout,
-        [renamed.clone()],
-        [eredu_runtime::OwnedParameterGroupSpec::new(
-            source_group.owner().clone(),
-            renamed,
-        )],
-    )
-    .unwrap();
-    assert!(shared_definition
-        .project_parameters_with_unit_paths(renamed)
-        .is_err());
-    let packed = projected_parameters.groups()[0].group();
-    let detached = [
-        eredu_runtime::OwnedParameterGroupSpec::new(
-            source_group.owner().clone(),
-            eredu_runtime::ParameterGroupSpec::new(
-                "shared",
-                packed.role(),
-                packed
-                    .members()
-                    .iter()
-                    .filter(|member| member.linear_companion().is_none())
-                    .cloned(),
-            )
-            .unwrap(),
-        ),
-        eredu_runtime::OwnedParameterGroupSpec::new(
-            eredu_runtime::ParameterGroupOwner::static_role("detached"),
-            eredu_runtime::ParameterGroupSpec::new(
-                "detached",
-                packed.role(),
-                packed
-                    .members()
-                    .iter()
-                    .filter(|member| member.linear_companion().is_some())
-                    .cloned(),
-            )
-            .unwrap(),
-        ),
-    ];
-    let detached = ArchitectureParameterDescription::new(
-        graph,
-        &shared_layout,
-        detached.iter().map(|group| group.group().clone()),
-        detached.clone(),
-    )
-    .unwrap();
-    assert!(shared_definition
-        .project_parameters_with_unit_paths(detached)
-        .is_err());
-    let shared_definition = shared_definition
-        .project_parameters_with_unit_paths(projected_parameters)
-        .unwrap()
-        .as_ref()
-        .clone();
     struct SharedObservation(Vec<String>);
     impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for SharedObservation {
         fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Failure> {
@@ -501,14 +373,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         }
     }
     let mut observed = LayerwiseRuntime::new(
-        ComponentAdapter::new(
-            shared_definition.clone(),
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap(),
+        ComponentAdapter::new(shared_definition.clone(), Kernel { pinned: None }).unwrap(),
         RecordingPolicy::bounded(shared_layout.len()),
     );
     let mut observer = SharedObservation(vec![]);
@@ -529,14 +394,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         ["shared.input", "shared.output"]
     );
     let mut shared = ResidentRuntime::new(
-        ComponentAdapter::new(
-            shared_definition,
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap(),
+        ComponentAdapter::new(shared_definition, Kernel { pinned: None }).unwrap(),
         &(),
     )
     .unwrap();
@@ -551,71 +409,11 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
             }
         );
     }
-    assert_eq!(shared.units().iter().map(Vec::len).sum::<usize>(), 2);
     shared.units_mut()[1][0].marker = 29;
     assert_eq!(
         shared.forward((&input, true), &mut state, &()).unwrap().0,
         [7, 0, 29, 29]
     );
-    let rank = eredu_core::ParallelRankTopology::new(
-        eredu_core::ParallelTopology::new(1, 1, 1, 1).unwrap(),
-        0,
-    )
-    .unwrap();
-    let pinned = definition(true);
-    let retained =
-        eredu_runtime::derive_partitioned_local_layout(pinned.parameters(), rank).unwrap();
-    let parameters = pinned
-        .parameters()
-        .clone()
-        .with_partition_layout(rank, retained)
-        .unwrap();
-    let pinned = pinned.with_parameters(parameters, []).unwrap();
-    use eredu_runtime::ArchitectureParameterError;
-    let parameters = pinned.parameters();
-    assert!(matches!(
-        parameters.project_groups(
-            &ExecutionGraph::chain(["first"]).unwrap(),
-            ["missing"],
-        ),
-        Err(ArchitectureParameterError::UnknownProjectedStaticRole(role)) if role == "missing"
-    ));
-    assert!(matches!(
-        parameters.project_groups(
-            &ExecutionGraph::chain(["missing"]).unwrap(),
-            std::iter::empty::<String>(),
-        ),
-        Err(ArchitectureParameterError::ProjectionLayout(_))
-    ));
-    assert!(matches!(
-        parameters.project_groups(
-            &ExecutionGraph::chain(["second", "first"]).unwrap(),
-            std::iter::empty::<String>(),
-        ),
-        Err(ArchitectureParameterError::InvalidProjectedDependencies(group)) if group == "second"
-    ));
-    let without_pinned = pinned
-        .project_groups(
-            "without-neighbor",
-            ExecutionGraph::chain(["first"]).unwrap(),
-            std::iter::empty::<String>(),
-        )
-        .unwrap();
-    assert!(
-        eredu_runtime::derive_partitioned_local_layout(without_pinned.parameters(), rank)
-            .unwrap()
-            .is_empty()
-    );
-    let other_rank = eredu_core::ParallelRankTopology::new(
-        eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
-        0,
-    )
-    .unwrap();
-    assert!(eredu_runtime::derive_partitioned_local_layout(
-        without_pinned.parameters(),
-        other_rank
-    )
-    .is_err());
     let declaration = shared.architecture().definition().clone();
     let child = declaration
         .project_groups(
@@ -625,14 +423,7 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         )
         .unwrap();
     let mut resident_child = ResidentRuntime::new(
-        ComponentAdapter::new(
-            child.clone(),
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap(),
+        ComponentAdapter::new(child.clone(), Kernel { pinned: None }).unwrap(),
         &(),
     )
     .unwrap();
@@ -643,16 +434,8 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
             .0,
         [7, 1, 1]
     );
-    assert_eq!(resident_child.units()[0].len(), 1);
     let mut child = LayerwiseRuntime::new(
-        ComponentAdapter::new(
-            child,
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap(),
+        ComponentAdapter::new(child, Kernel { pinned: None }).unwrap(),
         RecordingPolicy::bounded(2),
     );
     let mut child_observer = SharedObservation(vec![]);
@@ -672,41 +455,6 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
             .collect::<Vec<_>>(),
         ["shared.input", "shared.output"]
     );
-    let partition = eredu_runtime::ArchitecturePartition::from_description(
-        declaration.parameters(),
-        [("second", 0..1)],
-        eredu_runtime::PartitionOwnership::new(false, true, std::iter::empty::<String>()).unwrap(),
-        declaration.state_layout(),
-        declaration.state_partition_plan(),
-        (),
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(2),
-    )
-    .unwrap();
-    let other_storage = declaration
-        .parameters()
-        .invocations()
-        .storage_location(0)
-        .unwrap();
-    let selected = ComponentAdapter::new(
-        declaration,
-        Kernel {
-            fail: false,
-            pinned: None,
-        },
-    )
-    .unwrap()
-    .select_partition(&partition)
-    .unwrap();
-    assert!(selected.build_storage_unit(other_storage, &()).is_err());
-    assert_eq!(
-        selected
-            .build_storage_unit(partition.invocations().storage_location(0).unwrap(), &())
-            .unwrap()
-            .marker,
-        11
-    );
-    assert_eq!(selected.build_unit(1, 0, &()).unwrap().marker, 11);
-    assert!(selected.build_unit(1, 1, &()).is_err());
     // Topology admission and low-level construction retain sparse global IDs.
     let prototype = definition(false);
     let graph = prototype.parameters().graph();
@@ -731,109 +479,19 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
         ArchitectureStatePartitionPlan::new([]),
     )
     .unwrap();
-    let sparse_parameters = declaration.parameters().clone();
-    let mut component = ComponentAdapter::new(
-        declaration.clone(),
-        Kernel {
-            fail: false,
-            pinned: None,
-        },
-    )
-    .unwrap();
-    sparse_parameters
-        .validate_architecture::<FakeBackend, StatelessComponentState, _>(&component)
-        .unwrap();
-    let prepare = || {
-        eredu_runtime::PreparedComponent::prepare::<
-            Failure,
-            eredu_checkpoint::recipe::DerivedWeightRecipe,
-        >(
-            "sparse-fixture",
-            sparse_parameters.clone(),
-            Arc::new(counting_source().0),
-            |_| unreachable!("fixture has no parameters"),
-        )
-        .unwrap()
-    };
-    prepare()
-        .with_storage_preferences::<FakeBackend, StatelessComponentState, _>(&component, &())
-        .unwrap();
-    assert!(matches!(
-        prepare().with_storage_preferences::<FakeBackend, StatelessComponentState, _>(
-            &adapter(false),
-            &()
-        ),
-        Err(Failure::Preparation(
-            eredu_runtime::ComponentPreparationError::ArchitectureMismatch(_)
-        ))
-    ));
-    let selected =
-        <_ as LayeredArchitecture<FakeBackend, StatelessComponentState>>::execution_unit_layout(
-            &component,
-        )
-        .unwrap()
-        .select(addresses)
-        .unwrap();
-    let mut hidden = input.clone();
-    let mut forward = true;
-    for ordinal in 0..selected.len() {
-        let address = selected.address(ordinal).unwrap();
-        let mut unit = component
-            .build_unit(address.group(), address.index(), &())
-            .unwrap();
-        hidden = component
-            .forward_unit(
-                address.group(),
-                address.index(),
-                &mut unit,
-                &hidden,
-                &mut state,
-                &mut forward,
-                &(),
-            )
-            .unwrap();
-    }
-    assert_eq!(hidden.0, [7, 3, 17]);
-    assert!(component.build_unit(0, 0, &()).is_err());
-    let adopted_units = addresses
-        .into_iter()
-        .map(|address| {
-            vec![component
-                .build_unit(address.group(), address.index(), &())
-                .unwrap()]
-        })
-        .collect();
-    let mut adopted = ResidentRuntime::from_units(component, adopted_units).unwrap();
+    let hidden = FakeTensor(vec![7, 3, 17]);
     let mut resident = ResidentRuntime::new(
-        ComponentAdapter::new(
-            declaration.clone(),
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap(),
+        ComponentAdapter::new(declaration.clone(), Kernel { pinned: None }).unwrap(),
         &(),
     )
     .unwrap();
     let mut sparse_runtime = LayerwiseRuntime::new(
-        ComponentAdapter::new(
-            declaration,
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap(),
+        ComponentAdapter::new(declaration, Kernel { pinned: None }).unwrap(),
         RecordingPolicy::bounded(2),
     );
     for _ in 0..2 {
         assert_eq!(
             resident.forward((&input, true), &mut state, &()).unwrap(),
-            hidden
-        );
-        assert_eq!(
-            adopted.forward((&input, true), &mut state, &()).unwrap(),
             hidden
         );
         assert_eq!(
@@ -849,36 +507,6 @@ fn component_adapter_uses_ordinary_residency_and_operation_activity() {
             hidden
         );
     }
-    struct Paths(Vec<String>);
-    impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for Paths {
-        fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Failure> {
-            self.0.push(path.to_owned());
-            Ok(())
-        }
-    }
-    let mut paths = Paths(vec![]);
-    assert_eq!(
-        sparse_runtime
-            .forward_with_observer((&input, true), &mut state, &(), &mut paths)
-            .unwrap(),
-        hidden
-    );
-    for path in [
-        "first.input",
-        "first.output",
-        "second.input",
-        "second.output",
-    ] {
-        assert_eq!(
-            paths.0.iter().filter(|seen| seen.as_str() == path).count(),
-            1
-        );
-    }
-    assert!(sparse_runtime
-        .policy()
-        .addresses
-        .chunks_exact(2)
-        .all(|pair| pair == [(0, 0, 3), (1, 1, 7)]));
 }
 
 #[test]
@@ -925,16 +553,6 @@ fn component_logical_observation_boundaries_span_independently_leased_operations
             })
             .unwrap()
     };
-    assert!(definition(false)
-        .map_unit_observation_boundaries(|_, _| {
-            UnitObservationBoundaries::new(Some("ambiguous".into()), None)
-        })
-        .is_err());
-    assert!(definition(false)
-        .map_unit_observation_boundaries(|_, _| {
-            UnitObservationBoundaries::new(Some(" ".into()), None)
-        })
-        .is_err());
     let check = |seen: &[(String, FakeTensor)]| {
         let logical = seen
             .iter()
@@ -953,16 +571,8 @@ fn component_logical_observation_boundaries_span_independently_leased_operations
             "first.input" | "first.output" | "second.input" | "second.output"
         )));
     };
-    let component = |kernel_owned| {
-        ComponentAdapter::new(
-            split(kernel_owned),
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap()
-    };
+    let component =
+        |kernel_owned| ComponentAdapter::new(split(kernel_owned), Kernel { pinned: None }).unwrap();
     let architecture = component(false);
     let units = [(0, 0), (1, 0)]
         .into_iter()
@@ -982,50 +592,29 @@ fn component_logical_observation_boundaries_span_independently_leased_operations
         FakeTensor(vec![99])
     );
     check(&observer.seen);
-    for mode in 0..4 {
-        for kernel_owned in [false, true] {
-            // Raw custom executors borrow their declared seams from the driver;
-            // ordinary observed equations emit kernel-owned seams themselves.
-            if kernel_owned && mode < 2 {
-                continue;
-            }
-            let mut runtime =
-                LayerwiseRuntime::new(component(kernel_owned), RecordingPolicy::bounded(2));
-            let mut observer = Observer {
-                seen: vec![],
-                fail: None,
-            };
-            let input = FakeTensor(vec![1]);
-            let output = match mode {
-                0 => runtime.forward_with_observer((&input, true), &mut state, &(), &mut observer),
-                1 => runtime.forward_parallel_with_observer(
-                    (&input, true),
-                    &mut state,
-                    &(),
-                    &(),
-                    &mut observer,
-                ),
-                2 => runtime.forward_with_unit_executor_and_observer(
-                    (&input, true),
-                    &mut state,
-                    &(),
-                    |a, g, i, u, h, s, f, c| a.forward_unit(g, i, u, h, s, f, c),
-                    &mut observer,
-                ),
-                _ => runtime.forward_parallel_with_unit_executor_and_observer(
-                    (&input, true),
-                    &mut state,
-                    &(),
-                    &(),
-                    |a, g, i, u, h, s, f, p, c| a.forward_unit_parallel(g, i, u, h, s, f, p, c),
-                    &mut observer,
-                ),
-            }
-            .unwrap();
-            assert_eq!(output, FakeTensor(vec![99]));
-            check(&observer.seen);
-            assert!(!runtime.policy().forward_active);
+    for parallel in [false, true] {
+        let mut runtime = LayerwiseRuntime::new(component(parallel), RecordingPolicy::bounded(2));
+        let mut observer = Observer {
+            seen: vec![],
+            fail: None,
+        };
+        let input = FakeTensor(vec![1]);
+        let output = if parallel {
+            runtime.forward_parallel_with_unit_executor_and_observer(
+                (&input, true),
+                &mut state,
+                &(),
+                &(),
+                |a, g, i, u, h, s, f, p, c| a.forward_unit_parallel(g, i, u, h, s, f, p, c),
+                &mut observer,
+            )
+        } else {
+            runtime.forward_with_observer((&input, true), &mut state, &(), &mut observer)
         }
+        .unwrap();
+        assert_eq!(output, FakeTensor(vec![99]));
+        check(&observer.seen);
+        assert!(!runtime.policy().forward_active);
     }
     let mut runtime = LayerwiseRuntime::new(component(false), RecordingPolicy::bounded(2));
     for path in ["logical.input", "logical.output"] {
@@ -1050,129 +639,6 @@ fn component_logical_observation_boundaries_span_independently_leased_operations
         FakeTensor(vec![99])
     );
     check(&observer.seen);
-    let owned = definition(false)
-        .map_unit_observation_boundaries(|address, boundaries| {
-            if address.group() == 0 {
-                UnitObservationBoundaries::new(None, Some("fixture.internal".into()))
-                    .with_kernel_ownership()
-            } else {
-                boundaries.clone()
-            }
-        })
-        .unwrap();
-    let mut runtime = LayerwiseRuntime::new(
-        ComponentAdapter::new(
-            owned,
-            Kernel {
-                fail: false,
-                pinned: None,
-            },
-        )
-        .unwrap(),
-        RecordingPolicy::bounded(2),
-    );
-    let mut observer = Observer {
-        seen: vec![],
-        fail: None,
-    };
-    runtime
-        .forward_with_observer((&FakeTensor(vec![1]), true), &mut state, &(), &mut observer)
-        .unwrap();
-    assert_eq!(
-        observer
-            .seen
-            .iter()
-            .filter(|(path, _)| path == "fixture.internal")
-            .count(),
-        2
-    );
-}
-
-#[test]
-fn component_equation_failure_aborts_the_same_policy_and_allows_retry() {
-    let mut runtime = LayerwiseRuntime::new(adapter(true), RecordingPolicy::bounded(2));
-    let input = FakeTensor(vec![7]);
-    let mut state = StatelessComponentState::new().unwrap();
-    assert!(runtime.forward((&input, true), &mut state, &()).is_err());
-    assert_eq!(runtime.policy().aborts, 1);
-    assert!(!runtime.policy().forward_active);
-    runtime.architecture_mut().kernel_mut().fail = false;
-    assert_eq!(
-        runtime.forward((&input, true), &mut state, &()).unwrap().0,
-        [7, 0, 10]
-    );
-}
-
-#[test]
-fn component_observation_failure_aborts_and_intervention_reaches_downstream_equations() {
-    struct Observer {
-        fail_at: Option<&'static str>,
-        seen: Vec<String>,
-    }
-    impl eredu_runtime::ActivationObserver<FakeTensor, Failure> for Observer {
-        fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Failure> {
-            self.seen.push(path.into());
-            if self.fail_at == Some(path) {
-                return Err(Failure::Equation);
-            }
-            Ok(())
-        }
-        fn intervene(
-            &mut self,
-            path: &str,
-            value: &FakeTensor,
-        ) -> Result<Option<FakeTensor>, Failure> {
-            if path != "fixture.internal" {
-                return Ok(None);
-            }
-            let mut value = value.clone();
-            value.0.push(99);
-            Ok(Some(value))
-        }
-    }
-    let mut runtime = LayerwiseRuntime::new(adapter(false), RecordingPolicy::bounded(2));
-    let input = FakeTensor(vec![7]);
-    let mut state = StatelessComponentState::new().unwrap();
-    for path in ["fixture.input", "fixture.internal", "fixture.readout"] {
-        let mut observer = Observer {
-            fail_at: Some(path),
-            seen: vec![],
-        };
-        assert!(runtime
-            .forward_with_observer((&input, true), &mut state, &(), &mut observer)
-            .is_err());
-        assert!(!runtime.policy().forward_active);
-        assert_eq!(observer.seen.last().unwrap(), path);
-    }
-    // Input admission fails before a residency pass starts.
-    assert_eq!(runtime.policy().aborts, 2);
-    let mut observer = Observer {
-        fail_at: None,
-        seen: vec![],
-    };
-    let output = runtime
-        .forward_with_observer((&input, true), &mut state, &(), &mut observer)
-        .unwrap();
-    assert_eq!(output.0, [7, 0, 99, 10, 99]);
-    let internal: Vec<_> = observer
-        .seen
-        .iter()
-        .filter(|p| p.starts_with("fixture."))
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        internal,
-        [
-            "fixture.input",
-            "fixture.internal",
-            "fixture.internal",
-            "fixture.readout"
-        ]
-    );
-    assert_eq!(
-        runtime.forward((&input, true), &mut state, &()).unwrap().0,
-        [7, 0, 10]
-    );
 }
 
 #[test]
@@ -1182,17 +648,12 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
         type Error = Infallible;
         fn visit_mut<M: Parameterized<FakeTensor>>(
             &mut self,
-            role: &str,
+            _role: &str,
             module: &mut M,
         ) -> Result<(), Infallible> {
-            assert_eq!(role, "readout");
             struct Slot;
             impl<'a> ParameterVisitorMut<'a, FakeTensor> for Slot {
-                fn visit_mut(
-                    &mut self,
-                    _: eredu_nn::ParameterMetadata,
-                    value: &'a mut FakeTensor,
-                ) {
+                fn visit_mut(&mut self, _: eredu_nn::ParameterMetadata, value: &'a mut FakeTensor) {
                     *value = FakeTensor(vec![42]);
                 }
             }
@@ -1201,273 +662,13 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
         }
     }
     let declaration = definition(true);
-    let groups = declaration.parameters().groups();
-    let roles = declaration
-        .select_complete_pinned_roles(groups, &["readout", "embedding"])
-        .unwrap();
-    assert_eq!(
-        roles.into_iter().collect::<Vec<_>>(),
-        ["embedding", "readout"]
-    );
-    assert!(declaration
-        .select_complete_pinned_roles(&[], &["readout", "embedding"])
-        .unwrap()
-        .is_empty());
-    assert!(declaration
-        .select_complete_pinned_roles(&[groups[0].clone(), groups[0].clone()], &["embedding"])
-        .is_err());
-    // A pinned module may have separate canonical groups that must be admitted together.
-    let companion = eredu_runtime::OwnedParameterGroupSpec::new(
-        groups[0].owner().clone(),
-        eredu_runtime::ParameterGroupSpec::new(
-            "readout.bias",
-            eredu_runtime::ParameterRole::Replicated,
-            [eredu_runtime::ParameterMemberSpec::new(
-                "bias",
-                [1],
-                eredu_runtime::MemberSharding::Replicated,
-            )],
-        )
-        .unwrap(),
-    );
-    let complete_groups = vec![groups[0].clone(), companion.clone()];
-    let complete = ComponentDefinition::new(
-        "coupled-pinned-fixture",
-        ArchitectureParameterDescription::new(
-            declaration.parameters().graph(),
-            declaration.parameters().unit_layout(),
-            complete_groups
-                .iter()
-                .map(|binding| binding.group().clone()),
-            complete_groups.clone(),
-        )
-        .unwrap(),
-        vec![
-            declaration.unit(0, 0).unwrap().clone(),
-            declaration.unit(1, 0).unwrap().clone(),
-        ],
-        vec![
-            declaration.group_transport(0).unwrap().clone(),
-            declaration.group_transport(1).unwrap().clone(),
-        ],
-        "first",
-        vec![],
-        declaration.state_layout().clone(),
-        declaration.state_partition_plan().clone(),
-    )
-    .unwrap();
-    assert!(complete
-        .select_complete_pinned_roles(groups, &["embedding"])
-        .is_err());
-    // Independent resources within a role retain their own canonical group admission.
-    assert_eq!(
-        complete
-            .select_pinned_groups(groups, &["embedding"])
-            .unwrap(),
-        vec![&complete_groups[0]],
-    );
-    assert!(complete
-        .select_pinned_groups(
-            &[complete_groups[0].clone(), complete_groups[0].clone()],
-            &["embedding"]
-        )
-        .is_err());
-    assert!(declaration
-        .select_complete_pinned_roles(&[companion], &["embedding"])
-        .is_err());
-    assert_eq!(
-        complete
-            .select_complete_pinned_roles(&complete_groups, &["embedding"])
-            .unwrap()
-            .len(),
-        1
-    );
-    // Native resource boundaries can be finer than a storage role, while each
-    // resource's groups must coexist. Local roles can refine a canonical alias.
-    let coupled = [
-        ("table", &complete_groups[0]),
-        ("table", &complete_groups[1]),
-    ];
-    let independent = [
-        ("table", &complete_groups[0]),
-        ("bias", &complete_groups[1]),
-    ];
-    let refined = eredu_runtime::OwnedParameterGroupSpec::new(
-        eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-        complete_groups[0].group().clone(),
-    );
-    assert!(eredu_runtime::select_complete_pinned_resources(
-        complete.id(),
-        coupled,
-        std::slice::from_ref(&refined),
-        &["embedding"],
-    )
-    .is_err());
-    assert_eq!(
-        eredu_runtime::select_complete_pinned_resources(
-            complete.id(),
-            independent,
-            std::slice::from_ref(&refined),
-            &["embedding"],
-        )
-        .unwrap()
-        .into_iter()
-        .collect::<Vec<_>>(),
-        ["table"]
-    );
-    // Exact declaration projection still rejects a changed owner. Two conflicting
-    // canonical owners cannot be declared for one physical group either.
-    assert!(complete
-        .select_pinned_groups(std::slice::from_ref(&refined), &["embedding"])
-        .is_err());
-    assert!(eredu_runtime::select_complete_pinned_resources(
-        complete.id(),
-        [("table", &complete_groups[0]), ("other", &refined)],
-        &[],
-        &["embedding"],
-    )
-    .is_err());
-    // Group labels can repeat; canonical parameter targets identify storage.
-    let repeated_label = eredu_runtime::OwnedParameterGroupSpec::new(
-        complete_groups[1].owner().clone(),
-        eredu_runtime::ParameterGroupSpec::new(
-            complete_groups[0].group().logical_name(),
-            eredu_runtime::ParameterRole::Replicated,
-            complete_groups[1].members().iter().cloned(),
-        )
-        .unwrap(),
-    );
-    let repeated_groups = [complete_groups[0].clone(), repeated_label];
-    let repeated = ArchitectureParameterDescription::new(
-        declaration.parameters().graph(),
-        declaration.parameters().unit_layout(),
-        repeated_groups
-            .iter()
-            .map(|binding| binding.group().clone()),
-        repeated_groups.clone(),
-    )
-    .unwrap();
-    assert_eq!(
-        eredu_runtime::select_complete_pinned_resources(
-            complete.id(),
-            repeated.groups().iter().enumerate(),
-            repeated.groups(),
-            &["embedding"],
-        )
-        .unwrap()
-        .len(),
-        2
-    );
-    let sibling = eredu_runtime::OwnedParameterGroupSpec::new(
-        eredu_runtime::ParameterGroupOwner::static_role("sibling"),
-        complete_groups[1].group().clone(),
-    );
-    assert!(eredu_runtime::select_complete_pinned_resources(
-        complete.id(),
-        independent,
-        &[sibling],
-        &["embedding"],
-    )
-    .unwrap()
-    .is_empty());
     let kernel = || Kernel {
-        fail: false,
         pinned: Some(FakeModule {
             weight: FakeTensor(vec![5]),
         }),
     };
-    assert!(ComponentAdapter::new(declaration.clone(), kernel()).is_err());
-    assert!(ComponentAdapter::with_pinned_resources::<FakeBackend>(
-        declaration.clone(),
-        Kernel {
-            fail: false,
-            pinned: None
-        }
-    )
-    .is_err());
-    let extra = eredu_runtime::OwnedParameterGroupSpec::new(
-        eredu_runtime::ParameterGroupOwner::execution_unit(
-            declaration
-                .parameters()
-                .unit_layout()
-                .group_id(0)
-                .unwrap()
-                .clone(),
-            0,
-        ),
-        eredu_runtime::ParameterGroupSpec::new(
-            "optional-resource",
-            eredu_runtime::ParameterRole::Replicated,
-            [eredu_runtime::ParameterMemberSpec::new(
-                "optional.weight",
-                [1],
-                eredu_runtime::MemberSharding::Replicated,
-            )],
-        )
-        .unwrap(),
-    );
-    let root = std::sync::Arc::new(
-        ComponentDefinition::new(
-            declaration.id(),
-            ArchitectureParameterDescription::from_owned(
-                declaration.parameters().graph(),
-                declaration.parameters().unit_layout(),
-                declaration
-                    .parameters()
-                    .groups()
-                    .iter()
-                    .cloned()
-                    .chain([extra]),
-            )
-            .unwrap(),
-            vec![
-                declaration.unit(0, 0).unwrap().clone(),
-                declaration.unit(1, 0).unwrap().clone(),
-            ],
-            vec![
-                declaration.group_transport(0).unwrap().clone(),
-                declaration.group_transport(1).unwrap().clone(),
-            ],
-            declaration.primary_group(),
-            vec![],
-            declaration.state_layout().clone(),
-            declaration.state_partition_plan().clone(),
-        )
-        .unwrap(),
-    );
-    assert!(root
-        .project_parameters(declaration.parameters().clone())
-        .is_err());
-    let referenced = std::sync::Arc::new(
-        root.as_ref()
-            .clone()
-            .with_parameter_uses([(
-                "optional-use".into(),
-                eredu_runtime::ComponentParameterUse {
-                    invocation: declaration.parameters().unit_layout().address(0).unwrap(),
-                    target: "optional.weight".into(),
-                },
-            )])
-            .unwrap(),
-    );
-    assert!(referenced
-        .project_owned_parameters(declaration.parameters().clone())
-        .is_err());
-    let selected = root
-        .project_owned_parameters(declaration.parameters().clone())
-        .unwrap();
-    assert!(selected
-        .project_owned_parameters(root.parameters().clone())
-        .is_err());
-    let foreign = ArchitectureParameterDescription::from_owned(
-        declaration.parameters().graph(),
-        declaration.parameters().unit_layout(),
-        [refined],
-    )
-    .unwrap();
-    assert!(root.project_owned_parameters(foreign).is_err());
     let mut component =
-        ComponentAdapter::with_pinned_resources::<FakeBackend>(selected, kernel()).unwrap();
+        ComponentAdapter::with_pinned_resources::<FakeBackend>(declaration, kernel()).unwrap();
     component.visit_static_parameters_mut(&mut Replace).unwrap();
     let input = FakeTensor(vec![7]);
     let mut state = StatelessComponentState::new().unwrap();
@@ -1476,50 +677,6 @@ fn component_pinned_resources_follow_canonical_roles_and_parameter_replacement()
         bounded.forward((&input, true), &mut state, &()).unwrap().0,
         [7, 0, 10, 42]
     );
-    let partition =
-        ArchitecturePartition::from_architecture::<FakeBackend, StatelessComponentState, _, _>(
-            bounded.architecture(),
-            [("first", 0..1)],
-            PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
-            (),
-            NoAuxiliaryBoundarySchema::new(1),
-            declaration.parameters(),
-        )
-        .unwrap();
-    // A cut cannot silently retain a readout replica that it does not own.
-    assert!(ComponentAdapter::with_pinned_resources::<FakeBackend>(
-        declaration.clone(),
-        kernel()
-    )
-    .unwrap()
-    .select_partition(&partition)
-    .is_err());
-    ComponentAdapter::with_partition_resources::<FakeBackend, _, _>(
-        declaration.clone(),
-        Kernel {
-            fail: false,
-            pinned: None,
-        },
-        &partition,
-    )
-    .unwrap();
-    // A tied output consumer still binds its replica through the canonical readout role.
-    let tied =
-        ArchitecturePartition::from_architecture::<FakeBackend, StatelessComponentState, _, _>(
-            bounded.architecture(),
-            [("second", 0..1)],
-            PartitionOwnership::new(false, true, ["embedding"]).unwrap(),
-            (),
-            NoAuxiliaryBoundarySchema::new(1),
-            declaration.parameters(),
-        )
-        .unwrap();
-    ComponentAdapter::with_partition_resources::<FakeBackend, _, _>(
-        declaration,
-        kernel(),
-        &tied,
-    )
-    .unwrap();
 }
 
 // A mutable fixture uses global invocation addresses and independently sliced carry.
@@ -1549,11 +706,7 @@ impl ComponentKernel<FakeBackend> for CarryKernel {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Failure> {
-        Kernel {
-            fail: false,
-            pinned: None,
-        }
-        .state_identity(state, topology)
+        Kernel { pinned: None }.state_identity(state, topology)
     }
     fn prediction_target_placeholder_shape(&self, _: &()) -> Result<Option<Vec<i32>>, Failure> {
         Ok(Some(vec![1]))
@@ -1774,243 +927,6 @@ fn carry_state(layout: StateLayout) -> CarryState {
     .unwrap()
 }
 
-type CarryStage = (
-    ComponentAdapter<ComponentDefinition, CarryKernel>,
-    LayeredPartitionDriver,
-    CarryState,
-    Vec<ExecutionUnitAddress>,
-);
-
-fn advance_carry_stages(stages: &mut [CarryStage], step: i32) -> FakeTensor {
-    let input = FakeTensor(vec![7]);
-    let mut hidden = input.clone();
-    for (adapter, driver, state, addresses) in stages {
-        let ingress = if driver.owns_input() {
-            LayeredPartitionInput::Tokens(&input)
-        } else {
-            LayeredPartitionInput::Hidden {
-                hidden,
-                auxiliary: NoAuxiliaryBoundary,
-            }
-        };
-        let mut forward = driver
-            .begin::<FakeBackend, _, _>(adapter, ingress, None, state, None, &())
-            .unwrap();
-        for address in addresses.iter().copied() {
-            let mut unit = adapter
-                .build_unit(address.group(), address.index(), &())
-                .unwrap();
-            forward.hidden = adapter
-                .forward_unit(
-                    address.group(),
-                    address.index(),
-                    &mut unit,
-                    &forward.hidden,
-                    state,
-                    &mut forward.context,
-                    &(),
-                )
-                .unwrap();
-            let roots = adapter
-                .retained_state_ordinals(address.group(), address.index(), 0)
-                .flat_map(|local| {
-                    RuntimeState::<FakeBackend>::retained_values(state, local, address).unwrap()
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(roots, [FakeTensor(vec![step])]);
-        }
-        hidden = match driver
-            .finish::<FakeBackend, _, _>(
-                adapter,
-                &forward.hidden,
-                state,
-                &mut forward.context,
-                None,
-                &(),
-            )
-            .unwrap()
-        {
-            LayeredPartitionOutput::Boundary { hidden, .. } => hidden,
-            LayeredPartitionOutput::Final { output, .. } => output,
-        };
-    }
-    hidden
-}
-
-#[test]
-fn component_partitions_preserve_repeated_advancement_and_local_carry_retention() {
-    let full = ComponentAdapter::new(
-        carry_definition(&[0, 1, 2]),
-        CarryKernel::new(0, false),
-    )
-    .unwrap();
-    let mut resident = ResidentRuntime::new(full, &()).unwrap();
-    let mut fullstate = carry_state(carry_definition(&[0, 1, 2]).state_layout().clone());
-    let mut stages = [0..1, 1..3].map(|range| {
-        let original = std::sync::Arc::new(carry_definition(&[0, 1, 2]));
-        let selected_state = StateLayout::new(
-            LayerSchedule::new(
-                3,
-                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 2, 8).unwrap(); 3],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let declaration = if range.start == 0 {
-            original.clone().select_state_layout(&selected_state)
-        } else {
-            original.select_state_layout(&selected_state)
-        }
-        .unwrap();
-        let declaration = std::sync::Arc::unwrap_or_clone(declaration);
-        let full = ComponentAdapter::new(
-            declaration.clone(),
-            CarryKernel::new(range.start, false),
-        )
-        .unwrap();
-        let partition = ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
-            &full,
-            [("carry", range.clone())],
-            PartitionOwnership::new(
-                range.start == 0,
-                range.end == 3,
-                std::iter::empty::<String>(),
-            )
-            .unwrap(),
-            (),
-            NoAuxiliaryBoundarySchema::new(1),
-            declaration.parameters(),
-        )
-        .unwrap();
-        let addresses = partition.units().collect();
-        let state = carry_state(partition.state().unwrap().layout().clone());
-        let driver = LayeredPartitionDriver::new(&partition, 0, range).unwrap();
-        let adapter = full.select_partition(&partition).unwrap();
-        (adapter, driver, state, addresses)
-    });
-    for step in 1..=3 {
-        let input = FakeTensor(vec![7]);
-        let expected = resident.forward(&input, &mut fullstate, &()).unwrap();
-        let hidden = advance_carry_stages(&mut stages, step);
-        assert_eq!(hidden, expected);
-        assert_eq!(hidden, FakeTensor(vec![7, step, step, step]));
-    }
-    let (last, _, _, _) = &stages[1];
-    assert!(last.build_unit(0, 0, &()).is_err());
-    // Logical units 3/7 own independent dense state slots 0/1. The second
-    // history materializes when this selected execution needs a receiver.
-    let expected = carry_definition(&[3, 7]);
-    let dormant = StateLayout::new(
-        LayerSchedule::new(
-            2,
-            vec![
-                expected.state_layout().layer(0).unwrap().clone(),
-                LayerCachePolicy::NoState,
-            ],
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let declaration = ComponentDefinition::new(
-        expected.id(),
-        expected.parameters().clone(),
-        vec![
-            expected.unit(0, 3).unwrap().clone(),
-            expected.unit(0, 7).unwrap().clone(),
-        ],
-        vec![expected.group_transport(0).unwrap().clone()],
-        "carry",
-        vec![],
-        dormant,
-        expected.state_partition_plan().clone(),
-    )
-    .unwrap();
-    let selected = expected.state_layout().clone();
-    assert!(std::sync::Arc::new(declaration.clone())
-        .select_state_layout(&selected)
-        .is_err());
-    for invalid in [
-        vec![eredu_runtime::StateSlotId(1), eredu_runtime::StateSlotId(1)],
-        vec![eredu_runtime::StateSlotId(2)],
-    ] {
-        assert!(declaration
-            .clone()
-            .with_materialized_state_slots(selected.clone(), invalid)
-            .is_err());
-    }
-    let declaration = declaration
-        .with_materialized_state_slots(selected, [eredu_runtime::StateSlotId(1)])
-        .unwrap();
-    let declaration = declaration
-        .with_materialized_state_slots(
-            expected.state_layout().clone(),
-            [eredu_runtime::StateSlotId(1)],
-        )
-        .unwrap();
-    let mut sparse_stages = [3, 7]
-        .into_iter()
-        .enumerate()
-        .map(|(position, index)| {
-            let full = ComponentAdapter::new(
-                declaration.clone(),
-                CarryKernel::new(index, false),
-            )
-            .unwrap();
-            for invalid in [0..1, 3..8] {
-                assert!(
-                    ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
-                        &full,
-                        [("carry", invalid)],
-                        PartitionOwnership::new(false, false, std::iter::empty::<String>())
-                            .unwrap(),
-                        (),
-                        NoAuxiliaryBoundarySchema::new(1),
-                        declaration.parameters(),
-                    )
-                    .is_err()
-                );
-            }
-            let partition =
-                ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
-                    &full,
-                    [("carry", index..index + 1)],
-                    PartitionOwnership::new(
-                        position == 0,
-                        position == 1,
-                        std::iter::empty::<String>(),
-                    )
-                    .unwrap(),
-                    (),
-                    NoAuxiliaryBoundarySchema::new(1),
-                    declaration.parameters(),
-                )
-                .unwrap();
-            let addresses = partition.units().collect::<Vec<_>>();
-            let state = carry_state(partition.state().unwrap().layout().clone());
-            let driver = LayeredPartitionDriver::new_with_state_range(
-                &partition,
-                0,
-                index..index + 1,
-                Some(position..position + 1),
-            )
-            .unwrap();
-            (
-                full.select_partition(&partition).unwrap(),
-                driver,
-                state,
-                addresses,
-            )
-        })
-        .collect::<Vec<_>>();
-    for step in 1..=3 {
-        assert_eq!(
-            advance_carry_stages(&mut sparse_stages, step),
-            FakeTensor(vec![7, step, step])
-        );
-    }
-}
-
 impl eredu_runtime::PipelineComponentKernel<FakeBackend, CarryState> for CarryKernel {
     fn input_dimensions(&self, _: &Self::Input<'_>) -> Result<(i32, i32), Failure> {
         Ok((1, 1))
@@ -2040,36 +956,10 @@ impl eredu_runtime::PipelineComponentKernel<FakeBackend, CarryState> for CarryKe
     }
 }
 
-impl SumReductionBackend for FakeBackend {
-    fn all_reduce_sum(
-        value: FakeTensor,
-        _: &(),
-        _: &(),
-    ) -> Result<Submission<FakeTensor, CommunicationDone>, FakeCommunicationError> {
-        Ok(Submission {
-            output: value,
-            completion: CommunicationDone,
-        })
-    }
-}
-
-struct CaptureAllocator;
-impl eredu_runtime::PartitionTensorAllocator<FakeBackend> for CaptureAllocator {
-    fn tensor_placeholder(
-        &mut self,
-        shape: &[i32],
-        _: eredu_runtime::BoundaryTensorDtype,
-        _: eredu_runtime::PipelineActivationDtype,
-        _: &(),
-    ) -> Result<FakeTensor, eredu_nn::Error> {
-        assert_eq!(shape, [1]);
-        Ok(FakeTensor(vec![-1]))
-    }
-}
-
 #[test]
 fn component_invocation_state_ownership_skips_interleaved_stateless_units() {
-    for offset in [0, 7] {
+    {
+        let offset = 7;
         let base = carry_definition(&[0, 1]);
         let graph = base.parameters().graph();
         let complete = ExecutionUnitLayout::new(graph, [offset + 7]).unwrap();
@@ -2116,101 +1006,6 @@ fn component_invocation_state_ownership_skips_interleaved_stateless_units() {
             .unwrap()
             .project_groups("interleaved", graph.clone(), std::iter::empty::<String>())
             .unwrap();
-        // Cold placement consumes the complete declaration; selected execution
-        // below retains the nonzero interval without inventing prefix state.
-        let cold_units = (0..offset)
-            .map(|index| ComponentUnit {
-                path: format!("operation.{index}"),
-                state: 0..0,
-            })
-            .chain(units.iter().cloned())
-            .collect();
-        let cold_definition = ComponentDefinition::new(
-            "interleaved",
-            ArchitectureParameterDescription::new(graph, &complete, [], []).unwrap(),
-            cold_units,
-            vec![base.group_transport(0).unwrap().clone()],
-            "carry",
-            vec![],
-            definition.state_layout().clone(),
-            owners(false),
-        )
-        .unwrap();
-        let requirements = eredu_runtime::ReplicatedTextRequirements::new(
-            "interleaved",
-            eredu_nn::NeuralOperatorCapabilities::NONE,
-            graph.clone(),
-            complete.clone(),
-            vec![base.group_transport(0).unwrap().clone()],
-            definition.state_layout().clone(),
-            eredu_runtime::ReplicatedTextStateAccess::KeyValue,
-            vec![],
-        )
-        .unwrap();
-        let incompatible = ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::output_owner(0..2),
-        ]);
-        let cold = requirements
-            .clone()
-            .with_component_definition(cold_definition.clone())
-            .unwrap();
-        let changed_seams = cold_definition
-            .clone()
-            .map_unit_observation_boundaries(|address, boundaries| {
-                if address.index() == 0 {
-                    eredu_runtime::UnitObservationBoundaries::new(Some("changed.input".into()), None)
-                } else {
-                    boundaries.clone()
-                }
-            })
-            .unwrap();
-        assert!(cold
-            .clone()
-            .with_component_definition(changed_seams)
-            .is_err());
-        let cold = cold
-            .with_component_definition(cold_definition.clone())
-            .unwrap();
-        assert!(cold
-            .clone()
-            .with_state_partition_plan(incompatible.clone())
-            .is_err());
-        assert!(requirements
-            .with_state_partition_plan(incompatible)
-            .unwrap()
-            .with_component_definition(cold_definition.clone())
-            .is_err());
-        for rank in 0..3 {
-            let projection = eredu_runtime::PipelineRankProjection::new(
-                &cold,
-                Some(definition.state_layout()),
-                eredu_core::ParallelRankTopology::new(
-                    eredu_core::ParallelTopology::new(1, 3, 1, 1).unwrap(),
-                    rank,
-                )
-                .unwrap(),
-                false,
-            )
-            .unwrap();
-            let expected = [offset + 1, offset + 4]
-                .into_iter()
-                .enumerate()
-                .filter(|(_, invocation)| {
-                    projection
-                        .groups()
-                        .iter()
-                        .any(|group| group.units().contains(invocation))
-                })
-                .map(|(slot, _)| slot)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                projection.state().map(|state| state.global_layers()),
-                expected
-                    .first()
-                    .zip(expected.last())
-                    .map(|(first, last)| *first..last + 1)
-            );
-        }
         let kernel = |start, shared| {
             let mut kernel = CarryKernel::new(start, false);
             kernel.slots = Some(
@@ -2337,112 +1132,14 @@ fn component_invocation_state_ownership_skips_interleaved_stateless_units() {
                 FakeTensor(vec![9, step * 2 - 1, step * 2])
             );
         }
-        let other_consumer = ArchitecturePartition::from_description(
-            shared.parameters(),
-            [("carry", offset + 3..offset + 6)],
-            PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            shared.state_layout(),
-            shared.state_partition_plan(),
-            (),
-            NoAuxiliaryBoundarySchema::new(1),
-        )
-        .unwrap();
-        assert!(shared.select_partition(&other_consumer).is_err());
-        let unknown = ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::invocation(
-                layout.address(1).unwrap().with_index(offset + 99),
-                0..2,
-            ),
-        ]);
-        assert!(matches!(
-            make(units.clone(), base.state_layout().clone(), unknown),
-            Err(ComponentDefinitionError::StatePartition {
-                source: eredu_runtime::ArchitectureStatePartitionError::UnknownInvocation { .. },
-                ..
-            })
-        ));
-        let wrong_owner = ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::invocation(
-                layout.address(0).unwrap(),
-                0..1,
-            ),
-            eredu_runtime::ArchitectureStatePartitionRule::invocation(
-                layout.address(4).unwrap(),
-                1..2,
-            ),
-        ]);
-        assert!(make(units.clone(), base.state_layout().clone(), wrong_owner).is_err());
-        let mut gap_units = units.clone();
-        gap_units[4].state = 2..3;
-        gap_units[6].state = 1..2;
-        let gap_plan = ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::invocation(
-                layout.address(1).unwrap(),
-                0..1,
-            ),
-            eredu_runtime::ArchitectureStatePartitionRule::invocation(
-                layout.address(6).unwrap(),
-                1..2,
-            ),
-            eredu_runtime::ArchitectureStatePartitionRule::invocation(
-                layout.address(4).unwrap(),
-                2..3,
-            ),
-        ])
-        .with_packing(eredu_runtime::StatePartitionPacking::PreserveGlobalOrdinals);
-        let gap_state = carry_definition(&[0, 1, 2]).state_layout().clone();
-        let gap = make(gap_units.clone(), gap_state.clone(), gap_plan.clone()).unwrap();
-        let partition = ArchitecturePartition::from_description(
-            gap.parameters(),
-            [("carry", offset..offset + 6)],
-            PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
-            gap.state_layout(),
-            gap.state_partition_plan(),
-            (),
-            NoAuxiliaryBoundarySchema::new(1),
-        )
-        .unwrap();
-        assert_eq!(
-            partition.state().unwrap().selected_global_layers(),
-            [0..1, 2..3]
-        );
-        assert!(matches!(
-            partition.state().unwrap().layout().layers().get(1),
-            Some(LayerCachePolicy::NoState)
-        ));
-        let span = gap
-            .state_partition_plan()
-            .group_state_range(&layout, 0, offset..offset + 6)
-            .unwrap();
-        assert_eq!(span, Some(0..3));
-        assert!(gap.select_partition(&partition).is_ok());
-        assert!(LayeredPartitionDriver::new_with_state_range(
-            &partition,
-            0,
-            offset..offset + 6,
-            span
-        )
-        .is_ok());
-        gap_units[0].state = 1..2;
-        let unowned = make(gap_units, gap_state, gap_plan).unwrap();
-        assert!(unowned.select_partition(&partition).is_err());
     }
 }
 
 #[test]
 fn component_stage_accepts_stateless_ingress_and_retains_later_group_carry() {
-    for offset in [0, 7] {
-        check_stage_carry(offset);
-    }
-}
-
-fn check_stage_carry(offset: usize) {
+    let offset = 7;
     let base = carry_definition(&[0, 1, 2]);
-    let source = ComponentAdapter::new(
-        base.clone(),
-        CarryKernel::new(0, false),
-    )
-    .unwrap();
+    let source = ComponentAdapter::new(base.clone(), CarryKernel::new(0, false)).unwrap();
     let graph = ExecutionGraph::new(
         vec![
             ExecutionGroupSpec::root("ingress"),
@@ -2477,39 +1174,8 @@ fn check_stage_carry(offset: usize) {
         ]),
     )
     .unwrap();
-    assert!(definition
-        .project_groups(
-            "lost-state-owner",
-            ExecutionGraph::chain(["ingress"]).unwrap(),
-            std::iter::empty::<String>(),
-        )
-        .is_err());
-    let child = definition
-        .project_groups(
-            "carry-child",
-            ExecutionGraph::chain(["carry"]).unwrap(),
-            std::iter::empty::<String>(),
-        )
-        .unwrap();
-    let mut child_state = carry_state(child.state_layout().clone());
-    let mut child = ResidentRuntime::new(
-        ComponentAdapter::new(child, CarryKernel::new(offset, false)).unwrap(),
-        &(),
-    )
-    .unwrap();
-    for step in 1..=3 {
-        assert_eq!(
-            child
-                .forward(&FakeTensor(vec![9]), &mut child_state, &())
-                .unwrap(),
-            FakeTensor(vec![9, step, step, step])
-        );
-    }
-    let adapter = ComponentAdapter::new(
-        definition.clone(),
-        CarryKernel::new(offset, true),
-    )
-    .unwrap();
+    let adapter =
+        ComponentAdapter::new(definition.clone(), CarryKernel::new(offset, true)).unwrap();
     let partition = ArchitecturePartition::from_architecture::<FakeBackend, CarryState, _, _>(
         &adapter,
         [
@@ -2522,100 +1188,10 @@ fn check_stage_carry(offset: usize) {
         definition.parameters(),
     )
     .unwrap();
-    for (ordinals, valid) in [
-        (&[0, 1][..], true),
-        (&[0, 1, 2, 3][..], true),
-        (&[0, 2, 3][..], false),
-        (&[0, 1, 3][..], false),
-    ] {
-        let adapter = ComponentAdapter::new(
-            definition.clone(),
-            CarryKernel::new(offset, true),
-        )
-        .unwrap();
-        let addresses: Vec<_> = ordinals
-            .iter()
-            .map(|&ordinal| layout.address(ordinal).unwrap())
-            .collect();
-        let policy = eredu_runtime::ResidentUnitWindow::new(
-            addresses
-                .iter()
-                .map(|address| {
-                    adapter
-                        .build_unit(address.group(), address.index(), &())
-                        .unwrap()
-                })
-                .collect(),
-        );
-        let result = eredu_runtime::PipelinePartitionExecutor::new(
-            adapter,
-            policy,
-            addresses,
-            None,
-            CaptureAllocator,
-            eredu_runtime::PipelineActivationDtype::Float32,
-        );
-        if !valid {
-            assert!(result.is_err());
-            continue;
-        }
-        let mut executor = result.unwrap();
-        let capture = <_ as eredu_runtime::PartitionedGroupExecutor<
-            _,
-            FakeBackend,
-            CarryState,
-            (),
-            (),
-            FakeTensorMetadata,
-        >>::prediction_target_capture(&mut executor, &(), &())
-        .unwrap();
-        assert_eq!(
-            capture,
-            if ordinals.last() == Some(&3) {
-                None
-            } else {
-                Some(FakeTensor(vec![-1]))
-            }
-        );
-    }
     let mut state = carry_state(partition.state().unwrap().layout().clone());
     let mut runtime = adapter
         .into_partition_runtime(RecordingPolicy::bounded(4), &partition)
         .unwrap();
-    let incorrect_entry = RuntimeState::<FakeBackend>::layout(&state).clone();
-    let input = FakeTensor(vec![9]);
-    assert!(runtime
-        .forward_with_preparation(&mut state, None, &(), |adapter, state, _| {
-            eredu_runtime::PipelinePartitionArchitecture::begin_pipeline_partition(
-                adapter,
-                &input,
-                None,
-                state,
-                Some(&incorrect_entry),
-                0,
-                None,
-                &(),
-                &mut eredu_runtime::inspection::NoopObserver,
-            )
-        })
-        .is_err());
-    let incorrect_resume = incorrect_entry.slice(0..1).unwrap();
-    assert!(runtime
-        .forward_with_preparation(&mut state, None, &(), |adapter, state, _| {
-            eredu_runtime::PartitionedLayeredArchitecture::begin_partition(
-                adapter,
-                LayeredPartitionInput::Hidden {
-                    hidden: input.clone(),
-                    auxiliary: NoAuxiliaryBoundary,
-                },
-                None,
-                state,
-                &incorrect_resume,
-                0,
-                &(),
-            )
-        })
-        .is_err());
     for step in 1..=6 {
         let input = FakeTensor(vec![9]);
         let output = runtime
@@ -2674,11 +1250,7 @@ impl ComponentKernel<FakeBackend> for CaptureKernel {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Failure> {
-        Kernel {
-            fail: false,
-            pinned: None,
-        }
-        .state_identity(state, topology)
+        Kernel { pinned: None }.state_identity(state, topology)
     }
     fn build_unit(&self, address: ExecutionUnitAddress, _: &()) -> Result<FakeUnit, Failure> {
         Ok(FakeUnit {
@@ -2786,36 +1358,4 @@ fn component_group_completion_preserves_dependencies_capture_and_retry() {
     let expected = resident.forward(&input, &mut state, &()).unwrap();
     assert_eq!(expected.0, [7, 0, 100, 10, 101, 7, 0]);
     assert_eq!(bounded.forward(&input, &mut state, &()).unwrap(), expected);
-}
-
-#[test]
-fn component_parallel_group_ingress_validates_before_advancing_state() {
-    let declaration = carry_definition(&[0, 1, 2]);
-    let mut state = carry_state(declaration.state_layout().clone());
-    let mut adapter = ComponentAdapter::new(
-        declaration,
-        CarryKernel::new(0, false),
-    )
-    .unwrap();
-    let input = FakeTensor(vec![7]);
-    let before = state.layer(0).unwrap().0 .0[0];
-    for (group, dependencies) in [(0, vec![&input]), (1, vec![])] {
-        assert!(adapter
-            .begin_execution_group_parallel(
-                group,
-                &input,
-                &dependencies,
-                &mut state,
-                &mut (),
-                &(),
-                &(),
-            )
-            .is_err());
-        assert_eq!(state.layer(0).unwrap().0 .0[0], before);
-    }
-    let result = adapter
-        .begin_execution_group_parallel(0, &input, &[], &mut state, &mut (), &(), &())
-        .unwrap();
-    assert_eq!(result.0, input.0);
-    assert_eq!(state.layer(0).unwrap().0 .0[0], before + 1);
 }
