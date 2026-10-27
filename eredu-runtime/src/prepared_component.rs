@@ -482,26 +482,19 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         if architecture.execution_graph()? != *self.declaration.parameters().graph() {
             return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
         }
-        let layout = architecture
-            .execution_unit_layout()
-            .map_err(|error| match error {
-                crate::ArchitectureExecutionLayoutError::Architecture(error) => error,
-                crate::ArchitectureExecutionLayoutError::Layout(error) => {
-                    A::Error::from(ComponentPreparationError::Units(error))
-                }
-            })?;
+        let layout_error = |error| match error {
+            crate::ArchitectureExecutionLayoutError::Architecture(error) => error,
+            crate::ArchitectureExecutionLayoutError::Layout(error) => {
+                A::Error::from(ComponentPreparationError::Units(error))
+            }
+        };
+        let layout = architecture.execution_unit_layout().map_err(layout_error)?;
         if &layout != self.declaration.parameters().unit_layout() {
             return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
         }
-        let invocations =
-            architecture
-                .execution_unit_storage_map()
-                .map_err(|error| match error {
-                    crate::ArchitectureExecutionLayoutError::Architecture(error) => error,
-                    crate::ArchitectureExecutionLayoutError::Layout(error) => {
-                        A::Error::from(ComponentPreparationError::Units(error))
-                    }
-                })?;
+        let invocations = architecture
+            .execution_unit_storage_map()
+            .map_err(layout_error)?;
         if &invocations != self.declaration.parameters().invocations() {
             return Err(ComponentPreparationError::ArchitectureMismatch(self.id).into());
         }
