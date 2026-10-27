@@ -1185,9 +1185,8 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentSelection {
     component: String,
-    layout: crate::ExecutionUnitLayout,
     invocations: crate::ExecutionUnitAddressMap,
-    units: std::collections::BTreeSet<(usize, usize)>,
+    units: Vec<ExecutionUnitAddress>,
     storage: std::collections::BTreeSet<ParameterStorageId>,
     state: Option<PartitionState>,
     owns_output: bool,
@@ -1212,17 +1211,14 @@ impl ComponentSelection {
         group: usize,
         index: usize,
     ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
-        if !self.units.contains(&(group, index)) {
-            return Err(ComponentDefinitionError::Address {
+        self.units
+            .binary_search_by_key(&(group, index), |address| (address.group(), address.index()))
+            .map(|ordinal| self.units[ordinal])
+            .map_err(|_| ComponentDefinitionError::Address {
                 component: self.component.clone(),
                 group,
                 index,
-            });
-        }
-        Ok(self
-            .layout
-            .address(self.layout.ordinal(group, index).expect("selected unit"))
-            .expect("selected ordinal"))
+            })
     }
 }
 
@@ -1269,25 +1265,23 @@ impl ComponentDefinition {
         if partition.state() != expected.as_ref() {
             return Err(invalid("partition state ownership"));
         }
-        let mut units = std::collections::BTreeSet::new();
-        for group in partition.groups() {
-            for index in group.global_units() {
-                let unit = definition.unit(group.group_index(), index)?;
-                if !unit.state.is_empty()
-                    && expected.as_ref().is_none_or(|state| {
-                        unit.state
-                            .clone()
-                            .any(|slot| !state.owns_global_layer(slot))
-                    })
-                {
-                    return Err(invalid("partition unit state references"));
-                }
-                units.insert((group.group_index(), index));
+        // Partition traversal supplies canonical group/unit order for binary lookup.
+        let mut units = Vec::with_capacity(partition.invocations().logical_addresses().len());
+        for address in partition.units() {
+            let unit = definition.unit(address.group(), address.index())?;
+            if !unit.state.is_empty()
+                && expected.as_ref().is_none_or(|state| {
+                    unit.state
+                        .clone()
+                        .any(|slot| !state.owns_global_layer(slot))
+                })
+            {
+                return Err(invalid("partition unit state references"));
             }
+            units.push(address);
         }
         let selected = ComponentSelection {
             component: self.id.clone(),
-            layout: self.parameters.unit_layout().clone(),
             invocations: partition.invocations().clone(),
             units,
             storage: partition
@@ -1415,7 +1409,7 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         if self
             .selection
             .as_ref()
-            .is_none_or(|selection| !selection.units.iter().any(|(owned, _)| *owned == group))
+            .is_none_or(|selection| !selection.units.iter().any(|address| address.group() == group))
         {
             return Err(ComponentDefinitionError::Invalid {
                 component: self.definition().id.clone(),
@@ -1552,8 +1546,8 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
                     resource: "missing retained partition".into(),
                 })?;
         let declared = selected.state.as_ref().map(PartitionState::layout);
-        let entry_declared = selected.units.first().and_then(|(group, _)| {
-            self.group_has_state_geometry(*group)
+        let entry_declared = selected.units.first().and_then(|address| {
+            self.group_has_state_geometry(address.group())
                 .then_some(declared)
                 .flatten()
         });

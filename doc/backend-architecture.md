@@ -1136,6 +1136,9 @@ Format grouping and task identities remain runtime contracts.
 Shared source restriction, binding and placement failures propagate through
 `ComponentPreparationError`. Family preparation errors add their active source
 admission, recipe, precision, geometry and communication failures.
+`ComponentSelection` retains selected global invocation addresses in canonical
+order. Binary lookup resolves group/unit identities without retaining a second
+complete global layout; dense vector positions do not become invocation identities.
 `PreparedComponent` validates family-resolved recipes against canonical global
 shapes, groups bindings by parameter-storage owner, and restricts checkpoint
 source authority to the recipes' physical inputs. Before recipe preparation,
