@@ -140,6 +140,14 @@ impl PipelineRankProjection {
     pub fn groups(&self) -> &[PipelineGroupOwnership] {
         &self.groups
     }
+    /// Whether this rank executes a logical unit, independently of stored parameters.
+    /// Shared or replicated storage does not grant ownership of its other consumers.
+    pub fn owns_unit(&self, group: &crate::ExecutionGroupId, global_unit: usize) -> bool {
+        self.groups
+            .iter()
+            .any(|owned| owned.group() == group && owned.units.contains(&global_unit))
+    }
+
     /// Declared input, output and static-role ownership.
     pub const fn ownership(&self) -> &PartitionOwnership {
         &self.ownership

@@ -1088,7 +1088,11 @@ rank. It retains read-only `PipelineGroupOwnership` intervals, local state,
 publication rank and optional logical parameter targets. Partition admission
 retains this projection as one value, keeping its groups,
 ownership, state and publication metadata together. Ownership-only inspection
-omits target names and state. `validate_partition` compares constructed graph,
+omits target names and state. `owns_unit` tests logical invocation ranges independently
+of parameter storage; shared consumers on other stages do not become local invocations.
+Peer component inspection uses this ownership-only projection. Explicit unit observation
+points resolve against the complete invocation layout, including units without parameters.
+`validate_partition` compares constructed graph,
 global units, ownership, ordered group ranges and state against the retained
 admission. Mismatches return `PipelineRankBindingError`; successful validation
 does not allocate temporary group catalogs. A partition derives its local unit

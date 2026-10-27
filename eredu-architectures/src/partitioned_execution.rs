@@ -8135,52 +8135,40 @@ pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
         &derived
     };
     let projected_rank;
-    let (ownership, groups, publication_owner) = if topology == admission.topology() {
-        (
-            admission.ownership(),
-            admission.groups(),
-            admission.publication_owner(),
-        )
+    let rank = if topology == admission.topology() {
+        &admission.rank
     } else {
         projected_rank = eredu_runtime::PipelineRankProjection::new(
             admission.execution.text(),
             None,
             topology,
-            true,
+            false,
         )
         .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?;
-        (
-            projected_rank.ownership(),
-            projected_rank.groups(),
-            projected_rank.publication_owner(),
-        )
+        &projected_rank
     };
     let mut result = ComponentPartitionLayout::from_ownership(
         descriptor,
         parameters,
         layout,
         topology,
-        ownership,
-        groups,
-        publication_owner,
+        rank.ownership(),
+        rank.groups(),
+        rank.publication_owner(),
         routed,
         admission.execution.text().component_definition(),
     )?;
     for point in unit_observations {
-        let owner =
-            eredu_runtime::ParameterGroupOwner::execution_unit(point.group.clone(), point.unit);
-        if !parameters
-            .groups()
-            .iter()
-            .any(|group| group.owner() == &owner)
-        {
+        let declared = parameters
+            .graph()
+            .group_index(point.group.as_str())
+            .and_then(|group| parameters.unit_layout().ordinal(group, point.unit));
+        if declared.is_none() {
             return Err(ComponentPartitionError::InvalidPlacement(
                 point.path.clone(),
             ));
         }
-        let local = groups
-            .iter()
-            .any(|group| group.group() == &point.group && group.units().contains(&point.unit));
+        let local = rank.owns_unit(&point.group, point.unit);
         result.register_unit_observation(descriptor, &point.path, local)?;
     }
     Ok(result)

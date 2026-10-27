@@ -418,9 +418,7 @@ pub fn derive_rank_parameter_member_layout(
     let rank = crate::PipelineRankProjection::new(text, None, topology, false)
         .map_err(|error| invalid(&error.to_string()))?;
     let owns = parameters.stores_owner(group.owner(), rank.ownership(), |id, unit| {
-        rank.groups()
-            .iter()
-            .any(|owned| owned.group() == id && owned.units().contains(&unit))
+        rank.owns_unit(id, unit)
     });
     let retained = match authored {
         Some(layout) => Some(layout),

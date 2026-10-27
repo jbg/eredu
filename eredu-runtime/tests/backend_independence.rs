@@ -8230,6 +8230,10 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     });
     assert_eq!(ranks[0].parameter_targets(), ["shared"]);
     assert_eq!(ranks[1].parameter_targets(), ["shared", "late"]);
+    // Both stages store shared parameters; the late invocation belongs only to rank 1.
+    let text_group = eredu_runtime::ExecutionGroupId::new("text").unwrap();
+    assert!(!ranks[0].owns_unit(&text_group, 1));
+    assert!(ranks[1].owns_unit(&text_group, 1));
     assert_eq!(ranks[0].publication_owner(), 1);
     assert_eq!(ranks[1].publication_owner(), 1);
     let ownership_only =
