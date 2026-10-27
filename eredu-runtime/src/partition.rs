@@ -417,17 +417,18 @@ impl ArchitectureParameterDescription {
                             .expect("validated owner"),
                     )
                     .expect("declared owner");
-                let consumers = consumers.iter().copied().collect::<BTreeSet<_>>();
-                if owners
-                    .insert((group, *global_unit), consumers.clone())
-                    .is_some_and(|previous| previous != consumers)
+                let selected = owners
+                    .entry((group, *global_unit))
+                    .or_insert_with(|| consumers.iter().copied().collect::<BTreeSet<_>>());
+                if selected.len() != consumers.len()
+                    || consumers.iter().any(|consumer| !selected.contains(consumer))
                 {
                     return Err(ArchitectureParameterError::InconsistentUnitConsumers {
                         group,
                         global_unit: *global_unit,
                     });
                 }
-                for consumer in consumers {
+                for &consumer in selected.iter() {
                     if let Some(previous) = claims.insert((group, consumer), owner) {
                         if previous != owner {
                             return Err(ArchitectureParameterError::ConflictingUnitOwners {
