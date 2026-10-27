@@ -26,16 +26,7 @@ impl ComponentDefinition {
             let canonical = &self.unit(group_index, *global_unit)?.path;
             for &consumer in consumers {
                 let prefix = &self.unit(group_index, consumer)?.path;
-                let invocation = self
-                    .parameters
-                    .unit_layout()
-                    .ordinal(group_index, consumer)
-                    .and_then(|ordinal| self.parameters.unit_layout().address(ordinal))
-                    .ok_or_else(|| ComponentDefinitionError::Address {
-                        component: self.id.clone(),
-                        group: group_index,
-                        index: consumer,
-                    })?;
+                let invocation = self.unit_address(group_index, consumer)?;
                 for member in owned.members() {
                     let suffix = member
                         .target()

@@ -1300,11 +1300,15 @@ impl ComponentDefinition {
         group: usize,
         index: usize,
     ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
-        self.unit(group, index)?;
         let layout = self.parameters.unit_layout();
-        Ok(layout
-            .address(layout.ordinal(group, index).expect("validated unit"))
-            .expect("validated ordinal"))
+        layout
+            .ordinal(group, index)
+            .and_then(|ordinal| layout.address(ordinal))
+            .ok_or_else(|| ComponentDefinitionError::Address {
+                component: self.id.clone(),
+                group,
+                index,
+            })
     }
 }
 
@@ -1689,40 +1693,12 @@ where
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        if self
-            .definition()
-            .parameters
-            .graph()
-            .groups()
-            .get(group)
-            .is_none()
-        {
-            return Err(ComponentDefinitionError::Address {
-                component: self.definition().id.clone(),
-                group,
-                index: 0,
-            }
-            .into());
-        }
+        self.definition().unit_count(group)?;
         self.kernel.group_input_observation_path(group)
     }
 
     fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
-        if self
-            .definition()
-            .parameters
-            .graph()
-            .groups()
-            .get(group)
-            .is_none()
-        {
-            return Err(ComponentDefinitionError::Address {
-                component: self.definition().id.clone(),
-                group,
-                index: 0,
-            }
-            .into());
-        }
+        self.definition().unit_count(group)?;
         self.kernel.group_output_observation_path(group)
     }
 
