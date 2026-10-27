@@ -190,6 +190,18 @@ struct ExecutionUnitAddressMapData {
 }
 
 impl ExecutionUnitAddressMap {
+    /// Declares independent storage for every invocation in a validated layout.
+    pub fn identity(layout: &ExecutionUnitLayout) -> Self {
+        Self::new(
+            layout,
+            (0..layout.len()).map(|ordinal| {
+                let address = layout.address(ordinal).expect("declared invocation");
+                (address, address)
+            }),
+        )
+        .expect("identity storage map for a validated layout")
+    }
+
     /// Validates each logical invocation and its explicit physical storage address.
     /// Every selected resource has at least one consumer. Logical groups are
     /// contiguous and retain their physical group; storage may repeat within a group.

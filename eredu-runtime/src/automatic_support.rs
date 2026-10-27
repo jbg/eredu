@@ -30,9 +30,6 @@ pub fn default_allocator_cache_bytes(available_memory_bytes: Option<u64>) -> u64
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum BoundedResidencySizingError {
-    /// Invocation references do not match the selected resource catalog.
-    #[error(transparent)]
-    InvocationMap(#[from] crate::ExecutionUnitAddressMapError),
     /// The authoritative selected materialization contract is invalid.
     #[error(transparent)]
     Materialization(#[from] ReplicatedTextContractError),

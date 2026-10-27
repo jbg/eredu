@@ -1890,6 +1890,7 @@ impl<G, A> ArchitecturePartition<G, A> {
         validate_canonical_layout(&graph, &unit_layout)?;
         boundary_schema.wire_schema()?;
         let mut partition = Self::new(
+            parameters.invocations(),
             graph,
             unit_layout,
             group_ranges,
@@ -1902,9 +1903,6 @@ impl<G, A> ArchitecturePartition<G, A> {
         partition.state = partition
             .resolve_state_partition(complete_state, state_plan)
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
-        partition.invocations = parameters
-            .invocations()
-            .select_invocations(partition.units())?;
         partition.parameter_bindings = parameters.select_owned(&partition);
         Ok(partition)
     }
@@ -1913,6 +1911,7 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// authoritative architecture topology has already been derived.
     #[allow(clippy::too_many_arguments)]
     fn new<S>(
+        invocations: &crate::ExecutionUnitAddressMap,
         graph: ExecutionGraph,
         unit_layout: ExecutionUnitLayout,
         group_ranges: impl IntoIterator<Item = (S, Range<usize>)>,
@@ -1985,15 +1984,8 @@ impl<G, A> ArchitecturePartition<G, A> {
             }
         }
 
-        let invocations = crate::ExecutionUnitAddressMap::new(
-            &unit_layout,
-            (0..unit_layout.len()).map(|ordinal| {
-                let address = unit_layout.address(ordinal).expect("declared invocation");
-                (address, address)
-            }),
-        )
-        .expect("identity storage map")
-        .select_invocations(groups.iter().flat_map(|group| {
+        invocations.validate_layout(&unit_layout)?;
+        let invocations = invocations.select_invocations(groups.iter().flat_map(|group| {
             group
                 .ordinals
                 .clone()
@@ -3003,6 +2995,7 @@ mod tests {
         let graph = graph();
         let layout = layout(&graph);
         ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout),
             graph,
             layout,
             [("prediction", 0..2), ("primary", 1..4)],
@@ -3033,6 +3026,7 @@ mod tests {
     ) -> ArchitecturePartition<(), ()> {
         let graph = graph();
         ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
             graph.clone(),
             layout(&graph),
             [("primary", primary)],
@@ -3509,6 +3503,7 @@ mod tests {
     fn partition_rejects_parameter_owner_outside_local_unit_ranges() {
         let graph = graph();
         let error = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
             graph.clone(),
             layout(&graph),
             [("primary", 1..4)],
@@ -3722,6 +3717,7 @@ mod tests {
         let graph = graph();
         let mismatched_graph = ExecutionGraph::chain(["primary", "other"]).unwrap();
         let error = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&mismatched_graph)),
             graph.clone(),
             layout(&mismatched_graph),
             [("primary", 0..1)],
@@ -3738,6 +3734,7 @@ mod tests {
         ));
 
         let error = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
             graph.clone(),
             layout(&graph),
             [("missing", 0..1)],
@@ -3754,6 +3751,7 @@ mod tests {
         );
 
         let error = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
             graph.clone(),
             layout(&graph),
             [("primary", 0..1), ("primary", 1..2)],
@@ -3774,6 +3772,7 @@ mod tests {
     fn rejects_empty_and_out_of_bounds_group_ranges() {
         let graph = graph();
         let error = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
             graph.clone(),
             layout(&graph),
             [("primary", 2..2)],
@@ -3790,6 +3789,7 @@ mod tests {
         ));
 
         let error = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
             graph.clone(),
             layout(&graph),
             [("prediction", 1..4)],
@@ -3826,6 +3826,7 @@ mod tests {
 
         let graph = graph();
         let error = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
             graph.clone(),
             layout(&graph),
             [("primary", 0..1)],
@@ -3858,6 +3859,7 @@ mod tests {
         let graph = ExecutionGraph::chain(["decoder"]).unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [4]).unwrap();
         ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout),
             graph,
             layout,
             [("decoder", 1..3)],
@@ -3900,6 +3902,7 @@ mod tests {
         let graph = ExecutionGraph::chain(["vision", "decoder"]).unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [1, 2]).unwrap();
         let partition = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(&layout),
             graph,
             layout,
             [("vision", 0..1), ("decoder", 0..2)],
@@ -3917,6 +3920,9 @@ mod tests {
         assert_eq!(vision.group_index(), 0);
 
         let without_state = ArchitecturePartition::new(
+            &crate::ExecutionUnitAddressMap::identity(
+                &ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
+            ),
             ExecutionGraph::chain(["vision"]).unwrap(),
             ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
             [("vision", 0..1)],

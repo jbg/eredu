@@ -1329,13 +1329,7 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
             .collect::<Vec<_>>();
         let (static_bytes, window_bytes, depth) = match &self.execution_layout {
             Some(layout) => {
-                let invocations = eredu_runtime::ExecutionUnitAddressMap::new(
-                    layout,
-                    (0..layout.len()).map(|ordinal| {
-                        let address = layout.address(ordinal).expect("validated assistant layout");
-                        (address, address)
-                    }),
-                )?;
+                let invocations = eredu_runtime::ExecutionUnitAddressMap::identity(layout);
                 (
                     0,
                     eredu_runtime::execution_unit_parameter_window_bytes(

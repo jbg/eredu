@@ -6656,8 +6656,11 @@ concrete topology adapters do not erase or reject that axis independently.
 architecture-authored parameter, state and boundary declarations without native
 resources. `from_architecture` validates the parameter declaration against the
 concrete neutral architecture, derives its state plan and uses the same
-construction path. Backend placement code supplies rank-local ranges and
-ownership, but cannot substitute a caller-built topology that only resembles the
+construction path. Partition preparation projects the declaration's retained
+invocation-to-storage map directly, preserving shared owners outside the selected
+logical-unit range. Independent-storage callers use the runtime's identity-map
+constructor. Backend placement code supplies rank-local ranges and ownership,
+but cannot substitute a caller-built topology that only resembles the
 architecture it will execute.
 Balanced unit ranges are only a placement default. When an architecture
 declares dependency-safe pipeline ranges—for example, to keep a shared-state

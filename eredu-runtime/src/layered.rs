@@ -990,14 +990,7 @@ where
     ) -> Result<crate::ExecutionUnitAddressMap, crate::ArchitectureExecutionLayoutError<Self::Error>>
     {
         let layout = self.execution_unit_layout()?;
-        Ok(crate::ExecutionUnitAddressMap::new(
-            &layout,
-            (0..layout.len()).map(|ordinal| {
-                let address = layout.address(ordinal).expect("declared invocation");
-                (address, address)
-            }),
-        )
-        .expect("identity storage map for a validated layout"))
+        Ok(crate::ExecutionUnitAddressMap::identity(&layout))
     }
 
     /// Returns the number of ordered execution units in one graph group.
