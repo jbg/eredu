@@ -217,13 +217,14 @@ impl PreparedComponent<crate::ComponentDefinition> {
 
 impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     /// Prepares canonical physical recipes from an admitted catalog. Only declared
-    /// targets are resolved; conversion policy and missing-target errors belong to
-    /// the caller. Source restriction, ownership and placement use ordinary preparation.
-    pub fn prepare_physical_recipes<E>(
+    /// targets are resolved through a borrowed lookup; each used recipe is cloned once.
+    /// Conversion policy and missing-target errors belong to the caller. Source
+    /// restriction, ownership and placement use ordinary preparation.
+    pub fn prepare_physical_recipes<'a, E>(
         id: impl Into<String>,
         declaration: D,
         source: SharedCheckpointSource,
-        recipes: &BTreeMap<String, DerivedWeightRecipe>,
+        mut recipes: impl FnMut(&str) -> Option<&'a DerivedWeightRecipe>,
         conversion: Option<ComponentRecipeConversion>,
         mut missing: impl FnMut(&str) -> E,
     ) -> Result<Self, E>
@@ -231,8 +232,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         E: From<ComponentPreparationError>,
     {
         Self::prepare(id, declaration, source, |member| {
-            let recipe = recipes
-                .get(member.target())
+            let recipe = recipes(member.target())
                 .cloned()
                 .ok_or_else(|| missing(member.target()))?;
             Ok::<_, E>(ComponentRecipe::Physical {

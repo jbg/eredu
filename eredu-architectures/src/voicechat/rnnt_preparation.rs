@@ -75,15 +75,14 @@ impl PreparedRnntBindings {
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, RnntPreparationError> {
         let definition = rnnt_component_definition(dimensions)?;
-        let mut recipes = BTreeMap::new();
         for owned in definition.parameters().groups() {
             for member in owned.members() {
-                let name = member.target();
-                let parameter = admitted_member(parameters, &source, Component::Rnnt, member)?;
-                recipes.insert(name.into(), parameter.recipe.clone());
+                admitted_member(parameters, &source, Component::Rnnt, member)?;
             }
         }
-        Self::from_definition(dimensions, definition, source, &recipes)
+        Self::from_definition(dimensions, definition, source, |name| {
+            parameters.get(name).map(|parameter| &parameter.recipe)
+        })
     }
 
     /// Selects exact component recipes from a low-level retained source.
@@ -94,14 +93,14 @@ impl PreparedRnntBindings {
         parameters: &BTreeMap<String, DerivedWeightRecipe>,
     ) -> Result<Self, RnntPreparationError> {
         let definition = rnnt_component_definition(dimensions)?;
-        Self::from_definition(dimensions, definition, source, parameters)
+        Self::from_definition(dimensions, definition, source, |name| parameters.get(name))
     }
 
-    fn from_definition(
+    fn from_definition<'a>(
         dimensions: RnntDimensions,
         definition: eredu_runtime::ComponentDefinition,
         source: SharedCheckpointSource,
-        parameters: &BTreeMap<String, DerivedWeightRecipe>,
+        parameters: impl FnMut(&str) -> Option<&'a DerivedWeightRecipe>,
     ) -> Result<Self, RnntPreparationError> {
         let prepared = PreparedComponent::prepare_physical_recipes(
             "voicechat/rnnt/leased-units",

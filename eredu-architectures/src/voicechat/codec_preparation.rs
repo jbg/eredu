@@ -30,18 +30,18 @@ pub fn prepare_neural_decoder(
         SpeechParameterError::MissingComponent(Component::CodecDecoder),
     )?;
     let config = super::codec::waveform_decoder_config(&artifacts.plan().config().codec)?;
-    let recipes = artifacts
-        .plan()
-        .parameters()
-        .iter()
-        .filter(|(_, parameter)| parameter.component == Component::CodecDecoder)
-        .map(|(name, parameter)| (name.clone(), parameter.recipe.clone()))
-        .collect();
     Ok(PreparedDecoderBindings::from_recipes(
         config.neural,
         "tts_model.audio_codec.decoder",
         source.clone(),
-        &recipes,
+        |name| {
+            artifacts
+                .plan()
+                .parameters()
+                .get(name)
+                .filter(|parameter| parameter.component == Component::CodecDecoder)
+                .map(|parameter| &parameter.recipe)
+        },
     )?)
 }
 
@@ -71,19 +71,19 @@ pub fn prepare_quantizer(
             Component::CodecQuantizer,
         ))?;
     let config = super::codec::waveform_decoder_config(&artifacts.plan().config().codec)?;
-    let recipes = artifacts
-        .plan()
-        .parameters()
-        .iter()
-        .filter(|(_, parameter)| parameter.component == Component::CodecQuantizer)
-        .map(|(name, parameter)| (name.clone(), parameter.recipe.clone()))
-        .collect();
     Ok(
         eredu_codec::prvq_preparation::PreparedQuantizerBindings::from_recipes(
             config.quantizer,
             "tts_model.audio_codec.prvq",
             source.clone(),
-            &recipes,
+            |name| {
+                artifacts
+                    .plan()
+                    .parameters()
+                    .get(name)
+                    .filter(|parameter| parameter.component == Component::CodecQuantizer)
+                    .map(|parameter| &parameter.recipe)
+            },
         )?,
     )
 }
@@ -116,19 +116,19 @@ pub fn prepare_neural_encoder(
         SpeechParameterError::MissingComponent(Component::CodecEncoder),
     )?;
     let config = super::codec::waveform_encoder_config(&artifacts.plan().config().codec)?;
-    let recipes = artifacts
-        .plan()
-        .parameters()
-        .iter()
-        .filter(|(_, parameter)| parameter.component == Component::CodecEncoder)
-        .map(|(name, parameter)| (name.clone(), parameter.recipe.clone()))
-        .collect();
     Ok(
         eredu_codec::ear_encoder_preparation::PreparedEncoderBindings::from_recipes(
             config.neural,
             "tts_model.audio_codec.encoder",
             source.clone(),
-            &recipes,
+            |name| {
+                artifacts
+                    .plan()
+                    .parameters()
+                    .get(name)
+                    .filter(|parameter| parameter.component == Component::CodecEncoder)
+                    .map(|parameter| &parameter.recipe)
+            },
         )?,
     )
 }

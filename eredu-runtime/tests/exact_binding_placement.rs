@@ -1762,12 +1762,12 @@ mod component_preparation {
                     DerivedWeightRecipe::source(format!("physical.{index}"), TensorSelection::Full),
                 )
             })
-            .collect();
+            .collect::<std::collections::BTreeMap<_, _>>();
         PreparedComponent::prepare_physical_recipes(
             "shared-contract",
             declaration,
             source,
-            &recipes,
+            |name| recipes.get(name),
             None,
             |target| ComponentPreparationError::Geometry {
                 component: "shared-contract".into(),

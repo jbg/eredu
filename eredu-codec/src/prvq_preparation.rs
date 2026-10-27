@@ -1,7 +1,5 @@
 //! Cold exact binding plans for independently leased PRVQ codebook units.
 
-use std::collections::BTreeMap;
-
 use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
 use eredu_runtime::{
     ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
@@ -50,11 +48,11 @@ impl PreparedQuantizerBindings {
     /// Projects explicit low-level admitted component recipes without artifact
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring component payloads are excluded.
-    pub fn from_recipes(
+    pub fn from_recipes<'a>(
         geometry: Geometry,
         prefix: &str,
         source: SharedCheckpointSource,
-        parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        parameters: impl FnMut(&str) -> Option<&'a eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, QuantizerPreparationError> {
         let definition = quantizer_component_definition(geometry, prefix)?;
         let prepared = PreparedComponent::prepare_physical_recipes(
