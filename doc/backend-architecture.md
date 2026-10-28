@@ -1025,8 +1025,10 @@ projection ingress captures the raw encoder result alongside its projected outpu
 `PreparedCheckpointSource::retain` restricts physical inputs and snapshots their
 exact metadata and provenance before deferred payload access. Runtime's
 `PreparedParameterRecipes` couples this authority with validated family-resolved
-recipes for one ordinary, expert or pinned owner. Empty owners retain an empty
-source. Consuming `map_recipes` applies family-authored transformations while
+recipes for one ordinary, expert or pinned owner. Clones share immutable recipe
+metadata; consuming updates obtain an independent map. Canonical storage declarations
+determine physical sharing. Empty owners retain an empty source. Consuming
+`map_recipes` applies family-authored transformations while
 preserving canonical targets, validating outputs and narrowing authority to the
 transformed recipes' physical inputs. It cannot introduce a neighboring owner's
 sources. Consuming `project` selects existing canonical parameter identities,

@@ -1084,7 +1084,7 @@ impl ParameterBankRecipes {
 #[derive(Clone)]
 pub struct PreparedParameterRecipes {
     source: SharedCheckpointSource,
-    recipes: BTreeMap<String, DerivedWeightRecipe>,
+    recipes: Arc<BTreeMap<String, DerivedWeightRecipe>>,
 }
 
 impl PreparedParameterRecipes {
@@ -1104,7 +1104,10 @@ impl PreparedParameterRecipes {
         for recipe in recipes.values() {
             recipe.infer(source.as_ref())?;
         }
-        Ok(Self { source, recipes })
+        Ok(Self {
+            source,
+            recipes: Arc::new(recipes),
+        })
     }
 
     /// Transforms recipes without changing canonical parameter identities or
@@ -1138,8 +1141,7 @@ impl PreparedParameterRecipes {
             }
         }
         let catalog = MetadataView(self.source.as_ref());
-        let recipes = self
-            .recipes
+        let recipes = Arc::unwrap_or_clone(self.recipes)
             .into_iter()
             .map(|(name, recipe)| transform(&name, &recipe, &catalog).map(|recipe| (name, recipe)))
             .collect::<Result<_, E>>()?;
@@ -1161,7 +1163,7 @@ impl PreparedParameterRecipes {
                 });
             }
         }
-        self.recipes.retain(|target, _| targets.contains(target));
+        Arc::make_mut(&mut self.recipes).retain(|target, _| targets.contains(target));
         let keys = self
             .recipes
             .values()
