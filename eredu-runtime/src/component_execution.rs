@@ -83,25 +83,50 @@ pub enum ParameterStorageId {
     },
 }
 
-impl ParameterStorageId {
-    /// Projects storage identity without including logical-consumer selection.
-    pub(crate) fn from_owner(owner: &crate::ParameterGroupOwner) -> Self {
+// Borrowed canonical storage keys omit logical consumer declarations.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ParameterStorageRef<'a> {
+    StaticRole(&'a str),
+    ExecutionUnit {
+        group: &'a crate::ExecutionGroupId,
+        global_unit: usize,
+    },
+}
+
+impl<'a> ParameterStorageRef<'a> {
+    pub(crate) fn from_owner(owner: &'a crate::ParameterGroupOwner) -> Option<Self> {
         match owner {
             crate::ParameterGroupOwner::StaticRole(_)
             | crate::ParameterGroupOwner::StaticUnitConsumers { .. }
-            | crate::ParameterGroupOwner::StaticAnyOf(_) => Self::StaticRole(
-                owner
-                    .static_storage_role()
-                    .expect("validated static owner")
-                    .to_owned(),
-            ),
+            | crate::ParameterGroupOwner::StaticAnyOf(_) => {
+                owner.static_storage_role().map(Self::StaticRole)
+            }
             crate::ParameterGroupOwner::ExecutionUnit {
                 group, global_unit, ..
-            } => Self::ExecutionUnit {
-                group: group.clone(),
+            } => Some(Self::ExecutionUnit {
+                group,
                 global_unit: *global_unit,
+            }),
+        }
+    }
+
+    fn into_owned(self) -> ParameterStorageId {
+        match self {
+            Self::StaticRole(role) => ParameterStorageId::StaticRole(role.to_owned()),
+            Self::ExecutionUnit { group, global_unit } => ParameterStorageId::ExecutionUnit {
+                group: group.clone(),
+                global_unit,
             },
         }
+    }
+}
+
+impl ParameterStorageId {
+    /// Projects storage identity without including logical-consumer selection.
+    pub(crate) fn from_owner(owner: &crate::ParameterGroupOwner) -> Self {
+        ParameterStorageRef::from_owner(owner)
+            .expect("validated parameter owner")
+            .into_owned()
     }
 }
 
@@ -757,9 +782,12 @@ impl ComponentDefinition {
             .groups()
             .iter()
             .filter(|owned| owned.owner().has_unit_consumer(group_id, index))
-            .map(|owned| ParameterStorageId::from_owner(owned.owner()))
+            .map(|owned| {
+                ParameterStorageRef::from_owner(owned.owner()).expect("validated parameter owner")
+            })
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
+            .map(ParameterStorageRef::into_owned)
             .collect())
     }
     /// Mutable-state identities retained by this invocation.

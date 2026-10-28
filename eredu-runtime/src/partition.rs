@@ -3,6 +3,8 @@
 use std::ops::Deref;
 use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
 
+use crate::component_execution::ParameterStorageRef;
+
 use crate::{
     ArchitectureStatePartitionError, ArchitectureStatePartitionPlan, ArchitectureStatePlacement,
     ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, LayeredForwardState,
@@ -104,12 +106,11 @@ impl ParameterGroupOwner {
 
     /// Compares canonical storage without copying consumer declarations or role names.
     pub(crate) fn same_storage_as(&self, other: &Self) -> bool {
-        match (self.static_storage_role(), other.static_storage_role()) {
+        match (
+            ParameterStorageRef::from_owner(self),
+            ParameterStorageRef::from_owner(other),
+        ) {
             (Some(left), Some(right)) => left == right,
-            (None, None) => matches!((self, other), (
-                Self::ExecutionUnit { group: a, global_unit: i, .. },
-                Self::ExecutionUnit { group: b, global_unit: j, .. },
-            ) if a == b && i == j),
             _ => false,
         }
     }
@@ -697,10 +698,14 @@ impl ArchitectureParameterDescription {
             .groups
             .iter()
             .filter(|tagged| tagged.owner().is_stored_by(ownership, &owns_unit))
-            .map(|tagged| crate::ParameterStorageId::from_owner(tagged.owner()))
+            .map(|tagged| {
+                ParameterStorageRef::from_owner(tagged.owner()).expect("validated parameter owner")
+            })
             .collect::<BTreeSet<_>>();
         self.groups.iter().filter(move |tagged| {
-            storage.contains(&crate::ParameterStorageId::from_owner(tagged.owner()))
+            storage.contains(
+                &ParameterStorageRef::from_owner(tagged.owner()).expect("validated parameter owner"),
+            )
         })
     }
 
