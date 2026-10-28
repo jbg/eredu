@@ -969,6 +969,8 @@ Typed partition and pipeline adaptation require
 `PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
 selection validates canonical parameter ownership and the declared state projection,
 retains global invocation addresses, and maps declared state slots to local ordinals.
+Binding validation compares borrowed groups with the declaration's stored-resource
+projection; it does not construct a second selected parameter catalog.
 Ingress checks both the complete local state and its entry-group projection;
 egress checks output ownership. Declared state consumers also select the ordinary
 local-stage traversal without a family-authored state-group predicate. The

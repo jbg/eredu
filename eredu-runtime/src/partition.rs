@@ -658,6 +658,18 @@ impl ArchitectureParameterDescription {
         .collect()
     }
 
+    /// Compares retained partition bindings with their exact declared ownership.
+    /// The comparison borrows parameter groups instead of cloning a selected catalog.
+    pub fn matches_partition_bindings<G, A>(
+        &self,
+        partition: &ArchitecturePartition<G, A>,
+    ) -> bool {
+        partition.parameter_bindings().iter().eq(self.stored_groups(
+            partition.ownership(),
+            |group, unit| partition.owns_unit(group.as_str(), unit),
+        ))
+    }
+
     /// Projects every group in a stored canonical resource, including physical replicas.
     /// Logical invocation and observation ownership remain in each group's declaration.
     pub fn stored_groups(

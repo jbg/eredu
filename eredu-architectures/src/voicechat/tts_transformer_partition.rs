@@ -147,8 +147,7 @@ pub(super) fn validate_partition<G>(
             ))
         }
     }
-    let selected = description.select_owned(partition);
-    if selected != partition.parameter_bindings() {
+    if !description.matches_partition_bindings(partition) {
         return Err(TransformerError::Configuration(
             "TTS partition parameter authority differs from its units",
         ));

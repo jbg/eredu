@@ -169,7 +169,7 @@ pub fn validate_rnnt_predictor_partition<G>(
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &RnntPredictorBoundarySchema::new(dimensions)?
-        || partition.parameter_bindings() != description.select_owned(partition)
+        || !description.matches_partition_bindings(partition)
         || partition.groups().len() != 1
         || partition.groups()[0].group_index() != 0
         || !partition.ownership().static_roles().is_empty()

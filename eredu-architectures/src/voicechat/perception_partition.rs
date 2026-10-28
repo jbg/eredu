@@ -84,7 +84,7 @@ fn ownership<G>(
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &PerceptionBoundarySchema::new(dimensions)
-        || partition.parameter_bindings() != description.select_owned(partition)
+        || !description.matches_partition_bindings(partition)
     {
         return Err(PerceptionError::Configuration(
             "perception partition graph, parameters or boundary differs",

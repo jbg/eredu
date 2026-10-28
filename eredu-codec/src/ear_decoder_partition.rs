@@ -219,7 +219,7 @@ fn ownership<G>(
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &DecoderBoundarySchema::new(config)?
-        || partition.parameter_bindings() != description.select_owned(partition)
+        || !description.matches_partition_bindings(partition)
         || groups.len() != 1
         || groups[0].group_index() != 0
         || !partition.ownership().static_roles().is_empty()

@@ -1234,7 +1234,7 @@ impl ComponentDefinition {
         };
         if partition.graph() != definition.parameters.graph()
             || partition.unit_layout() != definition.parameters.unit_layout()
-            || partition.parameter_bindings() != definition.parameters.select_owned(partition)
+            || !definition.parameters.matches_partition_bindings(partition)
             || !definition
                 .parameters
                 .invocations()
