@@ -1026,13 +1026,13 @@ projection ingress captures the raw encoder result alongside its projected outpu
 exact metadata and provenance before deferred payload access. Runtime's
 `PreparedParameterRecipes` couples this authority with validated family-resolved
 recipes for one ordinary, expert or pinned owner. Clones share immutable recipe
-metadata; consuming updates obtain an independent map. Canonical storage declarations
-determine physical sharing. Empty owners retain an empty source. Consuming
+metadata; changed projections isolate their selected entries, and transformations
+produce independent maps. Canonical storage declarations determine physical sharing. Empty owners retain an empty source. Consuming
 `map_recipes` applies family-authored transformations while
 preserving canonical targets, validating outputs and narrowing authority to the
 transformed recipes' physical inputs. It cannot introduce a neighboring owner's
 sources. Consuming `project` selects existing canonical parameter identities,
-retains their recipes in place and narrows the existing exact source authority without
+retains their recipes and narrows the existing exact source authority without
 repeating recipe admission or metadata snapshots. It preserves deferred-read guards
 and rejects unknown targets. Qwen4
 target and prediction tensor partitions use the shared transformation traversal.

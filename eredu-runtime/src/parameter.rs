@@ -1166,7 +1166,19 @@ impl PreparedParameterRecipes {
                 });
             }
         }
-        Arc::make_mut(&mut self.recipes).retain(|target, _| targets.contains(target));
+        // Admission above makes equal cardinality an identical selection.
+        if self.recipes.len() != targets.len() {
+            self.recipes = Arc::new(match Arc::try_unwrap(self.recipes) {
+                Ok(mut recipes) => {
+                    recipes.retain(|target, _| targets.contains(target));
+                    recipes
+                }
+                Err(recipes) => targets
+                    .iter()
+                    .map(|target| (target.clone(), recipes[target].clone()))
+                    .collect(),
+            });
+        }
         let keys = self
             .recipes
             .values()
