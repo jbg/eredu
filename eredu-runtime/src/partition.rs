@@ -1056,6 +1056,11 @@ impl BoundaryWireSchema {
         &self.auxiliary
     }
 
+    /// Visits the primary tensor followed by auxiliaries in canonical transport order.
+    pub fn tensors(&self) -> impl Iterator<Item = &BoundaryTensorSpec> {
+        std::iter::once(&self.primary).chain(&self.auxiliary)
+    }
+
     /// Resolves invocation-dependent dimensions without backend family logic.
     pub fn resolve(
         &self,
@@ -1149,6 +1154,11 @@ impl ResolvedBoundaryWireSchema {
     /// Returns resolved auxiliary declarations in canonical transport order.
     pub fn auxiliary(&self) -> &[ResolvedBoundaryTensorSpec] {
         &self.auxiliary
+    }
+
+    /// Visits the primary tensor followed by auxiliaries in canonical transport order.
+    pub fn tensors(&self) -> impl Iterator<Item = &ResolvedBoundaryTensorSpec> {
+        std::iter::once(&self.primary).chain(&self.auxiliary)
     }
 }
 

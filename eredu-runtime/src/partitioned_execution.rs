@@ -3791,7 +3791,7 @@ where
     B: NeuralBackend,
     I: CommunicationTensorMetadata<B>,
 {
-    let specs = std::iter::once(schema.primary()).chain(schema.auxiliary());
+    let specs = schema.tensors();
     let expected = 1 + schema.auxiliary().len();
     if values.len() != expected {
         return Err(PartitionExecutionError::BoundaryTensorCount {
@@ -3816,7 +3816,7 @@ where
     B: NeuralBackend,
     I: CommunicationTensorMetadata<B>,
 {
-    let specs = std::iter::once(schema.primary()).chain(schema.auxiliary());
+    let specs = schema.tensors();
     let expected = 1 + schema.auxiliary().len();
     if values.len() != expected {
         return Err(PartitionExecutionError::BoundaryTensorCount {
@@ -3845,7 +3845,7 @@ fn resolved_tagged_boundary_roles<T>(
 ) -> Result<Vec<crate::BoundaryRoleContract>, PartitionExecutionError> {
     values
         .iter()
-        .zip(std::iter::once(schema.primary()).chain(schema.auxiliary()))
+        .zip(schema.tensors())
         .map(|(value, spec)| {
             let dtype = match spec.dtype() {
                 crate::BoundaryTensorDtype::Activation => match wire.activation_dtype() {

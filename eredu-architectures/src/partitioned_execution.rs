@@ -962,10 +962,7 @@ fn validate_composite_invocation_schema(
             "composite invocation boundary cardinality differs from selected route schema",
         ));
     }
-    for (selected, actual) in std::iter::once(selected.primary())
-        .chain(selected.auxiliary())
-        .zip(std::iter::once(actual.primary()).chain(actual.auxiliary()))
-    {
+    for (selected, actual) in selected.tensors().zip(actual.tensors()) {
         if selected.role() != actual.role()
             || selected.dtype() != actual.dtype()
             || selected.shape().len() != actual.shape().len()
@@ -1910,8 +1907,8 @@ where
         })?;
         validate_composite_invocation_schema(selected, schema)?;
         if !source {
-            return std::iter::once(schema.primary())
-                .chain(schema.auxiliary())
+            return schema
+                .tensors()
                 .map(|spec| {
                     self.allocator
                         .tensor_placeholder(
@@ -1996,8 +1993,8 @@ where
                 ]
             }
         };
-        std::iter::once(schema.primary())
-            .chain(schema.auxiliary())
+        schema
+            .tensors()
             .zip(values)
             .map(|(spec, value)| {
                 if value.role() != spec.role() {
@@ -7086,20 +7083,20 @@ fn pipeline_routes(
         let max_tensors = 1usize
             .checked_add(boundary.auxiliary().len())
             .ok_or_else(|| "pipeline boundary tensor count overflowed".to_owned())?;
-        let max_rank = std::iter::once(boundary.primary())
-            .chain(boundary.auxiliary())
+        let max_rank = boundary
+            .tensors()
             .map(|tensor| tensor.shape().len())
             .max()
             .unwrap_or(0);
-        let max_elements = std::iter::once(boundary.primary())
-            .chain(boundary.auxiliary())
+        let max_elements = boundary
+            .tensors()
             .map(|tensor| tensor_elements(tensor.shape()))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .max()
             .ok_or_else(|| "pipeline boundary is empty".to_owned())?;
         let mut dtypes = Vec::new();
-        for tensor in std::iter::once(boundary.primary()).chain(boundary.auxiliary()) {
+        for tensor in boundary.tensors() {
             let dtype = match tensor.dtype() {
                 eredu_runtime::BoundaryTensorDtype::Activation => activation_dtype.clone(),
                 eredu_runtime::BoundaryTensorDtype::Uint32 => {
@@ -7127,9 +7124,9 @@ fn pipeline_routes(
         .map_err(|error| error.to_string())?;
         let boundary_contract = RoleExactBoundaryContract::new(
             boundary.identity(),
-            std::iter::once(symbolic_boundary.primary())
-                .chain(symbolic_boundary.auxiliary())
-                .zip(std::iter::once(boundary.primary()).chain(boundary.auxiliary()))
+            symbolic_boundary
+                .tensors()
+                .zip(boundary.tensors())
                 .map(|(symbolic, resolved)| {
                     if symbolic.role() != resolved.role() || symbolic.dtype() != resolved.dtype() {
                         return Err(
@@ -7632,15 +7629,12 @@ where
             "selected boundary route has no role-exact manifest contract".to_owned()
         })?;
         let schema = selected.schema();
-        let specs = std::iter::once(schema.primary())
-            .chain(schema.auxiliary())
-            .collect::<Vec<_>>();
         if contract.schema() != schema.identity()
-            || contract.roles().len() != specs.len()
+            || contract.roles().len() != 1 + schema.auxiliary().len()
             || contract
                 .roles()
                 .iter()
-                .zip(specs)
+                .zip(schema.tensors())
                 .any(|(role, spec)| role.role() != spec.role())
         {
             return Err(

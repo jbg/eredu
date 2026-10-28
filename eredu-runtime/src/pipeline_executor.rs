@@ -1249,8 +1249,8 @@ where
                 )),
             }
         } else {
-            std::iter::once(schema.primary())
-                .chain(schema.auxiliary())
+            schema
+                .tensors()
                 .map(|spec| {
                     let tensor = self.allocator.tensor_placeholder(
                         spec.shape(),
@@ -1298,10 +1298,7 @@ where
                 "resolved pipeline boundary differs from its typed route declaration",
             ));
         }
-        for (declared, concrete) in std::iter::once(typed.primary())
-            .chain(typed.auxiliary())
-            .zip(std::iter::once(resolved.primary()).chain(resolved.auxiliary()))
-        {
+        for (declared, concrete) in typed.tensors().zip(resolved.tensors()) {
             if declared.role() != concrete.role() || declared.dtype() != concrete.dtype()
                 || declared.shape().len() != concrete.shape().len()
                 || declared.shape().iter().zip(concrete.shape()).any(|(symbolic, extent)| {

@@ -3973,9 +3973,11 @@ the final publication shape independently of the input sequence. This permits
 different channel orders and rates at successive boundaries. The executor
 checks resolved identity, roles and scalar kinds against the typed declaration;
 cold component binding checks compare every route with its architecture-authored
-wire schema. Receive allocation and final publication use these retained
-contracts. Fixed-width transformer and perception implementations use the
-ordinary batch/sequence defaults.
+wire schema. Symbolic and resolved schemas expose primary-then-auxiliary tensor
+traversal in canonical transport order for binding checks, exchange and composite
+assembly. Receive allocation and final publication use these retained contracts.
+Fixed-width transformer and perception implementations use the ordinary
+batch/sequence defaults.
 
 A prepared routed partition carries one
 immutable architecture-owned execution handoff: local-versus-pipeline dispatch,

@@ -246,13 +246,12 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
         let contract = route
             .boundary_contract()
             .ok_or(Contract("route lacks exact boundary roles"))?;
-        let symbolic = std::iter::once(schema.primary())
-            .chain(schema.auxiliary())
-            .collect::<Vec<_>>();
-        if contract.schema() != schema.identity() || contract.roles().len() != symbolic.len() {
+        if contract.schema() != schema.identity()
+            || contract.roles().len() != 1 + schema.auxiliary().len()
+        {
             return Err(Contract("route boundary identity or roles differ"));
         }
-        for (actual, expected) in contract.roles().iter().zip(symbolic) {
+        for (actual, expected) in contract.roles().iter().zip(schema.tensors()) {
             let dtype = match expected.dtype() {
                 BoundaryTensorDtype::Int32 => TensorDtype::I32,
                 BoundaryTensorDtype::Float32 => TensorDtype::F32,
