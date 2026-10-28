@@ -758,21 +758,24 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         let addresses = addresses.into_iter().collect::<Vec<_>>();
         let selected = self.unit_layout().select(addresses.iter().copied())?;
         let invocations = self.invocations.select_invocations(addresses)?;
-        let mut retained = self.units.into_iter().map(Some).collect::<Vec<_>>();
-        self.units = (0..invocations.storage_layout().len())
-            .map(|ordinal| {
-                let address = invocations
-                    .storage_layout()
-                    .address(ordinal)
-                    .expect("selected physical owner");
-                let original = self
-                    .invocations
-                    .storage_layout()
-                    .ordinal(address.group(), address.index())
-                    .expect("validated subset");
-                retained[original].take().expect("unique selected address")
-            })
-            .collect();
+        // Both physical catalogs retain canonical order; compare global owner
+        // addresses while compacting bindings without staging a second catalog.
+        let mut original_ordinal = 0;
+        let mut selected_ordinal = 0;
+        self.units.retain(|_| {
+            let address = self
+                .invocations
+                .storage_layout()
+                .address(original_ordinal)
+                .expect("prepared physical owner");
+            original_ordinal += 1;
+            if Some(address) == invocations.storage_layout().address(selected_ordinal) {
+                selected_ordinal += 1;
+                true
+            } else {
+                false
+            }
+        });
         self.selected_units = Some(selected);
         self.invocations = invocations;
         self.source = restrict_bindings(
