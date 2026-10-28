@@ -503,27 +503,32 @@ impl ComponentDefinition {
         {
             return Err(invalid("selected parameter invocation or storage identity"));
         }
-        fn primaries(
-            description: &ArchitectureParameterDescription,
-        ) -> std::collections::BTreeMap<&str, &crate::ParameterGroupOwner> {
-            description
-                .groups()
+        let mut primaries = self
+            .parameters
+            .groups()
+            .iter()
+            .flat_map(|group| {
+                group
+                    .members()
+                    .iter()
+                    .filter(|member| member.linear_companion().is_none())
+                    .map(move |member| (member.target(), (group.owner(), false)))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for group in parameters.groups() {
+            for member in group
+                .members()
                 .iter()
-                .flat_map(|group| {
-                    group
-                        .members()
-                        .iter()
-                        .filter(|member| member.linear_companion().is_none())
-                        .map(move |member| (member.target(), group.owner()))
-                })
-                .collect()
+                .filter(|member| member.linear_companion().is_none())
+            {
+                match primaries.get_mut(member.target()) {
+                    Some((owner, selected)) if *owner == group.owner() => *selected = true,
+                    _ => return Err(invalid("selected primary parameter ownership")),
+                }
+            }
         }
-        let original = primaries(&self.parameters);
-        let selected = primaries(&parameters);
-        if (projection == ParameterOwnershipProjection::Exact && original.len() != selected.len())
-            || selected
-                .iter()
-                .any(|(target, owner)| original.get(target) != Some(owner))
+        if projection == ParameterOwnershipProjection::Exact
+            && primaries.values().any(|(_, selected)| !selected)
         {
             return Err(invalid("selected primary parameter ownership"));
         }
@@ -531,7 +536,9 @@ impl ComponentDefinition {
             for member in group.members() {
                 match (member.linear_companion(), member.linear_companion_of()) {
                     (Some(_), Some(primary))
-                        if selected.get(primary).copied() == Some(group.owner()) => {}
+                        if primaries
+                            .get(primary)
+                            .is_some_and(|(owner, selected)| *selected && *owner == group.owner()) => {}
                     (None, None) => {}
                     _ => {
                         return Err(invalid(&format!(
