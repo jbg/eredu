@@ -16,7 +16,7 @@ pub struct ParameterMemberIndex {
     tasks: Arc<[ReplicatedTextMaterializationTask]>,
     parameters: Arc<ArchitectureParameterDescription>,
     outputs: BTreeMap<String, Option<(usize, Option<usize>)>>,
-    members: BTreeMap<String, (usize, usize)>,
+    members: Vec<(usize, usize)>,
 }
 
 impl ParameterMemberIndex {
@@ -54,20 +54,17 @@ impl ParameterMemberIndex {
             }
         }
         // ArchitectureParameterDescription already rejects duplicate members.
-        let members = parameters
+        let mut members = parameters
             .groups()
             .iter()
             .enumerate()
             .flat_map(|(group_index, group)| {
-                group
-                    .members()
-                    .iter()
-                    .enumerate()
-                    .map(move |(member_index, member)| {
-                        (member.target().to_owned(), (group_index, member_index))
-                    })
+                (0..group.members().len()).map(move |member_index| (group_index, member_index))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        members.sort_unstable_by_key(|&(group, member)| {
+            parameters.groups()[group].members()[member].target()
+        });
         Self {
             tasks: tasks.to_vec().into(),
             parameters,
@@ -98,6 +95,18 @@ impl ParameterMemberIndex {
         ))
     }
 
+    fn member_location(&self, target: &str) -> Option<(usize, usize)> {
+        let index = self
+            .members
+            .binary_search_by(|&(group, member)| {
+                self.parameters.groups()[group].members()[member]
+                    .target()
+                    .cmp(target)
+            })
+            .ok()?;
+        Some(self.members[index])
+    }
+
     fn member(
         &self,
         task: &ReplicatedTextMaterializationTask,
@@ -105,10 +114,10 @@ impl ParameterMemberIndex {
         parameter: &str,
     ) -> Result<(&OwnedParameterGroupSpec, &ParameterMemberSpec), ParameterError> {
         let primary = companion.map_or(task.name(), ReplicatedTextOutputCompanion::name);
-        let mut found = self.members.get(primary).copied();
+        let mut found = self.member_location(primary);
         if companion.is_none() {
             for alias in task.aliases() {
-                if let Some(location) = self.members.get(alias).copied() {
+                if let Some(location) = self.member_location(alias) {
                     if found.is_some_and(|previous| previous != location) {
                         return Err(invalid(
                             "selected parameter aliases resolve to multiple module slots",
