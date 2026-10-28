@@ -123,7 +123,7 @@ pub fn parameter_acquisition_units(
     tasks: &[ReplicatedTextMaterializationTask],
 ) -> Result<Vec<ParameterAcquisitionUnit>, ParameterAcquisitionError> {
     let mut units = Vec::<ParameterAcquisitionUnit>::new();
-    let mut declared = BTreeSet::new();
+    let mut declared = BTreeSet::<&str>::new();
     for (index, task) in tasks.iter().enumerate() {
         let owner = task.owner();
         let companion_owner = owner.parameter_group_owner()?;
@@ -168,8 +168,8 @@ pub fn parameter_acquisition_units(
                 reason: "unit bytes overflow",
             }
         })?;
-        let mut insert = |name: &str| {
-            if !declared.insert(name.to_owned()) {
+        let mut insert = |name| {
+            if !declared.insert(name) {
                 return Err(ParameterAcquisitionError::Output {
                     target: name.into(),
                     reason: "multiple acquisition owners",
