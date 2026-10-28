@@ -37,9 +37,12 @@ impl PartitionParameterCatalog {
                 "empty loaded parameter world".into(),
             ));
         }
-        let mut parameters = BTreeMap::<String, LoadedParameter>::new();
-        let mut coordinates = BTreeMap::<String, Vec<Option<ParameterCoordinateMap>>>::new();
-        let mut populated = BTreeSet::new();
+        struct Entry {
+            parameter: LoadedParameter,
+            coordinates: Vec<Option<ParameterCoordinateMap>>,
+            populated: bool,
+        }
+        let mut entries = BTreeMap::<String, Entry>::new();
         for (rank, facts) in ranks.iter().enumerate() {
             let mut seen = BTreeSet::new();
             for facts in facts {
@@ -57,7 +60,7 @@ impl PartitionParameterCatalog {
                         "loaded parameter differs from retained effective geometry",
                     ));
                 }
-                if !parameters.contains_key(&parameter.id) {
+                if !entries.contains_key(&parameter.id) {
                     charge(
                         reservation,
                         add(
@@ -65,19 +68,21 @@ impl PartitionParameterCatalog {
                             descriptor_bytes(parameter)?,
                         )?,
                     )?;
-                    parameters.insert(parameter.id.clone(), parameter.clone());
-                    coordinates.insert(
+                    entries.insert(
                         parameter.id.clone(),
-                        (0..ranks.len()).map(|_| None).collect(),
+                        Entry {
+                            parameter: parameter.clone(),
+                            coordinates: (0..ranks.len()).map(|_| None).collect(),
+                            populated: false,
+                        },
                     );
                 } else {
-                    let global = parameters
-                        .get_mut(&parameter.id)
-                        .expect("inserted descriptor");
+                    let entry = entries.get_mut(&parameter.id).expect("inserted descriptor");
+                    let global = &mut entry.parameter;
                     if global.shape != parameter.shape || global.shared_id != parameter.shared_id {
                         return Err(invalid("ranks disagree on parameter geometry or sharing"));
                     }
-                    if !facts.local_shape.contains(&0) && !populated.contains(&parameter.id) {
+                    if !facts.local_shape.contains(&0) && !entry.populated {
                         *global = parameter.clone();
                     } else if !facts.local_shape.contains(&0) {
                         let left = global.access();
@@ -100,30 +105,31 @@ impl PartitionParameterCatalog {
                         }
                     }
                 }
-                if !facts.local_shape.contains(&0) && !populated.contains(&parameter.id) {
-                    populated.insert(parameter.id.clone());
-                }
-                coordinates.get_mut(&parameter.id).expect("inserted owners")[rank] = Some(map);
+                let entry = entries.get_mut(&parameter.id).expect("inserted owners");
+                entry.populated |= !facts.local_shape.contains(&0);
+                entry.coordinates[rank] = Some(map);
             }
         }
-        if parameters.is_empty() {
+        if entries.is_empty() {
             return Err(ParameterError::Incomplete(
                 "no actual loaded parameter slots".into(),
             ));
         }
-        for parameter in parameters.values() {
-            let Some(shared) = parameters.get(&parameter.shared_id) else {
+        for entry in entries.values() {
+            let parameter = &entry.parameter;
+            let Some(shared) = entries.get(&parameter.shared_id) else {
                 return Err(ParameterError::Incomplete(format!(
                     "shared parameter {} has no loaded canonical slot",
                     parameter.shared_id
                 )));
             };
+            let shared = &shared.parameter;
             if shared.shared_id != shared.id || shared.shape != parameter.shape {
                 return Err(invalid(
                     "cyclic sharing or incompatible shared parameter geometry",
                 ));
             }
-            let maps = &coordinates[&parameter.id];
+            let maps = &entry.coordinates;
             charge(reservation, add(128, mul(maps.len() as u64, 16)?)?)?;
             let maps = maps.iter().map(Option::as_ref).collect::<Vec<_>>();
             let region = ParameterRegion {
@@ -139,12 +145,16 @@ impl PartitionParameterCatalog {
                 reservation,
             )?;
         }
-        for parameter in parameters.values_mut() {
-            let access = parameter.access();
-            parameter.supported = access.query && access.projection && access.replacement;
+        for entry in entries.values_mut() {
+            let access = entry.parameter.access();
+            entry.parameter.supported = access.query && access.projection && access.replacement;
         }
+        let (parameters, coordinates) = entries
+            .into_iter()
+            .map(|(id, entry)| (entry.parameter, (id, entry.coordinates)))
+            .unzip();
         Ok(Self {
-            parameters: parameters.into_values().collect(),
+            parameters,
             coordinates,
         })
     }
