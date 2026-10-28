@@ -362,6 +362,38 @@ impl ModuleBindingPlan {
     }
 }
 
+fn collect_module_parameters<P: 'static, M: Parameterized<P>>(
+    module: &M,
+) -> Result<BTreeMap<ParameterId, (&P, eredu_nn::ParameterStorageLayout)>, ModuleBindingPlanError> {
+    struct Collector<'a, P> {
+        parameters: BTreeMap<ParameterId, (&'a P, eredu_nn::ParameterStorageLayout)>,
+        duplicate: Option<ParameterId>,
+    }
+    impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
+            let name = metadata.id;
+            if self
+                .parameters
+                .insert(name.clone(), (parameter, metadata.storage_layout))
+                .is_some()
+            {
+                self.duplicate = Some(name);
+            }
+        }
+    }
+    let mut collector = Collector {
+        parameters: BTreeMap::new(),
+        duplicate: None,
+    };
+    module.visit_parameters(&mut collector);
+    if let Some(parameter) = collector.duplicate {
+        return Err(ModuleBindingPlanError::DuplicateParameter {
+            parameter: parameter.to_string(),
+        });
+    }
+    Ok(collector.parameters)
+}
+
 /// Builds the singular declarative plan by traversing any neutral parameterized module.
 ///
 /// `describe` is the backend's only type-binding hook: it exposes native slot
@@ -381,32 +413,7 @@ where
     F: Fn(&str) -> bool,
     D: Fn(&P) -> Option<ParameterBindingTarget>,
 {
-    struct Collector<'a, P> {
-        parameters: BTreeMap<String, (&'a P, eredu_nn::ParameterStorageLayout)>,
-        duplicate: Option<String>,
-    }
-
-    impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
-            let name = metadata.id.as_str().to_owned();
-            if self
-                .parameters
-                .insert(name.clone(), (parameter, metadata.storage_layout))
-                .is_some()
-            {
-                self.duplicate = Some(name);
-            }
-        }
-    }
-
-    let mut collector = Collector {
-        parameters: BTreeMap::new(),
-        duplicate: None,
-    };
-    module.visit_parameters(&mut collector);
-    if let Some(parameter) = collector.duplicate {
-        return Err(ModuleBindingPlanError::DuplicateParameter { parameter });
-    }
+    let parameters = collect_module_parameters::<P, M>(module)?;
 
     recipes.retain(|name, _| !excluded(name));
     let source_keys = source
@@ -417,11 +424,11 @@ where
     let mut destinations = BTreeMap::new();
     let mut permitted_dtype_conversions = BTreeMap::new();
 
-    for (local_name, (parameter, storage_layout)) in collector
-        .parameters
+    for (local_name, (parameter, storage_layout)) in parameters
         .into_iter()
-        .filter(|(name, _)| !excluded(name))
+        .filter(|(name, _)| !excluded(name.as_str()))
     {
+        let local_name = local_name.to_string();
         let destination = qualify_parameter(prefix, &local_name);
         destinations.insert(local_name.clone(), (destination.clone(), storage_layout));
         let description = describe(parameter).ok_or_else(|| {
@@ -496,33 +503,9 @@ where
     ) -> Result<DerivedWeightRecipe, E>,
     E: std::fmt::Display,
 {
-    struct Collector<'a, P> {
-        parameters: BTreeMap<ParameterId, &'a P>,
-        duplicate: Option<ParameterId>,
-    }
-    impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
-            let name = metadata.id;
-            if self.parameters.insert(name.clone(), parameter).is_some() {
-                self.duplicate = Some(name);
-            }
-        }
-    }
-
-    let mut collector = Collector {
-        parameters: BTreeMap::new(),
-        duplicate: None,
-    };
-    module.visit_parameters(&mut collector);
-    if let Some(parameter) = collector.duplicate {
-        return Err(ModuleBindingPlanError::DuplicateParameter {
-            parameter: parameter.to_string(),
-        });
-    }
-    let parameters = collector
-        .parameters
+    let parameters = collect_module_parameters::<P, M>(module)?
         .into_iter()
-        .map(|(name, parameter)| {
+        .map(|(name, (parameter, _))| {
             let description = describe(parameter).ok_or_else(|| {
                 ModuleBindingPlanError::InvalidParameterRepresentation {
                     parameter: name.to_string(),
