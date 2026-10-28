@@ -887,26 +887,19 @@ impl SelectedExecution {
                                         .ok_or("expert recipe workspace overflow")?,
                                 );
                             let output = recipe.infer(source).map_err(|e| e.to_string())?;
+                            let selected_bytes =
+                                eredu_runtime::selected_addressable_parameter_bytes(task, &output)
+                                    .map_err(|error| error.to_string())?;
                             if task.lowering().transforms_payload() {
                                 native_retained = native_retained
-                                    .checked_add(
-                                        eredu_runtime::selected_addressable_parameter_bytes(
-                                            task, &output,
-                                        )
-                                        .map_err(|error| error.to_string())?,
-                                    )
+                                    .checked_add(selected_bytes)
                                     .ok_or("expert conversion workspace overflow")?;
                             }
                             retained = retained
                                 .checked_add(output.byte_len())
                                 .ok_or("expert recipe output overflow")?;
                             bytes = bytes
-                                .checked_add(
-                                    eredu_runtime::selected_addressable_parameter_bytes(
-                                        task, &output,
-                                    )
-                                    .map_err(|e| e.to_string())?,
-                                )
+                                .checked_add(selected_bytes)
                                 .ok_or("expert selected bytes overflow")?;
                         }
                         result.expert_member_native_peak_bytes =
