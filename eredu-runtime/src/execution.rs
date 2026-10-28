@@ -15,8 +15,9 @@ pub enum ArchitectureExecutionLayoutError<E> {
 }
 
 /// Stable non-empty identity for one architecture execution group.
+/// Clones share the immutable identifier text.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExecutionGroupId(String);
+pub struct ExecutionGroupId(std::sync::Arc<str>);
 
 impl ExecutionGroupId {
     /// Creates a validated execution-group identifier.
@@ -25,7 +26,7 @@ impl ExecutionGroupId {
         if id.trim().is_empty() {
             return Err(ExecutionGraphError::EmptyGroupId);
         }
-        Ok(Self(id))
+        Ok(Self(id.into()))
     }
 
     /// Returns the stable identifier.
