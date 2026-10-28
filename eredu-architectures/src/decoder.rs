@@ -71,6 +71,20 @@ impl<T: Clone> ComponentInstrumentation<'_, T> {
         }
     }
 
+    /// Applies the decoder embedding seam while preserving request-local context.
+    pub(crate) fn apply_embedding<C, O>(
+        mut forward: LayeredForwardState<T, C>,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<T, C>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<T, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        forward.hidden = ComponentInstrumentation::new("readout", &mut borrowed)
+            .apply("embedding", forward.hidden)?;
+        Ok(forward)
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.observer.is_some()
     }
@@ -6283,11 +6297,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let mut forward = self.begin(input, state, context)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
+        ComponentInstrumentation::apply_embedding(self.begin(input, state, context)?, observer)
     }
     fn execute(
         &mut self,

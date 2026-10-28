@@ -290,11 +290,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let mut f = self.begin(input, state, context)?;
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        f.hidden =
-            ComponentInstrumentation::new("readout", &mut borrowed).apply("embedding", f.hidden)?;
-        Ok(f)
+        ComponentInstrumentation::apply_embedding(self.begin(input, state, context)?, observer)
     }
     fn begin_group(
         &mut self,

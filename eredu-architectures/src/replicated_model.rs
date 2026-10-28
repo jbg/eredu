@@ -687,11 +687,10 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let mut forward = self.begin(input, state, context)?;
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
+        crate::decoder::ComponentInstrumentation::apply_embedding(
+            self.begin(input, state, context)?,
+            observer,
+        )
     }
     fn execute(
         &mut self,
@@ -972,11 +971,10 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let mut forward = self.begin(input, state, context)?;
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
+        crate::decoder::ComponentInstrumentation::apply_embedding(
+            self.begin(input, state, context)?,
+            observer,
+        )
     }
     fn execute(
         &mut self,
