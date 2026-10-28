@@ -602,8 +602,10 @@ RNNT preparation retains its complete definition; projection-only and predictor-
 resource projections retain their own exact semantic definitions. Predictor pipeline
 validation borrows retained parameter and carry declarations, and native full/projection/
 predictor assembly consumes those definitions alongside exact selected bindings.
-The complete and projection declarations share the family phase constructor; predictor
-carry remains separate from request-local complete RNNT forward context.
+Complete, projection-only and predictor declarations use the same family phase
+constructor, which builds only the selected phases. Predictor group and unit paths
+come from that phase declaration; carry remains separate from request-local complete
+RNNT forward context.
 Perception preparation retains its complete parameter, transport and Conformer cache
 definition through precision, placement and stage selection. Pipeline validation borrows
 that declaration, and native complete and partition assembly consume it with the exact

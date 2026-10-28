@@ -34,7 +34,7 @@ const GROUPS: [&str; 5] = [
     "voicechat.rnnt.joint.joint_net.2",
 ];
 #[derive(Clone, Copy)]
-enum RnntPhase {
+pub(super) enum RnntPhase {
     Embedding,
     Predictor,
     Encoder,
@@ -42,10 +42,10 @@ enum RnntPhase {
     Output,
 }
 impl RnntPhase {
-    fn ordinal(self) -> usize {
+    const fn ordinal(self) -> usize {
         self as usize
     }
-    fn id(self) -> &'static str {
+    pub(super) const fn id(self) -> &'static str {
         GROUPS[self.ordinal()]
     }
     fn units(self, dimensions: RnntDimensions) -> usize {
@@ -55,7 +55,7 @@ impl RnntPhase {
             1
         }
     }
-    fn path(self, index: usize) -> String {
+    pub(super) fn path(self, index: usize) -> String {
         match self {
             Self::Embedding => EMBEDDING.into(),
             Self::Predictor => format!("{PREDICTOR}.layer{index}"),
@@ -598,7 +598,7 @@ pub(super) fn rnnt_projection_description(
 ) -> Result<ArchitectureParameterDescription, RnntError> {
     rnnt_parameter_description_for_phases(d, RnntSelection::Projections.phases())
 }
-fn rnnt_parameter_description_for_phases(
+pub(super) fn rnnt_parameter_description_for_phases(
     d: RnntDimensions,
     phases: &[RnntPhase],
 ) -> Result<ArchitectureParameterDescription, RnntError> {

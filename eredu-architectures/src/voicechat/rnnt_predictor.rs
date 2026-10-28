@@ -3,7 +3,7 @@ use super::{
     rnnt::{
         build_predictor_layer, step_predictor_layer, RnntDimensions, RnntError, RnntPredictionState,
     },
-    rnnt_layered::rnnt_parameter_description,
+    rnnt_layered::{rnnt_parameter_description_for_phases, RnntPhase},
     rnnt_predictor_partition::{
         validate_rnnt_predictor_partition, RnntPredictorBoundarySchema, RnntPredictorPipelineCuts,
     },
@@ -23,24 +23,15 @@ use eredu_nn::{
 use eredu_runtime::*;
 use std::{marker::PhantomData, num::NonZeroU32, ops::Range};
 
-pub(crate) const GROUP: &str = "voicechat.rnnt.predictor";
+pub(crate) const GROUP: &str = RnntPhase::Predictor.id();
 pub(crate) fn invalid(message: &'static str) -> RnntError {
     RnntError::InvalidState(message)
-}
-fn graph() -> Result<ExecutionGraph, RnntError> {
-    Ok(ExecutionGraph::new(
-        vec![ExecutionGroupSpec::root(GROUP)],
-        GROUP,
-    )?)
 }
 /// Exact recurrent parameter ownership, with no embedding or joint parameters.
 pub fn rnnt_predictor_parameter_description(
     dimensions: RnntDimensions,
 ) -> Result<ArchitectureParameterDescription, RnntError> {
-    Ok(rnnt_parameter_description(dimensions)?.project_groups(
-        &graph()?,
-        std::iter::empty::<String>(),
-    )?)
+    rnnt_parameter_description_for_phases(dimensions, &[RnntPhase::Predictor])
 }
 /// Global recurrent operations, independently leased layers and carry identities.
 pub fn rnnt_predictor_component_definition(
@@ -51,7 +42,7 @@ pub fn rnnt_predictor_component_definition(
         rnnt_predictor_parameter_description(dimensions)?,
         (0..dimensions.predictor_layers)
             .map(|index| ComponentUnit {
-                path: format!("stt_model.rnnt_decoder.prediction.dec_rnn.lstm.layer{index}"),
+                path: RnntPhase::Predictor.path(index),
                 state: index..index + 1,
             })
             .collect(),
