@@ -678,22 +678,17 @@ impl ComponentDefinition {
             &crate::UnitObservationBoundaries,
         ) -> crate::UnitObservationBoundaries,
     ) -> Result<Self, ComponentDefinitionError> {
-        let projected = self
-            .unit_observations
-            .iter()
-            .enumerate()
-            .map(|(ordinal, boundaries)| {
-                project(
-                    self.parameters
-                        .unit_layout()
-                        .address(ordinal)
-                        .expect("declared invocation"),
-                    boundaries,
-                )
-            })
-            .collect::<Vec<_>>();
+        for (ordinal, boundaries) in self.unit_observations.iter_mut().enumerate() {
+            *boundaries = project(
+                self.parameters
+                    .unit_layout()
+                    .address(ordinal)
+                    .expect("declared invocation"),
+                boundaries,
+            );
+        }
         let mut paths = std::collections::BTreeSet::new();
-        for boundaries in &projected {
+        for boundaries in &self.unit_observations {
             for path in [boundaries.input_path(), boundaries.output_path()]
                 .into_iter()
                 .flatten()
@@ -706,7 +701,6 @@ impl ComponentDefinition {
                 }
             }
         }
-        self.unit_observations = projected;
         Ok(self)
     }
 
