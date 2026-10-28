@@ -2,8 +2,8 @@
 use super::{
     rnnt::{RnntDimensions, RnntError, RnntProjectionExecution},
     rnnt_layered::{
-        rnnt_local_dimensions_for_description, runtime_error, RnntForward, RnntInput, RnntKernel,
-        RnntLocalDimensions, RnntUnit,
+        rnnt_local_dimensions_for_description, rnnt_parameter_description_for_phases, runtime_error,
+        RnntForward, RnntInput, RnntKernel, RnntLocalDimensions, RnntSelection, RnntUnit,
     },
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
@@ -13,7 +13,7 @@ use eredu_runtime::*;
 pub fn rnnt_projection_parameter_description(
     dimensions: RnntDimensions,
 ) -> Result<ArchitectureParameterDescription, RnntError> {
-    super::rnnt_layered::rnnt_projection_description(dimensions)
+    rnnt_parameter_description_for_phases(dimensions, RnntSelection::Projections.phases())
 }
 /// Projection-only semantic definition, without recurrent parameter or state ownership.
 pub fn rnnt_projection_component_definition(

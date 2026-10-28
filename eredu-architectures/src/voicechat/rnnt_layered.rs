@@ -71,7 +71,7 @@ pub(super) enum RnntSelection {
     Projections,
 }
 impl RnntSelection {
-    fn phases(self) -> &'static [RnntPhase] {
+    pub(super) fn phases(self) -> &'static [RnntPhase] {
         match self {
             Self::Complete => &[
                 RnntPhase::Embedding,
@@ -592,11 +592,6 @@ pub fn rnnt_parameter_description(
     d: RnntDimensions,
 ) -> Result<ArchitectureParameterDescription, RnntError> {
     rnnt_parameter_description_for_phases(d, RnntSelection::Complete.phases())
-}
-pub(super) fn rnnt_projection_description(
-    d: RnntDimensions,
-) -> Result<ArchitectureParameterDescription, RnntError> {
-    rnnt_parameter_description_for_phases(d, RnntSelection::Projections.phases())
 }
 pub(super) fn rnnt_parameter_description_for_phases(
     d: RnntDimensions,

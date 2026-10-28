@@ -22,20 +22,11 @@ impl PreparedRnntPredictorBindings {
     ) -> Result<Self, RnntPreparationError> {
         let dimensions = bindings.dimensions();
         let definition = rnnt_predictor_component_definition(dimensions)?;
-        let range = validate_rnnt_predictor_partition(&definition, dimensions, partition)?;
-        let selected = range
-            .map(|index| {
-                definition
-                    .parameters()
-                    .unit_layout()
-                    .address(index)
-                    .expect("validated predictor unit")
-            })
-            .collect::<Vec<_>>();
+        validate_rnnt_predictor_partition(&definition, dimensions, partition)?;
         let prepared = bindings
             .prepared
             .project("voicechat/rnnt/predictor-stage", definition)?
-            .select_units(selected)?;
+            .select_units(partition.units())?;
         Ok(Self {
             dimensions,
             prepared,
