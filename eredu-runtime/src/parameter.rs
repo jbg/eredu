@@ -1788,11 +1788,10 @@ pub fn apply_parameter_storage_layouts<P: 'static, M: Parameterized<P>>(
     module: &M,
     bindings: Vec<WeightBinding>,
 ) -> Vec<WeightBinding> {
-    struct Layouts(BTreeMap<String, eredu_nn::ParameterStorageLayout>);
+    struct Layouts(BTreeMap<ParameterId, eredu_nn::ParameterStorageLayout>);
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Layouts {
         fn visit(&mut self, metadata: ParameterMetadata, _: &'a P) {
-            self.0
-                .insert(metadata.id.as_str().to_owned(), metadata.storage_layout);
+            self.0.insert(metadata.id, metadata.storage_layout);
         }
     }
     let mut layouts = Layouts(BTreeMap::new());

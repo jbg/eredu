@@ -589,6 +589,12 @@ impl ParameterId {
     }
 }
 
+impl std::borrow::Borrow<str> for ParameterId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl std::fmt::Display for ParameterId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
