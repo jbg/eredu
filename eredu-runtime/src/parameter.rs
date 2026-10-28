@@ -1521,7 +1521,7 @@ where
 {
     struct Validator<'a, B: ParameterBackend> {
         weights: &'a BTreeMap<ParameterId, B::MaterializedWeight>,
-        visited: BTreeMap<ParameterId, ()>,
+        visited: BTreeSet<ParameterId>,
         error: Option<ParameterOrchestrationError<B::ParameterError>>,
         excluded: &'a dyn Fn(&ParameterId) -> bool,
     }
@@ -1534,7 +1534,7 @@ where
             if (self.excluded)(&metadata.id) {
                 return;
             }
-            if self.visited.insert(metadata.id.clone(), ()).is_some() {
+            if !self.visited.insert(metadata.id.clone()) {
                 self.error = Some(ParameterOrchestrationError::DuplicateParameter {
                     parameter: metadata.id,
                 });
@@ -1554,7 +1554,7 @@ where
 
     let mut validator = Validator::<B> {
         weights: &unit.weights,
-        visited: BTreeMap::new(),
+        visited: BTreeSet::new(),
         error: None,
         excluded: &excluded,
     };
@@ -1565,7 +1565,7 @@ where
     let unexpected = unit
         .weights
         .keys()
-        .filter(|id| !validator.visited.contains_key(*id))
+        .filter(|id| !validator.visited.contains(*id))
         .cloned()
         .collect::<Vec<_>>();
     if !unexpected.is_empty() {
@@ -1574,15 +1574,20 @@ where
         });
     }
 
-    struct MutableTopologyValidator<'a> {
-        expected: &'a BTreeMap<ParameterId, ()>,
-        visited: BTreeMap<ParameterId, ()>,
+    // Immutable traversal and materialized keys now agree exactly.
+    drop(validator);
+
+    struct MutableTopologyValidator<'a, W> {
+        expected: &'a BTreeMap<ParameterId, W>,
+        visited: BTreeSet<ParameterId>,
         unexpected: Vec<ParameterId>,
         duplicate: Option<ParameterId>,
         excluded: &'a dyn Fn(&ParameterId) -> bool,
     }
 
-    impl<'a, 'value, P: 'value> ParameterVisitorMut<'value, P> for MutableTopologyValidator<'a> {
+    impl<'a, 'value, P: 'value, W> ParameterVisitorMut<'value, P>
+        for MutableTopologyValidator<'a, W>
+    {
         fn visit_mut(&mut self, metadata: ParameterMetadata, _: &'value mut P) {
             if self.duplicate.is_some() {
                 return;
@@ -1590,7 +1595,7 @@ where
             if (self.excluded)(&metadata.id) {
                 return;
             }
-            if self.visited.insert(metadata.id.clone(), ()).is_some() {
+            if !self.visited.insert(metadata.id.clone()) {
                 self.duplicate = Some(metadata.id);
             } else if !self.expected.contains_key(&metadata.id) {
                 self.unexpected.push(metadata.id);
@@ -1599,8 +1604,8 @@ where
     }
 
     let mut mutable_topology = MutableTopologyValidator {
-        expected: &validator.visited,
-        visited: BTreeMap::new(),
+        expected: &unit.weights,
+        visited: BTreeSet::new(),
         unexpected: Vec::new(),
         duplicate: None,
         excluded: &excluded,
@@ -1611,10 +1616,9 @@ where
     }
     let mut mismatch = mutable_topology.unexpected;
     mismatch.extend(
-        validator
-            .visited
+        unit.weights
             .keys()
-            .filter(|id| !mutable_topology.visited.contains_key(*id))
+            .filter(|id| !mutable_topology.visited.contains(*id))
             .cloned(),
     );
     if !mismatch.is_empty() {
