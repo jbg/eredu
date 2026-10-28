@@ -327,12 +327,11 @@ pub struct ParameterBindingTarget {
     pub permitted_source_dtypes: Vec<RecipeDtype>,
 }
 
-/// A canonical binding plan paired with fully qualified logical destinations.
+/// A canonical binding plan with each destination's logical identity and storage preference.
 #[derive(Debug, Clone)]
 pub struct ModuleBindingPlan {
     plan: BindingPlan,
-    logical_targets: BTreeMap<String, String>,
-    storage_layouts: BTreeMap<String, eredu_nn::ParameterStorageLayout>,
+    destinations: BTreeMap<String, (String, eredu_nn::ParameterStorageLayout)>,
 }
 
 impl ModuleBindingPlan {
@@ -350,17 +349,12 @@ impl ModuleBindingPlan {
             .build_bindings(source)?
             .into_iter()
             .map(|binding| {
-                let target = self
-                    .logical_targets
+                let (target, layout) = self
+                    .destinations
                     .get(binding.name())
                     .expect("module binding declaration retains every target");
-                let layout = self
-                    .storage_layouts
-                    .get(binding.name())
-                    .copied()
-                    .unwrap_or_default();
                 binding
-                    .with_storage_layout(layout)
+                    .with_storage_layout(*layout)
                     .with_logical_target(target)
                     .map_err(ModuleBindingPlanError::from)
             })
@@ -388,17 +382,18 @@ where
     D: Fn(&P) -> Option<ParameterBindingTarget>,
 {
     struct Collector<'a, P> {
-        parameters: BTreeMap<String, &'a P>,
-        storage_layouts: BTreeMap<String, eredu_nn::ParameterStorageLayout>,
+        parameters: BTreeMap<String, (&'a P, eredu_nn::ParameterStorageLayout)>,
         duplicate: Option<String>,
     }
 
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
         fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
             let name = metadata.id.as_str().to_owned();
-            self.storage_layouts
-                .insert(name.clone(), metadata.storage_layout);
-            if self.parameters.insert(name.clone(), parameter).is_some() {
+            if self
+                .parameters
+                .insert(name.clone(), (parameter, metadata.storage_layout))
+                .is_some()
+            {
                 self.duplicate = Some(name);
             }
         }
@@ -406,7 +401,6 @@ where
 
     let mut collector = Collector {
         parameters: BTreeMap::new(),
-        storage_layouts: BTreeMap::new(),
         duplicate: None,
     };
     module.visit_parameters(&mut collector);
@@ -420,16 +414,16 @@ where
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut declarations = Vec::new();
-    let mut logical_targets = BTreeMap::new();
+    let mut destinations = BTreeMap::new();
     let mut permitted_dtype_conversions = BTreeMap::new();
 
-    for (local_name, parameter) in collector
+    for (local_name, (parameter, storage_layout)) in collector
         .parameters
         .into_iter()
         .filter(|(name, _)| !excluded(name))
     {
         let destination = qualify_parameter(prefix, &local_name);
-        logical_targets.insert(local_name.clone(), destination.clone());
+        destinations.insert(local_name.clone(), (destination.clone(), storage_layout));
         let description = describe(parameter).ok_or_else(|| {
             ModuleBindingPlanError::InvalidParameterRepresentation {
                 parameter: destination.clone(),
@@ -469,8 +463,7 @@ where
             shared_source_keys,
             permitted_dtype_conversions,
         )?,
-        logical_targets,
-        storage_layouts: collector.storage_layouts,
+        destinations,
     })
 }
 
