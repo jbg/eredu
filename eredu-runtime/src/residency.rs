@@ -723,9 +723,13 @@ impl<'a> WeightBindingPlan<'a> {
 
     /// Logical aliases paired with their resolved canonical owners.
     pub fn aliases(&self) -> impl Iterator<Item = (&WeightBinding, &WeightBinding)> {
-        self.aliases
-            .iter()
-            .map(|(alias, owner)| (&self.bindings[*alias], &self.bindings[*owner]))
+        self.alias_indices()
+            .map(|(alias, owner)| (&self.bindings[alias], &self.bindings[owner]))
+    }
+
+    // Indices refer to this plan's binding order and resolve directly to physical owners.
+    pub(crate) fn alias_indices(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.aliases.iter().copied()
     }
 }
 

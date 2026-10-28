@@ -605,7 +605,10 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             }
         }
         for (original, transformed) in self.units.iter().zip(&mut transformed) {
-            retain_aliases(original, transformed)?;
+            let plan = WeightBindingPlan::new(original)
+                .map_err(RecipeBindingError::from)
+                .map_err(ComponentPreparationError::from)?;
+            retain_aliases(&plan, transformed)?;
         }
         self.units = transformed;
         Ok(self)
@@ -871,35 +874,27 @@ fn restrict_bindings<'a>(
 
 // Placement and precision change physical byte counts; aliases keep referring to
 // the same canonical owner and adopt its selected physical size.
+// Both callers preserve binding order; plan indices resolve alias chains to physical owners.
 fn retain_aliases(
-    original: &[WeightBinding],
+    plan: &WeightBindingPlan<'_>,
     selected: &mut [WeightBinding],
 ) -> Result<(), ComponentPreparationError> {
-    let plan = WeightBindingPlan::new(original).map_err(RecipeBindingError::from)?;
-    let bytes = selected
-        .iter()
-        .map(|binding| (binding.name(), binding.expected_bytes()))
-        .collect::<BTreeMap<_, _>>();
-    let aliases = plan
-        .aliases()
-        .map(|(alias, owner)| (alias.name(), bytes[owner.name()]))
-        .collect::<BTreeMap<_, _>>();
-    for binding in selected.iter_mut() {
-        if let Some(&bytes) = aliases.get(binding.name()) {
-            let mut alias = WeightBinding::alias(
-                binding.name(),
-                binding.alias_of().expect("validated alias"),
-                bytes,
-            )
-            .map_err(RecipeBindingError::from)?
-            .with_storage_layout(binding.storage_layout());
-            if let Some(target) = binding.logical_target() {
-                alias = alias
-                    .with_logical_target(target)
-                    .map_err(RecipeBindingError::from)?;
-            }
-            *binding = alias;
+    for (alias_index, owner_index) in plan.alias_indices() {
+        let bytes = selected[owner_index].expected_bytes();
+        let binding = &mut selected[alias_index];
+        let mut alias = WeightBinding::alias(
+            binding.name(),
+            binding.alias_of().expect("validated alias"),
+            bytes,
+        )
+        .map_err(RecipeBindingError::from)?
+        .with_storage_layout(binding.storage_layout());
+        if let Some(target) = binding.logical_target() {
+            alias = alias
+                .with_logical_target(target)
+                .map_err(RecipeBindingError::from)?;
         }
+        *binding = alias;
     }
     WeightBindingPlan::new(selected).map_err(RecipeBindingError::from)?;
     Ok(())
@@ -931,6 +926,6 @@ fn place_resources(
         }
     }
     let mut selected = place_weight_bindings(bindings.clone(), source, layout)?;
-    retain_aliases(&bindings, &mut selected)?;
+    retain_aliases(&plan, &mut selected)?;
     Ok(selected)
 }
