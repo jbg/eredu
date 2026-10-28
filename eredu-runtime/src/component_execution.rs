@@ -1343,9 +1343,13 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         let expected: std::collections::BTreeSet<_> = groups
             .iter()
             .filter_map(|group| group.owner().static_storage_role())
-            .map(str::to_owned)
             .collect();
-        if self.resource_roles != expected {
+        if self
+            .resource_roles
+            .iter()
+            .map(String::as_str)
+            .ne(expected.iter().copied())
+        {
             return Err(ComponentDefinitionError::Invalid {
                 component: self.definition().id.clone(),
                 resource: format!(
