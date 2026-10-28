@@ -900,8 +900,8 @@ and remaining-tail counts follow logical positions. Native resident acquisition,
 inspection and completion retain logical lease proofs while borrowing physical pool slots;
 rejected completion restores its original resident slot. Parameter visitation and editing
 borrow physical owners once, and subsequent consumers see that same module.
-Parameter-group storage membership and invocation-resource discovery deduplicate
-borrowed canonical storage keys rather than copying role names for comparison.
+Prepared component recipe grouping, parameter-group storage membership and
+invocation-resource discovery use borrowed canonical storage keys for comparison.
 Cold preparation retains that map with per-owner device payloads and host-transfer
 capacities. Device and streamed-host admission use the largest distinct-resource
 invocation window; resident and host-layerwise totals count physical owners once.

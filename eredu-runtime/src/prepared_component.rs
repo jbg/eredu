@@ -1,5 +1,7 @@
 //! Exact cold component bindings and consuming placement selection.
 
+use crate::component_execution::ParameterStorageRef;
+
 use crate::{
     place_weight_bindings, prepare_resource_bindings, ArchitectureParameterDescription,
     BindingPlacementError, ExecutionUnitAddress, ExecutionUnitLayout, ExecutionUnitLayoutError,
@@ -253,10 +255,13 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
     {
         let id = id.into();
         let description = declaration.parameters();
-        let mut resources = BTreeMap::<ParameterStorageId, ParameterResourceRecipes>::new();
+        let mut resources = BTreeMap::<ParameterStorageRef<'_>, ParameterResourceRecipes>::new();
         for owned in description.groups() {
             let resource = resources
-                .entry(ParameterStorageId::from_owner(owned.owner()))
+                .entry(
+                    ParameterStorageRef::from_owner(owned.owner())
+                        .expect("validated parameter owner"),
+                )
                 .or_insert_with(|| ParameterResourceRecipes {
                     outputs: BTreeMap::new(),
                     aliases: Vec::new(),
@@ -330,7 +335,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                         .map_err(ComponentPreparationError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let ParameterStorageId::ExecutionUnit { group, global_unit } = &owner {
+            if let ParameterStorageRef::ExecutionUnit { group, global_unit } = owner {
                 let group = description
                     .graph()
                     .group_index(group.as_str())
@@ -338,11 +343,11 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 let ordinal = description
                     .invocations()
                     .storage_layout()
-                    .ordinal(group, *global_unit)
+                    .ordinal(group, global_unit)
                     .expect("validated execution unit");
                 units[ordinal] = bindings;
             } else {
-                pinned.insert(owner, bindings);
+                pinned.insert(owner.into_owned(), bindings);
             }
         }
         let invocations = description.invocations().clone();

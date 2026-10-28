@@ -110,7 +110,7 @@ impl<'a> ParameterStorageRef<'a> {
         }
     }
 
-    fn into_owned(self) -> ParameterStorageId {
+    pub(crate) fn into_owned(self) -> ParameterStorageId {
         match self {
             Self::StaticRole(role) => ParameterStorageId::StaticRole(role.to_owned()),
             Self::ExecutionUnit { group, global_unit } => ParameterStorageId::ExecutionUnit {
