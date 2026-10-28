@@ -1112,8 +1112,8 @@ impl PreparedParameterRecipes {
 
     /// Transforms recipes without changing canonical parameter identities or
     /// borrowing physical inputs outside this retained owner's authority.
-    /// Family hooks receive only metadata and supply equations such as exact
-    /// rank-local range selection; they cannot acquire payloads through this view.
+    /// Family hooks borrow retained recipes and metadata to supply equations such
+    /// as rank-local range selection; they cannot acquire payloads through this view.
     /// The result validates transformed outputs and narrows source authority to
     /// their actual inputs without reading payloads or allocating native values.
     pub fn map_recipes<E>(
@@ -1141,9 +1141,12 @@ impl PreparedParameterRecipes {
             }
         }
         let catalog = MetadataView(self.source.as_ref());
-        let recipes = Arc::unwrap_or_clone(self.recipes)
-            .into_iter()
-            .map(|(name, recipe)| transform(&name, &recipe, &catalog).map(|recipe| (name, recipe)))
+        let recipes = self
+            .recipes
+            .iter()
+            .map(|(name, recipe)| {
+                transform(name, recipe, &catalog).map(|recipe| (name.clone(), recipe))
+            })
             .collect::<Result<_, E>>()?;
         Self::new(scope, self.source, recipes).map_err(E::from)
     }
