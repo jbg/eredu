@@ -915,8 +915,9 @@ ordinary parameter owner fails before materialization. A later projection cannot
 discarded invocations merely because their storage is still available. Primary source views
 contain only pinned and ordinary recipe inputs. Each auxiliary owner retains its own
 restricted view, independently of identically named keys in another source.
-Selected provider acquisition resolves a logical invocation to typed dense storage
-coordinates. Leases retain that validated association and their policy identity through
+Component selection uses its retained invocation map for canonical address and group
+lookup without retaining a second logical-address catalog. Selected provider acquisition
+resolves a logical invocation to typed dense storage coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or
 returns the recorded storage owner independently of caller-supplied indices. Native
 resident and bounded policies receive the selected storage coordinates, while logical

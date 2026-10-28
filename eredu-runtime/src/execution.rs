@@ -351,6 +351,20 @@ impl ExecutionUnitAddressMap {
         self.data.addresses.iter().map(|(logical, _)| *logical)
     }
 
+    // Component selections validate against a canonical logical layout before lookup.
+    // General maps may retain a noncanonical order within a group.
+    pub(crate) fn canonical_logical_address(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Option<ExecutionUnitAddress> {
+        let addresses = &self.data.addresses[self.group_range(group)?];
+        let ordinal = addresses
+            .binary_search_by_key(&index, |(logical, _)| logical.index())
+            .ok()?;
+        Some(addresses[ordinal].0)
+    }
+
     /// Selected physical resources, independent of their invocation count.
     pub fn storage_layout(&self) -> &ExecutionUnitLayout {
         &self.data.storage

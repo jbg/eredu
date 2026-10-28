@@ -1167,7 +1167,6 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
 pub struct ComponentSelection {
     component: String,
     invocations: crate::ExecutionUnitAddressMap,
-    units: Vec<ExecutionUnitAddress>,
     storage: std::collections::BTreeSet<ParameterStorageId>,
     state: Option<PartitionState>,
     owns_output: bool,
@@ -1192,10 +1191,9 @@ impl ComponentSelection {
         group: usize,
         index: usize,
     ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
-        self.units
-            .binary_search_by_key(&(group, index), |address| (address.group(), address.index()))
-            .map(|ordinal| self.units[ordinal])
-            .map_err(|_| ComponentDefinitionError::Address {
+        self.invocations
+            .canonical_logical_address(group, index)
+            .ok_or_else(|| ComponentDefinitionError::Address {
                 component: self.component.clone(),
                 group,
                 index,
@@ -1246,8 +1244,7 @@ impl ComponentDefinition {
         if partition.state() != expected.as_ref() {
             return Err(invalid("partition state ownership"));
         }
-        // Partition traversal supplies canonical group/unit order for binary lookup.
-        let mut units = Vec::with_capacity(partition.invocations().logical_addresses().len());
+        // Validated partition invocations retain canonical group/unit order for lookup.
         for address in partition.units() {
             let unit = definition.unit(address.group(), address.index())?;
             if !unit.state.is_empty()
@@ -1259,12 +1256,10 @@ impl ComponentDefinition {
             {
                 return Err(invalid("partition unit state references"));
             }
-            units.push(address);
         }
         let selected = ComponentSelection {
             component: self.id.clone(),
             invocations: partition.invocations().clone(),
-            units,
             storage: partition
                 .parameter_bindings()
                 .iter()
@@ -1390,11 +1385,12 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
         &self,
         group: usize,
     ) -> Result<(), ComponentDefinitionError> {
-        if self
-            .selection
-            .as_ref()
-            .is_none_or(|selection| !selection.units.iter().any(|address| address.group() == group))
-        {
+        if self.selection.as_ref().is_none_or(|selection| {
+            selection
+                .invocations
+                .group_range(group)
+                .is_none_or(|range| range.is_empty())
+        }) {
             return Err(ComponentDefinitionError::Invalid {
                 component: self.definition().id.clone(),
                 resource: format!("partition group {group}"),
@@ -1522,11 +1518,15 @@ impl<D: Borrow<ComponentDefinition>, K, R> ComponentAdapter<D, K, R> {
                     resource: "missing retained partition".into(),
                 })?;
         let declared = selected.state.as_ref().map(PartitionState::layout);
-        let entry_declared = selected.units.first().and_then(|address| {
-            self.group_has_state_geometry(address.group())
-                .then_some(declared)
-                .flatten()
-        });
+        let entry_declared = selected
+            .invocations
+            .logical_addresses()
+            .next()
+            .and_then(|address| {
+                self.group_has_state_geometry(address.group())
+                    .then_some(declared)
+                    .flatten()
+            });
         let actual_matches = actual == declared
             || (actual.is_none()
                 && declared.is_some_and(|layout| {
