@@ -726,16 +726,7 @@ impl ComponentDefinition {
         group: usize,
         index: usize,
     ) -> Result<&crate::UnitObservationBoundaries, ComponentDefinitionError> {
-        let ordinal = self
-            .parameters
-            .unit_layout()
-            .ordinal(group, index)
-            .ok_or_else(|| ComponentDefinitionError::Address {
-                component: self.id.clone(),
-                group,
-                index,
-            })?;
-        Ok(&self.unit_observations[ordinal])
+        Ok(&self.unit_observations[self.unit_ordinal(group, index)?])
     }
 
     /// Resolves a logical invocation using the canonical address map.
@@ -744,10 +735,13 @@ impl ComponentDefinition {
         group: usize,
         index: usize,
     ) -> Result<&ComponentUnit, ComponentDefinitionError> {
+        Ok(&self.units[self.unit_ordinal(group, index)?])
+    }
+
+    fn unit_ordinal(&self, group: usize, index: usize) -> Result<usize, ComponentDefinitionError> {
         self.parameters
             .unit_layout()
             .ordinal(group, index)
-            .map(|ordinal| &self.units[ordinal])
             .ok_or_else(|| ComponentDefinitionError::Address {
                 component: self.id.clone(),
                 group,
@@ -1298,15 +1292,11 @@ impl ComponentDefinition {
         group: usize,
         index: usize,
     ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
-        let layout = self.parameters.unit_layout();
-        layout
-            .ordinal(group, index)
-            .and_then(|ordinal| layout.address(ordinal))
-            .ok_or_else(|| ComponentDefinitionError::Address {
-                component: self.id.clone(),
-                group,
-                index,
-            })
+        Ok(self
+            .parameters
+            .unit_layout()
+            .address(self.unit_ordinal(group, index)?)
+            .expect("validated invocation"))
     }
 }
 
