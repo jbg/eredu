@@ -215,12 +215,8 @@ impl<B: NeuralBackend> QuantizerKernel<B> {
     fn begin_input(
         &self,
         input: QuantizerInput<'_, B::Tensor>,
-        state: &StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, QuantizerForward<B::Tensor>>, Error> {
-        if *state.layout() != StatelessComponentState::state_layout()? {
-            return Err(invalid("residual quantizer runtime layout mismatch"));
-        }
         let (input, range, metric) = match input {
             QuantizerInput::Decode { codes, range } => (codes, range, None),
             QuantizerInput::Quantize {
@@ -524,13 +520,13 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Quanti
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         if self.is_parallel() {
             return Err(invalid("rank-local quantizer requires parallel execution"));
         }
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
     fn begin_group(
         &mut self,
@@ -699,12 +695,12 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         self.validate_parallel(parallel)?;
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
     fn execute_parallel(
         &mut self,

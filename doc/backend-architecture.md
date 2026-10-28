@@ -984,7 +984,9 @@ VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception,
 the TTS transformer, codec PRVQ and the EAR encoder/decoder
 use this adapter with their typed kernels and runtime-owned empty pinned modules.
 Components without mutable state use `StatelessComponentState::state_layout()` for
-shared traversal metadata and empty-state validation. RVQ retains bank-only sum,
+shared traversal metadata and empty-state validation. Its private immutable layout
+establishes the empty-state invariant for typed ingress; checks on independently
+supplied partition state remain explicit. RVQ retains bank-only sum,
 refinement advancement and bank-to-projection embedding operations. PRVQ retains selected depth ranges and
 ordered residual subtraction. Their collective-bearing equations retain explicit
 rank agreement and transient input/candidate roots through ordinary completion.

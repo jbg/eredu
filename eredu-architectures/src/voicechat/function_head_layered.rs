@@ -515,14 +515,9 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Functi
     fn begin<'a>(
         &mut self,
         hidden: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ()>, ChannelError> {
-        if *state.layout() != StatelessComponentState::state_layout()? {
-            return Err(ChannelError::Configuration(
-                "function-head runtime layout mismatch",
-            ));
-        }
         self.validate_replicated_projection(hidden)?;
         Ok(LayeredForwardState {
             hidden: hidden.clone(),
@@ -569,16 +564,11 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     fn begin_parallel<'a>(
         &mut self,
         hidden: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ()>, ChannelError> {
         self.validate_parallel_projection(hidden, parallel)?;
-        if *state.layout() != StatelessComponentState::state_layout()? {
-            return Err(ChannelError::Configuration(
-                "function-head runtime layout mismatch",
-            ));
-        }
         Ok(LayeredForwardState {
             hidden: hidden.clone(),
             context: (),

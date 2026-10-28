@@ -203,11 +203,7 @@ impl<B: NeuralBackend> MogKernel<B> {
     fn begin_input(
         &self,
         input: MogInput<'_, B::Tensor>,
-        state: &StatelessComponentState,
     ) -> Result<LayeredForwardState<B::Tensor, MogForward<B::Tensor>>, TtsError> {
-        if *state.layout() != StatelessComponentState::state_layout()? {
-            return Err(TtsError::Configuration("MoG runtime layout mismatch"));
-        }
         let mut forward = MogForward {
             selected: false,
             guidance: 0.0,
@@ -540,7 +536,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for MogKer
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         if self.is_parallel() {
@@ -548,7 +544,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for MogKer
                 "rank-local MoG execution requires its tensor communicator",
             ));
         }
-        self.begin_input(input, state)
+        self.begin_input(input)
     }
     fn begin_group(
         &mut self,
@@ -750,12 +746,12 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         self.validate_parallel(parallel)?;
-        self.begin_input(input, state)
+        self.begin_input(input)
     }
     fn execute_parallel(
         &mut self,

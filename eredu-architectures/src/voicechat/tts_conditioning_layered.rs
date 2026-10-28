@@ -371,14 +371,8 @@ impl<B: NeuralBackend> ConditioningKernel<B> {
     fn begin_input(
         &mut self,
         input: ConditioningInput<B::Tensor>,
-        state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ConditioningForward<B::Tensor>>, TtsError> {
-        if *state.layout() != StatelessComponentState::state_layout()? {
-            return Err(TtsError::Configuration(
-                "conditioning runtime layout mismatch",
-            ));
-        }
         let d = self.dimensions;
         let hidden = match &input {
             ConditioningInput::CharacterEmbed(batch) => {
@@ -734,7 +728,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Condit
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         if self.is_parallel() {
@@ -742,7 +736,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Condit
                 "sharded conditioning requires parallel execution",
             ));
         }
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
     fn begin_group(
         &mut self,
@@ -1118,12 +1112,12 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         self.validate_parallel(parallel)?;
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
     fn execute_parallel(
         &mut self,

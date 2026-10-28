@@ -408,12 +408,8 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
     fn begin_input<'a>(
         &mut self,
         input: RnntInput<'a, B::Tensor>,
-        state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, RnntForward<B::Tensor>>, RnntError> {
-        if *state.layout() != StatelessComponentState::state_layout()? {
-            return Err(RnntError::InvalidState("RNNT traversal layout mismatch"));
-        }
         let (group, input, previous) = match input {
             RnntInput::Embed(token) => {
                 if token > self.dimensions.vocab_size as usize {
@@ -760,7 +756,7 @@ impl<B: NeuralBackend, const PREDICTOR: bool> ComponentEquations<B, StatelessCom
     fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
         if self.is_parallel() {
@@ -768,7 +764,7 @@ impl<B: NeuralBackend, const PREDICTOR: bool> ComponentEquations<B, StatelessCom
                 "rank-local RNNT requires collective execution",
             ));
         }
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
     fn begin_group(
         &mut self,
@@ -973,12 +969,12 @@ impl<B: DistributedNeuralBackend, const PREDICTOR: bool>
     fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut StatelessComponentState,
+        _: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
         self.validate_parallel(parallel)?;
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
     fn execute_parallel(
         &mut self,
