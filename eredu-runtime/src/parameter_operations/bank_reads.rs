@@ -76,11 +76,11 @@ impl<'a> BankParameterReadPlan<'a> {
                 }
                 assemble(copies)?
             };
-            values.push((parameter.slot.parameter.clone(), value));
+            values.push((&parameter.slot, value));
         }
         operation(&mut |visitor| {
-            for (metadata, value) in &mut values {
-                visitor.visit_slot(metadata.clone(), value);
+            for (slot, value) in &mut values {
+                visitor.visit_slot(slot.parameter.clone(), value);
             }
         })
     }
