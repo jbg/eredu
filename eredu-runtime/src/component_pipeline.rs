@@ -185,18 +185,14 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
         .routes()
         .iter()
         .filter(|route| route.destination_rank == manifest.rank())
-        .collect::<Vec<_>>();
+        .map(|route| route.destination_group);
     let outgoing = plan
         .routes()
         .iter()
         .filter(|route| route.source_rank == manifest.rank())
-        .collect::<Vec<_>>();
-    if incoming.len() != usize::from(!partition.ownership().owns_input())
-        || outgoing.len() != usize::from(!partition.ownership().owns_output())
-        || incoming
-            .iter()
-            .any(|route| route.destination_group != first)
-        || outgoing.iter().any(|route| route.source_group != last)
+        .map(|route| route.source_group);
+    if !incoming.eq((!partition.ownership().owns_input()).then_some(first))
+        || !outgoing.eq((!partition.ownership().owns_output()).then_some(last))
     {
         return Err(Contract(
             "routes differ from the stage's single ingress and egress",
