@@ -87,15 +87,13 @@ impl ParameterStorageId {
     /// Projects storage identity without including logical-consumer selection.
     pub(crate) fn from_owner(owner: &crate::ParameterGroupOwner) -> Self {
         match owner {
-            crate::ParameterGroupOwner::StaticRole(role)
-            | crate::ParameterGroupOwner::StaticUnitConsumers { role, .. } => {
-                Self::StaticRole(role.clone())
-            }
-            crate::ParameterGroupOwner::StaticAnyOf(roles) => Self::StaticRole(
-                roles
-                    .first()
-                    .expect("validated shared static owner")
-                    .clone(),
+            crate::ParameterGroupOwner::StaticRole(_)
+            | crate::ParameterGroupOwner::StaticUnitConsumers { .. }
+            | crate::ParameterGroupOwner::StaticAnyOf(_) => Self::StaticRole(
+                owner
+                    .static_storage_role()
+                    .expect("validated static owner")
+                    .to_owned(),
             ),
             crate::ParameterGroupOwner::ExecutionUnit {
                 group, global_unit, ..
