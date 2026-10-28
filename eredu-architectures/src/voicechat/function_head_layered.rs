@@ -270,8 +270,6 @@ impl<B: NeuralBackend> FunctionHeadKernel<B> {
         dimensions: FunctionHeadDimensions,
         format: LinearFormatSpec,
     ) -> Result<Self, ChannelError> {
-        dimensions.validate()?;
-        head_spec(dimensions.width, dimensions.vocabulary, format.clone())?;
         function_head_parameter_description(dimensions, &format)?;
         Ok(Self {
             dimensions,
@@ -320,13 +318,16 @@ impl<B: DistributedNeuralBackend> FunctionHeadKernel<B> {
         layout: &LocalModelLayout,
     ) -> Result<Self, ChannelError> {
         let range = function_head_parallel_range(dimensions, &format, layout)?;
-        let mut architecture = Self::new(dimensions, format)?;
-        architecture.parallel = Some(ParallelFunctionHeadDefinition {
-            range,
-            layout: layout.clone(),
-            build: FunctionHead::<B>::new_parallel,
-        });
-        Ok(architecture)
+        Ok(Self {
+            dimensions,
+            format,
+            parallel: Some(ParallelFunctionHeadDefinition {
+                range,
+                layout: layout.clone(),
+                build: FunctionHead::<B>::new_parallel,
+            }),
+            backend: PhantomData,
+        })
     }
     /// Checks hidden geometry and exact communicator ownership before parameter acquisition.
     pub fn validate_parallel_projection(
