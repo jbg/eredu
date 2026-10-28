@@ -569,8 +569,9 @@ impl<T: Tensor> RelativeAttentionInput<'_, T> {
 }
 
 /// Stable authoritative identity of one logical model parameter.
+/// Clones share the immutable identifier text.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ParameterId(String);
+pub struct ParameterId(std::sync::Arc<str>);
 
 impl ParameterId {
     /// Creates a non-empty parameter identity.
@@ -579,7 +580,7 @@ impl ParameterId {
         if id.trim().is_empty() {
             return Err(ParameterTopologyError::EmptyId);
         }
-        Ok(Self(id))
+        Ok(Self(id.into()))
     }
 
     /// Returns the stable checkpoint-facing identity.

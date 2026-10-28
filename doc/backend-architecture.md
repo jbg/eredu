@@ -4514,7 +4514,9 @@ segment is not reserved, however: an architecture may itself declare
 `projection.inner.weight`, which remains distinct from `projection.weight`.
 Backend operators expose architecture parameter identities through their
 neutral `Parameterized` topology, including when native storage uses private
-module slots. Generic binding, residency, and distributed-planning utilities
+module slots. Cloned logical parameter IDs share immutable identifier text;
+parameter storage sharing remains explicit in alias and ownership declarations.
+Generic binding, residency, and distributed-planning utilities
 accept that topology rather than a backend module's raw physical parameter
 tree, consume its exact identities, and never normalize path segments. A
 single `eredu-runtime` binding-plan vocabulary records the stable target,
