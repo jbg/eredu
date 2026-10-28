@@ -329,11 +329,11 @@ pub struct ParameterBindingTarget {
     pub permitted_source_dtypes: Vec<RecipeDtype>,
 }
 
-/// A canonical binding plan with each destination's logical identity and storage preference.
+/// A canonical binding plan with ordered identities, logical targets and storage preferences.
 #[derive(Debug, Clone)]
 pub struct ModuleBindingPlan {
     plan: BindingPlan,
-    destinations: BTreeMap<String, (String, eredu_nn::ParameterStorageLayout)>,
+    destinations: Vec<(ParameterId, String, eredu_nn::ParameterStorageLayout)>,
 }
 
 impl ModuleBindingPlan {
@@ -347,14 +347,21 @@ impl ModuleBindingPlan {
         &self,
         source: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, ModuleBindingPlanError> {
-        self.plan
-            .build_bindings(source)?
+        let bindings = self.plan.build_bindings(source)?;
+        assert_eq!(
+            bindings.len(),
+            self.destinations.len(),
+            "module binding declaration retains every target"
+        );
+        bindings
             .into_iter()
-            .map(|binding| {
-                let (target, layout) = self
-                    .destinations
-                    .get(binding.name())
-                    .expect("module binding declaration retains every target");
+            .zip(&self.destinations)
+            .map(|(binding, (parameter, target, layout))| {
+                assert_eq!(
+                    binding.name(),
+                    parameter.as_str(),
+                    "canonical module binding order"
+                );
                 binding
                     .with_storage_layout(*layout)
                     .with_logical_target(target)
@@ -423,16 +430,16 @@ where
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut declarations = Vec::new();
-    let mut destinations = BTreeMap::new();
+    let mut destinations = Vec::new();
     let mut permitted_dtype_conversions = BTreeMap::new();
 
-    for (local_name, (parameter, storage_layout)) in parameters
+    for (parameter_id, (parameter, storage_layout)) in parameters
         .into_iter()
         .filter(|(name, _)| !excluded(name.as_str()))
     {
-        let local_name = local_name.to_string();
+        let local_name = parameter_id.to_string();
         let destination = qualify_parameter(prefix, &local_name);
-        destinations.insert(local_name.clone(), (destination.clone(), storage_layout));
+        destinations.push((parameter_id, destination.clone(), storage_layout));
         let description = describe(parameter).ok_or_else(|| {
             ModuleBindingPlanError::InvalidParameterRepresentation {
                 parameter: destination.clone(),
