@@ -613,7 +613,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             let plan = WeightBindingPlan::new(original)
                 .map_err(RecipeBindingError::from)
                 .map_err(ComponentPreparationError::from)?;
-            retain_aliases(&plan, transformed)?;
+            retain_aliases(plan.alias_indices(), transformed)?;
         }
         self.units = transformed;
         Ok(self)
@@ -881,10 +881,10 @@ fn restrict_bindings<'a>(
 // the same canonical owner and adopt its selected physical size.
 // Both callers preserve binding order; plan indices resolve alias chains to physical owners.
 fn retain_aliases(
-    plan: &WeightBindingPlan<'_>,
+    aliases: impl IntoIterator<Item = (usize, usize)>,
     selected: &mut [WeightBinding],
 ) -> Result<(), ComponentPreparationError> {
-    for (alias_index, owner_index) in plan.alias_indices() {
+    for (alias_index, owner_index) in aliases {
         let bytes = selected[owner_index].expected_bytes();
         let binding = &mut selected[alias_index];
         let mut alias = WeightBinding::alias(
@@ -930,7 +930,8 @@ fn place_resources(
             });
         }
     }
-    let mut selected = place_weight_bindings(bindings.clone(), source, layout)?;
-    retain_aliases(&plan, &mut selected)?;
+    let aliases = plan.alias_indices().collect::<Vec<_>>();
+    let mut selected = place_weight_bindings(bindings, source, layout)?;
+    retain_aliases(aliases, &mut selected)?;
     Ok(selected)
 }
