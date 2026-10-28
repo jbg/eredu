@@ -620,11 +620,10 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let mut forward = self.begin_parallel(input, state, parallel, context)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
+        ComponentInstrumentation::apply_embedding(
+            self.begin_parallel(input, state, parallel, context)?,
+            observer,
+        )
     }
     fn finish_parallel(
         &mut self,

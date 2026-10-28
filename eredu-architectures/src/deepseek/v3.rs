@@ -1954,10 +1954,7 @@ where
     {
         let mut forward = self.begin_parallel(input, state, parallel, context)?;
         if matches!(forward.context.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-                    .apply("embedding", forward.hidden)?;
+            forward = crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
             forward.context.embedded = forward.hidden.clone();
         }
         Ok(forward)
@@ -2402,10 +2399,7 @@ where
         let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
         let mut forward = self.begin_partition(input, mask, state, selected)?;
         if embedded {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-                    .apply("embedding", forward.hidden)?;
+            forward = crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
             forward.context.embedded = forward.hidden.clone();
         }
         Ok(forward)

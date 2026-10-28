@@ -731,11 +731,10 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let mut forward = self.begin_parallel(input, state, parallel, context)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
+        ComponentInstrumentation::apply_embedding(
+            self.begin_parallel(input, state, parallel, context)?,
+            observer,
+        )
     }
     fn execute_parallel(
         &mut self,
@@ -1076,9 +1075,7 @@ where
         let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
         let mut forward = self.begin_partition(input, mask, state, selected)?;
         if embedded {
-            let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-                .apply("embedding", forward.hidden)?;
+            forward = ComponentInstrumentation::apply_embedding(forward, observer)?;
         }
         Ok(forward)
     }

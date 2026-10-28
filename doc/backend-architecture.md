@@ -13392,8 +13392,9 @@ partition readout emits internal readout hooks; its ordinary low-level parallel
 readout leaves the observer unused. Complete ordinary parallel readout emits those
 hooks. Composite observed ingress retains its explicit image-embedding seam.
 
-Decoder observed ingress shares the `readout.embedding` observation and intervention
-operation. Kernels retain request preparation, mode checks and updates to embedded
+Decoder ordinary, parallel and partition observed ingress share the
+`readout.embedding` observation and intervention operation. Kernels retain request
+preparation, collective setup, mode and token-input checks, and updates to embedded
 context values after that operation.
 
 Shared dense decoder execution retains a `DecoderSchedule` of body and stateless
