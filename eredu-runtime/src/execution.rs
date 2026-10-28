@@ -210,7 +210,7 @@ impl ExecutionUnitAddressMap {
         references: impl IntoIterator<Item = (ExecutionUnitAddress, ExecutionUnitAddress)>,
     ) -> Result<Self, ExecutionUnitAddressMapError> {
         let mut seen = BTreeSet::new();
-        let mut used = BTreeSet::new();
+        let mut used = vec![false; local.len()];
         let mut addresses = Vec::new();
         let mut counts = vec![0; local.group_count()];
         let mut previous = 0;
@@ -235,7 +235,7 @@ impl ExecutionUnitAddressMap {
                     index: logical.index(),
                 });
             }
-            used.insert(storage_ordinal);
+            used[storage_ordinal] = true;
             counts[logical.group()] += 1;
             addresses.push((
                 logical,
@@ -245,7 +245,7 @@ impl ExecutionUnitAddressMap {
                 },
             ));
         }
-        if let Some(ordinal) = (0..local.len()).find(|ordinal| !used.contains(ordinal)) {
+        if let Some(ordinal) = used.iter().position(|used| !used) {
             return Err(ExecutionUnitAddressMapError::UnreferencedStorage {
                 address: local.address(ordinal).expect("validated storage layout"),
             });
