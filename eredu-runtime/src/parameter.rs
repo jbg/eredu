@@ -548,11 +548,6 @@ where
         })?;
     }
 
-    let parameter_names = collector
-        .parameters
-        .keys()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
     let mut covered = std::collections::BTreeSet::new();
     let mut declarations = Vec::new();
     let mut conversions = BTreeMap::new();
@@ -565,7 +560,7 @@ where
     for task in tasks {
         let candidates = std::iter::once(task.name())
             .chain(task.aliases().iter().map(String::as_str))
-            .filter(|candidate| parameter_names.contains(*candidate))
+            .filter(|candidate| collector.parameters.contains_key(*candidate))
             .collect::<std::collections::BTreeSet<_>>();
         if candidates.len() != 1 {
             return Err(ModuleBindingPlanError::ExactTask {
@@ -602,7 +597,7 @@ where
             if is_local_transform {
                 locally_materialized.insert(target.clone());
             }
-            if !parameter_names.contains(&target) {
+            if !collector.parameters.contains_key(&target) {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!(
                         "task {:?} companion {:?} has no module destination",
@@ -670,9 +665,10 @@ where
         }
     }
 
-    let missing = parameter_names
-        .difference(&covered)
-        .filter(|name| !addressable_parameters.contains(*name))
+    let missing = collector
+        .parameters
+        .keys()
+        .filter(|name| !covered.contains(*name) && !addressable_parameters.contains(*name))
         .cloned()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
