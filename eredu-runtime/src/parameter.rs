@@ -1332,7 +1332,7 @@ fn validated_binding_plan<'a, B: ParameterBackend>(
     plan: WeightBindingPlan<'a>,
 ) -> Result<WeightBindingPlan<'a>, ParameterOrchestrationError<B::ParameterError>> {
     for binding in plan.owners() {
-        let inferred = binding.source_recipe().infer(source)?;
+        let inferred = binding.recipe_view().infer(source)?;
         if inferred.byte_len() != binding.expected_bytes() {
             return Err(ParameterOrchestrationError::ByteMismatch {
                 parameter: binding.name().to_owned(),
@@ -1342,7 +1342,7 @@ fn validated_binding_plan<'a, B: ParameterBackend>(
         }
     }
     for binding in plan.owners() {
-        B::preflight_recipe(&binding.source_recipe(), source)
+        B::preflight_recipe(&binding.recipe_view(), source)
             .map_err(ParameterOrchestrationError::Backend)?;
     }
     Ok(plan)
@@ -1445,7 +1445,7 @@ fn materialize_validated_plan<B: ParameterBackend>(
         let materialization =
             if binding.storage_layout() != eredu_nn::ParameterStorageLayout::Canonical {
                 B::materialize_recipe_with_layout(
-                    &binding.source_recipe(),
+                    &binding.recipe_view(),
                     source,
                     binding.storage_layout(),
                     context,

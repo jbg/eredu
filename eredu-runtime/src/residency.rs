@@ -548,13 +548,23 @@ impl WeightBinding {
 
     /// Returns the complete source recipe represented by this binding.
     pub fn source_recipe(&self) -> DerivedWeightRecipe {
+        self.recipe_view().into_owned()
+    }
+
+    // Inspection borrows retained derived recipes; direct bindings synthesize
+    // their source expression from the checkpoint key and selection.
+    pub(crate) fn recipe_view(&self) -> Cow<'_, DerivedWeightRecipe> {
         assert!(
             self.alias_of.is_none(),
             "logical aliases have no physical recipe"
         );
-        self.recipe.clone().unwrap_or_else(|| {
-            DerivedWeightRecipe::source(self.checkpoint_key.clone(), self.selection.clone())
-        })
+        match &self.recipe {
+            Some(recipe) => Cow::Borrowed(recipe),
+            None => Cow::Owned(DerivedWeightRecipe::source(
+                self.checkpoint_key.clone(),
+                self.selection.clone(),
+            )),
+        }
     }
 
     /// Returns every checkpoint key consumed by this binding.
@@ -596,7 +606,7 @@ impl WeightBinding {
         catalog: &C,
         selection: TensorSelection,
     ) -> Result<Self, WeightBindingSelectionError> {
-        let recipe = self.source_recipe().select_bounded(catalog, selection)?;
+        let recipe = self.recipe_view().select_bounded(catalog, selection)?;
         let bytes = recipe.infer(catalog)?.byte_len();
         Ok(self.with_source_recipe(recipe, bytes)?)
     }
@@ -1167,7 +1177,7 @@ impl ResidencyController {
             let total = physical_binding_bytes(unit.bindings())?;
             for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
                 let actual = binding
-                    .source_recipe()
+                    .recipe_view()
                     .infer(catalog)
                     .map_err(|source| ResidencyControllerError::Recipe {
                         binding: binding.name().to_owned(),
