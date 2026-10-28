@@ -881,9 +881,11 @@ when opening its window. Bounded native acquisition and completion consume those
 projections through the ordinary policy lifecycle; resident execution loans the
 selected physical module.
 Leased parameter owners declare their canonical group/unit identity and explicit
-logical consumers. Parameter descriptions validate consumer membership, reject
-inconsistent declarations for one owner and conflicting leased owners for an invocation,
-and retain the derived physical map. Shared component adapters project that map directly.
+logical consumers. Logical parameter-use admission and invocation storage discovery
+share the owner's explicit unit-consumer predicate. Parameter descriptions validate
+consumer membership and retain the derived physical map. They reject inconsistent
+declarations for one owner and conflicting leased owners for an invocation.
+Shared component adapters project that map directly.
 Factories receive validated physical storage coordinates; equations retain logical
 invocation addresses. Preparation resolves and places each canonical binding list once.
 Consuming parts retain

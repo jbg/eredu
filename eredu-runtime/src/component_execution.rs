@@ -577,17 +577,7 @@ impl ComponentDefinition {
                 })
                 .get(usage.target.as_str())
                 .ok_or_else(&invalid)?;
-            let admitted = match owned.owner() {
-                crate::ParameterGroupOwner::ExecutionUnit {
-                    group: owner,
-                    consumers,
-                    ..
-                } => owner == group && consumers.contains(&address.index()),
-                crate::ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
-                    .iter()
-                    .any(|(owner, index)| owner == group && *index == address.index()),
-                _ => false,
-            };
+            let admitted = owned.owner().has_unit_consumer(group, address.index());
             if logical.trim().is_empty() || !admitted || declared.contains_key(&logical) {
                 return Err(invalid());
             }
@@ -765,15 +755,7 @@ impl ComponentDefinition {
             .parameters
             .groups()
             .iter()
-            .filter(|owned| match owned.owner() {
-                crate::ParameterGroupOwner::ExecutionUnit {
-                    group, consumers, ..
-                } => group == group_id && consumers.contains(&index),
-                crate::ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
-                    .iter()
-                    .any(|(group, unit)| group == group_id && *unit == index),
-                _ => false,
-            })
+            .filter(|owned| owned.owner().has_unit_consumer(group_id, index))
             .map(|owned| ParameterStorageId::from_owner(owned.owner()))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()

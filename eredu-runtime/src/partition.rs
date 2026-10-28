@@ -70,6 +70,22 @@ impl ParameterGroupOwner {
         }
     }
 
+    /// Whether one explicit logical unit consumes this resource.
+    /// Static roles alone do not declare unit consumers or mutable-state sharing.
+    pub fn has_unit_consumer(&self, group: &ExecutionGroupId, unit: usize) -> bool {
+        match self {
+            Self::ExecutionUnit {
+                group: owner,
+                consumers,
+                ..
+            } => owner == group && consumers.contains(&unit),
+            Self::StaticUnitConsumers { consumers, .. } => consumers
+                .iter()
+                .any(|(owner, index)| owner == group && *index == unit),
+            Self::StaticRole(_) | Self::StaticAnyOf(_) => false,
+        }
+    }
+
     /// Compares canonical ownership, allowing constructed consumers to refine
     /// a selected binding role or extend its declared invocation consumers.
     pub fn refines_storage_owner(&self, selected: &Self) -> bool {
