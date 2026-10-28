@@ -504,29 +504,13 @@ where
     E: std::fmt::Display,
 {
     struct Collector<'a, P> {
-        parameters: BTreeMap<ParameterId, (&'a P, ParameterBindingTarget)>,
+        parameters: BTreeMap<ParameterId, &'a P>,
         duplicate: Option<ParameterId>,
     }
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
         fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
             let name = metadata.id;
-            // The description is filled after traversal because the visitor cannot
-            // retain a borrowed callback without complicating this neutral API.
-            if self
-                .parameters
-                .insert(
-                    name.clone(),
-                    (
-                        parameter,
-                        ParameterBindingTarget {
-                            shape: Vec::new(),
-                            dtype: RecipeDtype::Other(String::new()),
-                            permitted_source_dtypes: Vec::new(),
-                        },
-                    ),
-                )
-                .is_some()
-            {
+            if self.parameters.insert(name.clone(), parameter).is_some() {
                 self.duplicate = Some(name);
             }
         }
@@ -542,13 +526,18 @@ where
             parameter: parameter.to_string(),
         });
     }
-    for (name, (parameter, description)) in &mut collector.parameters {
-        *description = describe(parameter).ok_or_else(|| {
-            ModuleBindingPlanError::InvalidParameterRepresentation {
-                parameter: name.to_string(),
-            }
-        })?;
-    }
+    let parameters = collector
+        .parameters
+        .into_iter()
+        .map(|(name, parameter)| {
+            let description = describe(parameter).ok_or_else(|| {
+                ModuleBindingPlanError::InvalidParameterRepresentation {
+                    parameter: name.to_string(),
+                }
+            })?;
+            Ok((name, description))
+        })
+        .collect::<Result<BTreeMap<_, _>, ModuleBindingPlanError>>()?;
 
     // Each admitted destination records whether its recipe is already rank-local.
     let mut covered = BTreeMap::new();
@@ -562,7 +551,7 @@ where
     for task in tasks {
         let candidates = std::iter::once(task.name())
             .chain(task.aliases().iter().map(String::as_str))
-            .filter(|candidate| collector.parameters.contains_key(*candidate))
+            .filter(|candidate| parameters.contains_key(*candidate))
             .collect::<std::collections::BTreeSet<_>>();
         if candidates.len() != 1 {
             return Err(ModuleBindingPlanError::ExactTask {
@@ -583,7 +572,7 @@ where
         validate_exact_task_provenance(task, source)?;
         let recipe = exact_task_recipe(task, source, &mut lower_mxfp4)?;
         push_exact_declaration(
-            &collector.parameters,
+            &parameters,
             &mut declarations,
             &mut conversions,
             target,
@@ -593,7 +582,7 @@ where
 
         for companion in task.output_companions() {
             let target = companion.name().to_owned();
-            if !collector.parameters.contains_key(target.as_str()) {
+            if !parameters.contains_key(target.as_str()) {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!(
                         "task {:?} companion {:?} has no module destination",
@@ -648,7 +637,7 @@ where
                 });
             };
             push_exact_declaration(
-                &collector.parameters,
+                &parameters,
                 &mut declarations,
                 &mut conversions,
                 target,
@@ -661,8 +650,7 @@ where
         }
     }
 
-    let missing = collector
-        .parameters
+    let missing = parameters
         .keys()
         .filter(|name| {
             !covered.contains_key(name.as_str()) && !addressable_parameters.contains(name.as_str())
@@ -713,18 +701,17 @@ where
         .map_err(Into::into)
 }
 
-fn push_exact_declaration<P>(
-    parameters: &BTreeMap<ParameterId, (&P, ParameterBindingTarget)>,
+fn push_exact_declaration(
+    parameters: &BTreeMap<ParameterId, ParameterBindingTarget>,
     declarations: &mut Vec<PlannedBinding>,
     conversions: &mut BTreeMap<String, Vec<RecipeDtype>>,
     target: String,
     recipe: DerivedWeightRecipe,
     explicitly_permitted_source_dtypes: &[RecipeDtype],
 ) -> Result<(), ModuleBindingPlanError> {
-    let description = &parameters
+    let description = parameters
         .get(target.as_str())
-        .expect("validated module destination remains present")
-        .1;
+        .expect("validated module destination remains present");
     let mut permitted = description.permitted_source_dtypes.clone();
     for dtype in explicitly_permitted_source_dtypes {
         if !permitted.contains(dtype) {
