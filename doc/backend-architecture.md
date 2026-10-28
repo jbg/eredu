@@ -917,8 +917,9 @@ ordinary parameter owner fails before materialization. A later projection cannot
 discarded invocations merely because their storage is still available. Primary source views
 contain only pinned and ordinary recipe inputs. Each auxiliary owner retains its own
 restricted view, independently of identically named keys in another source.
-Component selection uses its retained invocation map for canonical address and group
-lookup without retaining a second logical-address catalog. Selected provider acquisition
+Invocation maps retain a compact ordinal index for address lookup independently of
+within-group traversal order. Component and resource selection share this lookup,
+retaining declared invocation order and exact physical owners. Selected provider acquisition
 resolves a logical invocation to typed dense storage coordinates. Leases retain that validated association and their policy identity through
 completion and abort. Completion validates the original invocation; abort retires or
 returns the recorded storage owner independently of caller-supplied indices. Native

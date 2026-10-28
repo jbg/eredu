@@ -1221,7 +1221,7 @@ impl ComponentSelection {
         index: usize,
     ) -> Result<ExecutionUnitAddress, ComponentDefinitionError> {
         self.invocations
-            .canonical_logical_address(group, index)
+            .logical_address(group, index)
             .ok_or_else(|| ComponentDefinitionError::Address {
                 component: self.component.clone(),
                 group,
@@ -1273,7 +1273,7 @@ impl ComponentDefinition {
         if partition.state() != expected.as_ref() {
             return Err(invalid("partition state ownership"));
         }
-        // Validated partition invocations retain canonical group/unit order for lookup.
+        // Selected invocations retain every declared mutable-state reference.
         for address in partition.units() {
             let unit = definition.unit(address.group(), address.index())?;
             if !unit.state.is_empty()

@@ -187,6 +187,7 @@ pub struct ExecutionUnitAddressMap {
 struct ExecutionUnitAddressMapData {
     storage: ExecutionUnitLayout,
     addresses: Vec<(ExecutionUnitAddress, ExecutionUnitStorageLocation)>,
+    lookup: Vec<usize>,
     groups: Vec<Range<usize>>,
 }
 
@@ -210,7 +211,7 @@ impl ExecutionUnitAddressMap {
         local: &ExecutionUnitLayout,
         references: impl IntoIterator<Item = (ExecutionUnitAddress, ExecutionUnitAddress)>,
     ) -> Result<Self, ExecutionUnitAddressMapError> {
-        let mut seen = BTreeSet::new();
+        let mut lookup = BTreeMap::new();
         let mut used = vec![false; local.len()];
         let mut addresses = Vec::new();
         let mut counts = vec![0; local.group_count()];
@@ -230,7 +231,10 @@ impl ExecutionUnitAddressMap {
                 return Err(ExecutionUnitAddressMapError::UnorderedGroups { ordinal });
             }
             previous = logical.group();
-            if !seen.insert((logical.group(), logical.index())) {
+            if lookup
+                .insert((logical.group(), logical.index()), ordinal)
+                .is_some()
+            {
                 return Err(ExecutionUnitAddressMapError::DuplicateAddress {
                     group: logical.group(),
                     index: logical.index(),
@@ -264,6 +268,7 @@ impl ExecutionUnitAddressMap {
             data: std::sync::Arc::new(ExecutionUnitAddressMapData {
                 storage: local.clone(),
                 addresses,
+                lookup: lookup.into_values().collect(),
                 groups,
             }),
         })
@@ -310,22 +315,14 @@ impl ExecutionUnitAddressMap {
         &self,
         selected: impl IntoIterator<Item = ExecutionUnitAddress>,
     ) -> Result<Self, ExecutionUnitAddressMapError> {
-        let lookup = self
-            .data
-            .addresses
-            .iter()
-            .enumerate()
-            .map(|(ordinal, &(logical, storage))| {
-                ((logical.group(), logical.index()), (ordinal, storage))
-            })
-            .collect::<BTreeMap<_, _>>();
         let mut references = Vec::new();
         let mut resources = BTreeSet::new();
         let mut previous = None;
         for logical in selected {
-            let &(ordinal, storage) = lookup
-                .get(&(logical.group(), logical.index()))
+            let ordinal = self
+                .logical_ordinal(logical.group(), logical.index())
                 .ok_or(ExecutionUnitAddressMapError::UnknownInvocation { address: logical })?;
+            let storage = self.data.addresses[ordinal].1;
             if previous.is_some_and(|previous| ordinal <= previous) {
                 return Err(ExecutionUnitAddressMapError::NonCanonicalSelection);
             }
@@ -346,23 +343,26 @@ impl ExecutionUnitAddressMap {
         Self::new(&storage, references)
     }
 
-    /// Exact logical consumers in canonical traversal order, independently of storage.
+    /// Exact logical consumers in declared traversal order, independently of storage.
     pub fn logical_addresses(&self) -> impl ExactSizeIterator<Item = ExecutionUnitAddress> + '_ {
         self.data.addresses.iter().map(|(logical, _)| *logical)
     }
 
-    // Component selections validate against a canonical logical layout before lookup.
-    // General maps may retain a noncanonical order within a group.
-    pub(crate) fn canonical_logical_address(
+    fn logical_ordinal(&self, group: usize, index: usize) -> Option<usize> {
+        let lookup = &self.data.lookup[self.group_range(group)?];
+        let position = lookup
+            .binary_search_by_key(&index, |&ordinal| self.data.addresses[ordinal].0.index())
+            .ok()?;
+        Some(lookup[position])
+    }
+
+    // Identity lookup is independent of the retained within-group traversal order.
+    pub(crate) fn logical_address(
         &self,
         group: usize,
         index: usize,
     ) -> Option<ExecutionUnitAddress> {
-        let addresses = &self.data.addresses[self.group_range(group)?];
-        let ordinal = addresses
-            .binary_search_by_key(&index, |(logical, _)| logical.index())
-            .ok()?;
-        Some(addresses[ordinal].0)
+        Some(self.data.addresses[self.logical_ordinal(group, index)?].0)
     }
 
     /// Selected physical resources, independent of their invocation count.
