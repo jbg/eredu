@@ -348,7 +348,7 @@ pub fn partition_parameter_acquisition_bindings(
     let mut owners = std::collections::BTreeMap::new();
     for (index, unit) in units.iter().enumerate() {
         for target in unit.outputs() {
-            if owners.insert(target.as_str(), index).is_some() {
+            if owners.insert(target.as_str(), (index, false)).is_some() {
                 return Err(ParameterAcquisitionError::Output {
                     target: target.clone(),
                     reason: "multiple acquisition owners",
@@ -357,16 +357,15 @@ pub fn partition_parameter_acquisition_bindings(
         }
     }
     let mut partitioned = vec![Vec::new(); units.len()];
-    let mut assigned = BTreeSet::new();
     for binding in bindings {
         let target = binding.logical_target().unwrap_or_else(|| binding.name());
-        let index = owners
-            .get(target)
+        let (index, assigned) = owners
+            .get_mut(target)
             .ok_or_else(|| ParameterAcquisitionError::Output {
                 target: target.into(),
                 reason: "binding has no acquisition owner",
             })?;
-        if !assigned.insert(target.to_owned()) {
+        if std::mem::replace(assigned, true) {
             return Err(ParameterAcquisitionError::Output {
                 target: target.into(),
                 reason: "binding has duplicate destinations",
@@ -375,9 +374,9 @@ pub fn partition_parameter_acquisition_bindings(
         partitioned[*index].push(binding);
     }
     let missing = owners
-        .keys()
-        .filter(|target| !assigned.contains(**target))
-        .map(|target| (*target).to_owned())
+        .iter()
+        .filter(|(_, (_, assigned))| !assigned)
+        .map(|(target, _)| (*target).to_owned())
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(ParameterAcquisitionError::Selection {
