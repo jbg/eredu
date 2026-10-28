@@ -1005,19 +1005,6 @@ where
             context,
         )
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut TransformerRuntimeState<'_, B, C, D>,
-        forward: &Self::ForwardContext,
-        _: &B::ParallelContext,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TransformerError> {
-        if self.config.geometry().causal {
-            state.position = forward.offset + forward.sequence;
-        }
-        Ok(hidden.clone())
-    }
 }
 
 fn validate_input<T: Tensor>(

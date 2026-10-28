@@ -628,14 +628,4 @@ where
     ) -> Result<B::Tensor, Error> {
         self.execute(address, unit, hidden, state, forward, context)
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &AudioForward,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.finish(hidden, state, forward, context)
-    }
 }

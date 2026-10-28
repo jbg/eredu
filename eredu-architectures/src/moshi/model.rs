@@ -883,16 +883,6 @@ where
             Ok(hidden.clone())
         }
     }
-    fn finish_parallel(
-        &mut self,
-        _hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &Self::ForwardContext,
-        _parallel: &B::ParallelContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        <Self as ComponentEquations<B, S>>::finish(self, _hidden, _state, forward, _context)
-    }
 }
 /// Stateless mapping from the two-group graph to ordered runtime decisions.
 #[derive(Debug, Clone, Copy)]

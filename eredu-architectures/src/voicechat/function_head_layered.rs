@@ -609,16 +609,6 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
         self.validate_parallel_unit(unit)?;
         unit.project_parallel(hidden, parallel, context)
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut StatelessComponentState,
-        forward: &(),
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, ChannelError> {
-        self.finish(hidden, state, forward, context)
-    }
 }
 
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(

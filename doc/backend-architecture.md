@@ -956,7 +956,10 @@ Text request construction uses the independent `TextComponentKernel` capability.
 uses ordinary full-output readout and advertises no narrowing. Ordinary and observed
 readout keep their full result geometry.
 Parallel adaptation requires the separate
-`ParallelComponentKernel` bound. Typed partition and pipeline adaptation require
+`ParallelComponentKernel` bound, with explicit parallel ingress and unit equations.
+Its readout defaults to the ordinary equation when no collective or additional
+parallel validation is required; kernels override readout for those operations.
+Typed partition and pipeline adaptation require
 `PartitionComponentKernel` and `PipelineComponentKernel`. Consuming partition
 selection validates canonical parameter ownership and the declared state projection,
 retains global invocation addresses, and maps declared state slots to local ordinals.

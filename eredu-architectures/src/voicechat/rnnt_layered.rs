@@ -1006,16 +1006,6 @@ impl<B: DistributedNeuralBackend, const PREDICTOR: bool>
             context,
         )
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut StatelessComponentState,
-        forward: &Self::ForwardContext,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        self.finish(hidden, state, forward, context)
-    }
 }
 /// Tensor-parallel RNNT phases with complete recurrent ownership.
 /// The typed invocation uses the shared resource and completion lifecycle.

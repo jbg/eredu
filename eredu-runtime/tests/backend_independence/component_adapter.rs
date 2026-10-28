@@ -210,16 +210,6 @@ impl eredu_runtime::ParallelComponentKernel<FakeBackend, StatelessComponentState
     ) -> Result<FakeTensor, Failure> {
         self.execute(address, unit, hidden, state, forward, context)
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &FakeTensor,
-        state: &mut StatelessComponentState,
-        forward: &bool,
-        _: &(),
-        context: &(),
-    ) -> Result<FakeTensor, Failure> {
-        self.finish(hidden, state, forward, context)
-    }
 }
 
 fn definition(pinned: bool) -> ComponentDefinition {
@@ -823,16 +813,6 @@ impl eredu_runtime::ParallelComponentKernel<FakeBackend, CarryState> for CarryKe
         context: &(),
     ) -> Result<FakeTensor, Failure> {
         self.execute(address, unit, hidden, state, forward, context)
-    }
-    fn finish_parallel(
-        &mut self,
-        hidden: &FakeTensor,
-        state: &mut CarryState,
-        forward: &(),
-        _: &(),
-        context: &(),
-    ) -> Result<FakeTensor, Failure> {
-        self.finish(hidden, state, forward, context)
     }
 }
 impl eredu_runtime::PartitionComponentKernel<FakeBackend, CarryState> for CarryKernel {

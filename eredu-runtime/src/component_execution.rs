@@ -1162,15 +1162,17 @@ pub trait ParallelComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
-    /// Parallel readout.
+    /// Parallel readout, sharing ordinary readout when no collective is required.
     fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
+        _parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
+    ) -> Result<B::Tensor, Self::Error> {
+        self.finish(hidden, state, forward, context)
+    }
 }
 
 /// Validated invocation, canonical storage and independent mutable-state ownership.

@@ -879,16 +879,6 @@ impl<B: NeuralBackend>
             context,
         )
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut PerceptionRuntimeState<B::Tensor>,
-        forward: &Self::ForwardContext,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, PerceptionError> {
-        self.finish(hidden, state, forward, context)
-    }
 }
 
 pub(super) fn output<T>(

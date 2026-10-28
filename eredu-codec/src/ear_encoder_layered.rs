@@ -538,16 +538,6 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
         forward.next_unit = index + 1;
         Ok(output)
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut StatelessComponentState,
-        forward: &EncoderForward,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.finish(hidden, state, forward, context)
-    }
 }
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<Error, P>,

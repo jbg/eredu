@@ -1004,16 +1004,6 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
             &mut |_, success, _| Ok(success),
         )
     }
-    fn finish_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut StatelessComponentState,
-        forward: &Self::ForwardContext,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TtsError> {
-        self.finish(hidden, state, forward, context)
-    }
 }
 
 fn validate_codes<T: Tensor>(codes: &T) -> Result<(), TtsError> {
