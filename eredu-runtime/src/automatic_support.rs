@@ -209,7 +209,11 @@ pub fn placed_source_recipe<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>
     } else {
         vec![binding]
     };
-    Ok(bindings[0].source_recipe())
+    Ok(bindings
+        .into_iter()
+        .next()
+        .expect("one binding placement preserves cardinality")
+        .into_source_recipe())
 }
 
 /// Sizes exact selected tasks without reading payloads or constructing modules.

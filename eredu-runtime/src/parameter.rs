@@ -667,7 +667,7 @@ where
             .filter(|declaration| !covered[&declaration.target_name])
             .zip(placed)
         {
-            declaration.recipe = binding.source_recipe();
+            declaration.recipe = binding.into_source_recipe();
         }
     }
 

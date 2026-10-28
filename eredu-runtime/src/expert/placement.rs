@@ -54,7 +54,7 @@ pub fn place_addressable_bank_members<C: RecipeCatalog + ?Sized>(
                 .iter()
                 .zip(bindings)
                 .map(|(parameter, binding)| {
-                    let recipe = binding.source_recipe();
+                    let recipe = binding.into_source_recipe();
                     let metadata = recipe.infer(source)?;
                     let selected_bytes =
                         super::selected_addressable_parameter_bytes(parameter.task(), &metadata)?;

@@ -551,6 +551,17 @@ impl WeightBinding {
         self.recipe_view().into_owned()
     }
 
+    // Transfers a complete recipe when the binding metadata is no longer needed.
+    pub(crate) fn into_source_recipe(self) -> DerivedWeightRecipe {
+        assert!(
+            self.alias_of.is_none(),
+            "logical aliases have no physical recipe"
+        );
+        self.recipe.unwrap_or_else(|| {
+            DerivedWeightRecipe::source(self.checkpoint_key, self.selection)
+        })
+    }
+
     // Inspection borrows retained derived recipes; direct bindings synthesize
     // their source expression from the checkpoint key and selection.
     pub(crate) fn recipe_view(&self) -> Cow<'_, DerivedWeightRecipe> {
