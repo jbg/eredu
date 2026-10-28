@@ -477,17 +477,6 @@ impl<B: NeuralBackend> ComponentEquations<B, RnntPredictorRuntimeState<B::Tensor
         }
         self.begin_input(input.input, input.input, input.step, state)
     }
-    fn begin_group(
-        &mut self,
-        _: usize,
-        initial: &B::Tensor,
-        _: &[&B::Tensor],
-        _: &mut RnntPredictorRuntimeState<B::Tensor>,
-        _: &mut Self::ForwardContext,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, RnntError> {
-        Ok(initial.clone())
-    }
     fn execute(
         &mut self,
         address: ExecutionUnitAddress,

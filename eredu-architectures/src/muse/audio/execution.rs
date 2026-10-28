@@ -555,17 +555,6 @@ where
         }
         prepare_audio_forward::<B>(&self.config, input, 0, context)
     }
-    fn begin_group(
-        &mut self,
-        _group: usize,
-        initial: &B::Tensor,
-        _dependencies: &[&B::Tensor],
-        _: &mut S,
-        _: &mut AudioForward,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        Ok(initial.clone())
-    }
     fn execute(
         &mut self,
         address: eredu_runtime::ExecutionUnitAddress,

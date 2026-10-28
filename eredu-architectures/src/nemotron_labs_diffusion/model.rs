@@ -532,17 +532,6 @@ where
         )?;
         self.base.finish_hidden(&last, context)
     }
-    fn begin_group(
-        &mut self,
-        _: usize,
-        initial: &B::Tensor,
-        _: &[&B::Tensor],
-        _: &mut S,
-        _: &mut Self::ForwardContext,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        Ok(initial.clone())
-    }
     fn execute(
         &mut self,
         address: ExecutionUnitAddress,

@@ -588,17 +588,6 @@ where
             .apply("embedding", forward.hidden)?;
         Ok(forward)
     }
-    fn begin_group(
-        &mut self,
-        _group: usize,
-        initial: &B::Tensor,
-        _dependencies: &[&B::Tensor],
-        _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        Ok(initial.clone())
-    }
     fn execute(
         &mut self,
         address: eredu_runtime::ExecutionUnitAddress,

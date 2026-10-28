@@ -956,7 +956,9 @@ Text request construction uses the independent `TextComponentKernel` capability.
 uses ordinary full-output readout and advertises no narrowing. Ordinary and observed
 readout keep their full result geometry. Ordinary readout returns the final
 activation by default; kernels declare distinct projections, completion checks
-and state updates explicitly.
+and state updates explicitly. Group ingress uses the initial activation by default
+after shared dependency validation; kernels that assemble dependency values declare
+that assembly explicitly.
 Parallel adaptation requires the separate
 `ParallelComponentKernel` bound, with explicit parallel ingress and unit equations.
 Its readout defaults to the ordinary equation when no collective or additional

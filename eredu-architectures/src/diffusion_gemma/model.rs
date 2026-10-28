@@ -853,17 +853,6 @@ where
             },
         })
     }
-    fn begin_group(
-        &mut self,
-        _group: usize,
-        initial: &B::Tensor,
-        _dependencies: &[&B::Tensor],
-        _state: &mut S,
-        _forward: &mut ForwardContext<B::Tensor>,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        Ok(initial.clone())
-    }
     fn execute(
         &mut self,
         address: eredu_runtime::ExecutionUnitAddress,

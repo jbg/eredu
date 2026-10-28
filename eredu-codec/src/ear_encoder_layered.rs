@@ -373,17 +373,6 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Encode
         }
         self.begin_input(spectrum)
     }
-    fn begin_group(
-        &mut self,
-        _: usize,
-        initial: &B::Tensor,
-        _: &[&B::Tensor],
-        _: &mut StatelessComponentState,
-        _: &mut EncoderForward,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        Ok(initial.clone())
-    }
     fn execute(
         &mut self,
         address: ExecutionUnitAddress,

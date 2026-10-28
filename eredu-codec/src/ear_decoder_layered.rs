@@ -507,17 +507,6 @@ impl<B: NeuralBackend> ComponentEquations<B, DecoderRuntimeState<B::Tensor>> for
         }
         self.begin_input(latent, state, context)
     }
-    fn begin_group(
-        &mut self,
-        _: usize,
-        initial: &B::Tensor,
-        _: &[&B::Tensor],
-        _: &mut DecoderRuntimeState<B::Tensor>,
-        _: &mut DecoderForward,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        Ok(initial.clone())
-    }
     fn execute(
         &mut self,
         address: ExecutionUnitAddress,
