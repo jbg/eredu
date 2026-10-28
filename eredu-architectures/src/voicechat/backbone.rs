@@ -48,10 +48,19 @@ pub enum BackbonePreparationError {
 #[derive(Clone)]
 pub struct PreparedBackboneParameters {
     args: ModelArgs,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
     source: SharedCheckpointSource,
     parameters: BTreeMap<String, ParameterAdmission>,
 }
 impl PreparedBackboneParameters {
+    fn define(
+        args: &ModelArgs,
+    ) -> Result<Arc<eredu_runtime::ComponentDefinition>, BackbonePreparationError> {
+        nemotron_h::component_definition(args, None)
+            .map(Arc::new)
+            .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))
+    }
+
     /// Selects encoded recipes before parameter pool admission and module construction.
     pub fn with_quantization(
         mut self,
@@ -89,6 +98,7 @@ impl PreparedBackboneParameters {
             &eligible,
             RecipeDtype::F32,
         )?;
+        self.definition = Self::define(&args)?;
         self.args = args;
         self.source = source;
         self.parameters = parameters;
@@ -193,6 +203,7 @@ impl PreparedBackboneParameters {
             inputs,
         )?);
         Ok(Self {
+            definition: Self::define(&args)?,
             args,
             source,
             parameters,
