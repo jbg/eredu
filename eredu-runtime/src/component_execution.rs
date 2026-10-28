@@ -1050,14 +1050,16 @@ pub trait ComponentEquations<B: NeuralBackend, S: RuntimeState<B>>: ComponentKer
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
-    /// Converts the final activation to the typed operation's ordinary tensor result.
+    /// Returns the final activation unless the operation requires a distinct readout.
     fn finish(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(hidden.clone())
+    }
 }
 
 /// Explicit parallel equations; availability is enforced by a trait bound.

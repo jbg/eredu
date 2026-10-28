@@ -616,15 +616,6 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for MogKer
             )),
         }
     }
-    fn finish(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut StatelessComponentState,
-        _: &Self::ForwardContext,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TtsError> {
-        Ok(hidden.clone())
-    }
 }
 
 impl<B: DistributedNeuralBackend> MogKernel<B> {

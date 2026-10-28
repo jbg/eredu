@@ -921,9 +921,6 @@ impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P: 'static>
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
-    fn supports_chunked_prefill() -> bool {
-        false
-    }
 }
 trait CompressedExecutionProfile<
     B: BlockwiseAttentionBackend,
@@ -1046,16 +1043,6 @@ where
             context,
             Some(observer),
         )
-    }
-    fn complete_group(
-        &mut self,
-        _group: usize,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        Ok(hidden.clone())
     }
     fn finish(
         &mut self,

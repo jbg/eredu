@@ -564,15 +564,6 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Functi
         }
         unit.project(hidden, context)
     }
-    fn finish(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut StatelessComponentState,
-        _: &(),
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, ChannelError> {
-        Ok(hidden.clone())
-    }
 }
 
 impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>

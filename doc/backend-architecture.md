@@ -954,7 +954,9 @@ order and collective requirements are typed kernel hooks over validated invocati
 Text request construction uses the independent `TextComponentKernel` capability.
 `ComponentEquations` exposes final-position text readout explicitly; its default
 uses ordinary full-output readout and advertises no narrowing. Ordinary and observed
-readout keep their full result geometry.
+readout keep their full result geometry. Ordinary readout returns the final
+activation by default; kernels declare distinct projections, completion checks
+and state updates explicitly.
 Parallel adaptation requires the separate
 `ParallelComponentKernel` bound, with explicit parallel ingress and unit equations.
 Its readout defaults to the ordinary equation when no collective or additional

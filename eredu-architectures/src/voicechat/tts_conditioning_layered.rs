@@ -833,15 +833,6 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Condit
             )),
         }
     }
-    fn finish(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut StatelessComponentState,
-        _: &Self::ForwardContext,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TtsError> {
-        Ok(hidden.clone())
-    }
 }
 
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(

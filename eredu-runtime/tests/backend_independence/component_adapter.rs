@@ -767,15 +767,6 @@ impl ComponentEquations<FakeBackend, CarryState> for CarryKernel {
         output.0.push(carry.0 .0[0]);
         Ok(output)
     }
-    fn finish(
-        &mut self,
-        hidden: &FakeTensor,
-        _: &mut CarryState,
-        _: &(),
-        _: &(),
-    ) -> Result<FakeTensor, Failure> {
-        Ok(hidden.clone())
-    }
 }
 
 impl eredu_runtime::ParallelComponentKernel<FakeBackend, CarryState> for CarryKernel {
