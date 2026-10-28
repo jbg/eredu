@@ -46,10 +46,11 @@ impl<'a> BankParameterMemberAddress<'a> {
 /// Immutable index shared by parameter discovery and compact replacement access.
 /// Members retain source order; row projections use canonical physical-key order,
 /// matching full parameter assembly even for sparse selections and unsorted inputs.
+/// Binding-name lookup retains sorted member positions without copying those names.
 #[derive(Debug, Default)]
 pub struct PreparedBankParameterIndex {
     members: Vec<PreparedBankParameterMember>,
-    bindings: BTreeMap<ParameterBankKey, BTreeMap<String, usize>>,
+    bindings: BTreeMap<ParameterBankKey, Vec<usize>>,
     rows: Vec<usize>,
 }
 impl PreparedBankParameterIndex {
@@ -61,7 +62,7 @@ impl PreparedBankParameterIndex {
             if bindings
                 .entry(member.key)
                 .or_default()
-                .insert(member.binding.clone(), index)
+                .insert(member.binding.as_str(), index)
                 .is_some()
             {
                 return Err(BankParameterIndexError::DuplicateBinding {
@@ -87,6 +88,10 @@ impl PreparedBankParameterIndex {
                 rows[*index] = row;
             }
         }
+        let bindings = bindings
+            .into_iter()
+            .map(|(key, names)| (key, names.into_values().collect()))
+            .collect();
         Ok(Self {
             members,
             bindings,
@@ -103,7 +108,11 @@ impl PreparedBankParameterIndex {
         key: ParameterBankKey,
         binding: &str,
     ) -> Option<BankParameterMemberAddress<'_>> {
-        let index = *self.bindings.get(&key)?.get(binding)?;
+        let indices = self.bindings.get(&key)?;
+        let index = indices
+            .binary_search_by(|index| self.members[*index].binding.as_str().cmp(binding))
+            .ok()?;
+        let index = indices[index];
         Some(BankParameterMemberAddress {
             member: &self.members[index],
             row: self.rows[index],
