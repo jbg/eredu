@@ -116,8 +116,8 @@ impl BindingPlan {
         permitted_dtype_conversions: BTreeMap<String, Vec<RecipeDtype>>,
     ) -> Result<Self, BindingPlanError> {
         bindings.sort_by(|left, right| left.target_name.cmp(&right.target_name));
-        let mut targets = std::collections::BTreeSet::new();
-        let mut claims = BTreeMap::<String, String>::new();
+        let mut previous_target = None;
+        let mut claims = BTreeMap::<&str, &str>::new();
         for binding in &bindings {
             if binding.target_name.trim().is_empty() {
                 return Err(BindingPlanError::EmptyTarget);
@@ -135,7 +135,9 @@ impl BindingPlan {
                 .ok_or_else(|| BindingPlanError::TargetShapeOverflow {
                     target: binding.target_name.clone(),
                 })?;
-            if !targets.insert(binding.target_name.clone()) {
+            if previous_target.replace(binding.target_name.as_str())
+                == Some(binding.target_name.as_str())
+            {
                 return Err(BindingPlanError::DuplicateTarget {
                     target: binding.target_name.clone(),
                 });
@@ -155,10 +157,10 @@ impl BindingPlan {
                 if shared_source_keys.contains(source) {
                     continue;
                 }
-                if let Some(first) = claims.insert(source.into(), binding.target_name.clone()) {
+                if let Some(first) = claims.insert(source, binding.target_name.as_str()) {
                     return Err(BindingPlanError::DuplicateSourceClaim {
                         source_key: source.into(),
-                        first,
+                        first: first.to_owned(),
                         second: binding.target_name.clone(),
                     });
                 }
