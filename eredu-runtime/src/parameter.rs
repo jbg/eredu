@@ -1258,19 +1258,21 @@ pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
     set: AtomicRecipeSet,
 ) -> Result<Vec<WeightBinding>, RecipeBindingError> {
     let (outputs, aliases) = set.into_parts();
-    let mut bytes = BTreeMap::new();
-    for (name, recipe) in &outputs {
-        bytes.insert(name.clone(), recipe.infer(catalog)?.byte_len());
-    }
     let mut bindings = outputs
         .into_iter()
         .map(|(name, recipe)| {
-            let expected = bytes[&name];
-            WeightBinding::from_recipe(name, recipe, expected)
+            let expected = recipe.infer(catalog)?.byte_len();
+            Ok(WeightBinding::from_recipe(name, recipe, expected)?)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, RecipeBindingError>>()?;
+    // Canonical owners retain recipe-set order; appended aliases do not join this search.
+    let owners = bindings.len();
     for (alias, owner) in aliases {
-        bindings.push(WeightBinding::alias(alias, owner.clone(), bytes[&owner])?);
+        let index = bindings[..owners]
+            .binary_search_by(|binding| binding.name().cmp(owner.as_str()))
+            .expect("validated recipe alias names a canonical output");
+        let bytes = bindings[index].expected_bytes();
+        bindings.push(WeightBinding::alias(alias, owner, bytes)?);
     }
     WeightBindingPlan::new(&bindings)?;
     Ok(bindings)
