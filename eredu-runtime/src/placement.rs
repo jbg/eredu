@@ -551,15 +551,14 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
             .logical_target()
             .ok_or_else(|| BindingPlacementError::MissingLogicalTarget {
                 binding: binding.name().to_owned(),
-            })?
-            .to_owned();
-        let tensor = layout.tensor(&logical_target).ok_or_else(|| {
+            })?;
+        let tensor = layout.tensor(logical_target).ok_or_else(|| {
             BindingPlacementError::UnknownLogicalTarget {
                 binding: binding.name().to_owned(),
-                target: logical_target.clone(),
+                target: logical_target.to_owned(),
             }
         })?;
-        let companions = binding.quantization_companions().cloned();
+        let companions = binding.quantization_companions();
 
         if !skip_member_axis
             && binding.recipe().is_none()
