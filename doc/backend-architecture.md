@@ -4529,8 +4529,9 @@ accept that topology rather than a backend module's raw physical parameter
 tree, consume its exact identities, and never normalize path segments. A
 single `eredu-runtime` binding-plan vocabulary records the stable target,
 expected shape, dtype and bytes, direct or derived source, explicit source
-sharing, overlays, exclusions, and rank ownership. Its generic
-`ParameterBackend` orchestration preflights every recipe and immutable/mutable
+sharing, overlays, exclusions, and rank ownership. Exact task binding retains
+destination geometry and storage preferences from one neutral module traversal.
+Its generic `ParameterBackend` orchestration preflights every recipe and immutable/mutable
 module traversal before payload or native work, completes all materialization,
 then validates and publishes the whole binding atomically. Layerwise and
 addressable-bank executors reuse the same declarations while retaining their

@@ -485,9 +485,9 @@ where
 
 /// Builds canonical bindings for an exact architecture-selected task partition.
 ///
-/// Module traversal supplies destination geometry only. Task identities (including
-/// admitted aliases), physical provenance, recipes, companions, and coverage are
-/// validated here before any backend payload or native operation. `lower_mxfp4`
+/// Module traversal supplies destination geometry and storage preferences. Task
+/// identities (including admitted aliases), physical provenance, recipes, companions,
+/// and coverage are validated before backend payload or native work. `lower_mxfp4`
 /// is the sole backend hook and may only replace an admitted derived F4 recipe for
 /// an MXFP4 executable. When `local_layout` is present, its exact placements are
 /// applied before destination-shape validation. Selected transform outputs are
@@ -514,13 +514,13 @@ where
 {
     let parameters = collect_module_parameters::<P, M>(module)?
         .into_iter()
-        .map(|(name, (parameter, _))| {
+        .map(|(name, (parameter, storage_layout))| {
             let description = describe(parameter).ok_or_else(|| {
                 ModuleBindingPlanError::InvalidParameterRepresentation {
                     parameter: name.to_string(),
                 }
             })?;
-            Ok((name, description))
+            Ok((name, (description, storage_layout)))
         })
         .collect::<Result<BTreeMap<_, _>, ModuleBindingPlanError>>()?;
 
@@ -682,19 +682,32 @@ where
 
     BindingPlan::with_explicit_exceptions(declarations, shared_source_keys, conversions)?
         .build_bindings(source)
-        .map(|bindings| apply_parameter_storage_layouts(module, bindings))
+        .map(|bindings| {
+            bindings
+                .into_iter()
+                .map(|binding| {
+                    let (_, layout) = parameters
+                        .get(binding.name())
+                        .expect("validated exact destination retains its storage preference");
+                    binding.with_storage_layout(*layout)
+                })
+                .collect()
+        })
         .map_err(Into::into)
 }
 
 fn push_exact_declaration(
-    parameters: &BTreeMap<ParameterId, ParameterBindingTarget>,
+    parameters: &BTreeMap<
+        ParameterId,
+        (ParameterBindingTarget, eredu_nn::ParameterStorageLayout),
+    >,
     declarations: &mut Vec<PlannedBinding>,
     conversions: &mut BTreeMap<String, Vec<RecipeDtype>>,
     target: String,
     recipe: DerivedWeightRecipe,
     explicitly_permitted_source_dtypes: &[RecipeDtype],
 ) -> Result<(), ModuleBindingPlanError> {
-    let description = parameters
+    let (description, _) = parameters
         .get(target.as_str())
         .expect("validated module destination remains present");
     let mut permitted = description.permitted_source_dtypes.clone();
