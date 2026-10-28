@@ -875,8 +875,11 @@ Selected provider acquisition resolves explicit logical invocation references ag
 one retained physical layout. Each selected storage owner has a consumer; repeated
 references retain distinct invocation identities. The validated map projects group
 transfer sequences, distinct resource windows and group completion from invocation
-positions. Bounded native acquisition and completion consume those projections through
-the ordinary policy lifecycle; resident execution loans the selected physical module.
+positions. Group transfer order is a borrowed iterator; cold window sizing uses
+independent cursors over it, and native transfer scheduling retains the sequence
+when opening its window. Bounded native acquisition and completion consume those
+projections through the ordinary policy lifecycle; resident execution loans the
+selected physical module.
 Leased parameter owners declare their canonical group/unit identity and explicit
 logical consumers. Parameter descriptions validate consumer membership, reject
 inconsistent declarations for one owner and conflicting leased owners for an invocation,

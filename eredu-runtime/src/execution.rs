@@ -401,13 +401,15 @@ impl ExecutionUnitAddressMap {
         self.data.groups.get(group).cloned()
     }
 
-    /// Physical storage ordinals in this group's declared invocation order.
-    pub fn group_storage_ordinals(&self, group: usize) -> Option<Vec<usize>> {
+    /// Borrows physical storage ordinals in this group's declared invocation order.
+    pub fn group_storage_ordinals(
+        &self,
+        group: usize,
+    ) -> Option<impl ExactSizeIterator<Item = usize> + Clone + '_> {
         Some(
             self.data.addresses[self.group_range(group)?]
                 .iter()
-                .map(|(_, storage)| storage.ordinal())
-                .collect(),
+                .map(|(_, storage)| storage.ordinal()),
         )
     }
 

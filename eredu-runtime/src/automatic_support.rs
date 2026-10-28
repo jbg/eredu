@@ -108,10 +108,13 @@ pub(crate) fn execution_unit_window_bytes(
         let sequence = invocations
             .group_storage_ordinals(group)
             .expect("validated invocation group");
+        let mut expired = sequence.clone();
         let mut total = 0u64;
-        for (position, &storage) in sequence.iter().enumerate() {
+        for (position, storage) in sequence.enumerate() {
             if position >= depth {
-                let old = sequence[position - depth];
+                let old = expired
+                    .next()
+                    .expect("preceding invocation in the same group");
                 counts[old] -= 1;
                 if counts[old] == 0 {
                     total -= unit_bytes[old];
