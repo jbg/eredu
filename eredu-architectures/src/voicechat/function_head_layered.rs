@@ -16,7 +16,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParallelLayeredInvocation, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    ParameterMemberSpec, ParameterRole, StatelessComponentState, SubmissionBackend,
     TensorPlacement,
 };
 use std::marker::PhantomData;
@@ -195,11 +195,6 @@ where
         self.head
             .project_parallel(normalized, self.parallel, context)
     }
-}
-
-/// Neutral traversal metadata for a parameter-only function projection.
-pub fn function_head_state_layout() -> Result<StateLayout, ChannelError> {
-    Ok(StatelessComponentState::state_layout()?)
 }
 
 // The callback retains the additive vocabulary mechanism without requiring ordinary
@@ -403,7 +398,7 @@ pub fn function_head_component_definition(
         transport,
         FUNCTION,
         vec![],
-        function_head_state_layout()?,
+        StatelessComponentState::state_layout()?,
         ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
     )?)
 }
@@ -460,7 +455,9 @@ impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, ChannelError> {
-        if state.global_layer_offset() != 0 || *state.layout() != function_head_state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(ChannelError::Configuration(
                 "function-head stateless layout mismatch",
             ));
@@ -521,7 +518,7 @@ impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for Functi
         state: &mut StatelessComponentState,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ()>, ChannelError> {
-        if *state.layout() != function_head_state_layout()? {
+        if *state.layout() != StatelessComponentState::state_layout()? {
             return Err(ChannelError::Configuration(
                 "function-head runtime layout mismatch",
             ));
@@ -577,7 +574,7 @@ impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::Stat
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ()>, ChannelError> {
         self.validate_parallel_projection(hidden, parallel)?;
-        if *state.layout() != function_head_state_layout()? {
+        if *state.layout() != StatelessComponentState::state_layout()? {
             return Err(ChannelError::Configuration(
                 "function-head runtime layout mismatch",
             ));

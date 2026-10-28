@@ -15,7 +15,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    ParameterRole, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -430,10 +430,6 @@ pub trait RvqExecution<B: NeuralBackend> {
     }
 }
 
-fn rvq_state_layout() -> Result<StateLayout, TtsError> {
-    Ok(StatelessComponentState::state_layout()?)
-}
-
 /// Exact operation over the same independently leased parameter owners.
 pub enum RvqInput<'a, T> {
     /// Ordered depth sum without hidden projection.
@@ -509,7 +505,7 @@ impl<B: NeuralBackend> RvqKernel<B> {
         input: RvqInput<'a, B::Tensor>,
         state: &StatelessComponentState,
     ) -> Result<LayeredForwardState<B::Tensor, RvqForward<B::Tensor>>, TtsError> {
-        if *state.layout() != rvq_state_layout()? {
+        if *state.layout() != StatelessComponentState::state_layout()? {
             return Err(TtsError::Configuration("RVQ runtime layout mismatch"));
         }
         let (hidden, forward) = match input {
@@ -623,7 +619,7 @@ pub fn rvq_component_definition(d: RvqDimensions) -> Result<ComponentDefinition,
         vec![transport.clone(), transport],
         BANK,
         vec![],
-        rvq_state_layout()?,
+        StatelessComponentState::state_layout()?,
         ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
     )?)
 }
@@ -686,7 +682,9 @@ impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, TtsError> {
-        if state.global_layer_offset() != 0 || *state.layout() != rvq_state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(TtsError::Configuration(
                 "RVQ stateless layout differs from selected identity",
             ));

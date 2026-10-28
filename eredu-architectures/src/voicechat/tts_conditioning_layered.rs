@@ -19,7 +19,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
     LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
     ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ResidentRuntime,
-    StateLayout, StatelessComponentState, SubmissionBackend,
+    StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -259,10 +259,6 @@ pub enum ConditioningUnit<B: NeuralBackend> {
     Fusion(GatedFusion<B>),
 }
 
-fn conditioning_state_layout() -> Result<StateLayout, TtsError> {
-    Ok(StatelessComponentState::state_layout()?)
-}
-
 /// One conditioning phase, with immutable inputs retained until completion.
 pub enum ConditioningInput<T> {
     /// Packed character lookup.
@@ -378,7 +374,7 @@ impl<B: NeuralBackend> ConditioningKernel<B> {
         state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ConditioningForward<B::Tensor>>, TtsError> {
-        if *state.layout() != conditioning_state_layout()? {
+        if *state.layout() != StatelessComponentState::state_layout()? {
             return Err(TtsError::Configuration(
                 "conditioning runtime layout mismatch",
             ));
@@ -468,7 +464,7 @@ pub fn tts_conditioning_component_definition(
         transport,
         CHARACTER,
         vec![],
-        conditioning_state_layout()?,
+        StatelessComponentState::state_layout()?,
         ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
     )?)
 }
@@ -650,7 +646,9 @@ impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, TtsError> {
-        if state.global_layer_offset() != 0 || *state.layout() != conditioning_state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(TtsError::Configuration(
                 "conditioning stateless layout differs from selected identity",
             ));

@@ -14,7 +14,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    ParameterRole, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
@@ -105,10 +105,6 @@ pub trait MogExecution<B: NeuralBackend> {
         noise_scale: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogSample<B::Tensor>, TtsError>;
-}
-
-fn mog_state_layout() -> Result<StateLayout, TtsError> {
-    Ok(StatelessComponentState::state_layout()?)
 }
 
 /// One of the two explicit MoG invocation modes.
@@ -209,7 +205,7 @@ impl<B: NeuralBackend> MogKernel<B> {
         input: MogInput<'_, B::Tensor>,
         state: &StatelessComponentState,
     ) -> Result<LayeredForwardState<B::Tensor, MogForward<B::Tensor>>, TtsError> {
-        if *state.layout() != mog_state_layout()? {
+        if *state.layout() != StatelessComponentState::state_layout()? {
             return Err(TtsError::Configuration("MoG runtime layout mismatch"));
         }
         let mut forward = MogForward {
@@ -312,7 +308,7 @@ pub fn tts_mog_component_definition(
         transport,
         BLOCKS,
         vec![],
-        mog_state_layout()?,
+        StatelessComponentState::state_layout()?,
         ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
     )?)
 }
@@ -464,7 +460,9 @@ impl<B: NeuralBackend> ComponentKernel<B> for MogKernel<B> {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, TtsError> {
-        if state.global_layer_offset() != 0 || *state.layout() != mog_state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(TtsError::Configuration(
                 "MoG stateless layout differs from selected identity",
             ));

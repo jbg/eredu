@@ -16,7 +16,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, StateLayout, StatelessComponentState, SubmissionBackend,
+    ParameterRole, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -106,9 +106,6 @@ pub trait QuantizerExecution<B: NeuralBackend> {
             context,
         )
     }
-}
-fn quantizer_state_layout() -> Result<StateLayout, Error> {
-    Ok(StatelessComponentState::state_layout()?)
 }
 /// Invocation-local operation and selected contiguous codebook range.
 pub enum QuantizerInput<'a, T> {
@@ -221,7 +218,7 @@ impl<B: NeuralBackend> QuantizerKernel<B> {
         state: &StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, QuantizerForward<B::Tensor>>, Error> {
-        if *state.layout() != quantizer_state_layout()? {
+        if *state.layout() != StatelessComponentState::state_layout()? {
             return Err(invalid("residual quantizer runtime layout mismatch"));
         }
         let (input, range, metric) = match input {
@@ -401,7 +398,7 @@ pub fn quantizer_component_definition(
         vec![transport; geometry.depth],
         "prvq.codebook.0",
         vec![],
-        quantizer_state_layout()?,
+        StatelessComponentState::state_layout()?,
         ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
     )?)
 }
@@ -481,7 +478,9 @@ impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        if state.global_layer_offset() != 0 || *state.layout() != quantizer_state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(invalid("residual quantizer stateless layout mismatch"));
         }
         Ok(eredu_runtime::ModelStateIdentity::new(

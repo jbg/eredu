@@ -983,8 +983,9 @@ The adapter does not infer missing capabilities from equation defaults.
 VoiceChat RVQ, MoG, character conditioning, the function head, RNNT, perception,
 the TTS transformer, codec PRVQ and the EAR encoder/decoder
 use this adapter with their typed kernels and runtime-owned empty pinned modules.
-Components without mutable state use shared stateless traversal metadata. RVQ retains bank-only sum and refinement operations and the
-bank-to-projection embedding operation. PRVQ retains selected depth ranges and
+Components without mutable state use `StatelessComponentState::state_layout()` for
+shared traversal metadata and empty-state validation. RVQ retains bank-only sum,
+refinement advancement and bank-to-projection embedding operations. PRVQ retains selected depth ranges and
 ordered residual subtraction. Their collective-bearing equations retain explicit
 rank agreement and transient input/candidate roots through ordinary completion.
 RNNT's complete and projection-only selections use one kernel with a static

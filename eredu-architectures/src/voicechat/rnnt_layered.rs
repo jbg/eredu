@@ -21,7 +21,7 @@ use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
     LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
     MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, StatelessComponentState,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StatelessComponentState,
     SubmissionBackend, TensorPlacement,
 };
 use std::marker::PhantomData;
@@ -130,7 +130,7 @@ pub(super) fn rnnt_definition_for_selection(
         vec![transport; phases.len()],
         primary.id(),
         vec![],
-        state_layout()?,
+        StatelessComponentState::state_layout()?,
         ArchitectureStatePartitionPlan::new([]),
     )?)
 }
@@ -158,9 +158,6 @@ pub struct RnntUnit<B: NeuralBackend> {
     #[parameter(skip)]
     placement: Option<RnntLocalDimensions>,
     module: UnitModule<B>,
-}
-fn state_layout() -> Result<StateLayout, RnntError> {
-    Ok(StatelessComponentState::state_layout()?)
 }
 
 /// One neural phase selected before acquiring any parameter.
@@ -414,7 +411,7 @@ impl<B: NeuralBackend, const PREDICTOR: bool> RnntKernel<B, PREDICTOR> {
         state: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, RnntForward<B::Tensor>>, RnntError> {
-        if *state.layout() != state_layout()? {
+        if *state.layout() != StatelessComponentState::state_layout()? {
             return Err(RnntError::InvalidState("RNNT traversal layout mismatch"));
         }
         let (group, input, previous) = match input {
@@ -699,7 +696,9 @@ impl<B: NeuralBackend, const PREDICTOR: bool> ComponentKernel<B> for RnntKernel<
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, RnntError> {
-        if state.global_layer_offset() != 0 || *state.layout() != state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(RnntError::InvalidState(
                 "RNNT traversal state identity mismatch",
             ));
