@@ -159,26 +159,8 @@ impl ParameterGroupOwner {
                 }
             }
         }
-        let consumers = match self {
-            ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
-                .iter()
-                .map(|(group, unit)| (group, unit))
-                .collect::<Vec<_>>(),
-            ParameterGroupOwner::ExecutionUnit {
-                group,
-                global_unit,
-                consumers,
-            } => std::iter::once((group, global_unit))
-                .chain(consumers.iter().map(|unit| (group, unit)))
-                .collect(),
-            _ => Vec::new(),
-        };
-        for (group, global_unit) in consumers {
-            let Some(group_index) = graph
-                .groups()
-                .iter()
-                .position(|candidate| candidate.id() == group.as_str())
-            else {
+        let validate_unit = |group: &ExecutionGroupId, global_unit| {
+            let Some(group_index) = graph.group_index(group.as_str()) else {
                 return Err(ArchitectureParameterError::UnknownExecutionGroup(
                     group.as_str().to_owned(),
                 ));
@@ -187,15 +169,31 @@ impl ParameterGroupOwner {
                 .group_range(group_index)
                 .expect("validated canonical layout contains every group")
                 .len();
-            if layout.ordinal(group_index, *global_unit).is_none() {
+            if layout.ordinal(group_index, global_unit).is_none() {
                 return Err(ArchitectureParameterError::UnitOutOfRange {
                     group: group.as_str().to_owned(),
-                    global_unit: *global_unit,
+                    global_unit,
                     available,
                 });
             }
+            Ok(())
+        };
+        match self {
+            Self::StaticUnitConsumers { consumers, .. } => consumers
+                .iter()
+                .try_for_each(|(group, unit)| validate_unit(group, *unit)),
+            Self::ExecutionUnit {
+                group,
+                global_unit,
+                consumers,
+            } => {
+                validate_unit(group, *global_unit)?;
+                consumers
+                    .iter()
+                    .try_for_each(|unit| validate_unit(group, *unit))
+            }
+            Self::StaticRole(_) | Self::StaticAnyOf(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn is_local<G, A>(&self, partition: &ArchitecturePartition<G, A>) -> bool {
