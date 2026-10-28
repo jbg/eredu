@@ -127,18 +127,15 @@ impl PreparedExecutionUnitResources {
                 }
             }
         }
-        fn retain<T>(values: Vec<T>, retained: &[bool]) -> Vec<T> {
-            values
-                .into_iter()
-                .zip(retained)
-                .filter_map(|(value, &retain)| retain.then_some(value))
-                .collect()
+        fn retain<T>(values: &mut Vec<T>, retained: &[bool]) {
+            let mut retained = retained.iter();
+            values.retain(|_| *retained.next().expect("validated resource count"));
         }
-        self.definitions = retain(self.definitions, &retained);
-        self.specs = retain(self.specs, &retained);
-        self.unit_ids = retain(self.unit_ids, &retained);
-        self.unit_bytes = retain(self.unit_bytes, &retained);
-        self.host_bytes = retain(self.host_bytes, &retained);
+        retain(&mut self.definitions, &retained);
+        retain(&mut self.specs, &retained);
+        retain(&mut self.unit_ids, &retained);
+        retain(&mut self.unit_bytes, &retained);
+        retain(&mut self.host_bytes, &retained);
         self.source_keys = self
             .definitions
             .iter()
