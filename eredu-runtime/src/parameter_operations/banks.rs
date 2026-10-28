@@ -64,7 +64,7 @@ pub fn prepare_bank_parameter_members<'a, C: eredu_checkpoint::recipe::RecipeCat
                     key,
                     binding: binding.name().to_owned(),
                 })?;
-            let materialized = binding.source_recipe().infer(source).map_err(|source| {
+            let materialized = binding.recipe_view().infer(source).map_err(|source| {
                 BankParameterPreparationError::Recipe {
                     key,
                     binding: binding.name().to_owned(),

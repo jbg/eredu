@@ -269,7 +269,7 @@ pub fn local_parameter_acquisition_units(
         placed
             .pop()
             .expect("one binding placement preserves cardinality")
-            .source_recipe()
+            .recipe_view()
             .infer(source)
             .map_err(ParameterAcquisitionError::from)
     }

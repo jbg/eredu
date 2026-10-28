@@ -303,7 +303,7 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             for member in group.members() {
                 let binding = resolved[member.target()];
                 if binding
-                    .source_recipe()
+                    .recipe_view()
                     .infer(source.as_ref())
                     .map_err(ComponentPreparationError::from)?
                     .shape
@@ -591,11 +591,11 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                     continue;
                 }
                 let metadata = selected
-                    .source_recipe()
+                    .recipe_view()
                     .infer(self.source.as_ref())
                     .map_err(ComponentPreparationError::from)?;
                 let previous = original
-                    .source_recipe()
+                    .recipe_view()
                     .infer(self.source.as_ref())
                     .map_err(ComponentPreparationError::from)?;
                 if metadata.shape != previous.shape

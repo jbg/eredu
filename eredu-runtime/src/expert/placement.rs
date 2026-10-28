@@ -173,7 +173,7 @@ pub fn validate_addressable_bank_selection<'a, C: RecipeCatalog + ?Sized>(
         for binding in bindings {
             let bytes =
                 if let Some(transform) = transformations.get(&(key, binding.name().to_owned())) {
-                    let metadata = binding.source_recipe().infer(source).map_err(|source| {
+                    let metadata = binding.recipe_view().infer(source).map_err(|source| {
                         AddressableBankSelectionError::Recipe {
                             key,
                             binding: binding.name().to_owned(),
