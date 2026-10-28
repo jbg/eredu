@@ -155,14 +155,18 @@ pub fn validate_addressable_bank_selection<'a, C: RecipeCatalog + ?Sized>(
         .clone()
         .map(|(key, _)| key)
         .collect::<std::collections::BTreeSet<_>>();
-    let placement_keys = placements
-        .keys()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    if selected_keys != placement_keys {
+    if !selected_keys.iter().eq(placements.keys()) {
         return Err(AddressableBankSelectionError::PlacementCoverage {
-            missing: selected_keys.difference(&placement_keys).copied().collect(),
-            unexpected: placement_keys.difference(&selected_keys).copied().collect(),
+            missing: selected_keys
+                .iter()
+                .filter(|key| !placements.contains_key(*key))
+                .copied()
+                .collect(),
+            unexpected: placements
+                .keys()
+                .filter(|key| !selected_keys.contains(*key))
+                .copied()
+                .collect(),
         });
     }
     for (key, bindings) in entries {
