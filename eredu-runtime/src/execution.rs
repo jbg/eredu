@@ -315,7 +315,8 @@ impl ExecutionUnitAddressMap {
         &self,
         selected: impl IntoIterator<Item = ExecutionUnitAddress>,
     ) -> Result<Self, ExecutionUnitAddressMapError> {
-        let mut references = Vec::new();
+        // Global invocation and storage identities stay in the retained map.
+        let mut ordinals = Vec::new();
         let mut resources = BTreeSet::new();
         let mut previous = None;
         for logical in selected {
@@ -327,7 +328,7 @@ impl ExecutionUnitAddressMap {
                 return Err(ExecutionUnitAddressMapError::NonCanonicalSelection);
             }
             previous = Some(ordinal);
-            references.push((logical, storage.address()));
+            ordinals.push(ordinal);
             resources.insert(storage.ordinal());
         }
         let storage = self
@@ -340,7 +341,13 @@ impl ExecutionUnitAddressMap {
                     .expect("retained physical resource")
             }))
             .expect("physical owners form a canonical retained subset");
-        Self::new(&storage, references)
+        Self::new(
+            &storage,
+            ordinals.into_iter().map(|ordinal| {
+                let (logical, storage) = self.data.addresses[ordinal];
+                (logical, storage.address())
+            }),
+        )
     }
 
     /// Exact logical consumers in declared traversal order, independently of storage.
