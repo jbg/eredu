@@ -504,12 +504,12 @@ where
     E: std::fmt::Display,
 {
     struct Collector<'a, P> {
-        parameters: BTreeMap<String, (&'a P, ParameterBindingTarget)>,
-        duplicate: Option<String>,
+        parameters: BTreeMap<ParameterId, (&'a P, ParameterBindingTarget)>,
+        duplicate: Option<ParameterId>,
     }
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
         fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
-            let name = metadata.id.as_str().to_owned();
+            let name = metadata.id;
             // The description is filled after traversal because the visitor cannot
             // retain a borrowed callback without complicating this neutral API.
             if self
@@ -538,12 +538,14 @@ where
     };
     module.visit_parameters(&mut collector);
     if let Some(parameter) = collector.duplicate {
-        return Err(ModuleBindingPlanError::DuplicateParameter { parameter });
+        return Err(ModuleBindingPlanError::DuplicateParameter {
+            parameter: parameter.to_string(),
+        });
     }
     for (name, (parameter, description)) in &mut collector.parameters {
         *description = describe(parameter).ok_or_else(|| {
             ModuleBindingPlanError::InvalidParameterRepresentation {
-                parameter: name.clone(),
+                parameter: name.to_string(),
             }
         })?;
     }
@@ -597,7 +599,7 @@ where
             if is_local_transform {
                 locally_materialized.insert(target.clone());
             }
-            if !collector.parameters.contains_key(&target) {
+            if !collector.parameters.contains_key(target.as_str()) {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!(
                         "task {:?} companion {:?} has no module destination",
@@ -668,8 +670,10 @@ where
     let missing = collector
         .parameters
         .keys()
-        .filter(|name| !covered.contains(*name) && !addressable_parameters.contains(*name))
-        .cloned()
+        .filter(|name| {
+            !covered.contains(name.as_str()) && !addressable_parameters.contains(name.as_str())
+        })
+        .map(|name| name.to_string())
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(ModuleBindingPlanError::ExactTask {
@@ -716,7 +720,7 @@ where
 }
 
 fn push_exact_declaration<P>(
-    parameters: &BTreeMap<String, (&P, ParameterBindingTarget)>,
+    parameters: &BTreeMap<ParameterId, (&P, ParameterBindingTarget)>,
     declarations: &mut Vec<PlannedBinding>,
     conversions: &mut BTreeMap<String, Vec<RecipeDtype>>,
     target: String,
@@ -724,7 +728,7 @@ fn push_exact_declaration<P>(
     explicitly_permitted_source_dtypes: &[RecipeDtype],
 ) -> Result<(), ModuleBindingPlanError> {
     let description = &parameters
-        .get(&target)
+        .get(target.as_str())
         .expect("validated module destination remains present")
         .1;
     let mut permitted = description.permitted_source_dtypes.clone();
