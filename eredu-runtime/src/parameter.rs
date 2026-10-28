@@ -550,10 +550,10 @@ where
         })?;
     }
 
-    let mut covered = std::collections::BTreeSet::new();
+    // Each admitted destination records whether its recipe is already rank-local.
+    let mut covered = BTreeMap::new();
     let mut declarations = Vec::new();
     let mut conversions = BTreeMap::new();
-    let mut locally_materialized = std::collections::BTreeSet::new();
     let shared_source_keys = tasks
         .iter()
         .flat_map(|task| task.shared_source_keys().iter().cloned())
@@ -574,16 +574,13 @@ where
             });
         }
         let target = (*candidates.first().expect("one candidate was validated")).to_owned();
-        if !covered.insert(target.clone()) {
+        let is_local_transform = task.lowering().transforms_payload();
+        if covered.insert(target.clone(), is_local_transform).is_some() {
             return Err(ModuleBindingPlanError::ExactTask {
                 details: format!("module destination {target:?} is claimed more than once"),
             });
         }
         validate_exact_task_provenance(task, source)?;
-        let is_local_transform = task.lowering().transforms_payload();
-        if is_local_transform {
-            locally_materialized.insert(target.clone());
-        }
         let recipe = exact_task_recipe(task, source, &mut lower_mxfp4)?;
         push_exact_declaration(
             &collector.parameters,
@@ -596,9 +593,6 @@ where
 
         for companion in task.output_companions() {
             let target = companion.name().to_owned();
-            if is_local_transform {
-                locally_materialized.insert(target.clone());
-            }
             if !collector.parameters.contains_key(target.as_str()) {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!(
@@ -608,7 +602,7 @@ where
                     ),
                 });
             }
-            if !covered.insert(target.clone()) {
+            if covered.insert(target.clone(), is_local_transform).is_some() {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!("companion destination {target:?} is claimed more than once"),
                 });
@@ -671,7 +665,7 @@ where
         .parameters
         .keys()
         .filter(|name| {
-            !covered.contains(name.as_str()) && !addressable_parameters.contains(name.as_str())
+            !covered.contains_key(name.as_str()) && !addressable_parameters.contains(name.as_str())
         })
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
@@ -687,7 +681,7 @@ where
     if let Some(layout) = local_layout {
         let bindings = declarations
             .iter()
-            .filter(|declaration| !locally_materialized.contains(&declaration.target_name))
+            .filter(|declaration| !covered[&declaration.target_name])
             .map(|declaration| {
                 Ok(WeightBinding::from_recipe(
                     &declaration.target_name,
@@ -706,7 +700,7 @@ where
         // binding; logical identities remain the declarations' exact targets.
         for (declaration, binding) in declarations
             .iter_mut()
-            .filter(|declaration| !locally_materialized.contains(&declaration.target_name))
+            .filter(|declaration| !covered[&declaration.target_name])
             .zip(placed)
         {
             declaration.recipe = binding.source_recipe();
