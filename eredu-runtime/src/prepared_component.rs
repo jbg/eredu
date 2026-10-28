@@ -282,39 +282,44 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         }
         let (source, resources) = prepare_resource_bindings(source, &id, resources)
             .map_err(ComponentPreparationError::from)?;
+        // Targets are globally unique; aliases resolve within each physical resource.
+        let mut resolved = BTreeMap::new();
+        for bindings in resources.values() {
+            let plan = WeightBindingPlan::new(bindings)
+                .map_err(RecipeBindingError::from)
+                .map_err(ComponentPreparationError::from)?;
+            resolved.extend(
+                bindings
+                    .iter()
+                    .filter(|binding| !binding.is_alias())
+                    .map(|binding| (binding.name(), binding)),
+            );
+            resolved.extend(
+                plan.alias_indices()
+                    .map(|(alias, owner)| (bindings[alias].name(), &bindings[owner])),
+            );
+        }
+        for group in description.groups() {
+            for member in group.members() {
+                let binding = resolved[member.target()];
+                if binding
+                    .source_recipe()
+                    .infer(source.as_ref())
+                    .map_err(ComponentPreparationError::from)?
+                    .shape
+                    != member.global_shape()
+                {
+                    return Err(ComponentPreparationError::Geometry {
+                        component: id,
+                        target: member.target().into(),
+                    }
+                    .into());
+                }
+            }
+        }
         let mut units = vec![Vec::new(); description.invocations().storage_layout().len()];
         let mut pinned = BTreeMap::new();
         for (owner, bindings) in resources {
-            let plan = WeightBindingPlan::new(&bindings)
-                .map_err(RecipeBindingError::from)
-                .map_err(ComponentPreparationError::from)?;
-            let resolved = plan
-                .owners()
-                .map(|binding| (binding.name(), binding))
-                .chain(plan.aliases().map(|(alias, owner)| (alias.name(), owner)))
-                .collect::<BTreeMap<_, _>>();
-            for group in description
-                .groups()
-                .iter()
-                .filter(|group| ParameterStorageId::from_owner(group.owner()) == owner)
-            {
-                for member in group.members() {
-                    let binding = resolved[member.target()];
-                    if binding
-                        .source_recipe()
-                        .infer(source.as_ref())
-                        .map_err(ComponentPreparationError::from)?
-                        .shape
-                        != member.global_shape()
-                    {
-                        return Err(ComponentPreparationError::Geometry {
-                            component: id,
-                            target: member.target().into(),
-                        }
-                        .into());
-                    }
-                }
-            }
             let bindings = bindings
                 .into_iter()
                 .map(|binding| {
