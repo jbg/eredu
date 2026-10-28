@@ -542,21 +542,9 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
                 Err(ComponentPreparationError::SelectionMismatch(self.id))
             };
         }
-        self.units = self
-            .units
-            .into_iter()
-            .map(|bindings| place_resources(bindings, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.pinned = self
-            .pinned
-            .into_iter()
-            .map(|(owner, bindings)| {
-                Ok((
-                    owner,
-                    place_resources(bindings, self.source.as_ref(), layout)?,
-                ))
-            })
-            .collect::<Result<_, ComponentPreparationError>>()?;
+        for bindings in self.units.iter_mut().chain(self.pinned.values_mut()) {
+            *bindings = place_resources(std::mem::take(bindings), self.source.as_ref(), layout)?;
+        }
         self.local_layout = Some(layout.clone());
         Ok(self)
     }
