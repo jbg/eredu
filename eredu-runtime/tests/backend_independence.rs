@@ -1754,11 +1754,15 @@ fn independent_backend_consumes_canonical_binding_and_placement_plans() {
     let header = Header(eredu_checkpoint::store::WeightStore::metadata(&store, "weight").unwrap());
     let recipe = DerivedWeightRecipe::source("weight", TensorSelection::Full);
     let peak =
-        eredu_runtime::placed_recipe_peak_bytes(&recipe, "weight", &header, Some(&layout), false)
+        eredu_runtime::placed_source_recipe(&recipe, "weight", &header, Some(&layout), false)
+            .unwrap()
+            .peak_materialization_bytes(&header)
             .unwrap();
     assert_eq!(
         peak,
-        eredu_runtime::placed_recipe_peak_bytes(&recipe, "weight", &store, Some(&layout), false)
+        eredu_runtime::placed_source_recipe(&recipe, "weight", &store, Some(&layout), false)
+            .unwrap()
+            .peak_materialization_bytes(&store)
             .unwrap()
     );
     let placed = place_weight_bindings(bindings, &header, &layout).unwrap();

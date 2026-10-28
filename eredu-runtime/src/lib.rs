@@ -200,8 +200,8 @@ pub mod state;
 mod weight_residency;
 
 pub use automatic_support::{
-    execution_unit_parameter_window_bytes, placed_recipe_peak_bytes, placed_source_recipe,
-    residency_telemetry, selected_parameter_resources, selected_parameter_resources_for_layout,
+    execution_unit_parameter_window_bytes, placed_source_recipe, residency_telemetry,
+    selected_parameter_resources, selected_parameter_resources_for_layout,
     selected_text_bounded_requirement, BoundedResidencySizingError, SelectedParameterResources,
 };
 pub use backend::{

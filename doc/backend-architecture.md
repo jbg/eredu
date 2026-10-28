@@ -7342,7 +7342,8 @@ own physical geometry, including scale companions and replicated global routers;
 PP ownership selects static consumers and repeated units before aggregation.
 KV accounting uses only locally owned layers and complete KV heads. Source-recipe
 workspace uses the existing bounded binding-placement rewrite for both ordinary
-parameters and individual bank members. Compact-bank bounds preserve each bank's
+parameters and individual bank members. Ordinary native and recipe workspace
+estimates consume the same placed recipe. Compact-bank bounds preserve each bank's
 independent identity and the selected finite assembly budget. Native recipe estimates include source copies, intermediate tensors, indices
 and contiguous outputs. Separate conversion estimates count encoded outputs;
 queue concurrency and per-bank compact bounds are explicit. These are conservative

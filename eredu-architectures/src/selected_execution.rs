@@ -812,16 +812,11 @@ impl SelectedExecution {
                     .ok_or("conversion output size overflow")?;
                 conversion_source_peak = conversion_source_peak.max(native_peak);
             }
-            result.ordinary_recipe_peak_bytes =
-                result
-                    .ordinary_recipe_peak_bytes
-                    .max(eredu_runtime::placed_recipe_peak_bytes(
-                        &task.source_recipe().map_err(|e| e.to_string())?,
-                        &target(task)?,
-                        source,
-                        layout,
-                        false,
-                    )?);
+            result.ordinary_recipe_peak_bytes = result.ordinary_recipe_peak_bytes.max(
+                recipe
+                    .peak_materialization_bytes(source)
+                    .map_err(|error| error.to_string())?,
+            );
             for companion in task.output_companions() {
                 if let Some(task) = companion.materialization_task() {
                     let recipe = eredu_runtime::placed_source_recipe(
@@ -836,13 +831,9 @@ impl SelectedExecution {
                         mechanisms.recipe_materialization_workspace(&recipe, source)?,
                     )?;
                     result.ordinary_recipe_peak_bytes = result.ordinary_recipe_peak_bytes.max(
-                        eredu_runtime::placed_recipe_peak_bytes(
-                            &task.source_recipe().map_err(|e| e.to_string())?,
-                            &target(task)?,
-                            source,
-                            layout,
-                            false,
-                        )?,
+                        recipe
+                            .peak_materialization_bytes(source)
+                            .map_err(|error| error.to_string())?,
                     );
                 }
             }
