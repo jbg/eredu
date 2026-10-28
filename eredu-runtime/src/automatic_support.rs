@@ -147,13 +147,7 @@ pub fn selected_text_bounded_requirement(
         &BTreeSet::new(),
         excluded,
     )?;
-    let mut requirement = bounded_requirement(
-        ordinary
-            .into_iter()
-            .map(|(name, owner, bytes)| (name, owner, move || Ok(bytes))),
-        selected.residency(),
-        excluded,
-    )?;
+    let mut requirement = bounded_requirement(ordinary, selected.residency(), excluded)?;
     let auxiliary = auxiliary.device_bytes(selected.residency()).ok_or(
         BoundedResidencySizingError::ArithmeticOverflow("auxiliary phase bytes"),
     )?;
@@ -543,14 +537,11 @@ fn parameter_resources<'a>(
     Ok(result)
 }
 
-fn bounded_requirement<'a, F>(
-    parameters: impl IntoIterator<Item = (&'a str, &'a ReplicatedTextParameterOwner, F)>,
+fn bounded_requirement<'a>(
+    parameters: impl IntoIterator<Item = ParameterBytes<'a>>,
     residency: LayerWeightResidency,
     excluded: &BTreeSet<String>,
-) -> Result<BoundedResidencyRequirement, BoundedResidencySizingError>
-where
-    F: FnOnce() -> Result<u64, ReplicatedTextContractError>,
-{
+) -> Result<BoundedResidencyRequirement, BoundedResidencySizingError> {
     use BoundedResidencySizingError::ArithmeticOverflow;
 
     let mut static_bytes = 0u64;
@@ -559,7 +550,6 @@ where
         if excluded.contains(name) {
             continue;
         }
-        let bytes = bytes()?;
         match owner {
             ReplicatedTextParameterOwner::StaticRole(_)
             | ReplicatedTextParameterOwner::StaticUnitConsumers { .. } => {
@@ -783,7 +773,7 @@ mod tests {
         bounded_requirement(
             parameters
                 .iter()
-                .map(|(name, owner, bytes)| (*name, owner, || Ok(*bytes))),
+                .map(|(name, owner, bytes)| (*name, owner, *bytes)),
             residency,
             excluded,
         )
@@ -827,20 +817,6 @@ mod tests {
             crate::DenseDiskStreamLoadOptions::new(1024, 2048, 5, 2).unwrap(),
         );
         assert_eq!(size(&parameters, streamed, &excluded).unwrap().depth, 2);
-    }
-
-    #[test]
-    fn excluded_parameters_do_not_evaluate_byte_geometry() {
-        let owner = unit("decoder", usize::MAX);
-        let requirement = bounded_requirement(
-            [("bank", &owner, || {
-                panic!("excluded byte geometry must not be queried")
-            })],
-            host(3),
-            &BTreeSet::from(["bank".into()]),
-        )
-        .unwrap();
-        assert_eq!(requirement.required_bytes, 0);
     }
 
     #[test]
