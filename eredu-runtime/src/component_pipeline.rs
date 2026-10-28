@@ -331,23 +331,19 @@ pub fn validate_component_pipeline_ranges(
             "pipeline cuts must exactly cover the selected group routes",
         ));
     }
-    let mut incoming = vec![None; manifest.world_size()];
-    let mut outgoing = vec![None; manifest.world_size()];
+    // Admitted cuts are strictly interior, so untouched endpoints also mark
+    // ranks whose ingress or egress has not yet been assigned.
+    let mut ranges = vec![0..count; manifest.world_size()];
     for route in manifest.routes() {
         let cut = selected[&route.id()];
-        if incoming[route.destination()].replace(cut).is_some()
-            || outgoing[route.source()].replace(cut).is_some()
-        {
+        if ranges[route.destination()].start != 0 || ranges[route.source()].end != count {
             return Err(Contract(
                 "linear stage requires one ingress and one egress at most",
             ));
         }
+        ranges[route.destination()].start = cut;
+        ranges[route.source()].end = cut;
     }
-    let ranges = incoming
-        .iter()
-        .zip(&outgoing)
-        .map(|(start, end)| start.unwrap_or(0)..end.unwrap_or(count))
-        .collect::<Vec<_>>();
     if ranges.iter().any(|range| range.is_empty()) || ranges[manifest.rank()] != local_range {
         return Err(Contract(
             "route cuts disagree with contiguous stage ownership",
