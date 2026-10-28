@@ -422,27 +422,20 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             .invocations
             .resolve(ordinal, address)?
             .storage_location();
-        self.restrict_bindings(self.units[storage.ordinal()].iter())
+        restrict_bindings(
+            Arc::clone(&self.source),
+            &self.id,
+            self.units[storage.ordinal()].iter(),
+        )
     }
 
     /// Exact authority for the retained pinned aggregate, excluding leased units.
     pub fn pinned_source(&self) -> Result<SharedCheckpointSource, ComponentPreparationError> {
-        self.restrict_bindings(self.pinned.values().flatten())
-    }
-
-    fn restrict_bindings<'a>(
-        &self,
-        bindings: impl Iterator<Item = &'a WeightBinding>,
-    ) -> Result<SharedCheckpointSource, ComponentPreparationError> {
-        let inputs = bindings
-            .flat_map(WeightBinding::checkpoint_keys)
-            .map(str::to_owned)
-            .collect();
-        Ok(Arc::new(RestrictedCheckpointSource::including(
-            self.source.clone(),
+        restrict_bindings(
+            Arc::clone(&self.source),
             &self.id,
-            inputs,
-        )?))
+            self.pinned.values().flatten(),
+        )
     }
 
     /// Applies native immutable storage preferences to the same cold bindings.
@@ -741,18 +734,11 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
         for bindings in units.iter().chain(pinned.values()) {
             WeightBindingPlan::new(bindings).map_err(RecipeBindingError::from)?;
         }
-        let inputs = units
-            .iter()
-            .flatten()
-            .chain(pinned.values().flatten())
-            .flat_map(WeightBinding::checkpoint_keys)
-            .map(str::to_owned)
-            .collect();
-        let source = Arc::new(RestrictedCheckpointSource::including(
+        let source = restrict_bindings(
             self.source,
             &id,
-            inputs,
-        )?);
+            units.iter().flatten().chain(pinned.values().flatten()),
+        )?;
         let invocations = description.invocations().clone();
         Ok(PreparedComponent {
             id,
@@ -793,19 +779,14 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             .collect();
         self.selected_units = Some(selected);
         self.invocations = invocations;
-        let inputs = self
-            .units
-            .iter()
-            .flatten()
-            .chain(self.pinned.values().flatten())
-            .flat_map(WeightBinding::checkpoint_keys)
-            .map(str::to_owned)
-            .collect();
-        self.source = Arc::new(RestrictedCheckpointSource::including(
+        self.source = restrict_bindings(
             self.source,
             &self.id,
-            inputs,
-        )?);
+            self.units
+                .iter()
+                .flatten()
+                .chain(self.pinned.values().flatten()),
+        )?;
         Ok(self)
     }
 
@@ -884,6 +865,20 @@ impl<D: ComponentPreparationDeclaration> PreparedComponent<D> {
             self.units,
         ))
     }
+}
+
+fn restrict_bindings<'a>(
+    source: SharedCheckpointSource,
+    id: &str,
+    bindings: impl Iterator<Item = &'a WeightBinding>,
+) -> Result<SharedCheckpointSource, ComponentPreparationError> {
+    let inputs = bindings
+        .flat_map(WeightBinding::checkpoint_keys)
+        .map(str::to_owned)
+        .collect();
+    Ok(Arc::new(RestrictedCheckpointSource::including(
+        source, id, inputs,
+    )?))
 }
 
 // Placement and precision change physical byte counts; aliases keep referring to
