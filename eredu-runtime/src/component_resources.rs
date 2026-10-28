@@ -176,7 +176,7 @@ pub fn select_complete_pinned_resources<'a, R: Ord + Debug>(
 
 fn select_pinned_groups<'a>(
     component: &str,
-    declared: impl IntoIterator<Item = &'a crate::OwnedParameterGroupSpec>,
+    declared: impl Iterator<Item = &'a crate::OwnedParameterGroupSpec> + Clone,
     bindings: &[crate::OwnedParameterGroupSpec],
     roles: &[&str],
     ownership: impl Fn(&crate::ParameterGroupOwner, &crate::ParameterGroupOwner) -> bool,
@@ -188,9 +188,8 @@ fn select_pinned_groups<'a>(
     if roles.iter().any(|role| role.trim().is_empty()) {
         return Err(invalid("empty pinned role".into()));
     }
-    let declared = declared.into_iter().collect::<Vec<_>>();
     let mut canonical = BTreeMap::new();
-    for &group in &declared {
+    for group in declared.clone() {
         for member in group.members() {
             if canonical
                 .insert(member.target(), group)
@@ -210,7 +209,7 @@ fn select_pinned_groups<'a>(
             .any(|role| binding.owner().accepts_static_role(role))
     }) {
         let index = declared
-            .iter()
+            .clone()
             .position(|group| {
                 group.group() == binding.group() && ownership(group.owner(), binding.owner())
             })
@@ -227,7 +226,10 @@ fn select_pinned_groups<'a>(
             )));
         }
     }
-    Ok(selected.into_iter().map(|index| declared[index]).collect())
+    Ok(declared
+        .enumerate()
+        .filter_map(|(index, group)| selected.contains(&index).then_some(group))
+        .collect())
 }
 
 fn complete_pinned_resources<'a, R: Ord + Debug>(
@@ -267,7 +269,7 @@ impl ComponentDefinition {
     ) -> Result<Vec<&'a crate::OwnedParameterGroupSpec>, ComponentDefinitionError> {
         select_pinned_groups(
             self.id(),
-            self.parameters().groups(),
+            self.parameters().groups().iter(),
             bindings,
             roles,
             |declared, selected| declared == selected,
