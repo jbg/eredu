@@ -1820,7 +1820,6 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// that merely resembles, but is not the canonical topology of, the
     /// architecture it will execute. Pre-allocation selection should use
     /// [`Self::from_description`] with the architecture-authored declaration.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_architecture<B, S, M, N>(
         architecture: &M,
         group_ranges: impl IntoIterator<Item = (N, Range<usize>)>,
@@ -1859,7 +1858,6 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// canonical graph/unit declaration, state plan, boundary schema, local geometry, and
     /// parameter topology without constructing a backend module merely to rediscover those
     /// facts. Concrete backends must not synthesize any of these inputs.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_description<N>(
         parameters: &ArchitectureParameterDescription,
         group_ranges: impl IntoIterator<Item = (N, Range<usize>)>,
@@ -1873,14 +1871,9 @@ impl<G, A> ArchitecturePartition<G, A> {
         N: Into<String>,
         A: ArchitectureBoundary,
     {
-        let graph = parameters.graph().clone();
-        let unit_layout = parameters.unit_layout().clone();
-        validate_canonical_layout(&graph, &unit_layout)?;
         boundary_schema.wire_schema()?;
-        let mut partition = Self::new(
-            parameters.invocations(),
-            graph,
-            unit_layout,
+        let mut partition = Self::select_topology(
+            parameters,
             group_ranges,
             ownership,
             local_geometry,
@@ -1893,11 +1886,9 @@ impl<G, A> ArchitecturePartition<G, A> {
         Ok(partition)
     }
 
-    /// Selects rank-local topology before declaration-owned state and bindings attach.
-    fn new<S>(
-        invocations: &crate::ExecutionUnitAddressMap,
-        graph: ExecutionGraph,
-        unit_layout: ExecutionUnitLayout,
+    /// Selects rank-local topology from one validated parameter declaration.
+    fn select_topology<S>(
+        parameters: &ArchitectureParameterDescription,
         group_ranges: impl IntoIterator<Item = (S, Range<usize>)>,
         ownership: PartitionOwnership,
         local_geometry: G,
@@ -1906,7 +1897,8 @@ impl<G, A> ArchitecturePartition<G, A> {
     where
         S: Into<String>,
     {
-        validate_canonical_layout(&graph, &unit_layout)?;
+        let graph = parameters.graph();
+        let unit_layout = parameters.unit_layout();
         let mut seen_groups = BTreeSet::new();
         let mut groups = Vec::new();
         for (group, global_units) in group_ranges {
@@ -1946,16 +1938,17 @@ impl<G, A> ArchitecturePartition<G, A> {
         }
         groups.sort_by_key(PartitionGroup::group_index);
 
-        invocations.validate_layout(&unit_layout)?;
-        let invocations = invocations.select_invocations(groups.iter().flat_map(|group| {
-            group
-                .ordinals
-                .clone()
-                .map(|ordinal| unit_layout.address(ordinal).expect("owned invocation"))
-        }))?;
+        let invocations = parameters
+            .invocations()
+            .select_invocations(groups.iter().flat_map(|group| {
+                group
+                    .ordinals
+                    .clone()
+                    .map(|ordinal| unit_layout.address(ordinal).expect("owned invocation"))
+            }))?;
         Ok(Self {
-            graph,
-            unit_layout,
+            graph: graph.clone(),
+            unit_layout: unit_layout.clone(),
             invocations,
             groups,
             ownership,
@@ -2947,13 +2940,18 @@ mod tests {
         .unwrap()
     }
 
+    fn identity_description(
+        graph: &ExecutionGraph,
+        layout: &ExecutionUnitLayout,
+    ) -> ArchitectureParameterDescription {
+        ArchitectureParameterDescription::from_owned(graph, layout, []).unwrap()
+    }
+
     fn valid_partition() -> ArchitecturePartition<Geometry, Boundary> {
         let graph = graph();
         let layout = layout(&graph);
-        ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout),
-            graph,
-            layout,
+        ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout),
             [("prediction", 0..2), ("primary", 1..4)],
             PartitionOwnership::new(true, false, ["embedding", "normalization"]).unwrap(),
             Geometry("local"),
@@ -2984,10 +2982,8 @@ mod tests {
         ownership: PartitionOwnership,
     ) -> ArchitecturePartition<(), ()> {
         let graph = graph();
-        ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
-            graph.clone(),
-            layout(&graph),
+        ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("primary", primary)],
             ownership,
             (),
@@ -3641,28 +3637,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_noncanonical_unknown_and_duplicate_groups() {
+    fn rejects_unknown_and_duplicate_groups() {
         let graph = graph();
-        let mismatched_graph = ExecutionGraph::chain(["primary", "other"]).unwrap();
-        let error = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&mismatched_graph)),
-            graph.clone(),
-            layout(&mismatched_graph),
-            [("primary", 0..1)],
-            PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            (),
-            (),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ArchitecturePartitionError::LayoutGroupMismatch { .. }
-        ));
-
-        let error = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("missing", 0..1)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
             (),
@@ -3674,10 +3652,8 @@ mod tests {
             ArchitecturePartitionError::UnknownGroup("missing".into())
         );
 
-        let error = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("primary", 0..1), ("primary", 1..2)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
             (),
@@ -3693,10 +3669,8 @@ mod tests {
     #[test]
     fn rejects_empty_and_out_of_bounds_group_ranges() {
         let graph = graph();
-        let error = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("primary", 2..2)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
             (),
@@ -3708,10 +3682,8 @@ mod tests {
             ArchitecturePartitionError::EmptyGroupRange { .. }
         ));
 
-        let error = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout(&graph)),
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("prediction", 1..4)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
             (),
@@ -3741,10 +3713,8 @@ mod tests {
     ) -> ArchitecturePartition<(), ()> {
         let graph = ExecutionGraph::chain(["decoder"]).unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [4]).unwrap();
-        ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout),
-            graph,
-            layout,
+        ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout),
             [("decoder", 1..3)],
             PartitionOwnership::new(owns_input, false, std::iter::empty::<String>()).unwrap(),
             (),
@@ -3786,10 +3756,8 @@ mod tests {
     fn layered_driver_represents_stateless_root_without_borrowing_decoder_state() {
         let graph = ExecutionGraph::chain(["vision", "decoder"]).unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [1, 2]).unwrap();
-        let partition = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(&layout),
-            graph,
-            layout,
+        let partition = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout),
             [("vision", 0..1), ("decoder", 0..2)],
             PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
             (),
@@ -3806,12 +3774,11 @@ mod tests {
         assert!(vision.optional_state_layout().is_none());
         assert_eq!(vision.group_index(), 0);
 
-        let without_state = ArchitecturePartition::new(
-            &crate::ExecutionUnitAddressMap::identity(
+        let without_state = ArchitecturePartition::select_topology(
+            &identity_description(
+                &ExecutionGraph::chain(["vision"]).unwrap(),
                 &ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
             ),
-            ExecutionGraph::chain(["vision"]).unwrap(),
-            ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
             [("vision", 0..1)],
             PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
             (),

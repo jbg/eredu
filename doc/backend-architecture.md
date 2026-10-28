@@ -6652,9 +6652,10 @@ execution. A request with `data > 1` reaches neutral architecture
 selection and fails there before payload or native communication realization;
 concrete topology adapters do not erase or reject that axis independently.
 
-`ArchitecturePartition::from_description` constructs rank-local ownership from
-architecture-authored parameter, state and boundary declarations without native
-resources. `from_architecture` validates the parameter declaration against the
+`ArchitecturePartition::from_description` selects rank-local topology from the
+graph, logical layout and storage map retained in one validated
+`ArchitectureParameterDescription`, together with architecture-authored state and
+boundary declarations. This selection requires no native resources. `from_architecture` validates the parameter declaration against the
 concrete neutral architecture, derives its state plan and uses the same
 construction path. Partition preparation projects the declaration's retained
 invocation-to-storage map directly, preserving shared owners outside the selected
