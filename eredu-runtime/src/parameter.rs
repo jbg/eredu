@@ -11,8 +11,8 @@ use eredu_checkpoint::{
         AtomicRecipeSet, DerivedWeightRecipe, RecipeAlias, RecipeCatalog, RecipeDtype, RecipeError,
     },
     store::{
-        CheckpointSource, PreparedCheckpointSource, ReadPolicy, SharedCheckpointSource, StoreError,
-        TensorReadRequest, TensorSelection,
+        CheckpointSource, PreparedCheckpointSource, ReadPolicy, RestrictedCheckpointSource,
+        SharedCheckpointSource, StoreError, TensorReadRequest, TensorSelection,
     },
 };
 use eredu_nn::{
@@ -1195,18 +1195,23 @@ impl PreparedParameterRecipes {
         scope: impl Into<String>,
         targets: &BTreeSet<String>,
     ) -> Result<Self, RecipeBindingError> {
-        let recipes = targets
-            .iter()
-            .map(|target| {
-                self.recipes
-                    .remove(target)
-                    .map(|recipe| (target.clone(), recipe))
-                    .ok_or_else(|| RecipeBindingError::UnknownParameter {
-                        target: target.clone(),
-                    })
-            })
-            .collect::<Result<_, _>>()?;
-        Self::new(scope, self.source, recipes)
+        for target in targets {
+            if !self.recipes.contains_key(target) {
+                return Err(RecipeBindingError::UnknownParameter {
+                    target: target.clone(),
+                });
+            }
+        }
+        self.recipes.retain(|target, _| targets.contains(target));
+        let keys = self
+            .recipes
+            .values()
+            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+            .collect();
+        self.source = Arc::new(RestrictedCheckpointSource::including(
+            self.source, scope, keys,
+        )?);
+        Ok(self)
     }
 
     /// Exact restricted metadata and provenance authority for deferred binding.

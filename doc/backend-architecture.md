@@ -1026,7 +1026,9 @@ source. Consuming `map_recipes` applies family-authored transformations while
 preserving canonical targets, validating outputs and narrowing authority to the
 transformed recipes' physical inputs. It cannot introduce a neighboring owner's
 sources. Consuming `project` selects existing canonical parameter identities,
-keeps their recipes and exact source guards, and rejects unknown targets. Qwen4
+retains their recipes in place and narrows the existing exact source authority without
+repeating recipe admission or metadata snapshots. It preserves deferred-read guards
+and rejects unknown targets. Qwen4
 target and prediction tensor partitions use the shared transformation traversal.
 Runtime's `select_parameter_recipe` pushes declared physical selections through
 canonical recipes and assembles ordered range segments on one axis, retaining
