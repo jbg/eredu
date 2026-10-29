@@ -2229,11 +2229,27 @@ impl LayeredPartitionDriver {
         group_owns_state: bool,
     ) -> Result<Self, LayeredPartitionError> {
         let state_range = group_owns_state.then(|| storage_range.clone());
-        Self::new_with_state_range(partition, group_index, storage_range, state_range)
+        let driver =
+            Self::new_with_state_range(partition, group_index, storage_range, state_range)?;
+        if group_owns_state {
+            let state = partition.state().expect("validated state-owning partition");
+            if driver
+                .range
+                .clone()
+                .any(|layer| !state.owns_global_layer(layer))
+            {
+                return Err(LayeredPartitionError::StateRange {
+                    state: state.global_layers(),
+                    partition: driver.range,
+                });
+            }
+        }
+        Ok(driver)
     }
 
     /// Validates architecture-authored state addresses independently of unit indices.
-    /// Stateful encoder units can follow the decoder in the global state layout.
+    /// Stateful encoder units can follow the decoder in the global state layout;
+    /// explicitly mapped ranges may span unowned stateless gaps.
     pub fn new_with_state_range<G, A>(
         partition: &ArchitecturePartition<G, A>,
         group_index: usize,

@@ -943,6 +943,10 @@ state references and exact state ownership before materialization. Its retained
 `ComponentSelection` resolves only owned global invocation addresses and preserves
 state gaps. The shared adapter consumes that same selection and additionally checks
 actual pinned roles and compatible retained ownership.
+The strict `LayeredPartitionDriver` constructor requires ownership of every state
+slot corresponding to its unit range. Explicit state-range construction permits
+unowned stateless gaps between architecture-mapped histories; a placeholder alone
+does not establish ownership for the strict constructor.
 `ParameterStorageId` and `StateSlotId` distinguish physical parameter ownership
 from invocation addresses and mutable state. `ComponentAdapter` implements the
 ordinary architecture and layered contracts for independently leased components;
