@@ -9,6 +9,8 @@ use std::ops::Range;
 pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 
 pub(crate) mod attention_partition;
+mod boundary_modules;
+pub use boundary_modules::BoundaryModules;
 /// Shared-weight repeated stacks with independent state for each invocation.
 pub(crate) mod repeated;
 pub(crate) mod topology;
@@ -23,21 +25,18 @@ use eredu_nn::{
     NormalizationOperator, Parameter, ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec,
     RotarySubspace, Tensor, VocabularyParallelRange,
 };
+use eredu_runtime::PartitionComponentKernel as _;
 use eredu_runtime::{
     module_parameter_group, partitioned_module_parameter_group, partitioned_projection_group,
     segmented_projection_group, ArchitectureParameterDescription, ExecutionGraph,
-    ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    LayeredPartitionInput, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterRole, PartitionedLayeredArchitecture, ProjectionSharding, StateLayout,
-    TensorPlacement,
+    ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
+    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelPlanError,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
+    VocabularyModulePlacement,
 };
 
 /// Narrows a causal decoder's position-independent readout before projection.
-pub(crate) fn final_hidden_position<T: Tensor>(
-    hidden: &T,
-    context: &T::Context,
-) -> Result<T, Error> {
+pub fn final_hidden_position<T: Tensor>(hidden: &T, context: &T::Context) -> Result<T, Error> {
     if hidden.shape().len() < 3 || hidden.dim(1) <= 0 {
         return Err(Error::backend(
             "decoder readout requires nonempty batch/sequence/features",
@@ -58,6 +57,8 @@ pub struct ComponentInstrumentation<'a, T> {
 
 /// Typed residual ingress and readout transformations.
 pub mod boundary;
+mod schedule;
+pub use schedule::{DecoderOperation, DecoderSchedule};
 pub mod unary;
 pub use boundary::{DecoderBoundary, NormalizedBoundary};
 
@@ -68,6 +69,20 @@ impl<T: Clone> ComponentInstrumentation<'_, T> {
             observer: None,
             unit_path: "",
         }
+    }
+
+    /// Applies the decoder embedding seam while preserving request-local context.
+    pub(crate) fn apply_embedding<C, O>(
+        mut forward: LayeredForwardState<T, C>,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<T, C>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<T, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        forward.hidden = ComponentInstrumentation::new("readout", &mut borrowed)
+            .apply("embedding", forward.hidden)?;
+        Ok(forward)
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -543,8 +558,16 @@ pub trait Config: 'static {
     fn hidden_size(&self) -> i32;
     /// Number of decoder layers.
     fn num_hidden_layers(&self) -> i32;
+    /// Canonical body parameter owner for one logical layer invocation.
+    /// Owners are stable logical layer indices with identical body construction
+    /// policy. Mutable attention state remains local
+    /// to each invocation. Families declare sharing explicitly, independently of
+    /// checkpoint aliases.
+    fn block_parameter_owner(&self, layer: usize) -> usize {
+        layer
+    }
     /// Optional learned RMS normalization after a block's final residual.
-    /// The returned canonical parameter belongs to that execution unit.
+    /// The returned parameter belongs to an independently leased stateless operation.
     fn block_output_normalization(&self, _layer: usize) -> Option<String> {
         None
     }
@@ -755,22 +778,12 @@ pub trait PartitionedConfig: Config + Clone {
         dense_local_block_config(self, layer, layout)
     }
 
-    /// Validates that a selected parameter description belongs to this family.
-    ///
-    /// The default remains the exact dense declaration. Routed families may
-    /// validate their distinct router/bank topology without weakening dense
-    /// construction.
-    fn validate_partition_parameters(
+    /// Declares the canonical topology admitted by partition construction.
+    /// Specialized families supply their existing router, bank or adapter declaration.
+    fn partition_parameter_description(
         &self,
-        parameters: &ArchitectureParameterDescription,
-    ) -> Result<(), Error> {
-        let expected = dense_parameter_description(self).map_err(Error::backend)?;
-        if &expected != parameters {
-            return Err(Error::backend(
-                "decoder partition belongs to a different normalized parameter topology",
-            ));
-        }
-        Ok(())
+    ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+        dense_parameter_description(self)
     }
 }
 
@@ -879,45 +892,10 @@ impl<B: NeuralBackend> MultiTableEmbedding<B> {
         specs: impl IntoIterator<Item = NamedEmbeddingSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let specs = specs.into_iter().collect::<Vec<_>>();
-        if specs.is_empty() {
-            return Err(Error::backend(
-                "multi-table embedding sum requires at least one table",
-            ));
-        }
-        let mut names = std::collections::BTreeSet::new();
-        let mut dimensions = None;
-        let mut tables = Vec::with_capacity(specs.len());
-        for spec in specs {
-            if spec.name.trim().is_empty() || !names.insert(spec.name.clone()) {
-                return Err(Error::backend(format!(
-                    "multi-table embedding name {:?} is empty or duplicated",
-                    spec.name
-                )));
-            }
-            spec.lookup.validate()?;
-            if spec.embedding.vocabulary <= 0 || spec.embedding.dimensions <= 0 {
-                return Err(Error::backend(format!(
-                    "embedding table {:?} has invalid geometry vocabulary={} dimensions={}",
-                    spec.name, spec.embedding.vocabulary, spec.embedding.dimensions
-                )));
-            }
-            if dimensions
-                .replace(spec.embedding.dimensions)
-                .is_some_and(|expected| expected != spec.embedding.dimensions)
-            {
-                return Err(Error::backend(format!(
-                    "embedding table {:?} width {} differs from preceding width {:?}",
-                    spec.name, spec.embedding.dimensions, dimensions
-                )));
-            }
-            tables.push(NamedEmbedding {
-                embedding: B::embedding(spec.embedding, context)?,
-                name: spec.name,
-                lookup: spec.lookup,
-            });
-        }
-        Ok(Self { tables })
+        Self::from_specs(
+            specs.into_iter().map(|spec| (spec, ())).collect(),
+            |spec, ()| B::embedding(spec, context),
+        )
     }
 
     /// Builds rank-local vocabulary tables with validated global ownership.
@@ -936,28 +914,58 @@ impl<B: NeuralBackend> MultiTableEmbedding<B> {
                 "parallel multi-table embeddings require one range per table",
             ));
         }
+        for (spec, range) in specs.iter().zip(&ranges) {
+            range.validate_global_rows(spec.embedding.vocabulary)?;
+        }
+        Self::from_specs(specs.into_iter().zip(ranges).collect(), |spec, range| {
+            VocabularyModulePlacement::VocabularyParallel(range)
+                .materialize_embedding::<B>(spec, context)
+                .map(|embedding| embedding.expect("selected embedding table is owned"))
+        })
+    }
+
+    fn from_specs<P>(
+        specs: Vec<(NamedEmbeddingSpec, P)>,
+        mut materialize: impl FnMut(EmbeddingSpec, P) -> Result<B::Embedding, Error>,
+    ) -> Result<Self, Error> {
+        if specs.is_empty() {
+            return Err(Error::backend(
+                "multi-table embedding sum requires at least one table",
+            ));
+        }
         let mut names = std::collections::BTreeSet::new();
-        let mut dimensions = None;
-        let mut tables = Vec::with_capacity(specs.len());
-        for (spec, range) in specs.into_iter().zip(ranges) {
-            if spec.name.trim().is_empty() || !names.insert(spec.name.clone()) {
-                return Err(Error::backend(
-                    "parallel embedding name is empty or duplicated",
-                ));
+        let dimensions = specs[0].0.embedding.dimensions;
+        for (spec, _) in &specs {
+            if spec.name.trim().is_empty() || !names.insert(&spec.name) {
+                return Err(Error::backend(format!(
+                    "multi-table embedding name {:?} is empty or duplicated",
+                    spec.name
+                )));
             }
             spec.lookup.validate()?;
-            if dimensions
-                .replace(spec.embedding.dimensions)
-                .is_some_and(|expected| expected != spec.embedding.dimensions)
-            {
-                return Err(Error::backend("parallel embedding widths differ"));
+            if spec.embedding.vocabulary <= 0 || spec.embedding.dimensions <= 0 {
+                return Err(Error::backend(format!(
+                    "embedding table {:?} has invalid geometry vocabulary={} dimensions={}",
+                    spec.name, spec.embedding.vocabulary, spec.embedding.dimensions
+                )));
             }
-            tables.push(NamedEmbedding {
-                embedding: B::vocabulary_parallel_embedding(spec.embedding, range, context)?,
-                name: spec.name,
-                lookup: spec.lookup,
-            });
+            if spec.embedding.dimensions != dimensions {
+                return Err(Error::backend(format!(
+                    "embedding table {:?} width {} differs from preceding width {}",
+                    spec.name, spec.embedding.dimensions, dimensions
+                )));
+            }
         }
+        let tables = specs
+            .into_iter()
+            .map(|(spec, placement)| {
+                Ok(NamedEmbedding {
+                    embedding: materialize(spec.embedding, placement)?,
+                    name: spec.name,
+                    lookup: spec.lookup,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         Ok(Self { tables })
     }
 
@@ -1167,7 +1175,7 @@ where
     let layers = usize::try_from(config.num_hidden_layers())
         .map_err(|_| ParallelPlanError::InvalidGroup("decoder layer count exceeds usize".into()))?;
     let blocks = (0..layers)
-        .map(|index| local_block(config, index, layout))
+        .map(|index| local_block(config, config.block_parameter_owner(index), layout))
         .collect::<Result<Vec<_>, _>>()?;
     let key_value_heads = blocks.iter().map(Config::num_key_value_heads);
     let state_layout = StateLayout::new(
@@ -1175,16 +1183,13 @@ where
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let vocabulary = usize::try_from(config.vocabulary_size()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder vocabulary size exceeds usize".into())
-    })?;
-    let embedding_name = format!("{}.embed_tokens", config.parameter_root());
-    let embedding_range = vocabulary_range(layout, &embedding_name, vocabulary)?;
-    let output_range = if config.tie_word_embeddings() {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
+    let root = config.parameter_root();
+    let (embedding_range, output_range) = StaticModuleSpec::from_config(config).vocabulary_ranges(
+        layout,
+        &format!("{root}.embed_tokens"),
+        &format!("{root}.norm"),
+        "lm_head",
+    )?;
     let geometry = LocalGeometry {
         blocks,
         embedding_range,
@@ -1194,59 +1199,6 @@ where
     };
     geometry.validate_for(config)?;
     Ok(geometry)
-}
-
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    global_vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected: Option<std::ops::Range<usize>> = None;
-    let mut found = false;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        found = true;
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..global_vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "vocabulary member {target} has non-row placement {placement:?}"
-                )));
-            }
-        };
-        if tensor.global_shape().first().copied() != Some(global_vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "vocabulary member {target} has global shape {:?}, expected {global_vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        if selected.as_ref().is_some_and(|selected| selected != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "vocabulary group {logical_name} has inconsistent companion selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    if !found {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "missing local vocabulary layout for {logical_name}"
-        )));
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary,
-        local: selected.expect("a found vocabulary member supplies a selection"),
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
 }
 
 /// Declares the complete mutable-state geometry consumed by resident or bounded execution.
@@ -2533,10 +2485,11 @@ impl<B: NeuralBackend> TensorParallelProjectionOperator<B> for Mlp<B> {
     }
 }
 
-/// One RMS-pre-norm residual decoder block.
+/// Attention and feed-forward parameter body of an RMS-pre-norm decoder block.
+/// Terminal invocation normalization is borrowed by the equation and is not owned here.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
+pub struct TransformerBlockBody<B: NeuralBackend, F = Mlp<B>> {
     /// Self-attention operator.
     pub self_attention: Attention<B>,
     /// Feed-forward operator.
@@ -2549,17 +2502,66 @@ pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
     pub attention_output_norm: Option<B::Normalization>,
     /// Optional post-feed-forward normalization before residual addition.
     pub feed_forward_output_norm: Option<B::Normalization>,
-    /// Optional normalization of the completed block output.
+}
+
+/// One decoder invocation with its body and optional terminal normalization.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
+    /// Attention, feed-forward and residual-normalization parameters.
+    pub body: TransformerBlockBody<B, F>,
+    /// Invocation-specific normalization of the completed block output.
     pub output_norm: Option<B::Normalization>,
 }
 
-impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
-    /// Builds an unloaded block for one global layer index.
+/// Independently materialized decoder equation resource.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub enum DecoderUnit<B: NeuralBackend, F = Mlp<B>> {
+    /// Canonical attention/feed-forward parameters, without a terminal.
+    Body(TransformerBlockBody<B, F>),
+    /// Canonical stateless terminal normalization.
+    Terminal(B::Normalization),
+}
+
+impl<B: NeuralBackend> TransformerBlockBody<B, Mlp<B>> {
+    /// Constructs an unloaded dense body without invocation terminal parameters.
     pub fn new<C: Config>(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::from_factory::<C, DenseBlockFactory>(config, config, layer, context)
+    }
+}
+
+impl<B: NeuralBackend, F> TransformerBlockBody<B, F> {
+    /// Constructs a body from shared attention/residual policy and a typed
+    /// feed-forward factory. Global routing and rank-local bank geometry remain distinct.
+    pub fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+        global: &C,
+        local: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        P::validate_partitioned(global, local)?;
+        Self::construct_with_terminal(
+            local,
+            layer,
+            context,
+            || Ok(()),
+            || P::build_partitioned_feed_forward(global, local, layer, context),
+        )
+        .map(|(body, ())| body)
+    }
+
+    fn construct_with_terminal<C: Config, T>(
+        config: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+        terminal: impl FnOnce() -> Result<T, Error>,
+        feed_forward: impl FnOnce() -> Result<F, Error>,
+    ) -> Result<(Self, T), Error> {
         let fields = config.block_parameter_fields().validate()?;
         let norm = |name: String| {
             B::normalization(
@@ -2576,64 +2578,102 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                 context,
             )
         };
-        Ok(Self {
-            attention_output_norm: config
-                .attention_output_normalization(layer)
-                .map(&norm)
-                .transpose()?,
-            feed_forward_output_norm: config
-                .feed_forward_output_normalization(layer)
-                .map(&norm)
-                .transpose()?,
-            output_norm: config
-                .block_output_normalization(layer)
-                .map(|name| {
-                    B::normalization(
-                        NormalizationConstructionSpec::learned(
-                            config.hidden_size(),
-                            config.rms_norm_epsilon(),
-                            parameter_spec(config, name).map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
-                })
-                .transpose()?,
-            self_attention: Attention::new(config, layer, context)?,
-            mlp: Mlp::new(config, layer, context)?,
-            input_norm: norm(format!(
-                "{}.layers.{layer}.{}.weight",
-                config.parameter_root(),
-                fields.input_norm
-            ))?,
-            post_attention_norm: norm(format!(
-                "{}.layers.{layer}.{}.weight",
-                config.parameter_root(),
-                fields.post_attention_norm
-            ))?,
-        })
+        let attention_output_norm = config
+            .attention_output_normalization(layer)
+            .map(&norm)
+            .transpose()?;
+        let feed_forward_output_norm = config
+            .feed_forward_output_normalization(layer)
+            .map(&norm)
+            .transpose()?;
+        let terminal = terminal()?;
+        Ok((
+            Self {
+                attention_output_norm,
+                feed_forward_output_norm,
+                self_attention: Attention::new(config, layer, context)?,
+                mlp: feed_forward()?,
+                input_norm: norm(format!(
+                    "{}.layers.{layer}.{}.weight",
+                    config.parameter_root(),
+                    fields.input_norm
+                ))?,
+                post_attention_norm: norm(format!(
+                    "{}.layers.{layer}.{}.weight",
+                    config.parameter_root(),
+                    fields.post_attention_norm
+                ))?,
+            },
+            terminal,
+        ))
     }
 }
 
-impl<B, F> TransformerBlock<B, F>
+/// Constructs only a declared invocation's terminal normalization.
+/// Body parameters and mutable attention state are not allocated by this operation.
+pub fn terminal_normalization<B: NeuralBackend>(
+    config: &impl Config,
+    layer: usize,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<Option<B::Normalization>, Error> {
+    config
+        .block_output_normalization(layer)
+        .map(|name| {
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    config.hidden_size(),
+                    config.rms_norm_epsilon(),
+                    parameter_spec(config, name).map_err(Error::backend)?,
+                ),
+                context,
+            )
+        })
+        .transpose()
+}
+
+impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
+    /// Constructs one unloaded dense body and its optional terminal normalization.
+    pub fn new<C: Config>(
+        config: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::from_factory::<C, DenseBlockFactory>(config, config, layer, context)
+    }
+}
+
+impl<B: NeuralBackend, F> TransformerBlock<B, F> {
+    /// Assembles the shared body and declared terminal without changing their
+    /// independent construction interfaces or canonical parameter names.
+    pub fn from_factory<C: Config, P: BlockFactory<B, C, FeedForward = F>>(
+        global: &C,
+        local: &C,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        P::validate_partitioned(global, local)?;
+        let (body, output_norm) = TransformerBlockBody::construct_with_terminal(
+            local,
+            layer,
+            context,
+            || terminal_normalization::<B>(local, layer, context),
+            || P::build_partitioned_feed_forward(global, local, layer, context),
+        )?;
+        Ok(Self { body, output_norm })
+    }
+}
+
+impl<B, F> TransformerBlockBody<B, F>
 where
     B: NeuralBackend,
     F: DecoderProjectionOperator<B>,
 {
-    fn normalize_output(
-        &mut self,
-        hidden: B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        match &mut self.output_norm {
-            Some(norm) => norm.forward(&hidden, context),
-            None => Ok(hidden),
-        }
-    }
     /// Executes the shared normalization, attention, cache, and residual lifecycle
     /// with family-owned projection callbacks. The same provider is borrowed
     /// sequentially by value and feed-forward execution.
     fn forward_projections<C, D, V, H>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
@@ -2724,16 +2764,28 @@ where
         };
         let mlp = instrumentation.apply(self.mlp.residual_observation(), mlp)?;
         let hidden = instrumentation.apply("feed_forward.residual", hidden.add(&mlp, context)?)?;
-        self.normalize_output(hidden, context)
+        match output_norm {
+            Some(norm) => norm.forward(&hidden, context),
+            None => Ok(hidden),
+        }
     }
+}
 
-    /// Executes this block with replicated projections.
+impl<B, F> TransformerBlockBody<B, F>
+where
+    B: NeuralBackend,
+    F: DecoderProjectionOperator<B>,
+{
+    /// Executes this body with replicated projections and a separately borrowed terminal.
+    /// The caller owns both resource lifetimes through ordinary completion.
     pub fn forward<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2750,11 +2802,13 @@ where
     /// Executes the ordinary block equations with component capture/intervention.
     pub fn forward_observed<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2775,6 +2829,7 @@ where
     /// rank activations are reduced before the replicated adapter up projection.
     pub fn forward_with_output_adapter_observed<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         adapter: Option<&mut eredu_nn::low_rank::LowRankProjection<B>>,
         parallel: Option<&B::ParallelContext>,
@@ -2785,6 +2840,7 @@ where
         F: TensorParallelProjectionOperator<B>,
     {
         self.forward_projections(
+            output_norm,
             input,
             parallel,
             context,
@@ -2809,6 +2865,7 @@ where
     /// Delegates feed-forward computation while retaining the shared block lifecycle.
     pub fn forward_with_feed_forward<C, H>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
         feed_forward: H,
@@ -2818,6 +2875,7 @@ where
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
         self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2832,6 +2890,7 @@ where
     /// Executes column partitions and reduced row projections.
     pub fn forward_tensor_parallel<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2840,6 +2899,7 @@ where
         F: TensorParallelProjectionOperator<B>,
     {
         self.forward_tensor_parallel_observed(
+            output_norm,
             input,
             parallel,
             context,
@@ -2852,6 +2912,7 @@ where
     /// Global selection and record assembly belong to the partition driver.
     pub fn forward_tensor_parallel_observed<C: AttentionCache<B::Tensor>>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2861,6 +2922,7 @@ where
         F: TensorParallelProjectionOperator<B>,
     {
         self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -2884,6 +2946,7 @@ where
     /// Delegates feed-forward computation for a tensor-parallel block.
     pub fn forward_tensor_parallel_with_feed_forward<C, H>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -2894,6 +2957,7 @@ where
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
         self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -2908,6 +2972,7 @@ where
     /// Routes both replaceable projection stages through one runtime provider.
     pub fn forward_routed<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -2922,6 +2987,7 @@ where
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2941,6 +3007,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn forward_routed_observed<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -2957,6 +3024,7 @@ where
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
+            output_norm,
             input,
             None,
             context,
@@ -2992,6 +3060,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn forward_routed_parallel<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -3007,6 +3076,7 @@ where
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -3027,6 +3097,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn forward_routed_parallel_observed<C, P>(
         &mut self,
+        output_norm: Option<&mut B::Normalization>,
         layer: usize,
         input: AttentionInput<'_, B::Tensor, C>,
         pass: eredu_runtime::ExpertPass,
@@ -3044,6 +3115,7 @@ where
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
+            output_norm,
             input,
             Some(parallel),
             context,
@@ -3078,8 +3150,8 @@ where
 }
 
 /// Declares attention and normalization groups shared by dense and routed blocks.
-pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
-    block: &TransformerBlock<B, F>,
+pub fn body_common_parallel_parameter_groups<B: NeuralBackend, F>(
+    block: &TransformerBlockBody<B, F>,
     config: &impl Config,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
@@ -3164,19 +3236,6 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let mut groups = vec![attention];
-    if let Some(norm) = &block.output_norm {
-        let name = config.block_output_normalization(layer).ok_or_else(|| {
-            ParallelPlanError::InvalidGroup(
-                "block output normalization is absent from configuration".into(),
-            )
-        })?;
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            name.trim_end_matches(".weight"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
     if let Some(sinks) = &block.self_attention.sinks {
         groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
             format!("{attention_prefix}.{}", fields.attention_sinks),
@@ -3249,6 +3308,58 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         .into_iter()
         .map(|group| head_partition.apply(group, |name| config.linear_format(name)))
         .collect()
+}
+
+/// Projects common body resources and the enclosing invocation's terminal normalization.
+pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
+    block: &TransformerBlock<B, F>,
+    config: &impl Config,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    with_terminal_parameter_group::<B>(
+        body_common_parallel_parameter_groups(&block.body, config, layer)?,
+        block.output_norm.as_ref(),
+        config,
+        layer,
+    )
+}
+
+fn with_terminal_parameter_group<B: NeuralBackend>(
+    mut groups: Vec<ParameterGroupSpec>,
+    terminal: Option<&B::Normalization>,
+    config: &impl Config,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    if let Some(norm) = terminal {
+        let name = config.block_output_normalization(layer).ok_or_else(|| {
+            ParallelPlanError::InvalidGroup(
+                "block output normalization is absent from configuration".into(),
+            )
+        })?;
+        groups.insert(
+            1,
+            module_parameter_group::<B::Tensor, _>(
+                name.trim_end_matches(".weight"),
+                ParameterRole::Replicated,
+                norm,
+                |_, _| Ok(MemberSharding::Replicated),
+            )?,
+        );
+    }
+    Ok(groups)
+}
+
+/// Projects every parameter owned by one dense body, excluding invocation terminals.
+pub fn body_parallel_parameter_groups<B: NeuralBackend>(
+    body: &TransformerBlockBody<B>,
+    config: &impl Config,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let mut groups = body_common_parallel_parameter_groups(body, config, layer)?;
+    groups.push(dense_mlp_parallel_parameter_group(
+        &body.mlp, config, layer,
+    )?);
+    Ok(groups)
 }
 
 /// Declares the dense SwiGLU placement group shared by dense decoder families.
@@ -3332,11 +3443,12 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     config: &impl Config,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = block_common_parallel_parameter_groups(block, config, layer)?;
-    groups.push(dense_mlp_parallel_parameter_group(
-        &block.mlp, config, layer,
-    )?);
-    Ok(groups)
+    with_terminal_parameter_group::<B>(
+        body_parallel_parameter_groups(&block.body, config, layer)?,
+        block.output_norm.as_ref(),
+        config,
+        layer,
+    )
 }
 
 /// Derives the complete dense-decoder parameter topology from normalized
@@ -3362,6 +3474,82 @@ pub(crate) fn parameter_description(
     )
 }
 
+/// Neutral router and packed-bank declaration for one ordinary routed block.
+pub(crate) struct RoutedBlockParameters {
+    pub selector_name: String,
+    pub bank_name: String,
+    pub selector: eredu_nn::TopKGroupSelectorSpec,
+    pub bank: eredu_nn::GroupedGatedProductSpec,
+}
+
+/// Projects ordinary routed blocks into the common decoder topology.
+pub(crate) fn routed_parameter_description(
+    config: &impl Config,
+    block: impl Fn(usize) -> Result<RoutedBlockParameters, Error>,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    let invalid = |error: Error| ParallelPlanError::InvalidGroup(error.to_string());
+    config.validate_config().map_err(invalid)?;
+    let layers = usize::try_from(config.num_hidden_layers())
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let mut groups = Vec::with_capacity(layers);
+    let mut formats = std::collections::BTreeMap::new();
+    for layer in 0..layers {
+        let block = block(layer).map_err(invalid)?;
+        block.selector.validate().map_err(invalid)?;
+        block.bank.validate().map_err(invalid)?;
+        if block.selector.selection().group_count() != block.bank.group_count()
+            || block.selector.input_dimensions() != block.bank.input_dimensions()
+            || block.bank.input_dimensions() != config.hidden_size()
+            || block.bank.output_dimensions() != config.hidden_size()
+        {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "routed decoder unit {layer} has incompatible selector and bank geometry"
+            )));
+        }
+        formats.insert(
+            block.selector.weight().id.as_str().to_owned(),
+            block.selector.format().encoding(),
+        );
+        let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = block.bank.layout()
+        else {
+            return Err(ParallelPlanError::InvalidGroup(
+                "ordinary routed decoder topology requires packed expert projections".into(),
+            ));
+        };
+        for projection in [gate_up, down] {
+            formats.insert(
+                projection.weight().id.as_str().to_owned(),
+                projection.format().encoding(),
+            );
+        }
+        let units = eredu_runtime::aligned_partition_units(
+            &block.bank_name,
+            block.bank.intermediate_dimensions() as usize,
+            1,
+            crate::linear_format::input_partition_alignment(down.format().encoding()) as usize,
+        )?;
+        groups.push(vec![
+            eredu_runtime::top_k_group_selector_logical_group(
+                block.selector_name,
+                &block.selector,
+            )?,
+            eredu_runtime::packed_gated_product_logical_group(block.bank_name, &block.bank, units)?,
+        ]);
+    }
+    parameter_description_with_formats(
+        config,
+        |_| true,
+        |layer| Ok(Some(groups[layer].clone())),
+        true,
+        |name| {
+            formats
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| config.linear_format(name))
+        },
+    )
+}
+
 /// Derives block and final-normalization topology for supplied-embedding execution,
 /// without declaring a vocabulary table or a language-model output head.
 pub fn embedded_parameter_description(
@@ -3376,6 +3564,22 @@ fn parameter_description_with_vocabulary(
     replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
     include_vocabulary: bool,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    parameter_description_with_formats(
+        config,
+        ordinary_value_projection,
+        replacement_groups,
+        include_vocabulary,
+        |name| config.linear_format(name),
+    )
+}
+
+pub(crate) fn parameter_description_with_formats(
+    config: &impl Config,
+    ordinary_value_projection: impl Fn(usize) -> bool,
+    replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
+    include_vocabulary: bool,
+    format: impl Fn(&str) -> LinearFormat,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     config
         .validate_config()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
@@ -3383,22 +3587,13 @@ fn parameter_description_with_vocabulary(
         .block_parameter_fields()
         .validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    if config.learned_attention_sinks() {
-        return Err(ParallelPlanError::InvalidGroup(
-            "static dense parameter description requires no attention sinks".into(),
-        ));
-    }
     let dimension = |name: &str, value: i32| {
         usize::try_from(value)
             .map_err(|_| ParallelPlanError::InvalidTensor(format!("decoder {name} exceeds usize")))
     };
     let hidden = dimension("hidden width", config.hidden_size())?;
-    let vocabulary = if include_vocabulary {
-        dimension("vocabulary", config.vocabulary_size())?
-    } else {
-        0
-    };
-    let layers = dimension("layer count", config.num_hidden_layers())?;
+    let schedule = DecoderSchedule::new(config)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let query_heads = dimension("query-head count", config.num_attention_heads())?;
     let key_value_heads = dimension("key/value-head count", config.num_key_value_heads())?;
     let head = dimension("head width", config.head_dim())?;
@@ -3417,62 +3612,69 @@ fn parameter_description_with_vocabulary(
 
     let graph = ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let layout = ExecutionUnitLayout::new(&graph, [layers])
+    let layout = ExecutionUnitLayout::new(&graph, [schedule.len()])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let group_id = layout
         .group_id(0)
         .expect("dense decoder layout contains its text group")
         .clone();
     let root = config.parameter_root();
-    let embedding = format!("{root}.embed_tokens.weight");
-    let norm = format!("{root}.norm.weight");
-    let mut owned = Vec::new();
-    if include_vocabulary {
-        owned.push(OwnedParameterGroupSpec::new(
-            if config.tie_word_embeddings() {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role("embedding")
-            },
-            ParameterGroupSpec::new(
-                format!("{root}.embed_tokens"),
-                ParameterRole::Vocabulary,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    &embedding,
-                    vec![vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
-                )],
-            )?,
-        ));
-    }
-    owned.push(OwnedParameterGroupSpec::new(
-        ParameterGroupOwner::static_role("norm"),
-        ParameterGroupSpec::new(
-            format!("{root}.norm"),
-            ParameterRole::Replicated,
-            [eredu_runtime::ParameterMemberSpec::new(
-                norm,
-                vec![hidden],
-                MemberSharding::Replicated,
-            )],
-        )?,
-    ));
-    if include_vocabulary && !config.tie_word_embeddings() {
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("output"),
-            ParameterGroupSpec::new(
+    let statics = StaticModuleSpec::from_config(config);
+    let mut owned = if include_vocabulary {
+        statics
+            .logical_pinned_parameter_groups(
+                &format!("{root}.embed_tokens"),
+                &format!("{root}.norm"),
                 "lm_head",
-                ParameterRole::Vocabulary,
+            )?
+            .into_iter()
+            .map(|(role, group)| {
+                let owner = if role == "embedding" && statics.tied_head {
+                    ParameterGroupOwner::static_any_of(["embedding", "output"])
+                } else {
+                    ParameterGroupOwner::static_role(role)
+                };
+                OwnedParameterGroupSpec::new(owner, group)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_role("norm"),
+            ParameterGroupSpec::new(
+                format!("{root}.norm"),
+                ParameterRole::Replicated,
                 [eredu_runtime::ParameterMemberSpec::new(
-                    "lm_head.weight",
-                    vec![vocabulary, hidden],
-                    MemberSharding::Balanced { axis: 0 },
+                    &statics.normalization_weight,
+                    vec![hidden],
+                    MemberSharding::Replicated,
                 )],
             )?,
-        ));
-    }
+        )]
+    };
 
-    for layer in 0..layers {
+    for (owner, consumers) in schedule.resources() {
+        let operation = schedule
+            .operation(owner)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let layer = operation.layer();
+        if let DecoderOperation::Terminal { .. } = operation {
+            let name = config
+                .block_output_normalization(layer)
+                .expect("declared terminal");
+            owned.push(OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit_consumers(group_id.clone(), owner, consumers),
+                ParameterGroupSpec::new(
+                    name.trim_end_matches(".weight"),
+                    ParameterRole::Replicated,
+                    [eredu_runtime::ParameterMemberSpec::new(
+                        &name,
+                        vec![hidden],
+                        MemberSharding::Replicated,
+                    )],
+                )?,
+            ));
+            continue;
+        }
         let prefix = format!("{root}.layers.{layer}");
         let attention_prefix = format!("{prefix}.{}", fields.attention);
         let head_partition = attention_partition::AttentionPartition::new(config, layer)?;
@@ -3570,88 +3772,96 @@ fn parameter_description_with_vocabulary(
             attention_members,
         )?;
 
-        let feed_forward_prefix = format!("{prefix}.{}", fields.feed_forward);
-        let feed_forward_units = crate::linear_format::input_partition_units(
-            &feed_forward_prefix,
-            intermediate,
-            1,
-            config.linear_format(&format!(
-                "{feed_forward_prefix}.{}.weight",
-                fields.feed_forward_output
-            )),
-        )?;
-        let mut feed_forward_members = Vec::new();
-        let inputs = match config.gated_projection_layout() {
-            GatedProjectionLayout::Split => vec![
-                (
-                    fields.feed_forward_gate,
+        let feed_forward_groups = match replacement_groups(layer)? {
+            Some(groups) => groups,
+            None => {
+                let feed_forward_prefix = format!("{prefix}.{}", fields.feed_forward);
+                let feed_forward_units = crate::linear_format::input_partition_units(
+                    &feed_forward_prefix,
                     intermediate,
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                (
-                    fields.feed_forward_up,
+                    1,
+                    format(&format!(
+                        "{feed_forward_prefix}.{}.weight",
+                        fields.feed_forward_output
+                    )),
+                )?;
+                let mut feed_forward_members = Vec::new();
+                let inputs = match config.gated_projection_layout() {
+                    GatedProjectionLayout::Split => vec![
+                        (
+                            fields.feed_forward_gate,
+                            intermediate,
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                        (
+                            fields.feed_forward_up,
+                            intermediate,
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                    ],
+                    GatedProjectionLayout::Fused { field } => {
+                        let width = intermediate.checked_mul(2).ok_or_else(|| {
+                            ParallelPlanError::InvalidTensor(
+                                "fused gate/up width overflowed usize".into(),
+                            )
+                        })?;
+                        vec![(
+                            field,
+                            width,
+                            MemberSharding::PartitionedSegments {
+                                axis: 0,
+                                segments: vec![0..intermediate, intermediate..width],
+                            },
+                        )]
+                    }
+                };
+                for (field, width, sharding) in inputs {
+                    feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                        format!("{feed_forward_prefix}.{field}.weight"),
+                        vec![width, hidden],
+                        sharding.clone(),
+                    ));
+                    if config.mlp_bias() {
+                        feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                            format!("{feed_forward_prefix}.{field}.bias"),
+                            vec![width],
+                            sharding,
+                        ));
+                    }
+                }
+                feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                    format!(
+                        "{feed_forward_prefix}.{}.weight",
+                        fields.feed_forward_output
+                    ),
+                    vec![hidden, intermediate],
+                    MemberSharding::Partitioned { axis: 1 },
+                ));
+                if config.mlp_bias() {
+                    feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
+                        format!("{feed_forward_prefix}.{}.bias", fields.feed_forward_output),
+                        vec![hidden],
+                        MemberSharding::Replicated,
+                    ));
+                }
+                let feed_forward = ParameterGroupSpec::partitioned(
+                    format!("{feed_forward_prefix}.projections"),
+                    ParameterRole::FeedForwardIntermediate,
+                    feed_forward_units,
+                    feed_forward_members,
+                )?;
+                let feed_forward = crate::linear_format::dense_ffn_partition_tail(
+                    feed_forward,
                     intermediate,
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-            ],
-            GatedProjectionLayout::Fused { field } => {
-                let width = intermediate.checked_mul(2).ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor("fused gate/up width overflowed usize".into())
-                })?;
-                vec![(
-                    field,
-                    width,
-                    MemberSharding::PartitionedSegments {
-                        axis: 0,
-                        segments: vec![0..intermediate, intermediate..width],
-                    },
-                )]
+                    format(&format!(
+                        "{feed_forward_prefix}.{}.weight",
+                        fields.feed_forward_output
+                    )),
+                    |name| format(name),
+                )?;
+                vec![feed_forward]
             }
         };
-        for (field, width, sharding) in inputs {
-            feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                format!("{feed_forward_prefix}.{field}.weight"),
-                vec![width, hidden],
-                sharding.clone(),
-            ));
-            if config.mlp_bias() {
-                feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                    format!("{feed_forward_prefix}.{field}.bias"),
-                    vec![width],
-                    sharding,
-                ));
-            }
-        }
-        feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-            format!(
-                "{feed_forward_prefix}.{}.weight",
-                fields.feed_forward_output
-            ),
-            vec![hidden, intermediate],
-            MemberSharding::Partitioned { axis: 1 },
-        ));
-        if config.mlp_bias() {
-            feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
-                format!("{feed_forward_prefix}.{}.bias", fields.feed_forward_output),
-                vec![hidden],
-                MemberSharding::Replicated,
-            ));
-        }
-        let feed_forward = ParameterGroupSpec::partitioned(
-            format!("{feed_forward_prefix}.projections"),
-            ParameterRole::FeedForwardIntermediate,
-            feed_forward_units,
-            feed_forward_members,
-        )?;
-        let feed_forward = crate::linear_format::dense_ffn_partition_tail(
-            feed_forward,
-            intermediate,
-            config.linear_format(&format!(
-                "{feed_forward_prefix}.{}.weight",
-                fields.feed_forward_output
-            )),
-            |name| config.linear_format(name),
-        )?;
         let input_norm = ParameterGroupSpec::new(
             format!("{prefix}.{}", fields.input_norm),
             ParameterRole::Replicated,
@@ -3671,21 +3881,16 @@ fn parameter_description_with_vocabulary(
             )],
         )?;
         let mut unit_groups = vec![attention];
-        for name in [
-            config.block_output_normalization(layer),
-            config.attention_output_normalization(layer),
-            config.feed_forward_output_normalization(layer),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            unit_groups.push(ParameterGroupSpec::new(
-                name.trim_end_matches(".weight"),
-                ParameterRole::Replicated,
+        if config.learned_attention_sinks() {
+            let name = format!("{attention_prefix}.{}", fields.attention_sinks);
+            unit_groups.push(ParameterGroupSpec::partitioned(
+                name.clone(),
+                ParameterRole::AttentionHeads,
+                query_heads,
                 [eredu_runtime::ParameterMemberSpec::new(
-                    &name,
-                    vec![hidden],
-                    MemberSharding::Replicated,
+                    name,
+                    vec![query_heads],
+                    MemberSharding::Partitioned { axis: 0 },
                 )],
             )?);
         }
@@ -3717,42 +3922,42 @@ fn parameter_description_with_vocabulary(
                 });
             }
         }
-        unit_groups.extend([input_norm, post_attention_norm]);
-        if let Some(groups) = replacement_groups(layer)? {
-            unit_groups.extend(groups);
-        } else {
-            unit_groups.push(feed_forward);
+        for name in [
+            config.attention_output_normalization(layer),
+            config.feed_forward_output_normalization(layer),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            unit_groups.push(ParameterGroupSpec::new(
+                name.trim_end_matches(".weight"),
+                ParameterRole::Replicated,
+                [eredu_runtime::ParameterMemberSpec::new(
+                    &name,
+                    vec![hidden],
+                    MemberSharding::Replicated,
+                )],
+            )?);
         }
+        unit_groups.extend([input_norm, post_attention_norm]);
+        unit_groups.extend(feed_forward_groups);
         for group in unit_groups {
-            let group = head_partition.apply(group, |name| config.linear_format(name))?;
+            let group = head_partition.apply(group, |name| format(name))?;
             owned.push(OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::execution_unit(group_id.clone(), layer),
+                ParameterGroupOwner::execution_unit_consumers(
+                    group_id.clone(),
+                    owner,
+                    consumers.iter().copied(),
+                ),
                 group,
             ));
         }
     }
 
-    let mut expanded = Vec::with_capacity(owned.len());
-    for tagged in owned {
-        let owner = tagged.owner().clone();
-        let [group] = eredu_runtime::expand_linear_format_parameter_groups(
-            vec![tagged.into_group()],
-            |member| {
-                crate::linear_format::standard_parallel_linear_format(
-                    member,
-                    config.linear_format(member.target()),
-                )
-            },
-        )?
-        .try_into()
-        .expect("one parameter group expands to one parameter group");
-        expanded.push(OwnedParameterGroupSpec::new(owner, group));
-    }
-    let expected = expanded
-        .iter()
-        .map(|tagged| tagged.group().clone())
-        .collect::<Vec<_>>();
-    ArchitectureParameterDescription::new(&graph, &layout, expected, expanded)
+    let expanded = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
+        crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
+    })?;
+    ArchitectureParameterDescription::from_owned(&graph, &layout, expanded)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
 }
 
@@ -3847,32 +4052,218 @@ pub struct StaticModuleSpec {
     pub normalization_epsilon: f32,
     /// Fixed scalar added to the learned final-normalization scale.
     pub normalization_offset: f32,
-    /// Packed embedding format, when supported by the general embedding operator.
-    pub embedding_quantization: Option<WeightQuantization>,
+    /// Complete embedding physical encoding, including its declared companions.
+    pub embedding_format: LinearFormat,
     /// Complete output-head physical encoding.
     pub head_format: LinearFormat,
     /// Whether output logits reuse the embedding table.
     pub tied_head: bool,
 }
 
-impl StaticModuleSpec {
-    fn construction_specs(
+/// Validated ordinary pinned construction, retaining the full normalization policy.
+pub(crate) struct StaticModuleConstruction {
+    embedding: EmbeddingSpec,
+    head: Option<LinearSpec>,
+    normalization: NormalizationConstructionSpec,
+}
+
+impl StaticModuleConstruction {
+    pub(crate) fn new(
+        embedding: EmbeddingSpec,
+        head: Option<LinearSpec>,
+        normalization: NormalizationConstructionSpec,
+    ) -> Result<Self, Error> {
+        validate_vocabulary_specs(&embedding, head.as_ref())?;
+        normalization.validate()?;
+        if normalization.dimensions != embedding.dimensions {
+            return Err(Error::backend(
+                "final normalization and embedding widths differ",
+            ));
+        }
+        Ok(Self {
+            embedding,
+            head,
+            normalization,
+        })
+    }
+
+    /// Projects logical embedding, normalization and readout resources before
+    /// encoding expansion. Families retain group names and format admission;
+    /// explicit resource roles remain independent of group ordering.
+    pub(crate) fn logical_pinned_parameter_groups(
         &self,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+        let embedding = &self.embedding;
+        let head = &self.head;
+        let normalization_weight = match &self.normalization.scale {
+            eredu_nn::NormalizationScale::Learned(weight)
+            | eredu_nn::NormalizationScale::LearnedOffset { weight, .. } => weight,
+            eredu_nn::NormalizationScale::Unit => {
+                return Err(ParallelPlanError::InvalidGroup(
+                    "pinned normalization catalog requires a learned scale".into(),
+                ));
+            }
+        };
+        let group = |name: &str, role, target: &str, shape, sharding| {
+            ParameterGroupSpec::new(
+                name,
+                role,
+                [eredu_runtime::ParameterMemberSpec::new(
+                    target, shape, sharding,
+                )],
+            )
+        };
+        let mut groups = vec![
+            (
+                "embedding",
+                group(
+                    embedding_group,
+                    ParameterRole::Vocabulary,
+                    embedding.weight.id.as_str(),
+                    vec![embedding.vocabulary as usize, embedding.dimensions as usize],
+                    MemberSharding::Balanced { axis: 0 },
+                )?,
+            ),
+            (
+                "norm",
+                group(
+                    normalization_group,
+                    ParameterRole::Replicated,
+                    normalization_weight.id.as_str(),
+                    vec![embedding.dimensions as usize],
+                    MemberSharding::Replicated,
+                )?,
+            ),
+        ];
+        if let Some(head) = head {
+            let mut members = vec![eredu_runtime::ParameterMemberSpec::new(
+                head.weight.id.as_str(),
+                vec![head.output as usize, head.input as usize],
+                MemberSharding::Balanced { axis: 0 },
+            )];
+            if let Some(bias) = &head.bias {
+                members.push(eredu_runtime::ParameterMemberSpec::new(
+                    bias.id.as_str(),
+                    vec![head.output as usize],
+                    MemberSharding::Balanced { axis: 0 },
+                ));
+            }
+            groups.push((
+                "output",
+                ParameterGroupSpec::new(output_group, ParameterRole::Vocabulary, members)?,
+            ));
+        }
+        Ok(groups)
+    }
+
+    /// Projects physical pinned groups from the same admitted formats used by
+    /// construction. Resource roles survive encoding and companion expansion.
+    pub(crate) fn pinned_parameter_groups(
+        &self,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+        eredu_runtime::expand_tagged_linear_format_parameter_groups(
+            self.logical_pinned_parameter_groups(
+                embedding_group,
+                normalization_group,
+                output_group,
+            )?,
+            |member| {
+                let format = if member.target() == self.embedding.weight.id.as_str() {
+                    Some(self.embedding.format.clone())
+                } else {
+                    self.head
+                        .as_ref()
+                        .filter(|head| member.target() == head.weight.id.as_str())
+                        .map(|head| head.format.clone())
+                };
+                Ok(format)
+            },
+        )
+    }
+
+    /// Projects only vocabulary resources physically retained by a selected layout.
+    pub(crate) fn selected_vocabulary_ranges(
+        &self,
+        layout: &LocalModelLayout,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
     ) -> Result<
         (
-            EmbeddingSpec,
-            Option<LinearSpec>,
-            NormalizationConstructionSpec,
+            Option<VocabularyParallelRange>,
+            Option<VocabularyParallelRange>,
         ),
-        Error,
+        ParallelPlanError,
     > {
+        let groups =
+            self.pinned_parameter_groups(embedding_group, normalization_group, output_group)?;
+        let global_vocabulary = self.embedding.vocabulary as usize;
+        let range = |role| -> Result<_, ParallelPlanError> {
+            let Some((_, group)) = groups.iter().find(|(resource, _)| *resource == role) else {
+                return Ok(None);
+            };
+            Ok(eredu_runtime::balanced_parameter_group_range_if_present(
+                group,
+                layout,
+                0,
+                global_vocabulary,
+            )?
+            .map(|local| VocabularyParallelRange {
+                global_vocabulary,
+                local,
+            }))
+        };
+        Ok((range("embedding")?, range("output")?))
+    }
+
+    /// Projects exact vocabulary intervals from declared physical storage.
+    /// Runtime validates row companions and replicas; tied readout retains one owner.
+    pub(crate) fn vocabulary_ranges(
+        &self,
+        layout: &LocalModelLayout,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<(VocabularyParallelRange, Option<VocabularyParallelRange>), ParallelPlanError> {
+        let (embedding, output) = self.selected_vocabulary_ranges(
+            layout,
+            embedding_group,
+            normalization_group,
+            output_group,
+        )?;
+        let required = |range: Option<VocabularyParallelRange>, role| {
+            range.ok_or_else(|| {
+                ParallelPlanError::InvalidGroup(format!(
+                    "static declaration has no local {role} resource"
+                ))
+            })
+        };
+        Ok((
+            required(embedding, "embedding")?,
+            if self.head.is_none() {
+                None
+            } else {
+                Some(required(output, "output")?)
+            },
+        ))
+    }
+}
+
+impl StaticModuleSpec {
+    pub(crate) fn construction_specs(&self) -> Result<StaticModuleConstruction, Error> {
         let embedding = EmbeddingSpec {
             vocabulary: self.vocabulary,
             dimensions: self.hidden_size,
             weight: ParameterSpec::trainable(&self.embedding_weight).map_err(Error::backend)?,
             format: crate::linear_format::standard_linear_format(
                 &self.embedding_weight,
-                self.embedding_quantization.into(),
+                self.embedding_format,
             )?,
         };
         let head = (!self.tied_head)
@@ -3889,7 +4280,6 @@ impl StaticModuleSpec {
                 })
             })
             .transpose()?;
-        validate_vocabulary_specs(&embedding, head.as_ref())?;
         let weight =
             ParameterSpec::trainable(&self.normalization_weight).map_err(Error::backend)?;
         let normalization = NormalizationConstructionSpec {
@@ -3906,8 +4296,45 @@ impl StaticModuleSpec {
                 }
             },
         };
-        normalization.validate()?;
-        Ok((embedding, head, normalization))
+        StaticModuleConstruction::new(embedding, head, normalization)
+    }
+
+    /// Projects logical pinned roles from the validated construction declaration.
+    pub(crate) fn logical_pinned_parameter_groups(
+        &self,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+        self.construction_specs()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+            .logical_pinned_parameter_groups(embedding_group, normalization_group, output_group)
+    }
+
+    /// Projects physical storage and companions from the same construction declaration.
+    pub(crate) fn pinned_parameter_groups(
+        &self,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+        self.construction_specs()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+            .pinned_parameter_groups(embedding_group, normalization_group, output_group)
+    }
+
+    /// Projects exact vocabulary intervals from declared physical storage.
+    /// Runtime validates row companions and replicas; tied readout retains one owner.
+    pub(crate) fn vocabulary_ranges(
+        &self,
+        layout: &LocalModelLayout,
+        embedding_group: &str,
+        normalization_group: &str,
+        output_group: &str,
+    ) -> Result<(VocabularyParallelRange, Option<VocabularyParallelRange>), ParallelPlanError> {
+        self.construction_specs()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+            .vocabulary_ranges(layout, embedding_group, normalization_group, output_group)
     }
 
     /// Shared ordinary static-module specification before backend binding.
@@ -3922,7 +4349,7 @@ impl StaticModuleSpec {
             hidden_size: config.hidden_size(),
             normalization_epsilon: config.rms_norm_epsilon(),
             normalization_offset: config.normalization_offset(),
-            embedding_quantization: config.weight_quantization(&embedding_name),
+            embedding_format: config.linear_format(&embedding_name),
             head_format: config.linear_format("lm_head.weight"),
             tied_head: config.tie_word_embeddings(),
         }
@@ -3940,7 +4367,7 @@ impl StaticModuleSpec {
             input: self.hidden_size as u64,
             output: self.vocabulary as u64,
             format: if self.tied_head {
-                self.embedding_quantization.into()
+                self.embedding_format
             } else {
                 self.head_format
             },
@@ -3951,6 +4378,63 @@ impl StaticModuleSpec {
                 self.head_weight.clone()
             },
         })
+    }
+}
+
+// Borrow the actual tied or untied owner for every decoder readout. Instrumentation
+// and vocabulary collectives share this projection without changing normalization.
+struct DecoderOutput<'a, B: NeuralBackend> {
+    embedding: Option<&'a mut B::Embedding>,
+    head: Option<&'a mut B::Linear>,
+}
+impl<B: NeuralBackend> DecoderOutput<'_, B> {
+    fn project(
+        self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let logits = match self.head {
+            Some(head) => {
+                instrumentation.project::<B>("projection_input", head, hidden, None, context)
+            }
+            None => instrumentation.project_embedding(
+                "projection_input",
+                self.embedding
+                    .ok_or_else(|| Error::backend("tied decoder output has no embedding"))?,
+                hidden,
+                context,
+            ),
+        }?;
+        instrumentation.apply("linear", logits)
+    }
+}
+impl<B: eredu_nn::DistributedNeuralBackend> DecoderOutput<'_, B> {
+    fn project_parallel(
+        self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let logits = match self.head {
+            Some(head) => instrumentation.project_vocabulary::<B>(
+                "projection_input",
+                head,
+                hidden,
+                parallel,
+                context,
+            ),
+            None => instrumentation.project_vocabulary_embedding::<B>(
+                "projection_input",
+                self.embedding
+                    .ok_or_else(|| Error::backend("tied decoder output has no embedding"))?,
+                hidden,
+                parallel,
+                context,
+            ),
+        }?;
+        instrumentation.apply("linear", logits)
     }
 }
 
@@ -3992,29 +4476,18 @@ impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let Some(parallel) = parallel else {
-            return self.project_normalized_instrumented(hidden, context, instrumentation);
+        let output = DecoderOutput::<B> {
+            embedding: Some(&mut self.embeddings),
+            head: self.lm_head.as_mut(),
         };
-        let logits = match &mut self.lm_head {
-            Some(head) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                hidden,
-                parallel,
-                context,
-            ),
-            None => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                &mut self.embeddings,
-                hidden,
-                parallel,
-                context,
-            ),
-        }?;
-        instrumentation.apply("linear", logits)
+        match parallel {
+            Some(parallel) => output.project_parallel(hidden, parallel, context, instrumentation),
+            None => output.project(hidden, context, instrumentation),
+        }
     }
 
-    pub(crate) fn finish_parallel_instrumented(
+    /// Applies the declared readout boundary and vocabulary collective with instrumentation.
+    pub fn finish_parallel_instrumented(
         &mut self,
         hidden: &B::Tensor,
         parallel: &B::ParallelContext,
@@ -4042,7 +4515,7 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
     }
 
     /// Applies the actual residual, normalization and affine readout boundaries.
-    pub(crate) fn finish_instrumented(
+    pub fn finish_instrumented(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
@@ -4058,19 +4531,11 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let logits = match &mut self.lm_head {
-            Some(head) => {
-                instrumentation.project::<B>("projection_input", head, hidden, None, context)
-            }
-            None => instrumentation.project_embedding(
-                "projection_input",
-                &mut self.embeddings,
-                hidden,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
-        Ok(logits)
+        DecoderOutput::<B> {
+            embedding: Some(&mut self.embeddings),
+            head: self.lm_head.as_mut(),
+        }
+        .project(hidden, context, instrumentation)
     }
 
     /// Embeds token IDs and applies the architecture's residual expansion.
@@ -4179,7 +4644,11 @@ impl<B: NeuralBackend> StaticModules<B> {
         spec: StaticModuleSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let (embedding, head, normalization) = spec.construction_specs()?;
+        let StaticModuleConstruction {
+            embedding,
+            head,
+            normalization,
+        } = spec.construction_specs()?;
         let boundary = NormalizedBoundary::new(normalization, context)?;
         Self::from_boundary(embedding, head, boundary, context)
     }
@@ -4194,7 +4663,11 @@ impl<B: NeuralBackend> StaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let (embedding, head, normalization) = spec.construction_specs()?;
+        let StaticModuleConstruction {
+            embedding,
+            head,
+            normalization,
+        } = spec.construction_specs()?;
         let boundary = NormalizedBoundary::new(normalization, context)?;
         Self::from_parallel_boundary(
             embedding,
@@ -4466,9 +4939,76 @@ impl<T> ForwardContext<T> {
     pub fn visibility_mask(&self) -> Option<&T> {
         self.mask.as_ref()
     }
+
+    /// Borrows the same invocation geometry for every ordinary block equation.
+    fn attention_input<'a, C>(
+        &'a self,
+        hidden: &'a T,
+        cache: &'a mut C,
+    ) -> AttentionInput<'a, T, C> {
+        AttentionInput {
+            hidden,
+            selected_positions: None,
+            mask: self.mask.as_ref(),
+            cache: Some(cache),
+            allow_sliding_prefill: self.allow_sliding_prefill,
+            rotary_position: self
+                .rotary_embeddings
+                .as_ref()
+                .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
+        }
+    }
 }
 
-/// Statically dispatched construction policy for one decoder block family.
+// Full and selected decoder models resolve visibility through the same ingress.
+// The caller supplies the state ordinal in its own selected state view.
+#[allow(clippy::too_many_arguments)]
+fn begin_decoder_hidden<B, S>(
+    hidden: B::Tensor,
+    supplied_mask: Option<&B::Tensor>,
+    rotary_embeddings: Option<(&B::Tensor, &B::Tensor)>,
+    state: &mut S,
+    expected: Option<&StateLayout>,
+    first_state_ordinal: usize,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    if state.optional_layout() != expected {
+        return Err(Error::backend(format!(
+            "decoder runtime state layout {:?} does not match architecture layout {expected:?}",
+            state.optional_layout()
+        )));
+    }
+    let sequence = hidden.dim(1);
+    let mask = if let Some(mask) = supplied_mask {
+        Some(mask.clone())
+    } else if sequence > 1 && expected.is_some() {
+        let cache = state.layer(first_state_ordinal).map_err(Error::backend)?;
+        // The shared mask is consumed by full-attention layers. Sliding
+        // layers use their typed window-aware attention path, so deriving
+        // this mask from layer zero's retention policy would incorrectly
+        // impose that window on later full-attention layers.
+        Some(B::causal_mask(sequence, cache.offset(), None, context)?)
+    } else {
+        None
+    };
+    Ok(LayeredForwardState {
+        hidden,
+        context: ForwardContext {
+            mask,
+            allow_sliding_prefill: supplied_mask.is_none(),
+            rotary_embeddings: rotary_embeddings
+                .map(|(cosine, sine)| (cosine.clone(), sine.clone())),
+        },
+    })
+}
+
+/// Typed projection construction and parameter policy for one decoder block family.
+/// The shared constructor owns attention, residual and terminal assembly.
 pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
     /// Architecture-selected feed-forward policy inside the shared block.
     type FeedForward: DecoderProjectionOperator<B>;
@@ -4479,34 +5019,37 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
         Ok(())
     }
 
-    /// Builds one unloaded decoder block.
-    fn build(
+    /// Admits factory-specific global/local policy before allocating body resources.
+    /// Ordinary factories validate local construction; routed factories retain
+    /// global cardinality checks independently of owner-local bank dimensions.
+    fn validate_partitioned(global: &C, local: &C) -> Result<(), Error> {
+        let _ = global;
+        Self::validate(local)
+    }
+
+    /// Builds the family-selected projection resources inside an ordinary body.
+    fn build_feed_forward(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B, Self::FeedForward>, Error>;
+    ) -> Result<Self::FeedForward, Error>;
 
-    /// Builds one partition-local block while retaining global family policy.
-    ///
-    /// Dense families use only the localized configuration. Routed families
-    /// override this hook so the router keeps global expert cardinality while
-    /// the grouped bank uses owner-local EP and TP geometry.
-    fn build_partitioned(
+    /// Retains global routing cardinality while constructing owner-local banks.
+    /// Ordinary dense projection policies consume only the localized configuration.
+    fn build_partitioned_feed_forward(
         global: &C,
         local: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B, Self::FeedForward>, Error> {
+    ) -> Result<Self::FeedForward, Error> {
         let _ = global;
-        Self::build(local, layer, context)
+        Self::build_feed_forward(local, layer, context)
     }
 
-    /// Declares the complete neutral parameter placement for one built block.
-    fn parameter_groups(
-        block: &TransformerBlock<B, Self::FeedForward>,
+    /// Declares canonical global parameter topology without native resources.
+    fn parameter_description(
         config: &C,
-        layer: usize,
-    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>;
+    ) -> Result<ArchitectureParameterDescription, ParallelPlanError>;
 }
 
 /// Feed-forward policy that can delegate routed experts to runtime residency.
@@ -4655,41 +5198,31 @@ pub struct DenseBlockFactory;
 impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
     type FeedForward = Mlp<B>;
 
-    fn build(
+    fn build_feed_forward(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B, Self::FeedForward>, Error> {
-        TransformerBlock::new(config, layer, context)
+    ) -> Result<Self::FeedForward, Error> {
+        Mlp::new(config, layer, context)
     }
 
-    fn parameter_groups(
-        block: &TransformerBlock<B, Self::FeedForward>,
+    fn parameter_description(
         config: &C,
-        layer: usize,
-    ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-        layer_parallel_parameter_groups(block, config, layer)
+    ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+        dense_parameter_description(config)
     }
 }
 
-/// Shared layered decoder lifecycle over architecture configuration and block policy.
-pub struct LayeredModel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
-    args: C,
-    static_modules: StaticModules<B>,
-    parallel_geometry: Option<std::sync::Arc<LocalGeometry<C>>>,
-    block_factory: std::marker::PhantomData<fn() -> P>,
-}
+/// Shared runtime adapter for a complete decoder and its typed resource aggregate.
+pub type LayeredModel<B, C, P = DenseBlockFactory> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    CompleteDecoderKernel<B, C, P>,
+    eredu_runtime::KernelParameterModules,
+>;
 
-impl<B: NeuralBackend, C: Config + Clone, P> Clone for LayeredModel<B, C, P> {
-    fn clone(&self) -> Self {
-        Self {
-            args: self.args.clone(),
-            static_modules: self.static_modules.clone(),
-            parallel_geometry: self.parallel_geometry.clone(),
-            block_factory: std::marker::PhantomData,
-        }
-    }
-}
+/// Complete decoder equations, with ordinary or tensor-local geometry.
+pub type CompleteDecoderKernel<B, C, P = DenseBlockFactory> =
+    DecoderKernel<B, C, P, StaticModules<B>, CompleteDecoderGeometry<C>>;
 
 /// Pinned decoder modules physically present on one pipeline partition.
 #[derive(Debug, eredu_nn::Parameterized)]
@@ -4703,6 +5236,97 @@ pub struct PartitionStaticModules<B: NeuralBackend> {
     pub lm_head: Option<B::Linear>,
 }
 
+impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
+    /// Materializes only canonical pinned roles selected before native allocation.
+    pub(crate) fn from_selected_spec(
+        spec: StaticModuleSpec,
+        vocabulary: Option<(VocabularyParallelRange, Option<VocabularyParallelRange>)>,
+        owns: impl Fn(&str) -> bool,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let construction = spec.construction_specs()?;
+        if let Some((embedding_range, output_range)) = &vocabulary {
+            embedding_range.validate_global_rows(construction.embedding.vocabulary)?;
+            if construction.head.is_some() != output_range.is_some() {
+                return Err(Error::backend(
+                    "vocabulary ownership differs from tied or independent readout",
+                ));
+            }
+            if let (Some(head), Some(range)) = (&construction.head, output_range) {
+                range.validate_global_rows(head.output)?;
+            }
+        }
+        let embedding = if owns("embedding") {
+            vocabulary
+                .as_ref()
+                .map_or(VocabularyModulePlacement::Local, |(range, _)| {
+                    VocabularyModulePlacement::VocabularyParallel(range.clone())
+                })
+        } else {
+            VocabularyModulePlacement::Omitted
+        };
+        let norm = owns("norm");
+        let head = if construction.head.is_some() && owns("output") {
+            vocabulary
+                .as_ref()
+                .map_or(VocabularyModulePlacement::Local, |(_, range)| {
+                    VocabularyModulePlacement::VocabularyParallel(
+                        range.clone().expect("validated output range"),
+                    )
+                })
+        } else {
+            VocabularyModulePlacement::Omitted
+        };
+        Self::from_construction(construction, embedding, head, norm, context)
+    }
+
+    /// Materializes validated resources with independently selected vocabulary owners.
+    pub(crate) fn from_construction(
+        construction: StaticModuleConstruction,
+        embedding: VocabularyModulePlacement,
+        head: VocabularyModulePlacement,
+        owns_norm: bool,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let StaticModuleConstruction {
+            embedding: embedding_spec,
+            head: head_spec,
+            normalization,
+        } = construction;
+        embedding.validate_rows(embedding_spec.vocabulary)?;
+        if let Some(spec) = &head_spec {
+            head.validate_rows(spec.output)?;
+        } else if !matches!(head, VocabularyModulePlacement::Omitted) {
+            return Err(Error::backend(
+                "selected output has no vocabulary projection",
+            ));
+        }
+        let embeddings = embedding.materialize_embedding::<B>(embedding_spec, context)?;
+        let norm = owns_norm
+            .then(|| B::normalization(normalization, context))
+            .transpose()?;
+        let lm_head = match head_spec {
+            Some(spec) => head.materialize_linear::<B>(spec, context)?,
+            None => None,
+        };
+        Ok(Self {
+            embeddings,
+            norm,
+            lm_head,
+        })
+    }
+}
+
+impl<B: NeuralBackend> From<StaticModules<B>> for PartitionStaticModules<B> {
+    fn from(modules: StaticModules<B>) -> Self {
+        Self {
+            embeddings: Some(modules.embeddings),
+            norm: Some(modules.boundary.norm),
+            lm_head: modules.lm_head,
+        }
+    }
+}
+
 impl<B: NeuralBackend> Clone for PartitionStaticModules<B> {
     fn clone(&self) -> Self {
         Self {
@@ -4713,78 +5337,197 @@ impl<B: NeuralBackend> Clone for PartitionStaticModules<B> {
     }
 }
 
-impl<B: eredu_nn::DistributedNeuralBackend> PartitionStaticModules<B> {
-    /// Shared readout for an output-owning pipeline partition.
-    pub(crate) fn finish_instrumented(
+/// Canonical pinned decoder roles borrowed from their physical module owners.
+pub struct DecoderResources<'a, B: NeuralBackend> {
+    /// Input or tied-output embedding, when physically retained.
+    pub embedding: Option<&'a B::Embedding>,
+    /// Final normalization, when physically retained.
+    pub norm: Option<&'a B::Normalization>,
+    /// Untied output head, when physically retained.
+    pub head: Option<&'a B::Linear>,
+}
+
+/// Mutable access to the same physical pinned decoder roles.
+pub struct DecoderResourcesMut<'a, B: NeuralBackend> {
+    /// Input or tied-output embedding, when physically retained.
+    pub embedding: Option<&'a mut B::Embedding>,
+    /// Final normalization, when physically retained.
+    pub norm: Option<&'a mut B::Normalization>,
+    /// Untied output head, when physically retained.
+    pub head: Option<&'a mut B::Linear>,
+}
+
+/// Typed access to complete or selected pinned resources without a second owner.
+pub trait DecoderStaticResources<B: NeuralBackend>:
+    eredu_nn::Parameterized<B::Tensor> + 'static
+{
+    /// Borrows the canonical roles actually allocated by this aggregate.
+    fn decoder_resources(&self) -> DecoderResources<'_, B>;
+    /// Mutably borrows those same roles for equations and parameter editing.
+    fn decoder_resources_mut(&mut self) -> DecoderResourcesMut<'_, B>;
+}
+impl<B: NeuralBackend> DecoderStaticResources<B> for StaticModules<B> {
+    fn decoder_resources(&self) -> DecoderResources<'_, B> {
+        DecoderResources {
+            embedding: Some(&self.embeddings),
+            norm: Some(&self.boundary.norm),
+            head: self.lm_head.as_ref(),
+        }
+    }
+    fn decoder_resources_mut(&mut self) -> DecoderResourcesMut<'_, B> {
+        DecoderResourcesMut {
+            embedding: Some(&mut self.embeddings),
+            norm: Some(&mut self.boundary.norm),
+            head: self.lm_head.as_mut(),
+        }
+    }
+}
+impl<B: NeuralBackend> DecoderStaticResources<B> for PartitionStaticModules<B> {
+    fn decoder_resources(&self) -> DecoderResources<'_, B> {
+        DecoderResources {
+            embedding: self.embeddings.as_ref(),
+            norm: self.norm.as_ref(),
+            head: self.lm_head.as_ref(),
+        }
+    }
+    fn decoder_resources_mut(&mut self) -> DecoderResourcesMut<'_, B> {
+        DecoderResourcesMut {
+            embedding: self.embeddings.as_mut(),
+            norm: self.norm.as_mut(),
+            head: self.lm_head.as_mut(),
+        }
+    }
+}
+impl<B: NeuralBackend> DecoderResources<'_, B> {
+    /// Visits each physically retained canonical decoder role once.
+    pub fn visit<V: eredu_runtime::StaticParameterVisitor<B>>(
+        self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(embedding) = self.embedding {
+            visitor.visit("embedding", embedding)?;
+        }
+        if let Some(norm) = self.norm {
+            visitor.visit("norm", norm)?;
+        }
+        if let Some(head) = self.head {
+            visitor.visit("output", head)?;
+        }
+        Ok(())
+    }
+}
+impl<'a, B: NeuralBackend> DecoderResourcesMut<'a, B> {
+    /// Mutably visits the same canonical roles and physical resources.
+    pub fn visit<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+        self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(embedding) = self.embedding {
+            visitor.visit_mut("embedding", embedding)?;
+        }
+        if let Some(norm) = self.norm {
+            visitor.visit_mut("norm", norm)?;
+        }
+        if let Some(head) = self.head {
+            visitor.visit_mut("output", head)?;
+        }
+        Ok(())
+    }
+    fn input_embedding(self) -> Result<&'a mut B::Embedding, Error> {
+        self.embedding
+            .ok_or_else(|| Error::backend("decoder does not own input embedding"))
+    }
+    pub(crate) fn normalize(
         &mut self,
         hidden: &B::Tensor,
-        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let norm = self
             .norm
-            .as_mut()
-            .ok_or_else(|| Error::backend("decoder partition does not own final normalization"))?;
-        let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
-        let logits = match (parallel, self.lm_head.as_mut()) {
-            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, Some(head)) => {
-                instrumentation.project::<B>("projection_input", head, &hidden, None, context)
-            }
-            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                self.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, None) => instrumentation.project_embedding(
-                "projection_input",
-                self.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
-        Ok(logits)
+            .as_deref_mut()
+            .ok_or_else(|| Error::backend("decoder does not own final normalization"))?;
+        instrumentation.normalize_readout(hidden, norm, context)
+    }
+    fn finish(
+        mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.normalize(hidden, context, instrumentation)?;
+        DecoderOutput::<B> {
+            embedding: self.embedding,
+            head: self.head,
+        }
+        .project(&hidden, context, instrumentation)
+    }
+    /// Projects without normalization through the actually retained vocabulary owner.
+    pub(crate) fn project(
+        self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        let output = DecoderOutput::<B> {
+            embedding: self.embedding,
+            head: self.head,
+        };
+        match parallel {
+            Some(parallel) => output.project_parallel(hidden, parallel, context, instrumentation),
+            None => output.project(hidden, context, instrumentation),
+        }
+    }
+    pub(crate) fn finish_parallel(
+        mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        let Some(parallel) = parallel else {
+            return self.finish(hidden, context, instrumentation);
+        };
+        let hidden = self.normalize(hidden, context, instrumentation)?;
+        DecoderOutput::<B> {
+            embedding: self.embedding,
+            head: self.head,
+        }
+        .project_parallel(&hidden, parallel, context, instrumentation)
     }
 }
 
 /// Backend-neutral geometry retained by one genuinely pipeline-local decoder.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PartitionLocalGeometry<C> {
     owned_units: Range<usize>,
-    blocks: Vec<C>,
+    owned_state: Option<Range<usize>>,
+    blocks: std::collections::BTreeMap<usize, C>,
     embedding_range: VocabularyParallelRange,
     output_range: Option<VocabularyParallelRange>,
     complete_state_layout: StateLayout,
 }
 
 impl<C: Config> PartitionLocalGeometry<C> {
-    /// Returns the architecture-global execution-unit range allocated locally.
+    /// Returns the selected equation range, including stateless operations.
     pub fn owned_units(&self) -> Range<usize> {
         self.owned_units.clone()
     }
 
-    /// Returns the local configuration for one architecture-global unit.
+    /// Returns one selected canonical parameter owner's construction geometry.
+    /// Its address may lie outside this partition's logical invocation range.
     pub fn block(&self, global_unit: usize) -> Option<&C> {
-        self.owned_units
-            .contains(&global_unit)
-            .then(|| &self.blocks[global_unit - self.owned_units.start])
+        self.blocks.get(&global_unit)
     }
 
-    /// Returns the number of locally allocated unit configurations.
+    /// Returns the number of selected physical owner configurations.
     pub fn local_unit_count(&self) -> usize {
         self.blocks.len()
     }
@@ -4795,96 +5538,218 @@ impl<C: Config> PartitionLocalGeometry<C> {
     }
 }
 
-/// A dense decoder whose modules are limited to one admitted pipeline partition.
-pub struct PartitionedLayeredModel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
-    args: C,
-    static_modules: PartitionStaticModules<B>,
-    geometry: PartitionLocalGeometry<C>,
+/// Geometry operations required by the common decoder equations.
+pub trait DecoderGeometry<C: Config>: 'static {
+    /// Whether ordinary text requests admit chunked prefill.
+    const CHUNKED_PREFILL: bool = false;
+    /// Whether text-only readout narrows hidden state before projection.
+    const FINAL_TEXT_POSITION: bool = false;
+    /// Complete local-head state geometry before pipeline slicing.
+    fn complete_state_layout(&self) -> &StateLayout;
+    /// Selected operation range, independent of cache ownership.
+    fn owned_units(&self) -> Range<usize>;
+    /// Logical cache slots owned independently of operation addresses.
+    fn owned_state(&self) -> Option<Range<usize>>;
+    /// Construction geometry of one selected canonical physical owner.
+    /// Mutable-state ownership is checked independently by `state_index`.
+    fn block<'a>(&'a self, global: &'a C, index: usize, layer: usize) -> Result<&'a C, Error>;
+    /// Ordinary ingress can require replicated state even on a TP-constructed kernel.
+    fn ordinary_state_layout<'a>(
+        &'a self,
+        _global: &C,
+    ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
+        Ok(std::borrow::Cow::Borrowed(self.complete_state_layout()))
+    }
+    /// Tensor-parallel ingress requires an admitted rank-local realization.
+    fn parallel_state_layout(&self) -> Result<&StateLayout, Error> {
+        Ok(self.complete_state_layout())
+    }
+    /// State ordinal in this kernel's local cache view.
+    fn state_index(&self, index: usize) -> Result<usize, Error> {
+        let owned = self
+            .owned_state()
+            .ok_or_else(|| Error::backend("stateless decoder partition"))?;
+        if !owned.contains(&index) {
+            return Err(Error::backend(format!(
+                "decoder cache slot {index} is outside owned range {owned:?}"
+            )));
+        }
+        Ok(index - owned.start)
+    }
+    /// Complete low-level calls select their own cache origin; selected state is already sliced.
+    fn partition_state_ordinal(&self, _requested: usize) -> usize {
+        0
+    }
+}
+
+/// Complete decoder geometry projected from its retained declaration and TP plan.
+#[derive(Clone)]
+pub struct CompleteDecoderGeometry<C> {
+    parallel: Option<std::sync::Arc<LocalGeometry<C>>>,
+    state: StateLayout,
+    units: usize,
+}
+impl<C: Config> DecoderGeometry<C> for CompleteDecoderGeometry<C> {
+    const CHUNKED_PREFILL: bool = CHUNKED_TEXT_PREFILL;
+    const FINAL_TEXT_POSITION: bool = true;
+    fn complete_state_layout(&self) -> &StateLayout {
+        &self.state
+    }
+    fn owned_units(&self) -> Range<usize> {
+        0..self.units
+    }
+    fn owned_state(&self) -> Option<Range<usize>> {
+        Some(0..self.state.len())
+    }
+    fn block<'a>(&'a self, global: &'a C, _index: usize, layer: usize) -> Result<&'a C, Error> {
+        self.state_index(layer)?;
+        match &self.parallel {
+            Some(geometry) => geometry.block(layer).ok_or_else(|| {
+                Error::backend(format!("decoder local geometry is missing block {layer}"))
+            }),
+            None => Ok(global),
+        }
+    }
+    fn ordinary_state_layout<'a>(
+        &'a self,
+        global: &C,
+    ) -> Result<std::borrow::Cow<'a, StateLayout>, Error> {
+        match self.parallel {
+            Some(_) => state_layout(global).map(std::borrow::Cow::Owned),
+            None => Ok(std::borrow::Cow::Borrowed(&self.state)),
+        }
+    }
+    fn parallel_state_layout(&self) -> Result<&StateLayout, Error> {
+        self.parallel
+            .as_ref()
+            .map(|geometry| geometry.state_layout())
+            .ok_or_else(|| Error::backend("decoder model was not built with local geometry"))
+    }
+    fn partition_state_ordinal(&self, requested: usize) -> usize {
+        requested
+    }
+}
+impl<C: Config> DecoderGeometry<C> for PartitionLocalGeometry<C> {
+    fn complete_state_layout(&self) -> &StateLayout {
+        &self.complete_state_layout
+    }
+    fn owned_units(&self) -> Range<usize> {
+        self.owned_units.clone()
+    }
+    fn owned_state(&self) -> Option<Range<usize>> {
+        self.owned_state.clone()
+    }
+    fn block<'a>(&'a self, _global: &'a C, index: usize, _layer: usize) -> Result<&'a C, Error> {
+        self.block(index).ok_or_else(|| {
+            Error::backend(format!(
+                "decoder physical owner {index} is not selected for construction"
+            ))
+        })
+    }
+}
+
+/// Shared runtime adapter over an admitted decoder partition and its typed equations.
+pub type PartitionedLayeredModel<B, C, P = DenseBlockFactory> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    DecoderKernel<B, C, P>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Declares decoder operations and resource ownership without native allocation.
+pub fn component_definition<C: Config>(
+    args: &C,
     parameters: ArchitectureParameterDescription,
-    block_factory: std::marker::PhantomData<fn() -> P>,
-}
+    state: StateLayout,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    let schedule = DecoderSchedule::new(args)?;
+    if parameters.graph().groups().len() != 1
+        || parameters.graph().groups()[0].id() != TEXT_DECODER_EXECUTION_GROUP
+        || parameters.unit_layout().len() != schedule.len()
+        || (0..schedule.len()).any(|index| {
+            parameters
+                .unit_layout()
+                .address(index)
+                .is_none_or(|address| address.index() != index)
+        })
+        || state.len() != args.num_hidden_layers() as usize
+    {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: "text_decoder".into(),
+            resource: "configured operation or cache identities".into(),
+        }
+        .into());
+    }
 
-fn partition_static_modules<B, C>(
-    config: &C,
-    geometry: &PartitionLocalGeometry<C>,
-    ownership: &eredu_runtime::PartitionOwnership,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<PartitionStaticModules<B>, Error>
-where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: Config,
-{
-    let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
-    let embeddings = (ownership.owns_input()
-        || (ownership.owns_output() && config.tie_word_embeddings()))
-    .then(|| {
-        B::vocabulary_parallel_embedding(
-            EmbeddingSpec {
-                vocabulary: config.vocabulary_size(),
-                dimensions: config.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &embedding_name,
-                    config.linear_format(&embedding_name),
-                )?,
+    let units = (0..parameters.unit_layout().len())
+        .map(|ordinal| {
+            parameters
+                .unit_layout()
+                .address(ordinal)
+                .expect("declared unit")
+        })
+        .map(|address| eredu_runtime::ComponentUnit {
+            path: schedule
+                .path(args, address.index())
+                .expect("declared operation"),
+            state: match schedule
+                .operation(address.index())
+                .expect("declared operation")
+            {
+                DecoderOperation::Body { layer } => layer..layer + 1,
+                DecoderOperation::Terminal { .. } => 0..0,
             },
-            geometry.embedding_range.clone(),
-            context,
-        )
-    })
-    .transpose()?;
-    let norm = ownership
-        .owns_output()
-        .then(|| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    reduction: eredu_nn::NormalizationReduction::Native,
-                    groups: config.normalization_groups(),
-                    dimensions: config.hidden_size(),
-                    epsilon: config.rms_norm_epsilon(),
-                    scale: normalization_scale(
-                        ParameterSpec::trainable(format!(
-                            "{}.norm.weight",
-                            config.parameter_root()
-                        ))
-                        .map_err(Error::backend)?,
-                        config.normalization_offset(),
-                    ),
-                },
-                context,
-            )
         })
-        .transpose()?;
-    let lm_head = (ownership.owns_output() && !config.tie_word_embeddings())
-        .then(|| {
-            let name = "lm_head.weight";
-            let range = geometry.output_range.clone().ok_or_else(|| {
-                Error::backend("untied decoder output owner has no vocabulary range")
-            })?;
-            B::vocabulary_parallel_linear(
-                LinearSpec {
-                    input: config.hidden_size(),
-                    output: config.vocabulary_size(),
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        name,
-                        config.linear_format(name),
-                    )?,
-                },
-                range,
-                context,
-            )
+        .collect::<Vec<_>>();
+    let partition = schedule.state_partition_plan(parameters.unit_layout());
+    eredu_runtime::ComponentDefinition::new(
+        "text_decoder",
+        parameters,
+        units,
+        vec![crate::transport::decoder()],
+        TEXT_DECODER_EXECUTION_GROUP,
+        vec![],
+        state,
+        partition,
+    )
+    .and_then(|definition| definition.with_unit_parameter_paths())
+    .and_then(|definition| {
+        definition.map_unit_observation_boundaries(|address, _| {
+            schedule.boundaries(args, address.index())
         })
-        .transpose()?;
-    Ok(PartitionStaticModules {
-        embeddings,
-        norm,
-        lm_head,
     })
+    .map_err(Error::from)
 }
 
-impl<B, C, P> PartitionedLayeredModel<B, C, P>
+/// Typed decoder equations over exact admitted pipeline geometry.
+pub struct DecoderKernel<
+    B: NeuralBackend,
+    C: Config,
+    P = DenseBlockFactory,
+    M = PartitionStaticModules<B>,
+    G = PartitionLocalGeometry<C>,
+> {
+    args: C,
+    schedule: DecoderSchedule,
+    static_modules: M,
+    geometry: G,
+    block_factory: std::marker::PhantomData<fn() -> (B, P)>,
+}
+
+impl<B: NeuralBackend, C: Config + Clone, P, M: Clone, G: Clone> Clone
+    for DecoderKernel<B, C, P, M, G>
+{
+    fn clone(&self) -> Self {
+        Self {
+            args: self.args.clone(),
+            schedule: self.schedule.clone(),
+            static_modules: self.static_modules.clone(),
+            geometry: self.geometry.clone(),
+            block_factory: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<B, C, P> DecoderKernel<B, C, P>
 where
     B: eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
@@ -4893,24 +5758,20 @@ where
     /// Constructs only modules already selected by an exact neutral partition.
     pub fn from_partition<A>(
         args: C,
-        parameters: &ArchitectureParameterDescription,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         partition: &eredu_runtime::ArchitecturePartition<PartitionLocalGeometry<C>, A>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<PartitionedLayeredModel<B, C, P>, Error> {
         args.validate_config()?;
         P::validate(&args)?;
         crate::operator_requirements::require::<B>(
             "shared decoder equations",
             operator_requirements(&args),
         )?;
-        args.validate_partition_parameters(parameters)?;
-        if parameters.graph() != partition.graph()
-            || parameters.unit_layout() != partition.unit_layout()
-        {
-            return Err(Error::backend(
-                "decoder partition belongs to a different normalized parameter topology",
-            ));
-        }
+        let expected = args
+            .partition_parameter_description()
+            .map_err(Error::backend_source)?;
+        definition.validate_parameter_topology(&expected)?;
         let [group] = partition.groups() else {
             return Err(Error::backend(
                 "dense decoder partition must own exactly one execution group",
@@ -4923,30 +5784,91 @@ where
                 "decoder module construction range differs from selected partition",
             ));
         }
-        let owned = partition.local_geometry().owned_units();
-        let state = partition
-            .state()
-            .ok_or_else(|| Error::backend("partitioned decoder has no selected state"))?;
-        let expected_state = partition
+        let expected_storage = partition.invocations().storage_layout();
+        if !partition
             .local_geometry()
-            .complete_state_layout()
-            .slice(owned.clone())
-            .map_err(Error::backend)?;
-        if state.global_layer_offset() != owned.start || state.layout() != &expected_state {
+            .blocks
+            .keys()
+            .copied()
+            .eq((0..expected_storage.len()).map(|ordinal| {
+                expected_storage
+                    .address(ordinal)
+                    .expect("selected physical owner")
+                    .index()
+            }))
+        {
             return Err(Error::backend(
-                "decoder partition state does not match its global unit range",
+                "decoder factory geometry differs from selected parameter owners",
             ));
         }
+        match (&partition.local_geometry().owned_state, partition.state()) {
+            (Some(owned), Some(state)) => {
+                let expected = partition
+                    .local_geometry()
+                    .complete_state_layout()
+                    .slice(owned.clone())
+                    .map_err(Error::backend)?;
+                if state.global_layer_offset() != owned.start || state.layout() != &expected {
+                    return Err(Error::backend(
+                        "decoder partition cache geometry differs from selected body operations",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Error::backend(
+                    "decoder partition state ownership differs from its operations",
+                ))
+            }
+        }
         let geometry = partition.local_geometry().clone();
-        let static_modules =
-            partition_static_modules(&args, &geometry, partition.ownership(), context)?;
-        Ok(Self {
+        let definition = definition.select_state_layout(geometry.complete_state_layout())?;
+        validate_complete_definition(&args, &definition, geometry.complete_state_layout())?;
+        let selection = definition.select_partition(partition)?;
+        let static_modules = PartitionStaticModules::from_selected_spec(
+            StaticModuleSpec::from_config(&args),
+            Some((
+                geometry.embedding_range.clone(),
+                geometry.output_range.clone(),
+            )),
+            |role| {
+                selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+            },
+            context,
+        )?;
+        let kernel = Self {
+            schedule: DecoderSchedule::new(&args)?,
             args,
             static_modules,
             geometry,
-            parameters: parameters.clone(),
             block_factory: std::marker::PhantomData,
-        })
+        };
+        eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
+            definition, kernel, partition,
+        )
+        .map_err(Error::from)
+    }
+}
+
+impl<B, C, P, M, G> DecoderKernel<B, C, P, M, G>
+where
+    B: NeuralBackend,
+    C: Config,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
+    P: BlockFactory<B, C>,
+{
+    pub(crate) fn finish_hidden_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let logits =
+            self.static_modules
+                .decoder_resources_mut()
+                .finish(hidden, context, instrumentation)?;
+        softcap_logits(logits, self.args.output_softcap(), context)
     }
 
     /// Returns normalized architecture configuration.
@@ -4955,45 +5877,68 @@ where
     }
 
     /// Returns exact local pipeline geometry.
-    pub const fn local_geometry(&self) -> &PartitionLocalGeometry<C> {
+    pub const fn local_geometry(&self) -> &G {
         &self.geometry
     }
 
     /// Returns the physically allocated static modules.
-    pub const fn static_modules(&self) -> &PartitionStaticModules<B> {
+    pub const fn static_modules(&self) -> &M {
         &self.static_modules
     }
 
-    /// Borrows only statics retained by the selected pipeline owner for binding.
-    pub(crate) fn partition_static_modules_mut(&mut self) -> &mut PartitionStaticModules<B> {
+    /// Mutably borrows the physically retained static aggregate for binding.
+    pub fn static_modules_mut(&mut self) -> &mut M {
         &mut self.static_modules
     }
 
-    /// Constructs an admitted unit and rejects every unowned global index.
-    pub fn construct_unit(
+    /// Constructs an admitted physical owner, independently of local cache ownership.
+    pub fn construct_block(
         &self,
         global_unit: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B, P::FeedForward>, Error> {
-        let config = self.geometry.block(global_unit).ok_or_else(|| {
-            Error::backend(format!(
-                "decoder unit {global_unit} is not owned by local range {:?}",
-                self.geometry.owned_units
-            ))
-        })?;
-        P::build_partitioned(&self.args, config, global_unit, context)
+        let owner = self
+            .schedule
+            .owner(self.schedule.body_operation(global_unit));
+        let config = self.geometry.block(&self.args, owner, global_unit)?;
+        TransformerBlock::from_factory::<C, P>(&self.args, config, global_unit, context)
+    }
+    /// Materializes exactly one declared body or stateless terminal resource.
+    pub fn construct_unit(
+        &self,
+        operation: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<DecoderUnit<B, P::FeedForward>, Error> {
+        let equation = self.schedule.operation(operation)?;
+        let layer = equation.layer();
+        let config = self.geometry.block(&self.args, operation, layer)?;
+        match equation {
+            DecoderOperation::Body { .. } => Ok(DecoderUnit::Body(
+                TransformerBlockBody::from_factory::<C, P>(&self.args, config, layer, context)?,
+            )),
+            DecoderOperation::Terminal { .. } => Ok(DecoderUnit::Terminal(
+                terminal_normalization::<B>(config, layer, context)?.ok_or_else(|| {
+                    Error::backend("decoder terminal has no normalization policy")
+                })?,
+            )),
+        }
     }
 }
 
-/// Derives backend-free local decoder geometry for one selected PP range.
+/// Projects physical factory geometry from a complete invocation map and a selected PP range.
 pub fn partition_local_geometry<C: PartitionedConfig>(
     config: &C,
+    invocations: &eredu_runtime::ExecutionUnitAddressMap,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
 ) -> Result<PartitionLocalGeometry<C>, ParallelPlanError> {
-    partition_local_geometry_with(config, layout, owned_units, |config, unit, layout| {
-        config.local_block_config(unit, layout)
-    })
+    partition_local_geometry_with(
+        config,
+        invocations,
+        layout,
+        owned_units,
+        |config, unit, layout| config.local_block_config(unit, layout),
+    )
 }
 
 /// Derives partition-local decoder geometry with a family-owned block localizer.
@@ -5003,6 +5948,7 @@ pub fn partition_local_geometry<C: PartitionedConfig>(
 /// configuration. Static ownership and state geometry stay centralized here.
 pub(crate) fn partition_local_geometry_with<C, F>(
     config: &C,
+    invocations: &eredu_runtime::ExecutionUnitAddressMap,
     layout: &LocalModelLayout,
     owned_units: Range<usize>,
     mut localize: F,
@@ -5011,88 +5957,109 @@ where
     C: PartitionedConfig,
     F: FnMut(&C, usize, &LocalModelLayout) -> Result<C, Error>,
 {
-    let count = usize::try_from(config.num_hidden_layers())
-        .map_err(|_| ParallelPlanError::InvalidGroup("decoder layer count exceeds usize".into()))?;
+    let schedule = DecoderSchedule::new(config)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let count = schedule.len();
     if owned_units.is_empty() || owned_units.end > count {
         return Err(ParallelPlanError::InvalidGroup(format!(
             "decoder local unit range {owned_units:?} is outside {count} layers"
         )));
     }
-    let mut blocks = Vec::with_capacity(owned_units.len());
+    let invalid = |reason: String| ParallelPlanError::InvalidGroup(reason);
+    let group = (0..invocations.storage_layout().group_count())
+        .find(|&group| {
+            invocations
+                .storage_layout()
+                .group_id(group)
+                .is_some_and(|id| id.as_str() == TEXT_DECODER_EXECUTION_GROUP)
+        })
+        .ok_or_else(|| invalid("decoder geometry has no canonical execution group".into()))?;
+    let logical = invocations.logical_addresses().collect::<Vec<_>>();
+    let range = invocations
+        .group_range(group)
+        .expect("declared invocation group");
+    if range.len() != count
+        || logical[range.clone()]
+            .iter()
+            .enumerate()
+            .any(|(unit, address)| address.index() != unit)
+    {
+        return Err(invalid(
+            "decoder geometry has a different logical layer layout".into(),
+        ));
+    }
+    let selected = invocations
+        .select_invocations(owned_units.clone().map(|unit| logical[range.start + unit]))
+        .map_err(|error| invalid(error.to_string()))?;
+    let mut physical = std::collections::BTreeMap::new();
+    for ordinal in invocations
+        .storage_layout()
+        .group_range(group)
+        .expect("declared storage group")
+    {
+        let owner = invocations
+            .storage_layout()
+            .address(ordinal)
+            .expect("declared physical owner")
+            .index();
+        let local = match schedule
+            .operation(owner)
+            .map_err(|error| invalid(error.to_string()))?
+        {
+            DecoderOperation::Body { layer } => localize(config, layer, layout)
+                .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
+            DecoderOperation::Terminal { .. } => config.clone(),
+        };
+        physical.insert(owner, local);
+    }
     let mut local_key_value_heads = Vec::with_capacity(count);
-    for unit in 0..count {
-        let local = localize(config, unit, layout)
-            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-        local_key_value_heads.push(local.num_key_value_heads());
-        if owned_units.contains(&unit) {
-            blocks.push(local);
-        }
+    for layer in 0..config.num_hidden_layers() as usize {
+        let ordinal = range.start + schedule.body_operation(layer);
+        let address = logical[ordinal];
+        let owner = invocations
+            .resolve(ordinal, address)
+            .expect("validated storage mapping")
+            .storage_location()
+            .address()
+            .index();
+        local_key_value_heads.push(physical[&owner].num_key_value_heads());
+    }
+    let mut blocks = std::collections::BTreeMap::new();
+    for ordinal in selected
+        .storage_layout()
+        .group_range(group)
+        .expect("selected storage group")
+    {
+        let owner = selected
+            .storage_layout()
+            .address(ordinal)
+            .expect("selected owner")
+            .index();
+        blocks.insert(
+            owner,
+            physical.remove(&owner).expect("localized physical owner"),
+        );
     }
     let complete_state_layout = StateLayout::new(
         cache_layout_with_key_value_heads(config, local_key_value_heads)
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
     )
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let vocabulary = usize::try_from(config.vocabulary_size())
-        .map_err(|_| ParallelPlanError::InvalidGroup("decoder vocabulary exceeds usize".into()))?;
-    let embedding_range = vocabulary_range(
+    let root = config.parameter_root();
+    let (embedding_range, output_range) = StaticModuleSpec::from_config(config).vocabulary_ranges(
         layout,
-        &format!("{}.embed_tokens", config.parameter_root()),
-        vocabulary,
+        &format!("{root}.embed_tokens"),
+        &format!("{root}.norm"),
+        "lm_head",
     )?;
-    let output_range = if config.tie_word_embeddings() {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
     Ok(PartitionLocalGeometry {
+        owned_state: schedule.state_range(owned_units.clone()),
         owned_units,
         blocks,
         embedding_range,
         output_range,
         complete_state_layout,
     })
-}
-
-/// Validates the common graph and unit ownership of a routed decoder description.
-pub(crate) fn validate_partitioned_decoder_description(
-    config: &impl Config,
-    parameters: &ArchitectureParameterDescription,
-) -> Result<(), Error> {
-    let [group] = parameters.graph().groups() else {
-        return Err(Error::backend(
-            "partitioned decoder parameter graph must contain one execution group",
-        ));
-    };
-    if group.id() != TEXT_DECODER_EXECUTION_GROUP {
-        return Err(Error::backend(
-            "partitioned decoder parameter graph names a different execution group",
-        ));
-    }
-    let layers = usize::try_from(config.num_hidden_layers()).map_err(Error::backend)?;
-    if parameters
-        .unit_layout()
-        .group_range(0)
-        .map(|range| range.len())
-        != Some(layers)
-    {
-        return Err(Error::backend(
-            "partitioned decoder parameter unit layout differs from configured depth",
-        ));
-    }
-    let group_id = eredu_runtime::ExecutionGroupId::new(TEXT_DECODER_EXECUTION_GROUP)
-        .map_err(Error::backend)?;
-    for layer in 0..layers {
-        if !parameters.groups().iter().any(|owned| {
-            owned.owner()
-                == &eredu_runtime::ParameterGroupOwner::execution_unit(group_id.clone(), layer)
-        }) {
-            return Err(Error::backend(format!(
-                "partitioned decoder parameter description omits unit {layer}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn dense_local_block_config<C: PartitionedConfig>(
@@ -5182,49 +6149,14 @@ fn dense_local_block_config<C: PartitionedConfig>(
     Ok(local)
 }
 
-impl<B, C, P> PartitionedLayeredModel<B, C, P>
+impl<B, C, P, M, G> DecoderKernel<B, C, P, M, G>
 where
     B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
 {
-    fn begin_hidden<S>(
-        hidden: B::Tensor,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        _first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: AttentionCache<B::Tensor>,
-    {
-        if state.layout() != expected {
-            return Err(Error::backend(
-                "decoder runtime state does not match partition state layout",
-            ));
-        }
-        let sequence = hidden.dim(1);
-        let allow_sliding_prefill = mask.is_none();
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None if sequence > 1 => {
-                let cache = state.layer(0).map_err(Error::backend)?;
-                Some(B::causal_mask(sequence, cache.offset(), None, context)?)
-            }
-            None => None,
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask,
-                allow_sliding_prefill,
-                rotary_embeddings: None,
-            },
-        })
-    }
-
     pub(crate) fn finish_local(
         &mut self,
         hidden: &B::Tensor,
@@ -5246,62 +6178,35 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let norm =
-            self.static_modules.norm.as_mut().ok_or_else(|| {
-                Error::backend("decoder partition does not own final normalization")
-            })?;
-        let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
-        let logits = match (parallel, self.static_modules.lm_head.as_mut()) {
-            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, Some(head)) => {
-                instrumentation.project::<B>("projection_input", head, &hidden, None, context)
-            }
-            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                parallel,
-                context,
-            ),
-            (None, None) => instrumentation.project_embedding(
-                "projection_input",
-                self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("tied decoder output partition has no embedding")
-                })?,
-                &hidden,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
+        let logits = self
+            .static_modules
+            .decoder_resources_mut()
+            .finish_parallel(hidden, parallel, context, instrumentation)?;
         softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
 
-impl<B, C, P> eredu_runtime::ArchitectureParameters<B> for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, M, G> eredu_runtime::ComponentKernel<B> for DecoderKernel<B, C, P, M, G>
 where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: NeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
 {
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        Ok(self.geometry.complete_state_layout.clone())
-    }
-
+    type Input<'a> = LayeredInput<'a, B::Tensor>;
+    type Unit = DecoderUnit<B, P::FeedForward>;
+    type ForwardContext = ForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::option::Iter<'a, B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::Error> {
         state_identity(
             &self.args,
             state.layout(),
@@ -5309,124 +6214,66 @@ where
             topology,
         )
     }
-
-    fn parameter_description(
+    fn build_unit(
         &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        Ok(self.parameters.clone())
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, Error> {
+        self.construct_unit(address.index(), context)
     }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.mask.iter()
+    }
+}
+impl<B, C, P, M, G> eredu_runtime::ComponentPinnedResources<B> for DecoderKernel<B, C, P, M, G>
+where
+    B: NeuralBackend,
+    C: Config,
+    P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
+{
+    type Modules = M;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
-        if let Some(embedding) = &self.static_modules.embeddings {
-            visitor.visit("embedding", embedding)?;
-        }
-        if let Some(norm) = &self.static_modules.norm {
-            visitor.visit("norm", norm)?;
-        }
-        if let Some(head) = &self.static_modules.lm_head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
+        self.static_modules.decoder_resources().visit(visitor)
     }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    fn visit_pinned_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
-        if let Some(embedding) = &mut self.static_modules.embeddings {
-            visitor.visit_mut("embedding", embedding)?;
-        }
-        if let Some(norm) = &mut self.static_modules.norm {
-            visitor.visit_mut("norm", norm)?;
-        }
-        if let Some(head) = &mut self.static_modules.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
+        self.static_modules.decoder_resources_mut().visit(visitor)
     }
 }
-
-impl<B, C, P, S> LayeredArchitecture<B, S> for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, S, M, G> eredu_runtime::ComponentEquations<B, S> for DecoderKernel<B, C, P, M, G>
 where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: NeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
-
-    type Input<'a> = LayeredInput<'a, B::Tensor>;
-    type StaticModules = PartitionStaticModules<B>;
-    type Unit = TransformerBlock<B, P::FeedForward>;
-    type ForwardContext = ForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-
-    fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::transport::decoder()
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        TEXT_DECODER_EXECUTION_GROUP
-    }
-
-    fn state_partition_plan(
-        &self,
-        layout: &StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(0, layout)
-    }
-
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        Ok(self.parameters.graph().clone())
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend("decoder group is outside the text decoder"));
-        }
-        usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        if group != 0
-            || index >= usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?
-        {
-            return Err(Error::backend("decoder unit is outside the text decoder"));
-        }
-        Ok(format!("{}.layers.{index}", self.args.parameter_root()))
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend("decoder group is outside the text decoder"));
-        }
-        self.construct_unit(index, context)
-    }
-
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -5434,22 +6281,13 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let hidden = self
             .static_modules
-            .embeddings
-            .as_mut()
-            .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?
+            .decoder_resources_mut()
+            .input_embedding()?
             .forward(input.tokens, context)?;
         let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
-        Self::begin_hidden(
-            hidden,
-            input.mask,
-            state,
-            self.geometry.complete_state_layout(),
-            0,
-            context,
-        )
+        self.begin_embedded(hidden, input.mask, state, context)
     }
-
-    fn begin_forward_observed<'a, O>(
+    fn begin_observed<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -5459,63 +6297,32 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let mut forward = self.begin_forward(input, state, context)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
+        ComponentInstrumentation::apply_embedding(self.begin(input, state, context)?, observer)
     }
-
-    fn begin_execution_group(
+    fn execute(
         &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::backend(
-                "text decoder received invalid group dependencies",
-            ));
-        }
-        Ok(initial.clone())
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("decoder attempted an unowned unit"));
-        }
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let layer = self.schedule.operation(address.index())?.layer();
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(self.geometry.state_index(layer)?)
             .map_err(Error::backend)?;
-        unit.forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
-            context,
-        )
+        body.forward(None, forward.attention_input(hidden, cache), context)
     }
-
-    fn forward_unit_observed<O>(
+    fn execute_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -5526,39 +6333,55 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("decoder attempted an unowned unit"));
-        }
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let index = self.schedule.operation(address.index())?.layer();
+        let path = format!("{}.layers.{}", self.args.parameter_root(), index);
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        unit.forward_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+        body.forward_observed(
+            None,
+            forward.attention_input(hidden, cache),
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
         )
     }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_local(hidden, None, context)
+        self.finish_hidden_instrumented(hidden, context, &mut ComponentInstrumentation::disabled())
     }
-
-    fn finish_forward_observed<O>(
+    fn projects_final_text_position() -> bool {
+        G::FINAL_TEXT_POSITION
+    }
+    fn finish_text(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if G::FINAL_TEXT_POSITION {
+            self.finish_hidden_instrumented(
+                &final_hidden_position(hidden, context)?,
+                context,
+                &mut ComponentInstrumentation::disabled(),
+            )
+        } else {
+            self.finish(hidden, state, forward, context)
+        }
+    }
+    fn finish_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -5570,29 +6393,20 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.finish_local_instrumented(
+        self.finish_hidden_instrumented(
             hidden,
-            None,
             context,
             &mut ComponentInstrumentation::new("readout", &mut observer),
         )
     }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.mask.iter()
-    }
 }
-
-impl<B, C, P, S> ParallelLayeredArchitecture<B, S> for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, S, M, G> eredu_runtime::ParallelComponentKernel<B, S> for DecoderKernel<B, C, P, M, G>
 where
     B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -5600,36 +6414,27 @@ where
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
-
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self.geometry.parallel_state_layout()?;
         let hidden = B::vocabulary_parallel_lookup(
             self.static_modules
-                .embeddings
-                .as_mut()
-                .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?,
+                .decoder_resources_mut()
+                .input_embedding()?,
             input.tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
             context,
         )?;
         let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
-        Self::begin_hidden(
-            hidden,
-            input.mask,
-            state,
-            self.geometry.complete_state_layout(),
-            0,
-            context,
-        )
+        begin_decoder_hidden::<B, S>(hidden, input.mask, None, state, Some(expected), 0, context)
     }
-
-    fn begin_forward_parallel_observed<'a, O>(
+    fn begin_parallel_observed<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -5640,17 +6445,14 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let mut forward = self.begin_forward_parallel(input, state, parallel, context)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
+        ComponentInstrumentation::apply_embedding(
+            self.begin_parallel(input, state, parallel, context)?,
+            observer,
+        )
     }
-
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -5658,30 +6460,26 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("decoder attempted an unowned unit"));
-        }
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let layer = self.schedule.operation(address.index())?.layer();
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(self.geometry.state_index(layer)?)
             .map_err(Error::backend)?;
-        unit.forward_tensor_parallel(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+        body.forward_tensor_parallel(
+            None,
+            forward.attention_input(hidden, cache),
             parallel,
             context,
         )
     }
-
-    fn forward_unit_parallel_observed<O>(
+    fn execute_parallel_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -5693,30 +6491,27 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("decoder attempted an unowned unit"));
-        }
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let index = self.schedule.operation(address.index())?.layer();
+        let path = format!("{}.layers.{}", self.args.parameter_root(), index);
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        unit.forward_tensor_parallel_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+        body.forward_tensor_parallel_observed(
+            None,
+            forward.attention_input(hidden, cache),
             parallel,
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
         )
     }
-
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -5726,8 +6521,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         self.finish_local(hidden, Some(parallel), context)
     }
-
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -5748,12 +6542,13 @@ where
         )
     }
 }
-
-impl<B, C, P, S> eredu_runtime::RoutedLayeredArchitecture<B, S> for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, S, M, G> eredu_runtime::RoutedComponentKernel<B, S> for DecoderKernel<B, C, P, M, G>
 where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: GroupedNeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
     P::FeedForward: RoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -5761,29 +6556,58 @@ where
     fn routed_unit_observations(&self) -> bool {
         <P::FeedForward as RoutedProjectionOperator<B>>::COMPONENT_OBSERVATIONS
     }
-
     fn routed_sparse_observations(&self) -> bool {
         true
     }
-
-    fn routed_observation_points(
+    fn routing_points(
         &self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
     ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend(
-                "routed decoder observation requested for an unowned unit",
-            ));
+        match self.schedule.operation(address.index())? {
+            DecoderOperation::Body { layer } => Ok(self.args.routed_observation_points(
+                &format!("{}.layers.{layer}", self.args.parameter_root()),
+                layer,
+            )),
+            DecoderOperation::Terminal { .. } => Ok(None),
         }
-        let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        Ok(self.args.routed_observation_points(&unit_path, index))
     }
-
-    fn forward_unit_observed_with_provider<R, O>(
+    fn execute_routed<R>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut R,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        R: eredu_runtime::ParameterProvider<B>,
+        R::Error: std::fmt::Display,
+    {
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let index = self.schedule.operation(address.index())?.layer();
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
+        body.forward_routed(
+            None,
+            index,
+            forward.attention_input(hidden, cache),
+            pass,
+            provider,
+            context,
+        )
+    }
+    fn execute_routed_observed<R, O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -5798,25 +6622,23 @@ where
         R::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let index = self.schedule.operation(address.index())?.layer();
+        let path = format!("{}.layers.{}", self.args.parameter_root(), index);
         let points = self.args.routed_observation_points(&path, index);
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("routed decoder attempted an unowned unit"));
-        }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        unit.forward_routed_observed(
+        body.forward_routed_observed(
+            None,
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             context,
@@ -5824,52 +6646,15 @@ where
             points,
         )
     }
-
-    fn forward_unit_with_provider<R>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut R,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        R: eredu_runtime::ParameterProvider<B>,
-        R::Error: std::fmt::Display,
-    {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("routed decoder attempted an unowned unit"));
-        }
-        let cache = state
-            .layer(index - self.geometry.owned_units.start)
-            .map_err(Error::backend)?;
-        unit.forward_routed(
-            index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
-            pass,
-            provider,
-            context,
-        )
-    }
 }
-
-impl<B, C, P, S> eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
-    for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, S, M, G> eredu_runtime::ParallelRoutedComponentKernel<B, S>
+    for DecoderKernel<B, C, P, M, G>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
     P::FeedForward: TensorParallelRoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
@@ -5877,15 +6662,48 @@ where
     fn parallel_routed_unit_observations(&self) -> bool {
         <P::FeedForward as RoutedProjectionOperator<B>>::COMPONENT_OBSERVATIONS
     }
-
     fn parallel_routed_sparse_observations(&self) -> bool {
         true
     }
-
-    fn forward_unit_parallel_observed_with_provider<R, O>(
+    fn execute_parallel_routed<R>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut R,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        R: eredu_runtime::TensorParallelParameterProvider<B>,
+        R::Error: std::fmt::Display,
+    {
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let index = self.schedule.operation(address.index())?.layer();
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
+        body.forward_routed_parallel(
+            None,
+            index,
+            forward.attention_input(hidden, cache),
+            pass,
+            provider,
+            parallel,
+            context,
+        )
+    }
+    fn execute_parallel_routed_observed<R, O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -5901,25 +6719,23 @@ where
         R::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let DecoderUnit::Body(body) = unit else {
+            let DecoderUnit::Terminal(norm) = unit else {
+                unreachable!()
+            };
+            return norm.forward(hidden, context);
+        };
+        let index = self.schedule.operation(address.index())?.layer();
+        let path = format!("{}.layers.{}", self.args.parameter_root(), index);
         let points = self.args.routed_observation_points(&path, index);
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("routed decoder attempted an unowned unit"));
-        }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(self.geometry.state_index(index)?)
             .map_err(Error::backend)?;
-        unit.forward_routed_parallel_observed(
+        body.forward_routed_parallel_observed(
+            None,
             index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
+            forward.attention_input(hidden, cache),
             pass,
             provider,
             parallel,
@@ -5928,163 +6744,89 @@ where
             points,
         )
     }
-
-    fn forward_unit_parallel_with_provider<R>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut R,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        R: eredu_runtime::TensorParallelParameterProvider<B>,
-        R::Error: std::fmt::Display,
-    {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
-            return Err(Error::backend("routed decoder attempted an unowned unit"));
-        }
-        let cache = state
-            .layer(index - self.geometry.owned_units.start)
-            .map_err(Error::backend)?;
-        unit.forward_routed_parallel(
-            index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: None,
-            },
-            pass,
-            provider,
-            parallel,
-            context,
-        )
-    }
 }
-
-impl<B, C, P, S> PartitionedLayeredArchitecture<B, S> for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, S, M, G> eredu_runtime::PartitionComponentKernel<B, S>
+    for DecoderKernel<B, C, P, M, G>
 where
     B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    C: Config,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
     fn partition_observation_hooks(
         &self,
         _tensor_parallel: bool,
     ) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
-
-    type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
-
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
         Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
             self.args.hidden_size(),
         ))
     }
-
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+        let expected = selected.expected;
+        let context = selected.native;
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                let hidden = self
+                let embedding = self
                     .static_modules
-                    .embeddings
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::backend("decoder partition does not own input embedding")
-                    })?
-                    .forward(tokens, context)?;
+                    .decoder_resources_mut()
+                    .input_embedding()?;
+                let hidden = match selected.parallel {
+                    Some(parallel) => B::vocabulary_parallel_lookup(
+                        embedding,
+                        tokens,
+                        EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?,
+                    None => embedding.forward(tokens, context)?,
+                };
                 scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        Self::begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
+        begin_decoder_hidden::<B, S>(
+            hidden,
+            mask,
+            None,
+            state,
+            expected,
+            self.geometry
+                .partition_state_ordinal(selected.first_state_ordinal),
+            context,
+        )
     }
-
-    fn begin_partition_parallel<'a>(
+    fn begin_partition_observed<O>(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
+        input: LayeredPartitionInput<'_, B::Tensor>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => {
-                let hidden = B::vocabulary_parallel_lookup(
-                    self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                        Error::backend("decoder partition does not own input embedding")
-                    })?,
-                    tokens,
-                    EmbeddingLookupPolicy::Strict,
-                    parallel,
-                    context,
-                )?;
-                scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
-            }
-            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
-        };
-        Self::begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
-    }
-
-    fn begin_partition_observed<'a, O>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
     where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
-        let mut forward = match parallel {
-            Some(parallel) => self.begin_partition_parallel(
-                input,
-                mask,
-                state,
-                expected,
-                first_state_ordinal,
-                parallel,
-                context,
-            ),
-            None => {
-                self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
-            }
-        }?;
+        let mut forward = self.begin_partition(input, mask, state, selected)?;
         if embedded {
-            let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-                .apply("embedding", forward.hidden)?;
+            forward = ComponentInstrumentation::apply_embedding(forward, observer)?;
         }
         Ok(forward)
     }
-
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
@@ -6106,7 +6848,6 @@ where
             })
         }
     }
-
     fn finish_partition_observed<O>(
         &mut self,
         hidden: &B::Tensor,
@@ -6133,126 +6874,165 @@ where
         })
     }
 }
-
-impl<B, C, P, S> eredu_runtime::ReplicatedTextArchitecture<B, S>
-    for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, M, G> eredu_runtime::TextComponentKernel<B> for DecoderKernel<B, C, P, M, G>
 where
-    B: eredu_nn::DistributedNeuralBackend,
-    C: PartitionedConfig,
+    B: NeuralBackend,
+    C: Config,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelProjectionOperator<B>,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
 {
+    fn supports_chunked_prefill() -> bool {
+        G::CHUNKED_PREFILL
+    }
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
 }
-
-impl<B, C, P, S> eredu_runtime::PipelinePartitionArchitecture<B, S>
-    for PartitionedLayeredModel<B, C, P>
+impl<B, C, P, S, M, G> eredu_runtime::PipelineComponentKernel<B, S> for DecoderKernel<B, C, P, M, G>
 where
     B: eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
     P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
-    fn partition_input_dimensions(
-        &self,
-        input: &Self::Input<'_>,
-    ) -> Result<(i32, i32), Self::Error> {
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
         Ok((input.tokens.dim(0), input.tokens.dim(1)))
     }
-
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
-        incoming: Option<(
-            B::Tensor,
-            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
-        )>,
+        incoming: Option<(B::Tensor, eredu_runtime::NoAuxiliaryBoundary)>,
         state: &mut S,
-        expected: Option<&eredu_runtime::StateLayout>,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         observer: &mut O,
-    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
     where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let expected = expected.ok_or_else(|| {
-            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
-        })?;
-        let (tokens, mask) = (input.tokens, input.mask);
-        let input = match incoming {
-            Some((hidden, auxiliary)) => {
-                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
-            }
-            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        let transported = match incoming {
+            Some((hidden, auxiliary)) => LayeredPartitionInput::Hidden { hidden, auxiliary },
+            None => LayeredPartitionInput::Tokens(input.tokens),
         };
-        self.begin_partition_observed(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            parallel,
-            context,
-            observer,
-        )
+        self.begin_partition_observed(transported, input.mask, state, selected, observer)
     }
-
-    fn partition_output_width(&self) -> i32 {
+    fn tensor_vocabulary_sharded(&self) -> bool {
+        true
+    }
+    fn output_width(&self) -> i32 {
         self.args.vocabulary_size()
     }
-
-    fn partition_routed_bank_order(&self, unit: usize) -> Vec<eredu_runtime::RoutedBankId> {
-        self.args.routed_bank_order(unit)
-    }
-
-    fn partition_routed_bank_tensor_reductions(
+    fn routed_bank_order(
         &self,
-        unit: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Vec<eredu_runtime::RoutedBankId> {
+        match self.schedule.operation(address.index()) {
+            Ok(DecoderOperation::Body { layer }) => self.args.routed_bank_order(layer),
+            _ => Vec::new(),
+        }
+    }
+    fn routed_bank_tensor_reductions(
+        &self,
+        address: eredu_runtime::ExecutionUnitAddress,
         bank: eredu_runtime::RoutedBankId,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
+        let DecoderOperation::Body { layer } = self.schedule.operation(address.index())? else {
+            return Err(Error::backend(
+                "stateless decoder terminal has no routed bank",
+            ));
+        };
         self.args
-            .routed_bank_tensor_reductions(unit, bank)
+            .routed_bank_tensor_reductions(layer, bank)
             .map(|(before, after)| eredu_runtime::RoutedTensorReductions::hidden(before, after))
     }
 }
 
-impl<B, C, P> LayeredModel<B, C, P>
+fn validate_complete_definition<C: Config>(
+    args: &C,
+    definition: &eredu_runtime::ComponentDefinition,
+    state: &StateLayout,
+) -> Result<(), Error> {
+    let schedule = DecoderSchedule::new(args)?;
+    if definition.parameters().graph().groups().len() != 1
+        || definition.primary_group() != TEXT_DECODER_EXECUTION_GROUP
+        || definition.unit_count(0)? != schedule.len()
+        || definition.state_layout() != state
+    {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "decoder construction geometry".into(),
+        }
+        .into());
+    }
+    for index in 0..schedule.len() {
+        let unit = definition.unit(0, index)?;
+        let slots = match schedule.operation(index)? {
+            DecoderOperation::Body { layer } => layer..layer + 1,
+            DecoderOperation::Terminal { .. } => 0..0,
+        };
+        if unit.path != schedule.path(args, index)?
+            || unit.state != slots
+            || definition
+                .unit_observation_boundaries(0, index)?
+                .is_kernel_owned()
+        {
+            return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+                component: definition.id().into(),
+                resource: format!("decoder operation {index} equation geometry"),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+impl<B, C, P> CompleteDecoderKernel<B, C, P>
 where
     B: NeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
 {
-    /// Builds unloaded pinned modules from normalized architecture arguments.
-    pub fn new(args: C, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+    /// Materializes pinned resources from an already validated semantic definition.
+    pub fn from_definition(
+        args: C,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredModel<B, C, P>, Error> {
         args.validate_config()?;
         P::validate(&args)?;
         crate::operator_requirements::require::<B>(
             "shared decoder equations",
             operator_requirements(&args),
         )?;
+        validate_complete_definition(&args, &definition, &state_layout(&args)?)?;
         let static_modules = StaticModules::new(&args, context)?;
-        Ok(Self {
+        let geometry = CompleteDecoderGeometry {
+            parallel: None,
+            state: definition.state_layout().clone(),
+            units: definition.parameters().unit_layout().len(),
+        };
+        let kernel = Self {
+            schedule: DecoderSchedule::new(&args)?,
             args,
             static_modules,
-            parallel_geometry: None,
+            geometry,
             block_factory: std::marker::PhantomData,
-        })
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
     }
 
-    /// Builds the same model lifecycle with planner-derived rank-local modules.
-    pub fn new_parallel(
+    /// Materializes the retained declaration with planner-derived rank-local geometry.
+    pub fn from_parallel_definition(
         args: C,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry<C>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error>
+    ) -> Result<LayeredModel<B, C, P>, Error>
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
@@ -6263,41 +7043,28 @@ where
             operator_requirements(&args),
         )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
+        let definition = definition.select_state_layout(geometry.state_layout())?;
+        validate_complete_definition(&args, &definition, geometry.state_layout())?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
-        Ok(Self {
+        let geometry = CompleteDecoderGeometry {
+            parallel: Some(std::sync::Arc::new(geometry)),
+            state: definition.state_layout().clone(),
+            units: definition.parameters().unit_layout().len(),
+        };
+        let kernel = Self {
+            schedule: DecoderSchedule::new(&args)?,
             args,
             static_modules,
-            parallel_geometry: Some(std::sync::Arc::new(geometry)),
+            geometry,
             block_factory: std::marker::PhantomData,
-        })
-    }
-
-    /// Returns the normalized architecture arguments.
-    pub const fn args(&self) -> &C {
-        &self.args
-    }
-
-    /// Borrows pinned modules for neutral checkpoint loading.
-    pub const fn static_modules(&self) -> &StaticModules<B> {
-        &self.static_modules
-    }
-
-    /// Mutably borrows pinned modules for neutral checkpoint binding.
-    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
-        &mut self.static_modules
-    }
-
-    /// Returns the replicated or rank-local mutable-state layout for this model.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| state_layout(&self.args), Ok)
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
     }
 
     /// Returns planner-derived geometry when this is a rank-local realization.
     pub fn parallel_geometry(&self) -> Option<&LocalGeometry<C>> {
-        match self.parallel_geometry.as_ref() {
+        match self.geometry.parallel.as_ref() {
             Some(geometry) => Some(geometry.as_ref()),
             None => None,
         }
@@ -6305,33 +7072,18 @@ where
 
     /// Shares the authoritative local geometry with a backend residency policy.
     pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<LocalGeometry<C>>> {
-        self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
+        self.geometry.parallel.as_ref().map(std::sync::Arc::clone)
     }
+}
 
-    /// Constructs one canonical replicated or rank-local decoder unit.
-    ///
-    /// Residency and pipeline runtimes use this entry point so streamed units
-    /// cannot drift from the model's planner-derived geometry.
-    pub fn construct_unit(
-        &self,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B, P::FeedForward>, Error> {
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
-        if index >= count {
-            return Err(Error::backend(format!(
-                "decoder unit {index} is outside {count} decoder layers"
-            )));
-        }
-        let args = match &self.parallel_geometry {
-            Some(geometry) => geometry.block(index).ok_or_else(|| {
-                Error::backend(format!("decoder local geometry is missing block {index}"))
-            })?,
-            None => &self.args,
-        };
-        P::build_partitioned(&self.args, args, index, context)
-    }
-
+impl<B, C, P, M, G> DecoderKernel<B, C, P, M, G>
+where
+    B: NeuralBackend,
+    C: Config,
+    P: BlockFactory<B, C>,
+    M: DecoderStaticResources<B>,
+    G: DecoderGeometry<C>,
+{
     /// Prepares architecture-owned mask state after an execution policy has
     /// produced embeddings, including vocabulary-parallel embeddings.
     pub fn begin_embedded<S>(
@@ -6345,8 +7097,16 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        let expected = state_layout(&self.args)?;
-        self.begin_embedded_with_layout(hidden, supplied_mask, state, &expected, context)
+        let expected = self.geometry.ordinary_state_layout(&self.args)?;
+        begin_decoder_hidden::<B, S>(
+            hidden,
+            supplied_mask,
+            None,
+            state,
+            Some(expected.as_ref()),
+            0,
+            context,
+        )
     }
 
     /// Prepares architecture-owned mask state against an explicitly realized
@@ -6376,7 +7136,7 @@ where
 
     /// Starts one replicated pipeline partition from tokens or upstream hidden
     /// state using the partition's authoritative local state layout.
-    fn prepare_partition<S>(
+    pub fn prepare_partition<S>(
         &mut self,
         input: LayeredPartitionInput<'_, B::Tensor>,
         supplied_mask: Option<&B::Tensor>,
@@ -6391,17 +7151,21 @@ where
     {
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                let hidden = self.static_modules.embed(tokens, context)?;
+                let hidden = self
+                    .static_modules
+                    .decoder_resources_mut()
+                    .input_embedding()?
+                    .forward(tokens, context)?;
                 scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        self.begin_embedded_with_layout_at(
+        begin_decoder_hidden::<B, S>(
             hidden,
             supplied_mask,
             None,
             state,
-            expected,
+            Some(expected),
             first_state_ordinal,
             context,
         )
@@ -6409,7 +7173,7 @@ where
 
     /// Starts one tensor-parallel pipeline partition through the same neutral
     /// entry point, including vocabulary-parallel embedding on the input rank.
-    fn prepare_partition_parallel<S>(
+    pub fn prepare_partition_parallel<S>(
         &mut self,
         input: LayeredPartitionInput<'_, B::Tensor>,
         supplied_mask: Option<&B::Tensor>,
@@ -6427,7 +7191,9 @@ where
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
                 let hidden = B::vocabulary_parallel_lookup(
-                    &mut self.static_modules.embeddings,
+                    self.static_modules
+                        .decoder_resources_mut()
+                        .input_embedding()?,
                     tokens,
                     EmbeddingLookupPolicy::Strict,
                     parallel,
@@ -6437,12 +7203,12 @@ where
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
-        self.begin_embedded_with_layout_at(
+        begin_decoder_hidden::<B, S>(
             hidden,
             supplied_mask,
             None,
             state,
-            expected,
+            Some(expected),
             first_state_ordinal,
             context,
         )
@@ -6462,60 +7228,15 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        self.begin_embedded_with_layout_at(
+        begin_decoder_hidden::<B, S>(
             hidden,
             supplied_mask,
             rotary_embeddings,
             state,
-            expected,
+            Some(expected),
             0,
             context,
         )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn begin_embedded_with_layout_at<S>(
-        &mut self,
-        hidden: B::Tensor,
-        supplied_mask: Option<&B::Tensor>,
-        rotary_embeddings: Option<(&B::Tensor, &B::Tensor)>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: AttentionCache<B::Tensor>,
-    {
-        if state.layout() != expected {
-            return Err(Error::backend(format!(
-                "decoder runtime state layout {:?} does not match architecture layout {expected:?}",
-                state.layout()
-            )));
-        }
-        let sequence = hidden.dim(1);
-        let mask = if let Some(mask) = supplied_mask {
-            Some(mask.clone())
-        } else if sequence > 1 {
-            let cache = state.layer(first_state_ordinal).map_err(Error::backend)?;
-            // The shared mask is consumed by full-attention layers. Sliding
-            // layers use their typed window-aware attention path, so deriving
-            // this mask from layer zero's retention policy would incorrectly
-            // impose that window on later full-attention layers.
-            Some(B::causal_mask(sequence, cache.offset(), None, context)?)
-        } else {
-            None
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask,
-                allow_sliding_prefill: supplied_mask.is_none(),
-                rotary_embeddings: rotary_embeddings
-                    .map(|(cosine, sine)| (cosine.clone(), sine.clone())),
-            },
-        })
     }
 
     /// Executes one replicated block using architecture-owned forward state.
@@ -6532,19 +7253,12 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
-        block.forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
+        block.body.forward(
+            block.output_norm.as_mut(),
+            forward.attention_input(hidden, cache),
             context,
         )
     }
@@ -6571,19 +7285,12 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
-        block.forward_with_feed_forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
+        block.body.forward_with_feed_forward(
+            block.output_norm.as_mut(),
+            forward.attention_input(hidden, cache),
             context,
             feed_forward,
         )
@@ -6607,19 +7314,12 @@ where
         S::LayerState: AttentionCache<B::Tensor>,
         P::FeedForward: TensorParallelProjectionOperator<B>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
-        block.forward_tensor_parallel(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
+        block.body.forward_tensor_parallel(
+            block.output_norm.as_mut(),
+            forward.attention_input(hidden, cache),
             parallel,
             context,
         )
@@ -6648,19 +7348,12 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        let cache = state.layer(index).map_err(Error::backend)?;
-        block.forward_tensor_parallel_with_feed_forward(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
+        let cache = state
+            .layer(self.geometry.state_index(index)?)
+            .map_err(Error::backend)?;
+        block.body.forward_tensor_parallel_with_feed_forward(
+            block.output_norm.as_mut(),
+            forward.attention_input(hidden, cache),
             parallel,
             context,
             feed_forward,
@@ -6676,18 +7369,6 @@ where
         self.finish_hidden_instrumented(hidden, context, &mut ComponentInstrumentation::disabled())
     }
 
-    fn finish_hidden_instrumented(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error> {
-        let logits = self
-            .static_modules
-            .finish_instrumented(hidden, context, instrumentation)?;
-        softcap_logits(logits, self.args.output_softcap(), context)
-    }
-
     /// Applies rank-local normalization and vocabulary-parallel projection for
     /// an output-owning pipeline partition.
     pub fn finish_hidden_parallel(
@@ -6699,921 +7380,11 @@ where
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        self.finish_hidden_parallel_instrumented(
+        self.finish_local_instrumented(
             hidden,
-            parallel,
+            Some(parallel),
             context,
             &mut ComponentInstrumentation::disabled(),
-        )
-    }
-
-    fn finish_hidden_parallel_instrumented(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::DistributedNeuralBackend,
-    {
-        let hidden = instrumentation.normalize_readout(
-            hidden,
-            &mut self.static_modules.boundary.norm,
-            context,
-        )?;
-        let logits = match &mut self.static_modules.lm_head {
-            Some(head) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                &hidden,
-                parallel,
-                context,
-            ),
-            None => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                &mut self.static_modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }?;
-        let logits = instrumentation.apply("linear", logits)?;
-        softcap_logits(logits, self.args.output_softcap(), context)
-    }
-}
-
-impl<B, C, P> LayeredModel<B, C, P>
-where
-    B: NeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-{
-    /// Describes every shared-decoder parameter group with explicit static or
-    /// architecture-global unit ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph =
-            ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)?;
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
-        let layout = ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?;
-        let static_groups = static_parallel_parameter_groups::<B>(
-            &self.static_modules.embeddings,
-            &self.static_modules.boundary.norm,
-            self.static_modules.lm_head.as_ref(),
-            self.args.parameter_root(),
-        )
-        .map_err(Error::backend)?;
-        let mut expected = static_groups.clone();
-        let mut owned = Vec::new();
-        for (index, group) in static_groups.into_iter().enumerate() {
-            let role = match index {
-                0 => "embedding",
-                1 => "norm",
-                _ => "output",
-            };
-            let owner = if index == 0 && self.args.tie_word_embeddings() {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
-            } else {
-                ParameterGroupOwner::static_role(role)
-            };
-            owned.push(OwnedParameterGroupSpec::new(owner, group));
-        }
-        let group_id = layout.group_id(0).expect("decoder layout group").clone();
-        for index in 0..count {
-            let unit = self.construct_unit(index, context)?;
-            let groups = P::parameter_groups(&unit, &self.args, index).map_err(Error::backend)?;
-            expected.extend(groups.iter().cloned());
-            owned.extend(groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                    group,
-                )
-            }));
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
-    }
-}
-
-impl<B, C, P> eredu_runtime::ArchitectureParameters<B> for LayeredModel<B, C, P>
-where
-    B: NeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-{
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        state_identity(
-            &self.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    }
-
-    fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
-    }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitor<B>,
-    {
-        visitor.visit("embedding", &self.static_modules.embeddings)?;
-        visitor.visit("norm", &self.static_modules.boundary.norm)?;
-        if let Some(head) = &self.static_modules.lm_head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
-    }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitorMut<B>,
-    {
-        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.boundary.norm)?;
-        if let Some(head) = &mut self.static_modules.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
-    }
-}
-
-impl<B, C, P, S> LayeredArchitecture<B, S> for LayeredModel<B, C, P>
-where
-    B: NeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-{
-    type Input<'a> = LayeredInput<'a, B::Tensor>;
-    type StaticModules = StaticModules<B>;
-    type Unit = TransformerBlock<B, P::FeedForward>;
-    type ForwardContext = ForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-
-    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
-    }
-
-    fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::transport::decoder()
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        TEXT_DECODER_EXECUTION_GROUP
-    }
-
-    fn state_partition_plan(
-        &self,
-        layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(0, layout)
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        eredu_runtime::ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend(format!(
-                "decoder execution group {group} is outside the text decoder"
-            )));
-        }
-        usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend(format!(
-                "decoder execution group {group} is outside the text decoder"
-            )));
-        }
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
-        if index >= count {
-            return Err(Error::backend(format!(
-                "decoder unit {index} is outside {count} decoder layers"
-            )));
-        }
-        Ok(format!("{}.layers.{index}", self.args.parameter_root()))
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Self::Error> {
-        if group != 0 {
-            return Err(Error::backend(format!(
-                "decoder execution group {group} is outside the text decoder"
-            )));
-        }
-        self.construct_unit(index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let hidden = self
-            .static_modules
-            .embeddings
-            .forward(input.tokens, context)?;
-        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
-        self.begin_embedded(hidden, input.mask, state, context)
-    }
-
-    fn begin_forward_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let mut forward = self.begin_forward(input, state, context)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
-    }
-
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::backend(format!(
-                "text decoder group {group} received {} dependencies",
-                dependencies.len()
-            )));
-        }
-        Ok(initial.clone())
-    }
-
-    fn forward_unit(
-        &mut self,
-        _group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.forward_block(index, unit, hidden, state, forward, context)
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        let cache = state.layer(index).map_err(Error::backend)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        unit.forward_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            context,
-            &mut ComponentInstrumentation::new(&path, &mut observer),
-        )
-    }
-
-    fn finish_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        _forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.finish_hidden(hidden, context)
-    }
-
-    fn projects_final_text_position() -> bool {
-        true
-    }
-
-    fn finish_text_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        _forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.finish_hidden(&final_hidden_position(hidden, context)?, context)
-    }
-
-    fn finish_forward_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        _forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.finish_hidden_instrumented(
-            hidden,
-            context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
-        )
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.mask.iter()
-    }
-}
-
-impl<B, C, P, S> eredu_runtime::ReplicatedTextArchitecture<B, S> for LayeredModel<B, C, P>
-where
-    B: NeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-{
-    fn supports_chunked_prefill() -> bool {
-        CHUNKED_TEXT_PREFILL
-    }
-
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
-    }
-}
-
-impl<B, C, P, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B, C, P>
-where
-    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelProjectionOperator<B>,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-{
-    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
-    }
-
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self
-            .parallel_geometry
-            .as_ref()
-            .ok_or_else(|| Error::backend("decoder model was not built with local geometry"))?
-            .state_layout()
-            .clone();
-        let hidden = B::vocabulary_parallel_lookup(
-            &mut self.static_modules.embeddings,
-            input.tokens,
-            EmbeddingLookupPolicy::Strict,
-            parallel,
-            context,
-        )?;
-        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
-        self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
-    }
-
-    fn begin_forward_parallel_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let mut forward = self.begin_forward_parallel(input, state, parallel, context)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-            .apply("embedding", forward.hidden)?;
-        Ok(forward)
-    }
-
-    fn forward_unit_parallel(
-        &mut self,
-        _group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.forward_block_parallel(index, unit, hidden, state, forward, parallel, context)
-    }
-
-    fn forward_unit_parallel_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        let cache = state.layer(index).map_err(Error::backend)?;
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        unit.forward_tensor_parallel_observed(
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            parallel,
-            context,
-            &mut ComponentInstrumentation::new(&path, &mut observer),
-        )
-    }
-
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        _forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.finish_hidden_parallel(hidden, parallel, context)
-    }
-
-    fn finish_forward_parallel_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        _forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        self.finish_hidden_parallel_instrumented(
-            hidden,
-            parallel,
-            context,
-            &mut ComponentInstrumentation::new("readout", &mut observer),
-        )
-    }
-}
-
-impl<B, C, P, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
-where
-    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelProjectionOperator<B>,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-{
-    type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
-
-    fn partition_observation_hooks(
-        &self,
-        _tensor_parallel: bool,
-    ) -> eredu_runtime::inspection::ObservationHookSupport {
-        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
-    }
-
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
-            self.args().hidden_size(),
-        ))
-    }
-
-    fn begin_partition<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        LayeredModel::prepare_partition(
-            self,
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            context,
-        )
-    }
-
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        LayeredModel::prepare_partition_parallel(
-            self,
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            parallel,
-            context,
-        )
-    }
-
-    fn begin_partition_observed<'a, O>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
-        let mut forward = match parallel {
-            Some(parallel) => self.begin_partition_parallel(
-                input,
-                mask,
-                state,
-                expected,
-                first_state_ordinal,
-                parallel,
-                context,
-            ),
-            None => {
-                self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
-            }
-        }?;
-        if embedded {
-            let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
-                .apply("embedding", forward.hidden)?;
-        }
-        Ok(forward)
-    }
-
-    fn finish_partition(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::LayeredPartitionOutput<B::Tensor>, Self::Error> {
-        if owns_output {
-            let output = match parallel {
-                Some(parallel) => {
-                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
-                }
-                None => self.finish_forward(hidden, state, forward, context)?,
-            };
-            Ok(eredu_runtime::LayeredPartitionOutput::Final {
-                output,
-                retained: None,
-            })
-        } else {
-            Ok(eredu_runtime::LayeredPartitionOutput::Boundary {
-                hidden: hidden.clone(),
-                auxiliary: eredu_runtime::NoAuxiliaryBoundary,
-            })
-        }
-    }
-
-    fn finish_partition_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<eredu_runtime::LayeredPartitionOutput<B::Tensor>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        if !owns_output {
-            return self.finish_partition(hidden, state, forward, false, parallel, context);
-        }
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        let mut instrumentation = ComponentInstrumentation::new("readout", &mut observer);
-        let output = match parallel {
-            Some(parallel) => self.finish_hidden_parallel_instrumented(
-                hidden,
-                parallel,
-                context,
-                &mut instrumentation,
-            ),
-            None => self.finish_hidden_instrumented(hidden, context, &mut instrumentation),
-        }?;
-        Ok(eredu_runtime::LayeredPartitionOutput::Final {
-            output,
-            retained: None,
-        })
-    }
-}
-
-impl<B, C, P, S> eredu_runtime::RoutedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
-where
-    B: GroupedNeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-    P::FeedForward: RoutedProjectionOperator<B>,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-{
-    fn routed_unit_observations(&self) -> bool {
-        <P::FeedForward as RoutedProjectionOperator<B>>::COMPONENT_OBSERVATIONS
-    }
-
-    fn routed_sparse_observations(&self) -> bool {
-        true
-    }
-
-    fn routed_observation_points(
-        &self,
-        group: usize,
-        index: usize,
-    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
-        let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        Ok(self.args.routed_observation_points(&unit_path, index))
-    }
-
-    fn forward_unit_observed_with_provider<R, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut R,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        R: eredu_runtime::ParameterProvider<B>,
-        R::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        let points = self.args.routed_observation_points(&path, index);
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        let cache = state.layer(index).map_err(Error::backend)?;
-        unit.forward_routed_observed(
-            index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            pass,
-            provider,
-            context,
-            &mut ComponentInstrumentation::new(&path, &mut observer),
-            points,
-        )
-    }
-
-    fn forward_unit_with_provider<R>(
-        &mut self,
-        _group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut R,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        R: eredu_runtime::ParameterProvider<B>,
-        R::Error: std::fmt::Display,
-    {
-        let cache = state.layer(index).map_err(Error::backend)?;
-        unit.forward_routed(
-            index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            pass,
-            provider,
-            context,
-        )
-    }
-}
-
-impl<B, C, P, S> eredu_runtime::ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B, C, P>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    C: Config,
-    P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelRoutedProjectionOperator<B>,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-{
-    fn parallel_routed_unit_observations(&self) -> bool {
-        <P::FeedForward as RoutedProjectionOperator<B>>::COMPONENT_OBSERVATIONS
-    }
-
-    fn parallel_routed_sparse_observations(&self) -> bool {
-        true
-    }
-
-    fn forward_unit_parallel_observed_with_provider<R, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut R,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        R: eredu_runtime::TensorParallelParameterProvider<B>,
-        R::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        let points = self.args.routed_observation_points(&path, index);
-        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        let cache = state.layer(index).map_err(Error::backend)?;
-        unit.forward_routed_parallel_observed(
-            index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            pass,
-            provider,
-            parallel,
-            context,
-            &mut ComponentInstrumentation::new(&path, &mut observer),
-            points,
-        )
-    }
-
-    fn forward_unit_parallel_with_provider<R>(
-        &mut self,
-        _group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut R,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        R: eredu_runtime::TensorParallelParameterProvider<B>,
-        R::Error: std::fmt::Display,
-    {
-        let cache = state.layer(index).map_err(Error::backend)?;
-        unit.forward_routed_parallel(
-            index,
-            AttentionInput {
-                selected_positions: None,
-                hidden,
-                mask: forward.mask.as_ref(),
-                cache: Some(cache),
-                allow_sliding_prefill: forward.allow_sliding_prefill,
-                rotary_position: forward
-                    .rotary_embeddings
-                    .as_ref()
-                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
-            },
-            pass,
-            provider,
-            parallel,
-            context,
         )
     }
 }

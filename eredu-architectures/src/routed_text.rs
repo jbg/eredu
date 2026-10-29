@@ -236,94 +236,80 @@ pub enum RoutedTextPreparationError {
     /// The admitted graph no longer matches the selected routed class.
     #[error("replicated routed text preparation is ineligible")]
     Ineligible,
+    /// Primary and independently materialized companion identities overlap.
+    #[error(transparent)]
+    Materialization(#[from] eredu_runtime::MaterializationTaskIndexError),
+    /// Exact generated output geometry or ownership disagrees.
+    #[error(transparent)]
+    MaterializationContract(#[from] eredu_runtime::ReplicatedTextContractError),
+    /// Selected member geometry or payload accounting disagrees.
+    #[error(transparent)]
+    BankGeometry(#[from] eredu_runtime::AddressableBankMemberError),
     /// Requirements, artifact provenance, selected formats, or modules disagreed.
     #[error("invalid replicated routed text preparation: {0}")]
     Invalid(String),
 }
 
-fn index_materialization_tasks(
-    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
-) -> BTreeMap<&str, &eredu_runtime::ReplicatedTextMaterializationTask> {
-    let mut indexed = BTreeMap::new();
-    for task in tasks {
-        for companion in task.output_companions() {
-            if let Some(exact) = companion.materialization_task() {
-                indexed.insert(companion.name(), exact);
-            }
-        }
-        indexed.insert(task.name(), task);
-    }
-    indexed
-}
-
 fn selected_member_geometry(
     unit: &crate::ExpertResidencyUnit,
-    tasks: &BTreeMap<&str, &eredu_runtime::ReplicatedTextMaterializationTask>,
-) -> Result<(u64, u64), String> {
-    let mut source_bytes = 0u64;
-    let mut selected_bytes = 0u64;
-    for parameter in unit.parameters() {
-        let metadata = parameter.metadata().ok_or_else(|| {
-            format!(
-                "addressable member {:?} omitted admitted recipe metadata",
-                unit.identity()
-            )
-        })?;
-        source_bytes = source_bytes
-            .checked_add(metadata.byte_len())
-            .ok_or_else(|| "addressable source byte geometry overflowed".to_owned())?;
-        let task = tasks.get(parameter.logical_target()).ok_or_else(|| {
-            format!(
-                "addressable target {:?} has no selected parameter realization",
-                parameter.logical_target()
-            )
-        })?;
-        let parameter_bytes = if matches!(
-            task.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        ) {
-            if metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
-                && !matches!(
-                    parameter.role(),
-                    crate::ExpertParameterRole::QuantizableProjection { .. }
-                )
-            {
-                return Err(format!(
-                    "addressable transform target {:?} is not a quantizable projection",
-                    parameter.logical_target()
-                ));
-            }
-            let quantization = task.executable().weight_quantization().ok_or_else(|| {
-                format!(
-                    "addressable transform target {:?} has no packed realization",
-                    parameter.logical_target()
-                )
+    tasks: &eredu_runtime::MaterializationTaskIndex<'_>,
+) -> Result<eredu_runtime::AddressableBankFootprint, RoutedTextPreparationError> {
+    let invalid = RoutedTextPreparationError::Invalid;
+    let footprint = eredu_runtime::AddressableBankFootprint::try_from_parameters(
+        unit.identity(),
+        unit.parameters().iter().map(|parameter| {
+            let metadata = parameter.metadata().ok_or_else(|| {
+                invalid(format!(
+                    "addressable member {:?} omitted admitted recipe metadata",
+                    unit.identity()
+                ))
             })?;
-            if matches!(
-                quantization,
-                eredu_checkpoint::WeightQuantization::GgufIQuant { .. }
-            ) {
-                return Err(
-                    "load-time addressable transformation cannot select GGUF IQuant".into(),
-                );
-            }
-            eredu_runtime::selected_addressable_parameter_bytes(task, metadata)
-                .map_err(|error| error.to_string())?
-        } else {
-            metadata.byte_len()
-        };
-        selected_bytes = selected_bytes
-            .checked_add(parameter_bytes)
-            .ok_or_else(|| "addressable selected byte geometry overflowed".to_owned())?;
-    }
-    if unit.byte_len() != Some(source_bytes) {
-        return Err(format!(
+            let task = tasks.get(parameter.logical_target()).ok_or_else(|| {
+                invalid(format!(
+                    "addressable target {:?} has no selected parameter realization",
+                    parameter.logical_target()
+                ))
+            })?;
+            let parameter_bytes = if task.lowering().transforms_payload() {
+                if metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
+                    && !matches!(
+                        parameter.role(),
+                        crate::ExpertParameterRole::QuantizableProjection { .. }
+                    )
+                {
+                    return Err(invalid(format!(
+                        "addressable transform target {:?} is not a quantizable projection",
+                        parameter.logical_target()
+                    )));
+                }
+                let quantization = task.executable().weight_quantization().ok_or_else(|| {
+                    invalid(format!(
+                        "addressable transform target {:?} has no packed realization",
+                        parameter.logical_target()
+                    ))
+                })?;
+                if matches!(
+                    quantization,
+                    eredu_checkpoint::WeightQuantization::GgufIQuant { .. }
+                ) {
+                    return Err(invalid(
+                        "load-time addressable transformation cannot select GGUF IQuant".into(),
+                    ));
+                }
+                eredu_runtime::selected_addressable_parameter_bytes(task, metadata)?
+            } else {
+                metadata.byte_len()
+            };
+            Ok((metadata.byte_len(), parameter_bytes))
+        }),
+    )?;
+    if unit.byte_len() != Some(footprint.source_bytes()) {
+        return Err(invalid(format!(
             "addressable member {:?} source bytes differ from its admitted catalog",
             unit.identity()
-        ));
+        )));
     }
-    Ok((source_bytes, selected_bytes))
+    Ok(footprint)
 }
 
 pub(crate) fn project_addressable_members(
@@ -359,36 +345,14 @@ fn project_bank_members_with_tasks(
     tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
     include_replicated: bool,
 ) -> Result<Vec<eredu_runtime::AddressableBankMember>, RoutedTextPreparationError> {
-    let mut selected_tasks = index_materialization_tasks(selected.materialization_tasks());
-    selected_tasks.extend(index_materialization_tasks(
-        selected.auxiliary_materialization_tasks(),
-    ));
-    let mut exact_tasks = BTreeMap::new();
-    for task in tasks {
-        if exact_tasks.insert(task.name(), task).is_some() {
-            return Err(RoutedTextPreparationError::Invalid(format!(
-                "addressable materialization repeats task {:?}",
-                task.name()
-            )));
-        }
-        // Partition projection folds encoded-linear companions into their
-        // primary task so the physical family stays atomic. A bank catalog,
-        // however, retains one binding and recipe per stored value. Re-index
-        // the exact standalone task retained by each companion under the
-        // architecture topology identity; do not reconstruct its lowering.
-        for companion in task.output_companions() {
-            let Some(exact) = companion.materialization_task() else {
-                continue;
-            };
-            if exact_tasks.insert(companion.name(), exact).is_some() {
-                return Err(RoutedTextPreparationError::Invalid(format!(
-                    "addressable materialization repeats output {:?}",
-                    companion.name()
-                )));
-            }
-        }
-    }
-    let mut shared_tasks = BTreeMap::new();
+    let selected_tasks = eredu_runtime::MaterializationTaskIndex::new(
+        selected
+            .materialization_tasks()
+            .iter()
+            .chain(selected.auxiliary_materialization_tasks()),
+    )?;
+    let exact_tasks = eredu_runtime::MaterializationTaskIndex::new(tasks)?;
+    let mut shared_tasks = eredu_runtime::AddressableBankTaskCache::new(&exact_tasks);
     let mut members = Vec::with_capacity(catalog.units().len());
     for unit in catalog.units() {
         if !include_replicated
@@ -399,7 +363,7 @@ fn project_bank_members_with_tasks(
         let local_parameters = unit
             .parameters()
             .iter()
-            .filter(|parameter| exact_tasks.contains_key(parameter.logical_target()))
+            .filter(|parameter| exact_tasks.get(parameter.logical_target()).is_some())
             .count();
         if local_parameters == 0 {
             continue;
@@ -411,8 +375,7 @@ fn project_bank_members_with_tasks(
                 unit.parameters().len()
             )));
         }
-        let (source_bytes, _selected_bytes) = selected_member_geometry(unit, &selected_tasks)
-            .map_err(RoutedTextPreparationError::Invalid)?;
+        let source_bytes = selected_member_geometry(unit, &selected_tasks)?.source_bytes();
         let mut parameters = Vec::with_capacity(unit.parameters().len());
         for parameter in unit.parameters() {
             let metadata = parameter.metadata().ok_or_else(|| {
@@ -421,20 +384,13 @@ fn project_bank_members_with_tasks(
                     unit.identity()
                 ))
             })?;
-            let task = exact_tasks
-                .get(parameter.logical_target())
-                .copied()
-                .ok_or_else(|| {
-                    RoutedTextPreparationError::Invalid(format!(
-                        "addressable target {:?} has no exact materialization task",
-                        parameter.logical_target()
-                    ))
-                })?;
-            let transforms = matches!(
-                task.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            );
+            let task = exact_tasks.get(parameter.logical_target()).ok_or_else(|| {
+                RoutedTextPreparationError::Invalid(format!(
+                    "addressable target {:?} has no exact materialization task",
+                    parameter.logical_target()
+                ))
+            })?;
+            let transforms = task.lowering().transforms_payload();
             let selected_bytes = if transforms {
                 eredu_runtime::selected_addressable_parameter_bytes(task, metadata)
                     .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?
@@ -470,86 +426,32 @@ fn project_bank_members_with_tasks(
                 } else {
                     None
                 };
-            let shared_key = (
+            let shared_task = shared_tasks.resolve(
                 parameter.logical_target(),
                 metadata.shape(),
-                companions.as_ref().map(|bindings| {
-                    (
-                        bindings.scale().to_owned(),
-                        bindings.affine_bias().map(str::to_owned),
-                    )
-                }),
-            );
-            let shared_task = if let Some(shared) = shared_tasks.get(&shared_key) {
-                eredu_runtime::AddressableBankTask::clone(shared)
-            } else {
-                let mut task = task.clone();
-                if task.output_companions().is_empty() {
-                    if let Some(companions) = companions.as_ref() {
-                        let quantization =
-                            task.executable().weight_quantization().ok_or_else(|| {
-                                RoutedTextPreparationError::Invalid(format!(
-                                    "addressable transform target {:?} has no packed format",
-                                    task.name()
-                                ))
-                            })?;
-                        let prefix = parameter
-                            .logical_target()
-                            .strip_suffix(parameter.binding_name())
-                            .ok_or_else(|| {
-                                RoutedTextPreparationError::Invalid(format!(
+                companions.as_ref(),
+                |task, companions| -> Result<_, RoutedTextPreparationError> {
+                    let prefix = parameter
+                        .logical_target()
+                        .strip_suffix(parameter.binding_name())
+                        .ok_or_else(|| {
+                            RoutedTextPreparationError::Invalid(format!(
                                 "addressable target {:?} does not end in its local binding {:?}",
                                 parameter.logical_target(),
                                 parameter.binding_name()
                             ))
-                            })?;
-                        let mut shape = metadata.shape().to_vec();
-                        let columns = shape.last_mut().ok_or_else(|| {
-                            RoutedTextPreparationError::Invalid(
-                                "addressable transform companion has no group axis".into(),
-                            )
                         })?;
-                        *columns = columns
-                            .checked_div(quantization.group_size() as usize)
-                            .ok_or_else(|| {
-                                RoutedTextPreparationError::Invalid(
-                                    "addressable transform companion group geometry is invalid"
-                                        .into(),
-                                )
-                            })?;
-                        let owner = task.owner().parameter_group_owner().map_err(|error| {
-                            RoutedTextPreparationError::Invalid(error.to_string())
-                        })?;
-                        let mut outputs = vec![eredu_runtime::ReplicatedTextOutputCompanion::new(
-                            format!("{prefix}{}", companions.scale()),
-                            eredu_nn::LinearCompanionRole::Scale,
-                            shape.clone(),
-                            owner.clone(),
-                        )
-                        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?];
-                        if let Some(biases) = companions.affine_bias() {
-                            outputs.push(
-                                eredu_runtime::ReplicatedTextOutputCompanion::new(
-                                    format!("{prefix}{biases}"),
-                                    eredu_nn::LinearCompanionRole::AffineBias,
-                                    shape,
-                                    owner,
-                                )
-                                .map_err(|error| {
-                                    RoutedTextPreparationError::Invalid(error.to_string())
-                                })?,
-                            );
-                        }
-                        task = task.with_output_companions(outputs).map_err(|error| {
-                            RoutedTextPreparationError::Invalid(error.to_string())
-                        })?;
-                    }
-                }
-                let shared = eredu_runtime::AddressableBankTask::new(task)
-                    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-                shared_tasks.insert(shared_key, shared.clone());
-                shared
-            };
+                    let scale = format!("{prefix}{}", companions.scale());
+                    let affine_bias = companions
+                        .affine_bias()
+                        .map(|name| format!("{prefix}{name}"));
+                    Ok(task.transform_output_companions(
+                        metadata.shape(),
+                        &scale,
+                        affine_bias.as_deref(),
+                    )?)
+                },
+            )?;
             parameters.push(
                 eredu_runtime::AddressableBankParameter::from_shared_task(
                     parameter.binding_name(),
@@ -707,26 +609,44 @@ where
         return Err("iterative routed construction requires grouped-bank selection".into());
     };
     validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
-    )?;
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|error| error.to_string())?;
     let config = diffusion_args(inspection).ok_or("missing admitted diffusion geometry")?;
     let mut target = config.clone();
     target.text.weight_quantization = None;
     target.text.quantized_weights = None;
-    let formats = crate::replicated_text::selected_formats(selected.text());
+    let formats = selected.text().quantized_formats();
     target.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
     let identity = target.architecture_fingerprint();
     let capability =
         crate::capability::diffusion_gemma(&target).map_err(|error| error.to_string())?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
-        .then(|| crate::diffusion_gemma::model::TextModel::<B>::new(config.clone(), context))
+    let retained = selected
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or("shared iterative selection has no retained definition")?;
+    let source_architecture = selected
+        .text()
+        .uses_weight_transform()
+        .then(|| {
+            crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
+                config.clone(),
+                retained.clone(),
+                context,
+            )
+        })
         .transpose()
         .map_err(|error| error.to_string())?;
-    let architecture = crate::diffusion_gemma::model::TextModel::<B>::new(target, context)
+    let definition = crate::diffusion_gemma::model::project_parameters(&target, &retained)
         .map_err(|error| error.to_string())?;
+    let architecture = crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
+        target, definition, context,
+    )
+    .map_err(|error| error.to_string())?;
     if expected.text().block_refinement()
         != eredu_runtime::ReplicatedTextArchitecture::<B, S>::block_refinement_geometry(
             &architecture,
@@ -760,22 +680,23 @@ where
 {
     let expected = routed_text_requirements(inspection).map_err(|error| error.to_string())?;
     validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
-    )?;
+        eredu_runtime::SourceHandoffScope::Primary,
+    )
+    .map_err(|error| error.to_string())?;
     let args = k2_horizon_args(inspection).ok_or("expected K2 Horizon configuration")?;
-    let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
-        .then(|| crate::k2_horizon::LayeredModel::<B>::new(args.clone(), context))
-        .transpose()
-        .map_err(|error| error.to_string())?;
     let selected_args = crate::replicated_text::selected_k2_horizon_args(args, selected.text())?;
     let identity = crate::k2_horizon::prompt_cache_architecture_fingerprint(&selected_args);
     let capability =
         crate::capability::k2_horizon(&selected_args).map_err(|error| error.to_string())?;
-    let architecture = crate::k2_horizon::LayeredModel::<B>::new(selected_args, context)
-        .map_err(|error| error.to_string())?;
+    let (architecture, source_architecture) = crate::replicated_text::materialize_decoder::<
+        B,
+        crate::k2_horizon::ModelArgs,
+        crate::k2_horizon::BlockFactory,
+    >(args, selected_args, selected.text(), context)
+    .map_err(|error| error.to_string())?;
     prepare_routed_architecture_handoff::<B, S, _>(
         architecture,
         source_architecture,
@@ -808,12 +729,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -836,16 +757,16 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::qwen::RoutedLayeredModel::<B>::new(args.clone(), context))
-        .transpose()
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_qwen_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::qwen::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::qwen::RoutedLayeredModel::<B>::new(selected_args, context)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let (architecture, source_architecture) = crate::replicated_text::materialize_decoder::<
+        B,
+        crate::qwen::ModelArgs,
+        crate::qwen::RoutedQwenBlockFactory,
+    >(args, selected_args, &text, context)
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::qwen(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
@@ -890,12 +811,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -918,16 +839,16 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::gpt_oss::new_layered_model::<B>(args.clone(), context))
-        .transpose()
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_gpt_oss_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::gpt_oss::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::gpt_oss::new_layered_model::<B>(selected_args, context)
-        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let (architecture, source_architecture) = crate::replicated_text::materialize_decoder::<
+        B,
+        crate::gpt_oss::ModelArgs,
+        crate::gpt_oss::GptOssBlockFactory,
+    >(args, selected_args, &text, context)
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::gpt_oss(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
@@ -969,12 +890,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1003,16 +924,29 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::lfm2::LayeredModel::<B>::new(args.clone(), context))
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid("LFM2 selection has no retained definition".into())
+        })?;
+    let source_architecture = text
+        .uses_weight_transform()
+        .then(|| {
+            let definition = crate::lfm2::project_parameters(args, &retained)?;
+            crate::lfm2::CompleteLfm2Kernel::<B>::from_definition(args.clone(), definition, context)
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_lfm2_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::lfm2::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::lfm2::LayeredModel::<B>::new(selected_args, context)
+    let definition = crate::lfm2::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture =
+        crate::lfm2::CompleteLfm2Kernel::<B>::from_definition(selected_args, definition, context)
+            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::lfm2(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
@@ -1060,12 +994,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1096,16 +1030,38 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::kimi_linear::LayeredModel::<B>::new(args.clone(), context))
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid(
+                "Kimi Linear selection has no retained definition".into(),
+            )
+        })?;
+    let source_architecture = text
+        .uses_weight_transform()
+        .then(|| {
+            let definition = crate::kimi_linear::project_parameters(args, &retained)?;
+            crate::kimi_linear::CompleteKimiKernel::<B>::from_definition(
+                args.clone(),
+                definition,
+                context,
+            )
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_kimi_linear_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::kimi_linear::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::kimi_linear::LayeredModel::<B>::new(selected_args, context)
+    let definition = crate::kimi_linear::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture = crate::kimi_linear::CompleteKimiKernel::<B>::from_definition(
+        selected_args,
+        definition,
+        context,
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::kimi_linear(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
@@ -1150,12 +1106,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1190,16 +1146,31 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::qwen::hybrid::LayeredModel::<B>::new(args.clone(), context))
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid(
+                "Qwen hybrid selection has no retained definition".into(),
+            )
+        })?;
+    let source_architecture = text
+        .uses_weight_transform()
+        .then(|| {
+            let definition = crate::qwen::hybrid::project_parameters(args, &retained)?;
+            crate::qwen::hybrid::QwenKernel::<B>::from_definition(args.clone(), definition, context)
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_qwen_hybrid_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::qwen::hybrid::LayeredModel::<B>::new(selected_args, context)
+    let definition = crate::qwen::hybrid::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture =
+        crate::qwen::hybrid::QwenKernel::<B>::from_definition(selected_args, definition, context)
+            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::qwen_hybrid_text(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
@@ -1243,12 +1214,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1279,16 +1250,31 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::deepseek::v3::Model::<B>::new(args.clone(), context))
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid("V3 selection has no retained definition".into())
+        })?;
+    let source_architecture = text
+        .uses_weight_transform()
+        .then(|| {
+            let definition = crate::deepseek::v3::project_parameters(args, &retained)?;
+            crate::deepseek::v3::V3Kernel::<B>::from_definition(args.clone(), definition, context)
+                .and_then(|kernel| kernel.into_model())
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_deepseek_v3_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::deepseek::v3_architecture_fingerprint(&selected_args);
-    let architecture = crate::deepseek::v3::Model::<B>::new(selected_args, context)
+    let definition = crate::deepseek::v3::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture =
+        crate::deepseek::v3::V3Kernel::<B>::from_definition(selected_args, definition, context)
+            .and_then(|kernel| kernel.into_model())
+            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::deepseek_v3(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
@@ -1332,12 +1318,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1368,16 +1354,31 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::deepseek::v4::Model::<B>::new(args.clone(), context))
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid("V4 selection has no retained definition".into())
+        })?;
+    let source_architecture = text
+        .uses_weight_transform()
+        .then(|| {
+            let definition = crate::deepseek::v4::project_parameters(args, &retained)?;
+            crate::deepseek::v4::V4Kernel::<B>::from_definition(args.clone(), definition, context)
+                .and_then(|kernel| kernel.into_model())
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_deepseek_v4_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::deepseek::v4_architecture_fingerprint(&selected_args);
-    let architecture = crate::deepseek::v4::Model::<B>::new(selected_args, context)
+    let definition = crate::deepseek::v4::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture =
+        crate::deepseek::v4::V4Kernel::<B>::from_definition(selected_args, definition, context)
+            .and_then(|kernel| kernel.into_model())
+            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::deepseek_v4(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets =
@@ -1422,12 +1423,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(
+    eredu_runtime::validate_checkpoint_handoff(
         expected.text(),
         store.as_ref(),
-        crate::replicated_text::StoreHandoffScope::Primary,
+        eredu_runtime::SourceHandoffScope::Primary,
     )
-    .map_err(RoutedTextPreparationError::Invalid)?;
+    .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1458,16 +1459,38 @@ where
             "selected grouped equation differs from the admitted architecture".into(),
         ));
     };
-    let source_architecture = crate::replicated_text::selected_uses_transform(&text)
-        .then(|| crate::nemotron_h::LayeredModel::<B>::new(args.clone(), context))
+    let retained = text
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| {
+            RoutedTextPreparationError::Invalid(
+                "Nemotron-H selection has no retained definition".into(),
+            )
+        })?;
+    let source_architecture = text
+        .uses_weight_transform()
+        .then(|| {
+            let definition = crate::nemotron_h::project_parameters(args, &retained)?;
+            crate::nemotron_h::CompleteNemotronKernel::<B>::from_definition(
+                args.clone(),
+                definition,
+                context,
+            )
+        })
         .transpose()
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let selected_args = crate::replicated_text::selected_nemotron_h_args(args, &text)
         .map_err(RoutedTextPreparationError::Invalid)?;
     let prompt_cache_architecture_identity =
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&selected_args);
-    let architecture = crate::nemotron_h::LayeredModel::<B>::new(selected_args, context)
+    let definition = crate::nemotron_h::project_parameters(&selected_args, &retained)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    let architecture = crate::nemotron_h::CompleteNemotronKernel::<B>::from_definition(
+        selected_args,
+        definition,
+        context,
+    )
+    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let capability_estimate = crate::capability::nemotron_h(args)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
     let targets = addressable_parameter_targets::<Relu2Operation>(bank_residency, &plan, &catalog);
@@ -2632,13 +2655,18 @@ fn maximum_selected_compact_bytes(
     requirements: &RoutedBankRequirements,
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
 ) -> Result<u64, String> {
-    let mut tasks = index_materialization_tasks(selected.materialization_tasks());
-    tasks.extend(index_materialization_tasks(
-        selected.auxiliary_materialization_tasks(),
-    ));
+    let tasks = eredu_runtime::MaterializationTaskIndex::new(
+        selected
+            .materialization_tasks()
+            .iter()
+            .chain(selected.auxiliary_materialization_tasks()),
+    )
+    .map_err(|error| error.to_string())?;
     let mut by_unit = BTreeMap::<(String, usize), Vec<u64>>::new();
     for unit in requirements.catalog().units() {
-        let (_, selected_bytes) = selected_member_geometry(unit, &tasks)?;
+        let selected_bytes = selected_member_geometry(unit, &tasks)
+            .map_err(|error| error.to_string())?
+            .selected_bytes();
         by_unit
             .entry((
                 unit.owner_group().as_str().to_owned(),

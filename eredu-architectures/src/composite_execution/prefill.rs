@@ -41,8 +41,7 @@ impl<T, P> DecoderPrefillRequest<T, P> {
     }
 }
 
-impl<A, B, S> ChunkedPrefillRequest<PreparedCompositeArchitecture<A>, B, S>
-    for DecoderPrefillRequest<B::Tensor, A::InputPartPlan>
+impl<A, B, S> ChunkedPrefillRequest<A, B, S> for DecoderPrefillRequest<B::Tensor, A::InputPartPlan>
 where
     B: NeuralBackend,
     S: eredu_runtime::RuntimeState<B>,
@@ -62,7 +61,7 @@ where
         &self,
         range: Range<usize>,
         continuation: Option<&Self::Continuation>,
-        operation: impl for<'a> FnOnce(PreparedCompositeInput<'a, B::Tensor, A::InputPartPlan>) -> R,
+        operation: impl for<'a> FnOnce(A::Input<'a>) -> R,
     ) -> Result<R, A::Error> {
         let assembled = continuation.and_then(Option::as_ref);
         if range.start >= range.end
@@ -80,7 +79,7 @@ where
         let mut input = PreparedCompositeInput::new(&self.input.0, &self.input.1)
             .map_err(eredu_nn::Error::backend)?;
         input.decoder_chunk = Some((range.start, range.end, assembled));
-        Ok(operation(input))
+        Ok(operation(A::prepared_input(input)))
     }
     fn continuation(&self, completed: &A::ForwardContext) -> Self::Continuation {
         A::prefill_decoder_continuation(completed).cloned()

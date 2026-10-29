@@ -14,7 +14,7 @@ use eredu_runtime::ReplicatedTextPhysicalSource;
 pub struct SafetensorsPredictionPlan {
     config: Config,
     formats: ParameterFormats,
-    banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
     shared_recipes: BTreeMap<String, DerivedWeightRecipe>,
     unit_recipes: Vec<BTreeMap<String, DerivedWeightRecipe>>,
     catalog: HeaderCatalog,
@@ -101,7 +101,7 @@ impl SafetensorsPredictionPlan {
             .map(|(root, recipes)| {
                 Ok((
                     root,
-                    Arc::new(PreparedExpertBank::new(
+                    Arc::new(ParameterBankRecipes::new(
                         &catalog,
                         recipes,
                         config.experts.count as usize,
@@ -169,7 +169,7 @@ impl SafetensorsPredictionPlan {
         (
             PredictionSpec,
             ParameterFormats,
-            BTreeMap<String, Arc<PreparedExpertBank>>,
+            BTreeMap<String, Arc<ParameterBankRecipes>>,
         ),
         PreparationError,
     > {
@@ -212,7 +212,11 @@ impl SafetensorsPredictionPlan {
                 "prediction source set differs from admitted headers".into(),
             ));
         }
-        let artifact = retain(source, self.resolution.source_keys().clone())?;
+        let artifact: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
+            source,
+            "qwen4_exp prepared owner",
+            self.resolution.source_keys().clone(),
+        )?);
         for key in self.resolution.source_keys() {
             let metadata = artifact.source_metadata(key)?;
             let admitted = &self.catalog.0[key];
@@ -261,7 +265,7 @@ pub struct PreparedPredictionSource {
     config: Config,
     artifact: SharedCheckpointSource,
     formats: ParameterFormats,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
     recipes: (
         BTreeMap<String, DerivedWeightRecipe>,
         Vec<BTreeMap<String, DerivedWeightRecipe>>,

@@ -1,11 +1,11 @@
 //! Selection contracts for replicated text architectures.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
-use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
+use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization};
 use eredu_core::{
     cache::{StateComponentPolicy, StateTensorDtype},
     checkpoint::TensorDtype,
@@ -98,6 +98,14 @@ pub enum WeightLoweringKind {
     Transform,
     /// An architecture recipe derives a tensor that payload materialization then transforms.
     DerivedTransform,
+}
+
+impl WeightLoweringKind {
+    /// Whether admitted payload materialization performs a format transformation.
+    /// Direct loading and recipe-only derivation do not select payload conversion.
+    pub const fn transforms_payload(self) -> bool {
+        matches!(self, Self::Transform | Self::DerivedTransform)
+    }
 }
 
 /// One exact weight lowering implemented by a backend.
@@ -1212,6 +1220,7 @@ impl ReplicatedTextContractError {
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
+    component: Option<std::sync::Arc<crate::ComponentDefinition>>,
     state_partition_plan: Option<crate::ArchitectureStatePartitionPlan>,
     prefill_input_retention: crate::memory_forecast::PrefillInputRetention,
     execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
@@ -1300,18 +1309,72 @@ impl ReplicatedTextRequirements {
         self.execution_topology.as_ref()
     }
 
+    /// Retains the same validated component facts for cold ownership and execution.
+    pub fn with_component_definition(
+        mut self,
+        definition: crate::ComponentDefinition,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        if self
+            .component
+            .as_deref()
+            .is_some_and(|retained| retained != &definition)
+            || definition.parameters().graph() != &self.execution_graph
+            || definition.parameters().unit_layout() != &self.execution_units
+            || definition.state_layout() != &self.state_layout
+            || self
+                .state_partition_plan
+                .as_ref()
+                .is_some_and(|plan| plan != definition.state_partition_plan())
+            || (0..self.group_transports.len()).any(|group| {
+                definition.group_transport(group).ok() != self.group_transports.get(group)
+            })
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "component definition differs from text execution structure",
+            ));
+        }
+        self.state_partition_plan = None;
+        self.component = Some(std::sync::Arc::new(definition));
+        Ok(self)
+    }
+    /// Source-free invocation and parameter-use authority, when retained by the family.
+    pub fn component_definition(&self) -> Option<&crate::ComponentDefinition> {
+        self.component.as_deref()
+    }
+
+    /// Shares the retained immutable declaration with resource construction.
+    pub fn shared_component_definition(
+        &self,
+    ) -> Option<std::sync::Arc<crate::ComponentDefinition>> {
+        self.component.clone()
+    }
+
     /// Retains explicit state placement for decoder and non-decoder groups.
     pub fn with_state_partition_plan(
         mut self,
         plan: crate::ArchitectureStatePartitionPlan,
-    ) -> Self {
-        self.state_partition_plan = Some(plan);
-        self
+    ) -> Result<Self, ReplicatedTextContractError> {
+        plan.validate(&self.state_layout, &self.execution_units)
+            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        if self
+            .component
+            .as_ref()
+            .is_some_and(|definition| definition.state_partition_plan() != &plan)
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "state partition plan differs from retained component definition",
+            ));
+        }
+        self.state_partition_plan = self.component.is_none().then_some(plan);
+        Ok(self)
     }
 
-    /// Exact state placement, when the architecture declares non-default owners.
+    /// Exact state placement projected from the retained semantic authority.
     pub fn state_partition_plan(&self) -> Option<&crate::ArchitectureStatePartitionPlan> {
-        self.state_partition_plan.as_ref()
+        self.component
+            .as_ref()
+            .map(|definition| definition.state_partition_plan())
+            .or(self.state_partition_plan.as_ref())
     }
 
     /// Declares input ownership across consecutive decoder prefix invocations.
@@ -1432,6 +1495,7 @@ impl ReplicatedTextRequirements {
         }
         Ok(Self {
             execution_topology: None,
+            component: None,
             state_partition_plan: None,
             prefill_input_retention: crate::memory_forecast::PrefillInputRetention::TokenIds,
             chunked_prefill: false,
@@ -1670,6 +1734,36 @@ impl ReplicatedTextRequirements {
         self
     }
 
+    /// Ordinary admitted formats that use quantized native operators.
+    /// Auxiliary requirements retain their independent catalog and source scope.
+    pub fn native_quantized_formats(&self) -> HashMap<String, WeightQuantization> {
+        self.parameters()
+            .iter()
+            .filter_map(|parameter| {
+                parameter
+                    .native_executable()
+                    .weight_quantization()
+                    .map(|format| (parameter.name().to_owned(), format))
+            })
+            .collect()
+    }
+
+    /// Admitted linear and embedding formats, including dense matrices.
+    pub fn native_matrix_formats(&self) -> HashMap<String, LinearFormat> {
+        self.matrix_parameters()
+            .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
+            .collect()
+    }
+
+    fn matrix_parameters(&self) -> impl Iterator<Item = &ReplicatedTextParameterRequirement> {
+        self.parameters().iter().filter(|parameter| {
+            matches!(
+                parameter.role(),
+                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
+            )
+        })
+    }
+
     /// Returns required optional neural-operation semantics.
     pub const fn operators(&self) -> NeuralOperatorCapabilities {
         self.operators
@@ -1755,75 +1849,65 @@ impl ReplicatedTextRequirements {
     }
 }
 
+impl ReplicatedTextStateAccess {
+    /// Infers the exact access capability from declared state roles, without native resources.
+    pub fn from_layout(layout: &StateLayout) -> Result<Self, ReplicatedTextContractError> {
+        use eredu_core::cache::StateComponentRole;
+        let mut ordinary = false;
+        let mut compressed = false;
+        let mut fixed = false;
+        let mut streams = false;
+        for role in (0..layout.len())
+            .flat_map(|layer| layout.components(layer).expect("validated state layout"))
+            .map(StateComponentPolicy::role)
+        {
+            match role {
+                StateComponentRole::AttentionKeys | StateComponentRole::AttentionValues => {
+                    ordinary = true
+                }
+                StateComponentRole::CompressedLatent | StateComponentRole::RotaryKeys => {
+                    compressed = true
+                }
+                StateComponentRole::Fixed(_) => fixed = true,
+                StateComponentRole::AppendStream { .. } => streams = true,
+            }
+        }
+        if ordinary && compressed || streams && (!ordinary || compressed) {
+            return Err(ReplicatedTextContractError::invalid(
+                "state layout combines incompatible attention or append-stream roles",
+            ));
+        }
+        Ok(if streams {
+            Self::AttentionWithStreams
+        } else {
+            match (ordinary, compressed, fixed) {
+                (false, false, false) => Self::Stateless,
+                (true, false, false) => Self::KeyValue,
+                (false, false, true) => Self::Fixed,
+                (true, false, true) => Self::AttentionWithFixed,
+                (false, true, false) => Self::CompressedAttention,
+                (false, true, true) => Self::CompressedAttentionWithFixed,
+                (true, true, _) => unreachable!("rejected mixed attention encodings"),
+            }
+        })
+    }
+}
+
 fn validate_state_access_profile(
     layout: &StateLayout,
     access: ReplicatedTextStateAccess,
 ) -> Result<(), ReplicatedTextContractError> {
-    use eredu_core::cache::StateComponentRole;
-
+    if matches!(ReplicatedTextStateAccess::from_layout(layout), Ok(inferred) if inferred == access)
+    {
+        return Ok(());
+    }
     let roles = (0..layout.len())
-        .flat_map(|layer| {
-            layout
-                .components(layer)
-                .expect("validated state layout exposes every layer")
-        })
+        .flat_map(|layer| layout.components(layer).expect("validated state layout"))
         .map(StateComponentPolicy::role)
         .collect::<Vec<_>>();
-    let ordinary = |role| {
-        matches!(
-            role,
-            StateComponentRole::AttentionKeys | StateComponentRole::AttentionValues
-        )
-    };
-    let compressed = |role| {
-        matches!(
-            role,
-            StateComponentRole::CompressedLatent | StateComponentRole::RotaryKeys
-        )
-    };
-    let fixed = |role| matches!(role, StateComponentRole::Fixed(_));
-    let has_ordinary = roles.iter().copied().any(ordinary);
-    let has_compressed = roles.iter().copied().any(compressed);
-    let has_fixed = roles.iter().copied().any(fixed);
-    let append = |role| matches!(role, StateComponentRole::AppendStream { .. });
-    let coherent = match access {
-        ReplicatedTextStateAccess::AttentionWithStreams => {
-            has_ordinary
-                && roles.iter().copied().any(append)
-                && roles
-                    .iter()
-                    .copied()
-                    .all(|role| ordinary(role) || fixed(role) || append(role))
-        }
-        ReplicatedTextStateAccess::Stateless => roles.is_empty(),
-        ReplicatedTextStateAccess::KeyValue => roles.iter().copied().all(ordinary) && has_ordinary,
-        ReplicatedTextStateAccess::Fixed => roles.iter().copied().all(fixed) && has_fixed,
-        ReplicatedTextStateAccess::AttentionWithFixed => {
-            roles
-                .iter()
-                .copied()
-                .all(|role| ordinary(role) || fixed(role))
-                && has_ordinary
-                && has_fixed
-        }
-        ReplicatedTextStateAccess::CompressedAttention => {
-            roles.iter().copied().all(compressed) && has_compressed
-        }
-        ReplicatedTextStateAccess::CompressedAttentionWithFixed => {
-            roles
-                .iter()
-                .copied()
-                .all(|role| compressed(role) || fixed(role))
-                && has_compressed
-                && has_fixed
-        }
-    };
-    if !coherent {
-        return Err(ReplicatedTextContractError::invalid(format!(
-            "state access profile {access:?} does not match component roles {roles:?}"
-        )));
-    }
-    Ok(())
+    Err(ReplicatedTextContractError::invalid(format!(
+        "state access profile {access:?} does not match component roles {roles:?}"
+    )))
 }
 
 /// One required grouped-compute mechanism.
@@ -2571,6 +2655,69 @@ impl ReplicatedTextMaterializationTask {
         Ok(())
     }
 
+    /// Projects generated scale and affine-bias outputs onto a selected logical
+    /// shape. The caller supplies canonical output identities and the exact
+    /// member-local shape; ownership follows this task's parameter owner.
+    ///
+    /// Stored companions and formats requiring additional output roles retain
+    /// their declared outputs. Attach the result with `with_output_companions`
+    /// to validate the complete executable role set.
+    pub fn transform_output_companions(
+        &self,
+        logical_shape: &[usize],
+        scale: &str,
+        affine_bias: Option<&str>,
+    ) -> Result<Vec<ReplicatedTextOutputCompanion>, ReplicatedTextContractError> {
+        if !self.lowering().transforms_payload() {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "task {:?} does not select a load-time transform",
+                self.name()
+            )));
+        }
+        let quantization = self.executable().weight_quantization().ok_or_else(|| {
+            ReplicatedTextContractError::invalid(format!(
+                "transformed task {:?} selected a non-quantized executable",
+                self.name()
+            ))
+        })?;
+        let mut shape = logical_shape.to_vec();
+        let input = shape
+            .last_mut()
+            .ok_or_else(|| ReplicatedTextContractError::invalid("transformed scalar parameter"))?;
+        let group = usize::try_from(quantization.group_size()).map_err(|_| {
+            ReplicatedTextContractError::invalid("transform group size exceeds usize")
+        })?;
+        if group == 0 || !input.is_multiple_of(group) {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "transformed task {:?} has incompatible companion geometry",
+                self.name()
+            )));
+        }
+        *input /= group;
+        let owner = parameter_group_owner(self.owner())?;
+        let mut outputs = vec![ReplicatedTextOutputCompanion::new(
+            scale,
+            eredu_nn::LinearCompanionRole::Scale,
+            shape.clone(),
+            owner.clone(),
+        )?];
+        if quantization.has_biases() {
+            let affine_bias = affine_bias.ok_or_else(|| {
+                ReplicatedTextContractError::invalid(format!(
+                    "transformed task {:?} omitted its affine-bias identity",
+                    self.name()
+                ))
+            })?;
+            outputs.push(ReplicatedTextOutputCompanion::new(
+                affine_bias,
+                eredu_nn::LinearCompanionRole::AffineBias,
+                shape,
+                owner,
+            )?);
+        }
+        Ok(outputs)
+    }
+
     /// Attaches the architecture's exact selected packed-output companions.
     pub fn with_output_companions(
         mut self,
@@ -2839,12 +2986,7 @@ pub fn locally_materialized_replicated_text_outputs(
 ) -> BTreeSet<String> {
     tasks
         .iter()
-        .filter(|task| {
-            matches!(
-                task.lowering(),
-                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-            )
-        })
+        .filter(|task| task.lowering().transforms_payload())
         .flat_map(|task| {
             std::iter::once(task.name().to_owned()).chain(
                 task.output_companions()
@@ -2863,12 +3005,11 @@ pub fn group_replicated_text_transform_tasks(
     tasks: &[ReplicatedTextMaterializationTask],
 ) -> Result<Vec<ReplicatedTextTransformGroup>, ReplicatedTextContractError> {
     let mut groups = Vec::<ReplicatedTextTransformGroup>::new();
-    for (task_index, task) in tasks.iter().enumerate().filter(|(_, task)| {
-        matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    for (task_index, task) in tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.lowering().transforms_payload())
+    {
         let quantization = task.executable().weight_quantization().ok_or_else(|| {
             ReplicatedTextContractError::invalid(format!(
                 "selected materialization task {:?} has no packed output format",
@@ -2898,10 +3039,7 @@ pub fn group_replicated_text_transform_tasks(
 pub fn selected_materialization_task_bytes(
     task: &ReplicatedTextMaterializationTask,
 ) -> Result<u64, ReplicatedTextContractError> {
-    let transforms = matches!(
-        task.lowering(),
-        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-    );
+    let transforms = task.lowering().transforms_payload();
     if !transforms {
         if let Some(output) = task.derived_output() {
             return Ok(output.byte_len());
@@ -3107,10 +3245,7 @@ fn build_materialization_tasks(
         companion_names.insert(requirement.name().to_owned());
     }
     for task in &mut tasks {
-        let transforms = matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        );
+        let transforms = task.lowering().transforms_payload();
         let outputs = if transforms {
             let requirement = requirement_by_name.get(task.name()).ok_or_else(|| {
                 ReplicatedTextContractError::invalid(format!(
@@ -3124,42 +3259,7 @@ fn build_materialization_tasks(
                     task.name()
                 ))
             })?;
-            let quantization = task.executable().weight_quantization().ok_or_else(|| {
-                ReplicatedTextContractError::invalid(format!(
-                    "transformed task {:?} selected a non-quantized executable",
-                    task.name()
-                ))
-            })?;
-            let mut shape = task.logical_shape().to_vec();
-            let input = shape.last_mut().ok_or_else(|| {
-                ReplicatedTextContractError::invalid("transformed scalar parameter")
-            })?;
-            let group = usize::try_from(quantization.group_size()).map_err(|_| {
-                ReplicatedTextContractError::invalid("transform group size exceeds usize")
-            })?;
-            if group == 0 || !input.is_multiple_of(group) {
-                return Err(ReplicatedTextContractError::invalid(format!(
-                    "transformed task {:?} has incompatible companion geometry",
-                    task.name()
-                )));
-            }
-            *input /= group;
-            let owner = parameter_group_owner(task.owner())?;
-            let mut outputs = vec![ReplicatedTextOutputCompanion::new(
-                scale,
-                eredu_nn::LinearCompanionRole::Scale,
-                shape.clone(),
-                owner.clone(),
-            )?];
-            if quantization.has_biases() {
-                outputs.push(ReplicatedTextOutputCompanion::new(
-                    affine_bias,
-                    eredu_nn::LinearCompanionRole::AffineBias,
-                    shape,
-                    owner,
-                )?);
-            }
-            outputs
+            task.transform_output_companions(task.logical_shape(), scale, Some(affine_bias))?
         } else {
             declared.remove(task.name()).unwrap_or_default()
         };
@@ -3963,6 +4063,44 @@ impl SelectedReplicatedTextRealization {
     /// Returns exact per-parameter realizations.
     pub fn parameters(&self) -> &[SelectedParameterRealization] {
         &self.parameters
+    }
+    /// Ordinary selected formats that use quantized executable operators.
+    /// This reports the retained selection rather than the source-native formats.
+    pub fn quantized_formats(&self) -> HashMap<String, WeightQuantization> {
+        self.parameters()
+            .iter()
+            .filter_map(|parameter| {
+                parameter
+                    .executable()
+                    .weight_quantization()
+                    .map(|format| (parameter.name().to_owned(), format))
+            })
+            .collect()
+    }
+
+    /// Selected formats for matrix identities in an explicit admitted scope.
+    /// Only selected ordinary parameters are projected; dense entries are retained.
+    pub fn matrix_formats_for(
+        &self,
+        requirements: &ReplicatedTextRequirements,
+    ) -> HashMap<String, LinearFormat> {
+        let matrices = requirements
+            .matrix_parameters()
+            .map(ReplicatedTextParameterRequirement::name)
+            .collect::<BTreeSet<_>>();
+        self.parameters()
+            .iter()
+            .filter(|parameter| matrices.contains(parameter.name()))
+            .map(|parameter| (parameter.name().to_owned(), parameter.executable()))
+            .collect()
+    }
+
+    /// Whether ordinary selected parameters require payload conversion.
+    /// Auxiliary prediction parameters retain their own independent task selection.
+    pub fn uses_weight_transform(&self) -> bool {
+        self.parameters
+            .iter()
+            .any(|parameter| parameter.lowering().transforms_payload())
     }
     /// Returns the authoritative exact materialization task sequence.
     pub fn materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {
@@ -5354,6 +5492,7 @@ mod tests {
         let companion_owner = crate::ParameterGroupOwner::ExecutionUnit {
             group: crate::ExecutionGroupId::new("decoder").unwrap(),
             global_unit: 0,
+            consumers: vec![0],
         };
         exact_transform
             .set_output_companions(vec![
@@ -5424,6 +5563,7 @@ mod tests {
                 crate::ParameterGroupOwner::ExecutionUnit {
                     group: crate::ExecutionGroupId::new("decoder").unwrap(),
                     global_unit: 0,
+                    consumers: vec![0],
                 },
             )
             .unwrap()])

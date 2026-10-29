@@ -27,6 +27,12 @@ pub const TEXT_PAD_ID: i32 = 12;
 /// Invalid channel geometry, precision or bounded prompt admission.
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
+    /// Selected physical parameter placement differs from the tensor communicator.
+    #[error(transparent)]
+    TensorLayout(#[from] eredu_runtime::TensorParallelLayoutError),
+    /// Shared component declaration or invocation is invalid.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// The configuration changes the released channel equations.
     #[error("{0}")]
     Configuration(&'static str),
@@ -738,20 +744,6 @@ impl<B: DistributedNeuralBackend> FunctionHead<B> {
             parallel,
             context,
         )?)
-    }
-    /// Projects both vocabulary shards and gathers full logits through existing collectives.
-    pub fn project_channels_parallel(
-        &mut self,
-        normalized: &B::Tensor,
-        backbone: &mut StaticModules<B>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<DualChannelLogits<B::Tensor>, ChannelError> {
-        self.validate_parallel_projection(normalized, parallel)?;
-        let agent = backbone.project_normalized_parallel(normalized, parallel, context)?;
-        let function = self.project_parallel(normalized, parallel, context)?;
-        validate_logits(&agent, &function, self.vocabulary)?;
-        Ok(DualChannelLogits { agent, function })
     }
 }
 pub(super) fn agree_parallel_projection<B, F>(

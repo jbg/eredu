@@ -48,7 +48,7 @@ pub(in crate::component_partition) fn derive_observations(
     parameters: &ArchitectureParameterDescription,
     layout: &LocalModelLayout,
     topology: eredu_core::ParallelRankTopology,
-    owned_groups: &[crate::partitioned_execution::PartitionedGroupRequirements],
+    owned_groups: &[eredu_runtime::PipelineGroupOwnership],
     selected: &crate::SelectedRoutedTextRealization,
 ) -> Result<BTreeMap<String, PartitionedRoutedObservation>, ComponentPartitionError> {
     use crate::routed_text::RoutedGroupedPlan;

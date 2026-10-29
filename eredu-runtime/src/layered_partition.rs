@@ -11,6 +11,12 @@ use std::marker::PhantomData;
 /// Rejected local stage geometry before any invocation or parameter acquisition.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerwisePartitionConstructionError {
+    /// Component selection differs from its validated declaration.
+    #[error(transparent)]
+    Definition(#[from] crate::ComponentDefinitionError),
+    /// Explicit state ownership cannot be projected onto selected invocations.
+    #[error(transparent)]
+    StatePartition(#[from] crate::ArchitectureStatePartitionError),
     /// Canonical partition or architecture declarations disagree.
     #[error("invalid layered stage: {0}")]
     Contract(String),
@@ -69,15 +75,15 @@ where
     P: LayerwisePolicy<B, A::Unit>,
 {
     /// Adopts one exact selected stage and its already prepared parameter policy.
-    /// Architectures identify groups with state slots, including explicit NoState
-    /// schedules. A stateless group such as final normalization declares `false`.
+    /// Architectures identify each group's global state-slot range, including explicit
+    /// NoState schedules. Stateless groups such as final normalization return `None`.
     /// Local groups must form a contiguous dependency chain; joins and branches
     /// require the shared graph/pipeline executor instead of this chain adapter.
     pub fn new<G>(
         architecture: A,
         policy: P,
         partition: &ArchitecturePartition<G, A::Boundary>,
-        group_owns_state: impl Fn(usize) -> bool,
+        group_state_range: impl Fn(usize) -> Option<std::ops::Range<usize>>,
     ) -> Result<Self, LayerwisePartitionConstructionError> {
         let invalid = |error: String| LayerwisePartitionConstructionError::Contract(error);
         partition
@@ -109,14 +115,15 @@ where
                 let dependencies = graph.dependencies(group).expect("validated graph group");
                 if let Some(previous) = drivers.last() {
                     let previous: &LayeredPartitionDriver = previous;
-                    let expected_end = partition
-                        .unit_layout()
+                    let layout = partition.unit_layout();
+                    let previous_group = layout
                         .group_range(previous.group_index())
-                        .expect("validated group")
-                        .len();
+                        .expect("validated group");
+                    let current_group = layout.group_range(group).expect("validated group");
                     if dependencies != [previous.group_index()]
-                        || previous.range().end != expected_end
-                        || range.start != 0
+                        || previous.range().end - 1
+                            != layout.address(previous_group.end - 1).unwrap().index()
+                        || range.start != layout.address(current_group.start).unwrap().index()
                     {
                         return Err(invalid(
                             "local stage groups are not a contiguous complete dependency chain"
@@ -128,11 +135,11 @@ where
                         "a local chain ingress cannot merge multiple graph dependencies".into(),
                     ));
                 }
-                drivers.push(LayeredPartitionDriver::new_with_state_ownership(
+                drivers.push(LayeredPartitionDriver::new_with_state_range(
                     partition,
                     group,
                     range,
-                    group_owns_state(group),
+                    group_state_range(group),
                 )?);
             }
         }

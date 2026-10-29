@@ -106,7 +106,11 @@ impl TableDeclaration {
         output_type: TensorElementType,
     ) -> Result<PreparedNGramTable, NGramArtifactError> {
         let lookup = self.lookup_spec(bank, unit, output_type)?;
-        let source = retain(source, self.metadata.keys().cloned().collect())?;
+        let source: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
+            source,
+            "qwen4_exp n-gram companions",
+            self.metadata.keys().cloned().collect(),
+        )?);
         for (key, admitted) in &self.metadata {
             let meta = source.source_metadata(key)?;
             if meta.logical_shape != admitted.logical_shape
@@ -139,7 +143,11 @@ impl TableDeclaration {
                 let offsets = integers(source.as_ref(), &names[2], *heads)?;
                 (
                     hash_spec(config, multipliers, moduli, offsets, self.rows)?,
-                    NGramControls::Safetensors(retain(source.clone(), names.to_vec())?),
+                    NGramControls::Safetensors(Arc::new(PreparedCheckpointSource::retain(
+                        source.clone(),
+                        "qwen4_exp n-gram companions",
+                        names.iter().cloned().collect(),
+                    )?)),
                 )
             }
             HashLiterals::Admitted {
@@ -187,7 +195,11 @@ impl TableDeclaration {
                     RowEncoding::ScalarE4M3 { scale } => scale.clone(),
                     _ => unreachable!("declared scalar scale"),
                 },
-                source: retain(source.clone(), vec![name.clone()])?,
+                source: Arc::new(PreparedCheckpointSource::retain(
+                    source.clone(),
+                    "qwen4_exp n-gram companions",
+                    [name.clone()].into_iter().collect(),
+                )?),
                 recipe: DerivedWeightRecipe::source(name, TensorSelection::Full),
             })
         } else {

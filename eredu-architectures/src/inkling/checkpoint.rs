@@ -1205,23 +1205,40 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                         "Inkling sparse layer {layer} is missing expert group {logical_group:?}"
                     )
                 })?;
+            if count == 0 {
+                continue;
+            }
+            let bank = eredu_runtime::ParameterBankRecipes::new(
+                catalog,
+                group
+                    .members()
+                    .iter()
+                    .map(|member| {
+                        let target = member.target();
+                        (
+                            target.to_owned(),
+                            recipes.get(target).cloned().unwrap_or_else(|| {
+                                DerivedWeightRecipe::source(target, TensorSelection::Full)
+                            }),
+                        )
+                    })
+                    .collect(),
+                count,
+            )
+            .map_err(|error| error.to_string())?;
+            let has_member = |binding: &str| {
+                let target = format!("{bank_root}.{binding}");
+                group
+                    .members()
+                    .iter()
+                    .any(|member| member.target() == target)
+            };
+            let gate_up_quantizable =
+                !has_member("gate_up_proj_scales") && !has_member("gate_up_proj_biases");
+            let down_quantizable =
+                !has_member("down_proj_scales") && !has_member("down_proj_biases");
             for expert in 0..count {
-                let selection = TensorSelection::Range {
-                    axis: 0,
-                    start: expert,
-                    end: expert + 1,
-                };
-                let has_member = |binding: &str| {
-                    let target = format!("{bank_root}.{binding}");
-                    group
-                        .members()
-                        .iter()
-                        .any(|member| member.target() == target)
-                };
-                let gate_up_quantizable =
-                    !has_member("gate_up_proj_scales") && !has_member("gate_up_proj_biases");
-                let down_quantizable =
-                    !has_member("down_proj_scales") && !has_member("down_proj_biases");
+                let selected = bank.member(expert).expect("validated expert bank member");
                 let parameters = group
                     .members()
                     .iter()
@@ -1235,12 +1252,10 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                                     "Inkling expert target {target:?} is outside bank {bank_root:?}"
                                 )
                             })?;
-                        let bank_recipe = recipes.get(target).cloned().unwrap_or_else(|| {
-                            DerivedWeightRecipe::source(target, TensorSelection::Full)
-                        });
-                        let recipe = bank_recipe
-                            .select_bounded(catalog, selection.clone())
-                            .map_err(|error| error.to_string())?;
+                        let recipe = selected
+                            .get(target)
+                            .expect("declared bank parameter")
+                            .clone();
                         let role = match binding {
                             "gate_up_proj" if gate_up_quantizable => {
                                 crate::ExpertParameterRole::quantizable_projection(

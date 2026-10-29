@@ -7,6 +7,22 @@ refinement attends to retained context and the complete transient canvas without
 changing the cache. One parameter unit contains one shared layer. Its matrices
 serve both invocations, without a second encoder weight materialization.
 
+Low-level text construction uses `TextKernel::from_definition`,
+`from_parallel_definition` or `from_partition` with a retained text declaration.
+`model::component_definition` declares those resources without a native context;
+`model::project_parameters` selects executable formats while retaining invocation
+and state identities.
+
+Composite text kernels obtain their child declarations from the parent through
+`ComponentDefinition::project_groups`. Parameter ownership and observation seams
+remain shared semantic facts; local context dimensions use the ordinary validated
+state projection.
+
+Complete composite construction uses `CompositeKernel::from_definition`;
+partition construction supplies the same retained parent declaration to
+`from_partition`. Format and state projections preserve the admitted operation
+and resource identities.
+
 Validation uses the neutral layered-runtime driver and public model admission
 with MLX CPU tensors. The public-loader fixture constructs the complete official
 image/text architecture and invokes context and refinement through the retained

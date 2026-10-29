@@ -4,11 +4,16 @@
 //! inspected once per grouped block, validated before acquisition, coalesced in
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
-use eredu_checkpoint::{store::TensorSelection, WeightQuantization};
+#[cfg(test)]
+use eredu_checkpoint::store::TensorSelection;
+use eredu_checkpoint::WeightQuantization;
 use eredu_nn::GroupedNeuralBackend;
+#[cfg(test)]
+use eredu_runtime::OffloadUnit;
+pub use eredu_runtime::{AddressableBankCatalog, AddressableBankEntry};
 use eredu_runtime::{
-    AddressableGroupedBank, IndexedMovement, OffloadUnit, ParameterBankAccess,
-    ParameterBankAcquisition, ResidencyReport, WeightBinding, WeightMaterializationReport,
+    AddressableGroupedBank, IndexedMovement, ParameterBankAccess, ParameterBankAcquisition,
+    ResidencyReport, WeightBinding, WeightMaterializationReport,
 };
 
 use std::{
@@ -29,28 +34,22 @@ use crate::MlxTensor;
 use crate::{
     backend::error::Error,
     backend::nn::shared::MlxNeuralBackend,
-    backend::runtime::checkpoint::bounded_quantization::{
-        prepare_quantized_source, BoundedQuantizationPlan, BoundedQuantizationTarget,
-    },
+    backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source,
     backend::runtime::residency::manager::{ResidencyError, ResidencyManager, ResidentTransfer},
 };
-use eredu_core::residency::{
-    MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyLedgerError,
-    ResidencyPolicy,
-};
+use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
+#[cfg(test)]
+use eredu_core::residency::{OffloadPlan, ResidencyPolicy};
 
 mod catalog;
 #[cfg(test)]
 pub(crate) use catalog::quantize_entry_catalog;
+use catalog::quantize_selected_entry_catalog;
 #[allow(unused_imports)]
 pub(crate) use catalog::QuantizedParameterBankCatalog;
 pub use catalog::{
-    entries_from_selected_members, BankAccessClass, ParameterBankEntry, ParameterBankKey,
-    ParameterBankOptions, ParameterBankOptionsError, SelectedAddressableEntries,
-    SelectedBindingTransform,
-};
-use catalog::{
-    packed_projection_bytes, quantize_selected_entry_catalog, selected_transformation_formats,
+    entries_from_selected_members, BankAccessClass, ParameterBankKey, ParameterBankOptions,
+    ParameterBankOptionsError,
 };
 
 mod telemetry;
@@ -74,9 +73,9 @@ pub use movement::MlxIndexedMovement;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AddressableParameterBankError {
-    /// A compact operator cannot mix independently identified banks.
-    #[error("compact parameter-bank demand mixes bank identities")]
-    MixedBanks,
+    /// Portable demand ownership, use counts or compact resource admission failed.
+    #[error(transparent)]
+    Demand(#[from] eredu_runtime::AddressableBankDemandError),
     /// Grouped-entry placement controls were invalid.
     #[error(transparent)]
     Policy(#[from] ParameterBankOptionsError),
@@ -87,46 +86,9 @@ pub enum AddressableParameterBankError {
         #[source]
         source: Box<Error>,
     },
-    /// No entry definitions were supplied.
-    #[error("sparse entry cache requires at least one owned entry")]
-    EmptyCatalog,
-    /// A generic acquisition contained no entries.
-    #[error("addressable entry demand must not be empty")]
-    EmptyDemand,
-    /// A generic acquisition assigned no uses to one entry.
-    #[error("addressable entry {identity:?} has zero demand")]
-    ZeroDemand {
-        /// Entry with invalid demand.
-        identity: ParameterBankKey,
-    },
-    /// A generic acquisition repeated one entry identity.
-    #[error("addressable entry demand repeats {identity:?}")]
-    DuplicateDemand {
-        /// Repeated entry.
-        identity: ParameterBankKey,
-    },
-    /// One logical entry declared no materialized bytes.
-    #[error("entry {identity:?} must contain at least one byte")]
-    ZeroSizedEntry {
-        /// Invalid logical identity.
-        identity: ParameterBankKey,
-    },
-    /// Two catalog entries used the same namespace/global identity.
-    #[error("duplicate sparse entry catalog entry {identity:?}")]
-    DuplicateEntry {
-        /// Duplicated logical identity.
-        identity: ParameterBankKey,
-    },
-    /// The caller used a noncanonical residency unit id.
-    #[error("entry {identity:?} requires unit id {expected}, got {actual}")]
-    UnitIdentityMismatch {
-        /// Logical catalog identity.
-        identity: ParameterBankKey,
-        /// Required stable unit id.
-        expected: OffloadUnitId,
-        /// Adapter-supplied unit id.
-        actual: OffloadUnitId,
-    },
+    /// Independent member ownership or combined residency budgets are invalid.
+    #[error(transparent)]
+    Preparation(#[from] eredu_runtime::AddressableBankResidencyError),
     /// No owned entry catalog exists for this namespace.
     #[error("sparse entry cache has no catalog for namespace {namespace}")]
     UnknownNamespace {
@@ -140,6 +102,14 @@ pub enum AddressableParameterBankError {
         namespace: usize,
         /// Required global entry span.
         global_span: usize,
+    },
+    /// A dense replacement row cannot be represented by the native indexing mechanism.
+    #[error("replacement row {row} for bank member {identity:?} exceeds MLX i32 indexing")]
+    ReplacementRowOverflow {
+        /// Original global physical storage identity.
+        identity: ParameterBankKey,
+        /// Dense row within the canonical replacement parameter.
+        row: usize,
     },
     /// Device-side validation found one or more out-of-range selections.
     #[error("namespace {namespace} contains {invalid_count} grouped ids outside 0..{global_span}")]
@@ -160,12 +130,6 @@ pub enum AddressableParameterBankError {
         entry: i64,
         /// Owned entries cataloged for diagnostics.
         known_owned_entries: usize,
-    },
-    /// A valid global selection referred to an entry this cache does not own.
-    #[error("grouped entry {identity:?} is not owned by this cache")]
-    MissingOwnedEntry {
-        /// Requested non-owned global identity.
-        identity: ParameterBankKey,
     },
     /// Selectionr ids used an unsupported scalar type.
     #[error("grouped entry ids must use an integer dtype, got {actual:?}")]
@@ -202,19 +166,6 @@ pub enum AddressableParameterBankError {
         /// Returned output shape.
         actual: Vec<i32>,
     },
-    /// Selected entries exceed the configured temporary compact-bank allowance.
-    #[error("compact entry bank for {distinct_entries} entries requires {required_bytes} bytes, exceeding the {limit_bytes}-byte scratch limit")]
-    ScratchLimitExceeded {
-        /// Required compact-bank bytes.
-        required_bytes: u64,
-        /// Configured compact-bank byte limit.
-        limit_bytes: u64,
-        /// Selected unique entry count.
-        distinct_entries: usize,
-    },
-    /// Entry byte arithmetic overflowed.
-    #[error("sparse entry byte accounting overflowed")]
-    ByteOverflow,
     /// Cache statistics mutex was poisoned by a panic.
     #[error("sparse entry cache statistics are unavailable after a panic")]
     StatisticsPoisoned,

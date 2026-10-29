@@ -41,9 +41,9 @@ pub use equations::{
 };
 pub use graph::{component_graph, state_layout};
 pub use model::{
-    prepare_composite_ingress, DecoderInputPart, ForwardContext, LayeredModel, ModelInput,
-    PreparedCompositeIngress, TextPartitionInput, Unit, TEXT_EXECUTION_GROUP,
-    VISION_EXECUTION_GROUP,
+    component_definition, prepare_composite_ingress, DecoderInputPart, ForwardContext,
+    LayeredModel, ModelInput, MuseKernel, PreparedCompositeIngress, TextPartitionInput, Unit,
+    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     layer_parameter_groups, local_decoder_config, local_geometry, partition_local_geometry,
@@ -52,17 +52,23 @@ pub use parallel::{
     PartitionLocalFoundation, PartitionLocalGeometry,
 };
 pub use text::{Attention, FeedForward, Mlp, SparseMoe, StaticModules, TransformerBlock};
-pub use vision::{VisionBlock, VisionInput, VisionState, VisionStatic, VisionTower};
+pub use vision::{
+    VisionBlock, VisionInput, VisionState, VisionStatic, VisionStaticSelection, VisionTower,
+};
 
-/// Derives complete expert ownership and rank-local bank geometry from Muse-Glimmer.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
+/// Declares canonical expert ownership and TP/EP-local bank geometry without native resources.
+pub fn expert_realization_plan(
+    args: &DecoderConfig,
+    geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
-    let args = architecture.args();
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(args)
+            .map_err(eredu_nn::Error::backend_source)?;
+    }
     if !args.is_moe() {
         return Ok(None);
     }
@@ -83,8 +89,7 @@ pub fn expert_realization_plan<
         .map_err(eredu_nn::Error::backend)?;
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in 0..layers {
-        let local = architecture
-            .parallel_geometry()
+        let local = geometry
             .and_then(|geometry| geometry.text_block(layer))
             .unwrap_or(args);
         unit_specs.insert(

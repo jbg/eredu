@@ -17,10 +17,43 @@ pub mod bounded_execution;
 pub mod cache;
 /// Bounded observation admission and collection.
 pub mod capture;
+mod checkpoint_handoff;
+pub use checkpoint_handoff::{
+    restrict_checkpoint_handoff, validate_checkpoint_handoff, SourceHandoffError,
+    SourceHandoffScope,
+};
+
 /// Opaque groups, routes, and capability contracts for distributed mechanisms.
 pub mod communication;
 /// Typed multimodal component graphs and residency accounting.
 pub mod component;
+/// Validated declarations and typed component execution adapters.
+pub mod component_execution;
+pub use component_execution::{
+    ComponentAdapter, ComponentDefinition, ComponentDefinitionError, ComponentEquations,
+    ComponentKernel, ComponentParameterUse, ComponentSelection, ComponentUnit,
+    EmptyParameterModule, ParallelComponentKernel, ParameterStorageId, StateSlotId,
+    StatelessComponentState,
+};
+mod component_text;
+pub use component_text::{RefinementComponentKernel, TextComponentKernel};
+mod component_routed;
+pub use component_routed::{ParallelRoutedComponentKernel, RoutedComponentKernel};
+mod component_resources;
+pub use component_resources::{
+    select_complete_pinned_resources, ComponentPinnedResources, ComponentResourceAccess,
+    KernelParameterModules,
+};
+mod component_partition;
+pub use component_partition::{
+    ComponentPartitionContext, PartitionComponentKernel, PipelineComponentKernel,
+};
+/// Exact cold component preparation and consuming placement.
+pub mod prepared_component;
+pub use prepared_component::{
+    ComponentPreparationDeclaration, ComponentPreparationError, ComponentRecipe,
+    ComponentRecipeConversion, PreparedComponent,
+};
 mod component_pipeline;
 /// Mechanism-only selection contracts for composite model input.
 pub mod composite;
@@ -37,6 +70,13 @@ pub mod draft;
 /// Logical request encoder workspace admission.
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
+mod execution_unit_preparation;
+pub use execution_unit_preparation::{
+    execution_unit_resource_requirements, ExecutionUnitPreparationError,
+    ExecutionUnitResourcePreparation, ExecutionUnitResourceRequirements,
+    ParameterResourcePreparation, ParameterResourcePreparationError,
+    PreparedExecutionUnitResources, PreparedParameterResources,
+};
 /// Completed-token lifecycle, snapshot reservation and branch accounting policy.
 pub mod execution_control;
 pub mod execution_plan;
@@ -78,6 +118,15 @@ pub mod parallel;
 pub mod parameter;
 /// Physical rank-local parameter-layout lowering.
 pub mod parameter_layout;
+mod retained_parameter_layout;
+pub use retained_parameter_layout::{
+    validate_retained_parameter_layout, RetainedParameterLayoutError,
+};
+mod parameter_selection;
+pub use parameter_selection::{
+    project_additional_parameter_ranges, project_parameter_selection_layout,
+    ParameterSelectionLayoutError,
+};
 pub mod parameter_operations;
 /// Backend-neutral rank-local architecture ownership.
 pub mod partition;
@@ -88,7 +137,8 @@ mod pipeline_executor;
 pub mod replicated_execution;
 mod tensor_wave;
 pub use component_pipeline::{
-    validate_component_pipeline, validate_component_pipeline_ranges, PipelineBindingError,
+    validate_component_pipeline, validate_component_pipeline_ranges,
+    ComponentPipelinePreparationError, PipelineBindingError,
 };
 pub use pipeline_executor::{
     validate_pipeline_local_agreement, OrdinaryPipelinePartitionUnitStrategy,
@@ -152,8 +202,8 @@ pub mod state;
 mod weight_residency;
 
 pub use automatic_support::{
-    execution_unit_parameter_window_bytes, placed_recipe_peak_bytes, placed_source_recipe,
-    residency_telemetry, selected_parameter_resources, selected_parameter_resources_for_layout,
+    execution_unit_parameter_window_bytes, placed_source_recipe, residency_telemetry,
+    selected_parameter_resources, selected_parameter_resources_for_layout,
     selected_text_bounded_requirement, BoundedResidencySizingError, SelectedParameterResources,
 };
 pub use backend::{
@@ -223,22 +273,26 @@ pub use dense_sampling::{
 };
 pub use draft::{execute_draft_group, DraftGroupExecutionError, DraftStateTransaction};
 pub use execution::{
-    ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupSchedule,
-    ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress, ExecutionUnitLayout,
-    ExecutionUnitLayoutError, ReadyGroupState,
+    ArchitectureExecutionLayoutError, ExecutionGraph, ExecutionGraphError, ExecutionGroupId,
+    ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress,
+    ExecutionUnitAddressMap, ExecutionUnitAddressMapError, ExecutionUnitLayout,
+    ExecutionUnitLayoutError, ExecutionUnitLeaseAddress, ExecutionUnitStorageLocation,
+    ReadyGroupState,
 };
 pub use execution_plan::{
     execution_plan_layer_residency, execution_plan_quantization, ExecutionPlanLoadError,
     ResidencyDiagnostics,
 };
 pub use expert::{
-    combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
+    addressable_projection_bytes, combine_routed_expert_tensor_parallel,
+    combine_tensor_parallel_expert_outputs, place_addressable_bank_members,
     plan_addressable_bank_bindings, reduce_routed_expert_tensor_parallel,
     reduce_tensor_parallel_expert_output, selected_addressable_parameter_bytes,
     with_provider_unit_observer, with_resident_unit_coordinates, with_routed_unit_invocation,
     with_routed_unit_observer, AddressableBankBindingPlan, AddressableBankDistribution,
-    AddressableBankMember, AddressableBankMemberError, AddressableBankMemberPlacement,
-    AddressableBankParameter, AddressableBankTask, AddressableBindingTransform,
+    AddressableBankFootprint, AddressableBankMember, AddressableBankMemberError,
+    AddressableBankMemberPlacement, AddressableBankParameter, AddressableBankPlacementError,
+    AddressableBankTask, AddressableBankTaskCache, AddressableBindingTransform,
     AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
     AddressableGroupedBank, ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation,
     ExpertRouteTensorMovement, IndexedMovement, ObservedExpertProvider,
@@ -248,8 +302,22 @@ pub use expert::{
     RoutedUnitInvocation, RoutedUnitObserver, TensorParallelParameterProvider,
 };
 pub use expert::{
+    plan_addressable_bank_residency, AddressableBankCatalog, AddressableBankCatalogError,
+    AddressableBankEntry, AddressableBankEntryError, AddressableBankResidencyError,
+    PreparedAddressableBankResidency,
+};
+pub use expert::{
+    prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
+    AddressableBankQuantizationError, AddressableBankTransformGroup, AddressableBankTransformPlan,
+};
+pub use expert::{
     select_routes_with_observer, select_routes_with_provider, with_exchanged_unit_observer,
     with_partition_unit_observer, RoutedUnitOrigin, RoutedUnitOrigins,
+};
+pub use expert::{
+    validate_addressable_bank_selection, AddressableBankDemand, AddressableBankDemandError,
+    AddressableBankPreparation, AddressableBankPreparationError, AddressableBankSelectionError,
+    PreparedSelectedAddressableBank,
 };
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
@@ -264,7 +332,7 @@ pub use input::{
 pub use inspection::{
     observe_and_intervene, observe_model_logits, ActivationObserver, BorrowedActivationObserver,
     NoopObserver, RoutingDecision, RoutingObservation, TargetStateCapture, TargetStateCaptureError,
-    TargetStateTap,
+    TargetStateTap, UnitObservationBoundaries,
 };
 pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
@@ -296,23 +364,37 @@ pub use mechanism_synthesis::{
 pub use media_load_request::{MediaExecutionPolicy, MediaExecutionPolicyError, MediaLoadRequest};
 pub use parallel::{
     aligned_partition_units, aligned_partition_units_with_tail, derive_transform_source_layout,
-    expand_linear_format_parameter_groups, module_parameter_group, partition_chunk_range,
-    partition_parameter_group_chunks, partitioned_module_parameter_group,
+    expand_linear_format_parameter_group, expand_linear_format_parameter_groups,
+    expand_owned_linear_format_parameter_groups, expand_tagged_linear_format_parameter_groups,
+    module_parameter_group, packed_gated_product_logical_group, packed_relu2_logical_group,
+    partition_chunk_range, partition_parameter_group_chunks, partitioned_module_parameter_group,
     partitioned_projection_group, projection_parameter_group, segmented_projection_group,
-    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionUnitAssignment,
-    ProjectionSharding, ShardingPolicy, TensorPlacement,
+    top_k_group_selector_logical_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    PartitionUnitAssignment, ProjectionSharding, ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     apply_parameter_storage_layouts, bind_materialized_unit, bind_materialized_unit_excluding,
     bindings_from_recipe_set, build_exact_replicated_text_bindings, build_module_binding_plan,
-    materialize_bindings, materialize_selected_bindings, preflight_bindings, select_bindings,
-    BindingPlan, BindingPlanError, MaterializedUnit, ModuleBindingPlan, ModuleBindingPlanError,
-    ParameterBatchBudget, ParameterBindingTarget, ParameterOrchestrationError, PlannedBinding,
-    RecipeBindingError, SelectedBindingPlan,
+    materialize_bindings, materialize_selected_bindings, preflight_bindings,
+    prepare_resource_bindings, select_bindings, select_parameter_bank_recipes,
+    select_parameter_recipe, BindingPlan, BindingPlanError, MaterializedUnit, ModuleBindingPlan,
+    ModuleBindingPlanError, ParameterBankRecipes, ParameterBatchBudget, ParameterBindingTarget,
+    ParameterOrchestrationError, ParameterResourceRecipes, PlannedBinding,
+    PreparedParameterRecipes, RecipeBindingError, SelectedBindingPlan,
+};
+pub use parameter_acquisition::{
+    local_parameter_acquisition_units, order_parameter_acquisition_units,
+    parameter_acquisition_units, partition_parameter_acquisition_bindings,
+    ParameterAcquisitionError, ParameterAcquisitionUnit,
 };
 pub use parameter_layout::{
-    derive_partitioned_group_layout, derive_partitioned_local_layout, retained_partition_layout,
+    balanced_parameter_group_range, balanced_parameter_group_range_if_present,
+    derive_partitioned_group_layout, derive_partitioned_local_layout,
+    derive_partitioned_transform_source_layout, logical_parameter_group_range,
+    prepare_transform_source_layout, retained_partition_layout, validate_parameter_layout,
+    validate_tensor_parallel_layout, validate_transform_parameter_space, ParameterGroupSelection,
+    TensorParallelLayoutError, TransformSourceLayoutError,
 };
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,
@@ -322,7 +404,7 @@ pub use partition::{
     LayeredPartitionDriver, LayeredPartitionError, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema,
     OwnedParameterGroupSpec, ParameterGroupOwner, PartitionGroup, PartitionOwnership,
     PartitionState, PipelineActivationDtype, PipelineWireContract, ResolvedBoundaryTensorSpec,
-    ResolvedBoundaryWireSchema,
+    ResolvedBoundaryWireSchema, TransformParameterOwnershipError,
 };
 pub use partitioned_execution::{
     CommunicationTensorMetadata, DistributedExecutionPhase, LayerwiseTraversalPartitionExecutor,
@@ -450,9 +532,9 @@ pub use replicated_text::{
     WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
-    DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings, ResidencyAcquisition,
-    ResidencyController, ResidencyControllerError, ResidencyDeclarationError, ResidencyLease,
-    ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
+    physical_binding_bytes, DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings,
+    ResidencyAcquisition, ResidencyController, ResidencyControllerError, ResidencyDeclarationError,
+    ResidencyLease, ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
     ResidencyTransferOwner, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
     ResidentLayerGroupReport, ResidentParameterConversion, ResidentParameterConversionBinding,
     RowResidencyRange, WeightBinding, WeightBindingPlan, WeightBindingSelectionError,
@@ -483,27 +565,48 @@ pub use state::{
 };
 pub use weight_residency::{
     AuxiliaryModuleResidency, AuxiliaryWeightRequirements, DenseDiskStreamLoadOptions,
-    DenseTransferSchedule, DenseTransferScheduleError, ExecutionResidency, ExpertPass,
-    LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, OrdinaryWeightResidency,
-    ParameterBankAccess, ParameterBankKey, ParameterBankLoadOptions, ParameterBankResidency,
-    StaticUnitBindings, WeightResidency, WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
+    DenseTransferSchedule, DenseTransferScheduleError, DenseTransferStep, ExecutionResidency,
+    ExpertPass, LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata,
+    OrdinaryWeightResidency, ParameterBankAccess, ParameterBankKey, ParameterBankLoadOptions,
+    ParameterBankResidency, PreparedStaticUnit, StaticUnitBindings, WeightResidency,
+    WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
 };
 
 /// Generic calibrated target workspace composition from ordinary module topology.
 pub mod workspace_resources;
 
+mod parameter_acquisition;
 mod parameter_bank;
+mod parameter_coordinates;
+pub use parameter_coordinates::{
+    derive_parameter_coordinates, derive_parameter_member_layout,
+    derive_rank_parameter_member_layout, ParameterPartitionLayout,
+};
+mod materialization_index;
+pub use materialization_index::{MaterializationTaskIndex, MaterializationTaskIndexError};
+mod pipeline_rank;
+pub use pipeline_rank::{
+    PipelineGroupOwnership, PipelineRankBindingError, PipelineRankError, PipelineRankProjection,
+};
+mod pipeline_placement;
+pub use pipeline_placement::{
+    balanced_pipeline_ranges, PipelinePlacementError, PipelinePlacementPlan, PipelineRoute,
+};
+mod parameter_members;
 pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};
+pub use parameter_members::{
+    resolve_parameter_member, ParameterMemberIndex, ResolvedParameterMember,
+};
 
 /// Bounded row-addressable parameter lookup.
 pub mod row_lookup;
 pub use row_lookup::{
     BoundedRowLookup, NoRowLookups, PreparedRowLookup, PreparedRowLookups, PreparedRowScale,
-    RowEncoding, RowLookupBank, RowLookupDescriptor, RowLookupDescriptors, RowLookupError,
-    RowLookupLimits, RowLookupMechanismSupport, RowLookupProvider, RowLookupProviders,
-    RowLookupRequirements, RowLookupSelectionError, RowLookupSpec, RowLookupWorkspace,
-    RowScaleDescriptor, RowScaleSource, SelectedRowLookupPlans, SelectedRowLookupRequirements,
-    SelectedRowLookups, TensorParallelRowLookup,
+    RowBankDemand, RowEncoding, RowLookupBank, RowLookupDescriptor, RowLookupDescriptors,
+    RowLookupError, RowLookupLimits, RowLookupMechanismSupport, RowLookupProvider,
+    RowLookupProviders, RowLookupRequirements, RowLookupSelectionError, RowLookupSpec,
+    RowLookupWorkspace, RowScaleDescriptor, RowScaleSource, SelectedRowLookupPlans,
+    SelectedRowLookupRequirements, SelectedRowLookups, TensorParallelRowLookup,
 };
 
 mod parameter_providers;
@@ -527,3 +630,6 @@ mod unit_policy_view;
 pub use unit_policy_view::{
     ProjectedUnitLease, UnitPolicyView, UnitPolicyViewError, UnitProjection,
 };
+
+mod vocabulary_module;
+pub use vocabulary_module::VocabularyModulePlacement;

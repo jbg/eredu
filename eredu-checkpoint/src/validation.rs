@@ -28,6 +28,34 @@ pub trait SafetensorsCatalog {
     fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String>;
 }
 
+// Metadata maps support header-only schema validation and expose no payload methods.
+impl SafetensorsCatalog for BTreeMap<String, CatalogTensorMetadata> {
+    fn keys(&self) -> Vec<String> {
+        self.keys().cloned().collect()
+    }
+
+    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+        self.get(key)
+            .cloned()
+            .ok_or_else(|| format!("missing tensor {key:?}"))
+    }
+}
+
+impl SafetensorsCatalog for BTreeMap<String, crate::store::PreparedTensorSource> {
+    fn keys(&self) -> Vec<String> {
+        self.keys().cloned().collect()
+    }
+
+    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+        self.get(key)
+            .map(|source| CatalogTensorMetadata {
+                shape: source.metadata.logical_shape.clone(),
+                stored_dtype: source.metadata.stored_dtype.clone(),
+            })
+            .ok_or_else(|| format!("missing tensor {key:?}"))
+    }
+}
+
 impl SafetensorsCatalog for dyn crate::store::CheckpointSource + '_ {
     fn keys(&self) -> Vec<String> {
         self.source_keys()

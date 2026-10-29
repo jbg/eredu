@@ -205,7 +205,8 @@ impl ParameterMemberSpec {
         }
     }
 
-    fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
+    /// Retains canonical encoding relationships from a backend-neutral parameter declaration.
+    pub fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
         self.linear_row_layout = metadata.linear_row_layout;
         self.linear_companion = metadata.linear_companion;
         self.linear_companion_of = metadata
@@ -638,6 +639,156 @@ where
     partitioned_group_with_preferred_units(logical_name, role, preferred_units, collector.members)
 }
 
+/// Declares the replicated logical resources of a top-k group selector.
+/// Encoding companions are expanded before placement by
+/// `expand_linear_format_parameter_groups`.
+pub fn top_k_group_selector_logical_group(
+    logical_name: impl Into<String>,
+    spec: &eredu_nn::TopKGroupSelectorSpec,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    spec.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let groups = spec.selection().group_count() as usize;
+    let input = spec.input_dimensions() as usize;
+    let mut members = Vec::new();
+    for (parameter, shape) in std::iter::once((spec.weight(), vec![groups, input]))
+        .chain(spec.bias().map(|parameter| (parameter, vec![groups])))
+        .chain(
+            spec.correction_bias()
+                .map(|parameter| (parameter, vec![groups])),
+        )
+        .chain(
+            spec.coefficient_scale()
+                .map(|parameter| (parameter, vec![groups])),
+        )
+        .chain(
+            spec.input_transform()
+                .map(|transform| (transform.scale(), vec![input])),
+        )
+    {
+        members.push(
+            ParameterMemberSpec::new(parameter.id.as_str(), shape, MemberSharding::Replicated)
+                .with_parameter_metadata(&ParameterMetadata::from_spec(parameter, true)),
+        );
+    }
+    ParameterGroupSpec::new(logical_name, ParameterRole::Replicated, members)
+}
+
+/// Declares logical matrices and biases for a packed gated-product bank.
+/// The caller selects semantic partition units and expands the exact encoding
+/// companions through `expand_linear_format_parameter_groups` before placement.
+pub fn packed_gated_product_logical_group(
+    logical_name: impl Into<String>,
+    spec: &eredu_nn::GroupedGatedProductSpec,
+    preferred_units: usize,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    spec.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = spec.layout() else {
+        return Err(ParallelPlanError::InvalidGroup(
+            "packed parameter geometry requires a packed gated-product layout".into(),
+        ));
+    };
+    let groups = spec.group_count() as usize;
+    let intermediate = spec.intermediate_dimensions() as usize;
+    let doubled = intermediate.checked_mul(2).ok_or_else(|| {
+        ParallelPlanError::InvalidGroup("gated-product width overflowed usize".into())
+    })?;
+    let mut members = Vec::new();
+    for (projection, output, input, weight_sharding, bias_sharding) in [
+        (
+            gate_up,
+            doubled,
+            spec.input_dimensions() as usize,
+            MemberSharding::PartitionedSegments {
+                axis: 1,
+                segments: vec![0..intermediate, intermediate..doubled],
+            },
+            MemberSharding::PartitionedSegments {
+                axis: 1,
+                segments: vec![0..intermediate, intermediate..doubled],
+            },
+        ),
+        (
+            down,
+            spec.output_dimensions() as usize,
+            intermediate,
+            MemberSharding::Partitioned { axis: 2 },
+            MemberSharding::Replicated,
+        ),
+    ] {
+        members.push(
+            ParameterMemberSpec::new(
+                projection.weight().id.as_str(),
+                vec![groups, output, input],
+                weight_sharding,
+            )
+            .with_parameter_metadata(&ParameterMetadata::from_spec(projection.weight(), true)),
+        );
+        if let Some(bias) = projection.bias() {
+            members.push(
+                ParameterMemberSpec::new(bias.id.as_str(), vec![groups, output], bias_sharding)
+                    .with_parameter_metadata(&ParameterMetadata::from_spec(bias, true)),
+            );
+        }
+    }
+    ParameterGroupSpec::partitioned(
+        logical_name,
+        ParameterRole::ExpertIntermediate,
+        preferred_units,
+        members,
+    )
+}
+
+/// Declares logical matrices and biases for a packed ReLU-squared bank.
+/// Encoding companions are expanded before placement by
+/// `expand_linear_format_parameter_groups`.
+pub fn packed_relu2_logical_group(
+    logical_name: impl Into<String>,
+    spec: &eredu_nn::GroupedRelu2Spec,
+    preferred_units: usize,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    spec.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let groups = spec.group_count() as usize;
+    let hidden = spec.hidden_dimensions() as usize;
+    let intermediate = spec.intermediate_dimensions() as usize;
+    let mut members = Vec::new();
+    for (projection, output, input, axis) in [
+        (spec.up(), intermediate, hidden, 1),
+        (spec.down(), hidden, intermediate, 2),
+    ] {
+        members.push(
+            ParameterMemberSpec::new(
+                projection.weight().id.as_str(),
+                vec![groups, output, input],
+                MemberSharding::Partitioned { axis },
+            )
+            .with_parameter_metadata(&ParameterMetadata::from_spec(projection.weight(), true)),
+        );
+        if let Some(bias) = projection.bias() {
+            members.push(
+                ParameterMemberSpec::new(
+                    bias.id.as_str(),
+                    vec![groups, output],
+                    if axis == 1 {
+                        MemberSharding::Partitioned { axis: 1 }
+                    } else {
+                        MemberSharding::Replicated
+                    },
+                )
+                .with_parameter_metadata(&ParameterMetadata::from_spec(bias, true)),
+            );
+        }
+    }
+    ParameterGroupSpec::partitioned(
+        logical_name,
+        ParameterRole::ExpertIntermediate,
+        preferred_units,
+        members,
+    )
+}
+
 /// Describes one affine projection and all encoding companions.
 pub fn projection_parameter_group<T, M>(
     logical_name: impl Into<String>,
@@ -922,24 +1073,62 @@ pub fn expand_linear_format_parameter_groups(
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     groups
         .into_iter()
-        .map(|group| {
-            let mut members = Vec::new();
-            for source in group.members() {
-                members.extend(match declaration(source)? {
-                    Some(declaration) => expand_linear_format_member(source, &declaration)?,
-                    None => vec![source.clone()],
-                });
-            }
-            let expanded = match group.partition_units() {
-                Some(units) => partitioned_group_with_preferred_units(
-                    group.logical_name(),
-                    group.role(),
-                    units,
-                    members,
-                ),
-                None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
-            }?;
-            expanded.with_partition_unit_assignment(group.partition_unit_assignment())
+        .map(|group| expand_linear_format_parameter_group(group, &declaration))
+        .collect()
+}
+
+/// Expands one atomic group while callers retain its resource or ownership identity.
+/// Physical companions and partition constraints follow the same projection as
+/// ordinary parameter catalogs.
+pub fn expand_linear_format_parameter_group(
+    group: ParameterGroupSpec,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let mut members = Vec::new();
+    for source in group.members() {
+        members.extend(match declaration(source)? {
+            Some(declaration) => expand_linear_format_member(source, &declaration)?,
+            None => vec![source.clone()],
+        });
+    }
+    let expanded = match group.partition_units() {
+        Some(units) => partitioned_group_with_preferred_units(
+            group.logical_name(),
+            group.role(),
+            units,
+            members,
+        ),
+        None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
+    }?;
+    expanded.with_partition_unit_assignment(group.partition_unit_assignment())
+}
+
+/// Projects physical groups while retaining caller-owned typed resource tags.
+/// Tags move with their group and require neither cloning nor ordering.
+pub fn expand_tagged_linear_format_parameter_groups<Tag>(
+    groups: impl IntoIterator<Item = (Tag, ParameterGroupSpec)>,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+) -> Result<Vec<(Tag, ParameterGroupSpec)>, ParallelPlanError> {
+    groups
+        .into_iter()
+        .map(|(tag, group)| {
+            expand_linear_format_parameter_group(group, &declaration).map(|group| (tag, group))
+        })
+        .collect()
+}
+
+/// Projects physical storage for canonical owned groups without rebuilding their
+/// ownership, sharing or replica-consumer declarations.
+pub fn expand_owned_linear_format_parameter_groups(
+    groups: Vec<crate::OwnedParameterGroupSpec>,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+) -> Result<Vec<crate::OwnedParameterGroupSpec>, ParallelPlanError> {
+    groups
+        .into_iter()
+        .map(|owned| {
+            let owner = owned.owner().clone();
+            expand_linear_format_parameter_group(owned.into_group(), &declaration)
+                .map(|group| crate::OwnedParameterGroupSpec::new(owner, group))
         })
         .collect()
 }

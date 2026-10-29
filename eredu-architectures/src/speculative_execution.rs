@@ -779,7 +779,7 @@ where
         operation: impl for<'a> FnMut(
             A::Input<'a>,
             B::Tensor,
-            Option<&'a eredu_runtime::PreparedInputCacheIdentity>,
+            Option<&eredu_runtime::PreparedInputCacheIdentity>,
         ) -> Result<A::ForwardContext, E>,
     ) -> Result<(), E>;
 

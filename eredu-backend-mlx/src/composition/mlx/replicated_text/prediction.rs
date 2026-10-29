@@ -444,27 +444,18 @@ where
     let source_layout = prepared.source_layout().cloned();
     let (source, local, selected_tasks) = prepared.into_parts();
     let mut store = store;
-    let mut materialization = eredu_runtime::WeightMaterializationReport::default();
-    for group in eredu_runtime::group_replicated_text_transform_tasks(&selected_tasks)
-        .map_err(|error| Error::Quantization(error.to_string()))?
-    {
-        let tasks = group
-            .tasks(&selected_tasks)
-            .map_err(|error| Error::Quantization(error.to_string()))?;
-        let (transformed, report) = quantize_exact_replicated_text_tasks(
-            store,
-            &source,
-            &local,
-            &[] as &[M],
-            &[],
-            source_layout.as_deref(),
-            group.quantization(),
-            &tasks,
-            stream,
-        )?;
-        store = transformed;
-        materialization.merge(report);
-    }
+    let groups = eredu_runtime::group_replicated_text_transform_tasks(&selected_tasks)?;
+    let materialization = materialize_replicated_text_transform_groups(
+        &mut store,
+        &source,
+        &local,
+        &[] as &[M],
+        &[],
+        source_layout.as_deref(),
+        &selected_tasks,
+        &groups,
+        stream,
+    )?;
     let task_refs = selected_tasks.iter().collect::<Vec<_>>();
     let bindings = build_mlx_exact_replicated_text_bindings(
         &local,

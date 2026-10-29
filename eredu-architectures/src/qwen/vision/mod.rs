@@ -5,6 +5,7 @@ mod config;
 mod memory;
 mod model;
 mod parallel;
+mod specs;
 
 pub(crate) use checkpoint::{gguf_plan, temporal_patch_recipe};
 pub use checkpoint::{safetensors_plan, translate_gguf_weight_name};
@@ -21,4 +22,5 @@ pub use model::{
 pub use parallel::{
     block_parallel_parameter_groups, local_block_geometry, local_merger_widths,
     owned_static_parallel_parameter_groups, static_parallel_parameter_groups,
+    VisionStaticSelection,
 };

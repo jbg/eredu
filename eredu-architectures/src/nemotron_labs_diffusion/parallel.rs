@@ -142,13 +142,8 @@ pub fn composite_parameter_description(
             ));
         }
     }
-    ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        owned.iter().map(|group| group.group().clone()),
-        owned.clone(),
-    )
-    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
 }
 
 /// Counts shared base groups once and gives each adapter matrix the same layer owner.
@@ -192,13 +187,8 @@ pub fn parameter_description(
             parameters,
         ));
     }
-    ArchitectureParameterDescription::new(
-        base.graph(),
-        base.unit_layout(),
-        owned.iter().map(|g| g.group().clone()),
-        owned.clone(),
-    )
-    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
+    ArchitectureParameterDescription::from_owned(base.graph(), base.unit_layout(), owned)
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))
 }
 
 /// Exact Pixtral head/channel transforms. Both branch norms remain replicated
@@ -367,7 +357,7 @@ pub(crate) fn vision_local_widths(
 /// cache geometry and request-semantic transport before backend construction.
 pub fn partition(
     config: &FamilyConfig,
-    parameters: &ArchitectureParameterDescription,
+    definition: &eredu_runtime::ComponentDefinition,
     layout: &eredu_runtime::LocalModelLayout,
     units: std::ops::Range<usize>,
     ownership: eredu_runtime::PartitionOwnership,
@@ -378,23 +368,24 @@ pub fn partition(
     >,
     ParallelPlanError,
 > {
-    if parameter_description(config)? != *parameters {
-        return Err(ParallelPlanError::InvalidGroup(
-            "shared text partition has a different parameter catalog".into(),
-        ));
-    }
-    let geometry = decoder::partition_local_geometry(config, layout, units.clone())?;
+    super::definition::validate_text_identity(definition)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    definition
+        .validate_parameter_topology(&parameter_description(config)?)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let parameters = definition.parameters();
+    let geometry =
+        decoder::partition_local_geometry(config, parameters.invocations(), layout, units.clone())?;
+    let definition = definition
+        .clone()
+        .with_state_layout(geometry.complete_state_layout().clone())
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     eredu_runtime::ArchitecturePartition::from_description(
         parameters,
         [(decoder::TEXT_DECODER_EXECUTION_GROUP, units)],
         ownership,
-        geometry.complete_state_layout(),
-        &eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(
-                0,
-                0..config.num_hidden_layers() as usize,
-            ),
-        ]),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry.clone(),
         super::partitioned::TextBoundarySchema::new(config.hidden_size()),
     )

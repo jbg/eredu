@@ -4,6 +4,7 @@ mod checkpoint;
 mod config;
 mod model;
 mod parallel;
+mod parameters;
 mod positions;
 
 pub use checkpoint::{
@@ -21,26 +22,27 @@ pub use model::{
     prepare_input, vision_dependency_boundary_schema, vision_partition_boundary_schema,
     ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,
     PipelinePartitionInput, PipelinePrepared, PipelineVisionState, PreparedInput, StaticModules,
-    Unit, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    Unit, VlKernel, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     local_geometry, partition_local_geometry, partition_local_routed_geometry, LocalGeometry,
     PartitionLocalFoundation, PartitionLocalGeometry,
 };
+pub(crate) use parameters::select_definition;
+pub use parameters::{component_definition, parameter_description, project_parameters};
+
 pub use positions::{
     mrope_embeddings, mrope_spec, mrope_values, multimodal_position_ids, position_ids_tensor,
     PositionPart,
 };
 
 /// Derives complete expert ownership and rank-local text-bank geometry from Qwen3-VL.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
-    let args = architecture.args();
     if !args.text.is_moe() {
         return Ok(None);
     }
@@ -59,13 +61,11 @@ pub fn expert_realization_plan<
     .map_err(eredu_nn::Error::backend)?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
         .map_err(eredu_nn::Error::backend)?;
-    let geometry = architecture.shared_parallel_geometry();
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in
         0..usize::try_from(args.text.num_hidden_layers).map_err(eredu_nn::Error::backend)?
     {
         let local = geometry
-            .as_deref()
             .and_then(|geometry| geometry.text().block(layer))
             .unwrap_or(&args.text);
         unit_specs.insert(

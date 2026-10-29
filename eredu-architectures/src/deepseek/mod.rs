@@ -11,6 +11,7 @@ pub mod attention;
 pub mod block;
 /// Pure SafeTensors/GGUF schemas and canonical name translation.
 pub mod checkpoint;
+mod component;
 /// Strict V3/R1 and V4 configuration normalization.
 pub mod config;
 mod encoded_expert_residency;
@@ -140,7 +141,7 @@ pub fn v4_partition_expert_realization_plan(
 
 /// Derives complete V3 routed-expert ownership and rank-local bank geometry.
 pub fn v3_expert_realization_plan<B>(
-    architecture: &v3::Model<B>,
+    architecture: &v3::V3Kernel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 where
@@ -235,7 +236,7 @@ pub fn v3_replicated_expert_realization_plan(
 
 /// Derives complete V4 routed-expert ownership and rank-local bank geometry.
 pub fn v4_expert_realization_plan<B>(
-    architecture: &v4::Model<B>,
+    architecture: &v4::V4Kernel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error>
 where

@@ -339,6 +339,9 @@ impl Config for ModelArgs {
     fn num_hidden_layers(&self) -> i32 {
         self.state_layer_count() as i32
     }
+    fn block_parameter_owner(&self, layer: usize) -> usize {
+        layer % self.physical_layer_count()
+    }
     fn block_output_normalization(&self, layer: usize) -> Option<String> {
         (!self.skip_loop_final_norm
             && (layer + 1).is_multiple_of(self.physical_layer_count())

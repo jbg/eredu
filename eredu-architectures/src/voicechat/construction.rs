@@ -4,6 +4,8 @@
 //! supply exact recipes; a backend only constructs ordinary neural mechanisms.
 //! A unit has no session state, residency schedule, or completion authority.
 
+use crate::decoder::Config;
+
 use eredu_codec::{
     ear::{AudioDecoderConfig, AudioEncoderConfig},
     ear_decoder::DecoderUnit,
@@ -143,6 +145,12 @@ pub enum ConstructionError {
     /// Constructed parameter identities disagree with retained artifact admission.
     #[error(transparent)]
     Parameters(#[from] SpeechParameterError),
+    /// A semantic parameter ownership projection is inconsistent.
+    #[error(transparent)]
+    ParameterDeclaration(#[from] eredu_runtime::ArchitectureParameterError),
+    /// Shared embedded transformer declaration failed.
+    #[error(transparent)]
+    Transformer(#[from] super::tts_transformer_layered::TransformerError),
 }
 
 /// Cold, validated construction geometry without artifacts or native resources.
@@ -207,6 +215,149 @@ impl SpeechConstructionPlan {
     /// Exact normalized policy used by unit construction and consuming assembly.
     pub fn config(&self) -> &VoiceChatConfig {
         &self.config
+    }
+
+    /// Canonical parameters for one semantic unit, without native construction.
+    /// Ownership remains in the component's validated family declaration.
+    pub fn parameter_description(
+        &self,
+        id: SpeechUnitId,
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, ConstructionError> {
+        use super::{
+            perception_layered as perception, tts_conditioning_layered as conditioning,
+            tts_mog_layered as mog, tts_rvq_layered as rvq,
+        };
+        use eredu_codec::{
+            ear_decoder_layered as decoder, ear_encoder_layered as encoder,
+            prvq_layered as quantizer,
+        };
+        use eredu_runtime::{ArchitectureParameterDescription, ParameterGroupOwner};
+        use SpeechUnitId::*;
+        if !self.units.contains(&id) {
+            return Err(ConstructionError::Unit(id));
+        }
+        let (description, selected) = match id {
+            PerceptionSubsampling | PerceptionBlock(_) | PerceptionProjection => {
+                let unit = match id {
+                    PerceptionSubsampling => (perception::SUBSAMPLING.into(), 0),
+                    PerceptionBlock(index) => (perception::ENCODER.into(), index),
+                    _ => (perception::PROJECTION.into(), 0),
+                };
+                (
+                    perception::perception_parameter_description(self.perception)?,
+                    Some(unit),
+                )
+            }
+            Rnnt => (
+                super::rnnt_layered::rnnt_parameter_description(self.rnnt)?,
+                None,
+            ),
+            FunctionHead => (
+                super::function_head_layered::function_head_parameter_description(
+                    super::function_head_layered::FunctionHeadDimensions::new(
+                        self.perception.output_width,
+                        131072,
+                    )?,
+                    &LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?,
+                )?,
+                None,
+            ),
+            CharacterEmbedding | TtsIngress | TtsFusion => {
+                let group = match id {
+                    CharacterEmbedding => conditioning::CHARACTER,
+                    TtsIngress => conditioning::INGRESS,
+                    _ => conditioning::FUSION,
+                };
+                (
+                    conditioning::conditioning_parameter_description(
+                        conditioning::ConditioningDimensions::from_config(
+                            &self.config.tts,
+                            256,
+                            self.speaker_frames,
+                        )?,
+                    )?,
+                    Some((group.into(), 0)),
+                )
+            }
+            CharacterBlock(_) | CharacterNorm | TtsBlock(_) | TtsNorm => {
+                let config = match id {
+                    CharacterBlock(_) | CharacterNorm => &self.character,
+                    _ => &self.tts,
+                };
+                let unit = match id {
+                    CharacterBlock(index) | TtsBlock(index) => {
+                        (config.parameter_root().into(), index)
+                    }
+                    _ => (format!("{}.normalization", config.parameter_root()), 0),
+                };
+                (
+                    super::tts_transformer_layered::tts_transformer_parameter_description(config)?,
+                    Some(unit),
+                )
+            }
+            TtsRvqBank | TtsRvqProjection => {
+                let group = if id == TtsRvqBank {
+                    rvq::BANK
+                } else {
+                    rvq::PROJECTION
+                };
+                (
+                    rvq::rvq_parameter_description(RvqDimensions::from_config(&self.config.tts)?)?,
+                    Some((group.into(), 0)),
+                )
+            }
+            MogBlock(_) | MogPredictionHead | MogComponentBank => {
+                let unit = match id {
+                    MogBlock(index) => (mog::BLOCKS.into(), index),
+                    MogPredictionHead => (mog::PREDICTION.into(), 0),
+                    _ => (mog::COMPONENTS.into(), 0),
+                };
+                (mog::mog_parameter_description(self.mog)?, Some(unit))
+            }
+            CodecEncoder(index) => (
+                encoder::encoder_parameter_description(
+                    &self.encoder.neural,
+                    "tts_model.audio_codec.encoder",
+                )?,
+                Some((encoder::ENCODER_GROUP.into(), index)),
+            ),
+            CodecDecoder(index) => (
+                decoder::decoder_parameter_description(
+                    &self.decoder.neural,
+                    "tts_model.audio_codec.decoder",
+                )?,
+                Some((decoder::DECODER_GROUP.into(), index)),
+            ),
+            CodecCodebook(depth) => (
+                quantizer::quantizer_parameter_description(
+                    self.decoder.quantizer,
+                    "tts_model.audio_codec.prvq",
+                )?,
+                Some((quantizer::codebook_group_name(depth), 0)),
+            ),
+        };
+        let Some((selected_group, selected_index)) = selected else {
+            return Ok(description);
+        };
+        let groups = description
+            .groups()
+            .iter()
+            .filter(|owned| {
+                matches!(
+                    owned.owner(), ParameterGroupOwner::ExecutionUnit { group, global_unit, .. }
+                        if group.as_str() == selected_group && *global_unit == selected_index
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if groups.is_empty() {
+            return Err(ConstructionError::Unit(id));
+        }
+        Ok(ArchitectureParameterDescription::from_owned(
+            description.graph(),
+            description.unit_layout(),
+            groups,
+        )?)
     }
 
     /// Constructs only one unit's unloaded slots. No weight source is accessed.
@@ -327,10 +478,15 @@ impl<'a> PreparedSpeechConstruction<'a> {
                 return Err(ConstructionError::MissingComponent(id.component()).into());
             }
         }
+        let mut prepared = self
+            .plan
+            .units()
+            .iter()
+            .copied()
+            .map(|id| Ok((id, self.prepare_unit(id)?)))
+            .collect::<Result<std::collections::BTreeMap<_, _>, ConstructionError>>()?;
         self.plan.assemble_using(context, |id, module| {
-            let prepared =
-                PreparedSpeechParameterUnit::from_retained(self.artifacts, id.component(), module)
-                    .map_err(ConstructionError::from)?;
+            let prepared = prepared.remove(&id).expect("declared speech unit");
             prepared
                 .select::<P>()
                 .and_then(|selected| selected.bind(module, materialization))
@@ -364,6 +520,22 @@ impl<'a> PreparedSpeechConstruction<'a> {
         &self.units
     }
 
+    /// Resolves one semantic unit's exact recipes before native construction.
+    /// Neighboring modules and host buffers grant no source authority.
+    pub fn prepare_unit(
+        &self,
+        id: SpeechUnitId,
+    ) -> Result<PreparedSpeechParameterUnit, ConstructionError> {
+        if self.artifacts.component_source(id.component()).is_none() {
+            return Err(ConstructionError::MissingComponent(id.component()));
+        }
+        Ok(PreparedSpeechParameterUnit::from_description(
+            self.artifacts,
+            id.component(),
+            self.plan.parameter_description(id)?,
+        )?)
+    }
+
     /// Constructs an unloaded unit and its exact independently selectable bindings.
     /// Missing roles and invalid indices are rejected before native construction.
     pub fn build_unit<B: NeuralBackend>(
@@ -371,12 +543,8 @@ impl<'a> PreparedSpeechConstruction<'a> {
         id: SpeechUnitId,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(SpeechUnit<B>, PreparedSpeechParameterUnit), ConstructionError> {
-        if self.artifacts.component_source(id.component()).is_none() {
-            return Err(ConstructionError::MissingComponent(id.component()));
-        }
+        let parameters = self.prepare_unit(id)?;
         let module = self.plan.build_unit::<B>(id, context)?;
-        let parameters =
-            PreparedSpeechParameterUnit::from_retained(self.artifacts, id.component(), &module)?;
         Ok((module, parameters))
     }
 }

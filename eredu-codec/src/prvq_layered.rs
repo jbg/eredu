@@ -6,20 +6,17 @@ use crate::{
     },
     Error,
 };
-use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
-use eredu_nn::{
-    DistributedNeuralBackend, Index, NeuralBackend, Parameterized, Tensor, TensorElementType,
-};
+use eredu_core::BackendFailure;
+use eredu_nn::{DistributedNeuralBackend, Index, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
-    LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
-    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, RuntimeState, StateError, StateLayout, StaticParameterVisitor,
-    StaticParameterVisitorMut, SubmissionBackend, TensorPlacement,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -47,43 +44,15 @@ pub fn quantizer_local_dimensions(
     if range.is_empty() || range.end > geometry.channels as usize {
         return Err(invalid("invalid quantizer channel partition"));
     }
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        for member in group.members() {
-            let mut shape = member.global_shape().to_vec();
-            let placement = match member.sharding() {
-                MemberSharding::Replicated => TensorPlacement::Replicated,
-                MemberSharding::Partitioned { axis } => {
-                    shape[*axis] = range.len();
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: range.start,
-                        end: range.end,
-                    }
-                }
-                _ => return Err(invalid("unknown quantizer channel partition")),
-            };
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    placement,
-                    group.partition_units(),
-                    Some(range.clone()),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(invalid(
-            "quantizer physical layout differs from declared channel partition",
-        ));
-    }
+    eredu_runtime::validate_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |_| {
+            Ok::<_, Error>(eredu_runtime::ParameterGroupSelection::Logical(Some(
+                range.clone(),
+            )))
+        },
+    )?;
     Ok(QuantizerLocalDimensions {
         channels_start: range.start as i32,
         channels: range.len() as i32,
@@ -138,65 +107,6 @@ pub trait QuantizerExecution<B: NeuralBackend> {
         )
     }
 }
-/// All learned quantizer parameters belong to execution units.
-pub struct QuantizerStaticModules;
-impl<T: 'static> Parameterized<T> for QuantizerStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
-}
-
-/// Explicit stateless traversal owner; input and result tensors belong to the invocation.
-pub struct QuantizerRuntimeState {
-    layout: StateLayout,
-}
-impl QuantizerRuntimeState {
-    /// Constructs host-only empty state metadata.
-    pub fn new() -> Result<Self, Error> {
-        Ok(Self {
-            layout: quantizer_state_layout()?,
-        })
-    }
-}
-impl<B: NeuralBackend> RuntimeState<B> for QuantizerRuntimeState {
-    type RetainedValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    fn layout(&self) -> &StateLayout {
-        &self.layout
-    }
-    fn optional_layout(&self) -> Option<&StateLayout> {
-        None
-    }
-    fn retained_values(
-        &self,
-        ordinal: usize,
-        _: ExecutionUnitAddress,
-    ) -> Result<Self::RetainedValues<'_>, StateError> {
-        if ordinal != 0 {
-            return Err(StateError::UnknownLayer {
-                layer: ordinal,
-                count: 1,
-            });
-        }
-        Ok(std::iter::empty())
-    }
-}
-fn quantizer_state_layout() -> Result<StateLayout, Error> {
-    Ok(StateLayout::new(LayerSchedule::new(
-        1,
-        vec![LayerCachePolicy::NoState],
-    )?)?)
-}
 /// Invocation-local operation and selected contiguous codebook range.
 pub enum QuantizerInput<'a, T> {
     /// Ordered sum of selected codebook vectors.
@@ -233,14 +143,13 @@ impl<T> QuantizerForward<T> {
     }
 }
 /// Codec-owned canonical codebook order and parameter namespaces.
-pub struct QuantizerArchitecture<B: NeuralBackend> {
+pub struct QuantizerKernel<B: NeuralBackend> {
     geometry: Geometry,
     prefix: String,
     parallel: Option<(QuantizerLocalDimensions, LocalModelLayout)>,
-    empty: QuantizerStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> QuantizerArchitecture<B> {
+impl<B: NeuralBackend> QuantizerKernel<B> {
     /// Validates geometry and namespace without constructing backend resources.
     pub fn new(geometry: Geometry, prefix: &str) -> Result<Self, Error> {
         geometry.validate()?;
@@ -251,7 +160,6 @@ impl<B: NeuralBackend> QuantizerArchitecture<B> {
             geometry,
             prefix: prefix.into(),
             parallel: None,
-            empty: QuantizerStaticModules,
             backend: PhantomData,
         })
     }
@@ -283,25 +191,12 @@ impl<B: NeuralBackend> QuantizerArchitecture<B> {
     pub fn geometry(&self) -> Geometry {
         self.geometry
     }
-    /// One group per depth enables exact range selection through ordinary traversal.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        quantizer_graph(self.geometry)
-    }
-    /// Every depth group owns exactly one codebook unit.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        if group < self.geometry.depth {
-            Ok(1)
-        } else {
-            Err(invalid("unknown residual codebook group"))
-        }
-    }
-    /// Canonical namespace of the selected depth unit.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.group_unit_count(group)?;
-        if index != 0 {
-            return Err(invalid("residual codebook group has one unit"));
-        }
-        Ok(format!("{}.codebook.{group}", self.prefix))
+    /// Couples codec equations with the validated shared component definition.
+    pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
+        Ok(ComponentAdapter::new(
+            quantizer_component_definition(self.geometry, &self.prefix)?,
+            self,
+        )?)
     }
     /// Constructs only the requested unloaded codebook.
     pub fn build_unit(
@@ -310,20 +205,18 @@ impl<B: NeuralBackend> QuantizerArchitecture<B> {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Codebook<B::Tensor>, Error> {
-        self.unit_path(group, index)?;
+        if group >= self.geometry.depth || index != 0 {
+            return Err(invalid("unknown residual codebook unit"));
+        }
         Codebook::unloaded(self.local_geometry(), &self.prefix, group, context)
     }
 }
-impl<B: NeuralBackend> QuantizerArchitecture<B> {
+impl<B: NeuralBackend> QuantizerKernel<B> {
     fn begin_input(
         &self,
         input: QuantizerInput<'_, B::Tensor>,
-        state: &QuantizerRuntimeState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, QuantizerForward<B::Tensor>>, Error> {
-        if state.layout != quantizer_state_layout()? {
-            return Err(invalid("residual quantizer runtime layout mismatch"));
-        }
         let (input, range, metric) = match input {
             QuantizerInput::Decode { codes, range } => (codes, range, None),
             QuantizerInput::Quantize {
@@ -393,7 +286,7 @@ impl<B: NeuralBackend> QuantizerArchitecture<B> {
     }
 }
 
-impl<B: NeuralBackend> QuantizerArchitecture<B> {
+impl<B: NeuralBackend> QuantizerKernel<B> {
     #[allow(clippy::too_many_arguments)]
     fn forward_selected(
         &self,
@@ -406,7 +299,9 @@ impl<B: NeuralBackend> QuantizerArchitecture<B> {
         mut collective: impl FnMut(bool, Result<B::Tensor, Error>) -> Result<B::Tensor, Error>,
     ) -> Result<B::Tensor, Error> {
         let validated = (|| {
-            self.unit_path(group, index)?;
+            if group >= self.geometry.depth || index != 0 {
+                return Err(invalid("unknown residual codebook unit"));
+            }
             if unit.geometry() != self.local_geometry()
                 || unit.depth() != group
                 || unit.prefix() != self.prefix
@@ -468,21 +363,60 @@ impl<B: NeuralBackend> QuantizerArchitecture<B> {
     }
 }
 
-fn group_name(depth: usize) -> String {
+/// Stable execution group for one independently leased residual codebook depth.
+pub fn codebook_group_name(depth: usize) -> String {
     format!("prvq.codebook.{depth}")
 }
+/// Validated selected-depth invocations over independently leased codebooks.
+pub fn quantizer_component_definition(
+    geometry: Geometry,
+    prefix: &str,
+) -> Result<ComponentDefinition, Error> {
+    let parameters = quantizer_parameter_description(geometry, prefix)?;
+    let transport = ArchitectureGroupTransport {
+        placement: ArchitectureGroupPlacement::Pipeline,
+        kind: ArchitectureGroupKind::Projector,
+        first_owner_static_roles: vec![],
+        last_owner_static_roles: vec![],
+        merge_destination: ArchitectureMergeDestination::LastOwner,
+        parallel_subgroup: None,
+        request_optional: false,
+    };
+    Ok(ComponentDefinition::new(
+        "prvq",
+        parameters,
+        (0..geometry.depth)
+            .map(|depth| ComponentUnit {
+                path: format!("{prefix}.codebook.{depth}"),
+                state: 0..0,
+            })
+            .collect(),
+        vec![transport; geometry.depth],
+        "prvq.codebook.0",
+        vec![],
+        StatelessComponentState::state_layout()?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
+    )?)
+}
+
 fn quantizer_graph(geometry: Geometry) -> Result<ExecutionGraph, Error> {
     geometry.validate()?;
     let groups: Vec<_> = (0..geometry.depth)
         .map(|depth| {
             if depth == 0 {
-                ExecutionGroupSpec::root(group_name(depth))
+                ExecutionGroupSpec::root(codebook_group_name(depth))
             } else {
-                ExecutionGroupSpec::with_dependencies(group_name(depth), [group_name(depth - 1)])
+                ExecutionGroupSpec::with_dependencies(
+                    codebook_group_name(depth),
+                    [codebook_group_name(depth - 1)],
+                )
             }
         })
         .collect();
-    Ok(ExecutionGraph::new(groups, group_name(geometry.depth - 1))?)
+    Ok(ExecutionGraph::new(
+        groups,
+        codebook_group_name(geometry.depth - 1),
+    )?)
 }
 /// Cold canonical means/scalar geometry with one independently owned group per depth.
 pub fn quantizer_parameter_description(
@@ -495,7 +429,6 @@ pub fn quantizer_parameter_description(
     }
     let graph = quantizer_graph(geometry)?;
     let layout = ExecutionUnitLayout::new(&graph, vec![1; geometry.depth])?;
-    let mut expected = Vec::with_capacity(geometry.depth);
     let mut owned = Vec::with_capacity(geometry.depth);
     for depth in 0..geometry.depth {
         let spec = ParameterGroupSpec::partitioned(
@@ -520,25 +453,32 @@ pub fn quantizer_parameter_description(
                 layout.group_id(depth).expect("declared depth").clone(),
                 0,
             ),
-            spec.clone(),
+            spec,
         ));
-        expected.push(spec);
     }
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for QuantizerArchitecture<B> {
-    type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        quantizer_state_layout()
-    }
+
+impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {
+    type Input<'a> = QuantizerInput<'a, B::Tensor>;
+    type Unit = Codebook<B::Tensor>;
+    type ForwardContext = QuantizerForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        if state.global_layer_offset() != 0 || *state.layout() != quantizer_state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(invalid("residual quantizer stateless layout mismatch"));
         }
         Ok(eredu_runtime::ModelStateIdentity::new(
@@ -551,93 +491,51 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for QuantizerArchitecture<B> {
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        quantizer_parameter_description(self.geometry, &self.prefix)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, QuantizerRuntimeState> for QuantizerArchitecture<B> {
-    type Input<'a> = QuantizerInput<'a, B::Tensor>;
-    type StaticModules = QuantizerStaticModules;
-    type Unit = Codebook<B::Tensor>;
-    type ForwardContext = QuantizerForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::Projector,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        "prvq.codebook.0"
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &QuantizerStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut QuantizerStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.build_unit(group, index, context)
+        self.build_unit(address.group(), address.index(), context)
     }
-    fn begin_forward<'a>(
+
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        forward.range.contains(&group)
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut roots = Vec::with_capacity(forward.codes.len() + 5);
+        roots.push(&forward.input);
+        roots.extend(forward.codes.iter());
+        roots.extend(forward.selected.as_ref());
+        if let Some(result) = &forward.result {
+            roots.extend([&result.codes, &result.residual, &result.quantized]);
+        }
+        roots.into_iter()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for QuantizerKernel<B> {
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut QuantizerRuntimeState,
+        _: &mut StatelessComponentState,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         if self.is_parallel() {
             return Err(invalid("rank-local quantizer requires parallel execution"));
         }
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
-        _: &mut QuantizerRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
@@ -649,19 +547,12 @@ impl<B: NeuralBackend> LayeredArchitecture<B, QuantizerRuntimeState> for Quantiz
             Err(invalid("residual quantizer graph dependency mismatch"))
         }
     }
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        forward.range.contains(&group)
-    }
-    fn retained_state_ordinals(&self, _: usize, _: usize, _: usize) -> std::ops::Range<usize> {
-        0..0
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        _: &mut QuantizerRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
@@ -669,8 +560,8 @@ impl<B: NeuralBackend> LayeredArchitecture<B, QuantizerRuntimeState> for Quantiz
             return Err(invalid("rank-local quantizer requires parallel execution"));
         }
         self.forward_selected(
-            group,
-            index,
+            address.group(),
+            address.index(),
             unit,
             hidden,
             forward,
@@ -678,11 +569,10 @@ impl<B: NeuralBackend> LayeredArchitecture<B, QuantizerRuntimeState> for Quantiz
             |_, prepared| prepared,
         )
     }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
-        _: &mut QuantizerRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
@@ -695,23 +585,9 @@ impl<B: NeuralBackend> LayeredArchitecture<B, QuantizerRuntimeState> for Quantiz
         }
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut roots = Vec::with_capacity(forward.codes.len() + 5);
-        roots.push(&forward.input);
-        roots.extend(forward.codes.iter());
-        roots.extend(forward.selected.as_ref());
-        if let Some(result) = &forward.result {
-            roots.extend([&result.codes, &result.residual, &result.quantized]);
-        }
-        roots.into_iter()
-    }
 }
-impl<B: DistributedNeuralBackend> QuantizerArchitecture<B> {
+
+impl<B: DistributedNeuralBackend> QuantizerKernel<B> {
     /// Rejects a mismatched communicator before parameter acquisition.
     pub fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), Error> {
         let (_, selected) = self
@@ -815,33 +691,32 @@ impl<B: DistributedNeuralBackend> QuantizerArchitecture<B> {
         )
     }
 }
-impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, QuantizerRuntimeState>
-    for QuantizerArchitecture<B>
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for QuantizerKernel<B>
 {
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut QuantizerRuntimeState,
+        _: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         self.validate_parallel(parallel)?;
-        self.begin_input(input, state, context)
+        self.begin_input(input, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        _: &mut QuantizerRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.forward_unit_guarded(
-            group,
-            index,
+            address.group(),
+            address.index(),
             unit,
             hidden,
             forward,
@@ -850,51 +725,8 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, QuantizerRuntim
             &mut |_, success, _| Ok(success),
         )
     }
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut QuantizerRuntimeState,
-        forward: &Self::ForwardContext,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.finish_forward(hidden, state, forward, context)
-    }
 }
 
-/// Residual quantization using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseQuantizer<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
-{
-    runtime: LayerwiseRuntime<QuantizerArchitecture<B>, B, QuantizerRuntimeState, P>,
-}
-impl<B, P> LayerwiseQuantizer<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact codebook unit policy.
-    pub fn new(architecture: QuantizerArchitecture<B>, policy: P) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<QuantizerArchitecture<B>, B, QuantizerRuntimeState, P> {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<QuantizerArchitecture<B>, B, QuantizerRuntimeState, P> {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<Error, P>,
 ) -> Error {
@@ -911,14 +743,20 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-impl<B, P> QuantizerExecution<B> for LayerwiseQuantizer<B, P>
+impl<B, P> QuantizerExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, Codebook<B::Tensor>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn validate_coordinated_execution(&self) -> Result<(), Error> {
-        if self.runtime.architecture().is_parallel() {
+        if self.architecture().kernel().is_parallel() {
             Err(invalid(
                 "parallel PRVQ requires guarded collective execution",
             ))
@@ -927,7 +765,7 @@ where
         }
     }
     fn geometry(&self) -> Geometry {
-        self.runtime.architecture().geometry()
+        self.architecture().kernel().geometry()
     }
     fn decode_range(
         &mut self,
@@ -935,9 +773,8 @@ where
         range: Range<usize>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let mut state = QuantizerRuntimeState::new()?;
-        self.runtime
-            .invoke(QuantizerInput::Decode { codes, range }, &mut state, context)
+        let mut state = StatelessComponentState::new()?;
+        self.invoke(QuantizerInput::Decode { codes, range }, &mut state, context)
             .map_err(runtime_error)
     }
     fn quantize_range(
@@ -947,52 +784,47 @@ where
         metric: DistanceMetric,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Quantized<B::Tensor>, Error> {
-        let mut state = QuantizerRuntimeState::new()?;
-        self.runtime
-            .invoke_with_context(
-                QuantizerInput::Quantize {
-                    latent,
-                    range,
-                    metric,
-                },
-                &mut state,
-                context,
-            )
-            .map_err(runtime_error)?
-            .1
-            .into_quantized()
+        let mut state = StatelessComponentState::new()?;
+        self.invoke_with_context(
+            QuantizerInput::Quantize {
+                latent,
+                range,
+                metric,
+            },
+            &mut state,
+            context,
+        )
+        .map_err(runtime_error)?
+        .1
+        .into_quantized()
     }
 }
 
-impl<B, P> LayerwiseQuantizer<B, P>
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
-    /// Decodes selected codebooks locally and publishes the full channels within the final lease.
-    pub fn decode_range_parallel(
+/// Tensor-parallel range operations over independently leased residual codebooks.
+/// Implementors supply typed invocation and guarded channel-collective participation.
+pub trait ParallelQuantizerExecution<B: DistributedNeuralBackend>: QuantizerExecution<B> {
+    /// Invokes a selected depth range with request-local roots retained to completion.
+    fn invoke_parallel(
+        &mut self,
+        input: QuantizerInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error>;
+
+    /// Publishes full decoded channels while the final selected codebook stays leased.
+    fn decode_range_parallel(
         &mut self,
         codes: &B::Tensor,
         range: Range<usize>,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let mut state = QuantizerRuntimeState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                QuantizerInput::Decode { codes, range },
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
+        self.invoke_parallel(QuantizerInput::Decode { codes, range }, parallel, context)
             .map(|(output, _)| output)
-            .map_err(runtime_error)
     }
-    /// Reduces channel distance scores before each categorical decision and returns global results.
-    pub fn quantize_range_parallel(
+
+    /// Reduces distance scores before each categorical decision and retains global results.
+    fn quantize_range_parallel(
         &mut self,
         latent: &B::Tensor,
         range: Range<usize>,
@@ -1000,25 +832,63 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Quantized<B::Tensor>, Error> {
-        let mut state = QuantizerRuntimeState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                QuantizerInput::Quantize {
-                    latent,
-                    range,
-                    metric,
-                },
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map_err(runtime_error)?
-            .1
-            .into_quantized()
+        self.invoke_parallel(
+            QuantizerInput::Quantize {
+                latent,
+                range,
+                metric,
+            },
+            parallel,
+            context,
+        )?
+        .1
+        .into_quantized()
+    }
+
+    /// Runs channel shards with shared acquisition and collective-preparation gates.
+    fn invoke_parallel_guarded<H, F>(
+        &mut self,
+        input: QuantizerInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        agree: F,
+    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error>
+    where
+        H: LayeredTraversalHook<B, QuantizerForward<B::Tensor>, Error> + ?Sized,
+        F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, Error>;
+}
+
+impl<B, P> ParallelQuantizerExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, QuantizerKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, Codebook<B::Tensor>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn invoke_parallel(
+        &mut self,
+        input: QuantizerInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, QuantizerForward<B::Tensor>), Error> {
+        self.forward_parallel_with_context_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |_, _, _| Ok(()),
+        )
+        .map_err(runtime_error)
     }
     /// Runs channel shards with shared acquisition and local collective-preparation gates.
-    pub fn invoke_parallel_guarded<H, F>(
+    fn invoke_parallel_guarded<H, F>(
         &mut self,
         input: QuantizerInput<'_, B::Tensor>,
         parallel: &B::ParallelContext,
@@ -1061,19 +931,18 @@ where
         if !agree(descriptor, true, context)? {
             return Err(invalid("PRVQ participants selected different invocations"));
         }
-        self.runtime
-            .forward_parallel_with_unit_executor_and_traversal_hook(
-                input,
-                &mut QuantizerRuntimeState::new()?,
-                parallel,
-                context,
-                |architecture, group, index, unit, hidden, _, forward, parallel, context| {
-                    architecture.forward_unit_guarded(
-                        group, index, unit, hidden, forward, parallel, context, &mut agree,
-                    )
-                },
-                hook,
-            )
-            .map_err(runtime_error)
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, _, forward, parallel, context| {
+                architecture.kernel().forward_unit_guarded(
+                    group, index, unit, hidden, forward, parallel, context, &mut agree,
+                )
+            },
+            hook,
+        )
+        .map_err(runtime_error)
     }
 }

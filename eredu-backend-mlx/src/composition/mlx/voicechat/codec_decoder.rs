@@ -3,15 +3,15 @@
 use eredu_codec::{
     ear_decoder::{DecoderConfig, DecoderState, DecoderUnit},
     ear_decoder_layered::{
-        DecoderArchitecture, DecoderExecution, DecoderRuntimeState, LayerwiseDecoder,
+        DecoderExecution, DecoderKernel, DecoderRuntimeState, ParallelDecoderExecution,
     },
     ear_decoder_preparation::PreparedDecoderBindings,
     Error,
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport,
+    ComponentAdapter, ComponentDefinition, DenseDiskStreamReport, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout, ResidencyReport,
 };
 use safemlx::{Array, Stream};
 
@@ -28,9 +28,15 @@ use crate::{
 };
 
 type Unit = DecoderUnit<MlxTensor>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, DecoderKernel<MlxNeuralBackend>>,
+    MlxNeuralBackend,
+    DecoderRuntimeState<MlxTensor>,
+    P,
+>;
 enum Execution {
-    Resident(LayerwiseDecoder<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwiseDecoder<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native EAR neural decoder over the selected shared resident or bounded parameter policy.
@@ -44,8 +50,8 @@ impl MlxEarDecoder {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -55,7 +61,6 @@ impl MlxEarDecoder {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -65,8 +70,8 @@ impl MlxEarDecoder {
     /// Number of pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -86,13 +91,17 @@ impl DecoderExecution<MlxNeuralBackend> for MlxEarDecoder {
     ) -> Result<(MlxTensor, DecoderState<MlxTensor>), Error> {
         match (&mut self.execution, &self.parallel) {
             (Execution::Resident(model), Some(parallel)) => {
-                model.step_parallel(latent, parent, parallel, context)
+                ParallelDecoderExecution::step_parallel(model, latent, parent, parallel, context)
             }
             (Execution::Bounded(model), Some(parallel)) => {
-                model.step_parallel(latent, parent, parallel, context)
+                ParallelDecoderExecution::step_parallel(model, latent, parent, parallel, context)
             }
-            (Execution::Resident(model), None) => model.step(latent, parent, context),
-            (Execution::Bounded(model), None) => model.step(latent, parent, context),
+            (Execution::Resident(model), None) => {
+                DecoderExecution::step(model, latent, parent, context)
+            }
+            (Execution::Bounded(model), None) => {
+                DecoderExecution::step(model, latent, parent, context)
+            }
         }
     }
 }
@@ -151,14 +160,17 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (config, prefix, local_layout, layout, source, units) = prepared.into_parts();
-            let mut architecture = match local_layout.as_ref() {
+            let (config, prefix, definition, local_layout, layout, source, units) =
+                prepared.into_parts();
+            let kernel = match local_layout.as_ref() {
                 Some(local) => {
-                    DecoderArchitecture::<MlxNeuralBackend>::new_parallel(config, &prefix, local)
+                    DecoderKernel::<MlxNeuralBackend>::new_parallel(config, &prefix, local)
                 }
-                None => DecoderArchitecture::<MlxNeuralBackend>::new(config, &prefix),
+                None => DecoderKernel::<MlxNeuralBackend>::new(config, &prefix),
             }
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(Error::from(error)))?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
@@ -181,9 +193,9 @@ fn materialize(
                         std::marker::PhantomData::<DecoderRuntimeState<MlxTensor>>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwiseDecoder::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwiseDecoder::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxEarDecoder {

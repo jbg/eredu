@@ -23,10 +23,17 @@ where
     let mut selected_args = args.clone();
     selected_args.text.weight_quantization = None;
     selected_args.text.quantized_weights = None;
-    let formats = crate::replicated_text::selected_formats(selected.base().text());
+    let formats = selected.base().text().quantized_formats();
     selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
-    let parameters = crate::diffusion_gemma::parallel::parameter_description(&selected_args)
+    let retained = selected
+        .base()
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("shared iterative selection has no retained definition"))?;
+    let definition = crate::diffusion_gemma::model::project_parameters(&selected_args, &retained)
         .map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -42,78 +49,67 @@ where
     let geometry =
         crate::diffusion_gemma::parallel::local_geometry(&selected_args, &layout, owned.units())
             .map_err(architecture)?;
-    let plan = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
-        selected_args.clone(),
-        geometry.clone(),
-        context,
+    let plan = crate::diffusion_gemma::model::expert_realization_plan(
+        &selected_args,
+        Some(&geometry),
+        rank,
     )
     .map_err(architecture)?
-    .expert_realization_plan(rank)
-    .map_err(architecture)?
     .ok_or_else(|| architecture("selected shared stack has no routed bank"))?;
-    let complete_state = geometry.state_layout().clone();
+    let complete_state = geometry
+        .state_layout()
+        .cloned()
+        .ok_or_else(|| architecture("shared iterative partition has no context slots"))?;
     let partition = crate::diffusion_gemma::parallel::partition(
         &selected_args,
-        &parameters,
+        definition.clone(),
         &layout,
         owned.units(),
         selected.requirements().ownership().clone(),
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
-        let source_parameters =
-            crate::diffusion_gemma::parallel::parameter_description(args).map_err(architecture)?;
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
+    let source_architecture = if selected.base().text().uses_weight_transform() {
+        let source_parameters = retained.parameters();
         let source_layout =
-            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+            derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
                 .map_err(architecture)?;
-        if source_geometry.state_layout() != &complete_state {
+        if source_geometry.state_layout() != Some(&complete_state) {
             return Err(architecture(
                 "shared iterative transform source changed state geometry",
             ));
         }
-        let source_plan = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
-            args.clone(),
-            source_geometry.clone(),
-            context,
+        let source_plan = crate::diffusion_gemma::model::expert_realization_plan(
+            args,
+            Some(&source_geometry),
+            rank,
         )
-        .map_err(architecture)?
-        .expert_realization_plan(rank)
         .map_err(architecture)?
         .ok_or_else(|| architecture("source shared stack has no routed bank"))?;
         let source_partition = crate::diffusion_gemma::parallel::partition(
             args,
-            &source_parameters,
+            retained.clone(),
             &source_layout,
             owned.units(),
             selected.requirements().ownership().clone(),
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        selected
+            .requirements()
+            .validate_binding(&source_partition)
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "transform source changed shared unit addresses",
-            ));
-        }
-        let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+        let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
-            source_geometry,
+            retained.clone(),
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
-        let model = model
-            .with_expert_realization(source_plan)
+        model
+            .kernel_mut()
+            .set_expert_realization(source_plan)
             .map_err(architecture)?;
         Some((model, source_layout))
     } else {
@@ -122,14 +118,16 @@ where
     let capability_estimate =
         crate::capability::diffusion_gemma(&selected_args).map_err(architecture)?;
     let effective_model_type = "diffusion_gemma".to_owned();
-    let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+    let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
         selected_args,
-        geometry,
+        definition,
+        &partition,
         context,
     )
     .map_err(architecture)?;
-    let model = model
-        .with_expert_realization(plan.clone())
+    model
+        .kernel_mut()
+        .set_expert_realization(plan.clone())
         .map_err(architecture)?;
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         model,
@@ -168,10 +166,16 @@ where
     let mut selected_args = args.clone();
     selected_args.text.weight_quantization = None;
     selected_args.text.quantized_weights = None;
-    let formats = crate::replicated_text::selected_formats(selected.base());
+    let formats = selected.base().quantized_formats();
     selected_args.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
-    let parameters = crate::diffusion_gemma::parallel::parameter_description(&selected_args)
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("shared iterative selection has no retained definition"))?;
+    let definition = crate::diffusion_gemma::model::project_parameters(&selected_args, &retained)
         .map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -187,55 +191,47 @@ where
     let geometry =
         crate::diffusion_gemma::parallel::local_geometry(&selected_args, &layout, owned.units())
             .map_err(architecture)?;
-    let complete_state = geometry.state_layout().clone();
+    let complete_state = geometry
+        .state_layout()
+        .cloned()
+        .ok_or_else(|| architecture("shared iterative partition has no context slots"))?;
     let partition = crate::diffusion_gemma::parallel::partition(
         &selected_args,
-        &parameters,
+        definition.clone(),
         &layout,
         owned.units(),
         selected.requirements().ownership().clone(),
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
-        let source_parameters =
-            crate::diffusion_gemma::parallel::parameter_description(args).map_err(architecture)?;
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
+    let source_architecture = if selected.base().uses_weight_transform() {
+        let source_parameters = retained.parameters();
         let source_layout =
-            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+            derive_partitioned_transform_source_layout(source_parameters, &parameters, rank)
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::diffusion_gemma::parallel::local_geometry(args, &source_layout, owned.units())
                 .map_err(architecture)?;
-        if source_geometry.state_layout() != &complete_state {
+        if source_geometry.state_layout() != Some(&complete_state) {
             return Err(architecture(
                 "shared iterative transform source changed state geometry",
             ));
         }
         let source_partition = crate::diffusion_gemma::parallel::partition(
             args,
-            &source_parameters,
+            retained.clone(),
             &source_layout,
             owned.units(),
             selected.requirements().ownership().clone(),
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        selected
+            .requirements()
+            .validate_binding(&source_partition)
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "transform source changed shared unit addresses",
-            ));
-        }
-        let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+        let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
-            source_geometry,
+            retained.clone(),
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
@@ -246,13 +242,17 @@ where
     let capability_estimate =
         crate::capability::diffusion_gemma(&selected_args).map_err(architecture)?;
     let effective_model_type = "diffusion_gemma".to_owned();
-    let model = crate::diffusion_gemma::model::TextModel::<B>::new_parallel(
+    let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
         selected_args,
-        geometry,
+        definition,
+        &partition,
         context,
     )
     .map_err(architecture)?;
-    validate_partitioned_binding(selected.requirements(), &partition).map_err(architecture)?;
+    selected
+        .requirements()
+        .validate_binding(&partition)
+        .map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,

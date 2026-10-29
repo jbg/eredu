@@ -1668,6 +1668,13 @@ pub enum ArtifactError {
     /// Header/catalog content is contradictory.
     #[error("invalid model artifact: {0}")]
     InvalidArtifact(String),
+    /// A portable preparation mechanism rejected the retained artifact contract.
+    #[error("artifact preparation failed: {source}")]
+    Preparation {
+        /// Original typed policy, ownership, geometry or accounting failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Architecture-owned artifact planning rejected the inspected inputs.
     #[error("invalid architecture artifact plan: {0}")]
     InvalidArchitecturePlan(String),

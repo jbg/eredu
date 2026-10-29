@@ -705,14 +705,20 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
             .checked_add(1)
             .ok_or_else(|| "DeepSeek expert index overflowed".to_string())?,
     };
-    let mut gate_up = bank
-        .gate_up
-        .select_bounded(catalog, expert_selection.clone())
-        .map_err(|error| error.to_string())?;
-    let mut down = bank
-        .down
-        .select_bounded(catalog, expert_selection)
-        .map_err(|error| error.to_string())?;
+    let mut gate_up = eredu_runtime::select_parameter_recipe(
+        catalog,
+        &bank.target_gate_up,
+        &bank.gate_up,
+        Some(std::slice::from_ref(&expert_selection)),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut down = eredu_runtime::select_parameter_recipe(
+        catalog,
+        &bank.target_down,
+        &bank.down,
+        Some(std::slice::from_ref(&expert_selection)),
+    )
+    .map_err(|error| error.to_string())?;
 
     if let Some(intermediate) = intermediate {
         let metadata = gate_up.infer(catalog).map_err(|error| error.to_string())?;
@@ -728,42 +734,35 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
             ));
         }
         let width = fused / 2;
-        gate_up = DerivedWeightRecipe::Concatenate {
-            axis: 1,
-            inputs: vec![
-                gate_up
-                    .clone()
-                    .select_bounded(
-                        catalog,
-                        TensorSelection::Range {
-                            axis: 1,
-                            start: intermediate.start,
-                            end: intermediate.end,
-                        },
-                    )
-                    .map_err(|error| error.to_string())?,
-                gate_up
-                    .select_bounded(
-                        catalog,
-                        TensorSelection::Range {
-                            axis: 1,
-                            start: width + intermediate.start,
-                            end: width + intermediate.end,
-                        },
-                    )
-                    .map_err(|error| error.to_string())?,
-            ],
-        };
-        down = down
-            .select_bounded(
-                catalog,
+        gate_up = eredu_runtime::select_parameter_recipe(
+            catalog,
+            &bank.target_gate_up,
+            &gate_up,
+            Some(&[
                 TensorSelection::Range {
-                    axis: 2,
+                    axis: 1,
                     start: intermediate.start,
                     end: intermediate.end,
                 },
-            )
-            .map_err(|error| error.to_string())?;
+                TensorSelection::Range {
+                    axis: 1,
+                    start: width + intermediate.start,
+                    end: width + intermediate.end,
+                },
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+        down = eredu_runtime::select_parameter_recipe(
+            catalog,
+            &bank.target_down,
+            &down,
+            Some(&[TensorSelection::Range {
+                axis: 2,
+                start: intermediate.start,
+                end: intermediate.end,
+            }]),
+        )
+        .map_err(|error| error.to_string())?;
     }
 
     Ok(ExpertUnitRecipes { gate_up, down })
@@ -877,6 +876,20 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
     let owner_group =
         eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
     let outputs = eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, bank)?;
+    let selected_outputs = outputs
+        .into_iter()
+        .filter(|(target, _)| {
+            [&bank.target_gate_up, &bank.target_down]
+                .into_iter()
+                .any(|base| {
+                    ["", "_scales", "_biases"]
+                        .into_iter()
+                        .any(|suffix| *target == format!("{base}{suffix}"))
+                })
+        })
+        .collect();
+    let outputs = eredu_runtime::ParameterBankRecipes::new(catalog, selected_outputs, experts)
+        .map_err(|error| error.to_string())?;
     for expert in 0..experts {
         let parameters = super::encoded_expert_residency::unit_parameters(
             catalog,

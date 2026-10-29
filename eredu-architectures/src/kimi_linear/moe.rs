@@ -123,30 +123,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("model.layers.{layer}.mlp");
-        let gate_name = format!("{prefix}.gate.weight");
-        let mut routing = TopKGroupSelectionSpec::new(
-            args.num_experts,
-            args.num_experts_per_token,
-            GroupScoring::Sigmoid,
-            args.moe_renormalize,
-        )?;
-        if args.use_grouped_topk {
-            routing = routing.with_groups(args.num_expert_group, args.topk_group)?;
-        }
-        routing = routing.with_weight_policy(1e-20, args.routed_scaling_factor)?;
-        let selector = TopKGroupSelectorSpec::new(
-            args.hidden_size,
-            ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
-            crate::linear_format::standard_linear_format(
-                &gate_name,
-                args.weight_quantization_for(&gate_name).into(),
-            )?,
-            routing,
-        )?
-        .with_correction_bias(
-            ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
-                .map_err(Error::backend)?,
-        )?;
+        let selector = selector_spec(args, layer)?;
         let router = B::top_k_group_selector(selector, context)?;
         let experts = B::grouped_gated_product(spec, context)?;
         Ok(Self {
@@ -164,6 +141,37 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             )?,
         })
     }
+}
+
+pub(crate) fn selector_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<TopKGroupSelectorSpec, Error> {
+    let prefix = format!("model.layers.{layer}.mlp");
+    let gate_name = format!("{prefix}.gate.weight");
+    let mut routing = TopKGroupSelectionSpec::new(
+        args.num_experts,
+        args.num_experts_per_token,
+        GroupScoring::Sigmoid,
+        args.moe_renormalize,
+    )?;
+    if args.use_grouped_topk {
+        routing = routing.with_groups(args.num_expert_group, args.topk_group)?;
+    }
+    routing = routing.with_weight_policy(1e-20, args.routed_scaling_factor)?;
+    TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
+        crate::linear_format::standard_linear_format(
+            &gate_name,
+            args.weight_quantization_for(&gate_name).into(),
+        )?,
+        routing,
+    )?
+    .with_correction_bias(
+        ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
+            .map_err(Error::backend)?,
+    )
 }
 
 /// Returns the architecture-owned routed expert specification for one sparse layer.
@@ -200,17 +208,17 @@ fn expert_bank_spec_with_width(
     )
 }
 
-/// Derives complete expert ownership and rank-local bank geometry from Kimi Linear.
-pub fn expert_realization_plan<B>(
-    architecture: &super::LayeredModel<B>,
+/// Derives expert ownership from normalized policy and optional admitted local geometry.
+/// This operation requires no backend type, native modules or execution context.
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&super::LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
-) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error>
-where
-    B: GroupedNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::BlockwiseAttentionBackend,
-{
-    let args = architecture.args();
+) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
+    args.validate().map_err(Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry.validate_for(args).map_err(Error::backend)?;
+    }
     if !args.has_sparse_moe_layers() {
         return Ok(None);
     }
@@ -235,8 +243,7 @@ where
         {
             continue;
         }
-        let width = architecture
-            .parallel_geometry()
+        let width = geometry
             .and_then(|geometry| geometry.block(layer))
             .map_or(args.moe_intermediate_size, |geometry| {
                 geometry.routed_intermediate
@@ -259,30 +266,13 @@ pub fn replicated_expert_realization_plan(
             "Kimi Linear routed text requires sparse units",
         ));
     }
-    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
-    let owner_group = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
-        .map_err(Error::backend)?;
-    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let unit_specs = (0..layers)
-        .filter(|layer| {
-            args.layer_policy(*layer).map(|policy| policy.feed_forward)
-                == Some(FeedForwardPolicy::SparseMoe)
-        })
-        .map(|layer| {
-            expert_bank_spec_with_width(args, layer, args.moe_intermediate_size)
-                .map(|spec| ((owner_group.clone(), layer), spec))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(
-        global_experts,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
-            0,
-        )
-        .map_err(Error::backend)?,
-        unit_specs,
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(Error::backend)?,
+        0,
     )
-    .map_err(Error::backend)
+    .map_err(Error::backend)?;
+    expert_realization_plan(args, None, topology)?
+        .ok_or_else(|| Error::backend("Kimi Linear routed text requires sparse units"))
 }
 
 /// Per-layer dense-prefix or sparse Kimi feed-forward policy.

@@ -5,40 +5,39 @@ mod observation;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Index,
-    LinearOperator, NormalizationOperator, Parameterized, Tensor,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ParameterProvider,
-    PartitionedLayeredArchitecture, ResidentExpertProvider, RoutedLayeredArchitecture,
-    RuntimeStateComponents, StateLayout,
+    ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ParameterProvider, ResidentExpertProvider, RuntimeStateComponents,
+    StateLayout,
 };
 
-use crate::decoder::static_parallel_parameter_groups;
+use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
+
+use crate::decoder::{DecoderStaticResources, PartitionStaticModules};
 use crate::qwen::ingress::{prepare_input, prepared_semantic_tokens, ProjectedTokenPolicy};
-use crate::qwen::vision::{
-    block_parallel_parameter_groups, VisionBlock, VisionInput, VisionMode, VisionState,
-    VisionStatic,
-};
+use crate::qwen::vision::{VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic};
 use crate::qwen::vl::InputPart;
 use crate::{
     composite_execution::{CompositeArchitecture, PreparedCompositeInput},
     media_plan::QwenInputPartPlan,
 };
 
-use super::{
-    unit_parallel_parameter_groups, Block, ConditionalLocalGeometry, ForwardMode,
-    ParsedHybridConfig, PredictionUnit, Unit,
-};
+use super::{Block, ConditionalLocalGeometry, ForwardMode, ParsedHybridConfig, PredictionUnit};
 
 /// Stable execution-group identity for conditional Qwen vision ingress.
 pub const VISION_EXECUTION_GROUP: &str = "vision";
 
 enum PreparedPart<T> {
-    Text { tokens: T, embeddings: T },
-    Media { tokens: T },
+    Text {
+        tokens: T,
+        embeddings: T,
+        ready: bool,
+    },
+    Media {
+        tokens: T,
+    },
 }
 
 /// Pinned hybrid text and shared-vision modules.
@@ -46,7 +45,7 @@ enum PreparedPart<T> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct ConditionalStaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Hybrid token embedding, final normalization, and vocabulary head.
-    pub text: crate::decoder::StaticModules<B>,
+    pub text: PartitionStaticModules<B>,
     /// Shared Qwen patch, position, and merger modules.
     pub vision: VisionStatic<B>,
     /// Canonical fusion and normalization shared by all prediction depths.
@@ -65,7 +64,7 @@ pub enum ConditionalUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
     Prediction(PredictionUnit<B>),
 }
 
-impl<B, S> RoutedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
+impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -77,10 +76,9 @@ where
     fn routed_sparse_observations(&self) -> bool {
         self.prediction_steps == 0
     }
-    fn forward_unit_observed_with_provider<P, O>(
+    fn execute_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -96,14 +94,13 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.forward_target_observed(
-            group, index, unit, hidden, state, forward, provider, context, observer,
+            address, unit, hidden, state, forward, provider, context, observer,
         )
     }
 
-    fn forward_unit_with_provider<P>(
+    fn execute_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -116,18 +113,19 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
+        let (group, index) = (address.group(), address.index());
         match group {
-            0 => <Self as LayeredArchitecture<B, S>>::forward_unit(
-                self, group, index, unit, hidden, state, forward, context,
+            0 => <Self as eredu_runtime::ComponentEquations<B, S>>::execute(
+                self, address, unit, hidden, state, forward, context,
             ),
-            _ => ConditionalLayeredModel::forward_unit_with_provider(
+            _ => ConditionalKernel::forward_unit_with_provider(
                 self, group, index, unit, hidden, state, forward, provider, context,
             ),
         }
     }
 }
 
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
+impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -139,10 +137,9 @@ where
     fn parallel_routed_sparse_observations(&self) -> bool {
         self.prediction_steps == 0
     }
-    fn forward_unit_parallel_observed_with_provider<P, O>(
+    fn execute_parallel_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -159,14 +156,13 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.forward_target_parallel_observed(
-            group, index, unit, hidden, state, forward, provider, parallel, context, observer,
+            address, unit, hidden, state, forward, provider, parallel, context, observer,
         )
     }
 
-    fn forward_unit_parallel_with_provider<P>(
+    fn execute_parallel_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -180,11 +176,12 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
+        let (group, index) = (address.group(), address.index());
         match group {
-            0 => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
-                self, group, index, unit, hidden, state, forward, parallel, context,
+            0 => <Self as eredu_runtime::ParallelComponentKernel<B, S>>::execute_parallel(
+                self, address, unit, hidden, state, forward, parallel, context,
             ),
-            _ => ConditionalLayeredModel::forward_unit_with_provider_parallel(
+            _ => ConditionalKernel::forward_unit_with_provider_parallel(
                 self, group, index, unit, hidden, state, forward, provider, parallel, context,
             ),
         }
@@ -193,6 +190,8 @@ where
 
 /// Target media input or one embedded prediction request.
 pub enum ConditionalInput<'a, T> {
+    /// Admitted prepared input using the same target/media equations.
+    Prepared(crate::composite_execution::PreparedCompositeInput<'a, T, QwenInputPartPlan>),
     /// Ordered text/media target input.
     Target {
         /// Ordered semantic segments.
@@ -220,26 +219,6 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, ProjectedTokenPolicy::Placeholder(0), context)?.with_parts(
-            |parts, pixels| {
-                let input = ConditionalInput::Target {
-                    parts,
-                    pixels,
-                    mask: None,
-                };
-                <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-                    self, input, state, parallel, context,
-                )
-            },
-        )
-    }
 }
 
 impl<B, S> CompositeArchitecture<B, S> for ConditionalLayeredModel<B>
@@ -250,6 +229,26 @@ where
 {
     fn supports_chunked_text_prefill() -> bool {
         super::CHUNKED_TEXT_PREFILL
+    }
+
+    fn prepared_input<'a>(
+        input: crate::composite_execution::PreparedCompositeInput<
+            'a,
+            B::Tensor,
+            Self::InputPartPlan,
+        >,
+    ) -> Self::Input<'a> {
+        ConditionalInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            ConditionalInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
     }
 
     type InputPartPlan = QwenInputPartPlan;
@@ -266,7 +265,7 @@ where
     type AdmissionConfig = ParsedHybridConfig;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        self.parsed.clone()
+        self.kernel().parsed.clone()
     }
 
     fn admit_prepared_input(
@@ -357,6 +356,7 @@ where
         let patches = i32::try_from(patches)
             .map_err(|_| "conditional Qwen continuation patch count exceeds i32".to_owned())?;
         let width = self
+            .kernel()
             .parsed
             .vision
             .as_ref()
@@ -381,7 +381,7 @@ where
         if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
             return Ok(None);
         }
-        let vision = self.parsed.vision.as_ref().ok_or_else(|| {
+        let vision = self.kernel().parsed.vision.as_ref().ok_or_else(|| {
             "conditional Qwen collective schedule has no vision config".to_owned()
         })?;
         let mut patch_positions = 0_u64;
@@ -440,7 +440,7 @@ where
                     .map_err(|_| "conditional Qwen text positions exceed i32".to_owned())?;
                 ingress_operations.push(
                     crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: vec![batch, positions, self.parsed.text.hidden_size],
+                        shape: vec![batch, positions, self.kernel().parsed.text.hidden_size],
                     },
                 );
             }
@@ -494,6 +494,7 @@ where
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
         let vision_continuation = source_group == 0 && destination_group == 0;
         let vision = self
+            .kernel()
             .parsed
             .vision
             .as_ref()
@@ -510,7 +511,7 @@ where
                 [
                     Dim::Batch,
                     Dim::Sequence,
-                    Dim::Fixed(self.parsed.text.hidden_size),
+                    Dim::Fixed(self.kernel().parsed.text.hidden_size),
                 ],
                 Dtype::Activation,
             )
@@ -530,7 +531,7 @@ where
                     [
                         Dim::Batch,
                         Dim::Sequence,
-                        Dim::Fixed(self.parsed.text.hidden_size),
+                        Dim::Fixed(self.kernel().parsed.text.hidden_size),
                     ],
                     Dtype::Activation,
                 )
@@ -549,10 +550,12 @@ where
         let vision_sequence = *group_sequences.first().ok_or_else(|| {
             Error::backend("conditional Qwen boundary has no vision sequence geometry")
         })?;
-        // Active media carries compact DeepStack features at the projected-media
-        // extent. Text-only execution initializes the same roles from the full
-        // decoder embedding, and the inactive vision group has zero extent.
-        let deepstack_sequence = if vision_sequence > 0 {
+        // Vision edges carry compact media features. Decoder continuations
+        // carry contributions expanded to the declared decoder extent; receiving
+        // owners do not need the original visual mask or input embeddings.
+        let deepstack_sequence = if decoder_continuation {
+            source_sequence
+        } else if vision_sequence > 0 {
             vision_sequence
         } else {
             source_sequence
@@ -629,7 +632,7 @@ where
             let mut values = values.into_iter();
             let hidden = values.next().expect("validated decoder boundary primary");
             let boundary = eredu_runtime::ArchitectureBoundary::decode(
-                &self.pipeline_boundary_schema(),
+                &self.kernel().pipeline_boundary_schema(),
                 values.collect(),
             )
             .map_err(|error| Error::backend(error.to_string()))?;
@@ -664,39 +667,6 @@ where
             forward.vision_output = Some(hidden.clone());
         }
         Ok(Some(hidden))
-    }
-
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        forward.target_hidden()
-    }
-
-    fn prediction_target_placeholder_shape(
-        &self,
-        forward: &Self::ForwardContext,
-    ) -> Result<Option<Vec<i32>>, Self::Error> {
-        Ok(Some(vec![
-            forward.tokens.dim(0),
-            forward.tokens.dim(1),
-            self.parsed.text.hidden_size,
-        ]))
-    }
-
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, ProjectedTokenPolicy::Placeholder(0), context)?.with_parts(
-            |parts, pixels| {
-                let input = ConditionalInput::Target {
-                    parts,
-                    pixels,
-                    mask: None,
-                };
-                <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
-            },
-        )
     }
 }
 
@@ -778,6 +748,23 @@ pub struct ConditionalPipelineBoundarySchema {
 }
 
 impl ConditionalPipelineBoundarySchema {
+    /// Declares the target/DeepStack boundary without constructing native resources.
+    pub fn for_config(parsed: &ParsedHybridConfig) -> Result<Self, Error> {
+        let vision = parsed
+            .vision
+            .as_ref()
+            .ok_or_else(|| Error::backend("conditional Qwen requires vision config"))?;
+        vision
+            .validate_for(VisionMode::WindowScheduled)
+            .map_err(Error::backend)?;
+        let schema = Self {
+            hidden_size: parsed.text.hidden_size,
+            deepstack_count: vision.deepstack_layer_count(),
+        };
+        eredu_runtime::ArchitectureBoundary::wire_schema(&schema).map_err(Error::backend_source)?;
+        Ok(schema)
+    }
+
     /// Returns the expected number of transported DeepStack tensors.
     pub const fn deepstack_count(self) -> usize {
         self.deepstack_count
@@ -892,32 +879,43 @@ impl<T> ConditionalForwardContext<T> {
     }
 }
 
-/// One neutral conditional Qwen3.5 graph.
-pub struct ConditionalLayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+/// Shared execution adapter over conditional Qwen equations and selected pinned resources.
+pub type ConditionalLayeredModel<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    ConditionalKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Conditional Qwen semantic equations, native resource factories and media geometry.
+pub struct ConditionalKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     parsed: ParsedHybridConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     static_modules: ConditionalStaticModules<B>,
-    target_layers: usize,
     prediction_steps: usize,
+    owns_input: bool,
     parallel_geometry: Option<std::sync::Arc<ConditionalLocalGeometry>>,
     partition_state_layout: Option<StateLayout>,
     partition_state_offset: usize,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    eredu_runtime::ArchitectureParameters<B> for ConditionalLayeredModel<B>
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ComponentKernel<B>
+    for ConditionalKernel<B>
 {
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
+    type Input<'a> = ConditionalInput<'a, B::Tensor>;
+    type Unit = ConditionalUnit<B>;
+    type ForwardContext = ConditionalForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
 
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::Error> {
         let target_layers =
             usize::try_from(self.parsed.text.num_hidden_layers).map_err(Error::backend)?;
         let prediction_layers =
@@ -945,14 +943,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         )
         .map_err(Error::backend)
     }
-
-    fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
-    }
-
     fn static_parameter_recipes(
         &self,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -963,87 +953,98 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         let recipes = super::static_recipes(source)?;
         crate::static_parameters::module_recipes(&self.static_modules, recipes)
     }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    fn build_unit(
+        &self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, Error> {
+        self.construct_unit(address, context)
+    }
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        match forward.mode {
+            ForwardMode::Target => group == 1 || (group == 0 && forward.vision_state.is_some()),
+            ForwardMode::Draft(depth) => group == depth + 2,
+        }
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut values = vec![&forward.tokens, &forward.embedded];
+        for part in &forward.parts {
+            match part {
+                PreparedPart::Text {
+                    tokens, embeddings, ..
+                } => values.extend([tokens, embeddings]),
+                PreparedPart::Media { tokens } => values.push(tokens),
+            }
+        }
+        values.extend(forward.mask.iter());
+        values.extend(forward.vision_initial.iter());
+        values.extend(forward.vision_output.iter());
+        values.extend(forward.deepstack.iter());
+        values.extend(forward.visual_mask.iter());
+        values.extend(forward.target_hidden.iter());
+        if let Some(state) = &forward.vision_state {
+            values.extend(state.retained_values());
+        }
+        values.into_iter()
+    }
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward.target_hidden()
+    }
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        Ok(Some(vec![
+            forward.tokens.dim(0),
+            forward.tokens.dim(1),
+            self.parsed.text.hidden_size,
+        ]))
+    }
+}
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::ComponentPinnedResources<B> for ConditionalKernel<B>
+{
+    type Modules = ConditionalStaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
         if let Some(shared) = &self.static_modules.prediction {
             visitor.visit("mtp", shared)?;
         }
-        visitor.visit("vision", &self.static_modules.vision)?;
-        visitor.visit("embedding", &self.static_modules.text.embeddings)?;
-        visitor.visit("norm", &self.static_modules.text.boundary.norm)?;
-        if let Some(head) = &self.static_modules.text.lm_head {
-            visitor.visit("output", head)?;
+        if self.static_modules.vision.has_parameters() {
+            visitor.visit("vision", &self.static_modules.vision)?;
         }
-        Ok(())
+        self.static_modules.text.decoder_resources().visit(visitor)
     }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    fn visit_pinned_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         if let Some(shared) = &mut self.static_modules.prediction {
             visitor.visit_mut("mtp", shared)?;
         }
-        visitor.visit_mut("vision", &mut self.static_modules.vision)?;
-        visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.text.boundary.norm)?;
-        if let Some(head) = &mut self.static_modules.text.lm_head {
-            visitor.visit_mut("output", head)?;
+        if self.static_modules.vision.has_parameters() {
+            visitor.visit_mut("vision", &mut self.static_modules.vision)?;
         }
-        Ok(())
+        self.static_modules
+            .text
+            .decoder_resources_mut()
+            .visit(visitor)
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLayeredModel<B> {
-    #[allow(clippy::too_many_arguments)]
-    fn begin_distributed_partition<S>(
-        &mut self,
-        input: LayeredPartitionInput<'_, B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        _first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ConditionalForwardContext<B::Tensor>>, Error>
-    where
-        S: LayerRuntimeState<B>,
-        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-    {
-        if state.layout() != expected {
-            return Err(Error::backend(
-                "conditional Qwen partition state layout mismatch",
-            ));
-        }
-        let (input, batch, sequence) = match input {
-            LayeredPartitionInput::Tokens(tokens) => (
-                ConditionalPartitionInput::Tokens {
-                    tokens,
-                    offset: state.layer(0).map_err(Error::backend)?.position(),
-                },
-                tokens.dim(0),
-                tokens.dim(1),
-            ),
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => {
-                let batch = hidden.dim(0);
-                let sequence = hidden.dim(1);
-                (
-                    ConditionalPartitionInput::Hidden {
-                        hidden,
-                        boundary: auxiliary,
-                    },
-                    batch,
-                    sequence,
-                )
-            }
-        };
-        let offset = state.layer(0).map_err(Error::backend)?.position();
-        self.begin_routed_target_partition(input, mask, batch, sequence, offset, parallel, context)
-    }
-
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKernel<B> {
     /// Prepares one routed target decoder partition with architecture-owned
     /// shape validation and causal-mask construction.
     #[allow(clippy::too_many_arguments)]
@@ -1121,7 +1122,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.static_modules.text.embeddings.forward(tokens, context)
+        self.lookup_tokens(tokens, None, context)
     }
 
     /// Embeds tokens for an adapter-owned prediction unit with the selected TP layout.
@@ -1140,14 +1141,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => head.forward(hidden, context),
-            None => self
-                .static_modules
-                .text
-                .embeddings
-                .as_linear(hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            false,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     pub(crate) fn project_prediction_instrumented(
@@ -1157,9 +1157,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.static_modules
-            .text
-            .project_instrumented(hidden, parallel, context, instrumentation)
+        self.finish_readout(hidden, false, parallel, context, instrumentation)
     }
 
     /// Projects an already-normalized prediction hidden value through the selected TP head.
@@ -1177,235 +1175,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         &self.parsed
     }
 
-    fn canonical_execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        let mut groups = vec![
-            ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-            ExecutionGroupSpec::with_dependencies(
-                crate::decoder::TARGET_EXECUTION_GROUP,
-                [VISION_EXECUTION_GROUP],
-            ),
-        ];
-        let mut output = "target".to_owned();
-        for depth in 0..self.prediction_steps {
-            let id = format!("mtp.{depth}");
-            groups.push(ExecutionGroupSpec::with_dependencies(
-                id.clone(),
-                [output.clone()],
-            ));
-            output = id;
-        }
-        ExecutionGraph::new(groups, output).map_err(Error::backend)
-    }
-
-    fn canonical_group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self
-                .parsed
-                .vision
-                .as_ref()
-                .expect("validated vision")
-                .layer_count()),
-            1 => Ok(self.target_layers),
-            group if group < self.prediction_steps + 2 => Ok(1),
-            _ => Err(Error::backend(
-                "conditional Qwen3.5 execution group is invalid",
-            )),
-        }
-    }
-
     /// Returns the architecture-owned vision, target, and prediction traversal.
     pub fn unit_layout(&self) -> Result<ExecutionUnitLayout, Error> {
-        let graph = self.canonical_execution_graph()?;
-        let counts = (0..graph.groups().len())
-            .map(|group| self.canonical_group_unit_count(group))
-            .collect::<Result<Vec<_>, _>>()?;
-        ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)
+        Ok(self.definition.parameters().unit_layout().clone())
+    }
+
+    /// Borrows canonical invocation, parameter, transport and state ownership.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Returns the family-owned activation schema transported between stages.
     pub fn pipeline_boundary_schema(&self) -> ConditionalPipelineBoundarySchema {
-        ConditionalPipelineBoundarySchema {
-            hidden_size: self.parsed.text.hidden_size,
-            deepstack_count: self
-                .parsed
-                .vision
-                .as_ref()
-                .expect("validated vision")
-                .deepstack_layer_count(),
-        }
-    }
-
-    /// Describes vision, target, and prediction parameters with explicit
-    /// canonical graph ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = self.canonical_execution_graph()?;
-        let vision = self.parsed.vision.as_ref().expect("validated vision");
-        let layout = self.unit_layout()?;
-        // A partition-local model contains already-local tensor shapes. Keep
-        // parameter authority checkpoint-global so selected TP segments are
-        // validated once instead of being applied again to local modules.
-        let global_static = self.parallel_geometry.is_some().then(|| {
-            Ok::<_, Error>((
-                super::LayeredModel::<B>::new(self.parsed.text.clone(), context)?
-                    .into_static_modules(),
-                VisionStatic::new_with_root(vision.clone(), "model.visual", context)?,
-            ))
-        });
-        let global_static = global_static.transpose()?;
-        let (text_modules, vision_modules) = global_static.as_ref().map_or(
-            (&self.static_modules.text, &self.static_modules.vision),
-            |(text, vision)| (text, vision),
-        );
-        let text_static = static_parallel_parameter_groups::<B>(
-            &text_modules.embeddings,
-            &text_modules.boundary.norm,
-            text_modules.lm_head.as_ref(),
-            "model",
-        )
-        .map_err(Error::backend)?;
-        let vision_static = crate::qwen::vision::owned_static_parallel_parameter_groups::<B>(
-            vision_modules,
-            vision,
-            "model.visual",
-            eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP).map_err(Error::backend)?,
-            "vision",
-        )
-        .map_err(Error::backend)?;
-        let mut expected = text_static
-            .iter()
-            .cloned()
-            .chain(vision_static.iter().map(|owned| owned.group().clone()))
-            .collect::<Vec<_>>();
-        let mut owned = text_static
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                OwnedParameterGroupSpec::new(
-                    if index == 0 {
-                        let mut roles = vec!["embedding", "mtp"];
-                        if self.parsed.text.tie_word_embeddings {
-                            roles.push("output");
-                        }
-                        ParameterGroupOwner::static_any_of(roles)
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
-                    group,
-                )
-            })
-            .chain(vision_static)
-            .collect::<Vec<_>>();
-        if let Some(shared) = &self.static_modules.prediction {
-            let groups =
-                super::parallel::prediction_shared_parameter_groups(shared, self.prediction_steps)
-                    .map_err(Error::backend)?;
-            expected.extend(groups.iter().map(|group| group.group().clone()));
-            owned.extend(groups);
-        }
-        for group_index in 0..layout.group_count() {
-            let group_id = layout
-                .group_id(group_index)
-                .expect("conditional layout group")
-                .clone();
-            let count = layout
-                .group_range(group_index)
-                .expect("conditional layout range")
-                .len();
-            for index in 0..count {
-                let unit = if self.parallel_geometry.is_some() {
-                    match group_index {
-                        0 => ConditionalUnit::Vision(VisionBlock::new_with_root(
-                            vision,
-                            "model.visual",
-                            index,
-                            context,
-                        )?),
-                        1 => {
-                            ConditionalUnit::Target(Block::new(&self.parsed.text, index, context)?)
-                        }
-                        _ => ConditionalUnit::Prediction(PredictionUnit::new(
-                            &self.parsed.text,
-                            group_index - 2,
-                            context,
-                        )?),
-                    }
-                } else {
-                    self.construct_unit(group_index, index, context)?
-                };
-                let groups = match unit {
-                    ConditionalUnit::Vision(block) => {
-                        block_parallel_parameter_groups(&block, vision, "model.visual", index)
-                    }
-                    ConditionalUnit::Target(block) => unit_parallel_parameter_groups(
-                        &Unit::Target(block),
-                        &self.parsed.text,
-                        0,
-                        index,
-                    ),
-                    ConditionalUnit::Prediction(prediction) => unit_parallel_parameter_groups(
-                        &Unit::Prediction(prediction),
-                        &self.parsed.text,
-                        group_index - 1,
-                        index,
-                    ),
-                }
-                .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
+        ConditionalPipelineBoundarySchema::for_config(&self.parsed)
+            .expect("validated conditional definition")
     }
 
     /// Builds the exact configured vision/text/MTP graph.
-    pub fn new(
+    pub fn from_definition(
         parsed: ParsedHybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "Qwen hybrid conditional",
-            crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
-        )?;
-        let vision = parsed
-            .vision
-            .clone()
-            .ok_or_else(|| Error::backend("conditional Qwen3.5 requires vision config"))?;
-        vision
-            .validate_for(VisionMode::WindowScheduled)
-            .map_err(Error::backend)?;
-        let text_model = super::LayeredModel::<B>::new(parsed.text.clone(), context)?;
-        let text = text_model.into_extended_static_modules();
-        let target_layers =
-            usize::try_from(parsed.text.num_hidden_layers).map_err(Error::backend)?;
-        let prediction_steps =
-            usize::try_from(parsed.text.mtp_num_hidden_layers).map_err(Error::backend)?;
-        Ok(Self {
-            parsed,
-            static_modules: ConditionalStaticModules {
-                text: text.base,
-                prediction: text.extension,
-                vision: VisionStatic::new_with_root(vision, "model.visual", context)?,
-            },
-            target_layers,
-            prediction_steps,
-            parallel_geometry: None,
-            partition_state_layout: None,
-            partition_state_offset: 0,
-            expert_realization: None,
-        })
+    ) -> Result<ConditionalLayeredModel<B>, Error> {
+        Self::materialize(parsed, definition, None, None, context)
     }
 
     /// Applies the architecture-owned tensor-parallel token embedding boundary.
@@ -1415,13 +1207,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        B::vocabulary_parallel_lookup(
-            &mut self.static_modules.text.embeddings,
-            tokens,
-            EmbeddingLookupPolicy::Strict,
-            parallel,
-            context,
-        )
+        self.lookup_tokens(tokens, Some(parallel), context)
     }
 
     /// Applies the architecture-owned tensor-parallel output boundary.
@@ -1432,79 +1218,156 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = if normalize {
-            self.static_modules
-                .text
-                .boundary
-                .norm
-                .forward(hidden, context)?
-        } else {
-            hidden.clone()
-        };
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.text.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            normalize,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Builds the conditional graph with planner-derived local modules.
-    pub fn new_parallel(
+    pub fn from_parallel_definition(
         parsed: ParsedHybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: ConditionalLocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<ConditionalLayeredModel<B>, Error> {
+        Self::materialize(parsed, definition, Some(geometry), None, context)
+    }
+
+    /// Materializes exactly the pinned roots and unit factories owned by an authoritative partition.
+    pub fn from_partition(
+        parsed: ParsedHybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: ConditionalLocalGeometry,
+        partition: &eredu_runtime::ArchitecturePartition<
+            super::ConditionalPartitionLocalGeometry,
+            ConditionalPipelineBoundarySchema,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ConditionalLayeredModel<B>, Error> {
+        Self::materialize(parsed, definition, Some(geometry), Some(partition), context)
+    }
+
+    fn materialize(
+        parsed: ParsedHybridConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<ConditionalLocalGeometry>,
+        partition: Option<
+            &eredu_runtime::ArchitecturePartition<
+                super::ConditionalPartitionLocalGeometry,
+                ConditionalPipelineBoundarySchema,
+            >,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ConditionalLayeredModel<B>, Error> {
+        let definition =
+            super::select_conditional_definition(&parsed, definition, geometry.as_ref())?;
+        let ownership = if let Some(partition) = partition {
+            super::ConditionalPartitionLocalFoundation::from_partition(&parsed, partition)
+                .map_err(Error::backend_source)?;
+            partition
+                .local_geometry()
+                .validate_complete_geometry(
+                    &parsed,
+                    geometry.as_ref().ok_or_else(|| {
+                        Error::backend("selected conditional Qwen has no complete geometry")
+                    })?,
+                )
+                .map_err(Error::backend_source)?;
+            Some(definition.select_partition(partition)?)
+        } else {
+            None
+        };
         crate::operator_requirements::require::<B>(
             "Qwen hybrid conditional",
             crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
         )?;
-        geometry.validate_for(&parsed).map_err(Error::backend)?;
-        let vision_config = parsed
-            .vision
-            .clone()
-            .ok_or_else(|| Error::backend("conditional Qwen3.5 requires vision config"))?;
-        vision_config
-            .validate_for(VisionMode::WindowScheduled)
-            .map_err(Error::backend)?;
-        let text_model = super::LayeredModel::<B>::new_parallel(
-            parsed.text.clone(),
-            geometry.text().clone(),
+        if geometry.is_some() {
+            crate::operator_requirements::require::<B>(
+                "Qwen hybrid tensor parallelism",
+                eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+            )?;
+        }
+        let prediction_steps = definition.prediction_groups().len();
+        let text = PartitionStaticModules::<B>::from_selected_spec(
+            super::static_module_spec(&parsed.text),
+            geometry.as_ref().map(|geometry| {
+                (
+                    geometry.text().embedding_range().clone(),
+                    geometry.text().output_range().cloned(),
+                )
+            }),
+            |role| {
+                ownership.as_ref().is_none_or(|selection| {
+                    selection
+                        .owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+                })
+            },
             context,
         )?;
-        let target_layers =
-            usize::try_from(parsed.text.num_hidden_layers).map_err(Error::backend)?;
-        let prediction_steps =
-            usize::try_from(parsed.text.mtp_num_hidden_layers).map_err(Error::backend)?;
-        Ok(Self {
+        let prediction = (prediction_steps > 0)
+            .then(|| super::PredictionShared::new(&parsed.text, context))
+            .transpose()?;
+        let vision = parsed
+            .vision
+            .as_ref()
+            .expect("validated conditional vision")
+            .clone();
+        let selection = match partition {
+            Some(partition) => crate::qwen::vision::VisionStaticSelection::from_parameter_bindings(
+                vision,
+                "model.visual",
+                eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP)
+                    .map_err(Error::backend)?,
+                "vision",
+                partition.parameter_bindings(),
+            ),
+            None => crate::qwen::vision::VisionStaticSelection::all(vision, "model.visual"),
+        }
+        .map_err(Error::backend_source)?;
+        let complete_widths;
+        let widths = match &geometry {
+            Some(geometry) => geometry.merger_widths(),
+            None => {
+                complete_widths = selection
+                    .unsharded_merger_intermediates()
+                    .map_err(Error::backend_source)?;
+                &complete_widths
+            }
+        };
+        let vision = VisionStatic::from_selection(selection, widths, context)?;
+        let selected_state = partition.and_then(|partition| partition.state());
+        let kernel = Self {
             parsed,
-            static_modules: {
-                let text = text_model.into_extended_static_modules();
-                ConditionalStaticModules {
-                    text: text.base,
-                    prediction: text.extension,
-                    vision: VisionStatic::new_parallel_with_root(
-                        vision_config,
-                        "model.visual",
-                        geometry.merger_widths(),
-                        context,
-                    )?,
-                }
+            definition: std::sync::Arc::clone(&definition),
+            static_modules: ConditionalStaticModules {
+                text,
+                vision,
+                prediction,
             },
-            target_layers,
             prediction_steps,
-            parallel_geometry: Some(std::sync::Arc::new(geometry)),
-            partition_state_layout: None,
-            partition_state_offset: 0,
+            owns_input: partition.is_none_or(|partition| partition.ownership().owns_input()),
+            parallel_geometry: geometry.map(std::sync::Arc::new),
+            partition_state_layout: selected_state.map(|state| state.layout().clone()),
+            partition_state_offset: selected_state.map_or(0, |state| state.global_layer_offset()),
             expert_realization: None,
-        })
+        };
+        match partition {
+            Some(partition) => {
+                eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
+                    definition, kernel, partition,
+                )
+            }
+            None => eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel),
+        }
+        .map_err(Error::from)
     }
 
-    /// Restricts execution state to the exact PP-owned target slice while
-    /// retaining the complete TP-local unit construction geometry.
+    /// Restricts a low-level state view independently of parameter ownership.
+    /// Retained parameter ownership is independent of this state view.
     pub fn with_partition_state_layout(
         mut self,
         global_offset: usize,
@@ -1513,6 +1376,30 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         if self.parallel_geometry.is_none() || layout.is_empty() {
             return Err(Error::backend(
                 "conditional Qwen partition state requires parallel geometry and owned units",
+            ));
+        }
+        let end = global_offset
+            .checked_add(layout.len())
+            .ok_or_else(|| Error::backend("conditional Qwen partition state range overflowed"))?;
+        let expected = self
+            .definition
+            .state_layout()
+            .slice(global_offset..end)
+            .map_err(Error::backend)?;
+        if layout != expected {
+            return Err(Error::backend(
+                "conditional Qwen partition state geometry mismatch",
+            ));
+        }
+        if self
+            .partition_state_layout
+            .as_ref()
+            .is_some_and(|retained| {
+                retained != &layout || self.partition_state_offset != global_offset
+            })
+        {
+            return Err(Error::backend(
+                "conditional Qwen partition state selection is incompatible",
             ));
         }
         self.partition_state_layout = Some(layout);
@@ -1530,17 +1417,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         self.prediction_steps
     }
 
-    /// Returns replicated or planner-derived target/MTP state geometry.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(
-                || super::state_layout(&self.parsed.text).map_err(Error::backend),
-                Ok,
-            )
-    }
-
     /// Shares planner-owned local geometry with placed unit factories.
     pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<ConditionalLocalGeometry>> {
         self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
@@ -1554,30 +1430,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         self.expert_realization = Some(realization);
     }
 
-    /// Constructs one canonical vision, target, or prediction unit using this
-    /// model's replicated or planner-derived local geometry.
-    pub fn construct_unit(
+    fn construct_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalUnit<B>, Error> {
-        let count = match group {
-            0 => self
-                .parsed
-                .vision
-                .as_ref()
-                .expect("validated vision")
-                .layer_count(),
-            1 => self.target_layers,
-            group if group < self.prediction_steps + 2 => 1,
-            _ => return Err(Error::backend("conditional Qwen3.5 group is invalid")),
-        };
-        if index >= count {
-            return Err(Error::backend(
-                "conditional Qwen3.5 unit is outside its group",
-            ));
-        }
+        let (group, index) = (address.group(), address.index());
         match group {
             0 => {
                 let vision = self.parsed.vision.as_ref().expect("validated vision");
@@ -1631,9 +1489,216 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         }
     }
 
+    fn begin_request<S>(
+        &mut self,
+        input: ConditionalInput<'_, B::Tensor>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ConditionalForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        if parallel.is_some() && self.parallel_geometry.is_none() {
+            return Err(Error::backend("conditional Qwen3.5 has no local geometry"));
+        }
+        let expected = self
+            .partition_state_layout
+            .as_ref()
+            .unwrap_or_else(|| self.definition.state_layout());
+        if state.layout() != expected {
+            return Err(Error::backend("conditional Qwen3.5 state layout mismatch"));
+        }
+        match input {
+            ConditionalInput::Prepared(input) => {
+                self.begin_prepared(input, state, parallel, context)
+            }
+            ConditionalInput::Draft {
+                tokens,
+                hidden,
+                depth,
+            } => {
+                if depth >= self.prediction_steps {
+                    return Err(Error::backend("conditional Qwen3.5 MTP depth is invalid"));
+                }
+                let embedded = self.lookup_tokens(tokens, parallel, context)?;
+                let state_index = self.state_index(depth + 2, 0)?;
+                let offset = state.layer(state_index).map_err(Error::backend)?.position();
+                let mask = if tokens.dim(1) > 1 {
+                    Some(B::causal_mask(tokens.dim(1), offset, None, context)?)
+                } else {
+                    None
+                };
+                Ok(LayeredForwardState {
+                    hidden: hidden.clone(),
+                    context: ConditionalForwardContext {
+                        tokens: tokens.clone(),
+                        embedded,
+                        mask,
+                        mode: ForwardMode::Draft(depth),
+                        parts: Vec::new(),
+                        vision_state: None,
+                        vision_initial: None,
+                        vision_output: None,
+                        deepstack: Vec::new(),
+                        visual_mask: None,
+                        target_hidden: None,
+                    },
+                })
+            }
+            ConditionalInput::Target {
+                parts,
+                pixels,
+                mask,
+            } => {
+                let (prepared, grids) = self.prepare_parts(parts, parallel, context)?;
+                let has_media = !grids.is_empty();
+                if has_media != pixels.is_some() {
+                    return Err(Error::backend(
+                        "conditional Qwen3.5 pixels and media metadata must appear together",
+                    ));
+                }
+                let offset = state.layer(0).map_err(Error::backend)?.position();
+                if has_media && offset != 0 {
+                    return Err(Error::backend(
+                        "conditional Qwen3.5 media cannot append to populated state",
+                    ));
+                }
+                let (vision_initial, vision_state) = match pixels {
+                    Some(pixels) => {
+                        let (hidden, state) =
+                            self.prepare_vision_request(pixels, &grids, context)?;
+                        (Some(hidden), Some(state))
+                    }
+                    None => (None, None),
+                };
+                let assembled = self.assemble(&prepared, None, context);
+                let sequence = prepared
+                    .iter()
+                    .map(|part| match part {
+                        PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => {
+                            tokens.dim(1)
+                        }
+                    })
+                    .sum::<i32>();
+                let decoder_mask = match mask {
+                    Some(mask) => Some(mask.clone()),
+                    None if sequence > 1 => Some(B::causal_mask(sequence, offset, None, context)?),
+                    None => None,
+                };
+                let (tokens, embedded, error) = match assembled {
+                    Ok(value) => (Some(value.token_ids), Some(value.embeddings), None),
+                    Err(error) => (None, None, Some(error)),
+                };
+                let hidden = match vision_initial
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| embedded.clone())
+                {
+                    Some(hidden) => hidden,
+                    None if !self.owns_input => B::Tensor::full_f32(
+                        0.0,
+                        &[
+                            hidden_token_placeholder(&prepared).dim(0),
+                            sequence,
+                            self.parsed.text.hidden_size,
+                        ],
+                        context,
+                    )?,
+                    None => {
+                        return Err(
+                            error.unwrap_or_else(|| Error::backend("empty conditional input"))
+                        )
+                    }
+                };
+                let embedded = embedded.unwrap_or_else(|| hidden_embedding_placeholder(&prepared));
+                let deepstack = (0..self
+                    .parsed
+                    .vision
+                    .as_ref()
+                    .expect("validated conditional vision")
+                    .deepstack_layers()
+                    .len())
+                    .map(|_| embedded.zeros_like(context))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(LayeredForwardState {
+                    hidden,
+                    context: ConditionalForwardContext {
+                        tokens: tokens.unwrap_or_else(|| hidden_token_placeholder(&prepared)),
+                        embedded,
+                        mask: decoder_mask,
+                        mode: ForwardMode::Target,
+                        parts: prepared,
+                        vision_state,
+                        vision_initial,
+                        vision_output: None,
+                        deepstack,
+                        visual_mask: None,
+                        target_hidden: None,
+                    },
+                })
+            }
+        }
+    }
+
+    fn lookup_tokens(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let embedding = self
+            .static_modules
+            .text
+            .embeddings
+            .as_mut()
+            .ok_or_else(|| {
+                Error::backend("conditional Qwen does not own token embedding parameters")
+            })?;
+        match parallel {
+            Some(parallel) => B::vocabulary_parallel_lookup(
+                embedding,
+                tokens,
+                EmbeddingLookupPolicy::Strict,
+                parallel,
+                context,
+            ),
+            None => embedding.forward(tokens, context),
+        }
+    }
+
+    fn prepare_vision_request(
+        &mut self,
+        pixels: &B::Tensor,
+        grids: &[(i32, i32, i32)],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
+        if self.static_modules.vision.owns_ingress() {
+            return self.static_modules.vision.begin(
+                VisionInput {
+                    pixels,
+                    grid: grids,
+                },
+                context,
+            );
+        }
+        let config = self.parsed.vision.as_ref().expect("validated vision");
+        eredu_nn::sequence_layout::validate_patch_grid(
+            grids,
+            config.spatial_merge_size,
+            Some(pixels.dim(0)),
+        )
+        .map_err(Error::backend)?;
+        let state = self.static_modules.vision.prepare_state(grids, context)?;
+        let hidden = B::Tensor::full_f32(0.0, &[pixels.dim(0), config.hidden_size], context)?;
+        Ok((hidden, state))
+    }
+
     fn prepare_parts(
         &mut self,
         parts: &[InputPart<'_, B::Tensor>],
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(Vec<PreparedPart<B::Tensor>>, Vec<(i32, i32, i32)>), Error> {
         if parts.is_empty() {
@@ -1645,11 +1710,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             .map(|part| match part {
                 InputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
-                    embeddings: self
-                        .static_modules
-                        .text
-                        .embeddings
-                        .forward(tokens, context)?,
+                    embeddings: if self.owns_input {
+                        self.lookup_tokens(tokens, parallel, context)?
+                    } else {
+                        B::Tensor::full_f32(
+                            0.0,
+                            &[tokens.dim(0), tokens.dim(1), self.parsed.text.hidden_size],
+                            context,
+                        )?
+                    },
+                    ready: self.owns_input,
                 }),
                 InputPart::Projected { tokens, embeddings } => {
                     if embeddings.shape()
@@ -1662,53 +1732,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
                     Ok(PreparedPart::Text {
                         tokens: (*tokens).clone(),
                         embeddings: (*embeddings).clone(),
-                    })
-                }
-                InputPart::Image { tokens, grid } | InputPart::Video { tokens, grid } => {
-                    grids.extend_from_slice(grid);
-                    Ok(PreparedPart::Media {
-                        tokens: (*tokens).clone(),
-                    })
-                }
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        Ok((prepared, grids))
-    }
-
-    fn prepare_parts_parallel(
-        &mut self,
-        parts: &[InputPart<'_, B::Tensor>],
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(Vec<PreparedPart<B::Tensor>>, Vec<(i32, i32, i32)>), Error> {
-        if parts.is_empty() {
-            return Err(Error::backend("conditional Qwen3.5 input has no parts"));
-        }
-        let mut grids = Vec::new();
-        let prepared = parts
-            .iter()
-            .map(|part| match part {
-                InputPart::Text(tokens) => Ok(PreparedPart::Text {
-                    tokens: (*tokens).clone(),
-                    embeddings: B::vocabulary_parallel_lookup(
-                        &mut self.static_modules.text.embeddings,
-                        tokens,
-                        EmbeddingLookupPolicy::Strict,
-                        parallel,
-                        context,
-                    )?,
-                }),
-                InputPart::Projected { tokens, embeddings } => {
-                    if embeddings.shape()
-                        != [tokens.dim(0), tokens.dim(1), self.parsed.text.hidden_size]
-                    {
-                        return Err(Error::backend(
-                            "conditional Qwen3.5 projected input geometry mismatch",
-                        ));
-                    }
-                    Ok(PreparedPart::Text {
-                        tokens: (*tokens).clone(),
-                        embeddings: (*embeddings).clone(),
+                        ready: true,
                     })
                 }
                 InputPart::Image { tokens, grid } | InputPart::Video { tokens, grid } => {
@@ -1751,8 +1775,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         for part in parts {
             match part {
                 PreparedPart::Text {
-                    embeddings: value, ..
-                } => embeddings.push(value.clone()),
+                    embeddings: value,
+                    ready,
+                    ..
+                } => {
+                    if !ready {
+                        return Err(Error::backend(
+                            "conditional Qwen text embeddings await their input owner",
+                        ));
+                    }
+                    embeddings.push(value.clone());
+                }
                 PreparedPart::Media { tokens } => {
                     let length = tokens.dim(1);
                     embeddings.push(vision.expect("validated vision output").index(
@@ -1781,18 +1814,28 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
     }
 
     fn state_index(&self, group: usize, index: usize) -> Result<usize, Error> {
-        let global = if group == 1 {
-            index
-        } else if group >= 2 && group < self.prediction_steps + 2 && index == 0 {
-            self.target_layers + group - 2
-        } else {
+        let state = &self.definition.unit(group, index)?.state;
+        if state.len() != 1 {
             return Err(Error::backend(
-                "conditional Qwen3.5 state address is invalid",
+                "conditional Qwen unit has no mutable text state",
             ));
-        };
-        global
+        }
+        let local = state
+            .start
             .checked_sub(self.partition_state_offset)
-            .ok_or_else(|| Error::backend("conditional Qwen state precedes its selected PP offset"))
+            .ok_or_else(|| {
+                Error::backend("conditional Qwen state precedes its selected PP offset")
+            })?;
+        if self
+            .partition_state_layout
+            .as_ref()
+            .is_some_and(|layout| local >= layout.len())
+        {
+            return Err(Error::backend(
+                "conditional Qwen state follows its selected PP range",
+            ));
+        }
+        Ok(local)
     }
 
     /// Starts one pipeline target request before any placed vision block runs.
@@ -1829,10 +1872,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ConditionalPipelineVisionState<B::Tensor>, Error> {
-        let (parts, grids) = match parallel {
-            Some(parallel) => self.prepare_parts_parallel(parts, parallel, context)?,
-            None => self.prepare_parts(parts, context)?,
-        };
+        let (parts, grids) = self.prepare_parts(parts, parallel, context)?;
         let has_media = !grids.is_empty();
         if has_media != pixels.is_some() {
             return Err(Error::backend(
@@ -1846,13 +1886,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         }
         let (vision_initial, vision) = match pixels {
             Some(pixels) => {
-                let (hidden, state) = self.static_modules.vision.begin(
-                    VisionInput {
-                        pixels,
-                        grid: &grids,
-                    },
-                    context,
-                )?;
+                let (hidden, state) = self.prepare_vision_request(pixels, &grids, context)?;
                 (Some(hidden), Some(state))
             }
             None => (None, None),
@@ -1896,7 +1930,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         values.extend(state.mask.iter().cloned());
         for part in &state.parts {
             match part {
-                PreparedPart::Text { tokens, embeddings } => {
+                PreparedPart::Text {
+                    tokens, embeddings, ..
+                } => {
                     values.extend([tokens.clone(), embeddings.clone()]);
                 }
                 PreparedPart::Media { tokens } => values.push(tokens.clone()),
@@ -1927,7 +1963,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         }
         for part in &mut state.parts {
             match part {
-                PreparedPart::Text { tokens, embeddings } => {
+                PreparedPart::Text {
+                    tokens,
+                    embeddings,
+                    ready,
+                } => {
+                    *ready = true;
                     *tokens = values.next().expect("validated tokens");
                     *embeddings = values.next().expect("validated embeddings");
                 }
@@ -2066,26 +2107,35 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         })
     }
 
+    fn finish_readout(
+        &mut self,
+        hidden: &B::Tensor,
+        normalize: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let resources = self.static_modules.text.decoder_resources_mut();
+        if normalize {
+            resources.finish_parallel(hidden, parallel, context, instrumentation)
+        } else {
+            resources.project(hidden, parallel, context, instrumentation)
+        }
+    }
+
     /// Applies the conditional target normalization and vocabulary projection.
     pub fn finish_pipeline_logits(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self
-            .static_modules
-            .text
-            .boundary
-            .norm
-            .forward(hidden, context)?;
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => head.forward(&hidden, context),
-            None => self
-                .static_modules
-                .text
-                .embeddings
-                .as_linear(&hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            true,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Executes one text unit through a runtime-owned routed-expert provider.
@@ -2140,6 +2190,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         )
     }
 
+    fn deepstack_contribution(
+        hidden: &B::Tensor,
+        features: &B::Tensor,
+        visual_mask: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if features.shape() == hidden.shape() {
+            return Ok(features.clone());
+        }
+        let mask = visual_mask.ok_or_else(|| Error::backend("missing conditional visual mask"))?;
+        let source = features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
+        hidden
+            .zeros_like(context)?
+            .masked_scatter(mask, &source, context)
+    }
+
     /// Adds the exact prepared vision contribution at its target-layer boundary.
     /// The disabled path uses the same borrowed feature value as ordinary execution.
     fn add_deepstack(
@@ -2155,26 +2221,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             return Ok(output);
         };
         instrumentation.observe("deepstack.input", &output)?;
-        let output = if features.shape() == output.shape() {
-            if instrumentation.enabled() {
-                let contribution = instrumentation.apply("deepstack.output", features.clone())?;
-                output.add(&contribution, context)?
-            } else {
-                output.add(features, context)?
-            }
-        } else {
-            let source = features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
-            let contribution = output.zeros_like(context)?.masked_scatter(
-                forward
-                    .visual_mask
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("missing conditional visual mask"))?,
-                &source,
-                context,
-            )?;
-            let contribution = instrumentation.apply("deepstack.output", contribution)?;
-            output.add(&contribution, context)?
-        };
+        let contribution =
+            Self::deepstack_contribution(&output, features, forward.visual_mask.as_ref(), context)?;
+        let contribution = instrumentation.apply("deepstack.output", contribution)?;
+        let output = output.add(&contribution, context)?;
         instrumentation.apply("deepstack.residual", output)
     }
 
@@ -2238,7 +2288,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
     }
 }
 
-impl<B, S> LayeredArchitecture<B, S> for ConditionalLayeredModel<B>
+impl<B, S> eredu_runtime::ComponentEquations<B, S> for ConditionalKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -2248,10 +2298,9 @@ where
         let target = self.prediction_steps == 0;
         eredu_runtime::inspection::ObservationHookSupport::internal(target, target, target)
     }
-    fn forward_unit_observed<O>(
+    fn execute_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -2263,8 +2312,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.forward_target_observed(
-            group,
-            index,
+            address,
             unit,
             hidden,
             state,
@@ -2274,7 +2322,7 @@ where
             observer,
         )
     }
-    fn finish_forward_observed<O>(
+    fn finish_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -2288,72 +2336,8 @@ where
         if matches!(forward.mode, ForwardMode::Target) {
             self.finish_target_observed(hidden, None, context, observer)
         } else {
-            self.finish_forward(hidden, state, forward, context)
+            self.finish(hidden, state, forward, context)
         }
-    }
-
-    type Input<'a> = ConditionalInput<'a, B::Tensor>;
-    type StaticModules = ConditionalStaticModules<B>;
-    type Unit = ConditionalUnit<B>;
-    type ForwardContext = ConditionalForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        match group {
-            0 => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            },
-            1 => crate::transport::decoder(),
-            _ => conditional_prediction_group_transport(group),
-        }
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
-    }
-
-    fn prediction_execution_groups(&self) -> Vec<String> {
-        (0..self.prediction_steps)
-            .map(|depth| format!("mtp.{depth}"))
-            .collect()
-    }
-
-    fn state_partition_plan(
-        &self,
-        layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(1, self.target_layers, layout)
-    }
-
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        self.canonical_execution_graph()
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.canonical_group_unit_count(group)
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend(
-                "conditional Qwen3.5 unit is outside its group",
-            ));
-        }
-        Ok(match group {
-            0 => format!("model.visual.blocks.{index}"),
-            1 => format!("model.layers.{index}"),
-            _ => format!("mtp.layers.{}", group - 2),
-        })
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
@@ -2364,169 +2348,16 @@ where
         Ok((group == 0).then(|| eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()))
     }
 
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.construct_unit(group, index, context)
-    }
-
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let complete;
-        let expected = match (
-            self.partition_state_layout.as_ref(),
-            self.parallel_geometry.as_ref(),
-        ) {
-            (Some(layout), _) => layout,
-            (None, Some(geometry)) => geometry.state_layout(),
-            (None, None) => {
-                complete = super::state_layout(&self.parsed.text).map_err(Error::backend)?;
-                &complete
-            }
-        };
-        if state.layout() != expected {
-            return Err(Error::backend("conditional Qwen3.5 state layout mismatch"));
-        }
-        match input {
-            ConditionalInput::Draft {
-                tokens,
-                hidden,
-                depth,
-            } => {
-                if depth >= self.prediction_steps {
-                    return Err(Error::backend("conditional Qwen3.5 MTP depth is invalid"));
-                }
-                let embedded = self
-                    .static_modules
-                    .text
-                    .embeddings
-                    .forward(tokens, context)?;
-                let state_index = self.target_layers + depth;
-                let offset = state.layer(state_index).map_err(Error::backend)?.position();
-                let mask = if tokens.dim(1) > 1 {
-                    Some(B::causal_mask(tokens.dim(1), offset, None, context)?)
-                } else {
-                    None
-                };
-                Ok(LayeredForwardState {
-                    hidden: hidden.clone(),
-                    context: ConditionalForwardContext {
-                        tokens: tokens.clone(),
-                        embedded,
-                        mask,
-                        mode: ForwardMode::Draft(depth),
-                        parts: Vec::new(),
-                        vision_state: None,
-                        vision_initial: None,
-                        vision_output: None,
-                        deepstack: Vec::new(),
-                        visual_mask: None,
-                        target_hidden: None,
-                    },
-                })
-            }
-            ConditionalInput::Target {
-                parts,
-                pixels,
-                mask,
-            } => {
-                let (prepared, grids) = self.prepare_parts(parts, context)?;
-                let has_media = !grids.is_empty();
-                if has_media != pixels.is_some() {
-                    return Err(Error::backend(
-                        "conditional Qwen3.5 pixels and media metadata must appear together",
-                    ));
-                }
-                let offset = state.layer(0).map_err(Error::backend)?.position();
-                if has_media && offset != 0 {
-                    return Err(Error::backend(
-                        "conditional Qwen3.5 media cannot append to populated state",
-                    ));
-                }
-                let (vision_initial, vision_state) = match pixels {
-                    Some(pixels) => {
-                        let (hidden, state) = self.static_modules.vision.begin(
-                            VisionInput {
-                                pixels,
-                                grid: &grids,
-                            },
-                            context,
-                        )?;
-                        (Some(hidden), Some(state))
-                    }
-                    None => (None, None),
-                };
-                let assembled = self.assemble(&prepared, None, context);
-                let sequence = prepared
-                    .iter()
-                    .map(|part| match part {
-                        PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => {
-                            tokens.dim(1)
-                        }
-                    })
-                    .sum::<i32>();
-                let decoder_mask = match mask {
-                    Some(mask) => Some(mask.clone()),
-                    None if sequence > 1 => Some(B::causal_mask(sequence, offset, None, context)?),
-                    None => None,
-                };
-                let (tokens, embedded, error) = match assembled {
-                    Ok(value) => (Some(value.token_ids), Some(value.embeddings), None),
-                    Err(error) => (None, None, Some(error)),
-                };
-                let hidden = vision_initial
-                    .as_ref()
-                    .cloned()
-                    .or_else(|| embedded.clone())
-                    .ok_or_else(|| {
-                        error.unwrap_or_else(|| Error::backend("empty conditional input"))
-                    })?;
-                let embedded = embedded.unwrap_or_else(|| hidden_embedding_placeholder(&prepared));
-                let deepstack = (0..self
-                    .parsed
-                    .vision
-                    .as_ref()
-                    .expect("validated conditional vision")
-                    .deepstack_layers()
-                    .len())
-                    .map(|_| embedded.zeros_like(context))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(LayeredForwardState {
-                    hidden,
-                    context: ConditionalForwardContext {
-                        tokens: tokens.unwrap_or_else(|| hidden_token_placeholder(&prepared)),
-                        embedded,
-                        mask: decoder_mask,
-                        mode: ForwardMode::Target,
-                        parts: prepared,
-                        vision_state,
-                        vision_initial,
-                        vision_output: None,
-                        deepstack,
-                        visual_mask: None,
-                        target_hidden: None,
-                    },
-                })
-            }
-        }
+        self.begin_request(input, state, None, context)
     }
 
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
@@ -2564,31 +2395,16 @@ where
         }
     }
 
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        match forward.mode {
-            ForwardMode::Target => group == 1 || (group == 0 && forward.vision_state.is_some()),
-            ForwardMode::Draft(depth) => group == depth + 2,
-        }
-    }
-
-    fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
-        match group {
-            0 => 0,
-            1 => index,
-            _ => self.target_layers + group - 2,
-        }
-    }
-
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        let (group, index) = (address.group(), address.index());
         if group == 0 {
             let ConditionalUnit::Vision(block) = unit else {
                 return Err(Error::backend("conditional vision unit/group mismatch"));
@@ -2617,7 +2433,7 @@ where
         }
     }
 
-    fn complete_execution_group(
+    fn complete_group(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -2646,14 +2462,14 @@ where
         true
     }
 
-    fn finish_text_forward(
+    fn finish_text(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.finish_forward(
+        self.finish(
             &crate::decoder::final_hidden_position(hidden, context)?,
             state,
             forward,
@@ -2661,63 +2477,24 @@ where
         )
     }
 
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = match forward.mode {
-            ForwardMode::Target => self
-                .static_modules
-                .text
-                .boundary
-                .norm
-                .forward(hidden, context)?,
-            ForwardMode::Draft(_) => hidden.clone(),
-        };
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => head.forward(&hidden, context),
-            None => self
-                .static_modules
-                .text
-                .embeddings
-                .as_linear(&hidden, context),
-        }
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut values = vec![&forward.tokens, &forward.embedded];
-        values.extend(forward.mask.iter());
-        values.extend(forward.vision_initial.iter());
-        values.extend(forward.vision_output.iter());
-        values.extend(forward.deepstack.iter());
-        values.extend(forward.visual_mask.iter());
-        values.extend(forward.target_hidden.iter());
-        if let Some(state) = &forward.vision_state {
-            values.extend(state.retained_values());
-        }
-        values.into_iter()
+        self.finish_readout(
+            hidden,
+            matches!(forward.mode, ForwardMode::Target),
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
-fn conditional_prediction_group_transport(
-    group: usize,
-) -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = crate::transport::prediction();
-    if group == 2 {
-        transport.first_owner_static_roles.push("mtp".into());
-    }
-    transport
-}
-
-impl<B, S> ParallelLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
+impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -2727,10 +2504,9 @@ where
         let target = self.prediction_steps == 0;
         eredu_runtime::inspection::ObservationHookSupport::internal(target, target, target)
     }
-    fn forward_unit_parallel_observed<O>(
+    fn execute_parallel_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -2743,8 +2519,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.forward_target_parallel_observed(
-            group,
-            index,
+            address,
             unit,
             hidden,
             state,
@@ -2755,7 +2530,7 @@ where
             observer,
         )
     }
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -2770,158 +2545,23 @@ where
         if matches!(forward.mode, ForwardMode::Target) {
             self.finish_target_observed(hidden, Some(parallel), context, observer)
         } else {
-            self.finish_forward_parallel(hidden, state, forward, parallel, context)
+            self.finish_parallel(hidden, state, forward, parallel, context)
         }
     }
 
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = self.partition_state_layout.as_ref().unwrap_or_else(|| {
-            self.parallel_geometry
-                .as_ref()
-                .expect("parallel conditional Qwen has local geometry")
-                .state_layout()
-        });
-        if state.layout() != expected {
-            return Err(Error::backend(
-                "conditional Qwen3.5 rank-local state layout mismatch",
-            ));
-        }
-        match input {
-            ConditionalInput::Draft {
-                tokens,
-                hidden,
-                depth,
-            } => {
-                if depth >= self.prediction_steps {
-                    return Err(Error::backend("conditional Qwen3.5 MTP depth is invalid"));
-                }
-                let embedded = B::vocabulary_parallel_lookup(
-                    &mut self.static_modules.text.embeddings,
-                    tokens,
-                    EmbeddingLookupPolicy::Strict,
-                    parallel,
-                    context,
-                )?;
-                let state_index = self.target_layers + depth;
-                let offset = state.layer(state_index).map_err(Error::backend)?.position();
-                let mask = if tokens.dim(1) > 1 {
-                    Some(B::causal_mask(tokens.dim(1), offset, None, context)?)
-                } else {
-                    None
-                };
-                Ok(LayeredForwardState {
-                    hidden: hidden.clone(),
-                    context: ConditionalForwardContext {
-                        tokens: tokens.clone(),
-                        embedded,
-                        mask,
-                        mode: ForwardMode::Draft(depth),
-                        parts: Vec::new(),
-                        vision_state: None,
-                        vision_initial: None,
-                        vision_output: None,
-                        deepstack: Vec::new(),
-                        visual_mask: None,
-                        target_hidden: None,
-                    },
-                })
-            }
-            ConditionalInput::Target {
-                parts,
-                pixels,
-                mask,
-            } => {
-                let (prepared, grids) = self.prepare_parts_parallel(parts, parallel, context)?;
-                let has_media = !grids.is_empty();
-                if has_media != pixels.is_some() {
-                    return Err(Error::backend(
-                        "conditional Qwen3.5 pixels and media metadata must appear together",
-                    ));
-                }
-                let offset = state.layer(0).map_err(Error::backend)?.position();
-                if has_media && offset != 0 {
-                    return Err(Error::backend(
-                        "conditional Qwen3.5 media cannot append to populated state",
-                    ));
-                }
-                let (vision_initial, vision_state) = match pixels {
-                    Some(pixels) => {
-                        let (hidden, state) = self.static_modules.vision.begin(
-                            VisionInput {
-                                pixels,
-                                grid: &grids,
-                            },
-                            context,
-                        )?;
-                        (Some(hidden), Some(state))
-                    }
-                    None => (None, None),
-                };
-                let assembled = self.assemble(&prepared, None, context);
-                let sequence = prepared
-                    .iter()
-                    .map(|part| match part {
-                        PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => {
-                            tokens.dim(1)
-                        }
-                    })
-                    .sum::<i32>();
-                let decoder_mask = match mask {
-                    Some(mask) => Some(mask.clone()),
-                    None if sequence > 1 => Some(B::causal_mask(sequence, offset, None, context)?),
-                    None => None,
-                };
-                let (tokens, embedded, error) = match assembled {
-                    Ok(value) => (Some(value.token_ids), Some(value.embeddings), None),
-                    Err(error) => (None, None, Some(error)),
-                };
-                let hidden = vision_initial
-                    .as_ref()
-                    .cloned()
-                    .or_else(|| embedded.clone())
-                    .ok_or_else(|| {
-                        error.unwrap_or_else(|| Error::backend("empty conditional input"))
-                    })?;
-                let embedded = embedded.unwrap_or_else(|| hidden_embedding_placeholder(&prepared));
-                let deepstack = (0..self
-                    .parsed
-                    .vision
-                    .as_ref()
-                    .expect("validated conditional vision")
-                    .deepstack_layers()
-                    .len())
-                    .map(|_| embedded.zeros_like(context))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(LayeredForwardState {
-                    hidden,
-                    context: ConditionalForwardContext {
-                        tokens: tokens.unwrap_or_else(|| hidden_token_placeholder(&prepared)),
-                        embedded,
-                        mask: decoder_mask,
-                        mode: ForwardMode::Target,
-                        parts: prepared,
-                        vision_state,
-                        vision_initial,
-                        vision_output: None,
-                        deepstack,
-                        visual_mask: None,
-                        target_hidden: None,
-                    },
-                })
-            }
-        }
+        self.begin_request(input, state, Some(parallel), context)
     }
 
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -2929,6 +2569,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        let (group, index) = (address.group(), address.index());
         if group == 0 {
             let ConditionalUnit::Vision(block) = unit else {
                 return Err(Error::backend("conditional vision unit/group mismatch"));
@@ -2959,7 +2600,7 @@ where
         }
     }
 
-    fn complete_execution_group_parallel(
+    fn complete_group_parallel(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -2987,7 +2628,7 @@ where
         Ok(hidden.clone())
     }
 
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -2998,28 +2639,17 @@ where
         if self.parallel_geometry.is_none() {
             return Err(Error::backend("conditional Qwen3.5 has no local geometry"));
         }
-        let hidden = match forward.mode {
-            ForwardMode::Target => self
-                .static_modules
-                .text
-                .boundary
-                .norm
-                .forward(hidden, context)?,
-            ForwardMode::Draft(_) => hidden.clone(),
-        };
-        match &mut self.static_modules.text.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.text.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            matches!(forward.mode, ForwardMode::Target),
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
-impl<B, S> PartitionedLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
+impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -3049,10 +2679,10 @@ where
             return self.finish_partition(hidden, state, forward, false, parallel, context);
         }
         let output = match parallel {
-            Some(parallel) => self.finish_forward_parallel_observed(
-                hidden, state, forward, parallel, context, observer,
-            )?,
-            None => self.finish_forward_observed(hidden, state, forward, context, observer)?,
+            Some(parallel) => {
+                self.finish_parallel_observed(hidden, state, forward, parallel, context, observer)?
+            }
+            None => self.finish_observed(hidden, state, forward, context, observer)?,
         };
         Ok(LayeredPartitionOutput::Final {
             output,
@@ -3066,44 +2696,44 @@ where
         Ok(self.pipeline_boundary_schema())
     }
 
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.begin_distributed_partition(
+        let (input, batch, sequence) = match input {
+            LayeredPartitionInput::Tokens(tokens) => (
+                ConditionalPartitionInput::Tokens {
+                    tokens,
+                    offset: state.layer(0).map_err(Error::backend)?.position(),
+                },
+                tokens.dim(0),
+                tokens.dim(1),
+            ),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => {
+                let batch = hidden.dim(0);
+                let sequence = hidden.dim(1);
+                (
+                    ConditionalPartitionInput::Hidden {
+                        hidden,
+                        boundary: auxiliary,
+                    },
+                    batch,
+                    sequence,
+                )
+            }
+        };
+        let offset = state.layer(0).map_err(Error::backend)?.position();
+        self.begin_routed_target_partition(
             input,
             mask,
-            state,
-            expected,
-            first_state_ordinal,
-            None,
-            context,
-        )
-    }
-
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, ConditionalPipelineBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.begin_distributed_partition(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            Some(parallel),
-            context,
+            batch,
+            sequence,
+            offset,
+            selected.parallel,
+            selected.native,
         )
     }
 
@@ -3134,9 +2764,9 @@ where
         if owns_output {
             let output = match parallel {
                 Some(parallel) => {
-                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                    self.finish_parallel(hidden, state, forward, parallel, context)?
                 }
-                None => self.finish_forward(hidden, state, forward, context)?,
+                None => self.finish(hidden, state, forward, context)?,
             };
             Ok(LayeredPartitionOutput::Final {
                 output,
@@ -3146,7 +2776,18 @@ where
             Ok(LayeredPartitionOutput::Boundary {
                 hidden: hidden.clone(),
                 auxiliary: ConditionalPipelineBoundary {
-                    deepstack: forward.deepstack.clone(),
+                    deepstack: forward
+                        .deepstack
+                        .iter()
+                        .map(|features| {
+                            Self::deepstack_contribution(
+                                hidden,
+                                features,
+                                forward.visual_mask.as_ref(),
+                                context,
+                            )
+                        })
+                        .collect::<Result<_, _>>()?,
                 },
             })
         }
@@ -3167,4 +2808,29 @@ fn hidden_embedding_placeholder<T: Clone>(parts: &[PreparedPart<T>]) -> T {
             PreparedPart::Media { .. } => None,
         })
         .unwrap_or_else(|| hidden_token_placeholder(parts))
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKernel<B> {
+    fn begin_prepared<'a, S>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, QwenInputPartPlan>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ConditionalForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        prepare_input(input, ProjectedTokenPolicy::Placeholder(0), context)?.with_parts(
+            |parts, pixels| {
+                let input = ConditionalInput::Target {
+                    parts,
+                    pixels,
+                    mask: None,
+                };
+                self.begin_request(input, state, parallel, context)
+            },
+        )
+    }
 }

@@ -1,6 +1,6 @@
 //! Dense-only layered models for architecture-owned replicated text dispatch.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
@@ -9,17 +9,13 @@ use eredu_nn::{
     CompressedAttentionView, Error, NeuralBackend, Parameterized, Tensor,
 };
 use eredu_runtime::{
-    module_parameter_group, ArchitectureParameterDescription, ExecutionUnitLayout,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, MemberSharding,
-    ModelStateIdentity, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterRole,
-    ReplicatedTextArchitecture, RuntimeLayerState, RuntimeStateComponents, StateError, StateLayout,
-    StaticParameterVisitor, StaticParameterVisitorMut,
+    ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel,
+    ComponentPinnedResources, ExecutionUnitAddress, KernelParameterModules, LayerRuntimeState,
+    LayeredForwardState, ModelStateIdentity, RuntimeLayerState, RuntimeStateComponents, StateError,
+    StateLayout, StaticParameterVisitor, StaticParameterVisitorMut, TextComponentKernel,
 };
 
-use crate::{
-    decoder::{LayeredInput, StaticModuleSpec, StaticModules, TARGET_EXECUTION_GROUP},
-    hybrid_decoder::HybridDecoder,
-};
+use crate::decoder::{DecoderStaticResources, LayeredInput, StaticModuleSpec, StaticModules};
 
 pub(crate) struct ReplicatedForwardContext<T> {
     pub(crate) mask: Option<T>,
@@ -29,13 +25,12 @@ pub(crate) struct ReplicatedForwardContext<T> {
 pub(crate) trait FixedReplicatedFamily<B: NeuralBackend>: 'static {
     /// Validated equivalence of consecutive causal prefix passes.
     const CHUNKED_PREFILL: bool = false;
-    type Config: Clone;
+    type Config: Clone + 'static;
     type Unit: Parameterized<B::Tensor>;
 
     fn validate(config: &Self::Config) -> Result<(), Error>;
-    fn layer_count(config: &Self::Config) -> Result<usize, Error>;
+    fn definition(config: &Self::Config) -> Result<ComponentDefinition, Error>;
     fn static_spec(config: &Self::Config) -> StaticModuleSpec;
-    fn state_layout(config: &Self::Config) -> Result<StateLayout, Error>;
     fn state_identity(
         config: &Self::Config,
         layout: &StateLayout,
@@ -76,13 +71,12 @@ pub(crate) trait FixedReplicatedFamily<B: NeuralBackend>: 'static {
 }
 
 pub(crate) trait CompressedReplicatedFamily<B: BlockwiseAttentionBackend>: 'static {
-    type Config: Clone;
+    type Config: Clone + 'static;
     type Unit: Parameterized<B::Tensor>;
 
     fn validate(config: &Self::Config) -> Result<(), Error>;
-    fn layer_count(config: &Self::Config) -> Result<usize, Error>;
+    fn definition(config: &Self::Config) -> Result<ComponentDefinition, Error>;
     fn static_spec(config: &Self::Config) -> StaticModuleSpec;
-    fn state_layout(config: &Self::Config) -> Result<StateLayout, Error>;
     fn state_identity(
         config: &Self::Config,
         layout: &StateLayout,
@@ -121,6 +115,87 @@ pub(crate) trait CompressedReplicatedFamily<B: BlockwiseAttentionBackend>: 'stat
         let _ = (path, observer);
         Self::forward_unit(unit, hidden, state, forward, context)
     }
+}
+
+fn select_definition(
+    definition: Arc<ComponentDefinition>,
+    expected: ComponentDefinition,
+) -> Result<Arc<ComponentDefinition>, Error> {
+    let invalid = |resource: &str| eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    };
+    if definition.id() != expected.id() || definition.state_layout() != expected.state_layout() {
+        return Err(invalid("replicated component identity or state geometry").into());
+    }
+    let units = (0..expected.parameters().unit_layout().len())
+        .map(|ordinal| {
+            let address = expected
+                .parameters()
+                .unit_layout()
+                .address(ordinal)
+                .expect("declared invocation");
+            expected.unit(address.group(), address.index()).cloned()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let transport = (0..expected.parameters().graph().groups().len())
+        .map(|group| expected.group_transport(group).cloned())
+        .collect::<Result<Vec<_>, _>>()?;
+    definition.validate_execution_contract(
+        expected.primary_group(),
+        expected.prediction_groups(),
+        &units,
+        &transport,
+        expected.state_partition_plan(),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
+    let mut parameters = expected.parameters().clone();
+    if let Some((rank, layout)) = definition.parameters().partition_layout() {
+        let incomplete = |layout: &eredu_runtime::LocalModelLayout| {
+            layout.tensors().find_map(|(target, tensor)| {
+                let complete = |placement: &eredu_runtime::TensorPlacement| {
+                    use eredu_runtime::TensorPlacement;
+                    match placement {
+                        TensorPlacement::Replicated | TensorPlacement::Local => true,
+                        TensorPlacement::Rank { rank: owner } => *owner == rank.global_rank(),
+                        TensorPlacement::Shard { index, parts, .. } => *index == 0 && *parts == 1,
+                        TensorPlacement::Range { axis, start, end } => {
+                            *start == 0 && tensor.global_shape().get(*axis) == Some(end)
+                        }
+                        TensorPlacement::Indices { axis, indices } => tensor
+                            .global_shape()
+                            .get(*axis)
+                            .is_some_and(|width| indices.iter().copied().eq(0..*width)),
+                        TensorPlacement::Omit => false,
+                    }
+                };
+                (tensor.local_shape() != tensor.global_shape()
+                    || !complete(tensor.placement())
+                    || !tensor.additional_placements().iter().all(complete))
+                .then(|| target.to_owned())
+            })
+        };
+        if let Some(target) = incomplete(layout) {
+            return Err(invalid(&format!(
+                "replicated parameter {target} requires complete geometry"
+            ))
+            .into());
+        }
+        let selected = eredu_runtime::derive_partitioned_local_layout(&parameters, rank)
+            .map_err(Error::backend)?;
+        if let Some(target) = incomplete(&selected) {
+            return Err(invalid(&format!(
+                "replicated selected parameter {target} requires complete geometry"
+            ))
+            .into());
+        }
+        parameters = parameters
+            .with_partition_layout(rank, selected)
+            .map_err(Error::backend_source)?;
+    }
+    definition
+        .project_parameters(parameters)
+        .map_err(Error::from)
 }
 
 pub(crate) struct MixedState;
@@ -435,50 +510,849 @@ impl<B: NeuralBackend, C: CompressedAttentionCache<B::Tensor> + RuntimeLayerStat
     }
 }
 
-pub(crate) struct FixedReplicatedModel<
+pub(crate) type FixedReplicatedModel<B, F, P = MixedState> = ComponentAdapter<
+    Arc<ComponentDefinition>,
+    FixedReplicatedKernel<B, F, P>,
+    KernelParameterModules,
+>;
+pub(crate) struct FixedReplicatedKernel<
     B: NeuralBackend,
     F: FixedReplicatedFamily<B>,
     P = MixedState,
 > {
     config: F::Config,
-    decoder: HybridDecoder<B>,
+    definition: Arc<ComponentDefinition>,
+    static_modules: StaticModules<B>,
     prediction_capture: bool,
     family: PhantomData<(F, P)>,
 }
+impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P: 'static> FixedReplicatedKernel<B, F, P> {
+    pub fn from_definition(
+        config: F::Config,
+        definition: Arc<ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        F::validate(&config)?;
+        let definition = select_definition(definition, F::definition(&config)?)?;
+        let static_modules = StaticModules::from_spec(F::static_spec(&config), context)?;
+        Ok(Self {
+            config,
+            definition,
+            static_modules,
+            prediction_capture: false,
+            family: PhantomData,
+        })
+    }
+    pub fn into_model(self) -> Result<FixedReplicatedModel<B, F, P>, Error> {
+        ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
+            .map_err(Error::from)
+    }
+    pub(crate) fn enable_prediction_capture(&mut self) {
+        self.prediction_capture = true;
+    }
+}
+impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P: 'static> ComponentKernel<B>
+    for FixedReplicatedKernel<B, F, P>
+{
+    type Input<'a>
+        = LayeredInput<'a, B::Tensor>
+    where
+        Self: 'a;
+    type Unit = F::Unit;
+    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
+    type Error = Error;
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Error> {
+        F::state_identity(
+            &self.config,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
+    }
+    fn build_unit(
+        &self,
+        address: ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<F::Unit, Error> {
+        F::build_unit(&self.config, address.index(), context)
+    }
+    fn executes_group(&self, _group: usize, _forward: &Self::ForwardContext) -> bool {
+        true
+    }
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward.prediction_capture.as_ref()
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.mask.iter().chain(forward.prediction_capture.iter())
+    }
+}
+impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P: 'static> ComponentPinnedResources<B>
+    for FixedReplicatedKernel<B, F, P>
+{
+    type Modules = StaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V: StaticParameterVisitor<B>>(&self, visitor: &mut V) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources().visit(visitor)
+    }
+    fn visit_pinned_mut<V: StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources_mut().visit(visitor)
+    }
+}
+impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P: 'static> TextComponentKernel<B>
+    for FixedReplicatedKernel<B, F, P>
+{
+    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
+        LayeredInput { tokens, mask }
+    }
+    fn supports_chunked_prefill() -> bool {
+        F::CHUNKED_PREFILL
+    }
+}
+trait FixedExecutionProfile<B: NeuralBackend, S: LayerRuntimeState<B>, F: FixedReplicatedFamily<B>>:
+    'static
+{
+    fn validate(layout: &StateLayout, mask_layer: Option<usize>) -> Result<(), Error>;
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error>;
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error>;
+}
+impl<B, S, F, P> ComponentEquations<B, S> for FixedReplicatedKernel<B, F, P>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    F: FixedReplicatedFamily<B>,
+    P: FixedExecutionProfile<B, S, F>,
+{
+    fn begin<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+        P::validate(self.definition.state_layout(), F::mask_layer(&self.config))?;
+        if state.layout() != self.definition.state_layout() {
+            return Err(Error::backend(
+                "replicated state layout differs from architecture",
+            ));
+        }
+        let hidden = self.static_modules.embed(input.tokens, context)?;
+        let position = F::mask_layer(&self.config)
+            .map(|layer| P::position(state, layer))
+            .transpose()?;
+        let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
+        Ok(LayeredForwardState {
+            hidden,
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
+        })
+    }
+    fn begin_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        crate::decoder::ComponentInstrumentation::apply_embedding(
+            self.begin(input, state, context)?,
+            observer,
+        )
+    }
+    fn execute(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut F::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        P::execute::<eredu_runtime::NoopObserver>(
+            unit,
+            &self.definition.unit(address.group(), address.index())?.path,
+            address.index(),
+            hidden,
+            state,
+            forward,
+            context,
+            None,
+        )
+    }
+    fn execute_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut F::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        P::execute(
+            unit,
+            &self.definition.unit(address.group(), address.index())?.path,
+            address.index(),
+            hidden,
+            state,
+            forward,
+            context,
+            Some(observer),
+        )
+    }
+    fn complete_group(
+        &mut self,
+        _group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if self.prediction_capture {
+            forward.prediction_capture = Some(hidden.clone());
+        }
+        Ok(hidden.clone())
+    }
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.static_modules.finish_instrumented(
+            hidden,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+    fn finish_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.static_modules.finish_instrumented(
+            hidden,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+        )
+    }
+    fn projects_final_text_position() -> bool {
+        true
+    }
+    fn finish_text(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.finish(
+            &crate::decoder::final_hidden_position(hidden, context)?,
+            state,
+            forward,
+            context,
+        )
+    }
+}
 
-pub(crate) struct CompressedReplicatedModel<
+pub(crate) type CompressedReplicatedModel<B, F, P = MixedCompressedState> = ComponentAdapter<
+    Arc<ComponentDefinition>,
+    CompressedReplicatedKernel<B, F, P>,
+    KernelParameterModules,
+>;
+pub(crate) struct CompressedReplicatedKernel<
     B: BlockwiseAttentionBackend,
     F: CompressedReplicatedFamily<B>,
     P = MixedCompressedState,
 > {
     config: F::Config,
-    decoder: HybridDecoder<B>,
+    definition: Arc<ComponentDefinition>,
+    static_modules: StaticModules<B>,
     family: PhantomData<(F, P)>,
 }
-
-impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P> FixedReplicatedModel<B, F, P> {
-    pub fn new(config: F::Config, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P: 'static>
+    CompressedReplicatedKernel<B, F, P>
+{
+    pub fn from_definition(
+        config: F::Config,
+        definition: Arc<ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         F::validate(&config)?;
-        let layers = F::layer_count(&config)?;
+        let definition = select_definition(definition, F::definition(&config)?)?;
+        let static_modules = StaticModules::from_spec(F::static_spec(&config), context)?;
         Ok(Self {
-            decoder: HybridDecoder::new(
-                StaticModules::from_spec(F::static_spec(&config), context)?,
-                "model.layers",
-                layers,
-            )?,
             config,
-            prediction_capture: false,
+            definition,
+            static_modules,
             family: PhantomData,
         })
     }
+    pub fn into_model(self) -> Result<CompressedReplicatedModel<B, F, P>, Error> {
+        ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
+            .map_err(Error::from)
+    }
+}
+impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P: 'static> ComponentKernel<B>
+    for CompressedReplicatedKernel<B, F, P>
+{
+    type Input<'a>
+        = LayeredInput<'a, B::Tensor>
+    where
+        Self: 'a;
+    type Unit = F::Unit;
+    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
+    type Error = Error;
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Error> {
+        F::state_identity(
+            &self.config,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
+    }
+    fn build_unit(
+        &self,
+        address: ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<F::Unit, Error> {
+        F::build_unit(&self.config, address.index(), context)
+    }
+    fn executes_group(&self, _group: usize, _forward: &Self::ForwardContext) -> bool {
+        true
+    }
 
-    pub(crate) fn with_prediction_capture(mut self) -> Self {
-        self.prediction_capture = true;
-        self
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.mask.iter().chain(forward.prediction_capture.iter())
+    }
+}
+impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P: 'static>
+    ComponentPinnedResources<B> for CompressedReplicatedKernel<B, F, P>
+{
+    type Modules = StaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V: StaticParameterVisitor<B>>(&self, visitor: &mut V) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources().visit(visitor)
+    }
+    fn visit_pinned_mut<V: StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources_mut().visit(visitor)
+    }
+}
+impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P: 'static>
+    TextComponentKernel<B> for CompressedReplicatedKernel<B, F, P>
+{
+    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
+        LayeredInput { tokens, mask }
+    }
+}
+trait CompressedExecutionProfile<
+    B: BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    F: CompressedReplicatedFamily<B>,
+>: 'static
+{
+    fn validate(layout: &StateLayout, mask_layer: Option<usize>) -> Result<(), Error>;
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error>;
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error>;
+}
+impl<B, S, F, P> ComponentEquations<B, S> for CompressedReplicatedKernel<B, F, P>
+where
+    B: BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    F: CompressedReplicatedFamily<B>,
+    P: CompressedExecutionProfile<B, S, F>,
+{
+    fn begin<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+        P::validate(self.definition.state_layout(), F::mask_layer(&self.config))?;
+        if state.layout() != self.definition.state_layout() {
+            return Err(Error::backend(
+                "replicated state layout differs from architecture",
+            ));
+        }
+        let hidden = self.static_modules.embed(input.tokens, context)?;
+        let position = F::mask_layer(&self.config)
+            .map(|layer| P::position(state, layer))
+            .transpose()?;
+        let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
+        Ok(LayeredForwardState {
+            hidden,
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
+        })
+    }
+    fn begin_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        crate::decoder::ComponentInstrumentation::apply_embedding(
+            self.begin(input, state, context)?,
+            observer,
+        )
+    }
+    fn execute(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut F::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        P::execute::<eredu_runtime::NoopObserver>(
+            unit,
+            &self.definition.unit(address.group(), address.index())?.path,
+            address.index(),
+            hidden,
+            state,
+            forward,
+            context,
+            None,
+        )
+    }
+    fn execute_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut F::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        P::execute(
+            unit,
+            &self.definition.unit(address.group(), address.index())?.path,
+            address.index(),
+            hidden,
+            state,
+            forward,
+            context,
+            Some(observer),
+        )
+    }
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.static_modules.finish_instrumented(
+            hidden,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+    fn finish_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.static_modules.finish_instrumented(
+            hidden,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+        )
+    }
+    fn projects_final_text_position() -> bool {
+        true
+    }
+    fn finish_text(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.finish(
+            &crate::decoder::final_hidden_position(hidden, context)?,
+            state,
+            forward,
+            context,
+        )
     }
 }
 
-impl<B, F, P> FixedReplicatedModel<B, F, P>
+impl<B, S, F> FixedExecutionProfile<B, S, F> for MixedState
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    F: FixedReplicatedFamily<B>,
+{
+    fn validate(_layout: &StateLayout, _mask_layer: Option<usize>) -> Result<(), Error> {
+        Ok(())
+    }
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error> {
+        state
+            .layer(layer)
+            .map(|state| RuntimeStateComponents::position(&*state))
+            .map_err(Error::backend)
+    }
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error> {
+        match observer {
+            Some(observer) => F::forward_unit_observed(
+                unit,
+                path,
+                hidden,
+                state.layer(index).map_err(Error::backend)?,
+                forward,
+                context,
+                observer,
+            ),
+            None => F::forward_unit(
+                unit,
+                hidden,
+                state.layer(index).map_err(Error::backend)?,
+                forward,
+                context,
+            ),
+        }
+    }
+}
+
+impl<B, S, F> FixedExecutionProfile<B, S, F> for AttentionState
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+    F: FixedReplicatedFamily<B>,
+{
+    fn validate(_layout: &StateLayout, _mask_layer: Option<usize>) -> Result<(), Error> {
+        Ok(())
+    }
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error> {
+        state
+            .layer(layer)
+            .map(|state| AttentionCache::offset(&*state))
+            .map_err(Error::backend)
+    }
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error> {
+        match observer {
+            Some(observer) => {
+                let mut layer = AttentionLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit_observed(unit, path, hidden, &mut layer, forward, context, observer)
+            }
+            None => {
+                let mut layer = AttentionLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit(unit, hidden, &mut layer, forward, context)
+            }
+        }
+    }
+}
+
+impl<B, S, F> FixedExecutionProfile<B, S, F> for FixedState
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B>,
+    F: FixedReplicatedFamily<B>,
+{
+    fn validate(_layout: &StateLayout, _mask_layer: Option<usize>) -> Result<(), Error> {
+        if _mask_layer.is_some() {
+            return Err(Error::backend(
+                "fixed-only profile has an attention mask layer",
+            ));
+        }
+        Ok(())
+    }
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error> {
+        let _ = (state, layer);
+        Err(Error::backend("profile has no attention frontier"))
+    }
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error> {
+        match observer {
+            Some(observer) => {
+                let mut layer = FixedLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit_observed(unit, path, hidden, &mut layer, forward, context, observer)
+            }
+            None => {
+                let mut layer = FixedLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit(unit, hidden, &mut layer, forward, context)
+            }
+        }
+    }
+}
+
+impl<B, S, F> FixedExecutionProfile<B, S, F> for Stateless
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    F: FixedReplicatedFamily<B>,
+{
+    fn validate(_layout: &StateLayout, _mask_layer: Option<usize>) -> Result<(), Error> {
+        if _mask_layer.is_some()
+            || _layout
+                .layers()
+                .iter()
+                .any(|layer| layer.attention().is_some() || !layer.fixed_state().is_empty())
+        {
+            return Err(Error::backend("stateless profile contains mutable state"));
+        }
+        Ok(())
+    }
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error> {
+        let _ = (state, layer);
+        Err(Error::backend("profile has no attention frontier"))
+    }
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error> {
+        match observer {
+            Some(observer) => {
+                let mut layer = StatelessLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit_observed(unit, path, hidden, &mut layer, forward, context, observer)
+            }
+            None => {
+                let mut layer = StatelessLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit(unit, hidden, &mut layer, forward, context)
+            }
+        }
+    }
+}
+
+impl<B, S, F> CompressedExecutionProfile<B, S, F> for MixedCompressedState
+where
+    B: BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    F: CompressedReplicatedFamily<B>,
+{
+    fn validate(_layout: &StateLayout, _mask_layer: Option<usize>) -> Result<(), Error> {
+        Ok(())
+    }
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error> {
+        state
+            .layer(layer)
+            .map(|state| RuntimeStateComponents::position(&*state))
+            .map_err(Error::backend)
+    }
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error> {
+        match observer {
+            Some(observer) => F::forward_unit_observed(
+                unit,
+                path,
+                hidden,
+                state.layer(index).map_err(Error::backend)?,
+                forward,
+                context,
+                observer,
+            ),
+            None => F::forward_unit(
+                unit,
+                hidden,
+                state.layer(index).map_err(Error::backend)?,
+                forward,
+                context,
+            ),
+        }
+    }
+}
+
+impl<B, S, F> CompressedExecutionProfile<B, S, F> for CompressedState
+where
+    B: BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: CompressedAttentionCache<B::Tensor>,
+    F: CompressedReplicatedFamily<B>,
+{
+    fn validate(_layout: &StateLayout, _mask_layer: Option<usize>) -> Result<(), Error> {
+        Ok(())
+    }
+    fn position(state: &mut S, layer: usize) -> Result<i32, Error> {
+        state
+            .layer(layer)
+            .map(|state| CompressedAttentionCache::offset(&*state))
+            .map_err(Error::backend)
+    }
+    fn execute<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        unit: &mut F::Unit,
+        path: &str,
+        index: usize,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Error> {
+        match observer {
+            Some(observer) => {
+                let mut layer = CompressedLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit_observed(unit, path, hidden, &mut layer, forward, context, observer)
+            }
+            None => {
+                let mut layer = CompressedLayer::<B, _> {
+                    inner: state.layer(index).map_err(Error::backend)?,
+                    backend: PhantomData,
+                };
+                F::forward_unit(unit, hidden, &mut layer, forward, context)
+            }
+        }
+    }
+}
+
+impl<B, F, P: 'static> FixedReplicatedKernel<B, F, P>
 where
     B: BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
@@ -494,13 +1368,13 @@ where
     ) -> Result<B::Tensor, Error> {
         match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.decoder.static_modules_mut().embeddings,
+                &mut self.static_modules.embeddings,
                 tokens,
                 eredu_nn::EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             ),
-            None => self.decoder.static_modules_mut().embed(tokens, context),
+            None => self.static_modules.embed(tokens, context),
         }
     }
 
@@ -511,16 +1385,11 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.static_modules_mut().project_instrumented(
-            hidden,
-            parallel,
-            context,
-            instrumentation,
-        )
+        self.static_modules
+            .project_instrumented(hidden, parallel, context, instrumentation)
     }
 }
-
-impl<B, P> crate::prediction_extension::NemotronHPredictionTarget<B>
+impl<B, P: 'static> crate::prediction_extension::NemotronHPredictionTarget<B>
     for FixedReplicatedModel<B, crate::replicated_text::NemotronHReplicated, P>
 where
     B: BlockwiseAttentionBackend
@@ -534,7 +1403,8 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.embed_prediction_shared(tokens, parallel, context)
+        self.kernel_mut()
+            .embed_prediction_shared(tokens, parallel, context)
     }
     fn project_prediction(
         &mut self,
@@ -543,11 +1413,11 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.project_prediction_shared(hidden, parallel, context, instrumentation)
+        self.kernel_mut()
+            .project_prediction_shared(hidden, parallel, context, instrumentation)
     }
 }
-
-impl<B, P> crate::prediction_extension::QwenHybridPredictionTarget<B>
+impl<B, P: 'static> crate::prediction_extension::QwenHybridPredictionTarget<B>
     for FixedReplicatedModel<B, crate::replicated_text::QwenHybridReplicated, P>
 where
     B: BlockwiseAttentionBackend
@@ -561,7 +1431,8 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.embed_prediction_shared(tokens, parallel, context)
+        self.kernel_mut()
+            .embed_prediction_shared(tokens, parallel, context)
     }
     fn project_prediction(
         &mut self,
@@ -570,112 +1441,13 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        self.decoder.static_modules_mut().project_instrumented(
+        self.kernel_mut().static_modules.project_instrumented(
             hidden,
             parallel,
             context,
             instrumentation,
         )
     }
-}
-
-impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P>
-    CompressedReplicatedModel<B, F, P>
-{
-    pub fn new(config: F::Config, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        F::validate(&config)?;
-        let layers = F::layer_count(&config)?;
-        Ok(Self {
-            decoder: HybridDecoder::new(
-                StaticModules::from_spec(F::static_spec(&config), context)?,
-                "model.layers",
-                layers,
-            )?,
-            config,
-            family: PhantomData,
-        })
-    }
-}
-
-fn parameter_description<B: NeuralBackend, U: Parameterized<B::Tensor>>(
-    decoder: &HybridDecoder<B>,
-    layers: usize,
-    tied_head: bool,
-    mut build: impl FnMut(usize) -> Result<U, Error>,
-) -> Result<ArchitectureParameterDescription, Error> {
-    let graph = decoder.execution_graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [layers]).map_err(Error::backend)?;
-    let mut expected = Vec::new();
-    let mut owned = Vec::new();
-    let modules = decoder.static_modules();
-    fn add_static<B: NeuralBackend, M: Parameterized<B::Tensor>>(
-        expected: &mut Vec<eredu_runtime::ParameterGroupSpec>,
-        owned: &mut Vec<OwnedParameterGroupSpec>,
-        name: &str,
-        role: &str,
-        parameter_role: ParameterRole,
-        module: &M,
-        tied_head: bool,
-    ) -> Result<(), Error> {
-        let group = module_parameter_group::<B::Tensor, _>(name, parameter_role, module, |_, _| {
-            Ok(MemberSharding::Replicated)
-        })
-        .map_err(Error::backend)?;
-        expected.push(group.clone());
-        let owner = if tied_head && role == "embedding" {
-            ParameterGroupOwner::static_any_of(["embedding", "output"])
-        } else {
-            ParameterGroupOwner::static_role(role)
-        };
-        owned.push(OwnedParameterGroupSpec::new(owner, group));
-        Ok(())
-    }
-    add_static::<B, _>(
-        &mut expected,
-        &mut owned,
-        "embedding",
-        "embedding",
-        ParameterRole::Vocabulary,
-        &modules.embeddings,
-        tied_head,
-    )?;
-    add_static::<B, _>(
-        &mut expected,
-        &mut owned,
-        "norm",
-        "norm",
-        ParameterRole::Replicated,
-        &modules.boundary.norm,
-        tied_head,
-    )?;
-    if let Some(head) = &modules.lm_head {
-        add_static::<B, _>(
-            &mut expected,
-            &mut owned,
-            "output",
-            "output",
-            ParameterRole::Vocabulary,
-            head,
-            tied_head,
-        )?;
-    }
-    let owner_group = layout.group_id(0).expect("replicated target group").clone();
-    for index in 0..layers {
-        let unit = build(index)?;
-        let group = module_parameter_group::<B::Tensor, _>(
-            format!("model.layers.{index}"),
-            ParameterRole::Replicated,
-            &unit,
-            |_, _| Ok(MemberSharding::Replicated),
-        )
-        .map_err(Error::backend)?;
-        expected.push(group.clone());
-        owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-            group,
-        ));
-    }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned).map_err(Error::backend)
 }
 
 fn causal_mask<B: NeuralBackend>(
@@ -690,935 +1462,5 @@ fn causal_mask<B: NeuralBackend>(
     match (sequence > 1, position) {
         (true, Some(position)) => B::causal_mask(sequence, position, None, context).map(Some),
         _ => Ok(None),
-    }
-}
-
-macro_rules! architecture_parameters {
-    ($model:ident, $family:ident, $backend:path) => {
-        impl<B: $backend, F: $family<B>, P> eredu_runtime::ArchitectureParameters<B>
-            for $model<B, F, P>
-        {
-            type DefinitionError = Error;
-
-            fn state_layout(&self) -> Result<StateLayout, Error> {
-                F::state_layout(&self.config)
-            }
-
-            fn state_identity(
-                &self,
-                state: &eredu_runtime::PartitionState,
-                topology: PromptCacheTopology,
-            ) -> Result<ModelStateIdentity, Error> {
-                F::state_identity(
-                    &self.config,
-                    state.layout(),
-                    state.global_layer_offset(),
-                    topology,
-                )
-            }
-
-            fn parameter_description(
-                &self,
-                context: &<B::Tensor as Tensor>::Context,
-            ) -> Result<ArchitectureParameterDescription, Error> {
-                parameter_description(
-                    &self.decoder,
-                    F::layer_count(&self.config)?,
-                    self.decoder.static_modules().lm_head.is_none(),
-                    |index| F::build_unit(&self.config, index, context),
-                )
-            }
-
-            fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-            where
-                V: StaticParameterVisitor<B>,
-            {
-                let modules = self.decoder.static_modules();
-                visitor.visit("embedding", &modules.embeddings)?;
-                visitor.visit("norm", &modules.boundary.norm)?;
-                if let Some(head) = &modules.lm_head {
-                    visitor.visit("output", head)?;
-                }
-                Ok(())
-            }
-
-            fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-            where
-                V: StaticParameterVisitorMut<B>,
-            {
-                let modules = self.decoder.static_modules_mut();
-                visitor.visit_mut("embedding", &mut modules.embeddings)?;
-                visitor.visit_mut("norm", &mut modules.boundary.norm)?;
-                if let Some(head) = &mut modules.lm_head {
-                    visitor.visit_mut("output", head)?;
-                }
-                Ok(())
-            }
-        }
-    };
-}
-
-architecture_parameters!(FixedReplicatedModel, FixedReplicatedFamily, NeuralBackend);
-architecture_parameters!(
-    CompressedReplicatedModel,
-    CompressedReplicatedFamily,
-    BlockwiseAttentionBackend
-);
-
-macro_rules! common_layered_methods {
-    () => {
-        fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-            crate::transport::decoder()
-        }
-        fn primary_execution_group(&self) -> &str {
-            TARGET_EXECUTION_GROUP
-        }
-        fn state_partition_plan(
-            &self,
-            layout: &StateLayout,
-        ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-            crate::transport::pipeline_state(0, layout)
-        }
-        fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-            self.decoder.execution_graph()
-        }
-        fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-            self.decoder.group_unit_count(group)
-        }
-        fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-            self.decoder.unit_path(group, index)
-        }
-        fn static_modules(&self) -> &Self::StaticModules {
-            self.decoder.static_modules()
-        }
-        fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-            self.decoder.static_modules_mut()
-        }
-        fn begin_forward_observed<'a, O>(
-            &mut self,
-            input: Self::Input<'a>,
-            state: &mut S,
-            context: &<B::Tensor as Tensor>::Context,
-            observer: &mut O,
-        ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-        where
-            O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        {
-            let mut forward = self.begin_forward(input, state, context)?;
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-                    .apply("embedding", forward.hidden)?;
-            Ok(forward)
-        }
-        fn begin_execution_group(
-            &mut self,
-            group: usize,
-            initial: &B::Tensor,
-            dependencies: &[&B::Tensor],
-            _state: &mut S,
-            _forward: &mut Self::ForwardContext,
-            _context: &<B::Tensor as Tensor>::Context,
-        ) -> Result<B::Tensor, Error> {
-            self.decoder.begin_group(group, initial, dependencies)
-        }
-        fn finish_forward(
-            &mut self,
-            hidden: &B::Tensor,
-            _state: &mut S,
-            _forward: &Self::ForwardContext,
-            context: &<B::Tensor as Tensor>::Context,
-        ) -> Result<B::Tensor, Error> {
-            self.decoder.finish_logits(hidden, context)
-        }
-        fn projects_final_text_position() -> bool {
-            true
-        }
-        fn finish_text_forward(
-            &mut self,
-            hidden: &B::Tensor,
-            _state: &mut S,
-            _forward: &Self::ForwardContext,
-            context: &<B::Tensor as Tensor>::Context,
-        ) -> Result<B::Tensor, Error> {
-            self.decoder.finish_text_logits(hidden, context)
-        }
-        fn finish_forward_observed<O>(
-            &mut self,
-            hidden: &B::Tensor,
-            _state: &mut S,
-            _forward: &Self::ForwardContext,
-            context: &<B::Tensor as Tensor>::Context,
-            observer: &mut O,
-        ) -> Result<B::Tensor, Error>
-        where
-            O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.decoder.finish_logits_instrumented(
-                hidden,
-                context,
-                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-            )
-        }
-        fn retained_context_values<'a>(
-            &'a self,
-            forward: &'a Self::ForwardContext,
-            _group: usize,
-            _index: usize,
-        ) -> Self::RetainedContextValues<'a> {
-            forward.mask.iter().chain(forward.prediction_capture.iter())
-        }
-    };
-}
-
-impl<B, S, F> LayeredArchitecture<B, S> for FixedReplicatedModel<B, F, MixedState>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-    F: FixedReplicatedFamily<B>,
-{
-    type Input<'a>
-        = LayeredInput<'a, B::Tensor>
-    where
-        Self: 'a;
-    type StaticModules = StaticModules<B>;
-    type Unit = F::Unit;
-    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-
-    common_layered_methods!();
-
-    fn complete_execution_group(
-        &mut self,
-        _group: usize,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if self.prediction_capture {
-            forward.prediction_capture = Some(hidden.clone());
-        }
-        Ok(hidden.clone())
-    }
-
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        forward.prediction_capture.as_ref()
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::build_unit(&self.config, index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = F::state_layout(&self.config)?;
-        if state.layout() != &expected {
-            return Err(Error::backend(
-                "replicated fixed-state layout differs from architecture",
-            ));
-        }
-        let hidden = self
-            .decoder
-            .static_modules_mut()
-            .embed(input.tokens, context)?;
-        let position = F::mask_layer(&self.config)
-            .map(|layer| {
-                state
-                    .layer(layer)
-                    .map(|state| RuntimeStateComponents::position(&*state))
-                    .map_err(Error::backend)
-            })
-            .transpose()?;
-        let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ReplicatedForwardContext {
-                mask,
-                prediction_capture: None,
-            },
-        })
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::forward_unit(
-            unit,
-            hidden,
-            state.layer(index).map_err(Error::backend)?,
-            forward,
-            context,
-        )
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let path = self.decoder.unit_path(group, index)?;
-        F::forward_unit_observed(
-            unit,
-            &path,
-            hidden,
-            state.layer(index).map_err(Error::backend)?,
-            forward,
-            context,
-            observer,
-        )
-    }
-}
-
-impl<B, S, F> ReplicatedTextArchitecture<B, S> for FixedReplicatedModel<B, F, MixedState>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-    F: FixedReplicatedFamily<B>,
-{
-    fn supports_chunked_prefill() -> bool {
-        F::CHUNKED_PREFILL
-    }
-
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
-    }
-}
-
-impl<B, S, F> LayeredArchitecture<B, S> for FixedReplicatedModel<B, F, AttentionState>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-    F: FixedReplicatedFamily<B>,
-{
-    type Input<'a>
-        = LayeredInput<'a, B::Tensor>
-    where
-        Self: 'a;
-    type StaticModules = StaticModules<B>;
-    type Unit = F::Unit;
-    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-
-    common_layered_methods!();
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::build_unit(&self.config, index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = F::state_layout(&self.config)?;
-        if state.layout() != &expected {
-            return Err(Error::backend(
-                "replicated attention-state layout differs from architecture",
-            ));
-        }
-        let hidden = self
-            .decoder
-            .static_modules_mut()
-            .embed(input.tokens, context)?;
-        let position = F::mask_layer(&self.config)
-            .map(|layer| {
-                state
-                    .layer(layer)
-                    .map(|state| AttentionCache::offset(&*state))
-                    .map_err(Error::backend)
-            })
-            .transpose()?;
-        let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ReplicatedForwardContext {
-                mask,
-                prediction_capture: None,
-            },
-        })
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
-        let mut layer = AttentionLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit(unit, hidden, &mut layer, forward, context)
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let path = self.decoder.unit_path(group, index)?;
-        let mut layer = AttentionLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
-    }
-}
-
-impl<B, S, F> ReplicatedTextArchitecture<B, S> for FixedReplicatedModel<B, F, AttentionState>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>,
-    F: FixedReplicatedFamily<B>,
-{
-    fn supports_chunked_prefill() -> bool {
-        F::CHUNKED_PREFILL
-    }
-
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
-    }
-}
-
-impl<B, S, F> LayeredArchitecture<B, S> for FixedReplicatedModel<B, F, FixedState>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: RuntimeStateComponents<B>,
-    F: FixedReplicatedFamily<B>,
-{
-    type Input<'a>
-        = LayeredInput<'a, B::Tensor>
-    where
-        Self: 'a;
-    type StaticModules = StaticModules<B>;
-    type Unit = F::Unit;
-    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-
-    common_layered_methods!();
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::build_unit(&self.config, index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = F::state_layout(&self.config)?;
-        if state.layout() != &expected || F::mask_layer(&self.config).is_some() {
-            return Err(Error::backend(
-                "replicated fixed-only layout differs from architecture profile",
-            ));
-        }
-        let hidden = self
-            .decoder
-            .static_modules_mut()
-            .embed(input.tokens, context)?;
-        let mask = causal_mask::<B>(hidden.dim(1), input.mask, None, context)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ReplicatedForwardContext {
-                mask,
-                prediction_capture: None,
-            },
-        })
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
-        let mut layer = FixedLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit(unit, hidden, &mut layer, forward, context)
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let path = self.decoder.unit_path(group, index)?;
-        let mut layer = FixedLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
-    }
-}
-
-impl<B, S, F> ReplicatedTextArchitecture<B, S> for FixedReplicatedModel<B, F, FixedState>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: RuntimeStateComponents<B>,
-    F: FixedReplicatedFamily<B>,
-{
-    fn supports_chunked_prefill() -> bool {
-        F::CHUNKED_PREFILL
-    }
-
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
-    }
-}
-
-impl<B, S, F> LayeredArchitecture<B, S> for FixedReplicatedModel<B, F, Stateless>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    F: FixedReplicatedFamily<B>,
-{
-    type Input<'a>
-        = LayeredInput<'a, B::Tensor>
-    where
-        Self: 'a;
-    type StaticModules = StaticModules<B>;
-    type Unit = F::Unit;
-    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-
-    common_layered_methods!();
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::build_unit(&self.config, index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = F::state_layout(&self.config)?;
-        let has_components = expected
-            .layers()
-            .iter()
-            .any(|layer| layer.attention().is_some() || !layer.fixed_state().is_empty());
-        if state.layout() != &expected || has_components || F::mask_layer(&self.config).is_some() {
-            return Err(Error::backend(
-                "replicated stateless layout differs from architecture profile",
-            ));
-        }
-        let hidden = self
-            .decoder
-            .static_modules_mut()
-            .embed(input.tokens, context)?;
-        let mask = causal_mask::<B>(hidden.dim(1), input.mask, None, context)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ReplicatedForwardContext {
-                mask,
-                prediction_capture: None,
-            },
-        })
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
-        let mut layer = StatelessLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit(unit, hidden, &mut layer, forward, context)
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let path = self.decoder.unit_path(group, index)?;
-        let mut layer = StatelessLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
-    }
-}
-
-impl<B, S, F> ReplicatedTextArchitecture<B, S> for FixedReplicatedModel<B, F, Stateless>
-where
-    B: NeuralBackend,
-    S: LayerRuntimeState<B>,
-    F: FixedReplicatedFamily<B>,
-{
-    fn supports_chunked_prefill() -> bool {
-        F::CHUNKED_PREFILL
-    }
-
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
-    }
-}
-
-impl<B, S, F> LayeredArchitecture<B, S> for CompressedReplicatedModel<B, F, MixedCompressedState>
-where
-    B: BlockwiseAttentionBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-    F: CompressedReplicatedFamily<B>,
-{
-    type Input<'a>
-        = LayeredInput<'a, B::Tensor>
-    where
-        Self: 'a;
-    type StaticModules = StaticModules<B>;
-    type Unit = F::Unit;
-    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-
-    common_layered_methods!();
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::build_unit(&self.config, index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = F::state_layout(&self.config)?;
-        if state.layout() != &expected {
-            return Err(Error::backend(
-                "replicated compressed-state layout differs from architecture",
-            ));
-        }
-        let hidden = self
-            .decoder
-            .static_modules_mut()
-            .embed(input.tokens, context)?;
-        let position = F::mask_layer(&self.config)
-            .map(|layer| {
-                state
-                    .layer(layer)
-                    .map(|state| RuntimeStateComponents::position(&*state))
-                    .map_err(Error::backend)
-            })
-            .transpose()?;
-        let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ReplicatedForwardContext {
-                mask,
-                prediction_capture: None,
-            },
-        })
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::forward_unit(
-            unit,
-            hidden,
-            state.layer(index).map_err(Error::backend)?,
-            forward,
-            context,
-        )
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let path = self.decoder.unit_path(group, index)?;
-        F::forward_unit_observed(
-            unit,
-            &path,
-            hidden,
-            state.layer(index).map_err(Error::backend)?,
-            forward,
-            context,
-            observer,
-        )
-    }
-}
-
-impl<B, S, F> ReplicatedTextArchitecture<B, S>
-    for CompressedReplicatedModel<B, F, MixedCompressedState>
-where
-    B: BlockwiseAttentionBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-    F: CompressedReplicatedFamily<B>,
-{
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
-    }
-}
-
-impl<B, S, F> LayeredArchitecture<B, S> for CompressedReplicatedModel<B, F, CompressedState>
-where
-    B: BlockwiseAttentionBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: CompressedAttentionCache<B::Tensor>,
-    F: CompressedReplicatedFamily<B>,
-{
-    type Input<'a>
-        = LayeredInput<'a, B::Tensor>
-    where
-        Self: 'a;
-    type StaticModules = StaticModules<B>;
-    type Unit = F::Unit;
-    type ForwardContext = ReplicatedForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-
-    common_layered_methods!();
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        self.decoder.unit_path(group, index)?;
-        F::build_unit(&self.config, index, context)
-    }
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        let expected = F::state_layout(&self.config)?;
-        if state.layout() != &expected {
-            return Err(Error::backend(
-                "replicated compressed-only layout differs from architecture",
-            ));
-        }
-        let hidden = self
-            .decoder
-            .static_modules_mut()
-            .embed(input.tokens, context)?;
-        let position = F::mask_layer(&self.config)
-            .map(|layer| {
-                state
-                    .layer(layer)
-                    .map(|state| CompressedAttentionCache::offset(&*state))
-                    .map_err(Error::backend)
-            })
-            .transpose()?;
-        let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
-        Ok(LayeredForwardState {
-            hidden,
-            context: ReplicatedForwardContext {
-                mask,
-                prediction_capture: None,
-            },
-        })
-    }
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.decoder.unit_path(group, index)?;
-        let mut layer = CompressedLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit(unit, hidden, &mut layer, forward, context)
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let path = self.decoder.unit_path(group, index)?;
-        let mut layer = CompressedLayer::<B, _> {
-            inner: state.layer(index).map_err(Error::backend)?,
-            backend: PhantomData,
-        };
-        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
-    }
-}
-
-impl<B, S, F> ReplicatedTextArchitecture<B, S> for CompressedReplicatedModel<B, F, CompressedState>
-where
-    B: BlockwiseAttentionBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: CompressedAttentionCache<B::Tensor>,
-    F: CompressedReplicatedFamily<B>,
-{
-    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        LayeredInput { tokens, mask }
     }
 }

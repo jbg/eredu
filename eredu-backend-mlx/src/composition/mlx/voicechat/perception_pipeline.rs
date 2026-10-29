@@ -4,7 +4,7 @@ use eredu_architectures::voicechat::{
     perception::{PerceptionDimensions, PerceptionError},
     perception_distribution::PreparedPerceptionPipelineBindings,
     perception_layered::{
-        unpack_perception_pipeline_output, PerceptionArchitecture, PerceptionInput,
+        unpack_perception_pipeline_output, PerceptionInput, PerceptionKernel,
         PerceptionRuntimeState,
     },
     perception_rnnt_pipeline::PerceptionPipelineExecution,
@@ -23,7 +23,10 @@ use crate::{
 
 /// Caller-owned unpublished local cache branch and recorded perception frontier.
 pub type MlxPerceptionPipelineState = PerceptionRuntimeState<MlxTensor>;
-type Architecture = PerceptionArchitecture<MlxNeuralBackend>;
+type Architecture = eredu_runtime::ComponentAdapter<
+    eredu_runtime::ComponentDefinition,
+    PerceptionKernel<MlxNeuralBackend>,
+>;
 
 /// One selected native perception stage, with the same shared pipeline driver
 /// used by transformer stages. Architecture code owns the encoder/projection
@@ -45,6 +48,7 @@ impl PerceptionPipelineExecution<MlxNeuralBackend> for MlxPerceptionPipeline {
     fn validate_parent(&self, parent: &Self::State, batch: i32) -> Result<(), PerceptionError> {
         self.execution
             .architecture()
+            .kernel()
             .validate_parent_for_batch(parent, batch)
     }
 
@@ -155,14 +159,17 @@ pub fn materialize_voicechat_perception_pipeline(
 > {
     let (prepared, partition, manifest, plan, tensor_group, activation_dtype) =
         prepared.into_parts();
-    let (dimensions, local_layout, source, units, state_layout) = prepared.into_parts();
-    let architecture = Architecture::new_partition(dimensions, local_layout.as_ref(), &partition)
-        .map_err(BackendFailure::from_error)?;
-    let state = PerceptionRuntimeState::for_partition(&architecture, None)
+    let (dimensions, definition, local_layout, invocations, source, units, state_layout) =
+        prepared.into_parts();
+    let architecture =
+        PerceptionKernel::new_partition(definition, dimensions, local_layout.as_ref(), &partition)
+            .map_err(BackendFailure::from_error)?;
+    let state = PerceptionRuntimeState::for_partition(architecture.kernel(), None)
         .map_err(BackendFailure::from_error)?;
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,
         source,
+        invocations,
         units,
         manifest,
         plan,

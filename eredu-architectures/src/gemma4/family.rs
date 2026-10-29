@@ -166,6 +166,15 @@ impl FamilyConfig {
         }
     }
 
+    /// Retains the actual optional audio projection bias admitted from tensor presence.
+    pub fn with_audio_output_projection_bias(&self, present: bool) -> Self {
+        let mut exact = self.clone();
+        if let Some(audio) = exact.audio.as_mut() {
+            audio.output_projection_bias = present;
+        }
+        exact
+    }
+
     /// Parses and validates one top-level Hugging Face configuration.
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, FamilyConfigError> {
         let source: FamilySource = serde_json::from_slice(bytes)?;

@@ -4,7 +4,7 @@ pub mod partition;
 
 use super::{
     input::{admit_input, InputPartPlan},
-    model::{ForwardContext as TextForward, TextLayer, TextModel},
+    model::{ForwardContext as TextForward, TextKernel, TextLayer},
     vision::{ImageEmbedding, ImageInput, ImageLayer, ImageProjector, ImageState},
     FamilyConfig,
 };
@@ -18,22 +18,60 @@ use crate::{
 };
 use eredu_core::decoding::AttentionInvocation;
 use eredu_nn::{
-    DistributedNeuralBackend, EmbeddingLookupPolicy, Error, Index, Parameterized,
-    ReadOnlyAttentionCache, Tensor,
+    DistributedNeuralBackend, Error, Index, Parameterized, ReadOnlyAttentionCache, Tensor,
 };
-use eredu_runtime::{
-    ArchitectureParameters, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    ParallelLayeredArchitecture,
-};
+use eredu_runtime::{ComponentEquations as _, LayerRuntimeState, LayeredForwardState};
 
 /// Pinned roles have distinct first/last pipeline owners.
 #[derive(Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct StaticModules<B: DistributedNeuralBackend> {
     /// One text embedding, normalization and readout catalog.
-    pub text: TextModel<B>,
+    pub text: TextKernel<B>,
     /// First image-owner parameters.
     pub image_embedding: ImageEmbedding<B>,
+}
+/// Typed access to physically retained composite text and image resources.
+pub trait CompositeResources<B: DistributedNeuralBackend>:
+    Parameterized<B::Tensor> + Sized + 'static
+{
+    /// Internal observation coverage of ordinary low-level parallel readout.
+    const OBSERVED_PARALLEL_READOUT: bool;
+    /// Selected decoder pinned storage.
+    type TextModules: crate::decoder::DecoderStaticResources<B>;
+    /// Selected decoder invocation/state geometry.
+    type TextGeometry: crate::decoder::DecoderGeometry<FamilyConfig>;
+    /// Text resources, absent on stateless media owners.
+    fn text(&self) -> Option<&CompositeTextKernel<B, Self>>;
+    /// Mutable access to those same resources.
+    fn text_mut(&mut self) -> Option<&mut CompositeTextKernel<B, Self>>;
+    /// Image ingress, only on its physical owner.
+    fn image(&self) -> Option<&ImageEmbedding<B>>;
+    /// Mutable access to the retained image ingress.
+    fn image_mut(&mut self) -> Option<&mut ImageEmbedding<B>>;
+}
+/// Text equation specialization selected by the composite's physical aggregate.
+pub type CompositeTextKernel<B, R> = TextKernel<
+    B,
+    <R as CompositeResources<B>>::TextModules,
+    <R as CompositeResources<B>>::TextGeometry,
+>;
+impl<B: DistributedNeuralBackend> CompositeResources<B> for StaticModules<B> {
+    const OBSERVED_PARALLEL_READOUT: bool = true;
+    type TextModules = crate::decoder::StaticModules<B>;
+    type TextGeometry = crate::decoder::CompleteDecoderGeometry<FamilyConfig>;
+    fn text(&self) -> Option<&CompositeTextKernel<B, Self>> {
+        Some(&self.text)
+    }
+    fn text_mut(&mut self) -> Option<&mut CompositeTextKernel<B, Self>> {
+        Some(&mut self.text)
+    }
+    fn image(&self) -> Option<&ImageEmbedding<B>> {
+        Some(&self.image_embedding)
+    }
+    fn image_mut(&mut self) -> Option<&mut ImageEmbedding<B>> {
+        Some(&mut self.image_embedding)
+    }
 }
 /// Each bounded unit contains exactly one image or text residual block.
 #[derive(Parameterized)]
@@ -61,67 +99,107 @@ pub struct ForwardContext<T, C = TextForward<T>> {
     text: Option<C>,
     invocation: AttentionInvocation,
 }
-/// Backend-neutral composite using the ordinary layered residency lifecycle.
-pub struct Model<B: DistributedNeuralBackend> {
+/// Complete composite execution through the shared validated runtime adapter.
+pub type Model<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    CompositeKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+/// Family-owned media assembly and context/refinement equations.
+#[derive(Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct CompositeKernel<B: DistributedNeuralBackend, R: CompositeResources<B> = StaticModules<B>>
+{
+    #[parameter(skip)]
     config: FamilyConfig,
-    statics: StaticModules<B>,
+    #[parameter(skip)]
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    statics: R,
+    #[parameter(skip)]
     local_layout: Option<eredu_runtime::LocalModelLayout>,
+    #[parameter(skip)]
+    geometry: Option<partition::Geometry>,
+    #[parameter(skip)]
+    backend: std::marker::PhantomData<fn() -> B>,
 }
-impl<B: DistributedNeuralBackend> Model<B> {
-    /// Declares each pinned role and no resident residual layers.
-    pub fn new(
-        config: FamilyConfig,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text = TextModel::new(config.clone(), context)?;
-        Ok(Self {
-            config,
-            statics: StaticModules {
-                text,
-                image_embedding,
-            },
-            local_layout: None,
-        })
+impl<B: DistributedNeuralBackend, R: CompositeResources<B>> CompositeKernel<B, R> {
+    /// Retained semantic declaration used by execution and inspection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
-    /// Declares exact text vocabulary/cache shards and Pixtral head/channel shards.
-    pub fn new_parallel(
-        config: FamilyConfig,
-        layout: eredu_runtime::LocalModelLayout,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let geometry = crate::decoder::local_geometry(&config, &layout, |config, index, layout| {
-            config
-                .local_block_config(index, layout)
-                .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
-        })
-        .map_err(Error::backend)?;
-        let image_embedding = ImageEmbedding::new(&config, context)?;
-        let text = TextModel::new_parallel(config.clone(), geometry, context)?;
-        Ok(Self {
-            config,
-            statics: StaticModules {
-                text,
-                image_embedding,
-            },
-            local_layout: Some(layout),
-        })
-    }
+
     /// Shared family and checkpoint identity.
     pub fn config(&self) -> &FamilyConfig {
         &self.config
     }
 
     /// Borrows all independently bound pinned roles.
-    pub fn static_modules(&self) -> &StaticModules<B> {
+    pub fn static_modules(&self) -> &R {
         &self.statics
     }
 
     /// Binds the same pinned roles before execution or reload.
-    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
+    pub fn static_modules_mut(&mut self) -> &mut R {
         &mut self.statics
     }
 
+    fn text(&mut self) -> Result<&mut CompositeTextKernel<B, R>, Error> {
+        self.statics
+            .text_mut()
+            .ok_or_else(|| Error::backend("partition owns no shared text stack"))
+    }
+    /// Constructs one declared resource within the retained local ownership.
+    pub fn construct_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error> {
+        self.definition.unit_address(group, index)?;
+        if let Some(g) = &self.geometry {
+            let owned = match group {
+                0 => g.vision.contains(&index),
+                1 => g.projection && index == 0,
+                2 => g
+                    .text
+                    .as_ref()
+                    .is_some_and(|g| g.owned_units().contains(&index)),
+                _ => false,
+            };
+            if !owned {
+                return Err(Error::backend(
+                    "partition attempted an unowned image/text unit",
+                ));
+            }
+        }
+        let layout = self
+            .geometry
+            .as_ref()
+            .map(|g| &g.layout)
+            .or(self.local_layout.as_ref());
+        Ok(match group {
+            0 => Unit::Vision(match layout {
+                Some(layout) => ImageLayer::new_parallel(
+                    self.config.vision.as_ref().expect("validated tower"),
+                    index,
+                    layout,
+                    context,
+                )?,
+                None => ImageLayer::new(
+                    self.config.vision.as_ref().expect("validated tower"),
+                    index,
+                    context,
+                )?,
+            }),
+            1 => Unit::Projector(ImageProjector::new(&self.config, context)?),
+            _ => Unit::Text(
+                self.statics
+                    .text()
+                    .ok_or_else(|| Error::backend("partition owns no text layers"))?
+                    .construct_unit(index, context)?,
+            ),
+        })
+    }
     fn prepare(
         &mut self,
         input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
@@ -136,9 +214,9 @@ impl<B: DistributedNeuralBackend> Model<B> {
         } = prepare_segments(&self.config, input, context)?;
         let (image_initial, image_state) = if patches.is_empty() {
             (None, None)
-        } else {
+        } else if let Some(embedding) = self.statics.image_mut() {
             let patches = B::Tensor::concatenate(&patches, 0, context)?;
-            let (hidden, state) = self.statics.image_embedding.begin(
+            let (hidden, state) = embedding.begin(
                 ImageInput {
                     patches: &patches,
                     grids: &grids,
@@ -146,6 +224,11 @@ impl<B: DistributedNeuralBackend> Model<B> {
                 context,
             )?;
             (Some(hidden), Some(state))
+        } else {
+            (
+                None,
+                Some(ImageState::prepare(&self.config, &grids, context)?),
+            )
         };
         let hidden =
             B::Tensor::full_f32(0.0, &[1, tokens.dim(1), self.config.hidden_size()], context)?;
@@ -162,180 +245,76 @@ impl<B: DistributedNeuralBackend> Model<B> {
             },
         })
     }
-}
-impl<B: DistributedNeuralBackend> ArchitectureParameters<B> for Model<B> {
-    type DefinitionError = Error;
-    fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        self.statics.text.state_layout()
-    }
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        self.statics.text.state_identity(state, topology)
-    }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Error> {
-        super::parallel::composite_parameter_description(&self.config).map_err(Error::backend)
-    }
-    fn static_parameter_recipes(
-        &self,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<
-        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-        String,
-    > {
-        super::checkpoint::module_source_recipes(&self.statics, source)
-    }
-    fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
-        &self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        self.statics.text.visit_static_parameters(visitor)?;
-        visitor.visit("vision_embedding", &self.statics.image_embedding)
-    }
-    fn visit_static_parameters_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+    fn run_unit<S, O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
         &mut self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        self.statics.text.visit_static_parameters_mut(visitor)?;
-        visitor.visit_mut("vision_embedding", &mut self.statics.image_embedding)
-    }
-}
-impl<B, S> LayeredArchitecture<B, S> for Model<B>
-where
-    B: DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    type Input<'a>
-        = PreparedCompositeInput<'a, B::Tensor, InputPartPlan>
-    where
-        Self: 'a;
-    type StaticModules = StaticModules<B>;
-    type Unit = Unit<B>;
-    type ForwardContext = ForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        <TextModel<B> as LayeredArchitecture<B, S>>::observation_hooks(&self.statics.text)
-    }
-    fn output_score_kind(
-        forward: &Self::ForwardContext,
-    ) -> Option<eredu_core::refinement::PredictionScoreKind> {
-        Some(forward.invocation.scores)
-    }
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        crate::nemotron_labs_diffusion::parallel::group_transport(group)
-    }
-    fn primary_execution_group(&self) -> &str {
-        crate::decoder::TEXT_DECODER_EXECUTION_GROUP
-    }
-    fn state_partition_plan(
-        &self,
-        layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(2, 0..layout.len()),
-        ])
-    }
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        Ok(super::parallel::composite_graph(&self.config)
-            .map_err(Error::backend)?
-            .0)
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self.config.vision.as_ref().unwrap().num_hidden_layers as usize),
-            1 => Ok(1),
-            2 => Ok(self.config.num_hidden_layers() as usize),
-            _ => Err(Error::backend("invalid image/text group")),
-        }
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend("unit outside image/text stack"));
-        }
-        Ok(if group == 0 {
-            format!("model.vision_tower.transformer.layers.{index}")
-        } else if group == 1 {
-            "model.multi_modal_projector".to_owned()
-        } else {
-            format!("model.layers.{index}")
-        })
-    }
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.statics
-    }
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.statics
-    }
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Error> {
-        <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        Ok(if group == 0 {
-            Unit::Vision(match &self.local_layout {
-                Some(layout) => ImageLayer::new_parallel(
-                    self.config.vision.as_ref().unwrap(),
-                    index,
-                    layout,
-                    context,
-                )?,
-                None => ImageLayer::new(self.config.vision.as_ref().unwrap(), index, context)?,
-            })
-        } else if group == 1 {
-            Unit::Projector(ImageProjector::new(&self.config, context)?)
-        } else {
-            Unit::Text(self.statics.text.construct_unit(index, context)?)
-        })
-    }
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        _: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.prepare(input, context)
-    }
-    fn begin_forward_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        _: &mut S,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Unit<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    ) -> Result<B::Tensor, Error>
     where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        S: LayerRuntimeState<B>,
+        S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
     {
-        let forward = self.prepare(input, context)?;
-        if let Some(hidden) = &forward.context.image_initial {
-            observer.observe("model.vision_tower.ln_pre.output", hidden)?;
+        let index = address.index();
+        match (address.group(), unit) {
+            (0, Unit::Vision(layer)) => layer.forward_observed(
+                hidden,
+                forward
+                    .image_state
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("image layer has no positions"))?,
+                parallel,
+                context,
+                observer,
+            ),
+            (1, Unit::Projector(projector)) => projector.finish_observed(
+                hidden,
+                forward
+                    .image_state
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("image projection has no positions"))?,
+                context,
+                observer,
+            ),
+            (2, Unit::Text(layer)) => {
+                let text = self.text()?;
+                let unit_address = text.definition().unit_address(0, index)?;
+                text.run_unit(
+                    unit_address,
+                    layer,
+                    hidden,
+                    state,
+                    forward
+                        .text
+                        .as_mut()
+                        .ok_or_else(|| Error::backend("text ingress has not completed"))?,
+                    parallel,
+                    context,
+                    observer,
+                )
+            }
+            _ => Err(Error::backend("unit has a different execution group")),
         }
-        Ok(forward)
     }
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        group == 2 || ((group == 0 || group == 1) && forward.image_state.is_some())
-    }
-    fn begin_execution_group(
+    fn begin_group_inner<S>(
         &mut self,
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
         state: &mut S,
-        forward: &mut Self::ForwardContext,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+    {
         match group {
             0 => Ok(forward.image_initial.as_ref().unwrap_or(initial).clone()),
             1 => Ok(dependencies
@@ -347,12 +326,10 @@ where
                     forward.image_output = Some((*output).clone());
                 }
                 let embedded = self
-                    .statics
-                    .text
-                    .static_modules_mut()
-                    .embed(&forward.tokens, context)?;
+                    .text()?
+                    .embed_tokens(&forward.tokens, parallel, context)?;
                 let hidden = assemble_embeddings(forward, &embedded, context)?;
-                let prepared = self.statics.text.begin_embedded(
+                let prepared = self.text()?.begin_embedded(
                     hidden,
                     None,
                     forward.invocation,
@@ -368,148 +345,95 @@ where
             }
         }
     }
-    fn state_ordinal(&self, group: usize, index: usize, ordinal: usize) -> usize {
-        if group == 2 {
-            index
-        } else {
-            ordinal
-        }
+}
+impl<B: DistributedNeuralBackend, R: CompositeResources<B>>
+    eredu_runtime::ComponentPinnedResources<B> for CompositeKernel<B, R>
+{
+    type Modules = R;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.statics
     }
-    fn retained_state_ordinals(
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.statics
+    }
+    fn visit_pinned<V: eredu_runtime::StaticParameterVisitor<B>>(
         &self,
-        group: usize,
-        index: usize,
-        _: usize,
-    ) -> std::ops::Range<usize> {
-        if group == 2 {
-            index..index + 1
-        } else {
-            0..0
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(text) = self.statics.text() {
+            text.visit_pinned(visitor)?;
         }
-    }
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.forward_unit_observed(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            context,
-            &mut eredu_runtime::NoopObserver,
-        )
-    }
-    fn forward_unit_observed<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error> {
-        match (group, unit) {
-            (0, Unit::Vision(layer)) => layer.forward_observed(
-                hidden,
-                forward
-                    .image_state
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("image layer has no positions"))?,
-                None,
-                context,
-                observer,
-            ),
-            (1, Unit::Projector(projector)) => projector.finish_observed(
-                hidden,
-                forward
-                    .image_state
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("image projection has no positions"))?,
-                context,
-                observer,
-            ),
-            (2, Unit::Text(layer)) => self.statics.text.forward_unit_observed(
-                0,
-                index,
-                layer,
-                hidden,
-                state,
-                forward
-                    .text
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("text ingress has not completed"))?,
-                context,
-                observer,
-            ),
-            _ => Err(Error::backend("unit has a different execution group")),
+        if let Some(image) = self.statics.image() {
+            visitor.visit("vision_embedding", image)?;
         }
+        Ok(())
     }
-    fn complete_execution_group(
+    fn visit_pinned_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
         &mut self,
-        group: usize,
-        hidden: &B::Tensor,
-        _: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if group == 1 && forward.image_state.is_some() {
-            forward.image_output = Some(hidden.clone());
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(text) = self.statics.text_mut() {
+            text.visit_pinned_mut(visitor)?;
         }
-        let _ = context;
-        Ok(hidden.clone())
+        if let Some(image) = self.statics.image_mut() {
+            visitor.visit_mut("vision_embedding", image)?;
+        }
+        Ok(())
     }
-    fn finish_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
+}
+impl<B: DistributedNeuralBackend, R: CompositeResources<B>> eredu_runtime::ComponentKernel<B>
+    for CompositeKernel<B, R>
+{
+    type Input<'a>
+        = PreparedCompositeInput<'a, B::Tensor, InputPartPlan>
+    where
+        Self: 'a;
+    type Unit = Unit<B>;
+    type ForwardContext = ForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
+    type Error = Error;
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
+        self.statics
+            .text()
+            .ok_or_else(|| Error::backend("stateless vision owner has no text cache identity"))?
+            .state_identity(state, topology)
+    }
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        super::checkpoint::module_source_recipes(&self.statics, source)
+    }
+    fn output_score_kind(
         forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_forward(
-            hidden,
-            state,
-            forward
-                .text
-                .as_ref()
-                .ok_or_else(|| Error::backend("text context is absent"))?,
-            context,
-        )
+    ) -> Option<eredu_core::refinement::PredictionScoreKind> {
+        Some(forward.invocation.scores)
     }
-    fn finish_forward_observed<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
+    fn build_unit(
+        &self,
+        address: eredu_runtime::ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_forward_observed(
-            hidden,
-            state,
-            forward
-                .text
-                .as_ref()
-                .ok_or_else(|| Error::backend("text context is absent"))?,
-            context,
-            observer,
-        )
+    ) -> Result<Self::Unit, Error> {
+        self.construct_unit(address.group(), address.index(), context)
     }
-    fn retained_context_values<'a>(
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        group == 2 || ((group == 0 || group == 1) && forward.image_state.is_some())
+    }
+    fn retained_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
+        _: eredu_runtime::ExecutionUnitAddress,
     ) -> Self::RetainedContextValues<'a> {
         let mut values = vec![&forward.tokens];
         values.extend(forward.image_initial.iter());
@@ -527,16 +451,147 @@ where
         values.into_iter()
     }
 }
-impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
+impl<B, S, R> eredu_runtime::ComponentEquations<B, S> for CompositeKernel<B, R>
 where
+    R: CompositeResources<B>,
+    B: DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+{
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
+    fn begin<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        _: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+        self.prepare(input, context)
+    }
+    fn begin_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        _: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let forward = self.prepare(input, context)?;
+        if let Some(hidden) = &forward.context.image_initial {
+            observer.observe("model.vision_tower.ln_pre.output", hidden)?;
+        }
+        Ok(forward)
+    }
+    fn begin_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.begin_group_inner(group, initial, dependencies, state, forward, None, context)
+    }
+    fn complete_group(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        _: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if group == 1 && (self.geometry.is_some() || forward.image_state.is_some()) {
+            forward.image_output = Some(hidden.clone());
+        }
+        let _ = context;
+        Ok(hidden.clone())
+    }
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.text()?.finish(
+            hidden,
+            state,
+            forward
+                .text
+                .as_ref()
+                .ok_or_else(|| Error::backend("text context is absent"))?,
+            context,
+        )
+    }
+    fn finish_observed<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error> {
+        self.text()?.finish_observed(
+            hidden,
+            state,
+            forward
+                .text
+                .as_ref()
+                .ok_or_else(|| Error::backend("text context is absent"))?,
+            context,
+            observer,
+        )
+    }
+    fn execute(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.run_unit(
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            None,
+            context,
+            &mut eredu_runtime::NoopObserver,
+        )
+    }
+    fn execute_observed<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error> {
+        self.run_unit(
+            address, unit, hidden, state, forward, None, context, observer,
+        )
+    }
+}
+impl<B, S, R> eredu_runtime::ParallelComponentKernel<B, S> for CompositeKernel<B, R>
+where
+    R: CompositeResources<B>,
     B: DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        <Self as LayeredArchitecture<B, S>>::observation_hooks(self)
+        <Self as eredu_runtime::ComponentEquations<B, S>>::observation_hooks(self)
     }
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         _: &mut S,
@@ -545,7 +600,21 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         self.prepare(input, context)
     }
-    fn begin_execution_group_parallel(
+    fn begin_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        _: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.begin_observed(input, state, context, observer)
+    }
+
+    fn begin_group_parallel(
         &mut self,
         group: usize,
         initial: &B::Tensor,
@@ -555,108 +624,17 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if group != 2 {
-            return self.begin_execution_group(
-                group,
-                initial,
-                dependencies,
-                state,
-                forward,
-                context,
-            );
-        }
-        if let Some(output) = dependencies.first() {
-            forward.image_output = Some((*output).clone());
-        }
-        let embedded = self.statics.text.static_modules_mut().embed_parallel(
-            &forward.tokens,
-            EmbeddingLookupPolicy::Strict,
-            parallel,
-            context,
-        )?;
-        let hidden = assemble_embeddings(forward, &embedded, context)?;
-        let prepared =
-            self.statics
-                .text
-                .begin_embedded(hidden, None, forward.invocation, state, context)?;
-        forward.text = Some(prepared.context);
-        Ok(prepared.hidden)
-    }
-    fn forward_unit_parallel(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.forward_unit_parallel_observed(
+        self.begin_group_inner(
             group,
-            index,
-            unit,
-            hidden,
+            initial,
+            dependencies,
             state,
             forward,
-            parallel,
+            Some(parallel),
             context,
-            &mut eredu_runtime::NoopObserver,
         )
     }
-    fn forward_unit_parallel_observed<
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    >(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error> {
-        match (group, unit) {
-            (0, Unit::Vision(layer)) => layer.forward_observed(
-                hidden,
-                forward
-                    .image_state
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("image layer has no positions"))?,
-                Some(parallel),
-                context,
-                observer,
-            ),
-            (1, Unit::Projector(projector)) => projector.finish_observed(
-                hidden,
-                forward
-                    .image_state
-                    .as_ref()
-                    .ok_or_else(|| Error::backend("image projection has no positions"))?,
-                context,
-                observer,
-            ),
-            (2, Unit::Text(layer)) => self.statics.text.forward_unit_parallel_observed(
-                0,
-                index,
-                layer,
-                hidden,
-                state,
-                forward
-                    .text
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("text ingress has not completed"))?,
-                parallel,
-                context,
-                observer,
-            ),
-            _ => Err(Error::backend("unit has a different execution group")),
-        }
-    }
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -664,7 +642,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_forward_parallel(
+        self.text()?.finish_parallel(
             hidden,
             state,
             forward
@@ -675,9 +653,7 @@ where
             context,
         )
     }
-    fn finish_forward_parallel_observed<
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    >(
+    fn finish_parallel_observed<O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized>(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -686,7 +662,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, Error> {
-        self.statics.text.finish_forward_parallel_observed(
+        if !R::OBSERVED_PARALLEL_READOUT {
+            return self.finish_parallel(hidden, state, forward, parallel, context);
+        }
+        self.text()?.finish_parallel_observed(
             hidden,
             state,
             forward
@@ -698,6 +677,51 @@ where
             observer,
         )
     }
+    fn execute_parallel(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.run_unit(
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            Some(parallel),
+            context,
+            &mut eredu_runtime::NoopObserver,
+        )
+    }
+    fn execute_parallel_observed<
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    >(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error> {
+        self.run_unit(
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            Some(parallel),
+            context,
+            observer,
+        )
+    }
 }
 impl<B, S> CompositeArchitecture<B, S> for Model<B>
 where
@@ -705,6 +729,19 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
+    fn prepared_input<'a>(
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    ) -> Self::Input<'a> {
+        input
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        Some(*input)
+    }
+
     type InputPartPlan = InputPartPlan;
     type PrefillRequest = SingleCompositePrefillRequest<B::Tensor, InputPartPlan>;
     type AdmissionConfig = FamilyConfig;
@@ -738,7 +775,7 @@ where
         SingleCompositePrefillRequest::new(prepared, admitted)
     }
     fn admission_config(&self) -> FamilyConfig {
-        self.config.clone()
+        self.kernel().config.clone()
     }
     fn prepared_prediction_token_ids(
         input: PreparedCompositeInput<'_, B::Tensor, InputPartPlan>,
@@ -773,26 +810,7 @@ where
                     .iter()
                     .any(|part| matches!(part, InputPartPlan::Image { native: true, .. })))
     }
-    fn begin_composite_forward<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward(input, state, context)
-    }
-    fn begin_composite_forward_observed<'a, O>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.begin_forward_observed(input, state, context, observer)
-    }
+
     fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
         forward.text.is_none()
     }
@@ -807,7 +825,7 @@ where
                     1,
                     i32::try_from(input.admitted().decoder_positions())
                         .map_err(|_| "decoder extent exceeds i32")?,
-                    self.config.hidden_size(),
+                    self.kernel().config.hidden_size(),
                 ],
             }]
         } else {
@@ -829,8 +847,8 @@ where
         if group == 2 {
             let sequence = i32::try_from(input.admitted().decoder_positions())
                 .map_err(|_| "decoder sequence exceeds i32")?;
-            let width = self.config.hidden_size();
-            let vocabulary = self.config.vocabulary_size() as usize;
+            let width = self.kernel().config.hidden_size();
+            let vocabulary = self.kernel().config.vocabulary_size() as usize;
             let counts = (0..tensor_partitions)
                 .map(|rank| {
                     eredu_core::balanced_contiguous_range(
@@ -843,7 +861,7 @@ where
                     .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let last = self.config.num_hidden_layers() as usize;
+            let last = self.kernel().config.num_hidden_layers() as usize;
             return Ok(Some(stage_units.iter().map(|range| {
                 let mut operations = Vec::new();
                 if !range.is_empty() && range.start == 0 {
@@ -852,7 +870,7 @@ where
                 for _ in range.clone() {
                     operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, width] });
                     if input.attention_invocation().is_some_and(|invocation| invocation.adapters == eredu_core::decoding::AdapterScope::Draft) {
-                        if let Some(adapter) = self.config.draft_adapter() {
+                        if let Some(adapter) = self.kernel().config.draft_adapter() {
                             operations.push(crate::composite_execution::CompositeTensorCollective::Sum { shape: vec![1, sequence, adapter.rank()] });
                         }
                     }
@@ -872,6 +890,7 @@ where
         }
         let patches = native_patch_positions(input)?;
         let vision = self
+            .kernel()
             .config
             .vision
             .as_ref()
@@ -909,7 +928,7 @@ where
                         grid, native: true, ..
                     } => Some(
                         (grid.0 as u64) * (grid.1 as u64)
-                            / u64::from(self.config.spatial_merge_size).pow(2),
+                            / u64::from(self.kernel().config.spatial_merge_size).pow(2),
                     ),
                     _ => None,
                 })
@@ -955,7 +974,7 @@ where
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
         resolve_group_boundary(
-            &self.config,
+            &self.kernel().config,
             source,
             destination,
             selected,
@@ -973,8 +992,13 @@ where
             return Ok(None);
         }
         let patches = native_patch_positions(input)?;
-        Ok((patches > 0)
-            .then_some((patches, self.config.vision.as_ref().unwrap().hidden_size).into()))
+        Ok((patches > 0).then_some(
+            (
+                patches,
+                self.kernel().config.vision.as_ref().unwrap().hidden_size,
+            )
+                .into(),
+        ))
     }
 }
 impl<B, S> ParallelCompositeArchitecture<B, S> for Model<B>
@@ -983,30 +1007,7 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
-        self.begin_forward_parallel(input, state, parallel, context)
-    }
-    fn begin_composite_forward_parallel_observed<'a, O>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, InputPartPlan>,
-        state: &mut S,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.begin_forward_observed(input, state, context, observer)
-    }
 }
-
 fn native_patch_positions<T: eredu_nn::Tensor>(
     input: PreparedCompositeInput<'_, T, InputPartPlan>,
 ) -> Result<i32, String> {
@@ -1292,16 +1293,16 @@ fn resolve_group_boundary(
         .map_err(Error::backend)
 }
 
-impl<B, S> eredu_runtime::RoutedLayeredArchitecture<B, S> for Model<B>
+impl<B, S, R> eredu_runtime::RoutedComponentKernel<B, S> for CompositeKernel<B, R>
 where
+    R: CompositeResources<B>,
     B: eredu_nn::GroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn forward_unit_with_provider<P>(
+    fn execute_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -1314,6 +1315,83 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.forward_unit(group, index, unit, hidden, state, forward, context)
+        self.execute(address, unit, hidden, state, forward, context)
+    }
+}
+
+impl<B: DistributedNeuralBackend> CompositeKernel<B> {
+    /// Materializes declared complete composite resources.
+    pub fn from_definition(
+        config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        let definition = super::definition::select_composite(
+            &config,
+            definition,
+            &crate::decoder::state_layout(&config)?,
+            None,
+        )?;
+        let image_embedding = ImageEmbedding::new(&config, context)?;
+        let text_definition = super::definition::text_from_composite(&definition)?;
+        let text = TextKernel::from_definition(config.clone(), text_definition, context)?
+            .into_parts()
+            .1;
+        let kernel = Self {
+            config,
+            definition: definition.clone(),
+            statics: StaticModules {
+                text,
+                image_embedding,
+            },
+            local_layout: None,
+            geometry: None,
+            backend: std::marker::PhantomData,
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
+    }
+    /// Materializes declared complete composite resources.
+    pub fn from_parallel_definition(
+        config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        layout: eredu_runtime::LocalModelLayout,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        let geometry = crate::decoder::local_geometry(&config, &layout, |config, index, layout| {
+            config
+                .local_block_config(index, layout)
+                .map_err(|e| eredu_runtime::ParallelPlanError::InvalidGroup(e.to_string()))
+        })
+        .map_err(Error::backend)?;
+        let definition = super::definition::select_composite(
+            &config,
+            definition,
+            geometry.state_layout(),
+            Some(&layout),
+        )?;
+        let image_embedding = ImageEmbedding::new(&config, context)?;
+        let text_definition = super::definition::text_from_composite(&definition)?;
+        let text = TextKernel::from_parallel_definition(
+            config.clone(),
+            text_definition,
+            geometry,
+            context,
+        )?
+        .into_parts()
+        .1;
+        let kernel = Self {
+            config,
+            definition: definition.clone(),
+            statics: StaticModules {
+                text,
+                image_embedding,
+            },
+            local_layout: Some(layout),
+            geometry: None,
+            backend: std::marker::PhantomData,
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
     }
 }

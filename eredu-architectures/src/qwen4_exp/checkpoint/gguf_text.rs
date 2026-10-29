@@ -3,7 +3,7 @@
 use super::recipes::ParameterScope;
 use crate::qwen4_exp::{
     config::{Config, LayerKind},
-    prepared::{PreparationError, PreparedParameters},
+    prepared::PreparationError,
 };
 use eredu_checkpoint::{
     gguf_store::GgufCatalog,
@@ -19,6 +19,7 @@ use eredu_checkpoint::{
     LinearFormat,
 };
 use eredu_gguf::{Checkpoint, QuantizedTensorRepresentation};
+use eredu_runtime::PreparedParameterRecipes;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -824,24 +825,24 @@ impl GgufTextPlan {
             ));
         }
         let bank = self.expert_bank_recipes(layer)?;
+        let selection = TensorSelection::Range {
+            axis: 0,
+            start: expert,
+            end: expert + 1,
+        };
         let recipes = bank
             .iter()
             .map(|(name, recipe)| {
-                Ok((
-                    name.clone(),
-                    recipe
-                        .select_bounded(
-                            &self.catalog,
-                            eredu_checkpoint::store::TensorSelection::Range {
-                                axis: 0,
-                                start: expert,
-                                end: expert + 1,
-                            },
-                        )
-                        .map_err(|e| PreparationError::Contract(e.to_string()))?,
-                ))
+                eredu_runtime::select_parameter_recipe(
+                    &self.catalog,
+                    name,
+                    recipe,
+                    Some(std::slice::from_ref(&selection)),
+                )
+                .map(|recipe| (name.clone(), recipe))
+                .map_err(PreparationError::from)
             })
-            .collect::<Result<_, PreparationError>>()?;
+            .collect::<Result<_, _>>()?;
         self.validate_recipes(recipes)
     }
     pub(in crate::qwen4_exp) fn expert_bank_recipes(
@@ -903,18 +904,25 @@ impl GgufTextWeights {
     pub fn parameters(
         &self,
         scope: ParameterScope,
-    ) -> Result<PreparedParameters, PreparationError> {
-        PreparedParameters::new(self.source.clone(), self.plan.parameter_recipes(scope)?)
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
+            self.source.clone(),
+            self.plan.parameter_recipes(scope)?,
+        )
+        .map_err(PreparationError::from)
     }
     /// One bounded expert selection with all exact companions.
     pub fn expert(
         &self,
         layer: usize,
         expert: usize,
-    ) -> Result<PreparedParameters, PreparationError> {
-        PreparedParameters::new(
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
             self.source.clone(),
             self.plan.expert_recipes(layer, expert)?,
         )
+        .map_err(PreparationError::from)
     }
 }

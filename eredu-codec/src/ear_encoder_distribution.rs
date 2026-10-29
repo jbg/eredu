@@ -1,6 +1,5 @@
 //! Cold finite encoder stage, source and transport authority.
 use crate::{
-    ear_encoder_layered::encoder_parameter_description,
     ear_encoder_partition::{
         validate_encoder_partition, EncoderBoundarySchema, EncoderPipelineCuts,
     },
@@ -9,26 +8,9 @@ use crate::{
 use eredu_core::CollectiveGroupId;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
-    PartitionExecutionError, PartitionedExecutionPlan, PipelineActivationDtype,
+    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
     PipelineBindingError,
 };
-
-/// Invalid retained encoder geometry or communication selection, before native allocation.
-#[derive(Debug, thiserror::Error)]
-pub enum EncoderPipelinePreparationError {
-    /// Codec-owned geometry, state or boundary validation failed.
-    #[error(transparent)]
-    Encoder(#[from] crate::Error),
-    /// Shared pipeline authority or completion validation failed.
-    #[error(transparent)]
-    Communication(#[from] PartitionExecutionError),
-    /// The tensor cohort cannot propagate local preparation or lease failures.
-    #[error(transparent)]
-    LocalAgreement(#[from] eredu_runtime::PipelineLocalAgreementError),
-    /// The selected source, stage or route contract differs from encoder ownership.
-    #[error("invalid EAR encoder pipeline selection: {0}")]
-    Contract(&'static str),
-}
 
 /// Exact source recipes, global cuts and distributed authority for one finite stage.
 /// This does not select the surrounding waveform preparation or conversational scheduler.
@@ -52,21 +34,26 @@ impl PreparedEncoderPipelineBindings {
         plan: PartitionedExecutionPlan,
         tensor_group: Option<CollectiveGroupId>,
         activation_dtype: PipelineActivationDtype,
-    ) -> Result<Self, EncoderPipelinePreparationError> {
-        use EncoderPipelinePreparationError::Contract;
+    ) -> Result<Self, ComponentPipelinePreparationError<crate::Error>> {
+        let contract = |reason| ComponentPipelinePreparationError::Contract {
+            component: "EAR encoder",
+            reason,
+        };
         validate_encoder_partition(
+            bindings.definition(),
             bindings.config(),
             bindings.prefix(),
             bindings.local_layout(),
             &partition,
-        )?;
+        )
+        .map_err(ComponentPipelinePreparationError::Component)?;
         if cuts.config() != bindings.config()
             || activation_dtype != PipelineActivationDtype::Float32
         {
-            return Err(Contract("encoder cuts or F32 activation precision differ"));
+            return Err(contract("encoder cuts or F32 activation precision differ"));
         }
         eredu_runtime::validate_component_pipeline_ranges(
-            bindings.config().unit_specs()?.len(),
+            bindings.definition().parameters().unit_layout().len(),
             partition.groups()[0].global_units(),
             0,
             cuts.routes(),
@@ -74,20 +61,11 @@ impl PreparedEncoderPipelineBindings {
             &plan,
             tensor_group,
         )
-        .map_err(|error| match error {
-            PipelineBindingError::Communication(error) => {
-                EncoderPipelinePreparationError::Communication(error)
-            }
-            PipelineBindingError::LocalAgreement(error) => {
-                EncoderPipelinePreparationError::LocalAgreement(error)
-            }
-            PipelineBindingError::Contract(message) => Contract(message),
-        })?;
-        let description = encoder_parameter_description(bindings.config(), bindings.prefix())?;
+        .map_err(|error| error.into_preparation("EAR encoder"))?;
         eredu_runtime::validate_component_pipeline(
-            &description,
+            bindings.definition().parameters(),
             &partition,
-            bindings.unit_bindings().iter().map(|(address, _)| *address),
+            bindings.unit_bindings().map(|(address, _)| address),
             None,
             bindings.local_layout(),
             &manifest,
@@ -104,15 +82,7 @@ impl PreparedEncoderPipelineBindings {
                     .map_err(|_| PipelineBindingError::Contract("invalid encoder route geometry"))
             },
         )
-        .map_err(|error| match error {
-            PipelineBindingError::Communication(error) => {
-                EncoderPipelinePreparationError::Communication(error)
-            }
-            PipelineBindingError::LocalAgreement(error) => {
-                EncoderPipelinePreparationError::LocalAgreement(error)
-            }
-            PipelineBindingError::Contract(message) => Contract(message),
-        })?;
+        .map_err(|error| error.into_preparation("EAR encoder"))?;
         Ok(Self {
             bindings,
             partition,

@@ -396,9 +396,12 @@ fn local_spec(
 /// Finite resident encoder using the shared ordered-unit traversal.
 pub struct NeuralEncoder<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        crate::ear_encoder_layered::EncoderArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            crate::ear_encoder_layered::EncoderKernel<B>,
+        >,
         B,
-        crate::ear_encoder_layered::EncoderRuntimeState,
+        eredu_runtime::StatelessComponentState,
     >,
 }
 impl<B: NeuralBackend> std::fmt::Debug for NeuralEncoder<B> {
@@ -465,17 +468,15 @@ impl<B: NeuralBackend> NeuralEncoder<B> {
                 "EAR encoder units do not match configured order, namespace and geometry",
             ));
         }
-        let architecture = crate::ear_encoder_layered::EncoderArchitecture::new(config, &prefix)?;
+        let architecture =
+            crate::ear_encoder_layered::EncoderKernel::new(config, &prefix)?.into_component()?;
         let runtime = eredu_runtime::ResidentRuntime::from_units(architecture, vec![units])
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                _ => invalid("EAR encoder resident unit count mismatch"),
-            })?;
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?;
         Ok(Self { runtime })
     }
     /// Exact finite encoder geometry.
     pub fn config(&self) -> &EncoderConfig {
-        self.runtime.architecture().config()
+        self.runtime.architecture().kernel().config()
     }
     /// Individually executable finite layers in canonical order.
     pub fn units(&self) -> &[EncoderUnit<B::Tensor>] {
@@ -504,7 +505,7 @@ impl<B: NeuralBackend> crate::ear_encoder_layered::EncoderExecution<B> for Neura
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         use eredu_runtime::LayeredInvocation;
-        let mut state = crate::ear_encoder_layered::EncoderRuntimeState::new()?;
+        let mut state = eredu_runtime::StatelessComponentState::new()?;
         self.runtime.invoke(spectrum, &mut state, context)
     }
 }

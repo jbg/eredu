@@ -574,6 +574,7 @@ where
     architecture: A,
     policy: P,
     addresses: Vec<crate::ExecutionUnitAddress>,
+    canonical_layout: crate::ExecutionUnitLayout,
     parallel: Option<B::ParallelContext>,
     local_agreement: Option<eredu_core::CollectiveGroupId>,
     allocator: F,
@@ -665,11 +666,8 @@ where
                 "a pipeline chain ingress cannot merge multiple graph dependencies",
             ));
         }
-        let counts = (0..graph.groups().len())
-            .map(|group| architecture.group_unit_count(group))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(eredu_nn::Error::backend_source)?;
-        let canonical_layout = crate::ExecutionUnitLayout::new(&graph, counts)
+        let canonical_layout = architecture
+            .execution_unit_layout()
             .map_err(eredu_nn::Error::backend_source)?;
         canonical_layout
             .select(addresses.iter().copied())
@@ -682,12 +680,12 @@ where
                 next.index() == previous.index() + 1
             } else {
                 graph.dependencies(next.group()) == Some(&[previous.group()][..])
-                    && previous.index() + 1
-                        == canonical_layout
-                            .group_range(previous.group())
-                            .unwrap()
-                            .len()
-                    && next.index() == 0
+                    && canonical_layout
+                        .address(canonical_layout.group_range(previous.group()).unwrap().end - 1)
+                        == Some(*previous)
+                    && canonical_layout
+                        .address(canonical_layout.group_range(next.group()).unwrap().start)
+                        == Some(*next)
             };
             if !contiguous {
                 return Err(eredu_nn::Error::backend(
@@ -699,6 +697,7 @@ where
             architecture,
             policy,
             addresses,
+            canonical_layout,
             parallel,
             local_agreement: None,
             allocator,
@@ -1013,21 +1012,16 @@ where
                 communication_executor,
             )?;
             let prepared: Result<_, A::Error> = (|| {
-                let path = architecture.unit_path(address.group(), address.index())?;
-                let unit_boundaries =
-                    architecture.observes_unit_boundaries(address.group(), address.index());
-                let unit_input = if unit_boundaries {
+                let boundaries =
+                    architecture.unit_observation_boundaries(address.group(), address.index())?;
+                let unit_input = if boundaries.is_kernel_owned() {
                     None
                 } else {
-                    Some(crate::observe_and_intervene(
-                        observer,
-                        &format!("{path}.input"),
-                        &forward.hidden,
-                    )?)
+                    boundaries.observe_input(observer, &forward.hidden)?
                 };
-                Ok((path, unit_boundaries, unit_input))
+                Ok((boundaries, unit_input))
             })();
-            let (path, unit_boundaries, unit_input) = agree_pipeline_local(
+            let (boundaries, unit_input) = agree_pipeline_local(
                 communication,
                 local_agreement,
                 3,
@@ -1066,10 +1060,12 @@ where
                         )
                         .map_err(pipeline_backend_source::<A::Error>)?;
                 }
-                forward.hidden = if unit_boundaries {
+                forward.hidden = if boundaries.is_kernel_owned() {
                     unit_output
                 } else {
-                    crate::observe_and_intervene(observer, &format!("{path}.output"), &unit_output)?
+                    boundaries
+                        .observe_output(observer, &unit_output)?
+                        .unwrap_or(unit_output)
                 };
                 let mut state_values = Vec::new();
                 for state_ordinal in architecture.partition_retained_state_ordinals(
@@ -1253,8 +1249,8 @@ where
                 )),
             }
         } else {
-            std::iter::once(schema.primary())
-                .chain(schema.auxiliary())
+            schema
+                .tensors()
                 .map(|spec| {
                     let tensor = self.allocator.tensor_placeholder(
                         spec.shape(),
@@ -1302,10 +1298,7 @@ where
                 "resolved pipeline boundary differs from its typed route declaration",
             ));
         }
-        for (declared, concrete) in std::iter::once(typed.primary())
-            .chain(typed.auxiliary())
-            .zip(std::iter::once(resolved.primary()).chain(resolved.auxiliary()))
-        {
+        for (declared, concrete) in typed.tensors().zip(resolved.tensors()) {
             if declared.role() != concrete.role() || declared.dtype() != concrete.dtype()
                 || declared.shape().len() != concrete.shape().len()
                 || declared.shape().iter().zip(concrete.shape()).any(|(symbolic, extent)| {
@@ -1397,8 +1390,13 @@ where
             .addresses
             .last()
             .expect("validated pipeline partition has a local unit");
-        let owns_output =
-            address.index() + 1 == self.architecture.group_unit_count(address.group())?;
+        let owns_output = self.canonical_layout.address(
+            self.canonical_layout
+                .group_range(address.group())
+                .expect("validated pipeline group")
+                .end
+                - 1,
+        ) == Some(*address);
         if owns_output {
             Ok(None)
         } else {

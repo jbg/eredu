@@ -305,13 +305,14 @@ fn main() -> anyhow::Result<()> {
             }
             if capture.output.is_some() {
                 let normalized =
-                    NormalizationOperator::forward(&mut block.input_norm, &hidden, &stream)?;
+                    NormalizationOperator::forward(&mut block.body.input_norm, &hidden, &stream)?;
                 capture.values.insert(
                     format!("layers.{step}.{layer}.input_norm"),
                     normalized.as_array().as_dtype(Dtype::Float32, &stream)?,
                 );
             }
-            hidden = block.forward_routed(
+            hidden = block.body.forward_routed(
+                block.output_norm.as_mut(),
                 layer,
                 decoder::AttentionInput {
                     selected_positions: None,

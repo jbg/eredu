@@ -8,9 +8,7 @@ use crate::nemotron_h::{self, ModelArgs};
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype, RecipeError},
     store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
-    validation::{
-        validate_safetensors_plan, CatalogTensorMetadata, SafetensorsCatalog, StrictLoadFailure,
-    },
+    validation::{validate_safetensors_plan, CatalogTensorMetadata, StrictLoadFailure},
     StoredDtype,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -34,6 +32,9 @@ pub enum BackbonePreparationError {
     /// Retained recipe metadata cannot be evaluated.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
+    /// Shared canonical component preparation failed.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentPreparationError),
     /// Exact source restriction failed.
     #[error(transparent)]
     Source(#[from] StoreError),
@@ -47,10 +48,19 @@ pub enum BackbonePreparationError {
 #[derive(Clone)]
 pub struct PreparedBackboneParameters {
     args: ModelArgs,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
     source: SharedCheckpointSource,
     parameters: BTreeMap<String, ParameterAdmission>,
 }
 impl PreparedBackboneParameters {
+    fn define(
+        args: &ModelArgs,
+    ) -> Result<Arc<eredu_runtime::ComponentDefinition>, BackbonePreparationError> {
+        nemotron_h::component_definition(args, None)
+            .map(Arc::new)
+            .map_err(|error| BackbonePreparationError::Configuration(error.to_string()))
+    }
+
     /// Selects encoded recipes before parameter pool admission and module construction.
     pub fn with_quantization(
         mut self,
@@ -88,6 +98,7 @@ impl PreparedBackboneParameters {
             &eligible,
             RecipeDtype::F32,
         )?;
+        self.definition = Self::define(&args)?;
         self.args = args;
         self.source = source;
         self.parameters = parameters;
@@ -175,7 +186,7 @@ impl PreparedBackboneParameters {
         }
         let plan =
             nemotron_h::safetensors_plan(&args).map_err(BackbonePreparationError::Configuration)?;
-        validate_safetensors_plan(&OutputCatalog(catalog), &plan).into_loader_result()?;
+        validate_safetensors_plan(&catalog, &plan).into_loader_result()?;
         let inputs = parameters
             .values()
             .flat_map(|parameter| {
@@ -192,6 +203,7 @@ impl PreparedBackboneParameters {
             inputs,
         )?);
         Ok(Self {
+            definition: Self::define(&args)?,
             args,
             source,
             parameters,
@@ -234,18 +246,6 @@ impl PreparedBackboneParameters {
             .filter(|(name, _)| name.starts_with(&prefix))
             .map(|(name, value)| (name.clone(), value.recipe.clone()))
             .collect())
-    }
-}
-
-struct OutputCatalog(BTreeMap<String, CatalogTensorMetadata>);
-
-impl SafetensorsCatalog for OutputCatalog {
-    fn keys(&self) -> Vec<String> {
-        self.0.keys().cloned().collect()
-    }
-
-    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
-        self.0.get(key).cloned().ok_or_else(|| key.into())
     }
 }
 

@@ -81,7 +81,7 @@ fn stack(
         hidden_size: config.hidden_size as u64,
         vocabulary_size: config.vocab_size as u64,
         layers,
-        output: super::model::static_module_spec(config).output_topology()?,
+        output: super::static_module_spec(config).output_topology()?,
         output_invocations: 1,
         output_softcap: false,
         selected_parameter_promotion_bytes: None,

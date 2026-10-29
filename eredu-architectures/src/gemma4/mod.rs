@@ -37,9 +37,10 @@ pub use ingress::{
 };
 pub use media::ModalityProjector;
 pub use model::{
-    prepare_composite_ingress, DecoderInputPart, ForwardContext, LayeredModel, ModelInput,
-    PreparedCompositeIngress, StaticModules, TextBoundary, TextBoundarySchema, Unit,
-    AUDIO_EXECUTION_GROUP, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    component_definition, parameter_description, prepare_composite_ingress, DecoderInputPart,
+    ForwardContext, GemmaKernel, LayeredModel, ModelInput, PreparedCompositeIngress, StaticModules,
+    TextBoundary, TextBoundarySchema, Unit, AUDIO_EXECUTION_GROUP, TEXT_EXECUTION_GROUP,
+    VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
@@ -57,11 +58,51 @@ pub use vision::{
     VisionState, VisionStatic, VisionTower,
 };
 
+/// Ordinary pinned text semantics shared by catalogs and native construction.
+pub(crate) fn static_construction_specs(
+    args: &ModelArgs,
+) -> Result<crate::decoder::StaticModuleConstruction, eredu_nn::Error> {
+    use eredu_nn::{
+        EmbeddingSpec, Error, LinearSpec, NormalizationConstructionSpec, ParameterSpec,
+    };
+    let embedding_weight = "model.language_model.embed_tokens.weight";
+    let head_weight = "lm_head.weight";
+    let embedding = EmbeddingSpec {
+        vocabulary: args.vocab_size,
+        dimensions: args.hidden_size,
+        weight: ParameterSpec::trainable(embedding_weight).map_err(Error::backend)?,
+        format: crate::linear_format::standard_linear_format(
+            embedding_weight,
+            args.linear_format_for(embedding_weight),
+        )?,
+    };
+    let head = (!args.tie_word_embeddings)
+        .then(|| -> Result<_, Error> {
+            Ok(LinearSpec {
+                input: args.hidden_size,
+                output: args.vocab_size,
+                weight: ParameterSpec::trainable(head_weight).map_err(Error::backend)?,
+                bias: None,
+                format: crate::linear_format::standard_linear_format(
+                    head_weight,
+                    args.linear_format_for(head_weight),
+                )?,
+            })
+        })
+        .transpose()?;
+    let normalization = NormalizationConstructionSpec::learned(
+        args.hidden_size,
+        args.rms_norm_eps,
+        ParameterSpec::trainable("model.language_model.norm.weight").map_err(Error::backend)?,
+    );
+    crate::decoder::StaticModuleConstruction::new(embedding, head, normalization)
+}
+
 /// Derives complete expert ownership and rank-local bank geometry from Gemma 4.
 pub fn expert_realization_plan<
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 >(
-    architecture: &LayeredModel<B>,
+    architecture: &GemmaKernel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {

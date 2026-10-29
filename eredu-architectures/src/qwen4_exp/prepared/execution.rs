@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     capability::CapabilityEstimate,
-    qwen4_exp::target::TargetModel,
+    qwen4_exp::target::{TargetKernel, TargetModel},
     routed_text::{
         prepare_routed_architecture_handoff, select_routed_text_realization,
         validate_selected_routed_handoff, RoutedTextArchitectureVisitor, RoutedTextDispatchError,
@@ -250,12 +250,12 @@ impl SelectedTargetExecution {
         let Self { plan, selected, .. } = self;
         validate_selected_routed_handoff(&plan.requirements, &selected)
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
-        let execution_source = crate::replicated_text::restrict_store_handoff(
+        let execution_source = eredu_runtime::restrict_checkpoint_handoff(
             plan.requirements.text(),
             plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(PreparationError::Contract)?;
+        .map_err(|handoff| PreparationError::Contract(handoff.to_string()))?;
         let spec = plan
             .target
             .selected_spec(&selected)
@@ -263,15 +263,18 @@ impl SelectedTargetExecution {
         let spec = plan.target.bind_spec(spec)?;
         let identity = spec.state_fingerprint().to_owned();
         construction_started();
-        let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
+        let source_architecture = selected
+            .text()
+            .uses_weight_transform()
             .then(|| {
-                plan.target
-                    .bound_spec()
-                    .and_then(|bound| TargetModel::<B>::new(bound, context))
+                plan.target.bound_spec().and_then(|bound| {
+                    TargetKernel::<B>::new(bound, context).and_then(TargetKernel::into_model)
+                })
             })
             .transpose()
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
-        let architecture = TargetModel::<B>::new(spec, context)
+        let architecture = TargetKernel::<B>::new(spec, context)
+            .and_then(TargetKernel::into_model)
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
         let prepared = prepare_routed_architecture_handoff::<B, S, _>(
             architecture,
@@ -327,10 +330,8 @@ pub(super) fn target_spec_from_formats(
 ) -> Result<TargetSpec, Error> {
     use crate::routed_text::RoutedGroupedPlan;
     let formats = selected.map(|selected| {
-        crate::replicated_text::selected_matrix_formats(
-            selected.text().requirements(),
-            selected.text(),
-        )
+        let text = selected.text();
+        text.matrix_formats_for(text.requirements())
     });
     let experts = selected
         .map(|selected| {

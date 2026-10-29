@@ -16,18 +16,16 @@ mod qwen4_exp;
 
 use eredu_nn::{AttentionCache, AuxiliaryConvolutionState, Tensor};
 use eredu_runtime::{
-    derive_partitioned_local_layout, ArchitectureParameters, ArchitecturePartition,
-    LocalModelLayout, PartitionedLayeredArchitecture, ReplicatedTextMaterializationTask,
-    RuntimeStateComponents,
+    derive_partitioned_local_layout, ArchitecturePartition, LocalModelLayout,
+    PartitionedLayeredArchitecture, ReplicatedTextMaterializationTask, RuntimeStateComponents,
 };
 
 use crate::partitioned_execution::{
     prepare_partitioned, PreparedPartitionedAdmission, SelectedPartitionedAdmission,
 };
 use crate::replicated_text::{
-    composite_config, qwen_hybrid_composite_with_formats, qwen_vl_with_formats, selected_formats,
-    selected_matrix_formats, CompositeConfig, CompositeTextRequirements,
-    SelectedCompositeTextRealization,
+    composite_config, qwen_hybrid_composite_with_formats, qwen_vl_with_formats, CompositeConfig,
+    CompositeTextRequirements, SelectedCompositeTextRealization,
 };
 
 /// Architecture-owned production decision for one selected composite partition.
@@ -1051,15 +1049,8 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
         F: FnOnce(
-            eredu_runtime::PartitionedSessionFactoryInput<
-                crate::composite_execution::PreparedCompositeArchitecture<A>,
-                G,
-                W,
-            >,
-            Option<(
-                Box<crate::composite_execution::PreparedCompositeArchitecture<A>>,
-                LocalModelLayout,
-            )>,
+            eredu_runtime::PartitionedSessionFactoryInput<A, G, W>,
+            Option<(Box<A>, LocalModelLayout)>,
             LocalModelLayout,
             PreparedCompositeExecutorPlan,
             &eredu_runtime::SelectedReplicatedTextRealization,
@@ -1093,8 +1084,7 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
         let (architecture, selected) = prepared.into_parts();
         let topology_rank = selected.topology();
         let (base, partition, communication) = selected.into_parts();
-        let architecture =
-            crate::composite_execution::PreparedCompositeArchitecture::new(architecture);
+        let architecture = architecture;
         let parameters = architecture
             .parameter_description(context)
             .map_err(|error| {
@@ -1110,21 +1100,22 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
         }
         let source_architecture = source_architecture
             .map(|(source, source_layout)| {
-                let source = Box::new(
-                    crate::composite_execution::PreparedCompositeArchitecture::new(*source),
-                );
+                let source = Box::new(*source);
                 let source_parameters = source.parameter_description(context).map_err(|error| {
                     eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
                 })?;
                 if source_parameters.graph() != parameters.graph()
                     || source_parameters.unit_layout() != parameters.unit_layout()
-                    || crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                    || eredu_runtime::derive_partitioned_transform_source_layout(
                         &source_parameters,
                         &parameters,
                         topology_rank,
                     )
-                    .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?
-                        != source_layout
+                    .map_err(|error| {
+                        eredu_runtime::PartitionedSessionPreparationError::Contract(
+                            error.to_string(),
+                        )
+                    })? != source_layout
                 {
                     return Err(eredu_runtime::PartitionedSessionPreparationError::Contract(
                         "composite transform source changed its layout or execution-unit addresses"
@@ -1190,10 +1181,7 @@ where
             + 'static,
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
-        P: crate::prediction_extension::PreparedRoutedPrediction<
-            B,
-            crate::composite_execution::PreparedCompositeArchitecture<A>,
-        >,
+        P: crate::prediction_extension::PreparedRoutedPrediction<B, A>,
     {
         Err(CompositePartitionPreparationError::Architecture(
             "retained composite partition prediction binding is unavailable".into(),
@@ -1233,7 +1221,9 @@ where
     fn visit<A, G, W>(
         self,
         prepared: PreparedCompositePartition<A, G, W>,
-        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::ParallelCompositeArchitecture<B, S, Error = eredu_nn::Error>
@@ -1241,8 +1231,7 @@ where
             + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
             + 'static,
         A::Error: std::fmt::Display,
-        crate::composite_execution::PreparedCompositeArchitecture<A>:
-            crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A: crate::prediction_extension::MaterializedPredictionTarget<B>,
         W: eredu_runtime::ArchitectureBoundary;
 }
 
@@ -1576,11 +1565,18 @@ where
     use crate::nemotron_labs_diffusion::{composite::partition, partitioned::TextBoundarySchema};
     let error = |message: String| CompositePartitionPreparationError::Architecture(message);
     let args = source
-        .with_checkpoint_formats(selected_formats(selected.base().execution()))
+        .with_checkpoint_formats(selected.base().execution().quantized_formats())
         .map_err(|e| error(e.to_string()))?;
-    let parameters =
-        crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&args)
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| error("composite selection has no retained definition".into()))?;
+    let definition =
+        crate::nemotron_labs_diffusion::definition::project_composite_parameters(&args, &retained)
             .map_err(|e| error(e.to_string()))?;
+    let parameters = definition.parameters().clone();
     let layout = derive_partitioned_local_layout(&parameters, selected.requirements().topology())
         .map_err(error)?;
     let range = |name: &str| {
@@ -1599,45 +1595,93 @@ where
         range(crate::decoder::TEXT_DECODER_EXECUTION_GROUP),
     )
     .map_err(|e| error(e.to_string()))?;
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        selected
-            .requirements()
-            .groups()
-            .iter()
-            .map(|group| (group.group().as_str(), group.units())),
-        selected.requirements().ownership().clone(),
+    let definition = crate::nemotron_labs_diffusion::definition::select_composite(
+        &args,
+        definition,
         geometry.complete_state(),
-        &eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(
-                2,
-                0..args.num_hidden_layers() as usize,
-            ),
-        ]),
-        geometry.clone(),
-        TextBoundarySchema::new(args.hidden_size()),
+        Some(geometry.local_layout()),
     )
     .map_err(|e| error(e.to_string()))?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry.clone(),
+            TextBoundarySchema::new(args.hidden_size()),
+        )
+        .map_err(|e| error(e.to_string()))?;
     if selected.requirements().state() != partition.state() {
         return Err(error(
             "constructed shared-backbone partition state differs from cold admission".into(),
         ));
     }
-    let architecture = partition::Model::<B>::new(args.clone(), &parameters, &partition, context)
+    let architecture = partition::SelectedCompositeKernel::<B>::from_partition(
+        args.clone(),
+        definition,
+        &partition,
+        context,
+    )
+    .map_err(|e| error(e.to_string()))?;
+    let source_architecture = if selected.base().execution().uses_weight_transform() {
+        let source_args = source
+            .with_checkpoint_formats(
+                selected
+                    .requirements()
+                    .execution()
+                    .execution()
+                    .native_quantized_formats(),
+            )
+            .map_err(|e| error(e.to_string()))?;
+        let source_parameters = retained.parameters();
+        let source_layout = eredu_runtime::derive_partitioned_transform_source_layout(
+            source_parameters,
+            &parameters,
+            selected.requirements().topology(),
+        )
+        .map_err(|failure| error(failure.to_string()))?;
+        let source_geometry = partition::geometry(
+            &source_args,
+            source_layout.clone(),
+            range("vision").unwrap_or(0..0),
+            range("vision_projection").is_some(),
+            range(crate::decoder::TEXT_DECODER_EXECUTION_GROUP),
+        )
         .map_err(|e| error(e.to_string()))?;
-    let source_architecture =
-        if crate::replicated_text::selected_uses_transform(selected.base().execution()) {
-            let source_args = source
-                .with_checkpoint_formats(crate::replicated_text::requirement_formats(
-                    selected.requirements().execution().execution(),
-                ))
-                .map_err(|e| error(e.to_string()))?;
-            let model = partition::Model::<B>::new(source_args, &parameters, &partition, context)
-                .map_err(|e| error(e.to_string()))?;
-            Some((Box::new(model), layout.clone()))
-        } else {
-            None
-        };
+        if source_geometry.complete_state() != geometry.complete_state() {
+            return Err(error(
+                "shared-backbone transform source changes state geometry".into(),
+            ));
+        }
+        let source_definition = crate::nemotron_labs_diffusion::definition::select_composite(
+            &source_args,
+            retained.clone(),
+            source_geometry.complete_state(),
+            Some(source_geometry.local_layout()),
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                source_parameters,
+                source_definition.state_layout(),
+                source_definition.state_partition_plan(),
+                source_geometry,
+                TextBoundarySchema::new(source_args.hidden_size()),
+            )
+            .map_err(|e| error(e.to_string()))?;
+        let model = partition::SelectedCompositeKernel::<B>::from_partition(
+            source_args,
+            source_definition,
+            &source_partition,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        Some((Box::new(model), source_layout))
+    } else {
+        None
+    };
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
@@ -1740,11 +1784,11 @@ where
         ));
     }
 
-    let target_formats = selected_formats(selected.base().execution());
-    let target_linear_formats = selected_matrix_formats(
-        selected.requirements().execution().execution(),
-        selected.base().execution(),
-    );
+    let target_formats = selected.base().execution().quantized_formats();
+    let target_linear_formats = selected
+        .base()
+        .execution()
+        .matrix_formats_for(selected.requirements().execution().execution());
     let config = composite_config(
         selected
             .requirements()
@@ -1762,27 +1806,33 @@ where
     macro_rules! prepare {
         ($architecture:expr, $parameters:expr, $geometry:expr, $partition_geometry:expr,
          $capability:expr, $effective:expr, $output_width:expr, $foundation:expr,
-         $routed:expr $(, $source:expr)?) => {{
+         $routed:expr $(, $source:expr)? $(; partition = $retained:expr)?) => {{
             let source_architecture = None$(.or($source))?;
             let architecture = $architecture;
-            let boundary =
-                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+            let partition = None$(.or(Some($retained)))?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    let boundary =
+                        <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?;
+                    ArchitecturePartition::from_architecture::<B, S, _, _>(
+                        &architecture,
+                        selected
+                            .requirements()
+                            .groups()
+                            .iter()
+                            .map(|group| (group.group().as_str(), group.units())),
+                        selected.requirements().ownership().clone(),
+                        $partition_geometry,
+                        boundary,
+                        &$parameters,
+                    )
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-                &architecture,
-                selected
-                    .requirements()
-                    .groups()
-                    .iter()
-                    .map(|group| (group.group().as_str(), group.units())),
-                selected.requirements().ownership().clone(),
-                $partition_geometry,
-                boundary,
-                &$parameters,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+                    })
+                })?;
             if selected.requirements().state() != partition.state() {
                 return Err(CompositePartitionPreparationError::Architecture(
                     "constructed composite partition state differs from cold admission".into(),
@@ -1821,14 +1871,21 @@ where
 
         CompositeConfig::Diffusion(source) => {
             let args = source.with_checkpoint_formats(target_formats);
-            let description =
-                crate::diffusion_gemma::composite::Model::<B>::new(args.clone(), context).map_err(
-                    |error| CompositePartitionPreparationError::Architecture(error.to_string()),
-                )?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition = crate::diffusion_gemma::composite::project_parameters(
+                &args, &retained,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let parameters = definition.parameters().clone();
             let rank = selected.requirements().topology();
             let layout = derive_partitioned_local_layout(&parameters, rank)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -1863,31 +1920,61 @@ where
                 vision_units: vision_units.clone(),
                 complete_state,
             };
-            let mut architecture = crate::diffusion_gemma::composite::Model::<B>::new_parallel(
-                args.clone(),
-                geometry.clone(),
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 Some(
-                    architecture
-                        .expert_realization_plan(rank)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?
-                        .ok_or_else(|| {
-                            CompositePartitionPreparationError::Architecture(
-                                "selected routed shared stack has no expert realization".into(),
-                            )
-                        })?,
+                    crate::diffusion_gemma::model::expert_realization_plan(
+                        &args,
+                        Some(&geometry.text),
+                        rank,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "selected routed shared stack has no expert realization".into(),
+                        )
+                    })?,
                 )
             } else {
                 None
             };
+            let definition = definition
+                .select_state_layout(&geometry.complete_state)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    crate::diffusion_gemma::composite::BoundarySchema::new(args.text.hidden_size),
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            if selected.requirements().state() != partition.state() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "constructed composite partition state differs from cold admission".into(),
+                ));
+            }
+            let mut architecture =
+                crate::diffusion_gemma::composite::CompositeKernel::<B>::from_partition(
+                    args.clone(),
+                    definition,
+                    &partition,
+                    context,
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             if let Some(realization) = &realization {
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
+                architecture
+                    .kernel_mut()
+                    .set_expert_realization(realization.clone())
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
@@ -1912,94 +1999,95 @@ where
                 })
                 .transpose()
                 .map_err(CompositePartitionPreparationError::Architecture)?;
-            let source_architecture =
-                if selected
-                    .base()
-                    .execution()
-                    .parameters()
-                    .iter()
-                    .any(|parameter| {
-                        matches!(
-                            parameter.lowering(),
-                            eredu_runtime::WeightLoweringKind::Transform
-                                | eredu_runtime::WeightLoweringKind::DerivedTransform
-                        )
-                    })
-                {
-                    let source_model =
-                        crate::diffusion_gemma::composite::Model::<B>::new(source.clone(), context)
-                            .map_err(|error| {
-                                CompositePartitionPreparationError::Architecture(error.to_string())
-                            })?;
-                    let source_parameters =
-                        source_model
-                            .parameter_description(context)
-                            .map_err(|error| {
-                                CompositePartitionPreparationError::Architecture(error.to_string())
-                            })?;
-                    crate::partitioned_execution::validate_transform_parameter_space(
-                        &source_parameters,
-                        &parameters,
-                    )
-                    .map_err(CompositePartitionPreparationError::Architecture)?;
-                    let source_layout =
-                        crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                            &source_parameters,
-                            &parameters,
+            let source_architecture = if selected.base().execution().uses_weight_transform() {
+                let source_parameters = retained.parameters();
+                let source_layout = eredu_runtime::derive_partitioned_transform_source_layout(
+                    source_parameters,
+                    &parameters,
+                    rank,
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+                let source_text = crate::diffusion_gemma::parallel::local_geometry(
+                    source,
+                    &source_layout,
+                    text_units,
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+                if source_text.state_layout() != geometry.text.state_layout() {
+                    return Err(CompositePartitionPreparationError::Architecture(
+                        "transform source changes shared context geometry".into(),
+                    ));
+                }
+                let source_geometry = crate::diffusion_gemma::parallel::CompositeGeometry {
+                    text: source_text,
+                    vision_units,
+                    complete_state: geometry.complete_state.clone(),
+                };
+                let source_plan = if routed {
+                    Some(
+                        crate::diffusion_gemma::model::expert_realization_plan(
+                            source,
+                            Some(&source_geometry.text),
                             rank,
                         )
-                        .map_err(CompositePartitionPreparationError::Architecture)?;
-                    let source_text = crate::diffusion_gemma::parallel::local_geometry(
-                        source,
-                        &source_layout,
-                        text_units,
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            CompositePartitionPreparationError::Architecture(
+                                "source shared stack has no routed realization".into(),
+                            )
+                        })?,
+                    )
+                } else {
+                    None
+                };
+                let source_definition = retained
+                    .clone()
+                    .select_state_layout(&source_geometry.complete_state)
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+                let source_partition = selected
+                    .requirements()
+                    .construct_partition(
+                        source_parameters,
+                        source_definition.state_layout(),
+                        source_definition.state_partition_plan(),
+                        source_geometry,
+                        crate::diffusion_gemma::composite::BoundarySchema::new(
+                            source.text.hidden_size,
+                        ),
                     )
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
-                    if source_text.state_layout() != geometry.text.state_layout() {
-                        return Err(CompositePartitionPreparationError::Architecture(
-                            "transform source changes shared context geometry".into(),
-                        ));
-                    }
-                    let source_geometry = crate::diffusion_gemma::parallel::CompositeGeometry {
-                        text: source_text,
-                        vision_units,
-                        complete_state: geometry.complete_state.clone(),
-                    };
-                    let mut source_model =
-                        crate::diffusion_gemma::composite::Model::<B>::new_parallel(
-                            source.clone(),
-                            source_geometry,
-                            context,
-                        )
+                let mut source_model =
+                    crate::diffusion_gemma::composite::CompositeKernel::<B>::from_partition(
+                        source.clone(),
+                        source_definition,
+                        &source_partition,
+                        context,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+                if let Some(source_plan) = source_plan {
+                    source_model
+                        .kernel_mut()
+                        .set_expert_realization(source_plan)
                         .map_err(|error| {
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?;
-                    if routed {
-                        let source_plan = source_model
-                            .expert_realization_plan(rank)
-                            .map_err(|error| {
-                                CompositePartitionPreparationError::Architecture(error.to_string())
-                            })?
-                            .ok_or_else(|| {
-                                CompositePartitionPreparationError::Architecture(
-                                    "source shared stack has no routed realization".into(),
-                                )
-                            })?;
-                        source_model =
-                            source_model
-                                .with_expert_realization(source_plan)
-                                .map_err(|error| {
-                                    CompositePartitionPreparationError::Architecture(
-                                        error.to_string(),
-                                    )
-                                })?;
-                    }
-                    Some((Box::new(source_model), source_layout))
-                } else {
-                    None
-                };
+                }
+                Some((Box::new(source_model), source_layout))
+            } else {
+                None
+            };
             let capability = crate::capability::diffusion_gemma(&args).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
@@ -2013,20 +2101,16 @@ where
                 args.text.vocab_size,
                 |_| Ok::<(), String>(()),
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
+
         CompositeConfig::Gemma4(source) => {
-            let mut exact = source.clone();
-            if let Some(audio) = exact.audio.as_mut() {
-                audio.output_projection_bias = selected
-                    .requirements()
-                    .execution()
-                    .inspection()
-                    .tensors()
-                    .get("model.audio_tower.output_proj.bias")
-                    .is_some();
-            }
+            let exact = source.with_audio_output_projection_bias(
+                crate::gemma4::checkpoint::audio_output_projection_bias(
+                    selected.requirements().execution().inspection(),
+                ),
+            );
             let args = crate::gemma4::with_checkpoint_formats(&exact, target_formats)
                 .map_err(CompositePartitionPreparationError::Architecture)?;
             let sparse = args.text.layer_schedule.iter().any(|policy| {
@@ -2038,14 +2122,21 @@ where
                         .into(),
                 ));
             }
-            let description = crate::gemma4::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::gemma4::model::project_parameters(&args, &retained).map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2080,12 +2171,13 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture =
-                crate::gemma4::LayeredModel::<B>::new_parallel(args.clone(), local, context)
-                    .and_then(|architecture| architecture.with_partition_state(&geometry))
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+            let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
+                args.clone(),
+                definition,
+                local,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 Some(
                     crate::gemma4::expert_realization_plan(&architecture, rank)
@@ -2109,6 +2201,23 @@ where
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?;
             }
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    geometry.complete_state_layout(),
+                    &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
+                    geometry.clone(),
+                    crate::gemma4::TextBoundarySchema::from_partition_args(&args.text, &geometry),
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let architecture = architecture
+                .into_partition_model(&partition)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
             let routed_execution = realization
                 .clone()
                 .map(|plan| {
@@ -2166,7 +2275,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::Muse(source) => {
@@ -2178,9 +2287,21 @@ where
                         .into(),
                 ));
             }
-            let parameters = crate::muse::model::parameter_description(&args).map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::muse::model::project_parameters(&args, &retained).map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2215,22 +2336,8 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture =
-                crate::muse::LayeredModel::<B>::new_parallel(args.clone(), local, context)
-                    .and_then(|architecture| {
-                        architecture.with_partition_state(
-                            selected.requirements().state().cloned().ok_or_else(|| {
-                                eredu_nn::Error::backend(
-                                    "Muse selected partition has no state ownership",
-                                )
-                            })?,
-                        )
-                    })
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
             let realization = if routed {
-                let realization = crate::muse::expert_realization_plan(&architecture, rank)
+                let realization = crate::muse::expert_realization_plan(&args, Some(&local), rank)
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?
@@ -2239,15 +2346,63 @@ where
                             "routed Muse-Glimmer has no expert realization".into(),
                         )
                     })?;
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
                 Some(realization)
             } else {
                 None
             };
+            let definition = crate::muse::model::select_definition(&args, definition, Some(&local))
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            if selected.requirements().state() != partition.state() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "constructed Muse partition state differs from cold admission".into(),
+                ));
+            }
+            crate::muse::PartitionLocalFoundation::from_partition(&args, &partition).map_err(
+                |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+            )?;
+            if let Some(realization) = &realization {
+                routed_muse_partition_foundation(
+                    &args,
+                    &layout,
+                    group_ranges
+                        .iter()
+                        .map(|(group, units)| (group.as_str(), units.clone())),
+                    &ownership,
+                    rank,
+                    realization,
+                )
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            }
+            let mut architecture = crate::muse::MuseKernel::<B>::from_partition(
+                args.clone(),
+                definition,
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            if let Some(realization) = &realization {
+                architecture
+                    .kernel_mut()
+                    .set_expert_realization(realization.clone())
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            }
             let routed_execution = realization
                 .clone()
                 .map(|plan| {
@@ -2274,7 +2429,7 @@ where
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let source_architecture =
-                muse_transform_source::<B, S>(source, &selected, &parameters, &geometry, context)
+                muse_transform_source::<B>(source, &selected, &parameters, &geometry, context)
                     .map_err(CompositePartitionPreparationError::Architecture)?;
             let effective = args.identity.text_model_type().to_owned();
             prepare!(
@@ -2306,7 +2461,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::QwenVl(source) => {
@@ -2318,14 +2473,21 @@ where
                         .into(),
                 ));
             }
-            let description = crate::qwen::vl::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::qwen::vl::project_parameters(&args, &retained).map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2340,14 +2502,9 @@ where
                 .collect::<Vec<_>>();
             let ownership = selected.requirements().ownership().clone();
             let rank = selected.requirements().topology();
-            let architecture =
-                crate::qwen::vl::LayeredModel::<B>::new_parallel(args.clone(), local, context)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
             let realization = if routed {
                 Some(
-                    crate::qwen::vl::expert_realization_plan(&architecture, rank)
+                    crate::qwen::vl::expert_realization_plan(&args, Some(&local), rank)
                         .map_err(|error| {
                             CompositePartitionPreparationError::Architecture(error.to_string())
                         })?
@@ -2381,7 +2538,30 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let architecture = architecture.with_partition_geometry(geometry.clone());
+            let definition = crate::qwen::vl::select_definition(&args, definition, Some(&local))
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    crate::qwen::vl::PipelineBoundarySchema::from_args(&args),
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let architecture = crate::qwen::vl::VlKernel::<B>::from_partition(
+                args.clone(),
+                definition,
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let routed_execution = realization
                 .clone()
                 .map(|plan| {
@@ -2428,7 +2608,7 @@ where
                     crate::qwen::vl::PartitionLocalFoundation::from_partition(&args, partition)
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::QwenHybrid(source) => {
@@ -2445,15 +2625,21 @@ where
                         .into(),
                 ));
             }
-            let description =
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), context)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition = crate::qwen::hybrid::project_conditional_parameters(&args, &retained)
                 .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2468,23 +2654,21 @@ where
                 .collect::<Vec<_>>();
             let ownership = selected.requirements().ownership().clone();
             let rank = selected.requirements().topology();
-            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_parallel(
-                args.clone(),
-                local,
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 Some(
-                    crate::qwen::hybrid::conditional_expert_realization_plan(&architecture, rank)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?
-                        .ok_or_else(|| {
-                            CompositePartitionPreparationError::Architecture(
-                                "routed conditional Qwen has no expert realization".into(),
-                            )
-                        })?,
+                    crate::qwen::hybrid::conditional_expert_realization_plan(
+                        &args,
+                        Some(&local),
+                        rank,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "routed conditional Qwen has no expert realization".into(),
+                        )
+                    })?,
                 )
             } else {
                 None
@@ -2508,20 +2692,39 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = geometry
-                .local_state_layout()
+            let definition =
+                crate::qwen::hybrid::select_conditional_definition(&args, definition, Some(&local))
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let boundary = crate::qwen::hybrid::ConditionalPipelineBoundarySchema::for_config(
+                &args,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    boundary,
+                )
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
-                })
-                .and_then(|layout| {
-                    architecture
-                        .with_partition_state_layout(geometry.target_units().start, layout)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })
                 })?;
+            let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
+                args.clone(),
+                definition,
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if let Some(plan) = &realization {
-                architecture.install_expert_realization(plan.clone());
+                architecture
+                    .kernel_mut()
+                    .install_expert_realization(plan.clone());
             }
             let routed_execution = realization
                 .clone()
@@ -2578,7 +2781,7 @@ where
                         .map_err(|error| error.to_string()),
                     }
                 },
-                routed_execution
+                routed_execution; partition = partition
             )
         }
         CompositeConfig::Inkling(source) => {
@@ -2599,14 +2802,21 @@ where
                         .into(),
                 ));
             }
-            let description = crate::inkling::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::inkling::model::project_parameters(&args, &retained).map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -2641,34 +2851,46 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::LayeredModel::<B>::new_parallel(
-                args.clone(),
-                std::sync::Arc::new(local),
-                context,
-            )
-            .and_then(|architecture| {
-                architecture.with_partition_state_offset(geometry.text_units().start)
-            })
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let definition =
+                crate::inkling::model::select_definition(&args, definition, Some(&local)).map_err(
+                    |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+                )?;
             let realization = if routed {
-                let realization = crate::inkling::expert_realization_plan(&architecture, rank)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?
-                    .ok_or_else(|| {
-                        CompositePartitionPreparationError::Architecture(
-                            "routed Inkling has no expert realization".into(),
-                        )
-                    })?;
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+                let realization =
+                    crate::inkling::expert_realization_plan(&args, Some(&local), rank)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            CompositePartitionPreparationError::Architecture(
+                                "routed Inkling has no expert realization".into(),
+                            )
+                        })?;
                 Some(realization)
             } else {
                 None
             };
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
+                args.clone(),
+                definition,
+                std::sync::Arc::new(local),
+                &partition,
+                realization.clone(),
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let routed_execution = realization
                 .as_ref()
                 .map(|realization| {
@@ -2737,7 +2959,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
     }
@@ -2761,38 +2983,37 @@ where
         + RuntimeStateComponents<B>
         + AuxiliaryConvolutionState<B::Tensor>,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source = qwen_vl_with_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        )
-        .into_iter()
-        .map(|(name, format)| (name, format.into()))
-        .collect(),
+        selected
+            .requirements()
+            .execution()
+            .execution()
+            .native_quantized_formats()
+            .into_iter()
+            .map(|(name, format)| (name, format.into()))
+            .collect(),
     )?;
-    let description = crate::qwen::vl::LayeredModel::<B>::new(source.clone(), context)
-        .map_err(|e| e.to_string())?;
-    let parameters = description
-        .parameter_description(context)
-        .map_err(|e| e.to_string())?;
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Qwen3-VL transform source changed execution-unit addresses".into());
-    }
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition =
+        crate::qwen::vl::project_parameters(&source, &retained).map_err(|e| e.to_string())?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(
         &parameters,
         target_parameters,
         rank,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let local = crate::qwen::vl::local_geometry(&source, &layout).map_err(|e| e.to_string())?;
-    let mut architecture =
-        crate::qwen::vl::LayeredModel::<B>::new_parallel(source.clone(), local, context)
-            .map_err(|e| e.to_string())?;
     let ranges = || {
         selected
             .requirements()
@@ -2801,8 +3022,8 @@ where
             .map(|g| (g.group().as_str(), g.units()))
     };
     let ownership = selected.requirements().ownership();
-    let realization =
-        crate::qwen::vl::expert_realization_plan(&architecture, rank).map_err(|e| e.to_string())?;
+    let realization = crate::qwen::vl::expert_realization_plan(&source, Some(&local), rank)
+        .map_err(|e| e.to_string())?;
     let geometry = match &realization {
         Some(realization) => crate::qwen::vl::partition_local_routed_geometry(
             &source,
@@ -2823,23 +3044,24 @@ where
     {
         return Err("Qwen3-VL transform source changed partition state or ownership".into());
     }
-    architecture = architecture.with_partition_geometry(geometry.clone());
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
-        .map_err(|e| e.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
-        ranges(),
-        ownership.clone(),
-        geometry,
-        boundary,
-        &parameters,
-    )
-    .map_err(|e| e.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Qwen3-VL transform source changed selected state".into());
-    }
+    let definition = crate::qwen::vl::select_definition(&source, definition, Some(&local))
+        .map_err(|error| error.to_string())?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            definition.parameters(),
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry,
+            crate::qwen::vl::PipelineBoundarySchema::from_args(&source),
+        )
+        .map_err(|error| error.to_string())?;
     crate::qwen::vl::PartitionLocalFoundation::from_partition(&source, &partition)
         .map_err(|e| e.to_string())?;
+    let architecture = crate::qwen::vl::VlKernel::<B>::from_partition(
+        source, definition, local, &partition, context,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 
@@ -2860,36 +3082,38 @@ where
         + RuntimeStateComponents<B>
         + AuxiliaryConvolutionState<B::Tensor>,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source_args = crate::gemma4::with_checkpoint_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        ),
+        selected
+            .requirements()
+            .execution()
+            .execution()
+            .native_quantized_formats(),
     )?;
     let source = &source_args;
     let sparse =
         source.text.layer_schedule.iter().any(|policy| {
             policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe
         });
-    let description = crate::gemma4::LayeredModel::<B>::new(source.clone(), context)
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition = crate::gemma4::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
-    let parameters = description
-        .parameter_description(context)
-        .map_err(|error| error.to_string())?;
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Gemma 4 transform source changed execution-unit addresses".into());
-    }
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(
         &parameters,
         target_parameters,
         rank,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let local =
         crate::gemma4::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {
@@ -2922,10 +3146,13 @@ where
     {
         return Err("Gemma 4 transform source changed partition state or ownership".into());
     }
-    let mut architecture =
-        crate::gemma4::LayeredModel::<B>::new_parallel(source.clone(), local, context)
-            .and_then(|architecture| architecture.with_partition_state(&geometry))
-            .map_err(|error| error.to_string())?;
+    let mut architecture = crate::gemma4::GemmaKernel::<B>::from_parallel_definition(
+        source.clone(),
+        definition,
+        local,
+        context,
+    )
+    .map_err(|error| error.to_string())?;
     if sparse {
         let realization = crate::gemma4::expert_realization_plan(&architecture, rank)
             .map_err(|error| error.to_string())?
@@ -2942,28 +3169,27 @@ where
             .with_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            geometry.complete_state_layout(),
+            &crate::transport::pipeline_state(2, geometry.complete_state_layout()),
+            geometry.clone(),
+            crate::gemma4::TextBoundarySchema::from_partition_args(&source.text, &geometry),
+        )
         .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
-        ranges(),
-        ownership.clone(),
-        geometry,
-        boundary,
-        &parameters,
-    )
-    .map_err(|error| error.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Gemma 4 transform source changed selected state".into());
-    }
     if !sparse {
         crate::gemma4::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
     }
+    let architecture = architecture
+        .into_partition_model(&partition)
+        .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 
-fn muse_transform_source<B, S>(
+fn muse_transform_source<B>(
     source: &crate::muse::DecoderConfig,
     selected: &SelectedPartitionedAdmission<
         SelectedCompositeTextRealization,
@@ -2975,37 +3201,35 @@ fn muse_transform_source<B, S>(
 ) -> Result<Option<(Box<crate::muse::LayeredModel<B>>, LocalModelLayout)>, String>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>
-        + RuntimeStateComponents<B>
-        + AuxiliaryConvolutionState<B::Tensor>,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source_args = crate::muse::with_checkpoint_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        ),
+        selected
+            .requirements()
+            .execution()
+            .execution()
+            .native_quantized_formats(),
     )?;
     let source = &source_args;
-    let description = crate::muse::LayeredModel::<B>::new(source.clone(), context)
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition = crate::muse::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
-    let parameters = description
-        .parameter_description(context)
-        .map_err(|error| error.to_string())?;
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Muse-Glimmer transform source changed execution-unit addresses".into());
-    }
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(
         &parameters,
         target_parameters,
         rank,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let local = crate::muse::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {
         selected
@@ -3031,41 +3255,37 @@ where
     {
         return Err("Muse-Glimmer transform source changed partition state or ownership".into());
     }
-    let mut architecture =
-        crate::muse::LayeredModel::<B>::new_parallel(source.clone(), local, context)
-            .and_then(|architecture| {
-                architecture.with_partition_state(
-                    selected.requirements().state().cloned().ok_or_else(|| {
-                        eredu_nn::Error::backend("Muse selected partition has no state ownership")
-                    })?,
-                )
-            })
-            .map_err(|error| error.to_string())?;
-    if source.is_moe() {
-        let realization = crate::muse::expert_realization_plan(&architecture, rank)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "Muse-Glimmer transform source has no expert realization".to_owned())?;
-        routed_muse_partition_foundation(source, &layout, ranges(), ownership, rank, &realization)?;
-        architecture = architecture
-            .with_expert_realization(realization)
-            .map_err(|error| error.to_string())?;
-    }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+    let realization = crate::muse::expert_realization_plan(source, Some(&local), rank)
         .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
-        ranges(),
-        ownership.clone(),
-        geometry,
-        boundary,
-        &parameters,
+    if let Some(realization) = &realization {
+        routed_muse_partition_foundation(source, &layout, ranges(), ownership, rank, realization)?;
+    }
+    let definition = crate::muse::model::select_definition(source, definition, Some(&local))
+        .map_err(|error| error.to_string())?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            definition.parameters(),
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(source.hidden_size),
+        )
+        .map_err(|error| error.to_string())?;
+    crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
+        .map_err(|error| error.to_string())?;
+    let mut architecture = crate::muse::MuseKernel::<B>::from_partition(
+        source.clone(),
+        definition,
+        local,
+        &partition,
+        context,
     )
     .map_err(|error| error.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Muse-Glimmer transform source changed selected state".into());
-    }
-    if !source.is_moe() {
-        crate::muse::PartitionLocalFoundation::from_partition(source, &partition)
+    if let Some(realization) = realization {
+        architecture
+            .kernel_mut()
+            .set_expert_realization(realization)
             .map_err(|error| error.to_string())?;
     }
     Ok(Some((Box::new(architecture), layout)))
@@ -3091,32 +3311,34 @@ where
         + RuntimeStateComponents<B>
         + AuxiliaryConvolutionState<B::Tensor>,
 {
-    if !crate::replicated_text::selected_uses_transform(selected.base().execution()) {
+    if !selected.base().execution().uses_weight_transform() {
         return Ok(None);
     }
     let source_args = crate::inkling::with_checkpoint_formats(
         source,
-        crate::replicated_text::requirement_formats(
-            selected.requirements().execution().execution(),
-        ),
+        selected
+            .requirements()
+            .execution()
+            .execution()
+            .native_quantized_formats(),
     )?;
     let source = &source_args;
-    let description = crate::inkling::LayeredModel::<B>::new(source.clone(), context)
+    let retained = selected
+        .base()
+        .execution()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| "composite selection has no retained definition".to_owned())?;
+    let definition = crate::inkling::model::project_parameters(source, &retained)
         .map_err(|error| error.to_string())?;
-    let parameters = description
-        .parameter_description(context)
-        .map_err(|error| error.to_string())?;
-    if parameters.graph() != target_parameters.graph()
-        || parameters.unit_layout() != target_parameters.unit_layout()
-    {
-        return Err("Inkling transform source changed execution-unit addresses".into());
-    }
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
-    let layout = crate::partitioned_execution::derive_partitioned_transform_source_layout(
+    let layout = eredu_runtime::derive_partitioned_transform_source_layout(
         &parameters,
         target_parameters,
         rank,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let local =
         crate::inkling::local_geometry(source, &layout).map_err(|error| error.to_string())?;
     let ranges = || {
@@ -3147,15 +3369,10 @@ where
     {
         return Err("Inkling transform source changed partition state or ownership".into());
     }
-    let mut architecture = crate::inkling::LayeredModel::<B>::new_parallel(
-        source.clone(),
-        std::sync::Arc::new(local),
-        context,
-    )
-    .and_then(|architecture| architecture.with_partition_state_offset(geometry.text_units().start))
-    .map_err(|error| error.to_string())?;
-    if source.text_config.has_sparse_moe_layers() {
-        let realization = crate::inkling::expert_realization_plan(&architecture, rank)
+    let definition = crate::inkling::model::select_definition(source, definition, Some(&local))
+        .map_err(|error| error.to_string())?;
+    let realization = if source.text_config.has_sparse_moe_layers() {
+        let realization = crate::inkling::expert_realization_plan(source, Some(&local), rank)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Inkling transform source has no expert realization".to_owned())?;
         routed_inkling_partition_foundation(
@@ -3166,28 +3383,33 @@ where
             rank,
             &realization,
         )?;
-        architecture = architecture
-            .with_expert_realization(realization)
-            .map_err(|error| error.to_string())?;
-    }
-    let boundary = <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+        Some(realization)
+    } else {
+        None
+    };
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(source.text_config.hidden_size),
+        )
         .map_err(|error| error.to_string())?;
-    let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-        &architecture,
-        ranges(),
-        ownership.clone(),
-        geometry,
-        boundary,
-        &parameters,
-    )
-    .map_err(|error| error.to_string())?;
-    if selected.requirements().state() != partition.state() {
-        return Err("Inkling transform source changed selected state".into());
-    }
     if !source.text_config.has_sparse_moe_layers() {
         crate::inkling::PartitionLocalFoundation::from_partition(source, &partition)
             .map_err(|error| error.to_string())?;
     }
+    let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
+        source.clone(),
+        definition,
+        std::sync::Arc::new(local),
+        &partition,
+        realization,
+        context,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(Some((Box::new(architecture), layout)))
 }
 
@@ -3229,11 +3451,11 @@ where
             "selected composite decoder strategy differs from its requirements".into(),
         ));
     }
-    let target_formats = selected_formats(selected.base().execution());
-    let target_linear_formats = selected_matrix_formats(
-        selected.requirements().execution().execution(),
-        selected.base().execution(),
-    );
+    let target_formats = selected.base().execution().quantized_formats();
+    let target_linear_formats = selected
+        .base()
+        .execution()
+        .matrix_formats_for(selected.requirements().execution().execution());
     let config = composite_config(
         selected
             .requirements()
@@ -3251,27 +3473,33 @@ where
     macro_rules! finish_prediction_target {
         ($target:ty, $architecture:expr, $parameters:expr, $layout:expr, $geometry:expr,
          $capability:expr, $effective:expr, $output_width:expr, $foundation:expr,
-         $routed:expr $(, $source:expr)?) => {{
+         $routed:expr $(, $source:expr)? $(; partition = $retained:expr)?) => {{
             let source_architecture = None$(.or($source))?;
             let architecture = $architecture;
-            let boundary =
-                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+            let partition = None$(.or(Some($retained)))?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    let boundary =
+                        <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?;
+                    ArchitecturePartition::from_architecture::<B, S, _, _>(
+                        &architecture,
+                        selected
+                            .requirements()
+                            .groups()
+                            .iter()
+                            .map(|group| (group.group().as_str(), group.units())),
+                        selected.requirements().ownership().clone(),
+                        $geometry.clone(),
+                        boundary,
+                        &$parameters,
+                    )
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-                &architecture,
-                selected
-                    .requirements()
-                    .groups()
-                    .iter()
-                    .map(|group| (group.group().as_str(), group.units())),
-                selected.requirements().ownership().clone(),
-                $geometry.clone(),
-                boundary,
-                &$parameters,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+                    })
+                })?;
             if selected.requirements().state() != partition.state() {
                 return Err(CompositePartitionPreparationError::Architecture(
                     "constructed composite prediction partition state differs from cold admission"
@@ -3292,7 +3520,7 @@ where
                     .map_err(|error| {
                         CompositePartitionPreparationError::Architecture(error.to_string())
                     })?;
-            let extension = <crate::composite_execution::PreparedCompositeArchitecture<$target> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+            let extension = <$target as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
@@ -3339,15 +3567,21 @@ where
                         .into(),
                 ));
             }
-            let description =
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), context)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition = crate::qwen::hybrid::project_conditional_parameters(&args, &retained)
                 .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -3362,23 +3596,21 @@ where
                 .collect::<Vec<_>>();
             let ownership = selected.requirements().ownership().clone();
             let rank = selected.requirements().topology();
-            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_parallel(
-                args.clone(),
-                local,
-                context,
-            )
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let realization = if routed {
                 Some(
-                    crate::qwen::hybrid::conditional_expert_realization_plan(&architecture, rank)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })?
-                        .ok_or_else(|| {
-                            CompositePartitionPreparationError::Architecture(
-                                "routed conditional Qwen has no expert realization".into(),
-                            )
-                        })?,
+                    crate::qwen::hybrid::conditional_expert_realization_plan(
+                        &args,
+                        Some(&local),
+                        rank,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "routed conditional Qwen has no expert realization".into(),
+                        )
+                    })?,
                 )
             } else {
                 None
@@ -3402,20 +3634,39 @@ where
                 ),
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = geometry
-                .local_state_layout()
+            let definition =
+                crate::qwen::hybrid::select_conditional_definition(&args, definition, Some(&local))
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let boundary = crate::qwen::hybrid::ConditionalPipelineBoundarySchema::for_config(
+                &args,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    definition.parameters(),
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    boundary,
+                )
                 .map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
-                })
-                .and_then(|state| {
-                    architecture
-                        .with_partition_state_layout(geometry.target_units().start, state)
-                        .map_err(|error| {
-                            CompositePartitionPreparationError::Architecture(error.to_string())
-                        })
                 })?;
+            let mut architecture = crate::qwen::hybrid::ConditionalKernel::<B>::from_partition(
+                args.clone(),
+                definition,
+                local,
+                &partition,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             if let Some(plan) = &realization {
-                architecture.install_expert_realization(plan.clone());
+                architecture
+                    .kernel_mut()
+                    .install_expert_realization(plan.clone());
             }
             let routed_execution = realization
                 .clone()
@@ -3473,7 +3724,7 @@ where
                         .map_err(|error| error.to_string()),
                     }
                 },
-                routed_execution
+                routed_execution; partition = partition
             )
         }
         CompositeConfig::Inkling(source) => {
@@ -3494,14 +3745,21 @@ where
                         .into(),
                 ));
             }
-            let description = crate::inkling::LayeredModel::<B>::new(args.clone(), context)
-                .map_err(|error| {
+            let retained = selected
+                .base()
+                .execution()
+                .requirements()
+                .shared_component_definition()
+                .ok_or_else(|| {
+                    CompositePartitionPreparationError::Architecture(
+                        "composite selection has no retained definition".into(),
+                    )
+                })?;
+            let definition =
+                crate::inkling::model::project_parameters(&args, &retained).map_err(|error| {
                     CompositePartitionPreparationError::Architecture(error.to_string())
                 })?;
-            let parameters = ArchitectureParameters::parameter_description(&description, context)
-                .map_err(|error| {
-                CompositePartitionPreparationError::Architecture(error.to_string())
-            })?;
+            let parameters = definition.parameters().clone();
             let layout =
                 derive_partitioned_local_layout(&parameters, selected.requirements().topology())
                     .map_err(CompositePartitionPreparationError::Architecture)?;
@@ -3536,34 +3794,46 @@ where
                 )
             }
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let mut architecture = crate::inkling::LayeredModel::<B>::new_parallel(
-                args.clone(),
-                std::sync::Arc::new(local),
-                context,
-            )
-            .and_then(|architecture| {
-                architecture.with_partition_state_offset(geometry.text_units().start)
-            })
-            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let definition =
+                crate::inkling::model::select_definition(&args, definition, Some(&local)).map_err(
+                    |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+                )?;
             let realization = if routed {
-                let realization = crate::inkling::expert_realization_plan(&architecture, rank)
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?
-                    .ok_or_else(|| {
-                        CompositePartitionPreparationError::Architecture(
-                            "routed Inkling has no expert realization".into(),
-                        )
-                    })?;
-                architecture = architecture
-                    .with_expert_realization(realization.clone())
-                    .map_err(|error| {
-                        CompositePartitionPreparationError::Architecture(error.to_string())
-                    })?;
+                let realization =
+                    crate::inkling::expert_realization_plan(&args, Some(&local), rank)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            CompositePartitionPreparationError::Architecture(
+                                "routed Inkling has no expert realization".into(),
+                            )
+                        })?;
                 Some(realization)
             } else {
                 None
             };
+            let partition = selected
+                .requirements()
+                .construct_partition(
+                    &parameters,
+                    definition.state_layout(),
+                    definition.state_partition_plan(),
+                    geometry.clone(),
+                    eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
+                )
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let architecture = crate::inkling::InklingKernel::<B>::from_partition_definition(
+                args.clone(),
+                definition,
+                std::sync::Arc::new(local),
+                &partition,
+                realization.clone(),
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let routed_execution = realization
                 .as_ref()
                 .map(|realization| {
@@ -3633,7 +3903,7 @@ where
                     }
                 },
                 routed_execution,
-                source_architecture
+                source_architecture; partition = partition
             )
         }
         CompositeConfig::NemotronLabsDiffusion(_)

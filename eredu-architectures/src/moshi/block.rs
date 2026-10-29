@@ -34,7 +34,8 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     let cache = state.layer(state_ordinal).map_err(Error::backend)?;
-    block.forward(
+    block.body.forward(
+        block.output_norm.as_mut(),
         AttentionInput {
             selected_positions: None,
             hidden,
@@ -65,7 +66,8 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     let cache = state.layer(state_ordinal).map_err(Error::backend)?;
-    block.forward_tensor_parallel(
+    block.body.forward_tensor_parallel(
+        block.output_norm.as_mut(),
         AttentionInput {
             selected_positions: None,
             hidden,

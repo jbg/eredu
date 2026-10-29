@@ -1,12 +1,18 @@
 //! Backend-neutral checkpoint materialization and parameter binding.
 
-use std::{collections::BTreeMap, marker::PhantomData};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeCatalog, RecipeDtype, RecipeError},
+    recipe::{
+        AtomicRecipeSet, DerivedWeightRecipe, RecipeAlias, RecipeCatalog, RecipeDtype, RecipeError,
+    },
     store::{
-        CheckpointSource, ReadPolicy, SharedCheckpointSource, StoreError, TensorReadRequest,
-        TensorSelection,
+        CheckpointSource, PreparedCheckpointSource, ReadPolicy, RestrictedCheckpointSource,
+        SharedCheckpointSource, StoreError, TensorReadRequest, TensorSelection,
     },
 };
 use eredu_nn::{
@@ -110,8 +116,8 @@ impl BindingPlan {
         permitted_dtype_conversions: BTreeMap<String, Vec<RecipeDtype>>,
     ) -> Result<Self, BindingPlanError> {
         bindings.sort_by(|left, right| left.target_name.cmp(&right.target_name));
-        let mut targets = std::collections::BTreeSet::new();
-        let mut claims = BTreeMap::<String, String>::new();
+        let mut previous_target = None;
+        let mut claims = BTreeMap::<&str, &str>::new();
         for binding in &bindings {
             if binding.target_name.trim().is_empty() {
                 return Err(BindingPlanError::EmptyTarget);
@@ -129,7 +135,9 @@ impl BindingPlan {
                 .ok_or_else(|| BindingPlanError::TargetShapeOverflow {
                     target: binding.target_name.clone(),
                 })?;
-            if !targets.insert(binding.target_name.clone()) {
+            if previous_target.replace(binding.target_name.as_str())
+                == Some(binding.target_name.as_str())
+            {
                 return Err(BindingPlanError::DuplicateTarget {
                     target: binding.target_name.clone(),
                 });
@@ -149,10 +157,10 @@ impl BindingPlan {
                 if shared_source_keys.contains(source) {
                     continue;
                 }
-                if let Some(first) = claims.insert(source.into(), binding.target_name.clone()) {
+                if let Some(first) = claims.insert(source, binding.target_name.as_str()) {
                     return Err(BindingPlanError::DuplicateSourceClaim {
                         source_key: source.into(),
-                        first,
+                        first: first.to_owned(),
                         second: binding.target_name.clone(),
                     });
                 }
@@ -321,12 +329,11 @@ pub struct ParameterBindingTarget {
     pub permitted_source_dtypes: Vec<RecipeDtype>,
 }
 
-/// A canonical binding plan paired with fully qualified logical destinations.
+/// A canonical binding plan with ordered identities, logical targets and storage preferences.
 #[derive(Debug, Clone)]
 pub struct ModuleBindingPlan {
     plan: BindingPlan,
-    logical_targets: BTreeMap<String, String>,
-    storage_layouts: BTreeMap<String, eredu_nn::ParameterStorageLayout>,
+    destinations: Vec<(ParameterId, String, eredu_nn::ParameterStorageLayout)>,
 }
 
 impl ModuleBindingPlan {
@@ -340,26 +347,60 @@ impl ModuleBindingPlan {
         &self,
         source: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, ModuleBindingPlanError> {
-        self.plan
-            .build_bindings(source)?
+        let bindings = self.plan.build_bindings(source)?;
+        assert_eq!(
+            bindings.len(),
+            self.destinations.len(),
+            "module binding declaration retains every target"
+        );
+        bindings
             .into_iter()
-            .map(|binding| {
-                let target = self
-                    .logical_targets
-                    .get(binding.name())
-                    .expect("module binding declaration retains every target");
-                let layout = self
-                    .storage_layouts
-                    .get(binding.name())
-                    .copied()
-                    .unwrap_or_default();
+            .zip(&self.destinations)
+            .map(|(binding, (parameter, target, layout))| {
+                assert_eq!(
+                    binding.name(),
+                    parameter.as_str(),
+                    "canonical module binding order"
+                );
                 binding
-                    .with_storage_layout(layout)
+                    .with_storage_layout(*layout)
                     .with_logical_target(target)
                     .map_err(ModuleBindingPlanError::from)
             })
             .collect()
     }
+}
+
+fn collect_module_parameters<P: 'static, M: Parameterized<P>>(
+    module: &M,
+) -> Result<BTreeMap<ParameterId, (&P, eredu_nn::ParameterStorageLayout)>, ModuleBindingPlanError> {
+    struct Collector<'a, P> {
+        parameters: BTreeMap<ParameterId, (&'a P, eredu_nn::ParameterStorageLayout)>,
+        duplicate: Option<ParameterId>,
+    }
+    impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
+            let name = metadata.id;
+            if self
+                .parameters
+                .insert(name.clone(), (parameter, metadata.storage_layout))
+                .is_some()
+            {
+                self.duplicate = Some(name);
+            }
+        }
+    }
+    let mut collector = Collector {
+        parameters: BTreeMap::new(),
+        duplicate: None,
+    };
+    module.visit_parameters(&mut collector);
+    if let Some(parameter) = collector.duplicate {
+        return Err(ModuleBindingPlanError::DuplicateParameter {
+            parameter: parameter.to_string(),
+        });
+    }
+    Ok(collector.parameters)
 }
 
 /// Builds the singular declarative plan by traversing any neutral parameterized module.
@@ -381,32 +422,7 @@ where
     F: Fn(&str) -> bool,
     D: Fn(&P) -> Option<ParameterBindingTarget>,
 {
-    struct Collector<'a, P> {
-        parameters: BTreeMap<String, &'a P>,
-        storage_layouts: BTreeMap<String, eredu_nn::ParameterStorageLayout>,
-        duplicate: Option<String>,
-    }
-
-    impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
-            let name = metadata.id.as_str().to_owned();
-            self.storage_layouts
-                .insert(name.clone(), metadata.storage_layout);
-            if self.parameters.insert(name.clone(), parameter).is_some() {
-                self.duplicate = Some(name);
-            }
-        }
-    }
-
-    let mut collector = Collector {
-        parameters: BTreeMap::new(),
-        storage_layouts: BTreeMap::new(),
-        duplicate: None,
-    };
-    module.visit_parameters(&mut collector);
-    if let Some(parameter) = collector.duplicate {
-        return Err(ModuleBindingPlanError::DuplicateParameter { parameter });
-    }
+    let parameters = collect_module_parameters::<P, M>(module)?;
 
     recipes.retain(|name, _| !excluded(name));
     let source_keys = source
@@ -414,16 +430,16 @@ where
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut declarations = Vec::new();
-    let mut logical_targets = BTreeMap::new();
+    let mut destinations = Vec::new();
     let mut permitted_dtype_conversions = BTreeMap::new();
 
-    for (local_name, parameter) in collector
-        .parameters
+    for (parameter_id, (parameter, storage_layout)) in parameters
         .into_iter()
-        .filter(|(name, _)| !excluded(name))
+        .filter(|(name, _)| !excluded(name.as_str()))
     {
+        let local_name = parameter_id.to_string();
         let destination = qualify_parameter(prefix, &local_name);
-        logical_targets.insert(local_name.clone(), destination.clone());
+        destinations.push((parameter_id, destination.clone(), storage_layout));
         let description = describe(parameter).ok_or_else(|| {
             ModuleBindingPlanError::InvalidParameterRepresentation {
                 parameter: destination.clone(),
@@ -463,16 +479,15 @@ where
             shared_source_keys,
             permitted_dtype_conversions,
         )?,
-        logical_targets,
-        storage_layouts: collector.storage_layouts,
+        destinations,
     })
 }
 
 /// Builds canonical bindings for an exact architecture-selected task partition.
 ///
-/// Module traversal supplies destination geometry only. Task identities (including
-/// admitted aliases), physical provenance, recipes, companions, and coverage are
-/// validated here before any backend payload or native operation. `lower_mxfp4`
+/// Module traversal supplies destination geometry and storage preferences. Task
+/// identities (including admitted aliases), physical provenance, recipes, companions,
+/// and coverage are validated before backend payload or native work. `lower_mxfp4`
 /// is the sole backend hook and may only replace an admitted derived F4 recipe for
 /// an MXFP4 executable. When `local_layout` is present, its exact placements are
 /// applied before destination-shape validation. Selected transform outputs are
@@ -497,60 +512,22 @@ where
     ) -> Result<DerivedWeightRecipe, E>,
     E: std::fmt::Display,
 {
-    struct Collector<'a, P> {
-        parameters: BTreeMap<String, (&'a P, ParameterBindingTarget)>,
-        duplicate: Option<String>,
-    }
-    impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
-            let name = metadata.id.as_str().to_owned();
-            // The description is filled after traversal because the visitor cannot
-            // retain a borrowed callback without complicating this neutral API.
-            if self
-                .parameters
-                .insert(
-                    name.clone(),
-                    (
-                        parameter,
-                        ParameterBindingTarget {
-                            shape: Vec::new(),
-                            dtype: RecipeDtype::Other(String::new()),
-                            permitted_source_dtypes: Vec::new(),
-                        },
-                    ),
-                )
-                .is_some()
-            {
-                self.duplicate = Some(name);
-            }
-        }
-    }
+    let parameters = collect_module_parameters::<P, M>(module)?
+        .into_iter()
+        .map(|(name, (parameter, storage_layout))| {
+            let description = describe(parameter).ok_or_else(|| {
+                ModuleBindingPlanError::InvalidParameterRepresentation {
+                    parameter: name.to_string(),
+                }
+            })?;
+            Ok((name, (description, storage_layout)))
+        })
+        .collect::<Result<BTreeMap<_, _>, ModuleBindingPlanError>>()?;
 
-    let mut collector = Collector {
-        parameters: BTreeMap::new(),
-        duplicate: None,
-    };
-    module.visit_parameters(&mut collector);
-    if let Some(parameter) = collector.duplicate {
-        return Err(ModuleBindingPlanError::DuplicateParameter { parameter });
-    }
-    for (name, (parameter, description)) in &mut collector.parameters {
-        *description = describe(parameter).ok_or_else(|| {
-            ModuleBindingPlanError::InvalidParameterRepresentation {
-                parameter: name.clone(),
-            }
-        })?;
-    }
-
-    let parameter_names = collector
-        .parameters
-        .keys()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut covered = std::collections::BTreeSet::new();
+    // Each admitted destination records whether its recipe is already rank-local.
+    let mut covered = BTreeMap::new();
     let mut declarations = Vec::new();
     let mut conversions = BTreeMap::new();
-    let mut locally_materialized = std::collections::BTreeSet::new();
     let shared_source_keys = tasks
         .iter()
         .flat_map(|task| task.shared_source_keys().iter().cloned())
@@ -559,7 +536,7 @@ where
     for task in tasks {
         let candidates = std::iter::once(task.name())
             .chain(task.aliases().iter().map(String::as_str))
-            .filter(|candidate| parameter_names.contains(*candidate))
+            .filter(|candidate| parameters.contains_key(*candidate))
             .collect::<std::collections::BTreeSet<_>>();
         if candidates.len() != 1 {
             return Err(ModuleBindingPlanError::ExactTask {
@@ -571,22 +548,16 @@ where
             });
         }
         let target = (*candidates.first().expect("one candidate was validated")).to_owned();
-        if !covered.insert(target.clone()) {
+        let is_local_transform = task.lowering().transforms_payload();
+        if covered.insert(target.clone(), is_local_transform).is_some() {
             return Err(ModuleBindingPlanError::ExactTask {
                 details: format!("module destination {target:?} is claimed more than once"),
             });
         }
         validate_exact_task_provenance(task, source)?;
-        let is_local_transform = matches!(
-            task.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        );
-        if is_local_transform {
-            locally_materialized.insert(target.clone());
-        }
         let recipe = exact_task_recipe(task, source, &mut lower_mxfp4)?;
         push_exact_declaration(
-            &collector.parameters,
+            &parameters,
             &mut declarations,
             &mut conversions,
             target,
@@ -596,10 +567,7 @@ where
 
         for companion in task.output_companions() {
             let target = companion.name().to_owned();
-            if is_local_transform {
-                locally_materialized.insert(target.clone());
-            }
-            if !parameter_names.contains(&target) {
+            if !parameters.contains_key(target.as_str()) {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!(
                         "task {:?} companion {:?} has no module destination",
@@ -608,7 +576,7 @@ where
                     ),
                 });
             }
-            if !covered.insert(target.clone()) {
+            if covered.insert(target.clone(), is_local_transform).is_some() {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!("companion destination {target:?} is claimed more than once"),
                 });
@@ -632,13 +600,12 @@ where
             } else if let Some(physical) = companion.catalog_source() {
                 validate_physical_source(physical, source)?;
                 DerivedWeightRecipe::source(physical.catalog_key(), TensorSelection::Full)
-            } else if matches!(
-                task.lowering(),
-                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-            ) || matches!(
-                task.source_encoding(),
-                eredu_checkpoint::SourceTensorEncoding::Gguf { .. }
-            ) {
+            } else if task.lowering().transforms_payload()
+                || matches!(
+                    task.source_encoding(),
+                    eredu_checkpoint::SourceTensorEncoding::Gguf { .. }
+                )
+            {
                 if !source.is_authoritative_materialized_key(companion.name()) {
                     return Err(ModuleBindingPlanError::ExactTask {
                         details: format!(
@@ -657,7 +624,7 @@ where
                 });
             };
             push_exact_declaration(
-                &collector.parameters,
+                &parameters,
                 &mut declarations,
                 &mut conversions,
                 target,
@@ -670,10 +637,12 @@ where
         }
     }
 
-    let missing = parameter_names
-        .difference(&covered)
-        .filter(|name| !addressable_parameters.contains(*name))
-        .cloned()
+    let missing = parameters
+        .keys()
+        .filter(|name| {
+            !covered.contains_key(name.as_str()) && !addressable_parameters.contains(name.as_str())
+        })
+        .map(|name| name.to_string())
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(ModuleBindingPlanError::ExactTask {
@@ -687,7 +656,7 @@ where
     if let Some(layout) = local_layout {
         let bindings = declarations
             .iter()
-            .filter(|declaration| !locally_materialized.contains(&declaration.target_name))
+            .filter(|declaration| !covered[&declaration.target_name])
             .map(|declaration| {
                 Ok(WeightBinding::from_recipe(
                     &declaration.target_name,
@@ -706,31 +675,40 @@ where
         // binding; logical identities remain the declarations' exact targets.
         for (declaration, binding) in declarations
             .iter_mut()
-            .filter(|declaration| !locally_materialized.contains(&declaration.target_name))
+            .filter(|declaration| !covered[&declaration.target_name])
             .zip(placed)
         {
-            declaration.recipe = binding.source_recipe();
+            declaration.recipe = binding.into_source_recipe();
         }
     }
 
     BindingPlan::with_explicit_exceptions(declarations, shared_source_keys, conversions)?
         .build_bindings(source)
-        .map(|bindings| apply_parameter_storage_layouts(module, bindings))
+        .map(|bindings| {
+            bindings
+                .into_iter()
+                .map(|binding| {
+                    let (_, layout) = parameters
+                        .get(binding.name())
+                        .expect("validated exact destination retains its storage preference");
+                    binding.with_storage_layout(*layout)
+                })
+                .collect()
+        })
         .map_err(Into::into)
 }
 
-fn push_exact_declaration<P>(
-    parameters: &BTreeMap<String, (&P, ParameterBindingTarget)>,
+fn push_exact_declaration(
+    parameters: &BTreeMap<ParameterId, (ParameterBindingTarget, eredu_nn::ParameterStorageLayout)>,
     declarations: &mut Vec<PlannedBinding>,
     conversions: &mut BTreeMap<String, Vec<RecipeDtype>>,
     target: String,
     recipe: DerivedWeightRecipe,
     explicitly_permitted_source_dtypes: &[RecipeDtype],
 ) -> Result<(), ModuleBindingPlanError> {
-    let description = &parameters
-        .get(&target)
-        .expect("validated module destination remains present")
-        .1;
+    let (description, _) = parameters
+        .get(target.as_str())
+        .expect("validated module destination remains present");
     let mut permitted = description.permitted_source_dtypes.clone();
     for dtype in explicitly_permitted_source_dtypes {
         if !permitted.contains(dtype) {
@@ -753,10 +731,7 @@ fn validate_exact_task_provenance(
     task: &ReplicatedTextMaterializationTask,
     source: &dyn CheckpointSource,
 ) -> Result<(), ModuleBindingPlanError> {
-    if matches!(
-        task.lowering(),
-        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-    ) {
+    if task.lowering().transforms_payload() {
         return Ok(());
     }
     let declared = task
@@ -933,6 +908,351 @@ pub enum ModuleBindingPlanError {
     Declaration(#[from] ResidencyDeclarationError),
 }
 
+/// Family-admitted recipes and logical aliases for one independently owned resource.
+/// Aliases resolve only within this resource; separate resources retain separate
+/// materializations even when they read the same checkpoint input.
+pub struct ParameterResourceRecipes {
+    /// Canonical physical outputs, keyed by parameter identity.
+    pub outputs: BTreeMap<String, DerivedWeightRecipe>,
+    /// Logical consumers sharing an output within this resource.
+    pub aliases: Vec<RecipeAlias>,
+}
+
+/// Projects a canonical parameter recipe through declared physical selections.
+///
+/// No selection retains the validated complete recipe. One selection preserves
+/// its representation; multiple ordered ranges on one axis concatenate their
+/// bounded projections on that axis. Families supply ranges after accounting for
+/// their packed geometry. This function inspects metadata without reading payloads.
+pub fn select_parameter_recipe<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    target: &str,
+    source: &DerivedWeightRecipe,
+    selections: Option<&[TensorSelection]>,
+) -> Result<DerivedWeightRecipe, RecipeBindingError> {
+    let invalid_recipe = |source| RecipeBindingError::ParameterRecipe {
+        target: target.to_owned(),
+        source,
+    };
+    let recipe = match selections {
+        None => source.clone(),
+        Some([selection]) => source
+            .select_bounded(catalog, selection.clone())
+            .map_err(invalid_recipe)?,
+        Some(selections) => {
+            let Some(TensorSelection::Range { axis, .. }) = selections.first() else {
+                return Err(RecipeBindingError::InvalidParameterSelection {
+                    target: target.to_owned(),
+                });
+            };
+            if !selections.iter().all(|selection| {
+                matches!(selection, TensorSelection::Range { axis: selected, .. } if selected == axis)
+            }) {
+                return Err(RecipeBindingError::InvalidParameterSelection {
+                    target: target.to_owned(),
+                });
+            }
+            let inputs = selections
+                .iter()
+                .map(|selection| {
+                    source
+                        .select_bounded(catalog, selection.clone())
+                        .map_err(invalid_recipe)
+                })
+                .collect::<Result<_, _>>()?;
+            DerivedWeightRecipe::Concatenate {
+                axis: *axis,
+                inputs,
+            }
+        }
+    };
+    recipe.infer(catalog).map_err(invalid_recipe)?;
+    Ok(recipe)
+}
+
+/// Selects ordered bank-global member identities from canonical parameter recipes.
+///
+/// Selection validates the nonempty, unique member list against the declared
+/// global count before inspecting recipes. The family supplies the canonical
+/// member axis; checkpoint selection pushdown preserves layout transforms and
+/// the requested order without acquiring payloads or inferring family geometry.
+/// Repeated canonical parameter destinations are rejected rather than overwritten.
+pub fn select_parameter_bank_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    global_members: usize,
+    member_axis: usize,
+    members: &[usize],
+    outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, RecipeBindingError> {
+    if members.is_empty() {
+        return Err(RecipeBindingError::EmptyBankSelection);
+    }
+    let mut unique = BTreeSet::new();
+    for &member in members {
+        if member >= global_members {
+            return Err(RecipeBindingError::BankMemberOutOfBounds {
+                member,
+                global_members,
+            });
+        }
+        if !unique.insert(member) {
+            return Err(RecipeBindingError::DuplicateBankMember { member });
+        }
+    }
+    let selection = TensorSelection::Indices {
+        axis: member_axis,
+        indices: members.to_vec(),
+    };
+    let mut selected = BTreeMap::new();
+    for (target, recipe) in outputs {
+        if selected.contains_key(&target) {
+            return Err(ResidencyDeclarationError::DuplicateLogicalBinding { name: target }.into());
+        }
+        let recipe = select_parameter_recipe(
+            catalog,
+            &target,
+            &recipe,
+            Some(std::slice::from_ref(&selection)),
+        )?;
+        selected.insert(target, recipe);
+    }
+    Ok(selected)
+}
+
+/// Source-free canonical bank recipes and bounded leading-axis member projections.
+///
+/// Member identities are bank-global ordinals. Every declared parameter retains
+/// the singleton member axis and original recipe transforms. This catalog owns no
+/// payload, native operator, mutable state, or residency selection.
+#[derive(Debug)]
+pub struct ParameterBankRecipes {
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
+    members: Vec<BTreeMap<String, DerivedWeightRecipe>>,
+}
+
+impl ParameterBankRecipes {
+    /// Validates every declared bank member count and prepares bounded recipes
+    /// against metadata only. Physical source admission remains with the caller.
+    pub fn new<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        recipes: BTreeMap<String, DerivedWeightRecipe>,
+        member_count: usize,
+    ) -> Result<Self, RecipeBindingError> {
+        let mut members = vec![BTreeMap::new(); member_count];
+        for (target, recipe) in &recipes {
+            let selected = recipe.select_bounded_members(catalog).map_err(|source| {
+                RecipeBindingError::ParameterRecipe {
+                    target: target.clone(),
+                    source,
+                }
+            })?;
+            if selected.len() != member_count {
+                return Err(RecipeBindingError::BankMemberCount {
+                    target: target.clone(),
+                    expected: member_count,
+                    actual: selected.len(),
+                });
+            }
+            for (member, recipe) in members.iter_mut().zip(selected) {
+                member.insert(target.clone(), recipe);
+            }
+        }
+        Ok(Self { recipes, members })
+    }
+
+    /// Transforms complete bank recipes before deriving bounded members again.
+    /// Canonical targets and the declared bank-global member count remain fixed;
+    /// families supply their rank geometry and format-specific selections.
+    pub fn map_recipes<C: RecipeCatalog + ?Sized, E>(
+        &self,
+        catalog: &C,
+        mut transform: impl FnMut(&str, &DerivedWeightRecipe) -> Result<DerivedWeightRecipe, E>,
+    ) -> Result<Self, E>
+    where
+        E: From<RecipeBindingError>,
+    {
+        let recipes = self
+            .recipes
+            .iter()
+            .map(|(target, recipe)| {
+                transform(target, recipe).map(|recipe| (target.clone(), recipe))
+            })
+            .collect::<Result<_, E>>()?;
+        Self::new(catalog, recipes, self.member_count()).map_err(E::from)
+    }
+
+    /// Complete bank geometry and parameter identities before member selection.
+    pub fn recipes(&self) -> &BTreeMap<String, DerivedWeightRecipe> {
+        &self.recipes
+    }
+
+    /// Number of globally indexed members, independent of local resource order.
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Exact parameter recipes for one bank-global member, retaining its axis.
+    pub fn member(&self, member: usize) -> Option<&BTreeMap<String, DerivedWeightRecipe>> {
+        self.members.get(member)
+    }
+}
+
+/// Exact recipes and immutable physical source authority for one parameter owner.
+/// Empty owners are valid. This retains no native tensor or execution state and
+/// does not merge separately leased ordinary units, experts or pinned resources.
+#[derive(Clone)]
+pub struct PreparedParameterRecipes {
+    source: SharedCheckpointSource,
+    recipes: Arc<BTreeMap<String, DerivedWeightRecipe>>,
+}
+
+impl PreparedParameterRecipes {
+    /// Retains only the recipes' physical inputs and validates their outputs
+    /// against the exact metadata snapshot, without acquiring payloads.
+    pub fn new(
+        scope: impl Into<String>,
+        source: SharedCheckpointSource,
+        recipes: BTreeMap<String, DerivedWeightRecipe>,
+    ) -> Result<Self, RecipeBindingError> {
+        let keys = recipes
+            .values()
+            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+            .collect();
+        let source: SharedCheckpointSource =
+            Arc::new(PreparedCheckpointSource::retain(source, scope, keys)?);
+        for recipe in recipes.values() {
+            recipe.infer(source.as_ref())?;
+        }
+        Ok(Self {
+            source,
+            recipes: Arc::new(recipes),
+        })
+    }
+
+    /// Transforms recipes without changing canonical parameter identities or
+    /// borrowing physical inputs outside this retained owner's authority.
+    /// Family hooks borrow retained recipes and metadata to supply equations such
+    /// as rank-local range selection; they cannot acquire payloads through this view.
+    /// The result validates transformed outputs and narrows source authority to
+    /// their actual inputs without reading payloads or allocating native values.
+    pub fn map_recipes<E>(
+        self,
+        scope: impl Into<String>,
+        mut transform: impl FnMut(
+            &str,
+            &DerivedWeightRecipe,
+            &dyn RecipeCatalog,
+        ) -> Result<DerivedWeightRecipe, E>,
+    ) -> Result<Self, E>
+    where
+        E: From<RecipeBindingError>,
+    {
+        struct MetadataView<'a>(&'a dyn CheckpointSource);
+        impl RecipeCatalog for MetadataView<'_> {
+            fn tensor_metadata(
+                &self,
+                key: &str,
+            ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
+                self.0.source_metadata(key)
+            }
+            fn recipe_cache(&self) -> Option<&eredu_checkpoint::recipe::RecipeInferenceCache> {
+                self.0.recipe_cache()
+            }
+        }
+        let catalog = MetadataView(self.source.as_ref());
+        let recipes = self
+            .recipes
+            .iter()
+            .map(|(name, recipe)| {
+                transform(name, recipe, &catalog).map(|recipe| (name.clone(), recipe))
+            })
+            .collect::<Result<_, E>>()?;
+        Self::new(scope, self.source, recipes).map_err(E::from)
+    }
+
+    /// Projects retained canonical parameter identities without transforming their
+    /// recipes. Empty selections are valid; unknown identities fail explicitly.
+    /// Deferred reads retain the original exact metadata and provenance guards.
+    pub fn project(
+        mut self,
+        scope: impl Into<String>,
+        targets: &BTreeSet<String>,
+    ) -> Result<Self, RecipeBindingError> {
+        for target in targets {
+            if !self.recipes.contains_key(target) {
+                return Err(RecipeBindingError::UnknownParameter {
+                    target: target.clone(),
+                });
+            }
+        }
+        // Admission above makes equal cardinality an identical selection.
+        if self.recipes.len() != targets.len() {
+            self.recipes = Arc::new(match Arc::try_unwrap(self.recipes) {
+                Ok(mut recipes) => {
+                    recipes.retain(|target, _| targets.contains(target));
+                    recipes
+                }
+                Err(recipes) => targets
+                    .iter()
+                    .map(|target| (target.clone(), recipes[target].clone()))
+                    .collect(),
+            });
+        }
+        let keys = self
+            .recipes
+            .values()
+            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+            .collect();
+        self.source = Arc::new(RestrictedCheckpointSource::including(
+            self.source,
+            scope,
+            keys,
+        )?);
+        Ok(self)
+    }
+
+    /// Exact restricted metadata and provenance authority for deferred binding.
+    pub fn source(&self) -> &SharedCheckpointSource {
+        &self.source
+    }
+
+    /// Canonical parameter identities mapped to family-admitted physical recipes.
+    pub fn recipes(&self) -> &BTreeMap<String, DerivedWeightRecipe> {
+        &self.recipes
+    }
+}
+
+/// Prepares independent resources against one exact restricted source authority.
+///
+/// The keys retain canonical storage ownership; their order does not define logical
+/// invocation or state identities. This reads metadata only. No resource is merged
+/// with another, and aliases cannot borrow a neighboring resource's materialization.
+pub fn prepare_resource_bindings<K: Ord>(
+    source: SharedCheckpointSource,
+    scope: impl Into<String>,
+    resources: BTreeMap<K, ParameterResourceRecipes>,
+) -> Result<(SharedCheckpointSource, BTreeMap<K, Vec<WeightBinding>>), RecipeBindingError> {
+    let inputs = resources
+        .values()
+        .flat_map(|resource| resource.outputs.values())
+        .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
+        .collect();
+    let source: SharedCheckpointSource =
+        Arc::new(PreparedCheckpointSource::retain(source, scope, inputs)?);
+    let bindings = resources
+        .into_iter()
+        .map(|(owner, resource)| {
+            let set = AtomicRecipeSet::new_with_aliases(
+                source.as_ref(),
+                resource.outputs,
+                resource.aliases,
+            )?;
+            Ok((owner, bindings_from_recipe_set(source.as_ref(), set)?))
+        })
+        .collect::<Result<_, RecipeBindingError>>()?;
+    Ok((source, bindings))
+}
+
 /// Consumes one atomic recipe publication into owner bindings and lightweight
 /// logical aliases without cloning any derived recipe.
 pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
@@ -940,27 +1260,80 @@ pub fn bindings_from_recipe_set<C: RecipeCatalog + ?Sized>(
     set: AtomicRecipeSet,
 ) -> Result<Vec<WeightBinding>, RecipeBindingError> {
     let (outputs, aliases) = set.into_parts();
-    let mut bytes = BTreeMap::new();
-    for (name, recipe) in &outputs {
-        bytes.insert(name.clone(), recipe.infer(catalog)?.byte_len());
-    }
     let mut bindings = outputs
         .into_iter()
         .map(|(name, recipe)| {
-            let expected = bytes[&name];
-            WeightBinding::from_recipe(name, recipe, expected)
+            let expected = recipe.infer(catalog)?.byte_len();
+            Ok(WeightBinding::from_recipe(name, recipe, expected)?)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, RecipeBindingError>>()?;
+    // Canonical owners retain recipe-set order; appended aliases do not join this search.
+    let owners = bindings.len();
     for (alias, owner) in aliases {
-        bindings.push(WeightBinding::alias(alias, owner.clone(), bytes[&owner])?);
+        let index = bindings[..owners]
+            .binary_search_by(|binding| binding.name().cmp(owner.as_str()))
+            .expect("validated recipe alias names a canonical output");
+        let bytes = bindings[index].expected_bytes();
+        bindings.push(WeightBinding::alias(alias, owner, bytes)?);
     }
     WeightBindingPlan::new(&bindings)?;
     Ok(bindings)
 }
 
-/// Failure while lowering an atomic neutral recipe set into runtime bindings.
+/// Failure preparing exact source authority or lowering atomic recipe bindings.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeBindingError {
+    /// A segmented projection has no ranges or mixes range axes or kinds.
+    #[error("parameter {target:?} selection requires one selection or ordered ranges on one axis")]
+    InvalidParameterSelection {
+        /// Canonical parameter whose selected pieces cannot be assembled.
+        target: String,
+    },
+    /// An ordered bank projection selected no members.
+    #[error("parameter bank selection requires at least one member")]
+    EmptyBankSelection,
+    /// A selected identity is outside the declared global bank.
+    #[error("parameter bank member {member} is outside {global_members} members")]
+    BankMemberOutOfBounds {
+        /// Requested bank-global member identity.
+        member: usize,
+        /// Declared global member count.
+        global_members: usize,
+    },
+    /// A bank projection repeats a global identity.
+    #[error("parameter bank selection repeats member {member}")]
+    DuplicateBankMember {
+        /// Repeated bank-global member identity.
+        member: usize,
+    },
+    /// A canonical parameter recipe cannot be inferred or projected.
+    #[error("parameter {target:?} recipe failed: {source}")]
+    ParameterRecipe {
+        /// Canonical parameter identity.
+        target: String,
+        /// Original typed recipe failure.
+        #[source]
+        source: RecipeError,
+    },
+    /// A bank parameter describes a different leading-axis member count.
+    #[error("parameter {target:?} has {actual} bank members; expected {expected}")]
+    BankMemberCount {
+        /// Canonical parameter identity.
+        target: String,
+        /// Declared bank member count.
+        expected: usize,
+        /// Actual recipe member count.
+        actual: usize,
+    },
+    /// An identity projection names a parameter outside the retained owner.
+    #[error("parameter {target:?} is absent from the prepared recipe owner")]
+    UnknownParameter {
+        /// Canonical parameter identity requested by the projection.
+        target: String,
+    },
+    /// Exact physical source authority cannot be restricted.
+    #[error(transparent)]
+    Source(#[from] StoreError),
     /// Recipe metadata inference failed.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
@@ -999,7 +1372,7 @@ fn validated_binding_plan<'a, B: ParameterBackend>(
     plan: WeightBindingPlan<'a>,
 ) -> Result<WeightBindingPlan<'a>, ParameterOrchestrationError<B::ParameterError>> {
     for binding in plan.owners() {
-        let inferred = binding.source_recipe().infer(source)?;
+        let inferred = binding.recipe_view().infer(source)?;
         if inferred.byte_len() != binding.expected_bytes() {
             return Err(ParameterOrchestrationError::ByteMismatch {
                 parameter: binding.name().to_owned(),
@@ -1009,7 +1382,7 @@ fn validated_binding_plan<'a, B: ParameterBackend>(
         }
     }
     for binding in plan.owners() {
-        B::preflight_recipe(&binding.source_recipe(), source)
+        B::preflight_recipe(&binding.recipe_view(), source)
             .map_err(ParameterOrchestrationError::Backend)?;
     }
     Ok(plan)
@@ -1112,7 +1485,7 @@ fn materialize_validated_plan<B: ParameterBackend>(
         let materialization =
             if binding.storage_layout() != eredu_nn::ParameterStorageLayout::Canonical {
                 B::materialize_recipe_with_layout(
-                    &binding.source_recipe(),
+                    &binding.recipe_view(),
                     source,
                     binding.storage_layout(),
                     context,
@@ -1186,7 +1559,7 @@ where
 {
     struct Validator<'a, B: ParameterBackend> {
         weights: &'a BTreeMap<ParameterId, B::MaterializedWeight>,
-        visited: BTreeMap<ParameterId, ()>,
+        visited: BTreeSet<ParameterId>,
         error: Option<ParameterOrchestrationError<B::ParameterError>>,
         excluded: &'a dyn Fn(&ParameterId) -> bool,
     }
@@ -1199,7 +1572,7 @@ where
             if (self.excluded)(&metadata.id) {
                 return;
             }
-            if self.visited.insert(metadata.id.clone(), ()).is_some() {
+            if !self.visited.insert(metadata.id.clone()) {
                 self.error = Some(ParameterOrchestrationError::DuplicateParameter {
                     parameter: metadata.id,
                 });
@@ -1219,7 +1592,7 @@ where
 
     let mut validator = Validator::<B> {
         weights: &unit.weights,
-        visited: BTreeMap::new(),
+        visited: BTreeSet::new(),
         error: None,
         excluded: &excluded,
     };
@@ -1230,7 +1603,7 @@ where
     let unexpected = unit
         .weights
         .keys()
-        .filter(|id| !validator.visited.contains_key(*id))
+        .filter(|id| !validator.visited.contains(*id))
         .cloned()
         .collect::<Vec<_>>();
     if !unexpected.is_empty() {
@@ -1239,15 +1612,18 @@ where
         });
     }
 
-    struct MutableTopologyValidator<'a> {
-        expected: &'a BTreeMap<ParameterId, ()>,
-        visited: BTreeMap<ParameterId, ()>,
+    // Immutable traversal and materialized keys now agree exactly.
+    drop(validator);
+
+    struct MutableTopologyValidator<'a, W> {
+        expected: &'a BTreeMap<ParameterId, W>,
+        visited: BTreeSet<ParameterId>,
         unexpected: Vec<ParameterId>,
         duplicate: Option<ParameterId>,
         excluded: &'a dyn Fn(&ParameterId) -> bool,
     }
 
-    impl<'a, 'value, P: 'value> ParameterVisitorMut<'value, P> for MutableTopologyValidator<'a> {
+    impl<'a, 'value, P: 'value, W> ParameterVisitorMut<'value, P> for MutableTopologyValidator<'a, W> {
         fn visit_mut(&mut self, metadata: ParameterMetadata, _: &'value mut P) {
             if self.duplicate.is_some() {
                 return;
@@ -1255,7 +1631,7 @@ where
             if (self.excluded)(&metadata.id) {
                 return;
             }
-            if self.visited.insert(metadata.id.clone(), ()).is_some() {
+            if !self.visited.insert(metadata.id.clone()) {
                 self.duplicate = Some(metadata.id);
             } else if !self.expected.contains_key(&metadata.id) {
                 self.unexpected.push(metadata.id);
@@ -1264,8 +1640,8 @@ where
     }
 
     let mut mutable_topology = MutableTopologyValidator {
-        expected: &validator.visited,
-        visited: BTreeMap::new(),
+        expected: &unit.weights,
+        visited: BTreeSet::new(),
         unexpected: Vec::new(),
         duplicate: None,
         excluded: &excluded,
@@ -1276,10 +1652,9 @@ where
     }
     let mut mismatch = mutable_topology.unexpected;
     mismatch.extend(
-        validator
-            .visited
+        unit.weights
             .keys()
-            .filter(|id| !mutable_topology.visited.contains_key(*id))
+            .filter(|id| !mutable_topology.visited.contains(*id))
             .cloned(),
     );
     if !mismatch.is_empty() {
@@ -1412,11 +1787,10 @@ pub fn apply_parameter_storage_layouts<P: 'static, M: Parameterized<P>>(
     module: &M,
     bindings: Vec<WeightBinding>,
 ) -> Vec<WeightBinding> {
-    struct Layouts(BTreeMap<String, eredu_nn::ParameterStorageLayout>);
+    struct Layouts(BTreeMap<ParameterId, eredu_nn::ParameterStorageLayout>);
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Layouts {
         fn visit(&mut self, metadata: ParameterMetadata, _: &'a P) {
-            self.0
-                .insert(metadata.id.as_str().to_owned(), metadata.storage_layout);
+            self.0.insert(metadata.id, metadata.storage_layout);
         }
     }
     let mut layouts = Layouts(BTreeMap::new());

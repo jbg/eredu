@@ -129,28 +129,9 @@ impl VisionPlan {
                 };
                 Ok((key, PreparedTensorSource { metadata, provenance }))
             }).collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-        struct Catalog<'a>(&'a BTreeMap<String, PreparedTensorSource>);
-        impl eredu_checkpoint::validation::SafetensorsCatalog for Catalog<'_> {
-            fn keys(&self) -> Vec<String> {
-                self.0.keys().cloned().collect()
-            }
-            fn metadata(
-                &self,
-                key: &str,
-            ) -> Result<eredu_checkpoint::validation::CatalogTensorMetadata, String> {
-                let value = self
-                    .0
-                    .get(key)
-                    .ok_or_else(|| format!("missing vision header {key}"))?;
-                Ok(eredu_checkpoint::validation::CatalogTensorMetadata {
-                    shape: value.metadata.logical_shape.clone(),
-                    stored_dtype: value.metadata.stored_dtype.clone(),
-                })
-            }
-        }
         let checkpoint = vision::safetensors_plan(&config, "model.visual")
             .map_err(PreparationError::Contract)?;
-        resolve_safetensors_plan(&Catalog(&expected), &checkpoint).map_err(|error| {
+        resolve_safetensors_plan(&expected, &checkpoint).map_err(|error| {
             PreparationError::Contract(format!("vision contract did not resolve: {error:?}"))
         })?;
         let recipes = expected
@@ -293,13 +274,23 @@ impl VisionPlan {
             source,
             self.declaration.expected.clone(),
         )?);
-        let static_parameters =
-            PreparedParameters::new(source.clone(), self.declaration.static_recipes.clone())?;
+        let static_parameters = PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
+            source.clone(),
+            self.declaration.static_recipes.clone(),
+        )?;
         let blocks = self
             .declaration
             .blocks
             .iter()
-            .map(|recipes| PreparedParameters::new(source.clone(), recipes.clone()))
+            .map(|recipes| {
+                PreparedParameterRecipes::new(
+                    "qwen4_exp prepared owner",
+                    source.clone(),
+                    recipes.clone(),
+                )
+                .map_err(PreparationError::from)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(PreparedVision {
             plan: Arc::new(self),

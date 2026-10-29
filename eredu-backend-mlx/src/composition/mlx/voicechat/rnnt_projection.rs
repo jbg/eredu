@@ -14,27 +14,32 @@ use crate::{
     },
     MlxTensor,
 };
+use eredu_architectures::voicechat::rnnt_layered::{RnntKernel, RnntUnit};
 use eredu_architectures::voicechat::{
     rnnt::{RnntDimensions, RnntError, RnntProjectionExecution},
-    rnnt_projection_layered::{
-        LayerwiseRnntProjection, RnntProjectionArchitecture, RnntProjectionInput,
-        RnntProjectionRuntimeState, RnntProjectionUnit,
-    },
+    rnnt_projection_layered::{ParallelRnntProjectionExecution, RnntProjectionInput},
     rnnt_projection_preparation::{
         validate_projection_parallel_communication, PreparedRnntProjectionBindings,
     },
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport,
+    ComponentAdapter, ComponentDefinition, DenseDiskStreamReport, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout, ResidencyReport,
+    StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
-type Unit = RnntProjectionUnit<MlxNeuralBackend>;
+type Unit = RnntUnit<MlxNeuralBackend>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, RnntKernel<MlxNeuralBackend, false>>,
+    MlxNeuralBackend,
+    StatelessComponentState,
+    P,
+>;
 enum Execution {
-    Resident(LayerwiseRnntProjection<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwiseRnntProjection<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native projection providers over exact embedding and joint source authority.
@@ -47,8 +52,8 @@ impl MlxRnntProjection {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -57,7 +62,6 @@ impl MlxRnntProjection {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -66,8 +70,8 @@ impl MlxRnntProjection {
     /// Pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -222,19 +226,22 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
-            let mut architecture = match local_layout.as_ref() {
+            let (dimensions, definition, local_layout, layout, source, units) =
+                prepared.into_parts();
+            let kernel = match local_layout.as_ref() {
                 Some(local) => {
-                    RnntProjectionArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local)
+                    RnntKernel::<MlxNeuralBackend, false>::new_parallel(dimensions, local)
                 }
-                None => RnntProjectionArchitecture::<MlxNeuralBackend>::new(dimensions),
+                None => RnntKernel::<MlxNeuralBackend, false>::new(dimensions),
             }
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(RnntError::from(error)))?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<RnntProjectionRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -249,12 +256,12 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<RnntProjectionRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwiseRnntProjection::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwiseRnntProjection::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxRnntProjection {

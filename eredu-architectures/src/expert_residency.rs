@@ -2,8 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eredu_checkpoint::recipe::DerivedWeightRecipe;
-use eredu_checkpoint::{recipe::RecipeCatalog, store::TensorSelection};
+use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeCatalog};
 use eredu_core::{
     balanced_contiguous_range, CollectiveGroupDescriptor, CollectiveGroupId, ParallelAxis,
     ParallelRankTopology,
@@ -1510,50 +1509,6 @@ pub enum ExpertResidencyDistribution {
     Replicated,
 }
 
-/// Selects architecture-canonical expert outputs for one rank's global IDs.
-///
-/// The expert axis is part of the architecture's canonical parameter geometry.
-/// Applying the selection to derived outputs lets the checkpoint recipe layer
-/// push it through fused, stacked, or transposed physical layouts without a
-/// backend recovering storage geometry.
-pub(crate) fn select_rank_local_expert_recipes<C: RecipeCatalog + ?Sized>(
-    catalog: &C,
-    global_experts: usize,
-    expert_axis: usize,
-    group_indices: &[usize],
-    outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    if group_indices.is_empty() {
-        return Err("rank-local expert recipes require at least one expert".into());
-    }
-    let mut unique = BTreeSet::new();
-    for &expert in group_indices {
-        if expert >= global_experts {
-            return Err(format!(
-                "rank-local expert {expert} is outside {global_experts} experts"
-            ));
-        }
-        if !unique.insert(expert) {
-            return Err(format!(
-                "rank-local expert recipe contains duplicate expert {expert}"
-            ));
-        }
-    }
-    let selection = TensorSelection::Indices {
-        axis: expert_axis,
-        indices: group_indices.to_vec(),
-    };
-    outputs
-        .into_iter()
-        .map(|(target, recipe)| {
-            recipe
-                .select_bounded(catalog, selection.clone())
-                .map(|recipe| (target, recipe))
-                .map_err(|error| error.to_string())
-        })
-        .collect()
-}
-
 /// One architecture-logical parameter in an independently resident expert.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExpertParameterRecipe {
@@ -2073,12 +2028,17 @@ where
         let (unit, path, recipes) = entry?;
         let outputs =
             eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, &recipes)?;
+        let selected_outputs = [&recipes.target_gate_up, &recipes.target_down]
+            .into_iter()
+            .flat_map(|target| ["", "_scales", "_biases"].map(|suffix| format!("{target}{suffix}")))
+            .filter_map(|target| outputs.get(&target).cloned().map(|recipe| (target, recipe)))
+            .collect();
+        let members = eredu_runtime::ParameterBankRecipes::new(catalog, selected_outputs, experts)
+            .map_err(|error| error.to_string())?;
         for expert in 0..experts {
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert.checked_add(1).ok_or("expert index overflow")?,
-            };
+            let selected = members
+                .member(expert)
+                .expect("validated expert bank member");
             let mut parameters = Vec::new();
             for (binding, target) in [
                 ("gate_up_proj", &recipes.target_gate_up),
@@ -2089,12 +2049,9 @@ where
                     .any(|suffix| outputs.contains_key(&format!("{target}{suffix}")));
                 for suffix in ["", "_scales", "_biases"] {
                     let name = format!("{target}{suffix}");
-                    let Some(recipe) = outputs.get(&name) else {
+                    let Some(recipe) = selected.get(&name) else {
                         continue;
                     };
-                    let recipe = recipe
-                        .select_bounded(catalog, selection.clone())
-                        .map_err(|error| error.to_string())?;
                     let role = if suffix.is_empty() && !has_companions {
                         ExpertParameterRole::quantizable_projection(
                             format!("{binding}_scales"),
@@ -2107,7 +2064,7 @@ where
                         ExpertParameterRecipe::new(
                             format!("{binding}{suffix}"),
                             name,
-                            recipe,
+                            recipe.clone(),
                             role,
                         )
                         .map_err(|error| error.to_string())?,

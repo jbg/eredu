@@ -43,6 +43,18 @@ pub trait RealtimeArchitectureIdentity {
     ) -> Result<RealtimeArchitectureConstructionIdentity, String>;
 }
 
+impl<D, K, R> RealtimeArchitectureIdentity for crate::ComponentAdapter<D, K, R>
+where
+    D: std::borrow::Borrow<crate::ComponentDefinition>,
+    K: RealtimeArchitectureIdentity,
+{
+    fn realtime_construction_identity(
+        &self,
+    ) -> Result<RealtimeArchitectureConstructionIdentity, String> {
+        self.kernel().realtime_construction_identity()
+    }
+}
+
 /// Concrete state paired with the exact realization its mechanism implemented.
 pub struct RealizedRealtimeState<S> {
     state: S,
@@ -232,10 +244,7 @@ pub fn preflight_realtime_materialization_tasks<B: ParameterBackend>(
     source: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<(), RealtimeModelContractError> {
     for task in tasks {
-        let transformed = matches!(
-            task.lowering().kind(),
-            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-        );
+        let transformed = task.lowering().kind().transforms_payload();
         let targets = task
             .components()
             .iter()
@@ -312,10 +321,7 @@ pub fn realtime_task_binding_plan(
                 units.entry(task.owner().clone()).or_default()
             }
         };
-        let transformed = matches!(
-            task.lowering().kind(),
-            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-        );
+        let transformed = task.lowering().kind().transforms_payload();
         for component in task.components() {
             let requirement = component.requirement();
             let target = requirement.target().as_str();
@@ -690,12 +696,10 @@ where
     M::Error: std::fmt::Display,
 {
     let (selected, tasks) = prepared.into_parts();
-    let requires_source_architecture = selected.weight_lowerings().iter().any(|lowering| {
-        matches!(
-            lowering.kind(),
-            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
-        )
-    });
+    let requires_source_architecture = selected
+        .weight_lowerings()
+        .iter()
+        .any(|lowering| lowering.kind().transforms_payload());
     if requires_source_architecture != source_architecture.is_some() {
         return Err(RealtimeModelConstructionError::Contract(
             "selected realtime lowering and source-format architecture presence differ".into(),

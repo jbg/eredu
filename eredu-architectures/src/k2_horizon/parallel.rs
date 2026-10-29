@@ -197,54 +197,11 @@ impl crate::decoder::PartitionedConfig for ModelArgs {
         local_block_args(self, layer, layout).map_err(eredu_nn::Error::backend)
     }
 
-    fn validate_partition_parameters(
+    fn partition_parameter_description(
         &self,
-        parameters: &eredu_runtime::ArchitectureParameterDescription,
-    ) -> Result<(), eredu_nn::Error> {
-        crate::decoder::validate_partitioned_decoder_description(self, parameters)?;
-        let expected = executable_shapes(self).map_err(eredu_nn::Error::backend)?;
-        let logical = ParameterGroupSpec::new(
-            "k2.expected_parameters",
-            ParameterRole::Replicated,
-            expected.into_iter().map(|(name, shape)| {
-                eredu_runtime::ParameterMemberSpec::new(name, shape, MemberSharding::Replicated)
-            }),
-        )
-        .map_err(eredu_nn::Error::backend)?;
-        let expanded =
-            eredu_runtime::expand_linear_format_parameter_groups(vec![logical], |member| {
-                crate::linear_format::standard_parallel_linear_format(
-                    member,
-                    self.linear_format_for(member.target()),
-                )
-            })
-            .map_err(eredu_nn::Error::backend)?;
-        let expected = expanded
-            .iter()
-            .flat_map(|group| group.members())
-            .map(|member| (member.target().to_owned(), member.global_shape().to_vec()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let actual = parameters
-            .groups()
-            .iter()
-            .flat_map(|owned| owned.group().members())
-            .map(|member| (member.target().to_owned(), member.global_shape().to_vec()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if actual != expected {
-            let differences = expected
-                .iter()
-                .filter(|(name, shape)| actual.get(*name) != Some(*shape))
-                .take(6)
-                .map(|(name, shape)| {
-                    format!("{name}: expected {shape:?}, actual {:?}", actual.get(name))
-                })
-                .collect::<Vec<_>>();
-            return Err(eredu_nn::Error::backend(format!(
-                "partition parameters differ from normalized K2 bank geometry: {}",
-                differences.join("; ")
-            )));
-        }
-        Ok(())
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        parameter_description(self)
     }
 }
 
@@ -256,7 +213,7 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = crate::decoder::block_common_parallel_parameter_groups(block, args, layer)?;
     let prefix = format!("model.layers.{layer}");
-    if let Some(values) = &block.mlp.values {
+    if let Some(values) = &block.body.mlp.values {
         groups.push(module_parameter_group::<B::Tensor, _>(
             format!("{prefix}.self_attn.v_router"),
             ParameterRole::Replicated,
@@ -282,7 +239,7 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                 .apply(group, |name| args.linear_format_for(name))?,
         );
     }
-    match &block.mlp.feed_forward {
+    match &block.body.mlp.feed_forward {
         FeedForward::Dense(mlp) => groups.push(crate::decoder::dense_mlp_parallel_parameter_group(
             mlp, args, layer,
         )?),
@@ -551,6 +508,7 @@ pub fn partition_local_routed_geometry(
     }
     crate::decoder::partition_local_geometry_with(
         args,
+        parameter_description(args)?.invocations(),
         layout,
         owned_units,
         |args, layer, layout| {

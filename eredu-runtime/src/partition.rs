@@ -3,6 +3,8 @@
 use std::ops::Deref;
 use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
 
+use crate::component_execution::ParameterStorageRef;
+
 use crate::{
     ArchitectureStatePartitionError, ArchitectureStatePartitionPlan, ArchitectureStatePlacement,
     ExecutionGraph, ExecutionGroupId, ExecutionUnitLayout, LayeredForwardState,
@@ -26,13 +28,16 @@ pub enum ParameterGroupOwner {
         /// Canonical group and unit identities that consume the module.
         consumers: Vec<(ExecutionGroupId, usize)>,
     },
-    /// One architecture-global unit in a canonical execution group.
+    /// One canonical independently leased module and its logical consumers.
     #[non_exhaustive]
     ExecutionUnit {
         /// Canonical execution-group identity.
         group: ExecutionGroupId,
-        /// Group-local architecture-global unit index.
+        /// Canonical physical owner address within its execution group.
         global_unit: usize,
+        /// Logical consumers in the same canonical execution group. Parameter
+        /// sharing is independent of each consumer's mutable-state ownership.
+        consumers: Vec<usize>,
     },
 }
 
@@ -67,16 +72,69 @@ impl ParameterGroupOwner {
         }
     }
 
-    /// Compares exact ownership, allowing a constructed consumer declaration
-    /// to refine a selected static binding role.
+    /// Whether one explicit logical unit consumes this resource.
+    /// Static roles alone do not declare unit consumers or mutable-state sharing.
+    pub fn has_unit_consumer(&self, group: &ExecutionGroupId, unit: usize) -> bool {
+        match self {
+            Self::ExecutionUnit {
+                group: owner,
+                consumers,
+                ..
+            } => owner == group && consumers.contains(&unit),
+            Self::StaticUnitConsumers { consumers, .. } => consumers
+                .iter()
+                .any(|(owner, index)| owner == group && *index == unit),
+            Self::StaticRole(_) | Self::StaticAnyOf(_) => false,
+        }
+    }
+
+    /// Compares canonical ownership, allowing constructed consumers to refine
+    /// a selected binding role or extend its declared invocation consumers.
     pub fn refines_storage_owner(&self, selected: &Self) -> bool {
         self == selected
             || matches!(selected, Self::StaticRole(role) if self.accepts_static_role(role))
+            || matches!((self, selected), (
+                Self::ExecutionUnit { group, global_unit, consumers },
+                Self::ExecutionUnit {
+                    group: expected_group,
+                    global_unit: expected_unit,
+                    consumers: expected_consumers,
+                },
+            ) if group == expected_group && global_unit == expected_unit
+                && expected_consumers.iter().all(|unit| consumers.contains(unit)))
+    }
+
+    /// Compares canonical storage without copying consumer declarations or role names.
+    pub(crate) fn same_storage_as(&self, other: &Self) -> bool {
+        match (
+            ParameterStorageRef::from_owner(self),
+            ParameterStorageRef::from_owner(other),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
     }
 
     /// Creates execution-unit ownership in the architecture-global index space.
     pub fn execution_unit(group: ExecutionGroupId, global_unit: usize) -> Self {
-        Self::ExecutionUnit { group, global_unit }
+        Self::ExecutionUnit {
+            group,
+            global_unit,
+            consumers: vec![global_unit],
+        }
+    }
+
+    /// Declares one independently leased owner used by explicit logical invocations.
+    pub fn execution_unit_consumers(
+        group: ExecutionGroupId,
+        global_unit: usize,
+        consumers: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        Self::ExecutionUnit {
+            group,
+            global_unit,
+            consumers: consumers.into_iter().collect(),
+        }
     }
 
     pub(crate) fn validate(
@@ -110,24 +168,16 @@ impl ParameterGroupOwner {
                     return Err(ArchitectureParameterError::DuplicateStaticConsumer);
                 }
             }
-            ParameterGroupOwner::ExecutionUnit { .. } => {}
-        }
-        let consumers = match self {
-            ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
-                .iter()
-                .map(|(group, unit)| (group, unit))
-                .collect::<Vec<_>>(),
-            ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
-                vec![(group, global_unit)]
+            ParameterGroupOwner::ExecutionUnit { consumers, .. } => {
+                if consumers.is_empty()
+                    || consumers.iter().collect::<BTreeSet<_>>().len() != consumers.len()
+                {
+                    return Err(ArchitectureParameterError::InvalidUnitConsumers);
+                }
             }
-            _ => Vec::new(),
-        };
-        for (group, global_unit) in consumers {
-            let Some(group_index) = graph
-                .groups()
-                .iter()
-                .position(|candidate| candidate.id() == group.as_str())
-            else {
+        }
+        let validate_unit = |group: &ExecutionGroupId, global_unit| {
+            let Some(group_index) = graph.group_index(group.as_str()) else {
                 return Err(ArchitectureParameterError::UnknownExecutionGroup(
                     group.as_str().to_owned(),
                 ));
@@ -136,32 +186,36 @@ impl ParameterGroupOwner {
                 .group_range(group_index)
                 .expect("validated canonical layout contains every group")
                 .len();
-            if *global_unit >= available {
+            if layout.ordinal(group_index, global_unit).is_none() {
                 return Err(ArchitectureParameterError::UnitOutOfRange {
                     group: group.as_str().to_owned(),
-                    global_unit: *global_unit,
+                    global_unit,
                     available,
                 });
             }
+            Ok(())
+        };
+        match self {
+            Self::StaticUnitConsumers { consumers, .. } => consumers
+                .iter()
+                .try_for_each(|(group, unit)| validate_unit(group, *unit)),
+            Self::ExecutionUnit {
+                group,
+                global_unit,
+                consumers,
+            } => {
+                validate_unit(group, *global_unit)?;
+                consumers
+                    .iter()
+                    .try_for_each(|unit| validate_unit(group, *unit))
+            }
+            Self::StaticRole(_) | Self::StaticAnyOf(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn is_local<G, A>(&self, partition: &ArchitecturePartition<G, A>) -> bool {
         self.is_stored_by(partition.ownership(), |group, unit| {
             partition.owns_unit(group.as_str(), unit)
-        })
-    }
-
-    fn is_local_partition_parts(
-        &self,
-        groups: &[PartitionGroup],
-        ownership: &PartitionOwnership,
-    ) -> bool {
-        self.is_stored_by(ownership, |group, unit| {
-            groups
-                .iter()
-                .any(|owned| owned.group() == group && owned.contains(unit))
         })
     }
 
@@ -177,7 +231,9 @@ impl ParameterGroupOwner {
             Self::StaticUnitConsumers { consumers, .. } => consumers
                 .iter()
                 .any(|(group, unit)| owns_unit(group, *unit)),
-            Self::ExecutionUnit { group, global_unit } => owns_unit(group, *global_unit),
+            Self::ExecutionUnit {
+                group, consumers, ..
+            } => consumers.iter().any(|unit| owns_unit(group, *unit)),
         }
     }
 
@@ -188,20 +244,17 @@ impl ParameterGroupOwner {
         ownership: &PartitionOwnership,
         owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
     ) -> bool {
-        match self {
-            Self::StaticRole(role) => ownership.stores_static_role(role),
-            Self::StaticAnyOf(roles) => roles.iter().any(|role| ownership.stores_static_role(role)),
-            Self::StaticUnitConsumers { role, consumers } => {
-                ownership.replicated_static_roles().contains(role)
-                    || consumers
-                        .iter()
-                        .any(|(group, unit)| owns_unit(group, *unit))
-            }
-            Self::ExecutionUnit { group, global_unit } => owns_unit(group, *global_unit),
-        }
+        ownership
+            .replicated_static_roles()
+            .iter()
+            .any(|role| self.accepts_static_role(role))
+            || self.is_owned_by(ownership, owns_unit)
     }
 
-    fn static_storage_role(&self) -> Option<&str> {
+    /// Returns the canonical static storage role, independently of its consumers.
+    /// Shared static groups use their first declared role as the storage owner.
+    /// Execution-unit storage has no static role.
+    pub fn static_storage_role(&self) -> Option<&str> {
         match self {
             Self::StaticRole(role) => Some(role),
             Self::StaticAnyOf(roles) => roles.first().map(String::as_str),
@@ -209,6 +262,20 @@ impl ParameterGroupOwner {
             Self::ExecutionUnit { .. } => None,
         }
     }
+}
+
+/// Source-format conversion changes canonical ownership of a selected parameter.
+#[derive(Debug, thiserror::Error)]
+pub enum TransformParameterOwnershipError {
+    /// The selected output has no target partition owner.
+    #[error("selected transform task {0:?} has no target partition owner")]
+    MissingTarget(String),
+    /// The selected output has no source partition owner.
+    #[error("selected transform task {0:?} has no source partition owner")]
+    MissingSource(String),
+    /// Source and target assign the same parameter to different storage owners.
+    #[error("selected transform task {0:?} changed its source/target owner address")]
+    Changed(String),
 }
 
 /// One neutral parameter group tagged with its architecture-owned location.
@@ -253,6 +320,7 @@ impl Deref for OwnedParameterGroupSpec {
 pub struct ArchitectureParameterDescription {
     graph: ExecutionGraph,
     unit_layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     groups: Vec<OwnedParameterGroupSpec>,
     partition_layout: Option<(
         eredu_core::ParallelRankTopology,
@@ -262,7 +330,8 @@ pub struct ArchitectureParameterDescription {
 
 impl ArchitectureParameterDescription {
     /// Validates explicit ownership against the canonical graph/layout and an
-    /// authoritative set of neutral parameter groups.
+    /// authoritative set of neutral parameter groups. Every target retains its
+    /// member metadata and group semantics, independently of member ordering.
     pub fn new(
         graph: &ExecutionGraph,
         layout: &ExecutionUnitLayout,
@@ -271,13 +340,33 @@ impl ArchitectureParameterDescription {
     ) -> Result<Self, ArchitectureParameterError> {
         validate_canonical_layout(graph, layout)
             .map_err(|error| ArchitectureParameterError::InvalidLayout(error.to_string()))?;
-        let expected = parameter_targets(expected)?;
-        let groups = groups.into_iter().collect::<Vec<_>>();
+        let expected = parameter_declarations(expected)?;
+        Self::validate_ownership(graph, layout, Some(expected), groups.into_iter().collect())
+    }
+
+    /// Validates a canonical owned declaration without duplicating its parameter catalog.
+    /// Use [`Self::new`] when ownership must match independently declared parameters.
+    pub fn from_owned(
+        graph: &ExecutionGraph,
+        layout: &ExecutionUnitLayout,
+        groups: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+    ) -> Result<Self, ArchitectureParameterError> {
+        validate_canonical_layout(graph, layout)
+            .map_err(|error| ArchitectureParameterError::InvalidLayout(error.to_string()))?;
+        Self::validate_ownership(graph, layout, None, groups.into_iter().collect())
+    }
+
+    fn validate_ownership(
+        graph: &ExecutionGraph,
+        layout: &ExecutionUnitLayout,
+        expected: Option<BTreeMap<String, ExpectedParameter>>,
+        groups: Vec<OwnedParameterGroupSpec>,
+    ) -> Result<Self, ArchitectureParameterError> {
         let mut actual = BTreeMap::new();
         for tagged in &groups {
             tagged.owner().validate(graph, layout)?;
             for member in tagged.group().members() {
-                if let Some(previous) = actual.insert(member.target().to_owned(), tagged.owner()) {
+                if let Some(previous) = actual.insert(member.target(), tagged.owner()) {
                     return Err(ArchitectureParameterError::DuplicateOwnership {
                         target: member.target().to_owned(),
                         first: previous.clone(),
@@ -286,19 +375,101 @@ impl ArchitectureParameterDescription {
                 }
             }
         }
-        let actual_targets = actual.keys().cloned().collect::<BTreeSet<_>>();
-        let expected_targets = expected.keys().cloned().collect::<BTreeSet<_>>();
-        if let Some(target) = expected_targets.difference(&actual_targets).next() {
-            return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
+        if let Some(expected) = expected {
+            if let Some(target) = expected
+                .keys()
+                .find(|target| !actual.contains_key(target.as_str()))
+            {
+                return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
+            }
+            if let Some(target) = actual
+                .keys()
+                .find(|target| !expected.contains_key(**target))
+            {
+                return Err(ArchitectureParameterError::UnexpectedOwnership(
+                    target.to_string(),
+                ));
+            }
+            for tagged in &groups {
+                for member in tagged.members() {
+                    if !expected[member.target()].matches(tagged.group(), member) {
+                        return Err(ArchitectureParameterError::InconsistentDeclaration {
+                            target: member.target().to_owned(),
+                            group: tagged.logical_name().to_owned(),
+                        });
+                    }
+                }
+            }
         }
-        if let Some(target) = actual_targets.difference(&expected_targets).next() {
-            return Err(ArchitectureParameterError::UnexpectedOwnership(
-                target.clone(),
-            ));
+        let mut owners = BTreeMap::new();
+        let mut claims = BTreeMap::new();
+        for tagged in &groups {
+            if let ParameterGroupOwner::ExecutionUnit {
+                group,
+                global_unit,
+                consumers,
+            } = tagged.owner()
+            {
+                let group = graph.group_index(group.as_str()).expect("validated group");
+                let owner = layout
+                    .address(
+                        layout
+                            .ordinal(group, *global_unit)
+                            .expect("validated owner"),
+                    )
+                    .expect("declared owner");
+                let selected = owners
+                    .entry((group, *global_unit))
+                    .or_insert_with(|| consumers.iter().copied().collect::<BTreeSet<_>>());
+                if selected.len() != consumers.len()
+                    || consumers
+                        .iter()
+                        .any(|consumer| !selected.contains(consumer))
+                {
+                    return Err(ArchitectureParameterError::InconsistentUnitConsumers {
+                        group,
+                        global_unit: *global_unit,
+                    });
+                }
+                for &consumer in selected.iter() {
+                    if let Some(previous) = claims.insert((group, consumer), owner) {
+                        if previous != owner {
+                            return Err(ArchitectureParameterError::ConflictingUnitOwners {
+                                group,
+                                global_unit: consumer,
+                            });
+                        }
+                    }
+                }
+            }
         }
+        let references = (0..layout.len())
+            .map(|ordinal| {
+                let logical = layout.address(ordinal).expect("declared invocation");
+                let storage = claims
+                    .get(&(logical.group(), logical.index()))
+                    .copied()
+                    .unwrap_or(logical);
+                (logical, storage)
+            })
+            .collect::<Vec<_>>();
+        let used = references
+            .iter()
+            .map(|(_, storage)| (storage.group(), storage.index()))
+            .collect::<BTreeSet<_>>();
+        let storage = layout
+            .select(
+                (0..layout.len())
+                    .map(|ordinal| layout.address(ordinal).expect("declared invocation"))
+                    .filter(|address| used.contains(&(address.group(), address.index()))),
+            )
+            .expect("canonical physical subset");
+        let invocations = crate::ExecutionUnitAddressMap::new(&storage, references)
+            .expect("validated consumer ownership");
         Ok(Self {
             graph: graph.clone(),
             unit_layout: layout.clone(),
+            invocations,
             groups,
             partition_layout: None,
         })
@@ -362,6 +533,11 @@ impl ArchitectureParameterDescription {
         &self.unit_layout
     }
 
+    /// Canonical physical owners and the logical invocations that consume them.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
+    }
+
     /// Proves that this description still matches a concrete neutral architecture.
     pub fn validate_architecture<B, S, M>(
         &self,
@@ -380,12 +556,31 @@ impl ArchitectureParameterDescription {
         if unit_layout != self.unit_layout {
             return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
         }
+        let invocations = architecture
+            .execution_unit_storage_map()
+            .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+        if invocations != self.invocations {
+            return Err(ArchitecturePartitionError::ArchitectureStorageMapMismatch);
+        }
         Ok(())
     }
 
     /// Returns every explicitly tagged neutral parameter group.
     pub fn groups(&self) -> &[OwnedParameterGroupSpec] {
         &self.groups
+    }
+
+    /// Borrows physical member specifications by their authoritative target names.
+    ///
+    /// Declaration validation guarantees unique ownership. The view includes
+    /// encoding companions and retains their exact metadata without copying it;
+    /// it grants no source, materialization or parameter-edit authority.
+    pub fn members_by_target(&self) -> BTreeMap<&str, &crate::ParameterMemberSpec> {
+        self.groups
+            .iter()
+            .flat_map(|owned| owned.group().members())
+            .map(|member| (member.target(), member))
+            .collect()
     }
 
     /// Returns every physical target owned by groups with the supplied semantic role.
@@ -402,16 +597,137 @@ impl ArchitectureParameterDescription {
             .collect()
     }
 
+    /// Projects named execution groups and pinned roles, preserving canonical owners,
+    /// sparse global unit indices and exact retained rank placement. Omitted graph
+    /// dependencies become caller-owned ingress; included dependencies stay unchanged.
+    pub fn project_groups(
+        &self,
+        graph: &ExecutionGraph,
+        pinned_roles: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, ArchitectureParameterError> {
+        let roles = pinned_roles
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
+        for role in &roles {
+            if !self
+                .groups
+                .iter()
+                .any(|group| group.owner().accepts_static_role(role))
+            {
+                return Err(ArchitectureParameterError::UnknownProjectedStaticRole(
+                    role.clone(),
+                ));
+            }
+        }
+        let layout = self.unit_layout.project_groups(graph)?;
+        for group in graph.groups() {
+            let parent = self.graph.group_index(group.id()).expect("projected group");
+            let dependencies = self.graph.groups()[parent]
+                .dependencies()
+                .iter()
+                .filter(|dependency| graph.group_index(dependency).is_some());
+            if !group.dependencies().iter().eq(dependencies) {
+                return Err(ArchitectureParameterError::InvalidProjectedDependencies(
+                    group.id().to_owned(),
+                ));
+            }
+        }
+        let groups = self.groups.iter().filter(|owned| match owned.owner() {
+            ParameterGroupOwner::ExecutionUnit { group, .. } => {
+                graph.group_index(group.as_str()).is_some()
+            }
+            ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => {
+                roles
+                    .iter()
+                    .any(|role| owned.owner().accepts_static_role(role))
+                    || consumers
+                        .iter()
+                        .any(|(group, _)| graph.group_index(group.as_str()).is_some())
+            }
+            ParameterGroupOwner::StaticRole(_) | ParameterGroupOwner::StaticAnyOf(_) => roles
+                .iter()
+                .any(|role| owned.owner().accepts_static_role(role)),
+        });
+        let mut selected = Self::from_owned(graph, &layout, groups.cloned())?;
+        if let Some((rank, retained)) = self.partition_layout() {
+            let mut local = crate::LocalModelLayout::default();
+            for group in selected.groups() {
+                for member in group.members() {
+                    local.insert(
+                        member.target().to_owned(),
+                        retained
+                            .tensor(member.target())
+                            .expect("validated retained parameter placement")
+                            .clone(),
+                    );
+                }
+            }
+            selected = selected.with_partition_layout(rank, local)?;
+        }
+        Ok(selected)
+    }
+
     /// Selects rank-owned groups without discarding their architecture owner.
     pub fn select_owned<G, A>(
         &self,
         partition: &ArchitecturePartition<G, A>,
     ) -> Vec<OwnedParameterGroupSpec> {
-        self.groups
+        self.stored_groups(partition.ownership(), |group, unit| {
+            partition.owns_unit(group.as_str(), unit)
+        })
+        .cloned()
+        .collect()
+    }
+
+    /// Compares retained partition bindings with their exact declared ownership.
+    /// The comparison borrows parameter groups instead of cloning a selected catalog.
+    pub fn matches_partition_bindings<G, A>(
+        &self,
+        partition: &ArchitecturePartition<G, A>,
+    ) -> bool {
+        partition
+            .parameter_bindings()
             .iter()
-            .filter(|tagged| tagged.owner().is_local(partition))
-            .cloned()
-            .collect()
+            .eq(self.stored_groups(partition.ownership(), |group, unit| {
+                partition.owns_unit(group.as_str(), unit)
+            }))
+    }
+
+    /// Projects every group in a stored canonical resource, including physical replicas.
+    /// Logical invocation and observation ownership remain in each group's declaration.
+    pub fn stored_groups(
+        &self,
+        ownership: &PartitionOwnership,
+        owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
+    ) -> impl Iterator<Item = &OwnedParameterGroupSpec> {
+        let storage = self
+            .groups
+            .iter()
+            .filter(|tagged| tagged.owner().is_stored_by(ownership, &owns_unit))
+            .map(|tagged| {
+                ParameterStorageRef::from_owner(tagged.owner()).expect("validated parameter owner")
+            })
+            .collect::<BTreeSet<_>>();
+        self.groups.iter().filter(move |tagged| {
+            storage.contains(
+                &ParameterStorageRef::from_owner(tagged.owner())
+                    .expect("validated parameter owner"),
+            )
+        })
+    }
+
+    /// Resolves one canonical resource without allocating a selected parameter catalog.
+    pub fn stores_owner(
+        &self,
+        owner: &ParameterGroupOwner,
+        ownership: &PartitionOwnership,
+        owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
+    ) -> bool {
+        self.groups.iter().any(|tagged| {
+            tagged.owner().same_storage_as(owner)
+                && tagged.owner().is_stored_by(ownership, &owns_unit)
+        })
     }
 
     /// Returns canonical static storage roles selected for one partition.
@@ -432,18 +748,36 @@ impl ArchitectureParameterDescription {
     }
 }
 
-fn parameter_targets(
+struct ExpectedParameter {
+    group: std::sync::Arc<ParameterGroupSpec>,
+    member: usize,
+}
+
+impl ExpectedParameter {
+    fn matches(&self, group: &ParameterGroupSpec, member: &crate::ParameterMemberSpec) -> bool {
+        self.group.logical_name() == group.logical_name()
+            && self.group.role() == group.role()
+            && self.group.partition_units() == group.partition_units()
+            && self.group.partition_unit_assignment() == group.partition_unit_assignment()
+            && self.group.members()[self.member] == *member
+    }
+}
+
+fn parameter_declarations(
     groups: impl IntoIterator<Item = ParameterGroupSpec>,
-) -> Result<BTreeMap<String, String>, ArchitectureParameterError> {
+) -> Result<BTreeMap<String, ExpectedParameter>, ArchitectureParameterError> {
     let mut targets = BTreeMap::new();
     for group in groups {
-        for member in group.members() {
-            if let Some(previous) =
-                targets.insert(member.target().to_owned(), group.logical_name().to_owned())
-            {
+        let group = std::sync::Arc::new(group);
+        for (index, member) in group.members().iter().enumerate() {
+            let declaration = ExpectedParameter {
+                group: group.clone(),
+                member: index,
+            };
+            if let Some(previous) = targets.insert(member.target().to_owned(), declaration) {
                 return Err(ArchitectureParameterError::DuplicateExpectedTarget {
                     target: member.target().to_owned(),
-                    first: previous,
+                    first: previous.group.logical_name().to_owned(),
                     second: group.logical_name().to_owned(),
                 });
             }
@@ -456,6 +790,35 @@ fn parameter_targets(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitectureParameterError {
+    /// A projected pinned role is absent from the canonical declaration.
+    #[error("unknown projected static parameter role {0:?}")]
+    UnknownProjectedStaticRole(String),
+    /// A child graph changes dependencies between included execution groups.
+    #[error("projected dependencies differ for execution group {0:?}")]
+    InvalidProjectedDependencies(String),
+    /// Named group selection cannot preserve the canonical invocation layout.
+    #[error("invalid projected invocation layout: {0}")]
+    ProjectionLayout(#[from] crate::ExecutionUnitLayoutError),
+    /// A leased resource has no consumers or repeats one logical consumer.
+    #[error("architecture leased parameter owner has empty or repeated consumers")]
+    InvalidUnitConsumers,
+    /// Parameter groups for one physical owner disagree about its consumers.
+    #[error("architecture parameter owner {group}:{global_unit} has inconsistent consumers")]
+    InconsistentUnitConsumers {
+        /// Canonical group slot.
+        group: usize,
+        /// Canonical physical owner index.
+        global_unit: usize,
+    },
+    /// One logical invocation claims multiple independently leased owners.
+    #[error("architecture invocation {group}:{global_unit} has conflicting leased owners")]
+    ConflictingUnitOwners {
+        /// Canonical group slot.
+        group: usize,
+        /// Logical invocation index.
+        global_unit: usize,
+    },
+
     /// The supplied graph/layout is not canonical.
     #[error("invalid architecture parameter layout: {0}")]
     InvalidLayout(String),
@@ -474,8 +837,8 @@ pub enum ArchitectureParameterError {
     /// A unit owner names no canonical graph group.
     #[error("architecture parameter owner names unknown execution group {0:?}")]
     UnknownExecutionGroup(String),
-    /// A unit owner exceeds its canonical group size.
-    #[error("architecture parameter owner {group}:{global_unit} exceeds {available} units")]
+    /// A unit reference is absent from its declared group.
+    #[error("architecture parameter reference {group}:{global_unit} is not among its {available} declared units")]
     UnitOutOfRange {
         /// Canonical execution-group identity.
         group: String,
@@ -510,6 +873,16 @@ pub enum ArchitectureParameterError {
     /// An ownership tag names a target outside the authoritative set.
     #[error("parameter target {0:?} is not present in the authoritative parameter groups")]
     UnexpectedOwnership(String),
+    /// An ownership tag changes an authoritative parameter or its group semantics.
+    #[error(
+        "parameter target {target:?} in group {group:?} differs from its authoritative declaration"
+    )]
+    InconsistentDeclaration {
+        /// Canonical physical parameter target.
+        target: String,
+        /// Logical group in the ownership declaration.
+        group: String,
+    },
 }
 
 /// Logical scalar kind carried by one architecture-owned boundary tensor.
@@ -724,6 +1097,11 @@ impl BoundaryWireSchema {
         &self.auxiliary
     }
 
+    /// Visits the primary tensor followed by auxiliaries in canonical transport order.
+    pub fn tensors(&self) -> impl Iterator<Item = &BoundaryTensorSpec> {
+        std::iter::once(&self.primary).chain(&self.auxiliary)
+    }
+
     /// Resolves invocation-dependent dimensions without backend family logic.
     pub fn resolve(
         &self,
@@ -817,6 +1195,11 @@ impl ResolvedBoundaryWireSchema {
     /// Returns resolved auxiliary declarations in canonical transport order.
     pub fn auxiliary(&self) -> &[ResolvedBoundaryTensorSpec] {
         &self.auxiliary
+    }
+
+    /// Visits the primary tensor followed by auxiliaries in canonical transport order.
+    pub fn tensors(&self) -> impl Iterator<Item = &ResolvedBoundaryTensorSpec> {
+        std::iter::once(&self.primary).chain(&self.auxiliary)
     }
 }
 
@@ -1137,22 +1520,19 @@ pub struct PartitionState {
 }
 
 impl ArchitectureStatePartitionPlan {
-    /// Resolves exact rank-local state from cold unit ownership or a constructed
-    /// partition. Global-ordinal packing keeps unowned gaps stateless.
-    pub fn resolve_partition(
+    /// Validates complete state coverage and group geometry without selecting ownership.
+    pub fn validate(
         &self,
         complete: &StateLayout,
         units: &ExecutionUnitLayout,
-        owned_units: impl Fn(usize) -> Option<Range<usize>>,
-        owns_output: bool,
-    ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
+    ) -> Result<(), ArchitectureStatePartitionError> {
         if self.rules().is_empty() {
             if complete
                 .layers()
                 .iter()
                 .all(|policy| matches!(policy, eredu_core::cache::LayerCachePolicy::NoState))
             {
-                return Ok(None);
+                return Ok(());
             }
             return Err(ArchitectureStatePartitionError::EmptyPlan);
         }
@@ -1198,32 +1578,130 @@ impl ArchitectureStatePartitionPlan {
                     });
                 }
             }
+            if let ArchitectureStatePlacement::Invocation { address } = rule.placement() {
+                if units.group_range(address.group()).is_none() {
+                    return Err(ArchitectureStatePartitionError::UnknownGroup {
+                        group: address.group(),
+                    });
+                }
+                if units.ordinal(address.group(), address.index()).is_none() {
+                    return Err(ArchitectureStatePartitionError::UnknownInvocation {
+                        group: address.group(),
+                        global_unit: address.index(),
+                    });
+                }
+            }
             frontier = layers.end;
         }
         if frontier != complete.len() {
             return Err(ArchitectureStatePartitionError::UnassignedLayer { layer: frontier });
         }
 
+        Ok(())
+    }
+
+    fn group_state_ranges(
+        &self,
+        units: &ExecutionUnitLayout,
+        group: usize,
+        owned: Range<usize>,
+    ) -> Result<Vec<Range<usize>>, ArchitectureStatePartitionError> {
+        let complete = units
+            .group_range(group)
+            .ok_or(ArchitectureStatePartitionError::UnknownGroup { group })?;
+        let ordinals = units
+            .contiguous_ordinals(group, owned.clone())
+            .ok_or_else(|| {
+                ArchitectureStatePartitionError::InvalidLayout(format!(
+                    "group {group} owned units {owned:?} are not a declared contiguous range"
+                ))
+            })?;
         let mut selected = Vec::new();
         for rule in self.rules() {
             let layers = rule.layers();
             match rule.placement() {
-                ArchitectureStatePlacement::GroupUnits { group } => {
-                    if let Some(units) = owned_units(group) {
-                        if units.is_empty() || units.end > layers.len() {
-                            return Err(ArchitectureStatePartitionError::InvalidLayout(format!(
-                                "group {group} owned units {units:?} exceed its {} state slots",
-                                layers.len()
-                            )));
-                        }
-                        selected.push(layers.start + units.start..layers.start + units.end);
+                ArchitectureStatePlacement::GroupUnits { group: owner } if owner == group => {
+                    if layers.len() != complete.len() {
+                        return Err(ArchitectureStatePartitionError::GroupLengthMismatch {
+                            group,
+                            start: layers.start,
+                            end: layers.end,
+                            units: complete.len(),
+                        });
+                    }
+                    selected.push(
+                        layers.start + (ordinals.start - complete.start)
+                            ..layers.start + (ordinals.end - complete.start),
+                    );
+                }
+                ArchitectureStatePlacement::Invocation { address } if address.group() == group => {
+                    if units.ordinal(group, address.index()).is_none() {
+                        return Err(ArchitectureStatePartitionError::UnknownInvocation {
+                            group,
+                            global_unit: address.index(),
+                        });
+                    }
+                    if owned.contains(&address.index()) {
+                        selected.push(layers);
                     }
                 }
-                ArchitectureStatePlacement::OutputOwner if owns_output => {
-                    selected.push(layers);
-                }
-                ArchitectureStatePlacement::OutputOwner => {}
+                _ => {}
             }
+        }
+        Ok(selected)
+    }
+
+    /// Projects one group's selected state span independently of its unit count.
+    /// Full plan validation establishes coverage; global-ordinal packing retains
+    /// unowned gaps as `NoState` entries in the selected partition layout.
+    pub fn group_state_range(
+        &self,
+        units: &ExecutionUnitLayout,
+        group: usize,
+        owned: Range<usize>,
+    ) -> Result<Option<Range<usize>>, ArchitectureStatePartitionError> {
+        Ok(self
+            .group_state_ranges(units, group, owned)?
+            .into_iter()
+            .reduce(|span, range| span.start.min(range.start)..span.end.max(range.end)))
+    }
+
+    /// Resolves exact rank-local state from global unit identities. Unit-aligned
+    /// state slots follow declared invocation order, independently of global unit IDs.
+    /// Global-ordinal packing keeps unowned state gaps stateless.
+    pub fn resolve_partition(
+        &self,
+        complete: &StateLayout,
+        units: &ExecutionUnitLayout,
+        owned_units: impl Fn(usize) -> Option<Range<usize>>,
+        owns_output: bool,
+    ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
+        self.validate(complete, units)?;
+        if self.rules().is_empty() {
+            return Ok(None);
+        }
+        let groups = self
+            .rules()
+            .iter()
+            .filter_map(|rule| match rule.placement() {
+                ArchitectureStatePlacement::GroupUnits { group } => Some(group),
+                ArchitectureStatePlacement::Invocation { address } => Some(address.group()),
+                ArchitectureStatePlacement::OutputOwner => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut selected = Vec::new();
+        for group in groups {
+            if let Some(owned) = owned_units(group) {
+                selected.extend(self.group_state_ranges(units, group, owned)?);
+            }
+        }
+        if owns_output {
+            selected.extend(
+                self.rules()
+                    .iter()
+                    .filter(|rule| rule.placement() == ArchitectureStatePlacement::OutputOwner)
+                    .map(|rule| rule.layers()),
+            );
         }
         if selected.is_empty() {
             return Ok(None);
@@ -1340,6 +1818,7 @@ pub struct PartitionGroup {
     group: ExecutionGroupId,
     group_index: usize,
     global_units: Range<usize>,
+    ordinals: Range<usize>,
 }
 
 impl PartitionGroup {
@@ -1372,6 +1851,7 @@ impl PartitionGroup {
 pub struct ArchitecturePartition<G, A> {
     graph: ExecutionGraph,
     unit_layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     groups: Vec<PartitionGroup>,
     ownership: PartitionOwnership,
     state: Option<PartitionState>,
@@ -1389,7 +1869,6 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// that merely resembles, but is not the canonical topology of, the
     /// architecture it will execute. Pre-allocation selection should use
     /// [`Self::from_description`] with the architecture-authored declaration.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_architecture<B, S, M, N>(
         architecture: &M,
         group_ranges: impl IntoIterator<Item = (N, Range<usize>)>,
@@ -1406,33 +1885,20 @@ impl<G, A> ArchitecturePartition<G, A> {
         N: Into<String>,
         A: ArchitectureBoundary,
     {
-        let (graph, unit_layout) = canonical_architecture_layout::<B, S, M>(architecture)?;
-        boundary_schema.wire_schema()?;
-        if parameters.graph() != &graph {
-            return Err(ArchitecturePartitionError::ArchitectureGraphMismatch);
-        }
-        if parameters.unit_layout() != &unit_layout {
-            return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
-        }
+        parameters.validate_architecture::<B, S, M>(architecture)?;
         let complete_state = architecture
             .state_layout()
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
         let plan = architecture.state_partition_plan(&complete_state);
-        let mut partition = Self::new(
-            graph,
-            unit_layout,
+        Self::from_description(
+            parameters,
             group_ranges,
             ownership,
-            None,
+            &complete_state,
+            &plan,
             local_geometry,
             boundary_schema,
-            std::iter::empty(),
-        )?;
-        partition.state = partition
-            .resolve_state_partition(&complete_state, &plan)
-            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
-        partition.parameter_bindings = parameters.select_owned(&partition);
-        Ok(partition)
+        )
     }
 
     /// Creates an authoritative partition from architecture-authored static declarations.
@@ -1441,7 +1907,6 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// canonical graph/unit declaration, state plan, boundary schema, local geometry, and
     /// parameter topology without constructing a backend module merely to rediscover those
     /// facts. Concrete backends must not synthesize any of these inputs.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_description<N>(
         parameters: &ArchitectureParameterDescription,
         group_ranges: impl IntoIterator<Item = (N, Range<usize>)>,
@@ -1455,19 +1920,13 @@ impl<G, A> ArchitecturePartition<G, A> {
         N: Into<String>,
         A: ArchitectureBoundary,
     {
-        let graph = parameters.graph().clone();
-        let unit_layout = parameters.unit_layout().clone();
-        validate_canonical_layout(&graph, &unit_layout)?;
         boundary_schema.wire_schema()?;
-        let mut partition = Self::new(
-            graph,
-            unit_layout,
+        let mut partition = Self::select_topology(
+            parameters,
             group_ranges,
             ownership,
-            None,
             local_geometry,
             boundary_schema,
-            std::iter::empty(),
         )?;
         partition.state = partition
             .resolve_state_partition(complete_state, state_plan)
@@ -1476,23 +1935,19 @@ impl<G, A> ArchitecturePartition<G, A> {
         Ok(partition)
     }
 
-    /// Creates one validated rank-local architecture partition after the
-    /// authoritative architecture topology has already been derived.
-    #[allow(clippy::too_many_arguments)]
-    fn new<S>(
-        graph: ExecutionGraph,
-        unit_layout: ExecutionUnitLayout,
+    /// Selects rank-local topology from one validated parameter declaration.
+    fn select_topology<S>(
+        parameters: &ArchitectureParameterDescription,
         group_ranges: impl IntoIterator<Item = (S, Range<usize>)>,
         ownership: PartitionOwnership,
-        state: Option<PartitionState>,
         local_geometry: G,
         boundary_schema: A,
-        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
     ) -> Result<Self, ArchitecturePartitionError>
     where
         S: Into<String>,
     {
-        validate_canonical_layout(&graph, &unit_layout)?;
+        let graph = parameters.graph();
+        let unit_layout = parameters.unit_layout();
         let mut seen_groups = BTreeSet::new();
         let mut groups = Vec::new();
         for (group, global_units) in group_ranges {
@@ -1512,14 +1967,14 @@ impl<G, A> ArchitecturePartition<G, A> {
                 .group_range(group_index)
                 .expect("canonical layout contains every graph group")
                 .len();
-            if global_units.end > available {
-                return Err(ArchitecturePartitionError::GroupRangeOutOfBounds {
-                    group,
+            let ordinals = unit_layout
+                .contiguous_ordinals(group_index, global_units.clone())
+                .ok_or_else(|| ArchitecturePartitionError::GroupRangeOutOfBounds {
+                    group: group.clone(),
                     start: global_units.start,
                     end: global_units.end,
                     available,
-                });
-            }
+                })?;
             groups.push(PartitionGroup {
                 group: unit_layout
                     .group_id(group_index)
@@ -1527,39 +1982,29 @@ impl<G, A> ArchitecturePartition<G, A> {
                     .clone(),
                 group_index,
                 global_units,
+                ordinals,
             });
         }
         groups.sort_by_key(PartitionGroup::group_index);
 
-        let parameter_bindings = parameter_bindings.into_iter().collect::<Vec<_>>();
-        let mut targets = BTreeSet::new();
-        for binding in &parameter_bindings {
-            if !binding
-                .owner()
-                .is_local_partition_parts(&groups, &ownership)
-            {
-                return Err(ArchitecturePartitionError::NonLocalParameterOwner(
-                    binding.owner().clone(),
-                ));
-            }
-            for member in binding.members() {
-                if !targets.insert(member.target().to_owned()) {
-                    return Err(ArchitecturePartitionError::DuplicateParameterTarget(
-                        member.target().to_owned(),
-                    ));
-                }
-            }
-        }
-
+        let invocations = parameters
+            .invocations()
+            .select_invocations(groups.iter().flat_map(|group| {
+                group
+                    .ordinals
+                    .clone()
+                    .map(|ordinal| unit_layout.address(ordinal).expect("owned invocation"))
+            }))?;
         Ok(Self {
-            graph,
-            unit_layout,
+            graph: graph.clone(),
+            unit_layout: unit_layout.clone(),
+            invocations,
             groups,
             ownership,
-            state,
+            state: None,
             local_geometry,
             boundary_schema,
-            parameter_bindings,
+            parameter_bindings: Vec::new(),
         })
     }
 
@@ -1573,6 +2018,11 @@ impl<G, A> ArchitecturePartition<G, A> {
         &self.unit_layout
     }
 
+    /// Selected logical invocations and their canonical parameter owners, including replicas.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
+    }
+
     /// Returns groups and group-local global unit ranges owned by this rank.
     pub fn groups(&self) -> &[PartitionGroup] {
         &self.groups
@@ -1581,16 +2031,10 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Traverses rank-owned execution units in canonical architecture order.
     pub fn units(&self) -> impl Iterator<Item = crate::ExecutionUnitAddress> + '_ {
         self.groups.iter().flat_map(move |owned| {
-            let group = owned.group_index;
-            let base = self
-                .unit_layout
-                .group_range(group)
-                .expect("partition group belongs to its canonical layout")
-                .start;
-            owned.global_units.clone().map(move |index| {
+            owned.ordinals.clone().map(move |ordinal| {
                 self.unit_layout
-                    .address(base + index)
-                    .expect("partition unit belongs to its canonical layout")
+                    .address(ordinal)
+                    .expect("validated partition invocation")
             })
         })
     }
@@ -1605,6 +2049,40 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Returns input, output, and static-module ownership.
     pub const fn ownership(&self) -> &PartitionOwnership {
         &self.ownership
+    }
+
+    /// Resolves the unique canonical storage owner of a selected physical target.
+    /// Logical consumers and replicated storage retain their declared owner identity.
+    pub fn parameter_owner(&self, target: &str) -> Option<&ParameterGroupOwner> {
+        self.parameter_bindings.iter().find_map(|binding| {
+            binding
+                .members()
+                .iter()
+                .any(|member| member.target() == target)
+                .then(|| binding.owner())
+        })
+    }
+
+    /// Checks that conversion resources keep the selected outputs' canonical owners.
+    /// Targets are supplied by admitted materialization tasks; this neither changes
+    /// ownership nor combines independent storage resources into one residency unit.
+    pub fn validate_transform_parameter_owners<'a, H, W>(
+        &self,
+        source: &ArchitecturePartition<H, W>,
+        targets: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), TransformParameterOwnershipError> {
+        for name in targets {
+            let target = self
+                .parameter_owner(name)
+                .ok_or_else(|| TransformParameterOwnershipError::MissingTarget(name.into()))?;
+            let source = source
+                .parameter_owner(name)
+                .ok_or_else(|| TransformParameterOwnershipError::MissingSource(name.into()))?;
+            if source != target {
+                return Err(TransformParameterOwnershipError::Changed(name.into()));
+            }
+        }
+        Ok(())
     }
 
     /// Returns rank-local state geometry when this partition owns mutable state.
@@ -1705,6 +2183,12 @@ impl<G, A> ArchitecturePartition<G, A> {
         if unit_layout != self.unit_layout {
             return Err(ArchitecturePartitionError::ArchitectureUnitLayoutMismatch);
         }
+        let invocations = architecture
+            .execution_unit_storage_map()
+            .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+        if invocations.select_invocations(self.units())? != self.invocations {
+            return Err(ArchitecturePartitionError::ArchitectureStorageMapMismatch);
+        }
         Ok(())
     }
 }
@@ -1745,11 +2229,27 @@ impl LayeredPartitionDriver {
         group_owns_state: bool,
     ) -> Result<Self, LayeredPartitionError> {
         let state_range = group_owns_state.then(|| storage_range.clone());
-        Self::new_with_state_range(partition, group_index, storage_range, state_range)
+        let driver =
+            Self::new_with_state_range(partition, group_index, storage_range, state_range)?;
+        if group_owns_state {
+            let state = partition.state().expect("validated state-owning partition");
+            if driver
+                .range
+                .clone()
+                .any(|layer| !state.owns_global_layer(layer))
+            {
+                return Err(LayeredPartitionError::StateRange {
+                    state: state.global_layers(),
+                    partition: driver.range,
+                });
+            }
+        }
+        Ok(driver)
     }
 
     /// Validates architecture-authored state addresses independently of unit indices.
-    /// Stateful encoder units can follow the decoder in the global state layout.
+    /// Stateful encoder units can follow the decoder in the global state layout;
+    /// explicitly mapped ranges may span unowned stateless gaps.
     pub fn new_with_state_range<G, A>(
         partition: &ArchitecturePartition<G, A>,
         group_index: usize,
@@ -1772,12 +2272,19 @@ impl LayeredPartitionDriver {
             let state = partition
                 .state()
                 .ok_or(LayeredPartitionError::MissingState)?;
-            if state_range.len() != range.len()
+            if state_range.is_empty()
                 || state.global_layers().start > state_range.start
                 || state.global_layers().end < state_range.end
-                || state_range
-                    .clone()
-                    .any(|layer| !state.owns_global_layer(layer))
+                || state_range.clone().any(|layer| {
+                    !state.owns_global_layer(layer)
+                        && !matches!(
+                            state
+                                .layout()
+                                .layers()
+                                .get(layer - state.global_layer_offset()),
+                            Some(eredu_core::cache::LayerCachePolicy::NoState)
+                        )
+                })
             {
                 return Err(LayeredPartitionError::StateRange {
                     state: state.global_layers(),
@@ -2235,14 +2742,20 @@ where
             )));
         }
     }
-    let mut counts = Vec::with_capacity(graph.groups().len());
+    let unit_layout = architecture
+        .execution_unit_layout()
+        .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+    validate_canonical_layout(&graph, &unit_layout)?;
     let mut paths = BTreeSet::new();
     for group in 0..graph.groups().len() {
-        let count = architecture
-            .group_unit_count(group)
-            .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
-        counts.push(count);
-        for index in 0..count {
+        for ordinal in unit_layout
+            .group_range(group)
+            .expect("canonical execution group")
+        {
+            let index = unit_layout
+                .address(ordinal)
+                .expect("canonical invocation")
+                .index();
             let path = architecture.unit_path(group, index).map_err(|error| {
                 ArchitecturePartitionError::ArchitectureTopology(error.to_string())
             })?;
@@ -2256,8 +2769,7 @@ where
             }
         }
     }
-    let unit_layout = ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| ArchitecturePartitionError::ArchitectureTopology(error.to_string()))?;
+
     Ok((graph, unit_layout))
 }
 
@@ -2290,6 +2802,13 @@ fn validate_canonical_layout(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitecturePartitionError {
+    /// Logical ownership cannot be projected onto the declared physical owners.
+    #[error(transparent)]
+    Invocations(#[from] crate::ExecutionUnitAddressMapError),
+    /// Canonical physical ownership differs despite matching logical topology.
+    #[error("architecture partition storage map differs from the neutral architecture")]
+    ArchitectureStorageMapMismatch,
+
     /// The architecture supplied an invalid partition-boundary wire schema.
     #[error("invalid architecture partition boundary: {0}")]
     InvalidBoundary(#[from] ArchitectureBoundaryError),
@@ -2353,9 +2872,9 @@ pub enum ArchitecturePartitionError {
         /// Canonical group identity.
         group: String,
     },
-    /// A group-local global unit range exceeds the canonical group size.
+    /// A global unit range includes identities absent from the canonical layout.
     #[error(
-        "architecture partition range {start}..{end} for group {group:?} exceeds {available} units"
+        "architecture partition range {start}..{end} for group {group:?} is not contained in its {available} declared units"
     )]
     GroupRangeOutOfBounds {
         /// Canonical group identity.
@@ -2381,12 +2900,6 @@ pub enum ArchitecturePartitionError {
         /// Local state-layer count.
         layers: usize,
     },
-    /// Two semantic parameter groups claim the same physical target.
-    #[error("architecture partition repeats parameter target {0:?}")]
-    DuplicateParameterTarget(String),
-    /// A supplied parameter owner is not part of this rank-local partition.
-    #[error("architecture partition includes non-local parameter owner {0:?}")]
-    NonLocalParameterOwner(ParameterGroupOwner),
 }
 
 #[cfg(test)]
@@ -2492,18 +3005,26 @@ mod tests {
         .unwrap()
     }
 
+    fn identity_description(
+        graph: &ExecutionGraph,
+        layout: &ExecutionUnitLayout,
+    ) -> ArchitectureParameterDescription {
+        ArchitectureParameterDescription::from_owned(graph, layout, []).unwrap()
+    }
+
     fn valid_partition() -> ArchitecturePartition<Geometry, Boundary> {
         let graph = graph();
         let layout = layout(&graph);
-        ArchitecturePartition::new(
-            graph,
-            layout,
+        ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout),
             [("prediction", 0..2), ("primary", 1..4)],
             PartitionOwnership::new(true, false, ["embedding", "normalization"]).unwrap(),
-            Some(PartitionState::new(state_layout(2), 7).unwrap()),
             Geometry("local"),
             Boundary { route: 3 },
-            [
+        )
+        .map(|mut partition| {
+            partition.state = Some(PartitionState::new(state_layout(2), 7).unwrap());
+            partition.parameter_bindings = Vec::from([
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::static_role("embedding"),
                     parameter("model.embed_tokens", "model.embed_tokens.weight"),
@@ -2515,8 +3036,9 @@ mod tests {
                     ),
                     parameter("model.layers.1", "model.layers.1.weight"),
                 ),
-            ],
-        )
+            ]);
+            partition
+        })
         .unwrap()
     }
 
@@ -2525,15 +3047,12 @@ mod tests {
         ownership: PartitionOwnership,
     ) -> ArchitecturePartition<(), ()> {
         let graph = graph();
-        ArchitecturePartition::new(
-            graph.clone(),
-            layout(&graph),
+        ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("primary", primary)],
             ownership,
-            None,
             (),
             (),
-            [],
         )
         .unwrap()
     }
@@ -2999,34 +3518,6 @@ mod tests {
     }
 
     #[test]
-    fn partition_rejects_parameter_owner_outside_local_unit_ranges() {
-        let graph = graph();
-        let error = ArchitecturePartition::new(
-            graph.clone(),
-            layout(&graph),
-            [("primary", 1..4)],
-            PartitionOwnership::new(false, false, ["embedding"]).unwrap(),
-            None,
-            (),
-            (),
-            [OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::execution_unit(
-                    ExecutionGroupId::new("prediction").unwrap(),
-                    0,
-                ),
-                parameter("prediction", "prediction.weight"),
-            )],
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ArchitecturePartitionError::NonLocalParameterOwner(
-                ParameterGroupOwner::ExecutionUnit { .. }
-            )
-        ));
-    }
-
-    #[test]
     fn parameter_description_rejects_missing_duplicate_and_out_of_range_ownership() {
         let embedding = parameter("embedding", "model.embed_tokens.weight");
         let layer = parameter("layer", "model.layers.1.weight");
@@ -3211,34 +3702,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_noncanonical_unknown_and_duplicate_groups() {
+    fn rejects_unknown_and_duplicate_groups() {
         let graph = graph();
-        let mismatched_graph = ExecutionGraph::chain(["primary", "other"]).unwrap();
-        let error = ArchitecturePartition::new(
-            graph.clone(),
-            layout(&mismatched_graph),
-            [("primary", 0..1)],
-            PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
-            (),
-            (),
-            std::iter::empty(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ArchitecturePartitionError::LayoutGroupMismatch { .. }
-        ));
-
-        let error = ArchitecturePartition::new(
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("missing", 0..1)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert_eq!(
@@ -3246,15 +3717,12 @@ mod tests {
             ArchitecturePartitionError::UnknownGroup("missing".into())
         );
 
-        let error = ArchitecturePartition::new(
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("primary", 0..1), ("primary", 1..2)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert_eq!(
@@ -3266,15 +3734,12 @@ mod tests {
     #[test]
     fn rejects_empty_and_out_of_bounds_group_ranges() {
         let graph = graph();
-        let error = ArchitecturePartition::new(
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("primary", 2..2)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -3282,15 +3747,12 @@ mod tests {
             ArchitecturePartitionError::EmptyGroupRange { .. }
         ));
 
-        let error = ArchitecturePartition::new(
-            graph.clone(),
-            layout(&graph),
+        let error = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout(&graph)),
             [("prediction", 1..4)],
             PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -3310,59 +3772,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_empty_static_roles_and_duplicate_parameter_targets() {
-        assert_eq!(
-            PartitionOwnership::new(false, false, [" "]).unwrap_err(),
-            ArchitecturePartitionError::EmptyStaticRole
-        );
-
-        let graph = graph();
-        let error = ArchitecturePartition::new(
-            graph.clone(),
-            layout(&graph),
-            [("primary", 0..1)],
-            PartitionOwnership::new(false, false, ["embedding", "normalization"]).unwrap(),
-            None,
-            (),
-            (),
-            [
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::static_role("embedding"),
-                    parameter("first", "shared.weight"),
-                ),
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::static_role("normalization"),
-                    parameter("second", "shared.weight"),
-                ),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            ArchitecturePartitionError::DuplicateParameterTarget("shared.weight".into())
-        );
-    }
-
     fn layered_partition(
         storage_state: Range<usize>,
         owns_input: bool,
     ) -> ArchitecturePartition<(), ()> {
         let graph = ExecutionGraph::chain(["decoder"]).unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [4]).unwrap();
-        ArchitecturePartition::new(
-            graph,
-            layout,
+        ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout),
             [("decoder", 1..3)],
             PartitionOwnership::new(owns_input, false, std::iter::empty::<String>()).unwrap(),
-            Some(
+            (),
+            (),
+        )
+        .map(|mut partition| {
+            partition.state = Some(
                 PartitionState::new(state_layout(storage_state.len()), storage_state.start)
                     .unwrap(),
-            ),
-            (),
-            (),
-            std::iter::empty(),
-        )
+            );
+            partition
+        })
         .unwrap()
     }
 
@@ -3392,16 +3821,17 @@ mod tests {
     fn layered_driver_represents_stateless_root_without_borrowing_decoder_state() {
         let graph = ExecutionGraph::chain(["vision", "decoder"]).unwrap();
         let layout = ExecutionUnitLayout::new(&graph, [1, 2]).unwrap();
-        let partition = ArchitecturePartition::new(
-            graph,
-            layout,
+        let partition = ArchitecturePartition::select_topology(
+            &identity_description(&graph, &layout),
             [("vision", 0..1), ("decoder", 0..2)],
             PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
-            Some(PartitionState::new(state_layout(1), 1).unwrap()),
             (),
             (),
-            std::iter::empty(),
         )
+        .map(|mut partition| {
+            partition.state = Some(PartitionState::new(state_layout(1), 1).unwrap());
+            partition
+        })
         .unwrap();
 
         let vision =
@@ -3409,15 +3839,16 @@ mod tests {
         assert!(vision.optional_state_layout().is_none());
         assert_eq!(vision.group_index(), 0);
 
-        let without_state = ArchitecturePartition::new(
-            ExecutionGraph::chain(["vision"]).unwrap(),
-            ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
+        let without_state = ArchitecturePartition::select_topology(
+            &identity_description(
+                &ExecutionGraph::chain(["vision"]).unwrap(),
+                &ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1])
+                    .unwrap(),
+            ),
             [("vision", 0..1)],
             PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
-            None,
             (),
             (),
-            std::iter::empty(),
         )
         .unwrap();
         assert_eq!(

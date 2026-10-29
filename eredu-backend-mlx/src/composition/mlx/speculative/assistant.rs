@@ -240,7 +240,7 @@ pub(super) fn prepare_external_assistant_parameters<
 ) -> Result<PreparedAssistantParameters<A>, Error> {
     use crate::backend::runtime::{
         checkpoint::binding::{build_mlx_exact_replicated_text_bindings, ModuleBindingError},
-        execution::layerwise::quantize_exact_replicated_text_tasks,
+        execution::layerwise::materialize_replicated_text_transform_groups,
     };
     let parameter_units = prepared.parameter_units().to_vec();
     let parameter_layout = prepared.parameter_layout().cloned();
@@ -257,55 +257,26 @@ pub(super) fn prepare_external_assistant_parameters<
         tasks,
     ) = prepared.into_parts();
     let mut store = store;
-    let transformed = tasks
-        .iter()
-        .filter(|task| {
-            matches!(
-                task.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            )
-        })
-        .collect::<Vec<_>>();
-    if !transformed.is_empty() {
-        let source = A::module::<MlxNeuralBackend>(source_module_config, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target = A::module::<MlxNeuralBackend>(module_config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let mut groups = Vec::<(eredu_checkpoint::WeightQuantization, Vec<_>)>::new();
-        for task in transformed {
-            let format = task.executable().weight_quantization().ok_or_else(|| {
-                Error::Quantization(format!(
-                    "selected external assistant transform {:?} has no packed format",
-                    task.name()
-                ))
-            })?;
-            if let Some((_, grouped)) = groups.iter_mut().find(|(selected, _)| *selected == format)
-            {
-                grouped.push(task);
-            } else {
-                groups.push((format, vec![task]));
-            }
-        }
-        for (format, grouped) in groups {
-            store = quantize_exact_replicated_text_tasks(
-                store,
-                &source,
-                &target,
-                &[] as &[A::Module<MlxNeuralBackend>],
-                &[],
-                parameter_layout.as_ref(),
-                format,
-                &grouped,
-                stream,
-            )?
-            .0;
-        }
+    let transform_groups = eredu_runtime::group_replicated_text_transform_tasks(&tasks)?;
+    if !transform_groups.is_empty() {
+        let source = A::module::<MlxNeuralBackend>(source_module_config, stream)?;
+        let target = A::module::<MlxNeuralBackend>(module_config.clone(), stream)?;
+        materialize_replicated_text_transform_groups(
+            &mut store,
+            &source,
+            &target,
+            &[] as &[A::Module<MlxNeuralBackend>],
+            &[],
+            parameter_layout.as_ref(),
+            &tasks,
+            &transform_groups,
+            stream,
+        )?;
     }
-    let module = MlxModule::new(
-        A::module::<MlxNeuralBackend>(module_config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-    );
+    let module = MlxModule::new(A::module::<MlxNeuralBackend>(
+        module_config.clone(),
+        stream,
+    )?);
     let task_refs = tasks.iter().collect::<Vec<_>>();
     let bindings = build_mlx_exact_replicated_text_bindings(
         &module,
@@ -319,41 +290,8 @@ pub(super) fn prepare_external_assistant_parameters<
     // Validate the complete destination partition before any payload is read.
     // Architecture-declared units include every packed companion; native code
     // neither parses checkpoint names nor chooses an assistant's boundaries.
-    let mut units = vec![Vec::new(); parameter_units.len()];
-    let mut assigned = std::collections::BTreeSet::new();
-    for binding in bindings {
-        let name = binding.logical_target().unwrap_or_else(|| binding.name());
-        let index = parameter_units
-            .iter()
-            .position(|unit| unit.outputs().contains(name))
-            .ok_or_else(|| {
-                Error::ArchitectureModel(format!(
-                    "assistant binding {name:?} has no acquisition unit"
-                ))
-            })?;
-        if !assigned.insert(name.to_owned()) {
-            return Err(Error::ArchitectureModel(format!(
-                "assistant binding {name:?} has duplicate destinations"
-            )));
-        }
-        units[index].push(binding);
-    }
-    if parameter_units
-        .iter()
-        .any(|unit| !unit.outputs().is_subset(&assigned))
-    {
-        return Err(Error::ArchitectureModel(
-            "assistant acquisition units have missing destinations".into(),
-        ));
-    }
-    for (definition, bindings) in parameter_units.iter().zip(&units) {
-        let actual = crate::backend::runtime::checkpoint::binding::binding_bytes(bindings)?;
-        if actual != definition.parameter_bytes() {
-            return Err(Error::ArchitectureModel(
-                "assistant native parameter extent differs from the retained cold unit".into(),
-            ));
-        }
-    }
+    let units =
+        eredu_runtime::partition_parameter_acquisition_bindings(&parameter_units, bindings)?;
     Ok(PreparedAssistantParameters {
         store,
         config,
@@ -397,16 +335,14 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     // Query exact binding extents and the native host-buffer capacity mechanism
     // before units are consumed. No artifact reopening or payload materialization.
     let parameter_memory_bounds = if prepared.layout.is_some() {
-        use crate::backend::runtime::{
-            checkpoint::binding::binding_bytes,
-            residency::manager::host_capacity_upper_bound_for_bindings,
-        };
+        use crate::backend::runtime::residency::manager::host_capacity_upper_bound_for_bindings;
+        use eredu_runtime::physical_binding_bytes;
         let capacities = prepared
             .units
             .iter()
             .map(|bindings| {
                 Ok((
-                    binding_bytes(bindings)?,
+                    physical_binding_bytes(bindings)?,
                     host_capacity_upper_bound_for_bindings(bindings)?,
                 ))
             })
@@ -429,9 +365,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         )?;
     let policy = if let Some(layout) = prepared.layout.take() {
         use crate::backend::runtime::execution::generic::MlxSelectedLayerwisePolicy;
-        let addresses = (0..layout.len())
-            .map(|ordinal| layout.address(ordinal).expect("validated assistant layout"))
-            .collect::<Vec<_>>();
+        let addresses = eredu_runtime::ExecutionUnitAddressMap::identity(&layout);
         let bindings = std::mem::take(&mut prepared.units);
         let (policy, _) =
             crate::backend::runtime::execution::generic::prepare_parameter_unit_policy::<
@@ -447,7 +381,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
                 stream,
                 weights_stream,
                 |_| false,
-                layout.clone(),
+                addresses.clone(),
                 Vec::new(),
                 bindings,
                 Vec::new(),
@@ -469,13 +403,9 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            MlxSelectedLayerwisePolicy::resident(
-                policy.into_resident_units(units, stream)?,
-                &layout,
-                &addresses,
-            )?
+            MlxSelectedLayerwisePolicy::resident(policy.into_resident_units(units, stream)?)
         } else {
-            MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)?
+            MlxSelectedLayerwisePolicy::bounded(policy)
         };
         MlxAssistantParameterPolicy(Some(policy))
     } else {

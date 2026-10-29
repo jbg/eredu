@@ -313,7 +313,10 @@ impl PartitionedConfig for TransformerConfig {
 /// Resident component assembly using the same layered equations as bounded execution.
 pub struct TtsTransformer<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        super::tts_transformer_layered::TransformerArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            super::tts_transformer_layered::TransformerKernel<B>,
+        >,
         B,
         super::tts_transformer_layered::TransformerStateMarker<B>,
     >,
@@ -355,9 +358,10 @@ impl<B: NeuralBackend> TtsTransformer<B> {
     ) -> Result<Self, super::tts_transformer_layered::TransformerError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_transformer_layered::TransformerArchitecture::new(config)?,
+                super::tts_transformer_layered::TransformerKernel::new(config)?.into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts independently materialized blocks and normalization without replacements.
@@ -366,32 +370,22 @@ impl<B: NeuralBackend> TtsTransformer<B> {
         blocks: Vec<TransformerBlock<B>>,
         norm: B::Normalization,
     ) -> Result<Self, super::tts_transformer_layered::TransformerError> {
-        use super::tts_transformer_layered::{
-            TransformerArchitecture, TransformerError, TransformerUnit,
-        };
+        use super::tts_transformer_layered::{TransformerKernel, TransformerUnit};
         let units = vec![
             blocks.into_iter().map(TransformerUnit::Block).collect(),
             vec![TransformerUnit::Norm(norm)],
         ];
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::from_units(
-                TransformerArchitecture::new(config)?,
+                TransformerKernel::new(config)?.into_component()?,
                 units,
             )
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                eredu_runtime::ResidentUnitsError::GroupCount { .. }
-                | eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                    TransformerError::Configuration(
-                        "TTS transformer unit count differs from its graph",
-                    )
-                }
-            })?,
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Exact retained transformer equations and physical formats.
     pub fn config(&self) -> &TransformerConfig {
-        self.runtime.architecture().config()
+        self.runtime.architecture().kernel().config()
     }
     /// Runs independent character rows with bidirectional key-padding masks.
     pub fn forward_encoder(

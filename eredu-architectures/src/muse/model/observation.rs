@@ -2,7 +2,7 @@
 use super::*;
 use crate::decoder::ComponentInstrumentation;
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B> {
     fn observed_text_entry<O>(
         &self,
         index: usize,
@@ -50,8 +50,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_text_observed<S, P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -68,9 +67,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let (group, index) = (address.group(), address.index());
         if group != 1 {
-            return <Self as LayeredArchitecture<B, S>>::forward_unit(
-                self, group, index, unit, hidden, state, forward, context,
+            return <Self as eredu_runtime::ComponentEquations<B, S>>::execute(
+                self, address, unit, hidden, state, forward, context,
             );
         }
         let Unit::Text(unit) = unit else {
@@ -78,7 +78,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         };
         let entry = self.observed_text_entry(index, hidden, observer)?;
         let hidden = entry.as_ref().unwrap_or(hidden);
-        let path = format!("model.layers.{index}");
+        let path = &self.definition.unit(group, index)?.path;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_with_provider_observed(
             hidden,
@@ -91,19 +91,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             pass,
             provider,
             context,
-            &mut ComponentInstrumentation::new(&path, &mut borrowed),
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
         )
     }
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    LayeredModel<B>
+    MuseKernel<B>
 {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_text_parallel_observed<S, P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -121,9 +120,10 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let (group, index) = (address.group(), address.index());
         if group != 1 {
-            return <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
-                self, group, index, unit, hidden, state, forward, parallel, context,
+            return <Self as eredu_runtime::ParallelComponentKernel<B, S>>::execute_parallel(
+                self, address, unit, hidden, state, forward, parallel, context,
             );
         }
         let Unit::Text(unit) = unit else {
@@ -131,7 +131,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         };
         let entry = self.observed_text_entry(index, hidden, observer)?;
         let hidden = entry.as_ref().unwrap_or(hidden);
-        let path = format!("model.layers.{index}");
+        let path = &self.definition.unit(group, index)?.path;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_parallel_with_provider_observed(
             hidden,
@@ -145,7 +145,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
             provider,
             parallel,
             context,
-            &mut ComponentInstrumentation::new(&path, &mut borrowed),
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
         )
     }
 }

@@ -1,12 +1,12 @@
 //! Rank-local target equations using the ordinary residual, request and state lifecycle.
 use super::*;
 use eredu_runtime::{
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ResidentExpertProvider,
+    ComponentEquations, ExpertPass, LayerRuntimeState, LayeredForwardState,
+    ParallelComponentKernel, ParallelRoutedComponentKernel, ResidentExpertProvider,
     TensorParallelParameterProvider,
 };
 
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
     pub(super) fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), Error> {
         let plan = self.tensor_partition.as_ref().ok_or_else(|| {
             Error::backend("parallel target requires a retained tensor partition")
@@ -20,7 +20,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_parallel<P, S>(
+    fn run_parallel_equation<P, S>(
         &self,
         index: usize,
         unit: &mut Unit<B>,
@@ -62,7 +62,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
     }
 }
 
-impl<B, S> ParallelLayeredArchitecture<B, S> for TargetModel<B>
+impl<B, S> ParallelComponentKernel<B, S> for TargetKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -71,8 +71,7 @@ where
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
-
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -81,10 +80,9 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
         self.validate_parallel(parallel)?;
         // Vocabulary and the small residual ingress are explicitly replicated.
-        self.begin_forward(input, state, context)
+        self.begin(input, state, context)
     }
-
-    fn begin_forward_parallel_observed<'a, O>(
+    fn begin_parallel_observed<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -96,13 +94,11 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.validate_parallel(parallel)?;
-        self.begin_forward_observed(input, state, context, observer)
+        self.begin_observed(input, state, context, observer)
     }
-
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -110,9 +106,8 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_unit_parallel_with_provider(
-            group,
-            index,
+        self.execute_parallel_routed(
+            address,
             unit,
             hidden,
             state,
@@ -123,11 +118,9 @@ where
             context,
         )
     }
-
-    fn forward_unit_parallel_observed<O>(
+    fn execute_parallel_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -139,9 +132,8 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.forward_unit_parallel_observed_with_provider(
-            group,
-            index,
+        self.execute_parallel_routed_observed(
+            address,
             unit,
             hidden,
             state,
@@ -153,8 +145,7 @@ where
             observer,
         )
     }
-
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -163,10 +154,9 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.validate_parallel(parallel)?;
-        self.finish_forward(hidden, state, forward, context)
+        self.finish(hidden, state, forward, context)
     }
-
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
@@ -179,11 +169,10 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         self.validate_parallel(parallel)?;
-        self.finish_forward_observed(hidden, state, forward, context, observer)
+        self.finish_observed(hidden, state, forward, context, observer)
     }
 }
-
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for TargetModel<B>
+impl<B, S> ParallelRoutedComponentKernel<B, S> for TargetKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -195,11 +184,9 @@ where
     fn parallel_routed_sparse_observations(&self) -> bool {
         true
     }
-
-    fn forward_unit_parallel_with_provider<P>(
+    fn execute_parallel_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -213,8 +200,8 @@ where
         P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.decoder.unit_path(group, index)?;
-        self.execute_parallel(
+        let index = address.index();
+        self.run_parallel_equation(
             index,
             unit,
             hidden,
@@ -228,11 +215,9 @@ where
             &mut ComponentInstrumentation::disabled(),
         )
     }
-
-    fn forward_unit_parallel_observed_with_provider<P, O>(
+    fn execute_parallel_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -248,10 +233,10 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.decoder.unit_path(group, index)?;
+        let index = address.index();
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let path = format!("model.layers.{}", self.spec.units[index].layer());
-        self.execute_parallel(
+        self.run_parallel_equation(
             index,
             unit,
             hidden,

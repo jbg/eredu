@@ -10,10 +10,7 @@ use super::{
     recurrent::{RecurrentSublayer, RecurrentSublayerSpec},
     residual::{mixer_spec, ResidualBoundary},
 };
-use crate::{
-    decoder::{ComponentInstrumentation, StaticModules},
-    hybrid_decoder::HybridDecoder,
-};
+use crate::decoder::{BoundaryModules, ComponentInstrumentation, StaticModules};
 use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, EmbeddingSpec, Error, GroupedGatedProductSpec,
@@ -24,6 +21,8 @@ use eredu_runtime::{
     RuntimeAppendStreams, RuntimeStateComponents, StateLayout,
 };
 use std::collections::BTreeMap;
+
+mod parameters;
 
 /// Bounds retained by target construction, independently of table/cache residency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,18 +526,35 @@ impl BoundTargetSpec {
         &self.state_fingerprint
     }
 }
-/// Target-only layered composition. Prediction and media encoders attach in total
-/// prepared construction; this type does not register a family or facade load path.
-pub struct TargetModel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
+/// Target execution through the shared validated runtime adapter.
+pub type TargetModel<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    TargetKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Family equations and construction geometry for independently leased target units.
+/// Standalone execution and media composition borrow the same typed kernel.
+#[derive(eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct TargetKernel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
+    #[parameter(skip)]
     pub(crate) spec: TargetSpec,
+    #[parameter(skip)]
     hashes: BTreeMap<usize, NGramHashSpec>,
+    #[parameter(skip)]
     state_fingerprint: String,
+    #[parameter(skip)]
     tensor_partition: Option<TargetTensorPartition>,
+    #[parameter(skip)]
     partition_state: eredu_runtime::PartitionState,
-    global_parameters: Option<std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>>,
-    pub(crate) decoder: HybridDecoder<B, (), ResidualBoundary<B>>,
+    #[parameter(skip)]
+    parameter_root: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    #[parameter(skip)]
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    pub(crate) statics: BoundaryModules<B, ResidualBoundary<B>>,
 }
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetKernel<B> {
     fn clone(&self) -> Self {
         Self {
             spec: self.spec.clone(),
@@ -546,12 +562,35 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Clone for TargetModel<B
             state_fingerprint: self.state_fingerprint.clone(),
             tensor_partition: self.tensor_partition.clone(),
             partition_state: self.partition_state.clone(),
-            global_parameters: self.global_parameters.clone(),
-            decoder: self.decoder.clone(),
+            parameter_root: self.parameter_root.clone(),
+            definition: self.definition.clone(),
+            statics: self.statics.clone(),
         }
     }
 }
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
+    /// Consumes finalized geometry and resources into the shared execution adapter.
+    pub fn into_model(self) -> Result<TargetModel<B>, Error> {
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
+            .map_err(Error::from)
+    }
+    /// Retains exact selected ownership on the same runtime adapter.
+    pub fn into_partition_model<G, A>(
+        mut self,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+    ) -> Result<TargetModel<B>, Error> {
+        let state = partition
+            .state()
+            .ok_or_else(|| Error::backend("target partition requires selected state geometry"))?;
+        self = self.with_partition_state(state)?;
+        self.statics = self.statics.select(partition.parameter_bindings())?;
+        eredu_runtime::ComponentAdapter::with_partition_resources::<B, G, A>(
+            self.definition.clone(),
+            self,
+            partition,
+        )
+        .map_err(Error::from)
+    }
     /// Allocates pinned parameters only; layer residency constructs units on demand.
     pub fn new(
         bound: BoundTargetSpec,
@@ -562,51 +601,39 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
             hashes,
             state_fingerprint,
         } = bound;
-        spec.state_layout()?;
-        spec.limits.validate_for_config(&spec.config)?;
-        for (ordinal, unit) in spec.units.iter().enumerate() {
-            match unit {
-                UnitSpec::Lexical { spec: lexical, .. } => lexical.validate()?,
-                UnitSpec::Decoder {
-                    mixer,
-                    feed_forward,
-                    ..
-                } => {
-                    feed_forward.validate()?;
-                    if feed_forward.feed_forward.layer != ordinal {
-                        return Err(Error::backend("expert owner differs from target unit"));
-                    }
-                    match mixer {
-                        MixerSpec::Recurrent(r) => r.validate()?,
-                        MixerSpec::Indexed(a) => {
-                            a.validate().map_err(Error::backend_source)?;
-                            a.limits
-                                .validate::<B::Tensor>(a.state)
-                                .map_err(Error::backend_source)?;
-                        }
-                    }
-                }
+        let definition = std::sync::Arc::new(spec.definition()?);
+        for unit in &spec.units {
+            if let UnitSpec::Decoder {
+                mixer: MixerSpec::Indexed(indexed),
+                ..
+            } = unit
+            {
+                indexed
+                    .limits
+                    .validate::<B::Tensor>(indexed.state)
+                    .map_err(Error::backend_source)?;
             }
         }
         B::require_operator_capabilities("qwen4_exp target", spec.required_operators())?;
         let boundary = ResidualBoundary::new(spec.boundary.clone(), context)?;
-        let modules = StaticModules::from_boundary(
+        let statics = StaticModules::from_boundary(
             spec.embedding.clone(),
             spec.head.clone(),
             boundary,
             context,
         )?;
-        let decoder = HybridDecoder::new(modules, "model.units", spec.units.len())?;
         let partition_state =
-            eredu_runtime::PartitionState::new(spec.state_layout()?, 0).map_err(Error::backend)?;
+            eredu_runtime::PartitionState::new(definition.state_layout().clone(), 0)
+                .map_err(Error::backend)?;
         Ok(Self {
             spec,
             hashes,
             state_fingerprint,
             tensor_partition: None,
             partition_state,
-            global_parameters: None,
-            decoder,
+            parameter_root: definition.clone(),
+            definition,
+            statics: statics.into(),
         })
     }
     /// Constructs rank-local units while retaining replicated vocabulary and residual mixers.
@@ -629,11 +656,18 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
         self.tensor_partition.as_ref()
     }
 
-    pub(crate) fn retain_global_parameters(
-        &mut self,
+    /// Selects global bindings from the retained complete parameter declaration.
+    pub(crate) fn with_global_parameters(
+        mut self,
         parameters: eredu_runtime::ArchitectureParameterDescription,
-    ) {
-        self.global_parameters = Some(std::sync::Arc::new(parameters));
+    ) -> Result<Self, Error> {
+        self.definition = self.parameter_root.project_parameters(parameters)?;
+        Ok(self)
+    }
+
+    /// Validated invocation, storage and state authority retained before allocation.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
     }
 
     /// Literal-aware state identity retained at construction.
@@ -668,7 +702,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
             }),
         }
     }
-    pub(crate) fn execute<P, S>(
+    pub(crate) fn run_equation<P, S>(
         &self,
         index: usize,
         unit: &mut Unit<B>,

@@ -123,7 +123,7 @@ pub struct PreparedModelDiscovery {
     partition_selection: Option<crate::SelectedExecution>,
     target_static: Result<Option<crate::external_assistant::TargetStaticDescription>, String>,
     partition_parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
-    partition_parameter_index: Option<Arc<crate::parameter_partition::ParameterMemberIndex>>,
+    partition_parameter_index: Option<Arc<eredu_runtime::ParameterMemberIndex>>,
     partition_hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
     support: eredu_core::ObservationSupportReport,
     observation_context: eredu_runtime::inspection::ObservationExecutionContext,
@@ -214,9 +214,9 @@ impl PreparedModelDiscovery {
             .as_ref()
             .zip(parameters.as_ref())
             .map(|(selected, parameters)| {
-                Arc::new(crate::parameter_partition::ParameterMemberIndex::new(
+                Arc::new(eredu_runtime::ParameterMemberIndex::new(
                     selected.text_realization().materialization_tasks(),
-                    parameters,
+                    parameters.clone(),
                 ))
             });
         self.partition_parameters = parameters;
@@ -306,7 +306,7 @@ impl PreparedModelDiscovery {
         global_rank: usize,
         reservation: &mut impl eredu_core::capture::CaptureReservation,
     ) -> Result<
-        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
     > {
         let Some(selected) = &self.partition_selection else {

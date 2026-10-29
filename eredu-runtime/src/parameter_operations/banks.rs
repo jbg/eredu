@@ -4,7 +4,7 @@ use crate::ParameterBankKey;
 use eredu_checkpoint::recipe::RecipeMetadata;
 use eredu_core::parameters::ParameterError;
 use eredu_nn::ParameterMetadata;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// One physical member of an architecture-declared grouped parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,68 @@ pub struct PreparedBankParameterMember {
     pub parameter: String,
     /// Actual output after selected lowering and rank-local transforms.
     pub materialized: RecipeMetadata,
+}
+
+/// Failure joining a final physical binding to its retained logical destination.
+#[derive(Debug, thiserror::Error)]
+pub enum BankParameterPreparationError {
+    /// A selected binding has no canonical destination in the retained plan.
+    #[error("bank member {key:?} binding {binding:?} has no logical destination")]
+    MissingDestination {
+        /// Original global member identity.
+        key: ParameterBankKey,
+        /// Local binding that cannot be attributed.
+        binding: String,
+    },
+    /// Final materialized recipe geometry cannot be inferred from its source.
+    #[error("bank member {key:?} binding {binding:?}: {source}")]
+    Recipe {
+        /// Original global member identity.
+        key: ParameterBankKey,
+        /// Local binding being prepared.
+        binding: String,
+        /// Original recipe or source failure.
+        #[source]
+        source: eredu_checkpoint::recipe::RecipeError,
+    },
+}
+
+/// Joins final source-backed bindings to the exact retained logical destinations.
+///
+/// This runs after any selected storage transformation and preserves entry and
+/// binding order, including independent members reading the same source. It
+/// infers metadata only; parameter slot admission, leases and editing authority
+/// remain separate. No destination is reconstructed from synthetic source names.
+pub fn prepare_bank_parameter_members<'a, C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
+    entries: impl IntoIterator<Item = (ParameterBankKey, &'a [crate::WeightBinding])>,
+    targets: &BTreeMap<(ParameterBankKey, String), String>,
+    source: &C,
+) -> Result<Vec<PreparedBankParameterMember>, BankParameterPreparationError> {
+    entries
+        .into_iter()
+        .flat_map(|(key, bindings)| bindings.iter().map(move |binding| (key, binding)))
+        .map(|(key, binding)| {
+            let parameter = targets
+                .get(&(key, binding.name().to_owned()))
+                .ok_or_else(|| BankParameterPreparationError::MissingDestination {
+                    key,
+                    binding: binding.name().to_owned(),
+                })?;
+            let materialized = binding.recipe_view().infer(source).map_err(|source| {
+                BankParameterPreparationError::Recipe {
+                    key,
+                    binding: binding.name().to_owned(),
+                    source,
+                }
+            })?;
+            Ok(PreparedBankParameterMember {
+                key,
+                binding: binding.name().to_owned(),
+                parameter: parameter.clone(),
+                materialized,
+            })
+        })
+        .collect()
 }
 
 /// One complete rank-local parameter and its ordered independent source owners.
@@ -75,11 +137,11 @@ pub fn prepare_bank_parameter_slots(
         let mut materialized = first.materialized.clone();
         materialized.shape[0] = members.len();
         materialized.byte_len = 0;
-        let mut seen = BTreeSet::new();
+        let mut previous = None;
         for member in &members {
             if member.key.bank() != bank
                 || member.key.unit() != unit
-                || !seen.insert(member.key)
+                || previous.replace(member.key) == Some(member.key)
                 || member.materialized.shape != first.materialized.shape
                 || member.materialized.dtype != first.materialized.dtype
                 || member.materialized.byte_len != first.materialized.byte_len
@@ -103,10 +165,17 @@ pub fn prepare_bank_parameter_slots(
             members,
         });
     }
+    // Grouped parameters are emitted in canonical name order.
+    let find_parameter = |id: &str| {
+        output
+            .binary_search_by(|parameter| parameter.slot.parameter.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &output[index])
+    };
     for declaration in declarations {
         if let Some(owner) = &declaration.linear_companion_of {
-            if output.iter().any(|p| p.slot.parameter.id == *owner)
-                && !output.iter().any(|p| p.slot.parameter.id == declaration.id)
+            if find_parameter(owner.as_str()).is_some()
+                && find_parameter(declaration.id.as_str()).is_none()
             {
                 return Err(ParameterError::Missing(declaration.id.as_str().into()));
             }
@@ -114,9 +183,7 @@ pub fn prepare_bank_parameter_slots(
     }
     for parameter in &output {
         if let Some(owner) = &parameter.slot.parameter.linear_companion_of {
-            let owner = output
-                .iter()
-                .find(|candidate| candidate.slot.parameter.id == *owner)
+            let owner = find_parameter(owner.as_str())
                 .ok_or_else(|| ParameterError::Missing(owner.as_str().into()))?;
             if parameter
                 .members

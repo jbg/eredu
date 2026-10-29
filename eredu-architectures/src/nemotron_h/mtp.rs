@@ -21,6 +21,22 @@ pub enum TargetReadout {
 }
 
 impl TargetReadout {
+    /// Applies the shared target equation through borrowed canonical decoder roles.
+    pub(crate) fn apply<B: eredu_nn::DistributedNeuralBackend>(
+        self,
+        mut resources: crate::decoder::DecoderResourcesMut<'_, B>,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = resources.normalize(hidden, context, instrumentation)?;
+        match self {
+            Self::NormalizedHidden => Ok(hidden),
+            Self::Logits => resources.project(&hidden, parallel, context, instrumentation),
+        }
+    }
+
     /// Encodes invocation policy as an exact pipeline control tensor.
     pub fn encode<T: Tensor>(self, context: &T::Context) -> Result<T, Error> {
         T::from_i32_slice(

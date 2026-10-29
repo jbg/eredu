@@ -33,6 +33,15 @@ pub enum Error {
     /// Explicit prepared-input transfer exceeded portable logical limits.
     #[error(transparent)]
     InputTransfer(#[from] eredu_runtime::input_transfer::InputTransferError),
+    /// Neutral selected bank catalog construction failed.
+    #[error(transparent)]
+    AddressableBankCatalog(#[from] eredu_runtime::AddressableBankCatalogError),
+    /// A portable independent bank entry declaration is invalid.
+    #[error(transparent)]
+    AddressableBankEntry(#[from] eredu_runtime::AddressableBankEntryError),
+    /// Portable rank-local addressable parameter projection failed.
+    #[error(transparent)]
+    AddressableBankPlacement(#[from] eredu_runtime::AddressableBankPlacementError),
     /// Portable row lookup admission or specification failure.
     #[error(transparent)]
     RowLookup(#[from] eredu_runtime::RowLookupError),
@@ -117,6 +126,29 @@ pub enum Error {
     /// Invalid backend-neutral execution-group graph.
     #[error(transparent)]
     ExecutionGraph(#[from] eredu_runtime::ExecutionGraphError),
+
+    /// An exact neutral materialization task or transform group is invalid.
+    #[error(transparent)]
+    ReplicatedTextContract(#[from] eredu_runtime::ReplicatedTextContractError),
+
+    /// Exact bindings disagree with retained parameter acquisition ownership.
+    #[error(transparent)]
+    ParameterAcquisition(#[from] eredu_runtime::ParameterAcquisitionError),
+
+    /// Invalid selected parameter-residency capacity.
+    #[error(transparent)]
+    ResidencySizing(#[from] eredu_runtime::BoundedResidencySizingError),
+
+    /// Invalid admitted execution-unit resource count or capacity.
+    #[error(transparent)]
+    ExecutionUnitPreparation(#[from] eredu_runtime::ExecutionUnitPreparationError),
+    /// Exact parameter plan admission failed.
+    #[error(transparent)]
+    ParameterResourcePreparation(#[from] eredu_runtime::ParameterResourcePreparationError),
+
+    /// Invalid logical-to-local execution-unit mapping or invocation.
+    #[error(transparent)]
+    ExecutionUnitAddressMap(#[from] eredu_runtime::ExecutionUnitAddressMapError),
 
     /// Invalid backend-neutral pipeline execution-group lifecycle.
     #[error(transparent)]

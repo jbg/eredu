@@ -26,7 +26,10 @@ use eredu_nn::{
     Error, GatedProductGroupLayout, GatedProductPolicy, GroupedGatedProductSpec,
     GroupedProjectionSpec, LinearFormatSpec, ParameterSpec,
 };
-use eredu_runtime::{PreparedRowLookup, RowLookupLimits, RowResidencyRange};
+use eredu_runtime::{
+    ParameterBankRecipes, PreparedParameterRecipes, PreparedRowLookup, RowLookupLimits,
+    RowResidencyRange,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -80,63 +83,9 @@ pub enum PreparationError {
     /// Portable module specification is invalid.
     #[error(transparent)]
     Neural(#[from] Error),
-}
-
-/// Recipes for one ordinary owner or one expert, with no authority over other sources.
-#[derive(Clone)]
-pub struct PreparedParameters {
-    source: SharedCheckpointSource,
-    recipes: BTreeMap<String, DerivedWeightRecipe>,
-}
-impl PreparedParameters {
-    pub(in crate::qwen4_exp) fn new(
-        source: SharedCheckpointSource,
-        recipes: BTreeMap<String, DerivedWeightRecipe>,
-    ) -> Result<Self, PreparationError> {
-        let keys = recipes
-            .values()
-            .flat_map(|r| r.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source = retain(source, keys)?;
-        for recipe in recipes.values() {
-            recipe
-                .infer(source.as_ref())
-                .map_err(|e| PreparationError::Contract(e.to_string()))?;
-        }
-        Ok(Self { source, recipes })
-    }
-    /// Exact restricted source. Deferred binding cannot reopen or rediscover artifacts.
-    pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
-    }
-    /// Canonical parameter identities mapped to exact physical recipes.
-    pub fn recipes(&self) -> &BTreeMap<String, DerivedWeightRecipe> {
-        &self.recipes
-    }
-}
-fn retain(
-    source: SharedCheckpointSource,
-    keys: BTreeSet<String>,
-) -> Result<SharedCheckpointSource, StoreError> {
-    let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-        source,
-        "qwen4_exp prepared owner",
-        keys,
-    )?);
-    let catalog = source
-        .source_keys()
-        .into_iter()
-        .map(|key| {
-            Ok((
-                key.clone(),
-                PreparedTensorSource {
-                    metadata: source.source_metadata(&key)?,
-                    provenance: source.source_provenance(&key)?,
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-    Ok(Arc::new(PreparedCheckpointSource::new(source, catalog)?))
+    /// Shared exact parameter-resource preparation failed.
+    #[error(transparent)]
+    Parameters(#[from] eredu_runtime::RecipeBindingError),
 }
 
 /// A complete target's source-format construction and retained artifact ownership.
@@ -149,11 +98,11 @@ pub struct PreparedTarget {
     )>,
     artifact: SharedCheckpointSource,
     formats: ParameterFormats,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
     spec: TargetSpec,
     tables: BTreeMap<usize, PreparedNGramTable>,
-    static_parameters: PreparedParameters,
-    units: Vec<PreparedParameters>,
+    static_parameters: PreparedParameterRecipes,
+    units: Vec<PreparedParameterRecipes>,
 }
 impl PreparedTarget {
     /// Validates the complete official SafeTensors catalog and prepares exact target
@@ -165,7 +114,11 @@ impl PreparedTarget {
         limits: TargetLimits,
     ) -> Result<Self, PreparationError> {
         // Bind admission to this exact source before any bounded literal read.
-        let source = retain(source.clone(), source.source_keys().into_iter().collect())?;
+        let source: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
+            source.clone(),
+            "qwen4_exp prepared owner",
+            source.source_keys().into_iter().collect(),
+        )?);
         SafetensorsTargetPlan::prepare(source.as_ref(), config, encoding)?.bind(source, limits)
     }
     /// Exact construction specs; callers do not select family names or equations.
@@ -190,11 +143,11 @@ impl PreparedTarget {
         &self.artifact
     }
     /// Embedding, output and final residual mixer, excluding extension/media weights.
-    pub fn static_parameters(&self) -> &PreparedParameters {
+    pub fn static_parameters(&self) -> &PreparedParameterRecipes {
         &self.static_parameters
     }
     /// Exact ordinary source for one execution ordinal (not checkpoint layer).
-    pub fn unit(&self, ordinal: usize) -> Result<&PreparedParameters, PreparationError> {
+    pub fn unit(&self, ordinal: usize) -> Result<&PreparedParameterRecipes, PreparationError> {
         self.units
             .get(ordinal)
             .ok_or_else(|| PreparationError::Contract("execution owner is outside target".into()))
@@ -205,7 +158,7 @@ impl PreparedTarget {
         &self,
         ordinal: usize,
         expert: usize,
-    ) -> Result<PreparedParameters, PreparationError> {
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
         let Some(UnitSpec::Decoder { layer, .. }) = self.spec.units.get(ordinal) else {
             return Err(PreparationError::Contract(
                 "expert owner is not a decoder".into(),
@@ -213,13 +166,15 @@ impl PreparedTarget {
         };
         let root = format!("model.layers.{layer}.mlp.experts");
         let recipes = self.expert_recipes(&root, expert)?;
-        PreparedParameters::new(
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
             self.artifact.clone(),
             recipes
                 .into_iter()
                 .map(|(name, r)| (format!("{root}.{name}"), r))
                 .collect(),
         )
+        .map_err(PreparationError::from)
     }
     fn expert_recipes(
         &self,
@@ -284,42 +239,14 @@ impl PreparedTarget {
         )?)
     }
 }
-#[derive(Debug)]
-struct PreparedExpertBank {
-    recipes: BTreeMap<String, DerivedWeightRecipe>,
-    members: Vec<BTreeMap<String, DerivedWeightRecipe>>,
-}
-impl PreparedExpertBank {
-    fn new<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
-        source: &C,
-        recipes: BTreeMap<String, DerivedWeightRecipe>,
-        count: usize,
-    ) -> Result<Self, PreparationError> {
-        let mut members = vec![BTreeMap::new(); count];
-        for (name, recipe) in &recipes {
-            let selected = recipe
-                .select_bounded_members(source)
-                .map_err(|e| PreparationError::Contract(e.to_string()))?;
-            if selected.len() != count {
-                return Err(PreparationError::Contract(
-                    "prepared expert count mismatch".into(),
-                ));
-            }
-            for (member, recipe) in members.iter_mut().zip(selected) {
-                member.insert(name.clone(), recipe);
-            }
-        }
-        Ok(Self { recipes, members })
-    }
-}
 fn select_expert(
-    banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
+    banks: &BTreeMap<String, Arc<ParameterBankRecipes>>,
     root: &str,
     expert: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, PreparationError> {
     banks
         .get(root)
-        .and_then(|b| b.members.get(expert))
+        .and_then(|b| b.member(expert))
         .cloned()
         .ok_or_else(|| {
             PreparationError::Contract(format!("expert {expert} is outside prepared bank {root}"))

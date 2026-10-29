@@ -3,7 +3,7 @@
 use eredu_architectures::voicechat::{
     rnnt::{RnntDimensions, RnntError, RnntPredictionState},
     rnnt_pipeline::RnntPredictorExecution,
-    rnnt_predictor::{RnntPredictorArchitecture, RnntPredictorInput, RnntPredictorRuntimeState},
+    rnnt_predictor::{RnntPredictorInput, RnntPredictorKernel, RnntPredictorRuntimeState},
     rnnt_predictor_distribution::PreparedRnntPredictorPipelineBindings,
 };
 use eredu_core::{BackendFailure, DistributedCommitEpoch, DistributedCommitOutcome};
@@ -19,7 +19,10 @@ use crate::{
     MlxTensor,
 };
 
-type Architecture = RnntPredictorArchitecture<MlxNeuralBackend>;
+type Architecture = eredu_runtime::ComponentAdapter<
+    eredu_runtime::ComponentDefinition,
+    RnntPredictorKernel<MlxNeuralBackend>,
+>;
 type State = RnntPredictorRuntimeState<MlxTensor>;
 
 /// Selected recurrent stage with caller-owned, unpublished local LSTM history.
@@ -30,10 +33,10 @@ pub struct MlxRnntPredictorPipeline {
 
 impl RnntPredictorExecution<MlxNeuralBackend> for MlxRnntPredictorPipeline {
     fn dimensions(&self) -> RnntDimensions {
-        self.execution.architecture().dimensions()
+        self.execution.architecture().kernel().dimensions()
     }
     fn predictor_ownership(&self) -> std::ops::Range<usize> {
-        self.execution.architecture().predictor_ownership()
+        self.execution.architecture().kernel().predictor_ownership()
     }
     fn predictor_step(
         &mut self,
@@ -61,6 +64,7 @@ impl MlxRnntPredictorPipeline {
     pub fn prediction_state_bytes(&self) -> Result<u64, BackendFailure> {
         self.execution
             .architecture()
+            .kernel()
             .prediction_state_bytes()
             .map_err(BackendFailure::from_error)
     }
@@ -89,7 +93,7 @@ impl MlxRnntPredictorPipeline {
         epoch: DistributedCommitEpoch,
         stream: &Stream,
     ) -> Result<(RnntPredictionState<MlxTensor>, DistributedCommitOutcome), BackendFailure> {
-        let mut state = State::for_partition(self.execution.architecture(), parent)
+        let mut state = State::for_partition(self.execution.architecture().kernel(), parent)
             .map_err(BackendFailure::from_error)?;
         let mut request = [0; 8];
         request[..7].copy_from_slice(&descriptor);
@@ -130,12 +134,14 @@ pub fn materialize_voicechat_rnnt_predictor_pipeline(
         .expect("validated recurrent state ownership")
         .layout()
         .clone();
-    let (dimensions, _layout, source, units) = prepared.into_parts();
-    let architecture = Architecture::new_partition(dimensions, &partition, &cuts)
-        .map_err(BackendFailure::from_error)?;
+    let (dimensions, definition, invocations, source, units) = prepared.into_parts();
+    let architecture =
+        RnntPredictorKernel::new_partition(definition, dimensions, &partition, &cuts)
+            .map_err(BackendFailure::from_error)?;
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,
         source,
+        invocations,
         units,
         manifest,
         plan,

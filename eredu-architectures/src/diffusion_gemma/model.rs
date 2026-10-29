@@ -12,13 +12,14 @@ use eredu_nn::{
     AttentionCache, Error, GroupedNeuralBackend, ReadOnlyAttentionCache, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ArchitectureParameters, ExecutionGraph, LayerRuntimeState,
-    LayeredArchitecture, LayeredForwardState, ParameterProvider, PartitionedLayeredArchitecture,
-    ResidentExpertProvider, RoutedLayeredArchitecture, StateLayout,
+    LayerRuntimeState, LayeredForwardState, ParameterProvider, ResidentExpertProvider, StateLayout,
 };
+
+use eredu_runtime::PartitionComponentKernel as _;
 
 /// Stable identity of the shared encoder/refinement execution stack.
 pub const TEXT_EXECUTION_GROUP: &str = "shared_text";
+const TEXT_COMPONENT_ID: &str = "diffusion_gemma_text";
 
 /// Shared-stack placement, with decoder-only feedback retained on the input owner.
 pub(crate) fn text_transport() -> eredu_runtime::ArchitectureGroupTransport {
@@ -31,6 +32,178 @@ pub(crate) fn text_transport() -> eredu_runtime::ArchitectureGroupTransport {
         parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::Decoder),
         request_optional: false,
     }
+}
+
+/// Validates shared text storage, context slots, and invocation addressing without native resources.
+pub fn component_definition(
+    config: &FamilyConfig,
+    geometry: Option<&super::parallel::LocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    let state = match geometry {
+        Some(geometry) => geometry
+            .complete_state_layout(config)
+            .map_err(Error::backend_source)?,
+        None => super::state_layout(config).map_err(Error::backend_source)?,
+    };
+    let layers = config.text.num_hidden_layers();
+    eredu_runtime::ComponentDefinition::new(
+        TEXT_COMPONENT_ID,
+        super::parallel::parameter_description(config).map_err(Error::backend_source)?,
+        (0..layers).map(text_unit).collect(),
+        vec![text_transport()],
+        TEXT_EXECUTION_GROUP,
+        vec![],
+        state,
+        text_state_partition_plan(layers),
+    )
+    .map_err(Error::from)
+}
+
+pub(super) fn project_from_composite(
+    definition: &eredu_runtime::ComponentDefinition,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    let graph = eredu_runtime::ExecutionGraph::chain([TEXT_EXECUTION_GROUP])
+        .map_err(Error::backend_source)?;
+    definition
+        .project_groups(
+            TEXT_COMPONENT_ID,
+            graph,
+            ["embedding", "norm", "output", "conditioning"],
+        )
+        .map(std::sync::Arc::new)
+        .map_err(Error::from)
+}
+
+fn text_unit(index: usize) -> eredu_runtime::ComponentUnit {
+    eredu_runtime::ComponentUnit {
+        path: format!("model.decoder.layers.{index}"),
+        state: index..index + 1,
+    }
+}
+
+/// Projects exact executable formats without replacing retained invocation or state identities.
+pub fn project_parameters(
+    config: &FamilyConfig,
+    definition: &std::sync::Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_text_identity(definition)?;
+    let parameters =
+        super::parallel::parameter_description(config).map_err(Error::backend_source)?;
+    definition
+        .project_parameters(parameters)
+        .map_err(Error::from)
+}
+
+fn validate_text_identity(definition: &eredu_runtime::ComponentDefinition) -> Result<(), Error> {
+    if definition.id() != TEXT_COMPONENT_ID {
+        return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+            component: definition.id().into(),
+            resource: "shared text component identity".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+pub(super) fn select_definition(
+    config: &FamilyConfig,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::parallel::LocalGeometry>,
+) -> Result<std::sync::Arc<eredu_runtime::ComponentDefinition>, Error> {
+    validate_text_identity(&definition)?;
+    definition.validate_parameter_topology(
+        &super::parallel::parameter_description(config).map_err(Error::backend_source)?,
+    )?;
+    let layers = config.text.num_hidden_layers();
+    definition.validate_execution_contract(
+        TEXT_EXECUTION_GROUP,
+        &[],
+        &(0..layers).map(text_unit).collect::<Vec<_>>(),
+        &[text_transport()],
+        &text_state_partition_plan(layers),
+        |_, _, boundaries| !boundaries.is_kernel_owned(),
+    )?;
+    let state = match geometry {
+        Some(geometry) => geometry
+            .complete_state_layout(config)
+            .map_err(Error::backend_source)?,
+        None => super::state_layout(config).map_err(Error::backend_source)?,
+    };
+    definition.select_state_layout(&state).map_err(Error::from)
+}
+
+fn text_state_partition_plan(layers: usize) -> eredu_runtime::ArchitectureStatePartitionPlan {
+    eredu_runtime::ArchitectureStatePartitionPlan::new([
+        eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..layers),
+    ])
+}
+
+/// Derives ownership of the shared routed banks for an admitted rank topology.
+pub fn expert_realization_plan(
+    config: &FamilyConfig,
+    geometry: Option<&super::parallel::LocalGeometry>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, Error> {
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(config)
+            .map_err(Error::backend_source)?;
+    }
+    let Some(count) = config.text.num_experts else {
+        return Ok(None);
+    };
+    let global = usize::try_from(count).map_err(Error::backend)?;
+    let local = eredu_core::balanced_contiguous_range(
+        global,
+        topology.expert_parallel_size(),
+        topology.expert_parallel_rank(),
+        false,
+    )
+    .map_err(Error::backend)?;
+    let owner =
+        eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP).map_err(Error::backend)?;
+    let mut specs = std::collections::BTreeMap::new();
+    for (index, policy) in config.text.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
+            continue;
+        }
+        let args = geometry
+            .as_ref()
+            .and_then(|g| g.block_args(index))
+            .unwrap_or(&config.text);
+        let width = if geometry
+            .as_ref()
+            .is_some_and(|g| g.block_args(index).is_none())
+        {
+            let global_width = config
+                .text
+                .moe_intermediate_size
+                .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?;
+            let owned = eredu_core::balanced_contiguous_range(
+                global_width as usize,
+                topology.tensor_parallel_size(),
+                topology.tensor_parallel_rank(),
+                false,
+            )
+            .map_err(Error::backend)?;
+            i32::try_from(owned.len()).map_err(Error::backend)?
+        } else {
+            args.moe_intermediate_size
+                .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?
+        };
+        let spec = crate::gemma4::text::expert_bank_spec_at(
+            &config.text,
+            &format!("model.decoder.layers.{index}.experts.switch_glu"),
+        )?
+        .with_group_geometry(i32::try_from(local.len()).map_err(Error::backend)?, width)?;
+        specs.insert((owner.clone(), index), spec);
+    }
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    crate::ExpertRealizationPlan::balanced(global, topology, specs)
+        .map(Some)
+        .map_err(Error::backend)
 }
 
 /// One architecture invocation; refinement reads the context owned by the state.
@@ -70,46 +243,44 @@ pub struct ForwardContext<T> {
     shared: SharedAttentionStates<T>,
 }
 
-/// Family-owned text equations traversed through ordinary runtime residency.
-pub struct TextModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+/// Shared runtime contracts over DiffusionGemma's context and refinement equations.
+pub type TextModel<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    TextKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Shared storage and family-owned context/refinement equations.
+#[derive(eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct TextKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    #[parameter(skip)]
     config: FamilyConfig,
     statics: TextStatic<B>,
+    #[parameter(skip)]
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    #[parameter(skip)]
     geometry: Option<super::parallel::LocalGeometry>,
+    #[parameter(skip)]
+    owns_input: bool,
+    #[parameter(skip)]
     experts: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for TextModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for TextKernel<B> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
             statics: self.statics.clone(),
+            definition: std::sync::Arc::clone(&self.definition),
             geometry: self.geometry.clone(),
             experts: self.experts.clone(),
+            owns_input: self.owns_input,
         }
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    eredu_nn::Parameterized<B::Tensor> for TextModel<B>
-{
-    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, B::Tensor>>(
-        &'a self,
-        visitor: &mut V,
-    ) {
-        self.statics.visit_parameters(visitor);
-    }
-    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>>(
-        &'a mut self,
-        visitor: &mut V,
-    ) {
-        self.statics.visit_parameters_mut(visitor);
-    }
-    fn set_trainable(&mut self, trainable: bool) {
-        self.statics.set_trainable(trainable);
-    }
-}
-
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextKernel<B> {
     fn context_mask(
         &self,
         forward: &ForwardContext<B::Tensor>,
@@ -231,105 +402,154 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
         self.statics
             .encode_input_parallel(tokens, parallel, context)
     }
-    /// Declares pinned text modules independently from per-layer materialization.
-    pub fn new(
+
+    /// Materializes one complete text component over the retained declaration.
+    pub fn from_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            statics: TextStatic::new(&config, context)?,
-            config,
-            geometry: None,
-            experts: None,
-        })
+    ) -> Result<TextModel<B>, Error> {
+        let kernel = Self::materialize(config, definition, None, context)?;
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(
+            std::sync::Arc::clone(&kernel.definition),
+            kernel,
+        )
+        .map_err(Error::from)
     }
 
-    /// Constructs only parameters and state owned by the retained parallel partition.
-    pub fn new_parallel(
+    /// Materializes a tensor-local stack using the roles retained by its geometry.
+    pub fn from_parallel_definition(
         config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: super::parallel::LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        geometry.validate_for(&config).map_err(Error::backend)?;
-        Ok(Self {
+    ) -> Result<TextModel<B>, Error> {
+        let definition = select_definition(&config, definition, Some(&geometry))?;
+        let units = geometry.units();
+        let mut roles = vec![];
+        if geometry.embedding_range().is_some() {
+            roles.push("embedding".to_owned());
+        }
+        if geometry.owns_norm() {
+            roles.push("norm".to_owned());
+        }
+        if geometry.output_range().is_some() {
+            roles.push("output".to_owned());
+        }
+        if geometry.conditioning_width().is_some() {
+            roles.push("conditioning".to_owned());
+        }
+        let ownership = eredu_runtime::PartitionOwnership::new(
+            units.start == 0,
+            units.end == config.text.num_hidden_layers(),
+            roles,
+        )
+        .map_err(Error::backend_source)?;
+        let partition = eredu_runtime::ArchitecturePartition::from_description(
+            definition.parameters(),
+            [(TEXT_EXECUTION_GROUP, units)],
+            ownership,
+            definition.state_layout(),
+            definition.state_partition_plan(),
+            geometry,
+            super::boundary::TextBoundarySchema::new(config.text.hidden_size),
+        )
+        .map_err(Error::backend_source)?;
+        Self::materialize_selected(config, &partition, definition, context)
+    }
+
+    /// Constructs the exact canonical resources and independent local state selected by a partition.
+    pub fn from_partition(
+        config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        partition: &eredu_runtime::ArchitecturePartition<
+            super::parallel::LocalGeometry,
+            super::boundary::TextBoundarySchema,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TextModel<B>, Error> {
+        let definition = select_definition(&config, definition, Some(partition.local_geometry()))?;
+        Self::materialize_selected(config, partition, definition, context)
+    }
+
+    fn materialize_selected(
+        config: FamilyConfig,
+        partition: &eredu_runtime::ArchitecturePartition<
+            super::parallel::LocalGeometry,
+            super::boundary::TextBoundarySchema,
+        >,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TextModel<B>, Error> {
+        let geometry = partition.local_geometry();
+        definition.select_partition(partition)?;
+        if partition.boundary_schema()
+            != &super::boundary::TextBoundarySchema::new(config.text.hidden_size)
+        {
+            return Err(eredu_runtime::ComponentDefinitionError::Invalid {
+                component: definition.id().to_owned(),
+                resource: "partition boundary geometry".into(),
+            }
+            .into());
+        }
+        let units = geometry.units();
+        if partition.groups().len() != 1
+            || partition.groups()[0].group_index() != 0
+            || partition.groups()[0].global_units() != units
+        {
+            return Err(Error::backend(
+                "diffusion text partition differs from retained local units",
+            ));
+        }
+        let geometry = geometry.select_pinned_resources(
+            &config,
+            &definition,
+            partition.parameter_bindings(),
+        )?;
+        let kernel = Self {
             statics: TextStatic::new_parallel(&config, &geometry, context)?,
             config,
             geometry: Some(geometry),
+            owns_input: partition.ownership().owns_input(),
+            definition: std::sync::Arc::clone(&definition),
+            experts: None,
+        };
+        eredu_runtime::ComponentAdapter::with_partition_resources::<B, _, _>(
+            definition, kernel, partition,
+        )
+        .map_err(Error::from)
+    }
+
+    // Composite equations borrow the same kernel directly, under their enclosing component lifecycle.
+    pub(super) fn materialize(
+        config: FamilyConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<super::parallel::LocalGeometry>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let definition = select_definition(&config, definition, geometry.as_ref())?;
+        let statics = match &geometry {
+            Some(geometry) => TextStatic::new_parallel(&config, geometry, context)?,
+            None => TextStatic::new(&config, context)?,
+        };
+        let owns_input = geometry
+            .as_ref()
+            .is_none_or(|geometry| geometry.units().start == 0);
+        Ok(Self {
+            config,
+            statics,
+            definition,
+            geometry,
+            owns_input,
             experts: None,
         })
     }
 
-    /// Derives ownership of the shared routed banks for an admitted rank topology.
-    pub fn expert_realization_plan(
-        &self,
-        topology: eredu_core::ParallelRankTopology,
-    ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, Error>
-    {
-        let Some(count) = self.config.text.num_experts else {
-            return Ok(None);
-        };
-        let global = usize::try_from(count).map_err(Error::backend)?;
-        let local = eredu_core::balanced_contiguous_range(
-            global,
-            topology.expert_parallel_size(),
-            topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(Error::backend)?;
-        let owner =
-            eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP).map_err(Error::backend)?;
-        let mut specs = std::collections::BTreeMap::new();
-        for (index, policy) in self.config.text.layer_schedule.iter().enumerate() {
-            if policy.feed_forward != crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
-                continue;
-            }
-            let args = self
-                .geometry
-                .as_ref()
-                .and_then(|g| g.block_args(index))
-                .unwrap_or(&self.config.text);
-            let width = if self
-                .geometry
-                .as_ref()
-                .is_some_and(|g| g.block_args(index).is_none())
-            {
-                let global_width = self
-                    .config
-                    .text
-                    .moe_intermediate_size
-                    .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?;
-                let owned = eredu_core::balanced_contiguous_range(
-                    global_width as usize,
-                    topology.tensor_parallel_size(),
-                    topology.tensor_parallel_rank(),
-                    false,
-                )
-                .map_err(Error::backend)?;
-                i32::try_from(owned.len()).map_err(Error::backend)?
-            } else {
-                args.moe_intermediate_size
-                    .ok_or_else(|| Error::backend("missing routed intermediate geometry"))?
-            };
-            let spec = crate::gemma4::text::expert_bank_spec_at(
-                &self.config.text,
-                &format!("model.decoder.layers.{index}.experts.switch_glu"),
-            )?
-            .with_group_geometry(i32::try_from(local.len()).map_err(Error::backend)?, width)?;
-            specs.insert((owner.clone(), index), spec);
-        }
-        if specs.is_empty() {
-            return Ok(None);
-        }
-        crate::ExpertRealizationPlan::balanced(global, topology, specs)
-            .map(Some)
-            .map_err(Error::backend)
-    }
-
     /// Retains exact shared-bank ownership for native or neutral routed providers.
-    pub fn with_expert_realization(
-        mut self,
+    pub fn set_expert_realization(
+        &mut self,
         plan: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-    ) -> Result<Self, Error> {
+    ) -> Result<(), Error> {
         if self.config.text.num_experts.map(|n| n as usize) != Some(plan.global_expert_count()) {
             return Err(Error::backend(
                 "expert realization differs from the admitted global bank",
@@ -358,7 +578,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
             ));
         }
         self.experts = Some(plan);
-        Ok(self)
+        Ok(())
     }
 
     fn state_index(&self, index: usize) -> Result<usize, Error> {
@@ -381,8 +601,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
         &self.config
     }
 
-    fn graph(&self) -> Result<ExecutionGraph, Error> {
-        ExecutionGraph::chain([TEXT_EXECUTION_GROUP]).map_err(Error::backend)
+    /// Borrows the validated semantic definition retained before parameter construction.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.definition
+    }
+
+    /// Selected local context slots retained by the family geometry.
+    pub fn local_state_layout(&self) -> Result<StateLayout, Error> {
+        match &self.geometry {
+            Some(geometry) => self
+                .definition
+                .state_layout()
+                .slice(geometry.units())
+                .map_err(Error::backend_source),
+            None => Ok(self.definition.state_layout().clone()),
+        }
     }
 
     fn position<S>(&self, state: &mut S) -> Result<i32, Error>
@@ -390,11 +623,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
         S: LayerRuntimeState<B>,
         S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
     {
-        let expected = self
+        if self
             .geometry
             .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .unwrap_or(super::state_layout(&self.config).map_err(Error::backend)?);
+            .is_some_and(|geometry| geometry.units().is_empty())
+        {
+            if state.optional_layout().is_some() {
+                return Err(Error::backend(
+                    "stateless image partition retains text cache slots",
+                ));
+            }
+            return Ok(0);
+        }
+        let expected = self.local_state_layout()?;
         if state.layout() != &expected {
             return Err(Error::backend(
                 "diffusion state does not match the retained local geometry",
@@ -455,16 +696,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ArchitectureParameters<B>
-    for TextModel<B>
+impl<B> eredu_runtime::ComponentKernel<B> for TextKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
-    type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        match &self.geometry {
-            Some(geometry) => Ok(geometry.state_layout().clone()),
-            None => super::state_layout(&self.config).map_err(Error::backend),
-        }
-    }
+    type Input<'a> = TextInput<'a, B::Tensor>;
+    type Unit = TextLayer<B>;
+    type ForwardContext = ForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::option::Iter<'a, B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -481,93 +724,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ArchitectureP
         )
         .map_err(Error::backend)
     }
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        super::parallel::parameter_description(&self.config).map_err(Error::backend)
-    }
-    fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
-        &self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        if let Some(module) = &self.statics.embeddings {
-            visitor.visit("embedding", module)?;
-        }
-        if let Some(module) = &self.statics.norm {
-            visitor.visit("norm", module)?;
-        }
-        if let Some(head) = &self.statics.head {
-            visitor.visit("output", head)?;
-        }
-        if let Some(module) = &self.statics.conditioning {
-            visitor.visit("conditioning", module)?;
-        }
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
-        &mut self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        if let Some(module) = &mut self.statics.embeddings {
-            visitor.visit_mut("embedding", module)?;
-        }
-        if let Some(module) = &mut self.statics.norm {
-            visitor.visit_mut("norm", module)?;
-        }
-        if let Some(head) = &mut self.statics.head {
-            visitor.visit_mut("output", head)?;
-        }
-        if let Some(module) = &mut self.statics.conditioning {
-            visitor.visit_mut("conditioning", module)?;
-        }
-        Ok(())
-    }
-}
-
-impl<B, S> LayeredArchitecture<B, S> for TextModel<B>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
-{
-    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        eredu_runtime::inspection::ObservationHookSupport::internal(false, true, true)
-            .with_routed_units(true)
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut TextLayer<B>,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut ForwardContext<B::Tensor>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
-            self, group, index, hidden, forward,
-        );
-        <Self as RoutedLayeredArchitecture<B, S>>::forward_unit_observed_with_provider(
-            self,
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            pass,
-            &mut ResidentExpertProvider,
-            context,
-            observer,
-        )
-    }
-
     fn output_score_kind(
         forward: &Self::ForwardContext,
     ) -> Option<eredu_core::refinement::PredictionScoreKind> {
@@ -578,64 +734,13 @@ where
             }
         }
     }
-
-    type Input<'a>
-        = TextInput<'a, B::Tensor>
-    where
-        Self: 'a;
-    type StaticModules = TextStatic<B>;
-    type Unit = TextLayer<B>;
-    type ForwardContext = ForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
-    where
-        Self: 'a,
-        B::Tensor: 'a;
-    type Error = Error;
-    fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        text_transport()
-    }
-    fn primary_execution_group(&self) -> &str {
-        TEXT_EXECUTION_GROUP
-    }
-    fn state_partition_plan(
-        &self,
-        layout: &StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..layout.len()),
-        ])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        self.graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        if group != 0 {
-            return Err(Error::backend("invalid diffusion text group"));
-        }
-        Ok(self.config.text.num_hidden_layers())
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= <Self as LayeredArchitecture<B, S>>::group_unit_count(self, group)? {
-            return Err(Error::backend(
-                "diffusion unit lies outside the shared stack",
-            ));
-        }
-        Ok(format!("model.decoder.layers.{index}"))
-    }
-    fn static_modules(&self) -> &TextStatic<B> {
-        &self.statics
-    }
-    fn static_modules_mut(&mut self) -> &mut TextStatic<B> {
-        &mut self.statics
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TextLayer<B>, Error> {
-        <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let index = address.index();
+
         let args = match &self.geometry {
             Some(geometry) => geometry
                 .block_args(index)
@@ -649,12 +754,68 @@ where
             .cloned();
         TextLayer::new_with_experts(args, index, experts, context)
     }
-    fn begin_forward<'a>(
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a ForwardContext<B::Tensor>,
+        _address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.mask.iter()
+    }
+}
+
+impl<B, S> eredu_runtime::ComponentEquations<B, S> for TextKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
+{
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(false, true, true)
+            .with_routed_units(true)
+    }
+    fn execute_observed<O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut TextLayer<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let pass = <Self as eredu_runtime::RoutedComponentKernel<B, S>>::expert_pass(
+            self, address, hidden, forward,
+        );
+        <Self as eredu_runtime::RoutedComponentKernel<B, S>>::execute_routed_observed(
+            self,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            &mut ResidentExpertProvider,
+            context,
+            observer,
+        )
+    }
+    fn begin<'a>(
         &mut self,
         input: TextInput<'a, B::Tensor>,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error> {
+        if !self.owns_input {
+            return Err(Error::backend(
+                "diffusion text receiver requires transported invocation ingress",
+            ));
+        }
         let position = self.position(state)?;
         let (hidden, mask, phase) = match input {
             TextInput::Context { tokens, mask } => (
@@ -690,35 +851,16 @@ where
             },
         })
     }
-    fn begin_execution_group(
+    fn execute(
         &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        _state: &mut S,
-        _forward: &mut ForwardContext<B::Tensor>,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::backend(
-                "diffusion text group has no external execution dependencies",
-            ));
-        }
-        Ok(initial.clone())
-    }
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut ForwardContext<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if group != 0 {
-            return Err(Error::backend("invalid diffusion text group"));
-        }
+        let index = address.index();
         self.run_unit(
             index,
             unit,
@@ -731,7 +873,7 @@ where
             &mut ComponentInstrumentation::disabled(),
         )
     }
-    fn finish_forward_observed<O>(
+    fn finish_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -755,8 +897,7 @@ where
             }
         }
     }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -768,17 +909,9 @@ where
             TextInvocationPhase::Refinement => self.statics.readout(hidden, context),
         }
     }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a ForwardContext<B::Tensor>,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.mask.iter()
-    }
 }
 
-impl<B, S> RoutedLayeredArchitecture<B, S> for TextModel<B>
+impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for TextKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -790,11 +923,9 @@ where
     fn routed_sparse_observations(&self) -> bool {
         true
     }
-
-    fn forward_unit_observed_with_provider<P, O>(
+    fn execute_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -809,10 +940,8 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        if group != 0 {
-            return Err(Error::backend("invalid diffusion text group"));
-        }
-        let path = format!("model.decoder.layers.{index}");
+        let index = address.index();
+        let path = self.definition.unit(address.group(), index)?.path.clone();
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         self.run_unit(
             index,
@@ -826,11 +955,9 @@ where
             &mut ComponentInstrumentation::new(&path, &mut borrowed),
         )
     }
-
-    fn forward_unit_with_provider<P>(
+    fn execute_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -843,9 +970,7 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        if group != 0 {
-            return Err(Error::backend("invalid diffusion text group"));
-        }
+        let index = address.index();
         self.run_unit(
             index,
             unit,
@@ -860,16 +985,15 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ParallelLayeredArchitecture<B, S> for TextModel<B>
+impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for TextKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn forward_unit_parallel_observed<O>(
+    fn execute_parallel_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -881,14 +1005,13 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
-            self, group, index, hidden, forward,
+        let pass = <Self as eredu_runtime::RoutedComponentKernel<B, S>>::expert_pass(
+            self, address, hidden, forward,
         );
-        <Self as eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>>::forward_unit_parallel_observed_with_provider(
-            self, group, index, unit, hidden, state, forward, pass, &mut ResidentExpertProvider, parallel, context, observer)
+        <Self as eredu_runtime::ParallelRoutedComponentKernel<B, S>>::execute_parallel_routed_observed(
+            self, address, unit, hidden, state, forward, pass, &mut ResidentExpertProvider, parallel, context, observer)
     }
-
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: TextInput<'a, B::Tensor>,
         state: &mut S,
@@ -898,6 +1021,11 @@ where
         self.geometry.as_ref().ok_or_else(|| {
             Error::backend("tensor-parallel diffusion requires retained local geometry")
         })?;
+        if !self.owns_input {
+            return Err(Error::backend(
+                "diffusion text receiver requires transported invocation ingress",
+            ));
+        }
         let position = self.position(state)?;
         let (hidden, mask, phase) = match input {
             TextInput::Context { tokens, mask } => (
@@ -935,10 +1063,9 @@ where
             },
         })
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -946,9 +1073,20 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        <Self as eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>>::forward_unit_parallel_with_provider(self, group, index, unit, hidden, state, forward, eredu_runtime::ExpertPass::Prefill, &mut ResidentExpertProvider, parallel, context)
+        <Self as eredu_runtime::ParallelRoutedComponentKernel<B, S>>::execute_parallel_routed(
+            self,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            eredu_runtime::ExpertPass::Prefill,
+            &mut ResidentExpertProvider,
+            parallel,
+            context,
+        )
     }
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -973,8 +1111,7 @@ where
             }
         }
     }
-
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -991,16 +1128,15 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::ParallelRoutedLayeredArchitecture<B, S> for TextModel<B>
+impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for TextKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn forward_unit_parallel_observed_with_provider<P, O>(
+    fn execute_parallel_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -1016,10 +1152,10 @@ where
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let path = format!("model.decoder.layers.{index}");
+        let index = address.index();
+        let path = self.definition.unit(address.group(), index)?.path.clone();
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         self.run_unit_parallel(
-            group,
             index,
             unit,
             hidden,
@@ -1032,11 +1168,9 @@ where
             &mut ComponentInstrumentation::new(&path, &mut borrowed),
         )
     }
-
-    fn forward_unit_parallel_with_provider<P>(
+    fn execute_parallel_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -1050,8 +1184,8 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
+        let index = address.index();
         self.run_unit_parallel(
-            group,
             index,
             unit,
             hidden,
@@ -1066,7 +1200,7 @@ where
     }
 }
 
-impl<B> TextModel<B>
+impl<B> TextKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
@@ -1085,13 +1219,13 @@ where
     {
         let prepared = match parallel {
             Some(parallel) => {
-                <Self as eredu_runtime::ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+                <Self as eredu_runtime::ParallelComponentKernel<B, S>>::begin_parallel(
                     self, input, state, parallel, context,
                 )?
             }
-            None => {
-                <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)?
-            }
+            None => <Self as eredu_runtime::ComponentEquations<B, S>>::begin(
+                self, input, state, context,
+            )?,
         };
         Ok(PreparedPartitionInvocation {
             input: eredu_runtime::LayeredPartitionInput::Hidden {
@@ -1115,7 +1249,7 @@ where
         })
     }
 
-    fn resume_partition<S>(
+    pub(super) fn resume_partition<S>(
         &mut self,
         input: eredu_runtime::LayeredPartitionInput<
             '_,
@@ -1141,22 +1275,63 @@ where
         let position = self.position(state)?;
         match input {
             eredu_runtime::LayeredPartitionInput::Tokens(tokens) => match parallel {
-                Some(parallel) => <Self as eredu_runtime::ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(self, TextInput::Context { tokens, mask }, state, parallel, context),
-                None => <Self as LayeredArchitecture<B, S>>::begin_forward(self, TextInput::Context { tokens, mask }, state, context),
+                Some(parallel) => {
+                    <Self as eredu_runtime::ParallelComponentKernel<B, S>>::begin_parallel(
+                        self,
+                        TextInput::Context { tokens, mask },
+                        state,
+                        parallel,
+                        context,
+                    )
+                }
+                None => <Self as eredu_runtime::ComponentEquations<B, S>>::begin(
+                    self,
+                    TextInput::Context { tokens, mask },
+                    state,
+                    context,
+                ),
             },
             eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary } => {
-                if auxiliary.invocation.shape() != [2] { return Err(Error::backend("invalid diffusion invocation boundary geometry")); }
+                if auxiliary.invocation.shape() != [2] {
+                    return Err(Error::backend(
+                        "invalid diffusion invocation boundary geometry",
+                    ));
+                }
                 let words = auxiliary.invocation.to_i32_vec(context)?;
-                if words.len() != 2 || words[1] != position { return Err(Error::backend("diffusion pipeline context frontier differs from the transported invocation")); }
-                let phase = match words[0] { 0 => TextInvocationPhase::Context, 1 => TextInvocationPhase::Refinement, _ => return Err(Error::backend("unknown diffusion invocation phase")) };
-                if hidden.shape().len() != 3 || hidden.dim(0) <= 0 || hidden.dim(1) <= 0 || hidden.dim(2) != self.config.text.hidden_size || (phase == TextInvocationPhase::Refinement && hidden.dim(1) as u32 > self.config.canvas_length.get()) { return Err(Error::backend("invalid diffusion partition activation geometry")); }
-                Ok(LayeredForwardState { hidden, context: ForwardContext { phase, position, mask: mask.cloned(), shared: SharedAttentionStates::new() } })
-            },
+                if words.len() != 2 || words[1] != position {
+                    return Err(Error::backend("diffusion pipeline context frontier differs from the transported invocation"));
+                }
+                let phase = match words[0] {
+                    0 => TextInvocationPhase::Context,
+                    1 => TextInvocationPhase::Refinement,
+                    _ => return Err(Error::backend("unknown diffusion invocation phase")),
+                };
+                if hidden.shape().len() != 3
+                    || hidden.dim(0) <= 0
+                    || hidden.dim(1) <= 0
+                    || hidden.dim(2) != self.config.text.hidden_size
+                    || (phase == TextInvocationPhase::Refinement
+                        && hidden.dim(1) as u32 > self.config.canvas_length.get())
+                {
+                    return Err(Error::backend(
+                        "invalid diffusion partition activation geometry",
+                    ));
+                }
+                Ok(LayeredForwardState {
+                    hidden,
+                    context: ForwardContext {
+                        phase,
+                        position,
+                        mask: mask.cloned(),
+                        shared: SharedAttentionStates::new(),
+                    },
+                })
+            }
         }
     }
 }
 
-impl<B, S> eredu_runtime::PartitionedLayeredArchitecture<B, S> for TextModel<B>
+impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for TextKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -1175,27 +1350,20 @@ where
         >,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error> {
-        self.resume_partition(input, mask, state, expected, first, None, context)
-    }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: eredu_runtime::LayeredPartitionInput<
-            'a,
-            B::Tensor,
-            super::boundary::TextBoundary<B::Tensor>,
-        >,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error> {
-        self.resume_partition(input, mask, state, expected, first, Some(parallel), context)
+        let expected = selected
+            .expected
+            .ok_or_else(|| Error::backend("shared stack requires selected state geometry"))?;
+        self.resume_partition(
+            input,
+            mask,
+            state,
+            expected,
+            selected.first_state_ordinal,
+            selected.parallel,
+            selected.native,
+        )
     }
     fn finish_partition(
         &mut self,
@@ -1211,8 +1379,14 @@ where
     > {
         if owns_output {
             let output = match parallel {
-                Some(parallel) => <Self as eredu_runtime::ParallelLayeredArchitecture<B, S>>::finish_forward_parallel(self, hidden, state, forward, parallel, context)?,
-                None => <Self as LayeredArchitecture<B, S>>::finish_forward(self, hidden, state, forward, context)?,
+                Some(parallel) => {
+                    <Self as eredu_runtime::ParallelComponentKernel<B, S>>::finish_parallel(
+                        self, hidden, state, forward, parallel, context,
+                    )?
+                }
+                None => <Self as eredu_runtime::ComponentEquations<B, S>>::finish(
+                    self, hidden, state, forward, context,
+                )?,
             };
             Ok(eredu_runtime::LayeredPartitionOutput::Final {
                 output,
@@ -1228,12 +1402,11 @@ where
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    TextModel<B>
+    TextKernel<B>
 {
     #[allow(clippy::too_many_arguments)]
     fn run_unit_parallel<S, P>(
         &mut self,
-        group: usize,
         index: usize,
         unit: &mut TextLayer<B>,
         hidden: &B::Tensor,
@@ -1251,9 +1424,6 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        if group != 0 {
-            return Err(Error::backend("invalid diffusion text group"));
-        }
         let cache = state
             .layer(self.state_index(index)?)
             .map_err(Error::backend)?;
@@ -1277,12 +1447,9 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
     }
 }
 
-impl<B, S> eredu_runtime::generation::refinement::architecture::BlockRefinementArchitecture<B, S>
-    for TextModel<B>
+impl<B> eredu_runtime::RefinementComponentKernel<B> for TextKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
     fn refinement_geometry(
         &self,
@@ -1309,13 +1476,13 @@ where
     }
 }
 
-impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for TextModel<B>
+impl<B, S> eredu_runtime::PipelineComponentKernel<B, S> for TextKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
-    fn partition_input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         let tokens = match input {
             TextInput::Context { tokens, .. } | TextInput::Refinement { tokens, .. } => tokens,
         };
@@ -1326,22 +1493,18 @@ where
         }
         Ok((tokens.dim(0), tokens.dim(1)))
     }
-
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, super::boundary::TextBoundary<B::Tensor>)>,
         state: &mut S,
-        expected: Option<&StateLayout>,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         observer: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let expected = expected.ok_or_else(|| {
+        let expected = selected.expected.ok_or_else(|| {
             Error::backend("shared-stack pipeline requires selected state geometry")
         })?;
         let mask = match &input {
@@ -1352,7 +1515,7 @@ where
                 eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
             }
             None => {
-                self.prepare_partition_input(input, state, parallel, context)?
+                self.prepare_partition_input(input, state, selected.parallel, selected.native)?
                     .input
             }
         };
@@ -1360,19 +1523,19 @@ where
             prepared,
             mask.as_ref(),
             state,
-            expected,
-            first_state_ordinal,
-            parallel,
-            context,
+            eredu_runtime::ComponentPartitionContext {
+                expected: Some(expected),
+                first_state_ordinal: selected.first_state_ordinal,
+                parallel: selected.parallel,
+                native: selected.native,
+            },
             observer,
         )
     }
-
-    fn partition_output_width(&self) -> i32 {
+    fn output_width(&self) -> i32 {
         self.config.text.vocab_size
     }
-
-    fn partition_output_shape(
+    fn output_shape(
         &self,
         input: &Self::Input<'_>,
         batch: i32,
@@ -1384,10 +1547,9 @@ where
         };
         Ok(vec![batch, sequence, width])
     }
-
-    fn partition_routed_tensor_reductions(
+    fn routed_tensor_reductions(
         &self,
-        _unit: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
         routed: bool,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
         // Attention and the always-present dense branch reduce before routing;
@@ -1397,25 +1559,25 @@ where
             1,
         ))
     }
+    fn tensor_vocabulary_sharded(&self) -> bool {
+        true
+    }
 }
 
-impl<B, S> eredu_runtime::ReplicatedTextArchitecture<B, S> for TextModel<B>
+impl<B> eredu_runtime::TextComponentKernel<B> for TextKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: ReadOnlyAttentionCache<B::Tensor>,
 {
     fn supports_chunked_prefill() -> bool {
         true
     }
-
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         TextInput::Context { tokens, mask }
     }
     fn block_refinement_geometry(
         &self,
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
-        Some(<Self as eredu_runtime::generation::refinement::architecture::BlockRefinementArchitecture<B, S>>::refinement_geometry(self))
+        Some(<Self as eredu_runtime::RefinementComponentKernel<B>>::refinement_geometry(self))
     }
     fn invocation_input<'a>(
         tokens: &'a B::Tensor,
@@ -1437,5 +1599,54 @@ where
     }
     fn text_output_selection(&self) -> eredu_runtime::ReplicatedTextOutputSelection {
         eredu_runtime::ReplicatedTextOutputSelection::AllSequencePositions
+    }
+}
+
+impl<B> eredu_runtime::ComponentPinnedResources<B> for TextKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    type Modules = TextStatic<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.statics
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.statics
+    }
+    fn visit_pinned<V: eredu_runtime::StaticParameterVisitor<B>>(
+        &self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(module) = &self.statics.embeddings {
+            visitor.visit("embedding", module)?;
+        }
+        if let Some(module) = &self.statics.norm {
+            visitor.visit("norm", module)?;
+        }
+        if let Some(head) = &self.statics.head {
+            visitor.visit("output", head)?;
+        }
+        if let Some(module) = &self.statics.conditioning {
+            visitor.visit("conditioning", module)?;
+        }
+        Ok(())
+    }
+    fn visit_pinned_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        if let Some(module) = &mut self.statics.embeddings {
+            visitor.visit_mut("embedding", module)?;
+        }
+        if let Some(module) = &mut self.statics.norm {
+            visitor.visit_mut("norm", module)?;
+        }
+        if let Some(head) = &mut self.statics.head {
+            visitor.visit_mut("output", head)?;
+        }
+        if let Some(module) = &mut self.statics.conditioning {
+            visitor.visit_mut("conditioning", module)?;
+        }
+        Ok(())
     }
 }

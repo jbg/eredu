@@ -1,33 +1,15 @@
 //! Cold authority for a retained transformer component pipeline.
 use super::{
     tts_transformer_layered::{
-        tts_transformer_parameter_description, validate_transformer_partition,
-        TransformerBoundarySchema, TransformerError,
+        validate_transformer_partition, TransformerBoundarySchema, TransformerError,
     },
     tts_transformer_preparation::PreparedTtsTransformerPartitionBindings,
 };
 use eredu_core::CollectiveGroupId;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
-    PartitionExecutionError, PartitionedExecutionPlan, PipelineActivationDtype,
+    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
 };
-
-/// An inconsistent component selection is rejected before native resources exist.
-#[derive(Debug, thiserror::Error)]
-pub enum TransformerPipelinePreparationError {
-    /// Family geometry or parameter/state authority differs.
-    #[error(transparent)]
-    Transformer(#[from] TransformerError),
-    /// Generic communication selection is inconsistent.
-    #[error(transparent)]
-    Communication(#[from] PartitionExecutionError),
-    /// The tensor cohort cannot propagate local preparation or lease failures.
-    #[error(transparent)]
-    LocalAgreement(#[from] eredu_runtime::PipelineLocalAgreementError),
-    /// Selected stage, transport, or completion authority differs.
-    #[error("invalid TTS pipeline selection: {0}")]
-    Contract(&'static str),
-}
 
 /// Exact component sources, stage ownership and transport selection.
 ///
@@ -51,10 +33,18 @@ impl PreparedTtsTransformerPipelineBindings {
         plan: PartitionedExecutionPlan,
         tensor_group: Option<CollectiveGroupId>,
         activation_dtype: PipelineActivationDtype,
-    ) -> Result<Self, TransformerPipelinePreparationError> {
-        use TransformerPipelinePreparationError::Contract;
-        validate_transformer_partition(bindings.config(), bindings.local_layout(), &partition)?;
-        let description = tts_transformer_parameter_description(bindings.config())?;
+    ) -> Result<Self, ComponentPipelinePreparationError<TransformerError>> {
+        let contract = |reason| ComponentPipelinePreparationError::Contract {
+            component: "TTS",
+            reason,
+        };
+        validate_transformer_partition(
+            bindings.definition(),
+            bindings.config(),
+            bindings.local_layout(),
+            &partition,
+        )
+        .map_err(ComponentPipelinePreparationError::Component)?;
         let kind = if bindings.config().geometry().causal {
             ArchitectureGroupKind::Decoder
         } else {
@@ -62,15 +52,15 @@ impl PreparedTtsTransformerPipelineBindings {
         };
         for route in plan.routes() {
             if route.source_group != 0 || !matches!(route.destination_group, 0 | 1) {
-                return Err(Contract(
+                return Err(contract(
                     "route does not carry the transformer block boundary",
                 ));
             }
         }
         eredu_runtime::validate_component_pipeline(
-            &description,
+            bindings.definition().parameters(),
             &partition,
-            bindings.unit_bindings().iter().map(|(address, _)| *address),
+            bindings.unit_bindings().map(|(address, _)| address),
             bindings.state_layout(),
             bindings.local_layout(),
             &manifest,
@@ -88,15 +78,7 @@ impl PreparedTtsTransformerPipelineBindings {
                 })
             },
         )
-        .map_err(|error| match error {
-            eredu_runtime::PipelineBindingError::Communication(error) => {
-                TransformerPipelinePreparationError::Communication(error)
-            }
-            eredu_runtime::PipelineBindingError::LocalAgreement(error) => {
-                TransformerPipelinePreparationError::LocalAgreement(error)
-            }
-            eredu_runtime::PipelineBindingError::Contract(message) => Contract(message),
-        })?;
+        .map_err(|error| error.into_preparation("TTS"))?;
         Ok(Self {
             bindings,
             partition,

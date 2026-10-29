@@ -2,12 +2,10 @@
 use super::requirements::ParameterRequirements;
 use super::*;
 use crate::qwen4_exp::{
-    conditional::{self, ConditionalModel},
+    conditional::{self, ConditionalKernel, ConditionalModel},
     media::MediaIngress,
 };
-use eredu_runtime::{
-    ExecutionUnitLayout, ReplicatedTextParameterOwner as Owner, ReplicatedTextRequirements,
-};
+use eredu_runtime::{ReplicatedTextParameterOwner as Owner, ReplicatedTextRequirements};
 fn invalid(e: impl std::fmt::Display) -> PreparationError {
     PreparationError::Contract(e.to_string())
 }
@@ -38,15 +36,16 @@ impl TargetExecutionPlan {
         vision: PreparedVision,
     ) -> Result<ConditionalExecutionPlan, PreparationError> {
         let ingress = self.target.media_ingress(vision.clone()).map_err(invalid)?;
-        let target_source = retain(
+        let target_source: SharedCheckpointSource = Arc::new(PreparedCheckpointSource::retain(
             self.target.artifact.clone(),
+            "qwen4_exp prepared owner",
             self.target
                 .artifact
                 .source_keys()
                 .into_iter()
                 .filter(|key| !key.starts_with("model.visual."))
                 .collect(),
-        )?;
+        )?);
         let source: SharedCheckpointSource =
             Arc::new(eredu_checkpoint::store::CompositeCheckpointSource::new([
                 target_source,
@@ -122,9 +121,12 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
         }
     }
     let old = target.text();
-    let graph = conditional::graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [spec.units.len(), vision_config.layer_count()])
-        .map_err(invalid)?;
+    let definition = conditional::definition(&spec.definition()?, vision_config)?;
+    let graph = definition.parameters().graph().clone();
+    let layout = definition.parameters().unit_layout().clone();
+    let transport = (0..graph.groups().len())
+        .map(|group| definition.group_transport(group).cloned().map_err(invalid))
+        .collect::<Result<Vec<_>, _>>()?;
     let auxiliary_names = old
         .auxiliary_parameters()
         .iter()
@@ -159,8 +161,8 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
             .union(crate::operator_requirements::QWEN_VISION),
         graph,
         layout,
-        vec![crate::transport::decoder(), conditional::vision_transport()],
-        old.state_layout().clone(),
+        transport,
+        definition.state_layout().clone(),
         old.state_access(),
         parameters,
     )
@@ -268,10 +270,8 @@ impl SelectedConditionalExecution {
     fn selected_vision_config(&self) -> crate::qwen::vision::VisionConfig {
         let mut vision = self.ingress.vision().config().clone();
         vision.linear_formats.clear();
-        for (name, format) in crate::replicated_text::selected_matrix_formats(
-            self.selected.selected.text().requirements(),
-            self.selected.selected.text(),
-        ) {
+        let text = self.selected.selected.text();
+        for (name, format) in text.matrix_formats_for(text.requirements()) {
             if name.starts_with("model.visual.") {
                 vision.linear_formats.insert(name, format);
             }
@@ -376,9 +376,7 @@ impl SelectedConditionalExecution {
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<
         (
-            crate::routed_text::PreparedRoutedTextArchitecture<
-                crate::composite_execution::PreparedCompositeArchitecture<ConditionalModel<B>>,
-            >,
+            crate::routed_text::PreparedRoutedTextArchitecture<ConditionalModel<B>>,
             SharedCheckpointSource,
             crate::qwen4_exp::media::processor::SelectedMediaProcessor,
         ),
@@ -392,10 +390,7 @@ impl SelectedConditionalExecution {
             + eredu_runtime::RuntimeAppendStreams<B>,
     {
         let processor = self.processor.clone();
-        let (prepared, source) = self.prepare_with::<B, S, _>(
-            context,
-            crate::composite_execution::PreparedCompositeArchitecture::new,
-        )?;
+        let (prepared, source) = self.prepare_with::<B, S, _>(context, std::convert::identity)?;
         Ok((prepared, source, processor))
     }
 
@@ -480,12 +475,12 @@ impl SelectedConditionalExecution {
             .processor_requirements()
             .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
         let admission = self.ingress.admission_config().clone();
-        let provider_source = crate::replicated_text::restrict_store_handoff(
+        let provider_source = eredu_runtime::restrict_checkpoint_handoff(
             requirements.text(),
             self.selected.plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Complete,
+            eredu_runtime::SourceHandoffScope::Complete,
         )
-        .map_err(PreparedExecutionError::Architecture)?;
+        .map_err(|handoff| PreparedExecutionError::Architecture(handoff.to_string()))?;
         visitor.construction_started();
         let prediction = self
             .selected
@@ -538,28 +533,32 @@ impl SelectedConditionalExecution {
         let SelectedTargetExecution { plan, selected, .. } = self.selected;
         crate::routed_text::validate_selected_routed_handoff(&plan.requirements, &selected)
             .map_err(invalid)?;
-        let execution_source = crate::replicated_text::restrict_store_handoff(
+        let execution_source = eredu_runtime::restrict_checkpoint_handoff(
             plan.requirements.text(),
             plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         let source_vision = self.ingress.vision().config().clone();
         let spec = plan
             .target
             .bind_spec(plan.target.selected_spec(&selected)?)?;
-        let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
+        let source_architecture = selected
+            .text()
+            .uses_weight_transform()
             .then(|| {
-                ConditionalModel::<B>::new(
+                ConditionalKernel::<B>::new(
                     plan.target.bound_spec()?,
                     self.ingress.clone(),
                     source_vision,
                     context,
-                )
+                )?
+                .into_model()
             })
             .transpose()?;
-        let architecture = ConditionalModel::<B>::new(spec, self.ingress, vision, context)?;
-        let identity = architecture.state_fingerprint();
+        let architecture =
+            ConditionalKernel::<B>::new(spec, self.ingress, vision, context)?.into_model()?;
+        let identity = architecture.kernel().state_fingerprint();
         let prepared = crate::routed_text::prepare_routed_architecture_handoff::<B, S, _>(
             adapt(architecture),
             source_architecture.map(adapt),

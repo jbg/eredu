@@ -82,202 +82,69 @@ where
         &Stream,
     ) -> Result<Vec<WeightBinding>, Error>,
 {
-    let layout = architecture_execution_layout::<A, S>(architecture)?;
-    let unit_count = layout.len();
+    let layout = architecture
+        .execution_unit_layout()
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    let invocations = architecture
+        .execution_unit_storage_map()
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    invocations.validate_layout(&layout)?;
+    let unit_count = invocations.storage_layout().len();
     if unit_count == 0 {
         return Err(Error::Parallel(
             "generic MLX architecture declared no execution units".into(),
         ));
     }
-    let fully_resident = options.is_fully_resident();
-    let dense = options.dense();
-    let offload = options.offload()?;
-    let depth = options.device_depth(unit_count);
-    let mut definitions = Vec::new();
-    let mut specs = Vec::new();
-    let mut consumed = BTreeSet::new();
+    options.offload()?;
 
     let static_bindings = static_bindings(architecture.static_modules(), store.as_ref())?;
-    let static_bytes = binding_bytes(&static_bindings)?;
-    let static_parameters = static_bindings
-        .iter()
-        .map(|binding| binding.name().to_owned())
-        .collect();
-    consumed.extend(
-        static_bindings
-            .iter()
-            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-    );
-    // Some architectures place every learned parameter in execution units.
-    // An empty static role has no storage identity or residency lease.
-    let static_id = if static_bindings.is_empty() {
-        None
-    } else {
-        let id = OffloadUnitId::new("model.static")?;
-        definitions.push(OffloadUnit::new(id.clone(), static_bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            static_bytes,
-            ResidencyPolicy::Pinned,
-            MemoryTier::Device,
-        )?);
-        Some(id)
-    };
+    let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
+        .prepare::<Error>()?;
 
-    let mut unit_ids = Vec::with_capacity(unit_count);
-    let mut unit_bytes = Vec::with_capacity(unit_count);
-    let mut layer_parameter_bytes = 0u64;
-    let mut total_host_bytes = 0u64;
-    let mut maximum_host_bytes = 0u64;
+    let mut execution_units =
+        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &invocations, options);
     for index in 0..unit_count {
-        let address = layout
+        let address = invocations
+            .storage_layout()
             .address(index)
             .expect("validated layout covers every flat unit");
         let path = architecture
             .unit_path(address.group(), address.index())
             .map_err(|error| Error::Other(Box::new(error)))?;
         let unit = architecture
-            .build_unit(address.group(), address.index(), stream)
+            .build_storage_unit(
+                invocations
+                    .storage_location(index)
+                    .expect("declared physical owner"),
+                stream,
+            )
             .map_err(|error| Error::Other(Box::new(error)))?;
-        let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
-        let bytes = binding_bytes(&bindings)?;
-        layer_parameter_bytes = layer_parameter_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
-        let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
-        total_host_bytes = total_host_bytes
-            .checked_add(host_bytes)
-            .ok_or_else(|| Error::Parallel("generic host unit bytes overflowed".into()))?;
-        maximum_host_bytes = maximum_host_bytes.max(host_bytes);
-        consumed.extend(
-            bindings
-                .iter()
-                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-        );
-        let group_id = layout
-            .group_id(address.group())
-            .expect("validated layout names every execution group");
-        let id = OffloadUnitId::new(format!(
-            "model.{}.{:05}",
-            group_id.as_str(),
-            address.index()
-        ))?;
-        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else if dense.is_some() {
-                ResidencyPolicy::Cacheable
-            } else {
-                ResidencyPolicy::Windowed
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
-        unit_ids.push(id);
-        unit_bytes.push(bytes);
+        let ordinal = layout
+            .ordinal(address.group(), address.index())
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "physical owner {address:?} has no canonical factory invocation"
+                ))
+            })?;
+        let bindings = unit_bindings(ordinal, address, &path, unit, store.as_ref(), stream)?;
+        execution_units = execution_units.push(bindings, |bindings| {
+            host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
+        })?;
     }
+    let units = execution_units.finish()?;
+    let resources = eredu_runtime::ParameterResourcePreparation::new(pinned, units);
+    let mut consumed = resources.source_keys().clone();
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let device_window_bytes =
-        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &unit_bytes, options)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-    let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
-            .checked_mul(dense.host_lookahead() as u64)
-            .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
-        Some(_) => 0,
-        None if fully_resident => 0,
-        None => total_host_bytes,
-    };
-    validate_host_budget(offload, host_required)?;
-    validate_device_budget(offload, static_bytes, device_window_bytes, depth)?;
-
-    let plan = OffloadPlan::new(offload, specs)?;
-    let residency_stream = if dense.is_some() {
-        Stream::new_with_device(&stream.get_device()?)
-    } else {
-        stream.clone()
-    };
-    let residency = ResidencyManager::new_shared(
-        Arc::clone(&store),
-        plan,
-        definitions,
-        weights_stream.clone(),
-        residency_stream,
-    )?;
-    residency.initialize()?;
-    let mut static_leases = Vec::new();
-    if let Some(id) = static_id {
-        let lease = residency.acquire(&id, MemoryTier::Device)?;
-        populate_selected_parameterized(
-            architecture.static_modules_mut(),
-            &lease,
-            &static_parameters,
-        )?;
-        static_leases.push(lease);
-    }
-    let metadata = LayerwiseModelMetadata::new(
-        "generic",
-        None,
-        unit_count,
-        static_bytes,
-        options.execution_residency(),
-        layer_parameter_bytes,
-        device_window_bytes,
-        maximum_host_bytes,
-        depth,
-    );
-    let dense_controller = dense
-        .map(|options| {
-            DenseStreamController::new(
-                &residency,
-                options,
-                unit_count,
-                layer_parameter_bytes,
-                maximum_host_bytes,
-                static_bytes,
-                (0..layout.group_count())
-                    .filter(|&group| {
-                        layout
-                            .group_range(group)
-                            .is_some_and(|range| !range.is_empty())
-                    })
-                    .map(|group| {
-                        let range = layout
-                            .group_range(group)
-                            .expect("validated layout covers every execution group");
-                        let id = layout
-                            .group_id(group)
-                            .expect("validated layout names every execution group")
-                            .as_str()
-                            .to_owned();
-                        (id, unit_ids[range].to_vec())
-                    }),
-            )
-            .map(Arc::new)
-        })
-        .transpose()?;
-    let policy = MlxLayerwisePolicy::new(
-        residency,
-        Arc::clone(&store),
-        unit_ids,
-        layout,
-        depth,
+    let resources = resources.finish()?;
+    materialize_parameter_unit_policy::<A::Unit, _, _>(
+        store,
+        architecture.static_modules_mut(),
         populator,
-        static_leases,
-        dense_controller,
-        options.sample_backend_memory(),
-        options.sample_process_memory(),
-    )?;
-    Ok((policy, metadata))
+        stream,
+        weights_stream,
+        resources,
+    )
 }
 
 /// Builds an MLX residency policy from exact binding definitions projected by
@@ -292,7 +159,7 @@ pub fn prepare_layerwise_policy_from_bindings<A, S, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
-    layout: ExecutionUnitLayout,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
@@ -304,6 +171,18 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
+    let declared = architecture
+        .execution_unit_storage_map()
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    let logical = architecture
+        .execution_unit_layout()
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    declared.validate_layout(&logical)?;
+    if declared.select_invocations(invocations.logical_addresses())? != invocations {
+        return Err(Error::Parallel(
+            "prepared invocation map differs from architecture storage ownership".into(),
+        ));
+    }
     prepare_layerwise_policy_with_supplementary_bindings(
         store,
         architecture,
@@ -313,7 +192,7 @@ where
         stream,
         weights_stream,
         ignored,
-        layout,
+        invocations,
         static_bindings,
         unit_bindings,
         Vec::new(),
@@ -333,6 +212,7 @@ pub fn prepare_layerwise_policy_from_addressed_bindings<A, S, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
@@ -344,9 +224,20 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
-    let layout = architecture_execution_layout::<A, S>(architecture)?
-        .select(units.iter().map(|(address, _)| *address))
-        .map_err(|error| Error::Other(Box::new(error)))?;
+    if !units
+        .iter()
+        .map(|(address, _)| *address)
+        .eq((0..invocations.storage_layout().len()).map(|ordinal| {
+            invocations
+                .storage_layout()
+                .address(ordinal)
+                .expect("declared physical owner")
+        }))
+    {
+        return Err(Error::Parallel(
+            "addressed bindings differ from retained physical owners".into(),
+        ));
+    }
     prepare_layerwise_policy_from_bindings(
         store,
         architecture,
@@ -356,7 +247,7 @@ where
         stream,
         weights_stream,
         ignored,
-        layout,
+        invocations,
         static_bindings,
         units.into_iter().map(|(_, bindings)| bindings).collect(),
     )
@@ -374,7 +265,7 @@ pub fn prepare_layerwise_policy_with_supplementary_bindings<A, S, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
-    layout: ExecutionUnitLayout,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
     supplementary: Vec<SupplementaryResidencyUnit>,
@@ -395,7 +286,7 @@ where
         stream,
         weights_stream,
         ignored,
-        layout,
+        invocations,
         static_bindings,
         unit_bindings,
         supplementary,
@@ -414,7 +305,7 @@ pub fn prepare_parameter_unit_policy<U, SM, P, I>(
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
-    layout: ExecutionUnitLayout,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
     supplementary: Vec<SupplementaryResidencyUnit>,
@@ -428,165 +319,76 @@ where
     crate::backend::runtime::checkpoint::bounded_quantization::realize_prepared_source(
         &store, stream,
     )?;
-    let unit_count = layout.len();
+    let unit_count = invocations.storage_layout().len();
     if unit_count == 0 || unit_bindings.len() != unit_count {
         return Err(Error::Parallel(format!(
             "exact MLX binding definitions contain {} units for a layout of {unit_count}",
             unit_bindings.len()
         )));
     }
-    let fully_resident = options.is_fully_resident();
-    let dense = options.dense();
-    let offload = options.offload()?;
-    let depth = options.device_depth(unit_count);
-    let mut definitions = Vec::new();
-    let mut specs = Vec::new();
-    let mut consumed = BTreeSet::new();
+    options.offload()?;
 
-    let static_bytes = binding_bytes(&static_bindings)?;
-    let static_parameters = static_bindings
-        .iter()
-        .map(|binding| binding.name().to_owned())
-        .collect();
-    consumed.extend(
-        static_bindings
-            .iter()
-            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-    );
-    // Some architectures place every learned parameter in execution units.
-    // An empty static role has no storage identity or residency lease.
-    let static_id = if static_bindings.is_empty() {
-        None
-    } else {
-        let id = OffloadUnitId::new("model.static")?;
-        definitions.push(OffloadUnit::new(id.clone(), static_bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            static_bytes,
-            ResidencyPolicy::Pinned,
-            MemoryTier::Device,
-        )?);
-        Some(id)
-    };
+    let pinned = eredu_runtime::StaticUnitBindings::new("model.static", static_bindings)?
+        .prepare::<Error>()?;
 
-    let mut unit_ids = Vec::with_capacity(unit_count);
-    let mut unit_bytes = Vec::with_capacity(unit_count);
-    let mut layer_parameter_bytes = 0u64;
-    let mut total_host_bytes = 0u64;
-    let mut maximum_host_bytes = 0u64;
-    for (index, bindings) in unit_bindings.into_iter().enumerate() {
-        let address = layout
-            .address(index)
-            .expect("validated layout covers every flat unit");
-        let bytes = binding_bytes(&bindings)?;
-        layer_parameter_bytes = layer_parameter_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
-        let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
-        total_host_bytes = total_host_bytes
-            .checked_add(host_bytes)
-            .ok_or_else(|| Error::Parallel("generic host unit bytes overflowed".into()))?;
-        maximum_host_bytes = maximum_host_bytes.max(host_bytes);
-        consumed.extend(
-            bindings
-                .iter()
-                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-        );
-        let group_id = layout
-            .group_id(address.group())
-            .expect("validated layout names every execution group");
-        let id = OffloadUnitId::new(format!(
-            "model.{}.{:05}",
-            group_id.as_str(),
-            address.index()
-        ))?;
-        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else if dense.is_some() {
-                ResidencyPolicy::Cacheable
-            } else {
-                ResidencyPolicy::Windowed
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
-        unit_ids.push(id);
-        unit_bytes.push(bytes);
+    let mut execution_units =
+        eredu_runtime::ExecutionUnitResourcePreparation::new("model", &invocations, options);
+    for bindings in unit_bindings {
+        execution_units = execution_units.push(bindings, |bindings| {
+            host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
+        })?;
     }
-    let mut extra = eredu_runtime::AuxiliaryWeightRequirements::default();
-    let mut sources = std::collections::BTreeMap::new();
+    let units = execution_units.finish()?;
+    let mut resources = eredu_runtime::ParameterResourcePreparation::new(pinned, units);
     for unit in supplementary {
-        let bytes = binding_bytes(unit.definition.bindings())?;
-        let host = host_capacity_upper_bound_for_bindings(unit.definition.bindings())?;
-        extra = extra
-            .checked_add_module(bytes, host, unit.shared)
-            .ok_or_else(|| Error::Parallel("auxiliary residency bytes overflowed".into()))?;
-        let id = unit.definition.id().clone();
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else {
-                ResidencyPolicy::Cacheable
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
-        sources.insert(id, unit.source);
-        definitions.push(unit.definition);
+        resources =
+            resources.push_auxiliary(unit.definition, unit.source, unit.shared, |bindings| {
+                host_capacity_upper_bound_for_bindings(bindings).map_err(Error::from)
+            })?;
     }
+    let mut consumed = resources.source_keys().clone();
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
-    let device_window_bytes =
-        eredu_runtime::execution_unit_parameter_window_bytes(&layout, &unit_bytes, options)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-    let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
-            .checked_mul(dense.host_lookahead() as u64)
-            .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
-        Some(_) => 0,
-        None if fully_resident => 0,
-        None => total_host_bytes,
-    };
-    let auxiliary_host = extra
-        .host_bytes(options)
-        .ok_or_else(|| Error::Parallel("auxiliary host bytes overflowed".into()))?;
-    let host_required = if dense.is_some() {
-        host_required.max(auxiliary_host)
-    } else {
-        host_required
-            .checked_add(auxiliary_host)
-            .ok_or_else(|| Error::Parallel("combined host bytes overflowed".into()))?
-    };
-    let auxiliary_device = extra
-        .device_bytes(options)
-        .ok_or_else(|| Error::Parallel("auxiliary device bytes overflowed".into()))?;
-    let required_device = if fully_resident {
-        device_window_bytes
-            .checked_add(auxiliary_device)
-            .ok_or_else(|| Error::Parallel("combined device bytes overflowed".into()))?
-    } else {
-        device_window_bytes.max(auxiliary_device)
-    };
-    validate_host_budget(offload, host_required)?;
-    validate_device_budget(offload, static_bytes, required_device, depth)?;
+    let resources = resources.finish()?;
+    materialize_parameter_unit_policy::<U, _, _>(
+        store,
+        static_modules,
+        populator,
+        stream,
+        weights_stream,
+        resources,
+    )
+}
 
-    let plan = OffloadPlan::new(offload, specs)?;
+/// Materializes one admitted policy with the existing native completion and transfer owners.
+fn materialize_parameter_unit_policy<U, SM, P>(
+    store: SharedCheckpointSource,
+    static_modules: &mut SM,
+    populator: P,
+    stream: &Stream,
+    weights_stream: &Stream,
+    resources: eredu_runtime::PreparedParameterResources,
+) -> Result<(MlxLayerwisePolicy<U, P>, LayerwiseModelMetadata), Error>
+where
+    U: Parameterized<MlxTensor> + 'static,
+    SM: Parameterized<MlxTensor>,
+    P: MlxUnitPopulator<U>,
+{
+    let store = resources.restrict_primary_source(store)?;
+    let eredu_runtime::PreparedParameterResources {
+        residency: options,
+        plan,
+        definitions,
+        sources,
+        invocations,
+        unit_ids,
+        static_id,
+        static_parameters,
+        metadata,
+        ..
+    } = resources;
+    let layout = invocations.storage_layout();
+    let dense = options.dense();
     let residency_stream = if dense.is_some() {
         Stream::new_with_device(&stream.get_device()?)
     } else {
@@ -607,26 +409,15 @@ where
         populate_selected_parameterized(static_modules, &lease, &static_parameters)?;
         static_leases.push(lease);
     }
-    let metadata = LayerwiseModelMetadata::new(
-        "generic",
-        None,
-        unit_count,
-        static_bytes,
-        options.execution_residency(),
-        layer_parameter_bytes,
-        device_window_bytes,
-        maximum_host_bytes,
-        depth,
-    );
     let dense_controller = dense
         .map(|options| {
             DenseStreamController::new(
                 &residency,
                 options,
-                unit_count,
-                layer_parameter_bytes,
-                maximum_host_bytes,
-                static_bytes,
+                metadata.layer_count(),
+                metadata.layer_parameter_bytes(),
+                metadata.maximum_host_layer_bytes(),
+                metadata.static_device_bytes(),
                 (0..layout.group_count())
                     .filter(|&group| {
                         layout
@@ -652,8 +443,8 @@ where
         residency,
         Arc::clone(&store),
         unit_ids,
-        layout,
-        depth,
+        invocations,
+        metadata.device_layer_capacity(),
         populator,
         static_leases,
         dense_controller,

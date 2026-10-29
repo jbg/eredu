@@ -5,7 +5,7 @@ use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LocalModelLayout,
     MemberSharding, OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
 };
 use std::ops::Range;
 
@@ -483,59 +483,6 @@ fn state_geometry(args: &ModelArgs, blocks: &[BlockGeometry]) -> Vec<LayerCacheG
         .collect()
 }
 
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    global_vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    let mut found = false;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        found = true;
-        if tensor.global_shape().first().copied() != Some(global_vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "LFM2 vocabulary member {target} has global shape {:?}, expected {global_vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..global_vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "LFM2 vocabulary member {target} has non-row placement {placement:?}"
-                )));
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "LFM2 vocabulary group {logical_name} has inconsistent companion selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    if !found {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "missing local LFM2 vocabulary layout for {logical_name}"
-        )));
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary,
-        local: selected.expect("a found LFM2 vocabulary member supplies a selection"),
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
-}
-
 /// Derives complete rank-local LFM2 construction geometry from one typed plan.
 pub fn local_geometry(
     args: &ModelArgs,
@@ -550,15 +497,12 @@ pub fn local_geometry(
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = state_layout_with_geometry(args, &state_geometry(args, &blocks))
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let global_vocabulary = usize::try_from(args.vocab_size).map_err(|_| {
-        ParallelPlanError::InvalidGroup("LFM2 vocabulary size exceeds usize".into())
-    })?;
-    let embedding_range = vocabulary_range(layout, "model.embed_tokens", global_vocabulary)?;
-    let output_range = if args.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", global_vocabulary)?)
-    };
+    let (embedding_range, output_range) = super::static_spec(args).vocabulary_ranges(
+        layout,
+        "model.embed_tokens",
+        "model.embedding_norm",
+        "lm_head",
+    )?;
     let geometry = LocalGeometry {
         blocks,
         embedding_range,
@@ -804,6 +748,15 @@ pub fn dense_parameter_description(
             "dense LFM2 parameter topology does not accept routed layers".into(),
         ));
     }
+    parameter_description(args)
+}
+
+/// Declares complete dense and routed parameter ownership without native resources.
+pub fn parameter_description(
+    args: &ModelArgs,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    args.validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layers = usize::try_from(args.num_hidden_layers)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 layer count exceeds usize".into()))?;
     let graph = ExecutionGraph::new(
@@ -815,46 +768,27 @@ pub fn dense_parameter_description(
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let layout = ExecutionUnitLayout::new(&graph, [layers])
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let mut groups = vec![ParameterGroupSpec::new(
-        "model.embed_tokens",
-        ParameterRole::Vocabulary,
-        [ParameterMemberSpec::new(
-            "model.embed_tokens.weight",
-            vec![args.vocab_size as usize, args.hidden_size as usize],
-            MemberSharding::Balanced { axis: 0 },
-        )],
-    )?];
-    groups.push(ParameterGroupSpec::new(
-        "model.embedding_norm",
-        ParameterRole::Replicated,
-        [ParameterMemberSpec::new(
-            "model.embedding_norm.weight",
-            vec![args.hidden_size as usize],
-            MemberSharding::Replicated,
-        )],
-    )?);
-    if !args.tie_word_embeddings {
-        groups.push(ParameterGroupSpec::new(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            [ParameterMemberSpec::new(
-                "lm_head.weight",
-                vec![args.vocab_size as usize, args.hidden_size as usize],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?);
-    }
-    let static_count = groups.len();
+    let mut owned = super::static_spec(args)
+        .pinned_parameter_groups("model.embed_tokens", "model.embedding_norm", "lm_head")?
+        .into_iter()
+        .map(|(role, group)| {
+            let owner = if role == "embedding" && args.tie_word_embeddings {
+                ParameterGroupOwner::static_any_of(["embedding", "output"])
+            } else {
+                ParameterGroupOwner::static_role(role)
+            };
+            OwnedParameterGroupSpec::new(owner, group)
+        })
+        .collect::<Vec<_>>();
     let head_dim = usize::try_from(args.hidden_size / args.num_attention_heads)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 head width exceeds usize".into()))?;
     let hidden = usize::try_from(args.hidden_size)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 hidden width exceeds usize".into()))?;
     let kv_heads = usize::try_from(args.num_key_value_heads)
         .map_err(|_| ParallelPlanError::InvalidGroup("LFM2 KV heads exceed usize".into()))?;
-    let intermediate = usize::try_from(args.dense_intermediate_size).map_err(|_| {
-        ParallelPlanError::InvalidGroup("LFM2 intermediate width exceeds usize".into())
-    })?;
+    let mut formats = std::collections::BTreeMap::new();
     for layer in 0..layers {
+        let mut groups = Vec::new();
         let root = format!("model.layers.{layer}");
         match args
             .layer_policy(layer)
@@ -961,44 +895,100 @@ pub fn dense_parameter_description(
                 )],
             )?);
         }
-        let alignment = args
-            .weight_quantization_for(&format!("{root}.feed_forward.w2.weight"))
-            .map_or(Ok(1), |quantization| {
-                usize::try_from(quantization.group_size()).map_err(|_| {
-                    ParallelPlanError::InvalidGroup(
-                        "LFM2 dense quantization group exceeds usize".into(),
-                    )
-                })
-            })?;
-        groups.push(ParameterGroupSpec::partitioned(
-            format!("{root}.feed_forward.intermediate"),
-            ParameterRole::FeedForwardIntermediate,
-            aligned_partition_units(&root, intermediate, 1, alignment)?,
-            [
-                ParameterMemberSpec::new(
-                    format!("{root}.feed_forward.w1.weight"),
-                    vec![intermediate, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.feed_forward.w3.weight"),
-                    vec![intermediate, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{root}.feed_forward.w2.weight"),
-                    vec![hidden, intermediate],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-            ],
-        )?);
+        match args
+            .layer_policy(layer)
+            .expect("validated LFM2 schedule")
+            .feed_forward
+        {
+            super::FeedForwardPolicy::Dense => {
+                let intermediate = args.dense_intermediate_size as usize;
+                let alignment = args
+                    .weight_quantization_for(&format!("{root}.feed_forward.w2.weight"))
+                    .map_or(Ok(1), |quantization| {
+                        usize::try_from(quantization.group_size()).map_err(|_| {
+                            ParallelPlanError::InvalidGroup(
+                                "LFM2 dense quantization group exceeds usize".into(),
+                            )
+                        })
+                    })?;
+                groups.push(ParameterGroupSpec::partitioned(
+                    format!("{root}.feed_forward.intermediate"),
+                    ParameterRole::FeedForwardIntermediate,
+                    aligned_partition_units(&root, intermediate, 1, alignment)?,
+                    [
+                        ParameterMemberSpec::new(
+                            format!("{root}.feed_forward.w1.weight"),
+                            vec![intermediate, hidden],
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                        ParameterMemberSpec::new(
+                            format!("{root}.feed_forward.w3.weight"),
+                            vec![intermediate, hidden],
+                            MemberSharding::Partitioned { axis: 0 },
+                        ),
+                        ParameterMemberSpec::new(
+                            format!("{root}.feed_forward.w2.weight"),
+                            vec![hidden, intermediate],
+                            MemberSharding::Partitioned { axis: 1 },
+                        ),
+                    ],
+                )?);
+            }
+            super::FeedForwardPolicy::SparseMoe => {
+                let selector = super::moe::selector_spec(args, layer)
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+                let bank = super::moe::expert_bank_spec(args, layer)
+                    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+                formats.insert(
+                    selector.weight().id.as_str().to_owned(),
+                    selector.format().clone(),
+                );
+                let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout()
+                else {
+                    return Err(ParallelPlanError::InvalidGroup(
+                        "LFM2 requires packed expert projections".into(),
+                    ));
+                };
+                for projection in [gate_up, down] {
+                    formats.insert(
+                        projection.weight().id.as_str().to_owned(),
+                        projection.format().clone(),
+                    );
+                }
+                let name = format!("{root}.feed_forward.experts.intermediate");
+                let units = aligned_partition_units(
+                    &name,
+                    bank.intermediate_dimensions() as usize,
+                    1,
+                    crate::linear_format::input_partition_alignment(down.format().encoding())
+                        as usize,
+                )?;
+                groups.push(eredu_runtime::top_k_group_selector_logical_group(
+                    format!("{root}.feed_forward.gate"),
+                    &selector,
+                )?);
+                groups.push(eredu_runtime::packed_gated_product_logical_group(
+                    name, &bank, units,
+                )?);
+            }
+        }
+        let owner = ParameterGroupOwner::execution_unit(
+            layout.group_id(0).expect("LFM2 group").clone(),
+            layer,
+        );
+        owned.extend(
+            groups
+                .into_iter()
+                .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
+        );
     }
-    let groups = eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
+    let owned = eredu_runtime::expand_owned_linear_format_parameter_groups(owned, |member| {
         let name = member.target();
+        if let Some(format) = formats.get(name) {
+            return Ok(Some(format.clone()));
+        }
         let linear = name.ends_with(".weight")
-            && (name.contains("_proj.weight")
-                || name.contains("feed_forward.w")
-                || name == "lm_head.weight");
+            && (name.contains("_proj.weight") || name.contains("feed_forward.w"));
         linear
             .then(|| {
                 crate::linear_format::standard_linear_format(
@@ -1009,36 +999,7 @@ pub fn dense_parameter_description(
             })
             .transpose()
     })?;
-    let mut owned = Vec::with_capacity(groups.len());
-    for (index, group) in groups.iter().cloned().enumerate() {
-        let owner = if index < static_count {
-            match index {
-                0 if args.tie_word_embeddings => {
-                    ParameterGroupOwner::static_any_of(["embedding", "output"])
-                }
-                0 => ParameterGroupOwner::static_role("embedding"),
-                1 => ParameterGroupOwner::static_role("norm"),
-                _ => ParameterGroupOwner::static_role("output"),
-            }
-        } else {
-            let name = group.logical_name();
-            let layer = name
-                .strip_prefix("model.layers.")
-                .and_then(|suffix| suffix.split('.').next())
-                .and_then(|layer| layer.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    ParallelPlanError::InvalidGroup(format!(
-                        "LFM2 group {name:?} has no layer owner"
-                    ))
-                })?;
-            ParameterGroupOwner::execution_unit(
-                layout.group_id(0).expect("LFM2 group").clone(),
-                layer,
-            )
-        };
-        owned.push(OwnedParameterGroupSpec::new(owner, group));
-    }
-    ArchitectureParameterDescription::new(&graph, &layout, groups, owned)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
 }
 

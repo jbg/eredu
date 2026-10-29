@@ -5,6 +5,14 @@ execution drivers. Its physical blocks are expanded into logical invocations
 with exact checkpoint aliases, independent KV state and optional inter-pass
 RMSNorm. No family-specific backend implementation is required.
 
+Logical invocations share one canonical body per physical checkpoint block and
+retain independent KV state. Inter-pass RMSNorm has its own independently leased
+resource, shared across the boundaries that use it. Final readout normalization
+is a separately accounted pinned replica. Pipeline owners retain the physical
+resources needed by their selected invocations. Cold scalar and logical-layer
+capture ownership follows those invocations rather than parameter aliases;
+a normalization-only stage owns the post-normalization output seam and no KV state.
+
 Cold architecture discovery exposes the released configuration as a decoder
 group with 22 physical layers, two passes and shared weights. Its 44 logical
 execution nodes retain separate input/output capture paths, and explicit
@@ -168,10 +176,9 @@ top-five candidates shared on every row.
 | Decode 3 | 0.017338 | 0.999853 | 166104 |
 | Decode 4 | 0.013785 | 0.999920 | 13 |
 
-The resident measurement reports 14,637,625,344 active allocator bytes after
-loading. Resident materialization creates a separate module for each logical invocation,
-including copies of repeated block weights. Storage schemas describe physical
-weights; execution and residency estimates include the actual replicas.
+Storage schemas describe physical weights; execution and residency estimates include
+the modules and pipeline replicas retained by the selected ownership map.
+Full-checkpoint allocator totals for shared module ownership are not measured.
 The complete official checkpoint also passes with a one-block host window and
 disk streaming. Both modes produce bit-for-bit identical logits to the resident
 run for the prefill and all four decode steps. On this CPU setup the MLX allocator

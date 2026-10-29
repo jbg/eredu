@@ -12,7 +12,7 @@ use eredu_checkpoint::{
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
     RealtimeMaterializationTask, ReplicatedTextMaterializationTask, WeightBinding,
-    WeightLoweringKind, DENSE_TRANSFER_WINDOW,
+    DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
@@ -36,7 +36,7 @@ use crate::{
         ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
     },
 };
-use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
+use eredu_core::residency::{MemoryTier, OffloadUnitId, ResidencyLedgerError};
 
 use eredu_nn::{LinearCompanionRole, ParameterMetadata, ParameterVisitor, Parameterized};
 use eredu_runtime::WeightMaterializationReport;
@@ -48,15 +48,13 @@ pub use dense_stream::{
 };
 
 mod quantization;
+pub use quantization::{
+    materialize_replicated_text_transform_groups, quantize_exact_realtime_tasks,
+    quantize_exact_replicated_text_tasks, quantize_module_store_with_bindings,
+};
 #[allow(unused_imports)]
 pub(crate) use quantization::{packed_weight_companions, PackedWeightCompanions};
-pub use quantization::{
-    quantize_exact_realtime_tasks, quantize_exact_replicated_text_tasks,
-    quantize_module_store_with_bindings,
-};
 mod sharding;
-pub use sharding::{shard_addressable_member_bindings, shard_layer_bindings};
+pub use sharding::shard_layer_bindings;
 mod validation;
-pub use validation::{
-    validate_device_budget, validate_host_budget, validate_unused, LayerwiseModelError,
-};
+pub use validation::{validate_unused, LayerwiseModelError};

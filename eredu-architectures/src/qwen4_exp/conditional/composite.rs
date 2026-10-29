@@ -12,6 +12,26 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
 {
+    fn prepared_input<'a>(
+        input: crate::composite_execution::PreparedCompositeInput<
+            'a,
+            B::Tensor,
+            Self::InputPartPlan,
+        >,
+    ) -> Self::Input<'a> {
+        ConditionalInput::Prepared(input)
+    }
+    fn prepared_view<'a>(
+        input: &Self::Input<'a>,
+    ) -> Option<
+        crate::composite_execution::PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+    > {
+        match input {
+            ConditionalInput::Prepared(input) => Some(*input),
+            _ => None,
+        }
+    }
+
     type InputPartPlan = MediaInputPartPlan<B::Tensor>;
     type AdmissionConfig = MediaAdmissionConfig;
     fn supports_retained_prefill() -> bool {
@@ -38,7 +58,8 @@ where
     }
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        self.ingress.admission_config().clone()
+        let this = self.kernel();
+        this.ingress.admission_config().clone()
     }
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,
@@ -104,6 +125,7 @@ where
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
     ) -> Result<Option<crate::composite_execution::CompositeContinuationGeometry>, String> {
+        let this = self.kernel();
         if group != VISION_INDEX {
             return Ok(None);
         }
@@ -126,7 +148,7 @@ where
         Ok(Some(
             (
                 i32::try_from(patches).map_err(|_| "vision patch extent exceeds i32")?,
-                self.vision.hidden_size,
+                this.vision.hidden_size,
             )
                 .into(),
         ))
@@ -147,7 +169,8 @@ where
         unit: usize,
         routed: bool,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
-        self.modules.target.routed_tensor_reductions(unit, routed)
+        let this = self.kernel();
+        this.modules.target.routed_tensor_reductions(unit, routed)
     }
     fn routed_tensor_vocabulary_sharded(&self) -> bool {
         false
@@ -160,6 +183,7 @@ where
         stage_units: &[std::ops::Range<usize>],
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
+        let this = self.kernel();
         let pipeline_stages = stage_units.len();
         if group != VISION_INDEX || tensor_partitions <= 1 || pipeline_stages <= 1 {
             return Ok(None);
@@ -185,9 +209,9 @@ where
                 };
                 range.len() * 2
             ];
-            if range.end == self.vision.layer_count() {
+            if range.end == this.vision.layer_count() {
                 operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                    shape: vec![projected, self.vision.out_hidden_size],
+                    shape: vec![projected, this.vision.out_hidden_size],
                 });
             }
             stages.push(operations);
@@ -204,8 +228,9 @@ where
         _: &[i32],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<ResolvedBoundaryWireSchema>, Error> {
+        let this = self.kernel();
         if source_group == TARGET_INDEX && destination_group == TARGET_INDEX {
-            return self
+            return this
                 .modules
                 .target
                 .spec
@@ -233,7 +258,7 @@ where
                 "qwen4_exp.vision_to_target",
                 BoundaryTensorSpec::new(
                     "hidden",
-                    [D::Batch, D::Sequence, D::Fixed(self.vision.out_hidden_size)],
+                    [D::Batch, D::Sequence, D::Fixed(this.vision.out_hidden_size)],
                     K::Activation,
                 ),
                 source_sequence,
@@ -253,6 +278,7 @@ where
         forward: &Self::ForwardContext,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<Vec<ArchitectureBoundaryValue<B::Tensor>>>, Error> {
+        let this = self.kernel();
         let mut values =
             vec![
                 ArchitectureBoundaryValue::new(schema.primary().role(), hidden.clone())
@@ -265,7 +291,7 @@ where
                 .ok_or_else(|| Error::backend("missing target transport context"))?
                 .request;
             values.extend(
-                self.modules
+                this.modules
                     .target
                     .spec
                     .boundary_schema()?
@@ -288,6 +314,7 @@ where
         forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error> {
+        let this = self.kernel_mut();
         if source_group != VISION_INDEX
             && !(source_group == TARGET_INDEX && destination_group == TARGET_INDEX)
         {
@@ -304,7 +331,7 @@ where
             // Validation needs local committed state and a context; the ordinary
             // partition entry performs it before any receiving decoder unit.
             forward.incoming_target = Some(
-                self.modules
+                this.modules
                     .target
                     .spec
                     .boundary_schema()?
@@ -323,19 +350,29 @@ where
         }
         Ok(Some(hidden))
     }
-    fn begin_composite_forward<'a>(
+}
+
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
+    pub(super) fn begin_prepared<'a, S>(
         &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        input: PreparedCompositeInput<'a, B::Tensor, MediaInputPartPlan<B::Tensor>>,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error> {
+    ) -> Result<LayeredForwardState<B::Tensor, ConditionalForward<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>
+            + RuntimeStateComponents<B>
+            + eredu_runtime::RuntimeAppendStreams<B>,
+    {
+        let this = self;
         let request =
             MediaInputPartPlan::request(input.admitted().parts()).map_err(Error::backend_source)?;
         request
-            .validate_policy(self.ingress.admission_config())
+            .validate_policy(this.ingress.admission_config())
             .map_err(Error::backend_source)?;
         if let Some(chunk) = MediaInputPartPlan::chunk(input.admitted().parts()) {
-            return self.begin_forward(
+            return this.begin(
                 ConditionalInput::MediaChunk {
                     prepared: &chunk.prepared,
                     range: chunk.range.clone(),
@@ -345,7 +382,7 @@ where
                 context,
             );
         }
-        if input.admitted().decoder_positions() > self.modules.target.spec.limits.qsa.tokens as u64
+        if input.admitted().decoder_positions() > this.modules.target.spec.limits.qsa.tokens as u64
         {
             return Err(Error::backend_source(
                 super::super::media::MediaInputError::Geometry(
@@ -356,7 +393,7 @@ where
         // The state frontier is needed even for text-only composite continuations.
         // Reject before request tensors, embeddings or a vision invocation exist.
         let offset = state.layer(0).map_err(Error::backend)?.position();
-        self.modules
+        this.modules
             .target
             .spec
             .limits
@@ -365,18 +402,17 @@ where
         let prepared = request.prepare(context).map_err(Error::backend_source)?;
         let modalities = prepared.admission().active_modalities();
         if modalities.image || modalities.video {
-            return self.begin_forward(ConditionalInput::Media(&prepared), state, context);
+            return this.begin(ConditionalInput::Media(&prepared), state, context);
         }
-        if self
+        if this
             .partition_state
             .as_ref()
             .is_some_and(|partition| partition.global_layer_offset() != 0)
         {
             // Only the input owner embeds text. The receiving owner restores
             // original IDs and the media-derived rotary delta from its boundary.
-            let input =
-                <Self as ReplicatedTextArchitecture<B, S>>::text_input(prepared.token_ids(), None);
-            return self.begin_forward(input, state, context);
+            let input = <Self as TextComponentKernel<B>>::text_input(prepared.token_ids(), None);
+            return this.begin(input, state, context);
         }
         // Ordinary token/projected-text continuation derives rotary positions from
         // committed state, including a previous media prompt's signed delta.
@@ -385,11 +421,10 @@ where
                 0..prepared.token_ids().dim(1),
                 None,
                 |ids| {
-                    self.modules
+                    this.modules
                         .target
-                        .decoder
-                        .static_modules_mut()
-                        .embeddings
+                        .statics
+                        .embedding_mut()?
                         .forward(ids, context)
                 },
                 context,
@@ -398,10 +433,7 @@ where
         assembled.with_target_input(|mut input| {
             input.rotary = None;
             input.position_delta = None;
-            self.begin_forward(ConditionalInput::Target(input), state, context)
+            this.begin(ConditionalInput::Target(input), state, context)
         })
-    }
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        <Self as LayeredArchitecture<B, S>>::prediction_target_capture(forward)
     }
 }

@@ -5,23 +5,22 @@ use super::{
     tts_mog_layered::MogExecution,
     tts_rvq::{RefinementPolicy, RefinementState, RvqBank, RvqDimensions, RvqProjection},
 };
-use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
+use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
-    LayeredForwardState, LayeredInvocation, LayeredTraversalHook, LayerwisePolicy,
-    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, RuntimeState, StateError, StateLayout, StaticParameterVisitor,
-    StaticParameterVisitorMut, SubmissionBackend, TensorPlacement,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
+    ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, StatelessComponentState, SubmissionBackend,
 };
 use std::marker::PhantomData;
 
-const BANK: &str = "voicechat.tts.rvq.bank";
-const PROJECTION: &str = "voicechat.tts.rvq.projection";
+pub(super) const BANK: &str = "voicechat.tts.rvq.bank";
+pub(super) const PROJECTION: &str = "voicechat.tts.rvq.projection";
 
 /// Coherent latent-channel slice shared by the bank and feedback projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,39 +55,15 @@ pub fn rvq_local_dimensions(
         .tensor("tts_model.tts_model.rvq_embs")
         .ok_or(TtsError::Configuration("RVQ layout omits codebook bank"))?
         .expanded_logical_range(dimensions.latent as usize)?;
-    let mut expected = LocalModelLayout::default();
-    for owned in description.groups() {
-        let group = owned.group();
-        for member in group.members() {
-            let MemberSharding::Partitioned { axis } = member.sharding() else {
-                return Err(TtsError::Configuration("unknown RVQ partition declaration"));
-            };
-            let mut shape = member.global_shape().to_vec();
-            shape[*axis] = range.len();
-            expected.insert(
-                member.target().into(),
-                LocalTensorLayout::new(
-                    group.logical_name(),
-                    group.role(),
-                    member.global_shape().to_vec(),
-                    shape,
-                    TensorPlacement::Range {
-                        axis: *axis,
-                        start: range.start,
-                        end: range.end,
-                    },
-                    group.partition_units(),
-                    Some(range.clone()),
-                    false,
-                ),
-            );
-        }
-    }
-    if layout != &expected {
-        return Err(TtsError::Configuration(
-            "RVQ physical layout differs from its declared partition",
-        ));
-    }
+    eredu_runtime::validate_parameter_layout(
+        description.groups().iter().map(|owned| owned.group()),
+        layout,
+        |_| {
+            Ok::<_, TtsError>(eredu_runtime::ParameterGroupSelection::Logical(Some(
+                range.clone(),
+            )))
+        },
+    )?;
     let local = RvqLocalDimensions {
         latent_start: range.start as i32,
         latent: range.len() as i32,
@@ -106,22 +81,6 @@ pub enum RvqUnit<B: NeuralBackend> {
     /// Single shared embed_code projection.
     Projection(RvqProjection<B>),
 }
-/// All learned feedback parameters belong to execution units.
-pub struct RvqStaticModules;
-impl<T: 'static> Parameterized<T> for RvqStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
-}
-
 /// Shared refinement boundaries that must agree before any rank proceeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
@@ -471,50 +430,6 @@ pub trait RvqExecution<B: NeuralBackend> {
     }
 }
 
-/// Explicit stateless traversal owner; partial codes and RNG belong to the caller.
-pub struct RvqRuntimeState {
-    layout: StateLayout,
-}
-impl RvqRuntimeState {
-    /// Constructs host-only empty state metadata.
-    pub fn new() -> Result<Self, TtsError> {
-        Ok(Self {
-            layout: rvq_state_layout()?,
-        })
-    }
-}
-impl<B: NeuralBackend> RuntimeState<B> for RvqRuntimeState {
-    type RetainedValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    fn layout(&self) -> &StateLayout {
-        &self.layout
-    }
-    fn optional_layout(&self) -> Option<&StateLayout> {
-        None
-    }
-    fn retained_values(
-        &self,
-        ordinal: usize,
-        _: ExecutionUnitAddress,
-    ) -> Result<Self::RetainedValues<'_>, StateError> {
-        if ordinal != 0 {
-            return Err(StateError::UnknownLayer {
-                layer: ordinal,
-                count: 1,
-            });
-        }
-        Ok(std::iter::empty())
-    }
-}
-fn rvq_state_layout() -> Result<StateLayout, TtsError> {
-    Ok(StateLayout::new(LayerSchedule::new(
-        1,
-        vec![LayerCachePolicy::NoState],
-    )?)?)
-}
-
 /// Exact operation over the same independently leased parameter owners.
 pub enum RvqInput<'a, T> {
     /// Ordered depth sum without hidden projection.
@@ -547,20 +462,18 @@ impl<T> RvqForward<T> {
 }
 
 /// Architecture-owned bank/projection graph with operation-specific unit activity.
-pub struct RvqArchitecture<B: NeuralBackend> {
+pub struct RvqKernel<B: NeuralBackend> {
     dimensions: RvqDimensions,
     parallel: Option<(RvqLocalDimensions, LocalModelLayout)>,
-    empty: RvqStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> RvqArchitecture<B> {
+impl<B: NeuralBackend> RvqKernel<B> {
     /// Validates dimensions without constructing any native parameter.
     pub fn new(dimensions: RvqDimensions) -> Result<Self, TtsError> {
         dimensions.validate()?;
         Ok(Self {
             dimensions,
             parallel: None,
-            empty: RvqStaticModules,
             backend: PhantomData,
         })
     }
@@ -590,11 +503,7 @@ impl<B: NeuralBackend> RvqArchitecture<B> {
     fn begin_input<'a>(
         &self,
         input: RvqInput<'a, B::Tensor>,
-        state: &RvqRuntimeState,
     ) -> Result<LayeredForwardState<B::Tensor, RvqForward<B::Tensor>>, TtsError> {
-        if state.layout != rvq_state_layout()? {
-            return Err(TtsError::Configuration("RVQ runtime layout mismatch"));
-        }
         let (hidden, forward) = match input {
             RvqInput::Sum(codes) | RvqInput::Embed(codes) => {
                 validate_codes(codes)?;
@@ -640,28 +549,12 @@ impl<B: NeuralBackend> RvqArchitecture<B> {
     pub fn dimensions(&self) -> RvqDimensions {
         self.dimensions
     }
-    /// Stable bank-before-projection graph.
-    pub fn execution_graph(&self) -> Result<ExecutionGraph, TtsError> {
-        rvq_graph()
-    }
-    /// Each group has one separately leased parameter unit.
-    pub fn group_unit_count(&self, group: usize) -> Result<usize, TtsError> {
-        if group < 2 {
-            Ok(1)
-        } else {
-            Err(TtsError::Configuration("unknown RVQ execution group"))
-        }
-    }
-    /// Canonical parameter namespace for each unit.
-    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, TtsError> {
-        if index >= self.group_unit_count(group)? {
-            return Err(TtsError::Configuration("RVQ unit exceeds group"));
-        }
-        Ok(if group == 0 {
-            "tts_model.tts_model.rvq_embs".into()
-        } else {
-            "tts_model.tts_model.embed_code".into()
-        })
+    /// Combines validated semantic declarations with these typed equations.
+    pub fn into_component(self) -> Result<ComponentAdapter<ComponentDefinition, Self>, TtsError> {
+        Ok(ComponentAdapter::new(
+            rvq_component_definition(self.dimensions)?,
+            self,
+        )?)
     }
     /// Constructs only the requested unloaded unit.
     pub fn build_unit(
@@ -670,7 +563,9 @@ impl<B: NeuralBackend> RvqArchitecture<B> {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RvqUnit<B>, TtsError> {
-        self.unit_path(group, index)?;
+        if index != 0 || group > 1 {
+            return Err(TtsError::Configuration("unknown RVQ execution unit"));
+        }
         Ok(if group == 0 {
             RvqUnit::Bank(RvqBank::new_local(self.dimensions, self.local(), context)?)
         } else {
@@ -689,6 +584,39 @@ fn rvq_graph() -> Result<ExecutionGraph, TtsError> {
             ExecutionGroupSpec::with_dependencies(PROJECTION, [BANK]),
         ],
         PROJECTION,
+    )?)
+}
+
+/// Validated bank/projection invocations, transport and stateless resource geometry.
+pub fn rvq_component_definition(d: RvqDimensions) -> Result<ComponentDefinition, TtsError> {
+    let parameters = rvq_parameter_description(d)?;
+    let transport = ArchitectureGroupTransport {
+        placement: ArchitectureGroupPlacement::Pipeline,
+        kind: ArchitectureGroupKind::Projector,
+        first_owner_static_roles: vec![],
+        last_owner_static_roles: vec![],
+        merge_destination: ArchitectureMergeDestination::LastOwner,
+        parallel_subgroup: None,
+        request_optional: false,
+    };
+    Ok(ComponentDefinition::new(
+        "voicechat.tts.rvq",
+        parameters,
+        vec![
+            ComponentUnit {
+                path: "tts_model.tts_model.rvq_embs".into(),
+                state: 0..0,
+            },
+            ComponentUnit {
+                path: "tts_model.tts_model.embed_code".into(),
+                state: 0..0,
+            },
+        ],
+        vec![transport.clone(), transport],
+        BANK,
+        vec![],
+        StatelessComponentState::state_layout()?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)]),
     )?)
 }
 
@@ -719,7 +647,6 @@ pub fn rvq_parameter_description(
             MemberSharding::Partitioned { axis: 1 },
         )],
     )?;
-    let expected = vec![bank.clone(), projection.clone()];
     let owned = vec![
         OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(layout.group_id(0).expect("bank group").clone(), 0),
@@ -733,21 +660,29 @@ pub fn rvq_parameter_description(
             projection,
         ),
     ];
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
     )?)
 }
-impl<B: NeuralBackend> ArchitectureParameters<B> for RvqArchitecture<B> {
-    type DefinitionError = TtsError;
-    fn state_layout(&self) -> Result<StateLayout, TtsError> {
-        rvq_state_layout()
-    }
+
+impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {
+    type Input<'a> = RvqInput<'a, B::Tensor>;
+    type Unit = RvqUnit<B>;
+    type ForwardContext = RvqForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::iter::Flatten<std::array::IntoIter<Option<&'a B::Tensor>, 3>>
+    where
+        B::Tensor: 'a;
+    type Error = TtsError;
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, TtsError> {
-        if state.global_layer_offset() != 0 || *state.layout() != rvq_state_layout()? {
+        if state.global_layer_offset() != 0
+            || *state.layout() != StatelessComponentState::state_layout()?
+        {
             return Err(TtsError::Configuration(
                 "RVQ stateless layout differs from selected identity",
             ));
@@ -766,79 +701,37 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for RvqArchitecture<B> {
             topology,
         )?)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, TtsError> {
-        rvq_parameter_description(self.dimensions)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-impl<B: NeuralBackend> LayeredArchitecture<B, RvqRuntimeState> for RvqArchitecture<B> {
-    type Input<'a> = RvqInput<'a, B::Tensor>;
-    type StaticModules = RvqStaticModules;
-    type Unit = RvqUnit<B>;
-    type ForwardContext = RvqForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::iter::Flatten<std::array::IntoIter<Option<&'a B::Tensor>, 3>>
-    where
-        B::Tensor: 'a;
-    type Error = TtsError;
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::Projector,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        BANK
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::output_owner(0..1)])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, TtsError> {
-        self.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, TtsError> {
-        self.group_unit_count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, TtsError> {
-        self.unit_path(group, index)
-    }
-    fn static_modules(&self) -> &RvqStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut RvqStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RvqUnit<B>, TtsError> {
-        self.build_unit(group, index, context)
+        self.build_unit(address.group(), address.index(), context)
     }
-    fn begin_forward<'a>(
+
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        group == 0 || forward.embed
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        [
+            Some(&forward.codes),
+            forward.latent.as_ref(),
+            forward.candidate.as_ref().map(RefinementState::codes),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, StatelessComponentState> for RvqKernel<B> {
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut RvqRuntimeState,
+        _: &mut StatelessComponentState,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         if self.is_parallel() {
@@ -846,15 +739,14 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RvqRuntimeState> for RvqArchitectu
                 "sharded RVQ requires parallel execution",
             ));
         }
-        self.begin_input(input, state)
+        self.begin_input(input)
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
-        _: &mut RvqRuntimeState,
+        _: &mut StatelessComponentState,
         _: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
@@ -866,23 +758,16 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RvqRuntimeState> for RvqArchitectu
             )),
         }
     }
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        group == 0 || forward.embed
-    }
-    fn retained_state_ordinals(&self, _: usize, _: usize, _: usize) -> std::ops::Range<usize> {
-        0..0
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut RvqUnit<B>,
         hidden: &B::Tensor,
-        _: &mut RvqRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        self.unit_path(group, index)?;
+        let group = address.group();
         if self.is_parallel() {
             return Err(TtsError::Configuration(
                 "sharded RVQ requires parallel execution",
@@ -913,54 +798,26 @@ impl<B: NeuralBackend> LayeredArchitecture<B, RvqRuntimeState> for RvqArchitectu
             )),
         }
     }
-    fn finish_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        _: &mut RvqRuntimeState,
-        _: &Self::ForwardContext,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TtsError> {
-        Ok(hidden.clone())
-    }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        [
-            Some(&forward.codes),
-            forward.latent.as_ref(),
-            forward.candidate.as_ref().map(RefinementState::codes),
-        ]
-        .into_iter()
-        .flatten()
-    }
 }
-impl<B: DistributedNeuralBackend> RvqArchitecture<B> {
+
+impl<B: DistributedNeuralBackend> RvqKernel<B> {
     /// Rejects a mismatched rank or communicator before parameter acquisition.
     pub fn validate_parallel(&self, parallel: &B::ParallelContext) -> Result<(), TtsError> {
         let (_, selected) = self.parallel.as_ref().ok_or(TtsError::Configuration(
             "parallel RVQ requires rank-local construction",
         ))?;
-        let topology = eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(B::parallel_size(parallel), 1, 1, 1)
-                .map_err(|_| TtsError::Configuration("invalid RVQ tensor degree"))?,
-            B::parallel_rank(parallel),
-        )
-        .map_err(|_| TtsError::Configuration("invalid RVQ tensor rank"))?;
         let description = rvq_parameter_description(self.dimensions)?;
-        let expected = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(|_| TtsError::Configuration("RVQ tensor placement cannot be derived"))?;
-        if selected != &expected {
-            return Err(TtsError::Configuration(
-                "RVQ layout differs from its tensor communicator",
-            ));
-        }
+        eredu_runtime::validate_tensor_parallel_layout(
+            "voicechat.tts.rvq",
+            &description,
+            selected,
+            B::parallel_size(parallel),
+            B::parallel_rank(parallel),
+        )?;
         Ok(())
     }
 }
-impl<B: DistributedNeuralBackend> RvqArchitecture<B> {
+impl<B: DistributedNeuralBackend> RvqKernel<B> {
     fn forward_unit_guarded(
         &self,
         group: usize,
@@ -977,19 +834,23 @@ impl<B: DistributedNeuralBackend> RvqArchitecture<B> {
         ) -> Result<bool, TtsError>,
     ) -> Result<B::Tensor, TtsError> {
         let local = self.local();
-        let valid = self.unit_path(group, index).and_then(|_| match &*unit {
-            RvqUnit::Bank(bank) if group == 0 && bank.geometry() == (self.dimensions, local) => {
+        let valid = match &*unit {
+            RvqUnit::Bank(bank)
+                if group == 0 && index == 0 && bank.geometry() == (self.dimensions, local) =>
+            {
                 Ok(())
             }
             RvqUnit::Projection(projection)
-                if group == 1 && projection.geometry() == (self.dimensions, local.latent) =>
+                if group == 1
+                    && index == 0
+                    && projection.geometry() == (self.dimensions, local.latent) =>
             {
                 Ok(())
             }
             _ => Err(TtsError::Configuration(
                 "leased RVQ unit differs from selected geometry or graph address",
             )),
-        });
+        };
         if !agree(
             [
                 0x525651554e495430,
@@ -1096,33 +957,32 @@ impl<B: DistributedNeuralBackend> RvqArchitecture<B> {
         }
     }
 }
-impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, RvqRuntimeState>
-    for RvqArchitecture<B>
+impl<B: DistributedNeuralBackend> ParallelComponentKernel<B, eredu_runtime::StatelessComponentState>
+    for RvqKernel<B>
 {
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
-        state: &mut RvqRuntimeState,
+        _: &mut StatelessComponentState,
         parallel: &B::ParallelContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, TtsError> {
         self.validate_parallel(parallel)?;
-        self.begin_input(input, state)
+        self.begin_input(input)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
-        _: &mut RvqRuntimeState,
+        _: &mut StatelessComponentState,
         forward: &mut Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
         self.forward_unit_guarded(
-            group,
-            index,
+            address.group(),
+            address.index(),
             unit,
             hidden,
             forward,
@@ -1130,16 +990,6 @@ impl<B: DistributedNeuralBackend> ParallelLayeredArchitecture<B, RvqRuntimeState
             context,
             &mut |_, success, _| Ok(success),
         )
-    }
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut RvqRuntimeState,
-        forward: &Self::ForwardContext,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, TtsError> {
-        self.finish_forward(hidden, state, forward, context)
     }
 }
 
@@ -1157,37 +1007,6 @@ fn validate_codes<T: Tensor>(codes: &T) -> Result<(), TtsError> {
     Ok(())
 }
 
-/// RVQ feedback using the existing prepared parameter provider and bounded traversal.
-pub struct LayerwiseRvq<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RvqUnit<B>>,
-{
-    runtime: LayerwiseRuntime<RvqArchitecture<B>, B, RvqRuntimeState, P>,
-}
-impl<B, P> LayerwiseRvq<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RvqUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts an exact bank/projection unit policy.
-    pub fn new(architecture: RvqArchitecture<B>, policy: P) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Existing shared provider/runtime for diagnostics and parameter inspection.
-    pub fn runtime(&self) -> &LayerwiseRuntime<RvqArchitecture<B>, B, RvqRuntimeState, P> {
-        &self.runtime
-    }
-    /// Existing shared provider/runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<RvqArchitecture<B>, B, RvqRuntimeState, P> {
-        &mut self.runtime
-    }
-}
 fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
     error: eredu_runtime::LayerwiseRuntimeError<TtsError, P>,
 ) -> TtsError {
@@ -1203,23 +1022,28 @@ fn runtime_error<P: std::error::Error + Send + Sync + 'static>(
         }
     }
 }
-impl<B, P> RvqExecution<B> for LayerwiseRvq<B, P>
+impl<B, P> RvqExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, RvqUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> RvqDimensions {
-        self.runtime.architecture().dimensions()
+        self.architecture().kernel().dimensions()
     }
     fn depthsum(
         &mut self,
         codes: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        let mut state = RvqRuntimeState::new()?;
-        self.runtime
-            .invoke(RvqInput::Sum(codes), &mut state, context)
+        let mut state = StatelessComponentState::new()?;
+        self.invoke(RvqInput::Sum(codes), &mut state, context)
             .map_err(runtime_error)
     }
     fn embed_codes(
@@ -1227,9 +1051,8 @@ where
         codes: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        let mut state = RvqRuntimeState::new()?;
-        self.runtime
-            .invoke(RvqInput::Embed(codes), &mut state, context)
+        let mut state = StatelessComponentState::new()?;
+        self.invoke(RvqInput::Embed(codes), &mut state, context)
             .map_err(runtime_error)
     }
     fn advance(
@@ -1238,88 +1061,110 @@ where
         latent: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
-        let mut runtime_state = RvqRuntimeState::new()?;
-        self.runtime
-            .invoke_with_context(
-                RvqInput::Advance { state, latent },
-                &mut runtime_state,
-                context,
-            )
-            .map_err(runtime_error)?
-            .1
-            .into_state()
+        let mut runtime_state = StatelessComponentState::new()?;
+        self.invoke_with_context(
+            RvqInput::Advance { state, latent },
+            &mut runtime_state,
+            context,
+        )
+        .map_err(runtime_error)?
+        .1
+        .into_state()
     }
 }
 
-impl<B, P> LayerwiseRvq<B, P>
-where
-    B: DistributedNeuralBackend
-        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, RvqUnit<B>>,
-    P::Error: std::error::Error + Send + Sync + 'static,
-{
+/// Tensor-parallel RVQ operations over ordinary resource and completion lifecycles.
+/// Implementors supply typed invocation and guarded collective participation;
+/// convenience operations share the same invocation and candidate result.
+pub trait ParallelRvqExecution<B: DistributedNeuralBackend>: RvqExecution<B> {
+    /// Executes a typed operation with its request-local roots retained to completion.
+    fn invoke_parallel(
+        &mut self,
+        input: RvqInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, RvqForward<B::Tensor>), TtsError>;
+
     /// Publishes complete latent feedback from coherent channel shards.
-    pub fn depthsum_parallel(
+    fn depthsum_parallel(
         &mut self,
         codes: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        let mut state = RvqRuntimeState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                RvqInput::Sum(codes),
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
+        self.invoke_parallel(RvqInput::Sum(codes), parallel, context)
             .map(|(output, _)| output)
-            .map_err(runtime_error)
     }
+
     /// Reduces the shared projection's rank-local input-channel products.
-    pub fn embed_codes_parallel(
+    fn embed_codes_parallel(
         &mut self,
         codes: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, TtsError> {
-        let mut state = RvqRuntimeState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                RvqInput::Embed(codes),
-                &mut state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
+        self.invoke_parallel(RvqInput::Embed(codes), parallel, context)
             .map(|(output, _)| output)
-            .map_err(runtime_error)
     }
-    /// Selects shared codes from globally reduced distances before local residual subtraction.
-    pub fn advance_parallel(
+
+    /// Selects globally agreed codes before local residual subtraction.
+    fn advance_parallel(
         &mut self,
         state: &RefinementState<B::Tensor>,
         latent: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
-        let mut runtime_state = RvqRuntimeState::new()?;
-        self.runtime
-            .forward_parallel_with_context_hook(
-                RvqInput::Advance { state, latent },
-                &mut runtime_state,
-                parallel,
-                context,
-                |_, _, _| Ok(()),
-            )
-            .map_err(runtime_error)?
+        self.invoke_parallel(RvqInput::Advance { state, latent }, parallel, context)?
             .1
             .into_state()
     }
+
+    /// Coordinates operation identity and provider lifecycle before collectives.
+    fn invoke_parallel_guarded<H, F>(
+        &mut self,
+        input: RvqInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        hook: &mut H,
+        agree: F,
+    ) -> Result<(B::Tensor, RvqForward<B::Tensor>), TtsError>
+    where
+        H: LayeredTraversalHook<B, RvqForward<B::Tensor>, TtsError> + ?Sized,
+        F: FnMut([u64; 8], bool, &<B::Tensor as Tensor>::Context) -> Result<bool, TtsError>;
+}
+
+impl<B, P> ParallelRvqExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, RvqKernel<B>>,
+        B,
+        StatelessComponentState,
+        P,
+    >
+where
+    B: DistributedNeuralBackend
+        + SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    P: LayerwisePolicy<B, RvqUnit<B>>,
+    P::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn invoke_parallel(
+        &mut self,
+        input: RvqInput<'_, B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, RvqForward<B::Tensor>), TtsError> {
+        self.forward_parallel_with_context_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |_, _, _| Ok(()),
+        )
+        .map_err(runtime_error)
+    }
     /// Coordinates operation identity, provider lifecycle and all local preparation
     /// before the selected tensor-parallel collectives.
-    pub fn invoke_parallel_guarded<H, F>(
+    fn invoke_parallel_guarded<H, F>(
         &mut self,
         input: RvqInput<'_, B::Tensor>,
         parallel: &B::ParallelContext,
@@ -1379,19 +1224,18 @@ where
                 }
             }
         }
-        self.runtime
-            .forward_parallel_with_unit_executor_and_traversal_hook(
-                input,
-                &mut RvqRuntimeState::new()?,
-                parallel,
-                context,
-                |architecture, group, index, unit, hidden, _, forward, parallel, context| {
-                    architecture.forward_unit_guarded(
-                        group, index, unit, hidden, forward, parallel, context, &mut agree,
-                    )
-                },
-                hook,
-            )
-            .map_err(runtime_error)
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            input,
+            &mut StatelessComponentState::new()?,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, _, forward, parallel, context| {
+                architecture.kernel().forward_unit_guarded(
+                    group, index, unit, hidden, forward, parallel, context, &mut agree,
+                )
+            },
+            hook,
+        )
+        .map_err(runtime_error)
     }
 }

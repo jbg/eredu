@@ -93,7 +93,9 @@ fn detects_unit_total_overflow_before_checkpoint_access() {
     assert!(matches!(
         ResidencyManager::new(store, plan, [overflowing], cpu_stream(), cpu_stream()),
         Err(ResidencyError::Controller(
-            ResidencyControllerError::ArithmeticOverflow { .. }
+            ResidencyControllerError::Declaration(
+                eredu_runtime::ResidencyDeclarationError::BindingBytesOverflow { .. }
+            )
         ))
     ));
 }

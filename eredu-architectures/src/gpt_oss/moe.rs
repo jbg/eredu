@@ -95,28 +95,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
-        let router_weight = format!("{prefix}.router.weight");
-        let router_bias = format!("{prefix}.router.bias");
-        let routing = TopKGroupSelectionSpec::new(
-            args.num_local_experts,
-            args.num_experts_per_tok,
-            GroupScoring::SelectedSoftmax,
-            false,
-        )?;
-        let selector = TopKGroupSelectorSpec::new(
-            args.hidden_size,
-            ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
-            crate::linear_format::standard_linear_format(
-                &router_weight,
-                args.checkpoint_weight_quantization_for(&router_weight)
-                    .into(),
-            )?,
-            routing,
-        )?
-        .with_bias(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?)?;
-        let router = B::top_k_group_selector(selector, context)?;
-
+        let router = B::top_k_group_selector(selector_spec(args, layer)?, context)?;
         let experts = B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?;
         Ok(Self {
             layer,
@@ -132,28 +111,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{}.layers.{layer}.mlp", global.parameter_root);
-        let router_weight = format!("{prefix}.router.weight");
-        let router_bias = format!("{prefix}.router.bias");
-        let routing = TopKGroupSelectionSpec::new(
-            global.num_local_experts,
-            global.num_experts_per_tok,
-            GroupScoring::SelectedSoftmax,
-            false,
-        )?;
-        let selector = TopKGroupSelectorSpec::new(
-            global.hidden_size,
-            ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
-            crate::linear_format::standard_linear_format(
-                &router_weight,
-                global
-                    .checkpoint_weight_quantization_for(&router_weight)
-                    .into(),
-            )?,
-            routing,
-        )?
-        .with_bias(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?)?;
-        let router = B::top_k_group_selector(selector, context)?;
+        let router = B::top_k_group_selector(selector_spec(global, layer)?, context)?;
         let experts = B::grouped_gated_product(
             localized_expert_bank_spec(
                 global,
@@ -232,6 +190,33 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
     }
 }
 
+/// Declares global biased routing independently of native materialization.
+pub(crate) fn selector_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<TopKGroupSelectorSpec, Error> {
+    let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
+    let router_weight = format!("{prefix}.router.weight");
+    let router_bias = format!("{prefix}.router.bias");
+    let routing = TopKGroupSelectionSpec::new(
+        args.num_local_experts,
+        args.num_experts_per_tok,
+        GroupScoring::SelectedSoftmax,
+        false,
+    )?;
+    TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
+        crate::linear_format::standard_linear_format(
+            &router_weight,
+            args.checkpoint_weight_quantization_for(&router_weight)
+                .into(),
+        )?,
+        routing,
+    )?
+    .with_bias(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?)
+}
+
 /// Returns the architecture-owned routed expert specification for one layer.
 pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<GroupedGatedProductSpec, Error> {
     let expert_prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
@@ -301,7 +286,7 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     architecture: &super::LayeredModel<B>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<GroupedGatedProductSpec>>, Error> {
-    let args = architecture.args();
+    let args = architecture.kernel().args();
     let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
     let local_experts = i32::try_from(
         eredu_core::balanced_contiguous_range(
@@ -320,6 +305,7 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     let mut unit_specs = std::collections::BTreeMap::new();
     for layer in 0..layers {
         let width = architecture
+            .kernel()
             .parallel_geometry()
             .and_then(|geometry| geometry.block(layer))
             .map_or(args.intermediate_size, |local| local.intermediate_size);

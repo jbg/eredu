@@ -11,7 +11,7 @@ use eredu_runtime::{ParameterBank, PreparedRowLookup, RowEncoding, RowLookupBank
 pub struct MlxRowBank {
     manager: ResidencyManager,
     range: eredu_runtime::RowResidencyRange,
-    spec: RowLookupSpec,
+    descriptor: eredu_runtime::RowLookupDescriptor,
     scale: Option<MlxTensor>,
     decode_bytes: u64,
 }
@@ -33,7 +33,7 @@ impl MlxRowBank {
         scale: Option<(ParameterId, MlxTensor)>,
         decode_bytes: u64,
     ) -> Result<Self, Error> {
-        let spec = prepared.spec().clone();
+        let descriptor = prepared.descriptor().clone();
         let scale_dtype = prepared
             .scale()
             .map(|scale| {
@@ -68,7 +68,7 @@ impl MlxRowBank {
         Ok(Self {
             manager,
             range,
-            spec,
+            descriptor,
             scale: scale.map(|(_, v)| v),
             decode_bytes,
         })
@@ -79,18 +79,19 @@ impl ParameterBank<MlxNeuralBackend> for MlxRowBank {
     type Report = ResidencyReport;
     type Error = Error;
     fn member_bytes(&self, key: ParameterBankKey) -> Option<u64> {
-        (key.bank() == self.spec.bank
-            && key.unit() == self.spec.unit
-            && (key.member() as u64) < self.spec.rows)
-            .then_some(self.range.range().bytes())
+        self.descriptor.member_bytes(key)
     }
+
     fn acquire(
         &mut self,
         request: ParameterBankAcquisition<'_>,
         stream: &Stream,
     ) -> Result<AcquiredParameters, Error> {
         if request.entries().is_empty() {
-            return Err(AddressableParameterBankError::EmptyDemand.into());
+            return Err(AddressableParameterBankError::Demand(
+                eredu_runtime::AddressableBankDemandError::EmptyDemand,
+            )
+            .into());
         }
         let pass = match request.access() {
             ParameterBankAccess::Bulk => BankAccessClass::Bulk,
@@ -105,7 +106,7 @@ impl ParameterBank<MlxNeuralBackend> for MlxRowBank {
         let scratch = memory::workspace(
             request.entries().len() as u64,
             self.range.range().bytes(),
-            &self.spec,
+            self.descriptor.spec(),
         )?;
         if scratch > self.decode_bytes {
             return Err(eredu_runtime::RowLookupError::Budget {
@@ -115,36 +116,17 @@ impl ParameterBank<MlxNeuralBackend> for MlxRowBank {
             }
             .into());
         }
-        let mut seen = std::collections::BTreeSet::new();
-        let mut requests = Vec::with_capacity(request.entries().len());
-        for &(key, demand) in request.entries() {
-            if self.member_bytes(key).is_none() {
-                return Err(
-                    AddressableParameterBankError::MissingOwnedEntry { identity: key }.into(),
-                );
-            }
-            if demand == 0 {
-                return Err(AddressableParameterBankError::ZeroDemand { identity: key }.into());
-            }
-            if !seen.insert(key) {
-                return Err(
-                    AddressableParameterBankError::DuplicateDemand { identity: key }.into(),
-                );
-            }
-            let id = self
-                .range
-                .range()
-                .member_id(self.range.range().start() + key.member() as u64)
-                .expect("validated row");
-            requests.push((id, demand));
-        }
+        let demand = self
+            .descriptor
+            .plan_demand(request.entries())
+            .map_err(AddressableParameterBankError::from)?;
         let transfer = self
             .manager
-            .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
+            .acquire_many_with_transfer(demand.requests(), MemoryTier::Device)?;
         transfer.order_after(stream)?;
         Ok(AcquiredParameters {
-            identities: request.entries().iter().map(|(k, _)| *k).collect(),
-            demand: request.entries().iter().map(|(_, n)| *n).collect(),
+            identities: demand.entries().iter().map(|(k, _)| *k).collect(),
+            demand: demand.entries().iter().map(|(_, n)| *n).collect(),
             scratch_bytes: scratch,
             pass,
             transfer,
@@ -169,7 +151,7 @@ impl RowLookupBank<MlxNeuralBackend> for MlxRowBank {
         spec: &RowLookupSpec,
         stream: &Stream,
     ) -> Result<MlxTensor, Error> {
-        if spec != &self.spec {
+        if spec != self.descriptor.spec() {
             return Err(Error::ArchitectureModel(
                 "row decoder specification differs from prepared bank".into(),
             ));

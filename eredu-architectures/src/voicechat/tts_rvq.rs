@@ -462,9 +462,12 @@ impl<B: NeuralBackend> RvqProjection<B> {
 /// Resident RVQ execution through the same bank/projection traversal as bounded providers.
 pub struct RvqRefinement<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        super::tts_rvq_layered::RvqArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            super::tts_rvq_layered::RvqKernel<B>,
+        >,
         B,
-        super::tts_rvq_layered::RvqRuntimeState,
+        eredu_runtime::StatelessComponentState,
     >,
 }
 impl<B: NeuralBackend> std::fmt::Debug for RvqRefinement<B> {
@@ -513,13 +516,15 @@ impl<B: NeuralBackend> RvqRefinement<B> {
     ) -> Result<Self, TtsError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_rvq_layered::RvqArchitecture::new(RvqDimensions {
+                super::tts_rvq_layered::RvqKernel::new(RvqDimensions {
                     cardinality,
                     latent,
                     hidden,
-                })?,
+                })?
+                .into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts independently materialized codebook and shared projection units.
@@ -528,27 +533,21 @@ impl<B: NeuralBackend> RvqRefinement<B> {
         bank: RvqBank<B>,
         projection: RvqProjection<B>,
     ) -> Result<Self, TtsError> {
-        use super::tts_rvq_layered::{RvqArchitecture, RvqUnit};
+        use super::tts_rvq_layered::{RvqKernel, RvqUnit};
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::from_units(
-                RvqArchitecture::new(dimensions)?,
+                RvqKernel::new(dimensions)?.into_component()?,
                 vec![
                     vec![RvqUnit::Bank(bank)],
                     vec![RvqUnit::Projection(projection)],
                 ],
             )
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                eredu_runtime::ResidentUnitsError::GroupCount { .. }
-                | eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                    TtsError::Configuration("RVQ units differ from its execution graph")
-                }
-            })?,
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Exact selected feedback geometry.
     pub fn dimensions(&self) -> RvqDimensions {
-        self.runtime.architecture().dimensions()
+        self.runtime.architecture().kernel().dimensions()
     }
     /// Creates an all-PAD candidate at the first active refinement slot.
     pub fn start(
@@ -657,7 +656,7 @@ impl<B: NeuralBackend> RvqRefinement<B> {
         input: super::tts_rvq_layered::RvqInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, super::tts_rvq_layered::RvqForward<B::Tensor>), TtsError> {
-        let mut state = super::tts_rvq_layered::RvqRuntimeState::new()?;
+        let mut state = eredu_runtime::StatelessComponentState::new()?;
         self.runtime
             .forward_with_context(input, &mut state, context)
     }

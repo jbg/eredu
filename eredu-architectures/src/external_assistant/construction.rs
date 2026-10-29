@@ -277,15 +277,16 @@ impl CompatibleExternalAssistantPreparation {
                 "Muse static invocation has no Muse target",
             ));
         };
-        let args = muse::with_checkpoint_formats(
-            args,
-            crate::replicated_text::selected_formats(execution.text_realization()),
-        )
-        .map_err(invalid_assistant)?;
-        let parameters = muse::model::parameter_description(&args).map_err(invalid_assistant)?;
-        let index = crate::parameter_partition::ParameterMemberIndex::new(
+        let args =
+            muse::with_checkpoint_formats(args, execution.text_realization().quantized_formats())
+                .map_err(invalid_assistant)?;
+        let parameters = muse::component_definition(&args, None)
+            .map_err(invalid_assistant)?
+            .parameters()
+            .clone();
+        let index = eredu_runtime::ParameterMemberIndex::new(
             execution.text_realization().materialization_tasks(),
-            &parameters,
+            std::sync::Arc::new(parameters.clone()),
         );
         let description = super::static_placement::TargetStaticDescription::muse(&args);
         for (kind, shape) in invocations {

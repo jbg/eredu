@@ -459,7 +459,8 @@ where
         Ok(None)
     }
 
-    /// Chooses whether to execute the next unit.
+    /// Chooses whether to execute the next global unit within its canonical group.
+    /// Remaining units counts traversal positions, including the current invocation.
     fn before_unit(
         &mut self,
         _group: usize,
@@ -483,7 +484,7 @@ where
         Ok(())
     }
 
-    /// Observes one executed unit output.
+    /// Observes one executed unit output using its canonical group and global unit index.
     fn after_unit(
         &mut self,
         _group: usize,
@@ -694,9 +695,58 @@ impl<B, C, E> LayeredTraversalHook<B, C, E> for NoopLayeredTraversalHook where B
 
 struct ActivationObserverTraversalHook<'a, O: ?Sized> {
     observer: std::rc::Rc<std::cell::RefCell<&'a mut O>>,
-    units: Vec<Vec<Option<String>>>,
+    units: Vec<BTreeMap<usize, crate::UnitObservationBoundaries>>,
     group_inputs: Vec<Option<String>>,
     group_outputs: Vec<Option<String>>,
+}
+
+impl<'a, O: ?Sized> ActivationObserverTraversalHook<'a, O> {
+    fn new<A, B, S>(
+        architecture: &A,
+        observer: &'a mut O,
+    ) -> Result<Self, crate::ArchitectureExecutionLayoutError<A::Error>>
+    where
+        B: NeuralBackend,
+        S: RuntimeState<B>,
+        A: LayeredArchitecture<B, S>,
+    {
+        use crate::ArchitectureExecutionLayoutError::Architecture;
+        let graph = architecture.execution_graph().map_err(Architecture)?;
+        let layout = architecture.execution_unit_layout()?;
+        let mut units = Vec::with_capacity(graph.groups().len());
+        let mut group_inputs = Vec::with_capacity(graph.groups().len());
+        let mut group_outputs = Vec::with_capacity(graph.groups().len());
+        for group in 0..graph.groups().len() {
+            let mut paths = BTreeMap::new();
+            for ordinal in layout.group_range(group).expect("declared execution group") {
+                let address = layout.address(ordinal).expect("declared invocation");
+                let index = address.index();
+                let boundaries = architecture
+                    .unit_observation_boundaries(group, index)
+                    .map_err(Architecture)?;
+                if !boundaries.is_kernel_owned() {
+                    paths.insert(index, boundaries);
+                }
+            }
+            units.push(paths);
+            group_inputs.push(
+                architecture
+                    .group_input_observation_path(group)
+                    .map_err(Architecture)?,
+            );
+            group_outputs.push(
+                architecture
+                    .group_output_observation_path(group)
+                    .map_err(Architecture)?,
+            );
+        }
+        Ok(Self {
+            observer: std::rc::Rc::new(std::cell::RefCell::new(observer)),
+            units,
+            group_inputs,
+            group_outputs,
+        })
+    }
 }
 
 impl<B, C, E, O> LayeredTraversalHook<B, C, E> for ActivationObserverTraversalHook<'_, O>
@@ -737,12 +787,13 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredUnitAction, E> {
-        let Some(unit) = &self.units[group][index] else {
+        let Some(unit) = self.units[group].get(&index) else {
             return Ok(LayeredUnitAction::Execute);
         };
-        let path = eredu_core::UnitObservation::Input.path(unit);
         let mut observer = self.observer.borrow_mut();
-        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        if let Some(input) = unit.observe_input(&mut **observer, value)? {
+            *value = input;
+        }
         Ok(LayeredUnitAction::Execute)
     }
 
@@ -754,12 +805,13 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
-        let Some(unit) = &self.units[group][index] else {
+        let Some(unit) = self.units[group].get(&index) else {
             return Ok(());
         };
-        let path = eredu_core::UnitObservation::Output.path(unit);
-        let mut observer = self.observer.borrow_mut();
-        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        if let Some(path) = unit.output_path() {
+            let mut observer = self.observer.borrow_mut();
+            *value = observe_and_intervene(&mut **observer, path, value)?;
+        }
         Ok(())
     }
 
@@ -915,18 +967,48 @@ where
     /// Declares the dependency graph between ordered execution groups.
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error>;
 
+    /// Projects exact canonical invocation addresses before resource selection.
+    /// Shared component adapters retain this layout with their validated definition.
+    fn execution_unit_layout(
+        &self,
+    ) -> Result<crate::ExecutionUnitLayout, crate::ArchitectureExecutionLayoutError<Self::Error>>
+    {
+        use crate::ArchitectureExecutionLayoutError::Architecture;
+        let graph = self.execution_graph().map_err(Architecture)?;
+        let counts = (0..graph.groups().len())
+            .map(|group| self.group_unit_count(group).map_err(Architecture))
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::ExecutionUnitLayout::new(&graph, counts).map_err(Into::into)
+    }
+
+    /// Projects canonical physical resources independently of logical invocations.
+    /// Every invocation retains its own equation address and mutable-state mapping.
+    /// The resident constructor validates this map against the exact logical layout
+    /// before building or adopting one module per physical owner.
+    fn execution_unit_storage_map(
+        &self,
+    ) -> Result<crate::ExecutionUnitAddressMap, crate::ArchitectureExecutionLayoutError<Self::Error>>
+    {
+        let layout = self.execution_unit_layout()?;
+        Ok(crate::ExecutionUnitAddressMap::identity(&layout))
+    }
+
     /// Returns the number of ordered execution units in one graph group.
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error>;
 
     /// Returns the stable architecture-owned path of one group-local execution unit.
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error>;
 
-    /// Whether observed unit execution owns both input/output capture and
-    /// intervention, including their effective companions. The traversal omits
-    /// its outer copies of those exact seams. This includes observed provider
-    /// and parallel entry points and preserves in-unit state/capture timing.
-    fn observes_unit_boundaries(&self, _group: usize, _index: usize) -> bool {
-        false
+    /// Exact logical seams around this operation, independent of its execution path.
+    /// Kernel-owned boundaries are emitted inside the observed equation itself.
+    fn unit_observation_boundaries(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<crate::UnitObservationBoundaries, Self::Error> {
+        Ok(crate::UnitObservationBoundaries::around(
+            &self.unit_path(group, index)?,
+        ))
     }
 
     /// Architecture-owned name for the activation selected at group ingress.
@@ -952,6 +1034,18 @@ where
         index: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error>;
+
+    /// Builds a canonical physical owner independently of logical invocation lookup.
+    /// Identity-storage architectures use the ordinary unit constructor; shared
+    /// adapters validate storage identity and dispatch the canonical factory directly.
+    fn build_storage_unit(
+        &self,
+        storage: crate::ExecutionUnitStorageLocation,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Unit, Self::Error> {
+        let address = storage.address();
+        self.build_unit(address.group(), address.index(), context)
+    }
 
     /// Embeds input and prepares architecture-owned forward values.
     fn begin_forward<'a>(
@@ -1764,6 +1858,12 @@ pub enum ResidentUnitsError<E> {
     /// Architecture graph or unit declarations failed before adoption.
     #[error("resident architecture declaration failed: {0}")]
     Architecture(#[source] E),
+    /// Canonical invocation addresses cannot form a valid layout.
+    #[error("resident execution layout failed: {0}")]
+    Layout(#[source] crate::ExecutionUnitLayoutError),
+    /// Physical references disagree with canonical invocation identities.
+    #[error("resident invocation map failed: {0}")]
+    InvocationMap(#[source] crate::ExecutionUnitAddressMapError),
     /// Supplied groups differ from the declared execution graph.
     #[error("resident unit group count {actual} differs from declared {expected}")]
     GroupCount {
@@ -1784,6 +1884,31 @@ pub enum ResidentUnitsError<E> {
     },
 }
 
+impl<E> From<crate::ArchitectureExecutionLayoutError<E>> for ResidentUnitsError<E> {
+    fn from(error: crate::ArchitectureExecutionLayoutError<E>) -> Self {
+        match error {
+            crate::ArchitectureExecutionLayoutError::Architecture(error) => {
+                Self::Architecture(error)
+            }
+            crate::ArchitectureExecutionLayoutError::Layout(error) => Self::Layout(error),
+        }
+    }
+}
+
+impl<E> ResidentUnitsError<E>
+where
+    E: std::error::Error + Send + Sync + 'static + From<eredu_nn::Error>,
+{
+    /// Preserves architecture errors and translates adoption/layout failures through
+    /// the neutral neural error contract, retaining the complete typed source.
+    pub fn into_architecture(self) -> E {
+        match self {
+            Self::Architecture(error) => error,
+            error => eredu_nn::Error::backend_source(error).into(),
+        }
+    }
+}
+
 /// Fully resident runtime using the same lifecycle as bounded execution.
 pub struct ResidentRuntime<A, B, S>
 where
@@ -1793,6 +1918,8 @@ where
 {
     architecture: A,
     graph: ExecutionGraph,
+    layout: ExecutionUnitLayout,
+    invocations: crate::ExecutionUnitAddressMap,
     units: Vec<Vec<A::Unit>>,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
@@ -1803,9 +1930,20 @@ where
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
 {
+    fn storage_map(
+        architecture: &A,
+        layout: &ExecutionUnitLayout,
+    ) -> Result<crate::ExecutionUnitAddressMap, ResidentUnitsError<A::Error>> {
+        let invocations = architecture.execution_unit_storage_map()?;
+        invocations
+            .validate_layout(layout)
+            .map_err(ResidentUnitsError::InvocationMap)?;
+        Ok(invocations)
+    }
+
     /// Adopts exact ordered, already constructed units without allocating replacements.
-    /// Unit identities and bindings remain architecture/caller-owned; graph shape
-    /// is validated before the runtime can execute any supplied module.
+    /// Physical owners and bindings remain architecture/caller-owned; the invocation
+    /// map is validated before the runtime can execute any supplied module.
     pub fn from_units(
         architecture: A,
         units: Vec<Vec<A::Unit>>,
@@ -1819,10 +1957,14 @@ where
                 actual: units.len(),
             });
         }
+        let layout = architecture.execution_unit_layout()?;
+        let invocations = Self::storage_map(&architecture, &layout)?;
         for (group, supplied) in units.iter().enumerate() {
-            let expected = architecture
-                .group_unit_count(group)
-                .map_err(ResidentUnitsError::Architecture)?;
+            let expected = invocations
+                .storage_layout()
+                .group_range(group)
+                .expect("declared execution group")
+                .len();
             if supplied.len() != expected {
                 return Err(ResidentUnitsError::UnitCount {
                     group,
@@ -1834,29 +1976,45 @@ where
         Ok(Self {
             architecture,
             graph,
+            layout,
+            invocations,
             units,
             backend: std::marker::PhantomData,
         })
     }
 
-    /// Builds every execution unit once and keeps it resident.
+    /// Builds each canonical physical owner once and keeps it resident.
     pub fn new(
         architecture: A,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self, A::Error> {
-        let graph = architecture.execution_graph()?;
+    ) -> Result<Self, ResidentUnitsError<A::Error>> {
+        let graph = architecture
+            .execution_graph()
+            .map_err(ResidentUnitsError::Architecture)?;
+        let layout = architecture.execution_unit_layout()?;
+        let invocations = Self::storage_map(&architecture, &layout)?;
         let mut units = Vec::with_capacity(graph.groups().len());
         for group in 0..graph.groups().len() {
-            let count = architecture.group_unit_count(group)?;
             units.push(
-                (0..count)
-                    .map(|index| architecture.build_unit(group, index, context))
-                    .collect::<Result<Vec<_>, _>>()?,
+                invocations
+                    .storage_layout()
+                    .group_range(group)
+                    .expect("declared execution group")
+                    .map(|ordinal| {
+                        let storage = invocations
+                            .storage_location(ordinal)
+                            .expect("declared physical owner");
+                        architecture.build_storage_unit(storage, context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ResidentUnitsError::Architecture)?,
             );
         }
         Ok(Self {
             architecture,
             graph,
+            layout,
+            invocations,
             units,
             backend: std::marker::PhantomData,
         })
@@ -2010,12 +2168,29 @@ where
                 group,
                 &forward_context,
             ) {
-                let unit_count = self.units[group].len();
-                for (index, unit) in self.units[group].iter_mut().enumerate() {
+                let range = self
+                    .layout
+                    .group_range(group)
+                    .expect("declared execution group");
+                let unit_count = range.len();
+                let storage_start = self
+                    .invocations
+                    .storage_layout()
+                    .group_range(group)
+                    .expect("declared storage group")
+                    .start;
+                for (position, ordinal) in range.enumerate() {
+                    let address = self.layout.address(ordinal).expect("declared invocation");
+                    let index = address.index();
+                    let storage = self
+                        .invocations
+                        .local_location(ordinal)
+                        .expect("validated invocation storage");
+                    let unit = &mut self.units[group][storage.ordinal() - storage_start];
                     if hook.before_unit(
                         group,
                         index,
-                        unit_count - index,
+                        unit_count - position,
                         &mut hidden,
                         &mut forward_context,
                         context,
@@ -2104,17 +2279,22 @@ where
         &mut self.architecture
     }
 
-    /// Borrows resident execution units for loading or inspection.
+    /// Borrows physical owners in canonical storage order for loading or inspection.
     pub fn units(&self) -> &[Vec<A::Unit>] {
         &self.units
     }
 
-    /// Mutably borrows resident execution units for parameter binding.
+    /// Mutably borrows physical owners once for parameter binding.
     pub fn units_mut(&mut self) -> &mut [Vec<A::Unit>] {
         &mut self.units
     }
 
-    /// Decomposes the runtime without cloning backend-native values.
+    /// Retained logical-to-physical ownership used by this runtime.
+    pub fn invocations(&self) -> &crate::ExecutionUnitAddressMap {
+        &self.invocations
+    }
+
+    /// Decomposes the physical pool without cloning backend-native values.
     pub fn into_parts(self) -> (A, Vec<A::Unit>) {
         (
             self.architecture,
@@ -2204,8 +2384,9 @@ where
 
     /// Acquires one populated unit for exclusive execution.
     ///
-    /// The flat ordinal addresses storage while `address` preserves the
-    /// architecture execution group and group-local unit index for scheduling.
+    /// The ordinal and address identify an invocation in the driver layout.
+    /// A selected policy resolves that pair through its retained invocation/storage
+    /// map before admitting or acquiring physical storage.
     fn acquire<E, F>(
         &mut self,
         ordinal: usize,
@@ -2375,6 +2556,19 @@ where
     /// Backend-native graph submission or dependency ordering failed.
     #[error("layerwise backend submission failed: {0}")]
     Submission(String),
+}
+
+impl<A: std::fmt::Display, P: std::fmt::Display> From<crate::ArchitectureExecutionLayoutError<A>>
+    for LayerwiseRuntimeError<A, P>
+{
+    fn from(error: crate::ArchitectureExecutionLayoutError<A>) -> Self {
+        match error {
+            crate::ArchitectureExecutionLayoutError::Architecture(error) => {
+                Self::Architecture(error)
+            }
+            crate::ArchitectureExecutionLayoutError::Layout(error) => Self::Layout(error),
+        }
+    }
 }
 
 /// Bounded-unit runtime invoking the same architecture lifecycle as resident execution.
@@ -2641,14 +2835,12 @@ where
             state,
             context,
             |architecture, group, index, unit, hidden, state, forward, context, observer| {
-                let owned = architecture.observes_unit_boundaries(group, index);
-                let path = owned
-                    .then(|| architecture.unit_path(group, index))
-                    .transpose()?;
-                let input = path
-                    .as_ref()
-                    .map(|path| observe_and_intervene(observer, &format!("{path}.input"), hidden))
-                    .transpose()?;
+                let boundaries = architecture.unit_observation_boundaries(group, index)?;
+                let input = if boundaries.is_kernel_owned() {
+                    boundaries.observe_input(observer, hidden)?
+                } else {
+                    None
+                };
                 let output = execute(
                     architecture,
                     group,
@@ -2659,11 +2851,12 @@ where
                     forward,
                     context,
                 )?;
-                match path {
-                    Some(path) => {
-                        observe_and_intervene(observer, &format!("{path}.output"), &output)
-                    }
-                    None => Ok(output),
+                if boundaries.is_kernel_owned() {
+                    Ok(boundaries
+                        .observe_output(observer, &output)?
+                        .unwrap_or(output))
+                } else {
+                    Ok(output)
                 }
             },
             observer,
@@ -2693,49 +2886,10 @@ where
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if self.architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            self.architecture.unit_path(group, index).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let internal_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
+        let mut hook =
+            ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
+                .map_err(LayerwiseRuntimeError::from)?;
+        let internal_observer = hook.observer.clone();
         self.forward_with_unit_executor_and_traversal_hook(
             input,
             state,
@@ -2864,49 +3018,10 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if self.architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            self.architecture.unit_path(group, index).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let routed_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
+        let mut hook =
+            ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
+                .map_err(LayerwiseRuntimeError::from)?;
+        let routed_observer = hook.observer.clone();
         self.forward_with_unit_executor_and_traversal_hook(
             input,
             state,
@@ -3126,13 +3241,8 @@ where
             .map_err(LayerwiseRuntimeError::Architecture)?;
         let deferred_serial =
             self.policy.permits_deferred_serial_groups() && graph.is_serial_chain();
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                <A as LayeredArchitecture<B, S2>>::group_unit_count(&self.architecture, group)
-                    .map_err(LayerwiseRuntimeError::Architecture)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let layout = <A as LayeredArchitecture<B, S2>>::execution_unit_layout(&self.architecture)
+            .map_err(LayerwiseRuntimeError::from)?;
         if !deferred_serial && self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
             self.executors = Some(
                 B::fork_executors(context, graph.groups().len())
@@ -3231,16 +3341,18 @@ where
                 group,
                 &forward_context,
             ) {
-                let unit_count = layout
+                let range = layout
                     .group_range(group)
-                    .expect("layout covers every graph group")
-                    .len();
-                for index in 0..unit_count {
+                    .expect("layout covers every graph group");
+                let unit_count = range.len();
+                for (position, ordinal) in range.enumerate() {
+                    let address = layout.address(ordinal).expect("declared invocation");
+                    let index = address.index();
                     if hook
                         .before_unit(
                             group,
                             index,
-                            unit_count - index,
+                            unit_count - position,
                             &mut hidden,
                             &mut forward_context,
                             executor,
@@ -3250,12 +3362,6 @@ where
                     {
                         break;
                     }
-                    let ordinal = layout
-                        .ordinal(group, index)
-                        .expect("group-local unit belongs to the layout");
-                    let address = layout
-                        .address(ordinal)
-                        .expect("group-local unit has a stable policy address");
                     let lease = policy
                         .acquire(ordinal, address, |executor| {
                             <A as LayeredArchitecture<B, S2>>::build_unit(
@@ -3553,49 +3659,10 @@ where
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if self.architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            self.architecture.unit_path(group, index).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let internal_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
+        let mut hook =
+            ActivationObserverTraversalHook::new::<A, B, S>(&self.architecture, observer)
+                .map_err(LayerwiseRuntimeError::from)?;
+        let internal_observer = hook.observer.clone();
         self.forward_parallel_with_unit_executor_and_traversal_hook(
             input,
             state,
@@ -3650,20 +3717,22 @@ where
             parallel,
             context,
             |architecture, group, index, unit, hidden, state, forward, parallel, context| {
-                let path = architecture.unit_path(group, index)?;
-                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+                let boundaries = architecture.unit_observation_boundaries(group, index)?;
+                let input = boundaries.observe_input(observer, hidden)?;
                 let output = execute(
                     architecture,
                     group,
                     index,
                     unit,
-                    &input,
+                    input.as_ref().unwrap_or(hidden),
                     state,
                     forward,
                     parallel,
                     context,
                 )?;
-                observe_and_intervene(observer, &format!("{path}.output"), &output)
+                Ok(boundaries
+                    .observe_output(observer, &output)?
+                    .unwrap_or(output))
             },
         )
     }
@@ -3892,13 +3961,9 @@ where
         let initialized = (|| {
             let graph = <A as LayeredArchitecture<B, S2>>::execution_graph(&self.architecture)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            let counts = (0..graph.groups().len())
-                .map(|group| {
-                    <A as LayeredArchitecture<B, S2>>::group_unit_count(&self.architecture, group)
-                        .map_err(LayerwiseRuntimeError::Architecture)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let layout = ExecutionUnitLayout::new(&graph, counts)?;
+            let layout =
+                <A as LayeredArchitecture<B, S2>>::execution_unit_layout(&self.architecture)
+                    .map_err(LayerwiseRuntimeError::from)?;
             if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
                 self.executors = Some(
                     B::fork_executors(context, graph.groups().len())
@@ -4019,16 +4084,18 @@ where
                 group,
                 &forward_context,
             ) {
-                let unit_count = layout
+                let range = layout
                     .group_range(group)
-                    .expect("layout covers every graph group")
-                    .len();
-                for index in 0..unit_count {
+                    .expect("layout covers every graph group");
+                let unit_count = range.len();
+                for (position, ordinal) in range.enumerate() {
+                    let address = layout.address(ordinal).expect("declared invocation");
+                    let index = address.index();
                     let action = hook
                         .before_unit(
                             group,
                             index,
-                            unit_count - index,
+                            unit_count - position,
                             &mut hidden,
                             &mut forward_context,
                             executor,
@@ -4043,12 +4110,6 @@ where
                     {
                         break;
                     }
-                    let ordinal = layout
-                        .ordinal(group, index)
-                        .expect("group-local unit belongs to the layout");
-                    let address = layout
-                        .address(ordinal)
-                        .expect("group-local unit has a stable policy address");
                     let acquired = policy
                         .acquire(ordinal, address, |executor| {
                             <A as LayeredArchitecture<B, S2>>::build_unit(

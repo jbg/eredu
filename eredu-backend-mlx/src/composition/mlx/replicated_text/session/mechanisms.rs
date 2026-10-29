@@ -80,8 +80,7 @@ where
 }
 
 pub(in crate::composition::mlx::replicated_text) struct PreparedExactBindings {
-    layout: eredu_runtime::ExecutionUnitLayout,
-    addresses: Vec<eredu_runtime::ExecutionUnitAddress>,
+    invocations: eredu_runtime::ExecutionUnitAddressMap,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
     excluded_parameters: std::collections::BTreeSet<String>,
@@ -165,8 +164,7 @@ where
         source_layout: Option<&eredu_runtime::LocalModelLayout>,
         tasks: &[ReplicatedTextMaterializationTask],
     ) -> Result<(), Error> {
-        let task_groups = eredu_runtime::group_replicated_text_transform_tasks(tasks)
-            .map_err(|error| Error::Quantization(error.to_string()))?;
+        let task_groups = eredu_runtime::group_replicated_text_transform_tasks(tasks)?;
         if task_groups.is_empty() {
             if source_architecture.is_some() || source_units.is_some() {
                 return Err(Error::Quantization(
@@ -191,27 +189,17 @@ where
         }
         let source_static = source.static_modules();
         let target_static = target_architecture.static_modules();
-        let mut combined = eredu_runtime::WeightMaterializationReport::default();
-        for group in task_groups {
-            let exact_tasks = group
-                .tasks(tasks)
-                .map_err(|error| Error::Quantization(error.to_string()))?;
-            #[cfg(test)]
-            crate::tests::support::path_instrumentation::materialization();
-            let (store, report) = quantize_exact_replicated_text_tasks(
-                Arc::clone(&self.store),
-                source_static,
-                target_static,
-                source_units,
-                target_units,
-                source_layout,
-                group.quantization(),
-                &exact_tasks,
-                &self.stream,
-            )?;
-            self.store = store;
-            combined.merge(report);
-        }
+        let combined = materialize_replicated_text_transform_groups(
+            &mut self.store,
+            source_static,
+            target_static,
+            source_units,
+            target_units,
+            source_layout,
+            tasks,
+            &task_groups,
+            &self.stream,
+        )?;
         self.materialization = Some(combined);
         Ok(())
     }
@@ -221,8 +209,7 @@ where
         &mut self,
         architecture: &A,
         source_architecture: Option<&A>,
-        global_layout: &eredu_runtime::ExecutionUnitLayout,
-        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        invocations: &eredu_runtime::ExecutionUnitAddressMap,
         task_plan: &eredu_runtime::ReplicatedTextMaterializationPartitionPlan,
         units: &[A::Unit],
         source_units: Option<&[A::Unit]>,
@@ -230,12 +217,19 @@ where
         tasks: &[ReplicatedTextMaterializationTask],
         addressable_parameters: &std::collections::BTreeSet<String>,
     ) -> Result<(), Error> {
+        let addresses = (0..invocations.storage_layout().len())
+            .map(|ordinal| {
+                invocations
+                    .storage_layout()
+                    .address(ordinal)
+                    .expect("declared physical owner")
+            })
+            .collect::<Vec<_>>();
         if addresses.len() != units.len() || addresses.is_empty() {
             return Err(Error::ArchitectureModel(
                 "local partition addresses and constructed units differ".into(),
             ));
         }
-        let _ = global_layout;
         let static_tasks = task_plan
             .static_tasks(tasks)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -300,31 +294,17 @@ where
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let graph = architecture
-            .execution_graph()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                addresses
-                    .iter()
-                    .filter(|address| address.group() == group)
-                    .count()
-            })
-            .collect::<Vec<_>>();
-        let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, counts)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         (self.prepared_parameters, self.parameter_declarations) =
             super::prepared_parameters::collect::<A, S>(
                 architecture,
                 units,
-                addresses,
+                &addresses,
                 &static_bindings,
                 &unit_bindings,
                 self.store.as_ref(),
             )?;
         self.prepared_bindings = Some(PreparedExactBindings {
-            layout,
-            addresses: addresses.to_vec(),
+            invocations: invocations.clone(),
             static_bindings,
             unit_bindings,
             excluded_parameters,
@@ -348,21 +328,13 @@ where
         &mut self,
         architecture: &mut A,
         selected: &SelectedReplicatedTextRealization,
-    ) -> Result<
-        (
-            MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
-            eredu_runtime::ExecutionUnitLayout,
-            Vec<eredu_runtime::ExecutionUnitAddress>,
-        ),
-        Error,
-    >
+    ) -> Result<MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>, Error>
     where
         A::Unit: 'static,
     {
         let prepared = self.prepared_bindings.take().ok_or_else(|| {
             Error::ArchitectureModel("execution policy requested before materialization".into())
         })?;
-        let layout = prepared.layout.clone();
         let mut ignored_sources = self.ignored_checkpoint_sources.clone();
         ignored_sources.extend(
             selected
@@ -408,7 +380,7 @@ where
             &self.stream,
             &self.weights_stream,
             move |key| ignored_sources.contains(key),
-            prepared.layout,
+            prepared.invocations,
             prepared.static_bindings,
             prepared.unit_bindings,
             std::mem::take(&mut self.prediction_residency.units),
@@ -423,7 +395,7 @@ where
             )?;
         self.prediction_residency
             .install(policy.residency_manager())?;
-        Ok((policy, layout, prepared.addresses))
+        Ok(policy)
     }
 }
 
@@ -475,8 +447,7 @@ where
     fn prepare_partition_materialization(
         &mut self,
         architecture: &mut A,
-        global_layout: &eredu_runtime::ExecutionUnitLayout,
-        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        invocations: &eredu_runtime::ExecutionUnitAddressMap,
         task_partition: &eredu_runtime::ReplicatedTextMaterializationPartitionPlan,
         units: &mut [A::Unit],
         source_architecture: Option<&mut A>,
@@ -493,8 +464,7 @@ where
         self.prepare_local_partition_materialization_with_addressable_parameters(
             architecture,
             source_architecture.as_deref(),
-            global_layout,
-            addresses,
+            invocations,
             task_partition,
             units,
             source_units.as_deref(),
@@ -507,7 +477,7 @@ where
     fn prepare_materialization(
         &mut self,
         architecture: &mut A,
-        target_layout: &eredu_runtime::ExecutionUnitLayout,
+        invocations: &eredu_runtime::ExecutionUnitAddressMap,
         target_units: &mut [A::Unit],
         source_architecture: Option<&mut A>,
         source_units: Option<&mut [A::Unit]>,
@@ -515,6 +485,7 @@ where
         addressable_parameters: &[String],
         _context: &Stream,
     ) -> Result<(), Self::Error> {
+        let target_layout = invocations.storage_layout();
         if target_units.len() != target_layout.len() {
             return Err(Error::ArchitectureModel(
                 "neutral target unit set differs from the selected execution layout".into(),
@@ -589,8 +560,7 @@ where
                 self.store.as_ref(),
             )?;
         self.prepared_bindings = Some(PreparedExactBindings {
-            layout: target_layout.clone(),
-            addresses,
+            invocations: invocations.clone(),
             static_bindings,
             unit_bindings,
             excluded_parameters: addressable_parameters,
@@ -618,11 +588,11 @@ where
         selected: &SelectedReplicatedTextRealization,
         context: &Stream,
     ) -> Result<Self::ResidentPolicy, Self::Error> {
-        let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
+        let policy = self.take_prepared_policy(architecture, selected)?;
         let residency = policy.residency_manager().clone();
         let resident = policy.into_resident_units(units, context)?;
         self.resident_residency = Some(residency);
-        MlxSelectedLayerwisePolicy::resident(resident, &layout, &addresses)
+        Ok(MlxSelectedLayerwisePolicy::resident(resident))
     }
 
     fn bounded_policy(
@@ -632,9 +602,7 @@ where
         _context: &Stream,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
         self.take_prepared_policy(architecture, selected)
-            .and_then(|(policy, layout, addresses)| {
-                MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)
-            })
+            .map(MlxSelectedLayerwisePolicy::bounded)
     }
 
     fn index_text_output(

@@ -11,11 +11,11 @@ pub use tensor::PreparedTensorPrediction;
 #[derive(Clone)]
 pub struct PreparedPrediction {
     pub(super) spec: PredictionSpec,
-    shared: PreparedParameters,
-    vocabulary: PreparedParameters,
-    units: Vec<PreparedParameters>,
+    shared: PreparedParameterRecipes,
+    vocabulary: PreparedParameterRecipes,
+    units: Vec<PreparedParameterRecipes>,
     pub(super) artifact: SharedCheckpointSource,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
 }
 impl PreparedTarget {
     /// Prepares embedded prediction without reading any additional tensor payload.
@@ -48,22 +48,36 @@ impl PreparedTarget {
             .ok_or(PreparationError::MissingPrediction)?;
         let vocabulary = self
             .static_parameters
-            .recipes
+            .recipes()
             .iter()
             .filter(|(name, _)| {
                 name.starts_with("model.embed_tokens.")
                     || (self.spec.head.is_some() && name.starts_with("lm_head."))
             })
-            .map(|(name, recipe)| (name.clone(), recipe.clone()))
+            .map(|(name, _)| name.clone())
             .collect();
         let units = recipes
             .iter()
-            .map(|recipes| PreparedParameters::new(self.artifact.clone(), recipes.clone()))
+            .map(|recipes| {
+                PreparedParameterRecipes::new(
+                    "qwen4_exp prepared owner",
+                    self.artifact.clone(),
+                    recipes.clone(),
+                )
+                .map_err(PreparationError::from)
+            })
             .collect::<Result<_, _>>()?;
         Ok(PreparedPrediction {
             spec,
-            shared: PreparedParameters::new(self.artifact.clone(), shared.clone())?,
-            vocabulary: PreparedParameters::new(self.artifact.clone(), vocabulary)?,
+            shared: PreparedParameterRecipes::new(
+                "qwen4_exp prepared owner",
+                self.artifact.clone(),
+                shared.clone(),
+            )?,
+            vocabulary: self
+                .static_parameters
+                .clone()
+                .project("qwen4_exp prepared owner", &vocabulary)?,
             units,
             artifact: self.artifact.clone(),
             expert_banks: self
@@ -81,15 +95,15 @@ impl PreparedPrediction {
         &self.spec
     }
     /// Shared residual fusion and prediction readout; no target readout or vocabulary.
-    pub fn shared(&self) -> &PreparedParameters {
+    pub fn shared(&self) -> &PreparedParameterRecipes {
         &self.shared
     }
     /// Restricted references to the target's physical embedding/output parameters.
-    pub fn vocabulary(&self) -> &PreparedParameters {
+    pub fn vocabulary(&self) -> &PreparedParameterRecipes {
         &self.vocabulary
     }
     /// Ordinary parameters of one independently materializable depth.
-    pub fn unit(&self, depth: usize) -> Result<&PreparedParameters, PreparationError> {
+    pub fn unit(&self, depth: usize) -> Result<&PreparedParameterRecipes, PreparationError> {
         self.units.get(depth).ok_or_else(|| {
             PreparationError::Contract("prediction depth is outside the artifact schedule".into())
         })
@@ -99,16 +113,18 @@ impl PreparedPrediction {
         &self,
         depth: usize,
         expert: usize,
-    ) -> Result<PreparedParameters, PreparationError> {
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
         self.unit(depth)?;
         let root = format!("mtp.layers.{depth}.mlp.experts");
         let recipes = select_expert(&self.expert_banks, &root, expert)?;
-        PreparedParameters::new(
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
             self.artifact.clone(),
             recipes
                 .into_iter()
                 .map(|(name, recipe)| (format!("{root}.{name}"), recipe))
                 .collect(),
         )
+        .map_err(PreparationError::from)
     }
 }

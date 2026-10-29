@@ -1,28 +1,30 @@
 //! Cold exact binding plans for independently leased TTS RVQ units.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{RecipeDtype, RecipeError},
+    store::SharedCheckpointSource,
 };
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    ComponentPreparationError, LocalModelLayout, PreparedComponent, WeightBinding,
 };
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
-    parameters::{execution_parameter, SpeechParameterError},
+    parameters::{admitted_member, execution_parameter, SpeechParameterError},
     tts_mog::TtsError,
     tts_rvq::RvqDimensions,
-    tts_rvq_layered::rvq_parameter_description,
+    tts_rvq_layered::rvq_component_definition,
 };
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum RvqPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// Selected communication lacks membership, bounded completion or required operations.
     #[error(transparent)]
     Coordination(#[from] eredu_runtime::replicated_execution::CollectiveCoordinationError),
@@ -35,18 +37,9 @@ pub enum RvqPreparationError {
     /// A required parameter is missing from the selected component.
     #[error(transparent)]
     Parameters(#[from] SpeechParameterError),
-    /// Source restriction failed.
-    #[error(transparent)]
-    Source(#[from] StoreError),
     /// A recipe disagrees with its exact source metadata.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
-    /// Exact recipe binding cannot be represented.
-    #[error(transparent)]
-    Binding(#[from] RecipeBindingError),
-    /// Shared physical placement cannot be applied to an exact recipe.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
     /// Tensor topology or retained placement is inconsistent.
     #[error("invalid RVQ tensor partition: {0}")]
     Parallel(String),
@@ -63,10 +56,7 @@ pub enum RvqPreparationError {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedRvqBindings {
     dimensions: RvqDimensions,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
-    local_layout: Option<LocalModelLayout>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedRvqBindings {
@@ -92,85 +82,24 @@ impl PreparedRvqBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, RvqPreparationError> {
-        let description = rvq_parameter_description(dimensions)?;
-        let layout = description.unit_layout().clone();
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(RvqPreparationError::Geometry(
-                    "unexpected static RVQ owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
+        let definition = rvq_component_definition(dimensions)?;
+        let prepared = PreparedComponent::prepare(
+            "voicechat/tts_rvq/leased-units",
+            definition,
+            source.clone(),
+            |member| {
                 let name = member.target();
-                let parameter = parameters
-                    .get(name)
-                    .filter(|p| p.component == Component::Tts)
-                    .ok_or_else(|| SpeechParameterError::MissingParameter {
-                        component: Component::Tts,
-                        name: name.into(),
-                    })?;
-                if parameter.output.shape != member.global_shape()
-                    || parameter.recipe.infer(source.as_ref())? != parameter.output
-                {
-                    return Err(RvqPreparationError::Geometry(name.into()));
-                }
+                let parameter = admitted_member(parameters, &source, Component::Tts, member)?;
                 let parameter = execution_parameter(parameter, &source)?;
                 if parameter.output.dtype != RecipeDtype::F32 {
                     return Err(RvqPreparationError::Geometry(name.into()));
                 }
-                unit_recipes[ordinal].insert(name.into(), parameter.recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
-            "voicechat/tts_rvq/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !targets.contains(&target) {
-                            return Err(RvqPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(RvqPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, RvqPreparationError>>()?;
+                Ok(parameter.recipe)
+            },
+        )?;
         Ok(Self {
             dimensions,
-            layout,
-            source,
-            units,
-            local_layout: None,
+            prepared,
         })
     }
 
@@ -180,48 +109,20 @@ impl PreparedRvqBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), RvqPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(RvqPreparationError::Parallel(
-                "RVQ component selection requires a tensor-only topology".into(),
-            ));
-        }
-        let description = rvq_parameter_description(self.dimensions)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(RvqPreparationError::Parallel)?;
-        if let Some(selected) = self.local_layout.as_ref() {
-            if selected != &layout {
-                return Err(RvqPreparationError::Parallel(
-                    "retained RVQ placement differs from the tensor topology".into(),
-                ));
-            }
-            return Ok((self, layout));
-        }
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 
     /// Lowers each canonical binding through the selected shared physical layout.
     pub fn into_parallel(mut self, layout: &LocalModelLayout) -> Result<Self, RvqPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(RvqPreparationError::Parallel(
-                "RVQ bindings already have a tensor partition".into(),
-            ));
-        }
         super::tts_rvq_layered::rvq_local_dimensions(self.dimensions, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
 
     /// Exact retained tensor placement, when selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
 
     /// Validated RVQ geometry; no other speech stack is selected.
@@ -231,12 +132,17 @@ impl PreparedRvqBindings {
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
 
     /// Restricted retained source used by these exact bindings.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
+    }
+
+    /// Validated semantic declaration retained by this exact preparation.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
@@ -244,18 +150,17 @@ impl PreparedRvqBindings {
         self,
     ) -> (
         RvqDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (
-            self.dimensions,
-            self.local_layout,
-            self.layout,
-            self.source,
-            self.units,
-        )
+        let (definition, local, layout, source, units) = self
+            .prepared
+            .into_declared_unit_parts()
+            .expect("RVQ declares only independently leased units");
+        (self.dimensions, definition, local, layout, source, units)
     }
 }
 

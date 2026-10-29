@@ -61,7 +61,14 @@ where
     }
     let selected_args = crate::replicated_text::selected_qwen_hybrid_args(args, selected.base())
         .map_err(architecture)?;
-    let parameters = parameter_description::<B>(&selected_args, context).map_err(architecture)?;
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("Qwen hybrid selection has no retained definition"))?;
+    let definition =
+        crate::qwen::hybrid::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -74,43 +81,34 @@ where
             "dense Qwen hybrid admission names another execution group",
         ));
     }
-    let start = owned.units().start;
     let geometry =
         crate::qwen::hybrid::local_geometry(&selected_args, &layout).map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry.clone(),
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(architecture)?;
-    validate_partitioned_binding(selected.requirements(), &partition).map_err(architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry.clone(),
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
+        )
+        .map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
         &partition,
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().uses_weight_transform() {
         let source_args = args.clone();
-        let source_parameters =
-            parameter_description::<B>(&source_args, context).map_err(architecture)?;
-        validate_transform_parameter_space(&source_parameters, &parameters)
+        let source_definition = crate::qwen::hybrid::project_parameters(&source_args, &retained)
             .map_err(architecture)?;
+        let source_parameters = source_definition.parameters().clone();
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry = crate::qwen::hybrid::local_geometry(&source_args, &source_layout)
             .map_err(architecture)?;
         if source_geometry.state_layout() != &complete_state {
@@ -118,31 +116,23 @@ where
                 "dense Qwen hybrid transform source changed local state geometry",
             ));
         }
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
-        )
-        .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry.clone(),
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+            )
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "dense Qwen hybrid transform source changed local unit addresses",
-            ));
-        }
-        let mut model = crate::qwen::hybrid::LayeredModel::<B>::new_parallel(
+        let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             source_args,
-            source_geometry,
+            source_definition,
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
-        model.retain_global_parameters(source_parameters);
-        model.set_partition_target_start(start);
         Some((model, source_layout))
     } else {
         None
@@ -150,11 +140,13 @@ where
     let capability_estimate =
         crate::capability::qwen_hybrid_text(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let mut model =
-        crate::qwen::hybrid::LayeredModel::<B>::new_parallel(selected_args, geometry, context)
-            .map_err(architecture)?;
-    model.retain_global_parameters(parameters.clone());
-    model.set_partition_target_start(start);
+    let model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
+        selected_args,
+        definition,
+        &partition,
+        context,
+    )
+    .map_err(architecture)?;
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition)
         .map_err(architecture)?;
     finish(
@@ -199,17 +191,6 @@ where
     })
 }
 
-fn parameter_description<B>(
-    args: &crate::qwen::hybrid::HybridConfig,
-    context: &<B::Tensor as eredu_nn::Tensor>::Context,
-) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_nn::Error>
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-{
-    let model = crate::qwen::hybrid::LayeredModel::<B>::new(args.clone(), context)?;
-    eredu_runtime::ArchitectureParameters::parameter_description(&model, context)
-}
-
 pub(super) fn prepare_routed<B, S, V>(
     args: &crate::qwen::hybrid::HybridConfig,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
@@ -233,7 +214,15 @@ where
     let selected_args =
         crate::replicated_text::selected_qwen_hybrid_args(args, selected.base().text())
             .map_err(architecture)?;
-    let parameters = parameter_description::<B>(&selected_args, context).map_err(architecture)?;
+    let retained = selected
+        .base()
+        .text()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("Qwen hybrid selection has no retained definition"))?;
+    let definition =
+        crate::qwen::hybrid::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -246,7 +235,6 @@ where
             "routed Qwen hybrid admission names another execution group",
         ));
     }
-    let start = owned.units().start;
     let geometry =
         crate::qwen::hybrid::local_geometry(&selected_args, &layout).map_err(architecture)?;
     let plan =
@@ -254,29 +242,23 @@ where
             .map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry.clone(),
-        eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
-    )
-    .map_err(architecture)?;
-    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry.clone(),
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
         )
-    }) {
-        let source_parameters = parameter_description::<B>(args, context).map_err(architecture)?;
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
+        .map_err(architecture)?;
+    let source_architecture = if selected.base().text().uses_weight_transform() {
+        let source_definition =
+            crate::qwen::hybrid::project_parameters(args, &retained).map_err(architecture)?;
+        let source_parameters = source_definition.parameters().clone();
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::qwen::hybrid::local_geometry(args, &source_layout).map_err(architecture)?;
         if source_geometry.state_layout() != &complete_state {
@@ -287,32 +269,24 @@ where
         let source_plan =
             crate::qwen::hybrid::partition_expert_realization_plan(args, &source_geometry, rank)
                 .map_err(architecture)?;
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry.clone(),
-            eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
-        )
-        .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry.clone(),
+                eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+            )
             .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "routed Qwen hybrid transform source changed local unit addresses",
-            ));
-        }
-        let mut model = crate::qwen::hybrid::LayeredModel::<B>::new_parallel(
+        let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
             args.clone(),
-            source_geometry,
+            source_definition,
+            &source_partition,
             context,
         )
         .map_err(architecture)?;
-        model.retain_global_parameters(source_parameters);
-        model.set_partition_target_start(start);
-        model.install_expert_realization(source_plan);
+        model.kernel_mut().install_expert_realization(source_plan);
         Some((model, source_layout))
     } else {
         None
@@ -320,12 +294,14 @@ where
     let capability_estimate =
         crate::capability::qwen_hybrid_text(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let mut model =
-        crate::qwen::hybrid::LayeredModel::<B>::new_parallel(selected_args, geometry, context)
-            .map_err(architecture)?;
-    model.retain_global_parameters(parameters.clone());
-    model.set_partition_target_start(start);
-    model.install_expert_realization(plan.clone());
+    let mut model = crate::qwen::hybrid::QwenKernel::<B>::from_partition(
+        selected_args,
+        definition,
+        &partition,
+        context,
+    )
+    .map_err(architecture)?;
+    model.kernel_mut().install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         model,
         source_architecture,

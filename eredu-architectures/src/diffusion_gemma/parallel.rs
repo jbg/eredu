@@ -5,7 +5,7 @@ use crate::gemma4::ModelArgs;
 use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
     expand_linear_format_parameter_groups, LocalModelLayout, MemberSharding, ParallelPlanError,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout,
 };
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
@@ -17,7 +17,16 @@ pub fn static_parameter_groups(
     config: &FamilyConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let args = &config.text;
-    let mut groups = crate::gemma4::parallel::static_parameter_groups_at(args, "model.decoder")?;
+    let mut groups = super::text::static_construction_specs(config)
+        .map_err(|error| invalid(error.to_string()))?
+        .pinned_parameter_groups(
+            "model.decoder.embed_tokens",
+            "model.decoder.norm",
+            "lm_head",
+        )?
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect::<Vec<_>>();
     let hidden =
         usize::try_from(args.hidden_size).map_err(|_| invalid("invalid feedback hidden width"))?;
     let width = args
@@ -99,7 +108,7 @@ pub struct LocalGeometry {
     output: Option<VocabularyParallelRange>,
     conditioning_width: Option<i32>,
     norm: bool,
-    state: StateLayout,
+    state: Option<StateLayout>,
     fingerprint: String,
 }
 
@@ -109,8 +118,33 @@ impl LocalGeometry {
         self.units.clone()
     }
     /// Local state geometry in the same order as owned stack units.
-    pub fn state_layout(&self) -> &StateLayout {
-        &self.state
+    pub fn state_layout(&self) -> Option<&StateLayout> {
+        self.state.as_ref()
+    }
+    /// Complete global slot schedule with this coordinate's owned heads localized.
+    /// Unowned slots retain global geometry and are excluded by partition selection.
+    pub fn complete_state_layout(
+        &self,
+        config: &FamilyConfig,
+    ) -> Result<StateLayout, ParallelPlanError> {
+        self.validate_for(config)?;
+        let mut schedule = super::state_layout(config)
+            .map_err(|error| invalid(error.to_string()))?
+            .layers()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for (global, policy) in self
+            .units()
+            .zip(self.state.iter().flat_map(|state| state.layers().iter()))
+        {
+            schedule[global] = policy.clone();
+        }
+        StateLayout::new(
+            eredu_core::LayerSchedule::new(schedule.len(), schedule)
+                .map_err(|error| invalid(error.to_string()))?,
+        )
+        .map_err(|error| invalid(error.to_string()))
     }
     /// Exact per-unit head, dense and routed widths.
     pub fn block_args(&self, global_index: usize) -> Option<&ModelArgs> {
@@ -134,6 +168,44 @@ impl LocalGeometry {
     pub fn conditioning_width(&self) -> Option<i32> {
         self.conditioning_width
     }
+    /// Projects pinned ownership by canonical identity without changing retained placement.
+    pub(super) fn select_pinned_resources(
+        &self,
+        config: &FamilyConfig,
+        definition: &eredu_runtime::ComponentDefinition,
+        bindings: &[eredu_runtime::OwnedParameterGroupSpec],
+    ) -> Result<Self, eredu_nn::Error> {
+        self.validate_for(config)
+            .map_err(eredu_nn::Error::backend_source)?;
+        let roles = definition.select_complete_pinned_roles(
+            bindings,
+            &["embedding", "norm", "output", "conditioning"],
+        )?;
+        let mut selected = self.clone();
+        let embedding = roles.contains("embedding")
+            || (config.text.tie_word_embeddings && roles.contains("output"));
+        let output = !config.text.tie_word_embeddings && roles.contains("output");
+        if (embedding && self.embedding.is_none())
+            || (output && self.output.is_none())
+            || (roles.contains("norm") && !self.norm)
+            || (roles.contains("conditioning") && self.conditioning_width.is_none())
+        {
+            return Err(eredu_nn::Error::backend(
+                "diffusion selected pinned resource has no retained placement",
+            ));
+        }
+        if !embedding {
+            selected.embedding = None;
+        }
+        if !output {
+            selected.output = None;
+        }
+        if !roles.contains("conditioning") {
+            selected.conditioning_width = None;
+        }
+        selected.norm = roles.contains("norm");
+        Ok(selected)
+    }
     /// Rejects reuse of local geometry with a different family configuration.
     pub fn validate_for(&self, config: &FamilyConfig) -> Result<(), ParallelPlanError> {
         if self.fingerprint != config.architecture_fingerprint() {
@@ -145,37 +217,6 @@ impl LocalGeometry {
     }
 }
 
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    target: &str,
-    vocabulary: i32,
-) -> Result<Option<VocabularyParallelRange>, ParallelPlanError> {
-    let Some(tensor) = layout.tensor(target) else {
-        return Ok(None);
-    };
-    let local = match tensor.placement() {
-        TensorPlacement::Replicated => 0..vocabulary as usize,
-        TensorPlacement::Range {
-            axis: 0,
-            start,
-            end,
-        } => *start..*end,
-        _ => {
-            return Err(invalid(
-                "diffusion vocabulary placement must select complete rows",
-            ))
-        }
-    };
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary as usize,
-        local,
-    };
-    range
-        .validate_global_rows(vocabulary)
-        .map_err(|error| invalid(error.to_string()))?;
-    Ok(Some(range))
-}
-
 /// Derives local invocation geometry without duplicating shared parameters.
 pub fn local_geometry(
     config: &FamilyConfig,
@@ -184,7 +225,7 @@ pub fn local_geometry(
 ) -> Result<LocalGeometry, ParallelPlanError> {
     if units.start > units.end || units.end > config.text.num_hidden_layers() {
         return Err(invalid(
-            "diffusion local stack range is empty or out of bounds",
+            "diffusion local stack range is reversed or out of bounds",
         ));
     }
     let blocks = units
@@ -213,11 +254,17 @@ pub fn local_geometry(
             .map_err(|error| invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let state = StateLayout::new(
-        eredu_core::LayerSchedule::new(policies.len(), policies)
+    let state = if policies.is_empty() {
+        None
+    } else {
+        Some(
+            StateLayout::new(
+                eredu_core::LayerSchedule::new(policies.len(), policies)
+                    .map_err(|error| invalid(error.to_string()))?,
+            )
             .map_err(|error| invalid(error.to_string()))?,
-    )
-    .map_err(|error| invalid(error.to_string()))?;
+        )
+    };
     let conditioning_width = layout
         .tensor("model.decoder.self_conditioning.gate_proj.weight")
         .map(|tensor| {
@@ -231,18 +278,22 @@ pub fn local_geometry(
                 .ok_or_else(|| invalid("feedback local width is empty or exceeds i32"))
         })
         .transpose()?;
+    let (embedding, output) = super::text::static_construction_specs(config)
+        .map_err(|error| invalid(error.to_string()))?
+        .selected_vocabulary_ranges(
+            layout,
+            "model.decoder.embed_tokens",
+            "model.decoder.norm",
+            "lm_head",
+        )?;
     Ok(LocalGeometry {
         blocks,
         units,
         state,
         conditioning_width,
         norm: layout.tensor("model.decoder.norm.weight").is_some(),
-        embedding: vocabulary_range(
-            layout,
-            "model.decoder.embed_tokens.weight",
-            config.text.vocab_size,
-        )?,
-        output: vocabulary_range(layout, "lm_head.weight", config.text.vocab_size)?,
+        embedding,
+        output,
         fingerprint: config.architecture_fingerprint(),
     })
 }
@@ -252,7 +303,7 @@ pub fn local_geometry(
 /// interval is materialized or used for admission on this rank.
 pub fn partition(
     config: &FamilyConfig,
-    parameters: &eredu_runtime::ArchitectureParameterDescription,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     layout: &LocalModelLayout,
     units: std::ops::Range<usize>,
     ownership: eredu_runtime::PartitionOwnership,
@@ -261,31 +312,14 @@ pub fn partition(
     ParallelPlanError,
 > {
     let geometry = local_geometry(config, layout, units.clone())?;
-    let mut schedule = super::state_layout(config)
-        .map_err(|error| invalid(error.to_string()))?
-        .layers()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for (global, policy) in units.clone().zip(geometry.state_layout().layers().iter()) {
-        schedule[global] = policy.clone();
-    }
-    let complete = StateLayout::new(
-        eredu_core::LayerSchedule::new(schedule.len(), schedule)
-            .map_err(|error| invalid(error.to_string()))?,
-    )
-    .map_err(|error| invalid(error.to_string()))?;
+    let definition = super::model::select_definition(config, definition, Some(&geometry))
+        .map_err(|error| invalid(error.to_string()))?;
     eredu_runtime::ArchitecturePartition::from_description(
-        parameters,
+        definition.parameters(),
         [(super::model::TEXT_EXECUTION_GROUP, units)],
         ownership,
-        &complete,
-        &eredu_runtime::ArchitectureStatePartitionPlan::new([
-            eredu_runtime::ArchitectureStatePartitionRule::group_units(
-                0,
-                0..config.text.num_hidden_layers(),
-            ),
-        ]),
+        definition.state_layout(),
+        definition.state_partition_plan(),
         geometry,
         super::boundary::TextBoundarySchema::new(config.text.hidden_size),
     )
@@ -359,13 +393,8 @@ pub fn parameter_description(
             ));
         }
     }
-    eredu_runtime::ArchitectureParameterDescription::new(
-        &graph,
-        &layout,
-        owned.iter().map(|owned| owned.group().clone()),
-        owned.clone(),
-    )
-    .map_err(|error| invalid(error.to_string()))
+    eredu_runtime::ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 /// Exact image-stack cuts and rank-local shared text state.

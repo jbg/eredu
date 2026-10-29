@@ -3,8 +3,7 @@
 use eredu_codec::{
     prvq::{Codebook, DistanceMetric, Geometry, Quantized},
     prvq_layered::{
-        LayerwiseQuantizer, QuantizerArchitecture, QuantizerExecution, QuantizerInput,
-        QuantizerRuntimeState,
+        ParallelQuantizerExecution, QuantizerExecution, QuantizerInput, QuantizerKernel,
     },
     prvq_preparation::{validate_parallel_communication, PreparedQuantizerBindings},
     Error,
@@ -12,8 +11,9 @@ use eredu_codec::{
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport,
+    ComponentAdapter, ComponentDefinition, DenseDiskStreamReport, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout, ResidencyReport,
+    StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
@@ -33,9 +33,15 @@ use crate::{
 };
 
 type Unit = Codebook<MlxTensor>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, QuantizerKernel<MlxNeuralBackend>>,
+    MlxNeuralBackend,
+    StatelessComponentState,
+    P,
+>;
 enum Execution {
-    Resident(LayerwiseQuantizer<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwiseQuantizer<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native PRVQ codebooks over the selected shared resident or bounded parameter policy.
@@ -49,8 +55,8 @@ impl MlxPrvq {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -60,7 +66,6 @@ impl MlxPrvq {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -70,8 +75,8 @@ impl MlxPrvq {
     /// Number of pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -244,19 +249,22 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (geometry, prefix, local_layout, layout, source, units) = prepared.into_parts();
-            let mut architecture = match local_layout.as_ref() {
-                Some(local) => QuantizerArchitecture::<MlxNeuralBackend>::new_parallel(
-                    geometry, &prefix, local,
-                ),
-                None => QuantizerArchitecture::<MlxNeuralBackend>::new(geometry, &prefix),
+            let (geometry, prefix, definition, local_layout, layout, source, units) =
+                prepared.into_parts();
+            let kernel = match local_layout.as_ref() {
+                Some(local) => {
+                    QuantizerKernel::<MlxNeuralBackend>::new_parallel(geometry, &prefix, local)
+                }
+                None => QuantizerKernel::<MlxNeuralBackend>::new(geometry, &prefix),
             }
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(Error::from(error)))?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<QuantizerRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -271,12 +279,12 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<QuantizerRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwiseQuantizer::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwiseQuantizer::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxPrvq {

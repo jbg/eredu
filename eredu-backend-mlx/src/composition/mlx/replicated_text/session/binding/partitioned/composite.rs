@@ -29,11 +29,11 @@ where
     ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-                PreparedCompositeArchitecture<A>,
+                A,
                 MlxNeuralBackend,
                 MlxHybridState,
-                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
             > + MlxParameterBankTelemetry
             + 'static;
 }
@@ -51,11 +51,11 @@ where
     ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-                PreparedCompositeArchitecture<A>,
+                A,
                 MlxNeuralBackend,
                 MlxHybridState,
-                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
             > + MlxParameterBankTelemetry
             + 'static,
     {
@@ -70,7 +70,7 @@ where
     A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
     P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
-            PreparedCompositeArchitecture<A>,
+            A,
             MlxNeuralBackend,
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
@@ -81,10 +81,9 @@ where
         crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
         Error,
     > {
-        crate::composition::mlx::replicated_text::prediction::parameters::residency::<
-            PreparedCompositeArchitecture<A>,
-            P,
-        >(&mut self.prediction.extension)
+        crate::composition::mlx::replicated_text::prediction::parameters::residency::<A, P>(
+            &mut self.prediction.extension,
+        )
     }
 
     fn finish<D>(
@@ -93,11 +92,11 @@ where
     ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
     where
         D: eredu_runtime::ReplicatedTextExecutionStrategy<
-                PreparedCompositeArchitecture<A>,
+                A,
                 MlxNeuralBackend,
                 MlxHybridState,
-                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
-                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
             > + MlxParameterBankTelemetry
             + 'static,
     {
@@ -140,10 +139,7 @@ impl
             + 'static,
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
-        P: eredu_architectures::prediction_extension::PreparedRoutedPrediction<
-            MlxNeuralBackend,
-            PreparedCompositeArchitecture<A>,
-        >,
+        P: eredu_architectures::prediction_extension::PreparedRoutedPrediction<MlxNeuralBackend, A>,
     {
         bind_retained_partitioned_composite_prediction(
             prepared,
@@ -211,7 +207,7 @@ impl
     fn visit<A, G, W>(
         self,
         prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
-        extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
             MlxNeuralBackend,
         >>::Extension<MlxEmbeddedPredictionMaterializer>,
     ) -> Result<Self::Output, Self::Error>
@@ -225,7 +221,7 @@ impl
             + 'static,
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
-        PreparedCompositeArchitecture<A>:
+        A:
             eredu_architectures::prediction_extension::MaterializedPredictionTarget<
                 MlxNeuralBackend,
             >,
@@ -307,10 +303,7 @@ where
         + 'static,
     A::Error: std::fmt::Display,
     W: eredu_runtime::ArchitectureBoundary,
-    P: eredu_architectures::prediction_extension::PreparedRoutedPrediction<
-        MlxNeuralBackend,
-        PreparedCompositeArchitecture<A>,
-    >,
+    P: eredu_architectures::prediction_extension::PreparedRoutedPrediction<MlxNeuralBackend, A>,
 {
     use crate::composition::mlx::replicated_text::prediction::MlxPredictionMaterializationContext;
     let auxiliary = prediction.banks();
@@ -474,10 +467,8 @@ where
     let row_pool = row_binding
         .as_ref()
         .and_then(super::routed::MlxPartitionRows::reporting_pool);
-    let mut mechanisms: MlxReplicatedTextMechanisms<
-        PreparedCompositeArchitecture<A>,
-        MlxHybridState,
-    > = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    let mut mechanisms: MlxReplicatedTextMechanisms<A, MlxHybridState> =
+        MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(prepared.unowned_expert_checkpoint_sources());
     let mut distributed = Some(distributed);
@@ -548,7 +539,7 @@ where
                     .take()
                     .map(|grouped| eredu_runtime::ParameterProviders { grouped, rows });
                 let executor = executor_plan.bind_with_provider(
-                    architecture.into_inner(),
+                    architecture,
                     execution_policy,
                     parallel,
                     MlxPartitionTensorAllocator,

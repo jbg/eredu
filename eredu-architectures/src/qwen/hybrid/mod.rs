@@ -11,6 +11,7 @@ mod linear_attention;
 mod model;
 mod mtp;
 mod parallel;
+mod parameters;
 mod safetensors;
 pub(crate) mod topology;
 
@@ -38,7 +39,7 @@ pub use checkpoint::{
     translate_vision_gguf_weight_name, unit_recipes,
 };
 pub use conditional::{
-    ConditionalForwardContext, ConditionalInput, ConditionalLayeredModel,
+    ConditionalForwardContext, ConditionalInput, ConditionalKernel, ConditionalLayeredModel,
     ConditionalPartitionInput, ConditionalPipelineBoundary, ConditionalPipelineBoundarySchema,
     ConditionalPipelinePrepared, ConditionalPipelineVisionState, ConditionalStaticModules,
     ConditionalUnit, VISION_EXECUTION_GROUP,
@@ -52,34 +53,31 @@ pub use config::{
     ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use linear_attention::recurrent_spec;
-pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
+pub use model::{
+    state_identity, ForwardContext, LayeredModel, QwenKernel, QwenStaticModules,
+    TargetPartitionInput, Unit,
+};
 pub use mtp::{
     prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionUnit,
 };
 pub(crate) use parallel::routed_conditional_partition_local_geometry;
 pub use parallel::{
     conditional_local_geometry, conditional_partition_local_geometry, local_block_config,
-    local_geometry, local_unit_config, unit_parallel_parameter_groups, ConditionalLocalGeometry,
+    local_geometry, local_unit_config, ConditionalLocalGeometry,
     ConditionalPartitionLocalFoundation, ConditionalPartitionLocalGeometry, LocalGeometry,
 };
+pub use parameters::{
+    component_definition, conditional_component_definition, conditional_parameter_description,
+    parameter_description, project_conditional_parameters, project_parameters,
+    unit_parallel_parameter_groups,
+};
+pub(crate) use parameters::{select_conditional_definition, select_definition};
 
-/// Derives complete expert ownership and local bank geometry for Qwen hybrid text/MTP units.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
-    topology: eredu_core::ParallelRankTopology,
-) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
-{
-    let geometry = architecture.shared_parallel_geometry();
-    realization_plan(architecture.config(), geometry.as_deref(), topology)
-}
-
-/// Derives the complete replicated target expert plan from normalized geometry.
+/// Derives the complete replicated target/MTP expert plan from normalized geometry.
 pub fn replicated_expert_realization_plan(
     config: &HybridConfig,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    realization_plan(
+    expert_realization_plan(
         config,
         None,
         eredu_core::ParallelRankTopology::new(
@@ -91,18 +89,29 @@ pub fn replicated_expert_realization_plan(
     .ok_or_else(|| eredu_nn::Error::backend("Qwen hybrid routed text requires sparse units"))
 }
 
-/// Derives complete expert ownership and local bank geometry for conditional Qwen hybrid units.
-pub fn conditional_expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &ConditionalLayeredModel<B>,
+/// Derives conditional text/MTP expert ownership from neutral policy and optional local geometry.
+pub fn conditional_expert_realization_plan(
+    parsed: &ParsedHybridConfig,
+    geometry: Option<&ConditionalLocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
-    let geometry = architecture.shared_parallel_geometry();
-    realization_plan(
-        &architecture.parsed().text,
-        geometry.as_deref().map(ConditionalLocalGeometry::text),
+    parsed
+        .vision
+        .as_ref()
+        .ok_or_else(|| {
+            eredu_nn::Error::backend("conditional Qwen expert planning requires vision config")
+        })?
+        .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
+        .map_err(eredu_nn::Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(parsed)
+            .map_err(eredu_nn::Error::backend)?;
+    }
+    expert_realization_plan(
+        &parsed.text,
+        geometry.map(ConditionalLocalGeometry::text),
         topology,
     )
 }
@@ -113,19 +122,23 @@ pub(crate) fn partition_expert_realization_plan(
     geometry: &LocalGeometry,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
-    geometry
-        .validate_for(config)
-        .map_err(eredu_nn::Error::backend)?;
-    realization_plan(config, Some(geometry), topology)?
+    expert_realization_plan(config, Some(geometry), topology)?
         .ok_or_else(|| eredu_nn::Error::backend("Qwen partition has no routed units"))
 }
 
-fn realization_plan(
+/// Derives target and MTP bank ownership without a backend type or native resources.
+pub fn expert_realization_plan(
     config: &HybridConfig,
     geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>, eredu_nn::Error>
 {
+    config.validate().map_err(eredu_nn::Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(config)
+            .map_err(eredu_nn::Error::backend)?;
+    }
     if !config.is_moe() {
         return Ok(None);
     }
@@ -180,4 +193,24 @@ fn realization_plan(
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map(Some)
         .map_err(eredu_nn::Error::backend)
+}
+
+/// Shared static construction consumed by ordinary execution and cold topology.
+pub(crate) fn static_module_spec(config: &HybridConfig) -> crate::decoder::StaticModuleSpec {
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: None,
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: config.vocab_size,
+        hidden_size: config.hidden_size,
+        normalization_epsilon: config.rms_norm_eps,
+        normalization_offset: 1.0,
+        embedding_format: config
+            .linear_format("model.embed_tokens.weight")
+            .weight_quantization()
+            .into(),
+        head_format: config.linear_format("lm_head.weight"),
+        tied_head: config.tie_word_embeddings,
+    }
 }

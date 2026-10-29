@@ -28,14 +28,14 @@ pub use target_transport::{
 
 use crate::{
     observe_model_logits, partitioned_replicated_text_materialization_tasks,
-    plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
-    ActivationObserver, ArchitecturePartition, CommunicationManifest, ExecutionResidency,
-    ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime,
-    LayerwiseRuntimeError, ParameterGroupOwner, ParameterProvider, PartitionState,
-    PreparedInputCacheIdentity, ReplicatedTextArchitecture, ReplicatedTextMaterializationTask,
-    ReplicatedTextOutputCompanion, ReplicatedTextOutputSelection, ReplicatedTextParameterPresence,
-    RoutedLayeredArchitecture, RuntimeState, SelectedReplicatedTextRealization,
-    SelectedStateRealization, StateError, SubmissionBackend, WeightLoweringKind,
+    replicated_text_materialization_tasks, ActivationObserver, ArchitecturePartition,
+    CommunicationManifest, ExecutionResidency, ExpertPass, LayerWeightResidency,
+    LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError,
+    ParameterGroupOwner, ParameterProvider, PartitionState, PreparedInputCacheIdentity,
+    ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
+    ReplicatedTextOutputSelection, ReplicatedTextParameterPresence, RoutedLayeredArchitecture,
+    RuntimeState, SelectedReplicatedTextRealization, SelectedStateRealization, StateError,
+    SubmissionBackend,
 };
 
 use crate::parameter_operations::LayeredParameterOwner;
@@ -143,15 +143,14 @@ where
     /// sequence.
     ///
     /// The default is suitable for mechanisms whose ordinary preparation
-    /// already accepts the global layout. Backends with distinct local-unit
+    /// already accepts the retained invocation map. Backends with distinct local-unit
     /// binding storage override this method while retaining the neutral
     /// construction sequencing.
     #[allow(clippy::too_many_arguments)]
     fn prepare_partition_materialization(
         &mut self,
         architecture: &mut A,
-        global_layout: &crate::ExecutionUnitLayout,
-        addresses: &[crate::ExecutionUnitAddress],
+        invocations: &crate::ExecutionUnitAddressMap,
         task_partition: &crate::ReplicatedTextMaterializationPartitionPlan,
         units: &mut [A::Unit],
         source_architecture: Option<&mut A>,
@@ -160,10 +159,10 @@ where
         addressable_parameters: &[String],
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), Self::Error> {
-        let _ = (addresses, task_partition);
+        let _ = task_partition;
         self.prepare_materialization(
             architecture,
-            global_layout,
+            invocations,
             units,
             source_architecture,
             source_units,
@@ -173,12 +172,13 @@ where
         )
     }
 
-    /// Consumes the exact selected parameter tasks before runtime construction.
+    /// Consumes exact selected tasks and their logical-to-physical map. Units
+    /// follow canonical storage order, independently of invocation count.
     #[allow(clippy::too_many_arguments)]
     fn prepare_materialization(
         &mut self,
         architecture: &mut A,
-        layout: &crate::ExecutionUnitLayout,
+        invocations: &crate::ExecutionUnitAddressMap,
         units: &mut [A::Unit],
         source_architecture: Option<&mut A>,
         source_units: Option<&mut [A::Unit]>,
@@ -1224,9 +1224,9 @@ impl<A, G, W> PartitionedSessionFactoryInput<A, G, W> {
 /// Unit set constructed by the neutral partition lifecycle.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PartitionedUnitScope {
-    /// Construct every unit in the selected global execution layout.
+    /// Construct every canonical parameter owner declared by the architecture.
     All,
-    /// Construct only units owned by the admitted rank-local partition.
+    /// Construct each parameter owner required by the admitted local partition once.
     Owned,
 }
 
@@ -1316,46 +1316,46 @@ where
     P: LayerwisePolicy<B, A::Unit, Error = M::PolicyError> + Clone,
 {
     let (mut architecture, partition, communication, tasks) = input.into_parts();
-    let global_layout = partition.unit_layout().clone();
-    let addresses = match scope {
-        PartitionedUnitScope::All => (0..global_layout.len())
-            .map(|ordinal| {
-                global_layout.address(ordinal).ok_or_else(|| {
-                    PartitionedRuntimeConstructionError::Contract(format!(
-                        "global unit ordinal {ordinal} has no canonical address"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        PartitionedUnitScope::Owned => partition.units().collect::<Vec<_>>(),
+    let invocations = match scope {
+        PartitionedUnitScope::All => {
+            let map = architecture.execution_unit_storage_map().map_err(|error| {
+                PartitionedRuntimeConstructionError::Contract(error.to_string())
+            })?;
+            map.validate_layout(partition.unit_layout())
+                .map_err(|error| {
+                    PartitionedRuntimeConstructionError::Contract(error.to_string())
+                })?;
+            map
+        }
+        PartitionedUnitScope::Owned => partition.invocations().clone(),
     };
-    if addresses.is_empty() {
+    if invocations.storage_layout().is_empty() {
         return Err(PartitionedRuntimeConstructionError::Contract(
-            "partition owns no execution units".into(),
+            "partition owns no parameter resources".into(),
         ));
     }
     let task_partition =
-        plan_local_replicated_text_materialization_tasks(&tasks, &global_layout, &addresses)
+        crate::plan_replicated_text_materialization_tasks(&tasks, invocations.storage_layout())
             .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
-    let mut units = addresses
-        .iter()
-        .map(|address| {
-            architecture
-                .build_unit(address.group(), address.index(), context)
-                .map_err(PartitionedRuntimeConstructionError::Architecture)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut units = construct_units::<A, B, M::State>(&architecture, &invocations, context)
+        .map_err(PartitionedRuntimeConstructionError::Architecture)?;
     let mut source_units = source_architecture
         .as_ref()
         .map(|source| {
-            addresses
-                .iter()
-                .map(|address| {
-                    source
-                        .build_unit(address.group(), address.index(), context)
-                        .map_err(PartitionedRuntimeConstructionError::Architecture)
-                })
-                .collect::<Result<Vec<_>, _>>()
+            let source_map = source
+                .execution_unit_storage_map()
+                .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?
+                .select_invocations(invocations.logical_addresses())
+                .map_err(|error| {
+                    PartitionedRuntimeConstructionError::Contract(error.to_string())
+                })?;
+            if source_map != invocations {
+                return Err(PartitionedRuntimeConstructionError::Contract(
+                    "source parameter ownership differs from selected target".into(),
+                ));
+            }
+            construct_units::<A, B, M::State>(source, &invocations, context)
+                .map_err(PartitionedRuntimeConstructionError::Architecture)
         })
         .transpose()?;
     let local_state = partition.state();
@@ -1377,8 +1377,7 @@ where
     mechanisms
         .prepare_partition_materialization(
             &mut architecture,
-            &global_layout,
-            &addresses,
+            &invocations,
             &task_partition,
             &mut units,
             source_architecture.as_mut(),
@@ -1968,12 +1967,7 @@ where
     if let Some(source) = source_architecture {
         validate_architecture_geometry::<A, B, S>(source, &selected)?;
     }
-    let has_transform = selected.parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    });
+    let has_transform = selected.uses_weight_transform();
     if has_transform != source_architecture.is_some() {
         return Err(
             "selected transform tasks and source-format architecture ownership disagree".into(),
@@ -2175,27 +2169,33 @@ where
 {
     let (selected, tasks, addressable_parameters, prompt_cache_identity, output_selection) =
         prepared.into_parts();
-    let mut units = construct_units::<A, B, M::State>(
-        &architecture,
-        selected.requirements().execution_units(),
-        context,
-    )
-    .map_err(ReplicatedTextSessionError::Architecture)?;
+    let invocations = architecture
+        .execution_unit_storage_map()
+        .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
+    invocations
+        .validate_layout(selected.requirements().execution_units())
+        .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
+    let mut units = construct_units::<A, B, M::State>(&architecture, &invocations, context)
+        .map_err(ReplicatedTextSessionError::Architecture)?;
     let mut source_units = source_architecture
         .as_ref()
         .map(|source| {
-            construct_units::<A, B, M::State>(
-                source,
-                selected.requirements().execution_units(),
-                context,
-            )
+            let source_map = source
+                .execution_unit_storage_map()
+                .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
+            if source_map != invocations {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "source parameter ownership differs from selected target".into(),
+                ));
+            }
+            construct_units::<A, B, M::State>(source, &invocations, context)
+                .map_err(ReplicatedTextSessionError::Architecture)
         })
-        .transpose()
-        .map_err(ReplicatedTextSessionError::Architecture)?;
+        .transpose()?;
     mechanisms
         .prepare_materialization(
             &mut architecture,
-            selected.requirements().execution_units(),
+            &invocations,
             &mut units,
             source_architecture.as_mut(),
             source_units.as_deref_mut(),
@@ -2373,7 +2373,7 @@ where
 
 fn construct_units<A, B, S>(
     architecture: &A,
-    layout: &crate::ExecutionUnitLayout,
+    invocations: &crate::ExecutionUnitAddressMap,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Vec<A::Unit>, A::Error>
 where
@@ -2381,12 +2381,12 @@ where
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
 {
-    (0..layout.len())
+    (0..invocations.storage_layout().len())
         .map(|ordinal| {
-            let address = layout
-                .address(ordinal)
-                .expect("validated replicated layout contains every ordinal");
-            architecture.build_unit(address.group(), address.index(), context)
+            let storage = invocations
+                .storage_location(ordinal)
+                .expect("validated parameter storage contains every ordinal");
+            architecture.build_storage_unit(storage, context)
         })
         .collect()
 }
@@ -5080,21 +5080,14 @@ where
     if &graph != requirements.execution_graph() {
         return Err("architecture execution graph differs from selection".into());
     }
-    if requirements.execution_units().group_count() != graph.groups().len() {
-        return Err("selected execution-unit groups differ from architecture graph".into());
+    let units = architecture
+        .execution_unit_layout()
+        .map_err(|error| error.to_string())?;
+    if &units != requirements.execution_units() {
+        return Err("architecture execution-unit layout differs from selection".into());
     }
     for group in 0..graph.groups().len() {
-        let actual = architecture
-            .group_unit_count(group)
-            .map_err(|error| error.to_string())?;
-        let expected = requirements
-            .execution_units()
-            .group_range(group)
-            .expect("validated requirement exposes every graph group")
-            .len();
-        if actual != expected
-            || architecture.group_transport(group) != requirements.group_transports()[group]
-        {
+        if architecture.group_transport(group) != requirements.group_transports()[group] {
             return Err(format!(
                 "architecture execution group {group} differs from selection"
             ));
@@ -5266,11 +5259,7 @@ where
                 eredu_checkpoint::LinearFormat::Dense
                 | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => return Ok(packed),
                 eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
-                    if matches!(
-                        selected_lowering,
-                        crate::WeightLoweringKind::Transform
-                            | crate::WeightLoweringKind::DerivedTransform
-                    ) {
+                    if selected_lowering.transforms_payload() {
                         return Err(format!(
                             "selected parameter {:?} cannot apply a load-time GGUF transform",
                             parameter.name()

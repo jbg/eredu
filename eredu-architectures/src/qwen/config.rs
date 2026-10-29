@@ -74,7 +74,7 @@ impl TextConfigContext {
 }
 
 /// Normalized Qwen arguments shared by inspection, checkpoint planning, and execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelArgs {
     /// Exact supported architecture variant.
     pub variant: QwenVariant,

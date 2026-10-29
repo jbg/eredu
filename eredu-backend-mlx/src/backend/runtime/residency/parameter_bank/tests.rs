@@ -14,7 +14,9 @@ use super::acquisition::preflight_selected_entry_bindings;
 use super::*;
 use crate::tests::support::grouped_provider::ParameterBankSelection;
 use eredu_core::residency::CacheEvictionPolicy;
-use eredu_runtime::{ParameterBank, WeightBinding};
+use eredu_runtime::{
+    AddressableBankPreparationError, AddressableBankSelectionError, ParameterBank, WeightBinding,
+};
 
 fn stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -46,7 +48,7 @@ fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     (dir, store)
 }
 
-fn entries() -> Vec<ParameterBankEntry> {
+fn entries() -> Vec<AddressableBankEntry> {
     (0..3)
         .map(|entry| {
             let identity = ParameterBankKey::new(0, 2, entry);
@@ -57,7 +59,7 @@ fn entries() -> Vec<ParameterBankEntry> {
                     .unwrap(),
             ];
             let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
-            ParameterBankEntry::new(identity, unit, 16).unwrap()
+            AddressableBankEntry::new(identity, unit, 16).unwrap()
         })
         .collect()
 }
@@ -69,12 +71,11 @@ fn independent_bank_scopes_share_one_budget_and_reacquire_exact_companions() {
     let entries = (0..2)
         .flat_map(|bank| {
             entries().into_iter().map(move |entry| {
-                let key =
-                    ParameterBankKey::new(bank, entry.identity.unit(), entry.identity.member());
-                ParameterBankEntry::new(
+                let key = ParameterBankKey::new(bank, entry.key().unit(), entry.key().member());
+                AddressableBankEntry::new(
                     key,
-                    OffloadUnit::new(key.unit_id(), entry.unit.bindings().to_vec()).unwrap(),
-                    entry.bytes,
+                    OffloadUnit::new(key.unit_id(), entry.unit().bindings().to_vec()).unwrap(),
+                    entry.bytes(),
                 )
                 .unwrap()
             })
@@ -176,7 +177,7 @@ fn bank_preflight_rejects_every_entry_before_payload_reads_or_transforms() {
         [WeightBinding::new("weight", "unsupported", TensorSelection::Full, 2).unwrap()],
     )
     .unwrap();
-    let entry = ParameterBankEntry::new(key, unit, 2).unwrap();
+    let entry = AddressableBankEntry::new(key, unit, 2).unwrap();
     assert!(matches!(
         preflight_selected_entry_bindings(&store, &[entry]),
         Err(AddressableParameterBankError::Transformation { .. })
@@ -188,14 +189,14 @@ fn bank_preflight_rejects_every_entry_before_payload_reads_or_transforms() {
 fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
-    let identity = entry.identity;
+    let identity = entry.key();
     let parameter_targets = entry
-        .unit
+        .unit()
         .bindings()
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
         .collect();
-    let selected = SelectedAddressableEntries {
+    let selected = AddressableBankCatalog {
         parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
@@ -235,14 +236,14 @@ fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
 fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
-    let identity = entry.identity;
+    let identity = entry.key();
     let parameter_targets = entry
-        .unit
+        .unit()
         .bindings()
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
         .collect();
-    let selected = SelectedAddressableEntries {
+    let selected = AddressableBankCatalog {
         parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
@@ -265,7 +266,22 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
     )
     .err()
     .expect("incomplete selected placement must fail");
-    assert!(error.to_string().contains("placements do not cover"));
+    let preparation = match &error {
+        AddressableParameterBankError::Transformation { source } => match source.as_ref() {
+            Error::Other(source) => source.downcast_ref::<AddressableBankPreparationError>(),
+            _ => None,
+        },
+        _ => None,
+    };
+    assert!(
+        matches!(
+            preparation,
+            Some(AddressableBankPreparationError::Selection(
+                AddressableBankSelectionError::PlacementCoverage { missing, unexpected }
+            )) if missing.len() == 1 && missing.contains(&identity) && unexpected.is_empty()
+        ),
+        "unexpected rejection: {error:?}"
+    );
     assert_eq!(store.source_diagnostics().unwrap().physical_reads, before);
 }
 
@@ -273,7 +289,7 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
 fn residency_report_retains_exact_selected_entry_placement() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
-    let identity = entry.identity;
+    let identity = entry.key();
     let placement = eredu_runtime::AddressableBankMemberPlacement::new(
         eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
         identity.unit(),
@@ -282,12 +298,12 @@ fn residency_report_retains_exact_selected_entry_placement() {
     )
     .unwrap();
     let parameter_targets = entry
-        .unit
+        .unit()
         .bindings()
         .iter()
         .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
         .collect();
-    let selected = SelectedAddressableEntries {
+    let selected = AddressableBankCatalog {
         parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
@@ -311,30 +327,6 @@ fn residency_report_retains_exact_selected_entry_placement() {
     assert_eq!(
         bank.report().unwrap().placements(),
         &[(identity, placement)]
-    );
-}
-
-#[test]
-fn affine_selected_bytes_use_the_exact_non_f32_companion_dtype() {
-    let affine =
-        WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
-    assert_eq!(
-        packed_projection_bytes(
-            &[2, 64],
-            affine,
-            &eredu_checkpoint::recipe::RecipeDtype::F16,
-        )
-        .unwrap(),
-        72
-    );
-    assert_eq!(
-        packed_projection_bytes(
-            &[2, 64],
-            affine,
-            &eredu_checkpoint::recipe::RecipeDtype::F32,
-        )
-        .unwrap(),
-        80
     );
 }
 
@@ -433,7 +425,7 @@ fn quantized_cache_materializes_only_rank_local_entry_and_tp_recipes() {
                     .unwrap()
             });
             let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
-            ParameterBankEntry::new(identity, unit, 1_024).unwrap()
+            AddressableBankEntry::new(identity, unit, 1_024).unwrap()
         })
         .collect::<Vec<_>>();
     let options =
@@ -546,7 +538,7 @@ fn entry_quantization_uses_only_declared_roles_and_companion_names() {
         bytes.len() as u64,
     )
     .unwrap();
-    let entry = ParameterBankEntry::new(
+    let entry = AddressableBankEntry::new(
         identity,
         OffloadUnit::new(identity.unit_id(), [quantized, preserved]).unwrap(),
         (bytes.len() * 2) as u64,
@@ -565,7 +557,7 @@ fn entry_quantization_uses_only_declared_roles_and_companion_names() {
     assert_eq!(transformed.report.transformed_weights, 1);
     assert_eq!(
         transformed.entries[0]
-            .unit
+            .unit()
             .bindings()
             .iter()
             .map(WeightBinding::name)
@@ -782,11 +774,15 @@ fn rejects_invalid_missing_and_over_scratch_selections_before_loading() {
     ));
     assert!(matches!(
         cache.acquire_selection_slice(2, &[3], &[1], BankAccessClass::Incremental, &stream()),
-        Err(AddressableParameterBankError::MissingOwnedEntry { .. })
+        Err(AddressableParameterBankError::Demand(
+            eredu_runtime::AddressableBankDemandError::MissingOwnedEntry { .. }
+        ))
     ));
     assert!(matches!(
         cache.acquire_selection_slice(2, &[0, 1], &[2], BankAccessClass::Bulk, &stream()),
-        Err(AddressableParameterBankError::ScratchLimitExceeded { .. })
+        Err(AddressableParameterBankError::Demand(
+            eredu_runtime::AddressableBankDemandError::ScratchLimitExceeded { .. }
+        ))
     ));
     let report = cache.report().unwrap();
     assert_eq!(report.device_resident_entries, 0);

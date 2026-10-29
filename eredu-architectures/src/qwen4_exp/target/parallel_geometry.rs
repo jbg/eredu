@@ -121,11 +121,11 @@ impl Selections {
         .map_err(invalid)?;
         // Reuse the shared encoding rules for FP8 scale blocks, affine packing,
         // GGUF blocks and exact companion identities. Unaligned shards fail here.
-        let groups = eredu_runtime::expand_linear_format_parameter_groups(vec![group], |_| {
+        let group = eredu_runtime::expand_linear_format_parameter_group(group, |_| {
             Ok(Some(format.clone()))
         })
         .map_err(invalid)?;
-        for member in groups[0].members() {
+        for member in group.members() {
             let MemberSharding::Segmented { axis, segments } = member.sharding() else {
                 return Err(invalid("physical projection lost segmented placement"));
             };
@@ -479,15 +479,13 @@ impl TargetSpec {
     }
 }
 
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
-    /// Binds the selected local expert operators without changing global router
-    /// identities, ordinary shared projections, state or checkpoint coordinates.
-    /// Call during partition construction, before any execution units are built.
-    pub fn set_expert_realization(
-        &mut self,
+impl TargetSpec {
+    /// Consumes target geometry to bind exactly the admitted expert owner.
+    pub fn with_expert_realization(
+        self,
         realization: &crate::ExpertRealizationPlan<GroupedGatedProductSpec>,
-    ) -> Result<(), Error> {
-        let global = usize::try_from(self.spec.config.experts.count).map_err(invalid)?;
+    ) -> Result<Self, Error> {
+        let global = usize::try_from(self.config.experts.count).map_err(invalid)?;
         let groups = eredu_core::balanced_contiguous_range(
             global,
             realization.expert_parallel_size(),
@@ -502,14 +500,14 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
                 "expert realization ownership differs from target geometry",
             ));
         }
-        let mut local = self.spec.clone();
+        let mut local = self;
         let mut count = 0;
         for (ordinal, unit) in local.units.iter_mut().enumerate() {
             let UnitSpec::Decoder { feed_forward, .. } = unit else {
                 continue;
             };
             let experts = &feed_forward.feed_forward.experts;
-            if experts.group_count() != self.spec.config.experts.count {
+            if experts.group_count() as usize != global {
                 return Err(invalid("expert realization is already bound"));
             }
             let expected = local_expert_spec(experts, groups.clone())?;
@@ -530,7 +528,27 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
                 "expert realization includes another execution unit",
             ));
         }
+        Ok(local)
+    }
+}
+
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetKernel<B> {
+    /// Binds the selected local expert operators without changing global router
+    /// identities, ordinary shared projections, state or checkpoint coordinates.
+    /// Call during partition construction, before any execution units are built.
+    pub fn with_expert_realization(
+        mut self,
+        realization: &crate::ExpertRealizationPlan<GroupedGatedProductSpec>,
+    ) -> Result<Self, Error> {
+        let local = self.spec.clone().with_expert_realization(realization)?;
+        let definition = if self.definition.parameters().partition_layout().is_some() {
+            self.definition.clone()
+        } else {
+            self.parameter_root
+                .project_owned_parameters(local.declare_parameters()?)?
+        };
         self.spec = local;
-        Ok(())
+        self.definition = definition;
+        Ok(self)
     }
 }

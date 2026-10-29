@@ -1341,6 +1341,7 @@ pub struct PredictionExtensionPlan {
     kind: PredictionExtensionKind,
     depth: usize,
     complete_architecture: SafetensorsArchitecturePlan,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
 }
 
 impl PredictionExtensionPlan {
@@ -1354,10 +1355,39 @@ impl PredictionExtensionPlan {
                 "prediction extension depth must be positive".into(),
             ));
         }
+        let definition = match (kind, complete_architecture.model()) {
+            (PredictionExtensionKind::DeepSeekV3Mtp, SafetensorsModelConfig::DeepSeekV3(args)) => {
+                crate::deepseek::v3::component_definition(args, None)
+            }
+            (
+                PredictionExtensionKind::DeepSeekV4Embedded,
+                SafetensorsModelConfig::DeepSeekV4(args),
+            ) => crate::deepseek::v4::component_definition(args, None),
+            (PredictionExtensionKind::InklingMtp, SafetensorsModelConfig::Inkling(args)) => {
+                crate::inkling::model::component_definition(args, None)
+            }
+            (PredictionExtensionKind::QwenHybridMtp, SafetensorsModelConfig::QwenHybrid(args)) => {
+                if args.vision.is_some() {
+                    crate::qwen::hybrid::conditional_component_definition(args, None)
+                } else {
+                    crate::qwen::hybrid::component_definition(&args.text, None)
+                }
+            }
+            (PredictionExtensionKind::NemotronHMtp, SafetensorsModelConfig::NemotronH(args)) => {
+                crate::nemotron_h::component_definition(args, None)
+            }
+            _ => {
+                return Err(ArtifactError::InvalidArchitecturePlan(
+                    "prediction kind differs from complete architecture".into(),
+                ))
+            }
+        }
+        .map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))?;
         Ok(Self {
             kind,
             depth,
             complete_architecture,
+            definition: std::sync::Arc::new(definition),
         })
     }
 
@@ -1381,6 +1411,11 @@ impl PredictionExtensionPlan {
         &self.complete_architecture
     }
 
+    /// Validated complete execution declaration retained before target projection.
+    pub fn definition(&self) -> &std::sync::Arc<eredu_runtime::ComponentDefinition> {
+        &self.definition
+    }
+
     /// Returns whether two opaque values came from the same admitted extension contract.
     ///
     /// Normalized kind/depth, architecture family, checkpoint schema, and exact
@@ -1389,6 +1424,7 @@ impl PredictionExtensionPlan {
     pub fn same_admission(&self, other: &Self) -> bool {
         self.kind == other.kind
             && self.depth == other.depth
+            && self.definition == other.definition
             && self.complete_architecture.model_kind() == other.complete_architecture.model_kind()
             && self.complete_architecture.checkpoint() == other.complete_architecture.checkpoint()
             && self.complete_architecture.checkpoint_resolution()

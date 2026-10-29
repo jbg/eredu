@@ -5,10 +5,7 @@ use crate::decoder::{
     self, DecoderProjectionOperator, RoutedProjectionOperator, TensorParallelProjectionOperator,
     TensorParallelRoutedProjectionOperator,
 };
-use eredu_nn::{
-    Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec, ParameterSpec,
-    Parameterized, Tensor,
-};
+use eredu_nn::{Error, GroupedNeuralBackend, LinearSpec, ParameterSpec, Parameterized, Tensor};
 use eredu_runtime::{
     ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedBankId, RoutedExpertRequest,
     TensorParallelParameterProvider,
@@ -397,32 +394,22 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
     fn validate(args: &ModelArgs) -> Result<(), Error> {
         args.validate().map_err(Error::backend)
     }
-    fn build(
+    fn validate_partitioned(global: &ModelArgs, _local: &ModelArgs) -> Result<(), Error> {
+        <Self as decoder::BlockFactory<B, ModelArgs>>::validate(global)
+    }
+    fn build_feed_forward(
         args: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B>, Error> {
-        Self::build_partitioned(args, args, layer, context)
+    ) -> Result<Self::FeedForward, Error> {
+        Self::build_partitioned_feed_forward(args, args, layer, context)
     }
-    fn build_partitioned(
+    fn build_partitioned_feed_forward(
         global: &ModelArgs,
         local: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<TransformerBlock<B>, Error> {
-        global.validate().map_err(Error::backend)?;
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    local.hidden_size,
-                    local.rms_norm_eps,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                )
-                .with_groups(local.layernorm_num_groups)?,
-                context,
-            )
-        };
+    ) -> Result<Self::FeedForward, Error> {
         let values = if global.is_mova_layer(layer) {
             let spec = super::value_expert_spec(global, layer)?
                 .partition_output(local.value_output_range())?
@@ -448,31 +435,22 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
         } else {
             FeedForward::Dense(decoder::Mlp::new(local, layer, context)?)
         };
-        Ok(TransformerBlock {
-            self_attention: decoder::Attention::new(local, layer, context)?,
-            mlp: Projections {
+        Ok(Projections {
+            layer,
+            points: <ModelArgs as decoder::Config>::routed_observation_points(
+                global,
+                &format!("model.layers.{layer}"),
                 layer,
-                points: <ModelArgs as decoder::Config>::routed_observation_points(
-                    global,
-                    &format!("model.layers.{layer}"),
-                    layer,
-                ),
-                values,
-                feed_forward,
-            },
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
-            attention_output_norm: None,
-            feed_forward_output_norm: None,
-            output_norm: None,
+            ),
+            values,
+            feed_forward,
         })
     }
-    fn parameter_groups(
-        block: &TransformerBlock<B>,
+    fn parameter_description(
         args: &ModelArgs,
-        layer: usize,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
-        super::parallel::block_parameter_groups(block, args, layer)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        super::parallel::parameter_description(args)
     }
 }
 
@@ -482,7 +460,7 @@ pub fn new_block<B: GroupedNeuralBackend>(
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<TransformerBlock<B>, Error> {
-    <BlockFactory as decoder::BlockFactory<B, ModelArgs>>::build(args, layer, context)
+    TransformerBlock::from_factory::<_, BlockFactory>(args, args, layer, context)
 }
 
 /// Shared dense decoder execution for configurations with no routed invocations.
@@ -500,18 +478,17 @@ impl<B: eredu_nn::NeuralBackend> decoder::BlockFactory<B, ModelArgs> for DenseBl
         }
         Ok(())
     }
-    fn build(
+    fn build_feed_forward(
         args: &ModelArgs,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<decoder::TransformerBlock<B>, Error> {
-        decoder::TransformerBlock::new(args, layer, context)
+    ) -> Result<Self::FeedForward, Error> {
+        decoder::Mlp::new(args, layer, context)
     }
-    fn parameter_groups(
-        block: &decoder::TransformerBlock<B>,
+    fn parameter_description(
         args: &ModelArgs,
-        layer: usize,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
-        decoder::layer_parallel_parameter_groups(block, args, layer)
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        decoder::dense_parameter_description(args)
     }
 }

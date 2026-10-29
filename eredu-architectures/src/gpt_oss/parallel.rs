@@ -10,6 +10,21 @@ use crate::decoder::{block_common_parallel_parameter_groups, static_parallel_par
 
 use super::{block::TransformerBlock, config::ModelArgs};
 
+/// Complete parameter topology derived from neutral router and expert specifications.
+pub fn parameter_description(
+    args: &ModelArgs,
+) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
+    crate::decoder::routed_parameter_description(args, |layer| {
+        let root = format!("{}.layers.{layer}.mlp", args.parameter_root);
+        Ok(crate::decoder::RoutedBlockParameters {
+            selector_name: format!("{root}.router"),
+            bank_name: format!("{root}.experts.intermediate"),
+            selector: super::moe::selector_spec(args, layer)?,
+            bank: super::moe::expert_bank_spec(args, layer)?,
+        })
+    })
+}
+
 fn expert_member_sharding(
     name: &str,
     shape: &[usize],
@@ -54,7 +69,7 @@ pub fn layer_parallel_parameter_groups<
     groups.push(module_parameter_group::<B::Tensor, _>(
         format!("{prefix}.router"),
         ParameterRole::Replicated,
-        &block.mlp.router,
+        &block.body.mlp.router,
         |_, _| Ok(MemberSharding::Replicated),
     )?);
 
@@ -66,7 +81,7 @@ pub fn layer_parallel_parameter_groups<
         format!("{prefix}.experts.intermediate"),
         ParameterRole::ExpertIntermediate,
         units,
-        &block.mlp.experts,
+        &block.body.mlp.experts,
         |metadata, shape| expert_member_sharding(metadata.id.as_str(), shape, intermediate),
     )?);
     Ok(groups)
@@ -177,6 +192,7 @@ pub fn partition_local_routed_geometry(
     validate_routed_realization(args, topology, realization)?;
     crate::decoder::partition_local_geometry_with(
         args,
+        parameter_description(args)?.invocations(),
         layout,
         owned_units,
         |args, layer, layout| {

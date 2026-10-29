@@ -31,8 +31,14 @@ where
     }
     let selected_args = crate::replicated_text::selected_deepseek_v3_args(args, selected.base())
         .map_err(architecture)?;
-    let parameters = crate::deepseek::parallel::v3_parameter_description(&selected_args)
-        .map_err(architecture)?;
+    let retained = selected
+        .base()
+        .requirements()
+        .shared_component_definition()
+        .ok_or_else(|| architecture("V3 selection has no retained definition"))?;
+    let definition =
+        crate::deepseek::v3::project_parameters(&selected_args, &retained).map_err(architecture)?;
+    let parameters = definition.parameters().clone();
     let rank = selected.requirements().topology();
     let layout = derive_partitioned_local_layout(&parameters, rank).map_err(architecture)?;
     let [owned] = selected.requirements().groups() else {
@@ -43,44 +49,35 @@ where
             "dense V3 admission names another execution group",
         ));
     }
-    let start = owned.units().start;
     let geometry = crate::deepseek::parallel::v3_local_geometry(&selected_args, &layout)
         .map_err(architecture)?;
     let complete_state = geometry.state_layout().clone();
     let state_plan = crate::transport::pipeline_state(0, &complete_state);
-    let partition = ArchitecturePartition::from_description(
-        &parameters,
-        [(owned.group().as_str(), owned.units())],
-        selected.requirements().ownership().clone(),
-        &complete_state,
-        &state_plan,
-        geometry.clone(),
-        crate::deepseek::v3::TargetBoundarySchema::from_args(&selected_args),
-    )
-    .map_err(architecture)?;
-    validate_partitioned_binding(selected.requirements(), &partition).map_err(architecture)?;
+    let partition = selected
+        .requirements()
+        .construct_partition(
+            &parameters,
+            &complete_state,
+            &state_plan,
+            geometry.clone(),
+            crate::deepseek::v3::TargetBoundarySchema::from_args(&selected_args),
+        )
+        .map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,
         &partition,
     )
     .map_err(architecture)?;
-    let source_architecture = if selected.base().parameters().iter().any(|parameter| {
-        matches!(
-            parameter.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let source_architecture = if selected.base().uses_weight_transform() {
         let source_args = crate::replicated_text::source_deepseek_v3_args(args, selected.base())
             .map_err(architecture)?;
-        let source_parameters = crate::deepseek::parallel::v3_parameter_description(&source_args)
+        let source_definition = crate::deepseek::v3::project_parameters(&source_args, &retained)
             .map_err(architecture)?;
-        validate_transform_parameter_space(&source_parameters, &parameters)
-            .map_err(architecture)?;
+        let source_parameters = source_definition.parameters().clone();
         let source_layout =
             derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                .map_err(architecture)?;
+                .map_err(|error| architecture(error.to_string()))?;
         let source_geometry =
             crate::deepseek::parallel::v3_local_geometry(&source_args, &source_layout)
                 .map_err(architecture)?;
@@ -89,27 +86,24 @@ where
                 "dense V3 transform source changed local state geometry",
             ));
         }
-        let source_partition = ArchitecturePartition::from_description(
-            &source_parameters,
-            [(owned.group().as_str(), owned.units())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            source_geometry.clone(),
-            crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
+        let source_partition = selected
+            .requirements()
+            .construct_partition(
+                &source_parameters,
+                &complete_state,
+                &state_plan,
+                source_geometry.clone(),
+                crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
+            )
+            .map_err(architecture)?;
+        let model = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
+            source_args,
+            source_definition,
+            source_geometry,
+            &source_partition,
+            context,
         )
         .map_err(architecture)?;
-        validate_partitioned_binding(selected.requirements(), &source_partition)
-            .map_err(architecture)?;
-        if source_partition.units().ne(partition.units()) {
-            return Err(architecture(
-                "dense V3 transform source changed local unit addresses",
-            ));
-        }
-        let mut model =
-            crate::deepseek::v3::Model::<B>::new_parallel(source_args, source_geometry, context)
-                .map_err(architecture)?;
-        model.set_partition_target_start(start);
         Some((model, source_layout))
     } else {
         None
@@ -117,9 +111,14 @@ where
     let capability_estimate =
         crate::capability::deepseek_v3(&selected_args).map_err(architecture)?;
     let effective_model_type = selected_args.model_type.clone();
-    let mut model = crate::deepseek::v3::Model::<B>::new_parallel(selected_args, geometry, context)
-        .map_err(architecture)?;
-    model.set_partition_target_start(start);
+    let model = crate::deepseek::v3::V3Kernel::<B>::from_partition_definition(
+        selected_args,
+        definition,
+        geometry,
+        &partition,
+        context,
+    )
+    .map_err(architecture)?;
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(model, selected, partition)
         .map_err(architecture)?;
     visitor

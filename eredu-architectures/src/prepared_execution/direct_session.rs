@@ -6,9 +6,8 @@ use eredu_runtime::{
 };
 
 use super::{PreparedCompositeSessionFacts, PreparedTextSessionFacts};
-use crate::{
-    composite_execution::PreparedCompositeArchitecture,
-    replicated_text::{PreparedCompositeTextArchitecture, PreparedReplicatedTextArchitecture},
+use crate::replicated_text::{
+    PreparedCompositeTextArchitecture, PreparedReplicatedTextArchitecture,
 };
 
 /// Constructs an ordinary text session without exposing module/contract assembly to adapters.
@@ -47,17 +46,16 @@ pub fn construct_selected_composite_session<B, A, Admission, M>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<
     (
-        ReplicatedTextSession<PreparedCompositeArchitecture<A>, B, M>,
+        ReplicatedTextSession<A, B, M>,
         PreparedCompositeSessionFacts<Admission>,
     ),
     String,
 >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    M: ReplicatedTextSessionMechanisms<PreparedCompositeArchitecture<A>, B>,
-    PreparedCompositeArchitecture<A>: LayeredArchitecture<B, M::State>,
-    <PreparedCompositeArchitecture<A> as LayeredArchitecture<B, M::State>>::Error:
-        std::fmt::Display,
+    M: ReplicatedTextSessionMechanisms<A, B>,
+    A: LayeredArchitecture<B, M::State>,
+    <A as LayeredArchitecture<B, M::State>>::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {

@@ -2,22 +2,19 @@
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend,
-    NormalizationOperator, Parameterized, Tensor,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    ParameterProvider, PartitionedLayeredArchitecture, RoutedLayeredArchitecture,
-    RuntimeStateComponents, StateLayout,
+    LayerRuntimeState, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    ParameterProvider, RuntimeStateComponents, StateLayout,
 };
 
 use super::{
-    state_layout, static_parallel_parameter_groups, unit_parallel_parameter_groups, Block,
-    EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator, PredictionUnit, RetainedValues,
-    TargetReadout,
+    state_layout, Block, EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator,
+    PredictionUnit, RetainedValues, TargetReadout,
 };
-use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
+use crate::decoder::{ComponentInstrumentation, DecoderStaticResources, StaticModules};
+use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
 
 /// One target or appended prediction physical unit.
 #[derive(Debug, Clone, Parameterized)]
@@ -27,90 +24,6 @@ pub enum Unit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     Target(Block<B>),
     /// One physical unit in an MTP prediction group.
     Prediction(PredictionUnit<B>),
-}
-
-impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn forward_unit_with_provider<P>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: ParameterProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        LayeredModel::forward_unit_with_provider(
-            self, group, index, unit, hidden, state, forward, provider, context,
-        )
-    }
-
-    fn routed_sparse_observations(&self) -> bool {
-        true
-    }
-
-    fn forward_unit_observed_with_provider<P, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: ParameterProvider<B>,
-        P::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        LayeredModel::forward_unit_observed_with_provider(
-            self, group, index, unit, hidden, state, forward, observer, provider, context,
-        )
-    }
-}
-
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-{
-    fn forward_unit_parallel_with_provider<P>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: eredu_runtime::TensorParallelParameterProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        LayeredModel::forward_unit_parallel_with_provider(
-            self, group, index, unit, hidden, state, forward, parallel, provider, context,
-        )
-    }
 }
 
 /// Request-local values retained through one target or draft pass.
@@ -334,10 +247,17 @@ impl<T> ForwardContext<T> {
 }
 
 /// Shared layered Nemotron-H model including graph-visible MTP groups.
-pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub type LayeredModel<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    CompleteNemotronKernel<B>,
+    eredu_runtime::KernelParameterModules,
+>;
+
+/// Complete target and embedded-prediction equations over one retained definition.
+pub struct CompleteNemotronKernel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     args: ModelArgs,
     static_modules: StaticModules<B>,
-    groups: SequentialPredictionGroups,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     target_units: usize,
     prediction_steps: usize,
     prediction_pattern: usize,
@@ -345,169 +265,113 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
-{
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        super::state_identity(
-            &self.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    }
-
-    fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        self.parameter_description_impl(context)
-    }
-
-    fn static_parameter_recipes(
-        &self,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<
-        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
-        String,
-    > {
-        super::static_recipes(source, &self.args, None)
-    }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitor<B>,
-    {
-        visitor.visit("embedding", &self.static_modules.embeddings)?;
-        visitor.visit("norm", &self.static_modules.boundary.norm)?;
-        if let Some(head) = &self.static_modules.lm_head {
-            visitor.visit("output", head)?;
-        }
-        Ok(())
-    }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitorMut<B>,
-    {
-        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.boundary.norm)?;
-        if let Some(head) = &mut self.static_modules.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        Ok(())
-    }
-}
-
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
-    /// Builds unloaded static modules and validates target plus MTP schedules.
-    pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "Nemotron-H",
-            crate::operator_requirements::NEMOTRON_H,
-        )?;
-        args.validate().map_err(Error::backend)?;
-        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;
-        let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
-        let groups = SequentialPredictionGroups::new_pattern(
-            "model.layers",
-            target_units,
-            "model.mtp.layers",
-            prediction_steps,
-            prediction_pattern,
-        )?;
-        Ok(Self {
-            args,
-            static_modules,
-            groups,
-            target_units,
-            prediction_steps,
-            prediction_pattern,
-            parallel_geometry: None,
-            expert_realization: None,
-        })
-    }
-
-    /// Builds the same target-plus-MTP lifecycle with rank-local geometry.
-    pub fn new_parallel(
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CompleteNemotronKernel<B> {
+    /// Materializes serial resources from the cold retained declaration.
+    pub fn from_definition(
         args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredModel<B>, Error> {
+        Self::materialize(args, definition, None, context)
+    }
+    /// Materializes the same target/MTP equations with admitted rank-local geometry.
+    pub fn from_parallel_definition(
+        args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
+    ) -> Result<LayeredModel<B>, Error> {
+        Self::materialize(args, definition, Some(geometry), context)
+    }
+    fn materialize(
+        args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<LocalGeometry>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Nemotron-H",
             crate::operator_requirements::NEMOTRON_H,
         )?;
         args.validate().map_err(Error::backend)?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
-        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;
-        let static_modules = StaticModules::from_parallel_spec(
-            Self::static_spec(&args),
-            geometry.embedding_range().clone(),
-            geometry.output_range().cloned(),
-            context,
-        )?;
-        let groups = SequentialPredictionGroups::new_pattern(
-            "model.layers",
-            target_units,
-            "model.mtp.layers",
-            prediction_steps,
-            prediction_pattern,
-        )?;
-        Ok(Self {
-            args,
-            static_modules,
-            groups,
-            target_units,
-            prediction_steps,
-            prediction_pattern,
-            parallel_geometry: Some(std::sync::Arc::new(geometry)),
-            expert_realization: None,
-        })
+        let definition = match &geometry {
+            Some(geometry) => {
+                geometry.validate_for(&args).map_err(Error::backend)?;
+                super::parameters::select_definition(
+                    &args,
+                    definition,
+                    geometry.state_layout(),
+                    (
+                        geometry.embedding_range().clone(),
+                        geometry.output_range().cloned(),
+                    ),
+                    geometry
+                        .target_units()
+                        .iter()
+                        .chain(geometry.prediction_units())
+                        .copied()
+                        .enumerate(),
+                )?
+            }
+            None => {
+                let state = state_layout(&args).map_err(Error::backend)?;
+                let full = eredu_nn::VocabularyParallelRange {
+                    global_vocabulary: args.vocab_size as usize,
+                    local: 0..args.vocab_size as usize,
+                };
+                let targets = super::parallel::global_target_geometry(&args)
+                    .map_err(Error::backend_source)?;
+                let predictions = super::parallel::global_prediction_geometry(&args)
+                    .map_err(Error::backend_source)?;
+                super::parameters::select_definition(
+                    &args,
+                    definition,
+                    &state,
+                    (full.clone(), (!args.tie_word_embeddings).then_some(full)),
+                    targets.into_iter().chain(predictions).enumerate(),
+                )?
+            }
+        };
+        let static_modules = match &geometry {
+            Some(geometry) => StaticModules::from_parallel_spec(
+                super::static_spec(&args, super::FinalNormalization::Float32),
+                geometry.embedding_range().clone(),
+                geometry.output_range().cloned(),
+                context,
+            )?,
+            None => StaticModules::from_spec(
+                super::static_spec(&args, super::FinalNormalization::Float32),
+                context,
+            )?,
+        };
+        Self::with_selected_resources(args, definition, static_modules, geometry)
     }
 
-    fn schedule(args: &ModelArgs) -> Result<(usize, usize, usize), Error> {
-        let target_units = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-        let prediction_steps =
-            usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        let prediction_units = args.mtp_policies().map_err(Error::backend)?.len();
+    fn with_selected_resources(
+        args: ModelArgs,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        static_modules: StaticModules<B>,
+        geometry: Option<LocalGeometry>,
+    ) -> Result<LayeredModel<B>, Error> {
+        let target_units = definition.unit_count(0)?;
+        let prediction_steps = definition.prediction_groups().len();
         let prediction_pattern = if prediction_steps == 0 {
             0
         } else {
-            prediction_units
-                .checked_div(prediction_steps)
-                .filter(|n| *n > 0)
-                .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?
+            definition.unit_count(1)?
         };
-        Ok((target_units, prediction_steps, prediction_pattern))
-    }
-
-    fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
-        let embedding_name = "model.embeddings.weight";
-        StaticModuleSpec {
-            // One full-width group keeps reduction and learned scale in F32.
-            normalization_groups: Some(1),
-            embedding_weight: embedding_name.into(),
-            normalization_weight: "model.norm_f.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: args.vocab_size,
-            hidden_size: args.hidden_size,
-            normalization_epsilon: args.layer_norm_epsilon,
-            normalization_offset: 0.0,
-            embedding_quantization: args.weight_quantization_for(embedding_name),
-            head_format: args.weight_quantization_for("lm_head.weight").into(),
-            tied_head: args.tie_word_embeddings,
-        }
+        let kernel = Self {
+            args,
+            static_modules,
+            definition: std::sync::Arc::clone(&definition),
+            target_units,
+            prediction_steps,
+            prediction_pattern,
+            parallel_geometry: geometry.map(std::sync::Arc::new),
+            expert_realization: None,
+        };
+        eredu_runtime::ComponentAdapter::with_pinned_resources::<B>(definition, kernel)
+            .map_err(Error::from)
     }
 
     /// Returns normalized architecture policy.
@@ -517,74 +381,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Returns the prediction depth count declared by the execution graph.
     pub fn mtp_len(&self) -> usize {
-        self.groups.prediction_count()
+        self.definition.prediction_groups().len()
     }
 
-    /// Describes target and patterned prediction parameters with explicit
-    /// canonical execution-unit ownership.
-    fn parameter_description_impl(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = self.groups.execution_graph()?;
-        let counts = std::iter::once(self.target_units)
-            .chain(std::iter::repeat_n(
-                self.prediction_pattern,
-                self.prediction_steps,
-            ))
-            .collect::<Vec<_>>();
-        let layout = ExecutionUnitLayout::new(&graph, counts.clone()).map_err(Error::backend)?;
-        let static_groups =
-            static_parallel_parameter_groups(&self.static_modules).map_err(Error::backend)?;
-        let mut expected = static_groups.clone();
-        let mut owned = static_groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                OwnedParameterGroupSpec::new(
-                    if index == 0 {
-                        let mut roles = vec!["embedding", "mtp"];
-                        if self.args.tie_word_embeddings {
-                            roles.push("output");
-                        }
-                        ParameterGroupOwner::static_any_of(roles)
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
-                    group,
-                )
-            })
-            .collect::<Vec<_>>();
-        for (group_index, &count) in counts.iter().enumerate() {
-            let owner_group = layout
-                .group_id(group_index)
-                .expect("Nemotron-H layout group")
-                .clone();
-            for index in 0..count {
-                let unit = self.construct_unit(group_index, index, context)?;
-                let flat = if group_index == 0 {
-                    index
-                } else {
-                    self.target_units + (group_index - 1) * self.prediction_pattern + index
-                };
-                let groups = unit_parallel_parameter_groups(&unit, &self.args, flat)
-                    .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
-    }
     /// Borrows pinned static modules.
     pub const fn static_modules(&self) -> &StaticModules<B> {
         &self.static_modules
@@ -596,14 +395,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     /// Returns the authoritative target plus MTP state layout.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
         state_layout(&self.args).map_err(Error::backend)
-    }
-
-    /// Returns the replicated or planner-derived heterogeneous state layout.
-    fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        self.parallel_geometry
-            .as_ref()
-            .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| self.state_layout(), Ok)
     }
 
     /// Returns planner-derived geometry for a rank-local realization.
@@ -647,7 +438,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &mut self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<Option<super::ExpertProviderDescriptor>, Error> {
-        let realization = super::expert_realization_plan(self, topology)?;
+        let realization =
+            super::expert_realization_plan(&self.args, self.parallel_geometry(), topology)?;
         if let Some(realization) = realization {
             self.install_expert_realization(realization);
         }
@@ -966,17 +758,44 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         })
     }
 
+    fn finish_readout(
+        &mut self,
+        hidden: &B::Tensor,
+        mode: ForwardMode,
+        readout: TargetReadout,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let resources = self.static_modules.decoder_resources_mut();
+        match mode {
+            ForwardMode::Target => {
+                readout.apply(resources, hidden, parallel, context, instrumentation)
+            }
+            // Prediction units own their final norm; target observation seams do not apply.
+            ForwardMode::Draft(_) => resources.project(
+                hidden,
+                parallel,
+                context,
+                &mut ComponentInstrumentation::disabled(),
+            ),
+        }
+    }
+
     /// Applies the replicated target output boundary.
     pub fn finish_partition_target(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
-            Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
-            None => self.static_modules.embeddings.as_linear(&hidden, context),
-        }
+        self.finish_readout(
+            hidden,
+            ForwardMode::Target,
+            TargetReadout::Logits,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Applies the tensor-parallel target output boundary.
@@ -986,16 +805,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            ForwardMode::Target,
+            TargetReadout::Logits,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Applies tensor-parallel vocabulary lookup for a prediction boundary.
@@ -1022,37 +839,20 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match &mut self.static_modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.embeddings,
-                hidden,
-                parallel,
-                context,
-            ),
-        }
-    }
-
-    fn validate_group(&self, group: usize) -> Result<usize, Error> {
-        self.groups.unit_count(group)
+        self.static_modules.decoder_resources_mut().project(
+            hidden,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     fn unit_path_inner(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.groups.unit_path(group, index)
+        Ok(self.definition.unit(group, index)?.path.clone())
     }
 
     fn state_index(&self, group: usize, index: usize) -> Result<usize, Error> {
-        if group == 0 {
-            return Ok(index);
-        }
-        self.target_units
-            .checked_add(
-                (group - 1)
-                    .checked_mul(self.prediction_pattern)
-                    .and_then(|start| start.checked_add(index))
-                    .ok_or_else(|| Error::backend("Nemotron-H MTP state index overflowed"))?,
-            )
-            .ok_or_else(|| Error::backend("Nemotron-H total state index overflowed"))
+        Ok(self.definition.unit(group, index)?.state.start)
     }
 
     /// Executes a target or prediction unit through a runtime expert provider.
@@ -1185,14 +985,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 }
 
-impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
-where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ComponentKernel<B>
+    for CompleteNemotronKernel<B>
 {
     type Input<'a> = EmbeddedInput<'a, B::Tensor>;
-    type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
@@ -1200,56 +996,87 @@ where
     where
         B::Tensor: 'a;
     type Error = Error;
-
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            crate::transport::decoder()
-        } else {
-            prediction_group_transport(group)
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::Error> {
+        super::state_identity(
+            &self.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
+    }
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        super::static_recipes(source, &self.args, None)
+    }
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward.target_capture.as_ref()
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        RetainedValues::new([
+            Some(&forward.tokens),
+            Some(&forward.embedded),
+            forward.mask.as_ref(),
+            forward.target_capture.as_ref(),
+            forward.draft_logits.as_ref(),
+        ])
+    }
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        match forward.mode {
+            ForwardMode::Target => group == 0,
+            ForwardMode::Draft(depth) => group == depth + 1,
         }
     }
-
-    fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
-    }
-
-    fn prediction_execution_groups(&self) -> Vec<String> {
-        self.groups.prediction_execution_groups()
-    }
-
-    fn state_partition_plan(
-        &self,
-        layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(0, self.target_units, layout)
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.groups.execution_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.validate_group(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.unit_path_inner(group, index)
-    }
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
-        self.construct_unit(group, index, context)
+        self.construct_unit(address.group(), address.index(), context)
     }
-
-    fn begin_forward<'a>(
+}
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::ComponentPinnedResources<B> for CompleteNemotronKernel<B>
+{
+    type Modules = StaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V: eredu_runtime::StaticParameterVisitor<B>>(
+        &self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources().visit(visitor)
+    }
+    fn visit_pinned_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.static_modules.decoder_resources_mut().visit(visitor)
+    }
+}
+impl<B, S> eredu_runtime::ComponentEquations<B, S> for CompleteNemotronKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -1333,8 +1160,7 @@ where
             },
         })
     }
-
-    fn begin_forward_observed<'a, O>(
+    fn begin_observed<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -1344,72 +1170,48 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let mut forward = self.begin_forward(input, state, context)?;
+        let mut forward = self.begin(input, state, context)?;
         if matches!(forward.context.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            forward.hidden =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
-                    .apply("embedding", forward.hidden)?;
+            forward = crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
             forward.context.embedded = forward.hidden.clone();
         }
         Ok(forward)
     }
-
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
-        group: usize,
+        _group: usize,
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
         _state: &mut S,
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.groups.begin(group, initial, dependencies)
+        Ok(dependencies.first().copied().unwrap_or(initial).clone())
     }
-
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        match forward.mode {
-            ForwardMode::Target => group == 0,
-            ForwardMode::Draft(depth) => group == depth + 1,
-        }
-    }
-
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.unit_path_inner(group, index)?;
-        let state_index = self.state_index(group, index)?;
-        match unit {
-            Unit::Target(block) if group == 0 => block.forward(
-                hidden,
-                forward.mask.as_ref(),
-                state.layer(state_index).map_err(Error::backend)?,
-                context,
-            ),
-            Unit::Prediction(unit) if group > 0 => unit.forward(
-                hidden,
-                &forward.embedded,
-                forward.mask.as_ref(),
-                state.layer(state_index).map_err(Error::backend)?,
-                context,
-            ),
-            _ => Err(Error::backend(format!(
-                "Nemotron-H execution unit does not match group {group}"
-            ))),
-        }
+        let (group, index) = (address.group(), address.index());
+        self.forward_unit_with_provider(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+        )
     }
-
-    fn forward_unit_observed<O>(
+    fn execute_observed<O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -1420,6 +1222,7 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
+        let (group, index) = (address.group(), address.index());
         self.forward_unit_observed_with_provider(
             group,
             index,
@@ -1432,8 +1235,7 @@ where
             context,
         )
     }
-
-    fn complete_execution_group(
+    fn complete_group(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -1448,40 +1250,26 @@ where
         }
         Ok(hidden.clone())
     }
-
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        forward.target_capture.as_ref()
-    }
-
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match forward.mode {
-            ForwardMode::Target => {
-                let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
-                if forward.readout == TargetReadout::NormalizedHidden {
-                    return Ok(hidden);
-                }
-                match &mut self.static_modules.lm_head {
-                    Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
-                    None => self.static_modules.embeddings.as_linear(&hidden, context),
-                }
-            }
-            ForwardMode::Draft(_) => match &mut self.static_modules.lm_head {
-                Some(head) => eredu_nn::LinearOperator::forward(head, hidden, context),
-                None => self.static_modules.embeddings.as_linear(hidden, context),
-            },
-        }
+        self.finish_readout(
+            hidden,
+            forward.mode,
+            forward.readout,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
-
-    fn finish_forward_observed<O>(
+    fn finish_observed<O>(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut S,
+        _state: &mut S,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
@@ -1489,56 +1277,24 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if matches!(forward.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            let mut instrumentation =
-                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
-            if forward.readout == TargetReadout::NormalizedHidden {
-                instrumentation.normalize_readout(
-                    hidden,
-                    &mut self.static_modules.boundary.norm,
-                    context,
-                )
-            } else {
-                self.static_modules
-                    .finish_instrumented(hidden, context, &mut instrumentation)
-            }
-        } else {
-            self.finish_forward(hidden, state, forward, context)
-        }
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        RetainedValues::new([
-            Some(&forward.tokens),
-            Some(&forward.embedded),
-            forward.mask.as_ref(),
-            forward.target_capture.as_ref(),
-            forward.draft_logits.as_ref(),
-        ])
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.finish_readout(
+            hidden,
+            forward.mode,
+            forward.readout,
+            None,
+            context,
+            &mut ComponentInstrumentation::new("readout", &mut observer),
+        )
     }
 }
-
-fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-    let mut transport = crate::transport::prediction();
-    if group == 1 {
-        transport.first_owner_static_roles.push("mtp".into());
-    }
-    transport
-}
-
-impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for CompleteNemotronKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -1599,11 +1355,9 @@ where
             }
         }
     }
-
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -1611,6 +1365,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        let (group, index) = (address.group(), address.index());
         self.forward_unit_parallel_with_provider(
             group,
             index,
@@ -1623,8 +1378,7 @@ where
             context,
         )
     }
-
-    fn finish_forward_parallel(
+    fn finish_parallel(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
@@ -1637,28 +1391,19 @@ where
                 "Nemotron-H model was not built with rank-local geometry",
             ));
         }
-        let hidden = match forward.mode {
-            ForwardMode::Target => self.static_modules.boundary.norm.forward(hidden, context)?,
-            ForwardMode::Draft(_) => hidden.clone(),
-        };
-        if forward.mode == ForwardMode::Target && forward.readout == TargetReadout::NormalizedHidden
-        {
-            return Ok(hidden);
-        }
-        match &mut self.static_modules.lm_head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.embeddings,
-                &hidden,
-                parallel,
-                context,
-            ),
-        }
+        self.finish_readout(
+            hidden,
+            forward.mode,
+            forward.readout,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
-    fn finish_forward_parallel_observed<O>(
+    fn finish_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
-        state: &mut S,
+        _state: &mut S,
         forward: &Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -1667,55 +1412,122 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if forward.mode != ForwardMode::Target {
-            return self.finish_forward_parallel(hidden, state, forward, parallel, context);
-        }
         if self.parallel_geometry.is_none() {
             return Err(Error::backend(
                 "Nemotron-H model was not built with rank-local geometry",
             ));
         }
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        let mut instrumentation =
-            crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
-        let normalized = instrumentation.normalize_readout(
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.finish_readout(
             hidden,
-            &mut self.static_modules.boundary.norm,
-            context,
-        )?;
-        if forward.readout == TargetReadout::NormalizedHidden {
-            return Ok(normalized);
-        }
-        self.static_modules.project_instrumented(
-            &normalized,
+            forward.mode,
+            forward.readout,
             Some(parallel),
             context,
-            &mut instrumentation,
+            &mut ComponentInstrumentation::new("readout", &mut observer),
         )
     }
 }
-
-impl<B, S> PartitionedLayeredArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::RoutedComponentKernel<B, S> for CompleteNemotronKernel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn routed_sparse_observations(&self) -> bool {
+        true
+    }
+    fn execute_routed<P>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let (group, index) = (address.group(), address.index());
+        CompleteNemotronKernel::forward_unit_with_provider(
+            self, group, index, unit, hidden, state, forward, provider, context,
+        )
+    }
+    fn execute_routed_observed<P, O>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (group, index) = (address.group(), address.index());
+        CompleteNemotronKernel::forward_unit_observed_with_provider(
+            self, group, index, unit, hidden, state, forward, observer, provider, context,
+        )
+    }
+}
+impl<B, S> eredu_runtime::ParallelRoutedComponentKernel<B, S> for CompleteNemotronKernel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn execute_parallel_routed<P>(
+        &mut self,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let (group, index) = (address.group(), address.index());
+        CompleteNemotronKernel::forward_unit_parallel_with_provider(
+            self, group, index, unit, hidden, state, forward, parallel, provider, context,
+        )
+    }
+}
+impl<B, S> eredu_runtime::PartitionComponentKernel<B, S> for CompleteNemotronKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Boundary = TargetBoundarySchema;
-
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
         Ok(TargetBoundarySchema::from_args(self.args()))
     }
-
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, TargetBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = selected.expected.ok_or_else(|| {
+            Error::backend("Nemotron-H partition requires selected state geometry")
+        })?;
         let input = match input {
             LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
             LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
@@ -1723,37 +1535,40 @@ where
                 boundary: auxiliary,
             },
         };
-        self.begin_partition_target(input, mask, state, expected, first_state_ordinal, context)
-            .map(|(forward, _)| forward)
-    }
-
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut S,
-        expected: &StateLayout,
-        first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let input = match input {
-            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
-                hidden,
-                boundary: auxiliary,
-            },
-        };
-        self.begin_partition_target_parallel(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            parallel,
-            context,
-        )
+        match selected.parallel {
+            Some(parallel) => self.begin_partition_target_parallel(
+                input,
+                mask,
+                state,
+                expected,
+                selected.first_state_ordinal,
+                parallel,
+                selected.native,
+            ),
+            None => self.begin_partition_target(
+                input,
+                mask,
+                state,
+                expected,
+                selected.first_state_ordinal,
+                selected.native,
+            ),
+        }
         .map(|(forward, _)| forward)
+    }
+    fn enter_partition_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if group != 0 {
+            return Err(Error::backend("Nemotron-H target partition cannot enter a prediction dependency without its producer"));
+        }
+        Ok(initial.clone())
     }
 
     fn finish_partition(
@@ -1768,9 +1583,9 @@ where
         if owns_output {
             let output = match parallel {
                 Some(parallel) => {
-                    self.finish_forward_parallel(hidden, state, forward, parallel, context)?
+                    self.finish_parallel(hidden, state, forward, parallel, context)?
                 }
-                None => self.finish_forward(hidden, state, forward, context)?,
+                None => self.finish(hidden, state, forward, context)?,
             };
             Ok(LayeredPartitionOutput::Final {
                 output,
@@ -1804,14 +1619,21 @@ where
             return self.finish_partition(hidden, state, forward, owns_output, parallel, context);
         }
         let output = match parallel {
-            Some(parallel) => self.finish_forward_parallel_observed(
-                hidden, state, forward, parallel, context, observer,
-            )?,
-            None => self.finish_forward_observed(hidden, state, forward, context, observer)?,
+            Some(parallel) => {
+                self.finish_parallel_observed(hidden, state, forward, parallel, context, observer)?
+            }
+            None => self.finish_observed(hidden, state, forward, context, observer)?,
         };
         Ok(LayeredPartitionOutput::Final {
             output,
             retained: Some(hidden.clone()),
         })
+    }
+}
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::TextComponentKernel<B> for CompleteNemotronKernel<B>
+{
+    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
+        EmbeddedInput::target(tokens, mask)
     }
 }

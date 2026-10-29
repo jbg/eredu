@@ -3,7 +3,7 @@
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
-    CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error,
+    CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, Error,
     GatedProductGroupLayout, GroupSelection, GroupedGatedProductSpec, GroupedNeuralBackend,
     JointGroupSelectionInput, JointGroupSelectionSpec, LinearOperator, LinearSpec, NeuralBackend,
     NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
@@ -1268,6 +1268,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
     }
 }
 
+/// Inkling normalizes complete text/media assembly before decoder ingress.
+pub(crate) fn embedding_norm_spec(args: &TextArgs) -> Result<NormalizationConstructionSpec, Error> {
+    Ok(NormalizationConstructionSpec::learned(
+        args.hidden_size,
+        args.rms_norm_eps,
+        ParameterSpec::trainable("model.embed_norm.weight").map_err(Error::backend)?,
+    ))
+}
+
 /// Inkling token embedding, ordinary decoder layers, and final norm.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -1291,49 +1300,16 @@ pub struct TextModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> {
     /// Builds the complete neutral text model.
     pub fn new(args: &TextArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let norm = |name: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(name).map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
-        let output_weight = "lm_head.weight";
+        let common =
+            crate::decoder::StaticModules::<B>::from_spec(super::static_spec(args), context)?;
         Ok(Self {
-            embeddings: B::embedding(
-                EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable("model.embed_tokens.weight")
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        "model.embed_tokens.weight",
-                        args.linear_format_for("model.embed_tokens.weight"),
-                    )?,
-                },
-                context,
-            )?,
-            embedding_norm: norm("model.embed_norm.weight")?,
+            embeddings: common.embeddings,
+            embedding_norm: B::normalization(embedding_norm_spec(args)?, context)?,
             layers: (0..args.num_hidden_layers as usize)
                 .map(|layer| DecoderLayer::new(args, layer, context))
                 .collect::<Result<_, _>>()?,
-            final_norm: norm("model.norm.weight")?,
-            output: B::linear(
-                LinearSpec {
-                    input: args.hidden_size,
-                    output: args.vocab_size,
-                    weight: ParameterSpec::trainable(output_weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        output_weight,
-                        args.linear_format_for(output_weight),
-                    )?,
-                },
-                context,
-            )?,
+            final_norm: common.boundary.norm,
+            output: common.lm_head.expect("Inkling declares an untied readout"),
             logits_scale: args.logits_mup_width_multiplier,
             output_vocabulary: args.unpadded_vocab_size.unwrap_or(args.vocab_size),
         })

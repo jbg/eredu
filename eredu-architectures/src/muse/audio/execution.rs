@@ -9,13 +9,13 @@ use eredu_core::{
     },
     LayerSchedule,
 };
-use eredu_nn::{Error, NeuralBackend, Parameterized, Tensor};
+use eredu_nn::{Error, NeuralBackend, Tensor};
+use eredu_runtime::ComponentEquations as _;
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    MemberSharding, OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParameterGroupOwner,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
+    LayeredForwardState, MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner,
     ParameterGroupSpec, ParameterMemberSpec, ParameterRole, RuntimeStateComponents, StateLayout,
 };
 
@@ -101,28 +101,53 @@ pub fn parameter_description(
     let kinds = config.execution_units()?;
     let layout = ExecutionUnitLayout::new(&graph, [kinds.len()]).map_err(Error::backend)?;
     let owner = layout.group_id(0).expect("one audio group").clone();
-    let mut expected = Vec::new();
     let mut owned = Vec::new();
     for (index, kind) in kinds.into_iter().enumerate() {
         for group in unit_parameter_groups(config, kind)? {
-            expected.push(group.clone());
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(owner.clone(), index),
                 group,
             ));
         }
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned).map_err(Error::backend)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned).map_err(Error::backend)
 }
 
-/// Audio has no pinned learned parameters: the output adapter is its own lease.
-#[derive(Debug, Default)]
-pub struct AudioStaticModules;
-
-impl<T: 'static> Parameterized<T> for AudioStaticModules {
-    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, T>>(&'a self, _: &mut V) {}
-    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, T>>(&'a mut self, _: &mut V) {}
-    fn set_trainable(&mut self, _: bool) {}
+/// Validated waveform units, independently leased parameters, and convolution histories.
+pub fn component_definition(
+    config: &AudioConfig,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    let kinds = config.execution_units()?;
+    let count = kinds.len();
+    eredu_runtime::ComponentDefinition::new(
+        "muse_audio",
+        parameter_description(config)?,
+        kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| eredu_runtime::ComponentUnit {
+                path: kind.path(),
+                state: index..index + 1,
+            })
+            .collect(),
+        vec![ArchitectureGroupTransport {
+            placement: ArchitectureGroupPlacement::Pipeline,
+            kind: ArchitectureGroupKind::AudioEncoder,
+            first_owner_static_roles: vec![],
+            last_owner_static_roles: vec![],
+            merge_destination: ArchitectureMergeDestination::LastOwner,
+            parallel_subgroup: None,
+            request_optional: false,
+        }],
+        AUDIO_EXECUTION_GROUP,
+        vec![],
+        state_layout(config)?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+            0,
+            0..count,
+        )]),
+    )
+    .map_err(Error::from)
 }
 
 /// Convolution-history behavior at a declared waveform boundary.
@@ -347,28 +372,36 @@ pub(crate) fn finish_audio_forward<T: Tensor>(
     Ok(hidden.clone())
 }
 
-/// Architecture policy consumed by the shared layerwise engine and state factory.
-pub struct AudioArchitecture<B: NeuralBackend> {
+/// Shared execution contracts for the independently leased waveform units.
+pub type AudioArchitecture<B> = eredu_runtime::ComponentAdapter<
+    std::sync::Arc<eredu_runtime::ComponentDefinition>,
+    AudioKernel<B>,
+>;
+
+/// Waveform equations and request-specific continuation geometry.
+pub struct AudioKernel<B: NeuralBackend> {
     config: AudioConfig,
     units: Vec<AudioUnitKind>,
-    empty: AudioStaticModules,
+    definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
     backend: PhantomData<fn() -> B>,
 }
 
-impl<B: NeuralBackend> AudioArchitecture<B> {
+impl<B: NeuralBackend> AudioKernel<B> {
     /// Validates geometry without constructing any backend parameter or tensor.
-    pub fn new(config: AudioConfig) -> Result<Self, Error> {
+    pub fn new(config: AudioConfig) -> Result<AudioArchitecture<B>, Error> {
+        let definition = std::sync::Arc::new(component_definition(&config)?);
         crate::operator_requirements::require::<B>(
             "Muse audio",
             crate::operator_requirements::MUSE_AUDIO,
         )?;
         let units = config.execution_units()?;
-        Ok(Self {
+        let kernel = Self {
             config,
             units,
-            empty: AudioStaticModules,
+            definition: std::sync::Arc::clone(&definition),
             backend: PhantomData,
-        })
+        };
+        eredu_runtime::ComponentAdapter::new(definition, kernel).map_err(Error::from)
     }
 
     /// Exact selected physical formats and waveform geometry.
@@ -407,16 +440,6 @@ impl<B: NeuralBackend> AudioArchitecture<B> {
         Ok(crate::composite_execution::CompositeContinuationGeometry::AfterUnits(shapes))
     }
 
-    fn kind(&self, group: usize, index: usize) -> Result<AudioUnitKind, Error> {
-        if group != 0 {
-            return Err(Error::backend("unknown Muse audio execution group"));
-        }
-        self.units
-            .get(index)
-            .copied()
-            .ok_or_else(|| Error::backend("Muse audio unit index exceeds its group"))
-    }
-
     fn fingerprint(&self) -> String {
         let formats = self
             .config
@@ -437,17 +460,21 @@ impl<B: NeuralBackend> AudioArchitecture<B> {
     }
 }
 
-impl<B: NeuralBackend> ArchitectureParameters<B> for AudioArchitecture<B> {
-    type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        state_layout(&self.config)
-    }
+impl<B: NeuralBackend> eredu_runtime::ComponentKernel<B> for AudioKernel<B> {
+    type Input<'a> = AudioInput<'a, B::Tensor>;
+    type Unit = AudioUnit<B>;
+    type ForwardContext = AudioForward;
+    type RetainedContextValues<'a>
+        = std::iter::Empty<&'a B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = Error;
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
-        let complete = state_layout(&self.config)?;
+        let complete = self.definition.state_layout();
         let start = state.global_layer_offset();
         let end = start
             .checked_add(state.layout().len())
@@ -469,96 +496,41 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for AudioArchitecture<B> {
         )
         .map_err(Error::backend)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        parameter_description(&self.config)
+    fn output_score_kind(_: &AudioForward) -> Option<eredu_core::refinement::PredictionScoreKind> {
+        None
     }
-    fn visit_static_parameters<V: eredu_runtime::StaticParameterVisitor<B>>(
+    fn build_unit(
         &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
+        address: eredu_runtime::ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<AudioUnit<B>, Error> {
+        AudioUnit::new(&self.config, self.units[address.index()], context)
     }
-    fn visit_static_parameters_mut<V: eredu_runtime::StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
+    fn executes_group(&self, _: usize, _: &AudioForward) -> bool {
+        true
+    }
+    fn retained_values<'a>(
+        &'a self,
+        _: &'a AudioForward,
+        _: eredu_runtime::ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
     }
 }
 
-impl<B, S> LayeredArchitecture<B, S> for AudioArchitecture<B>
+impl<B, S> eredu_runtime::ComponentEquations<B, S> for AudioKernel<B>
 where
     B: NeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B>,
 {
-    type Input<'a> = AudioInput<'a, B::Tensor>;
-    type StaticModules = AudioStaticModules;
-    type Unit = AudioUnit<B>;
-    type ForwardContext = AudioForward;
-    type RetainedContextValues<'a>
-        = std::iter::Empty<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-
-    fn output_score_kind(_: &AudioForward) -> Option<eredu_core::refinement::PredictionScoreKind> {
-        None
-    }
-    fn group_transport(&self, _: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: ArchitectureGroupKind::AudioEncoder,
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        AUDIO_EXECUTION_GROUP
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
-            0,
-            0..self.units.len(),
-        )])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.kind(group, 0)?;
-        Ok(self.units.len())
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        Ok(self.kind(group, index)?.path())
-    }
-    fn static_modules(&self) -> &AudioStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut AudioStaticModules {
-        &mut self.empty
-    }
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<AudioUnit<B>, Error> {
-        AudioUnit::new(&self.config, self.kind(group, index)?, context)
-    }
-    fn begin_forward<'a>(
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, AudioForward>, Error> {
-        if state.layout() != &state_layout(&self.config)? {
+        if state.layout() != self.definition.state_layout() {
             return Err(Error::backend(
                 "Muse audio runtime state has incompatible geometry",
             ));
@@ -583,32 +555,17 @@ where
         }
         prepare_audio_forward::<B>(&self.config, input, 0, context)
     }
-    fn begin_execution_group(
+    fn execute(
         &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        _: &mut S,
-        _: &mut AudioForward,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.kind(group, 0)?;
-        if !dependencies.is_empty() {
-            return Err(Error::backend("Muse audio root has no dependencies"));
-        }
-        Ok(initial.clone())
-    }
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut AudioUnit<B>,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut AudioForward,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let kind = self.kind(group, index)?;
+        let index = address.index();
+        let kind = self.units[index];
         let advance = forward.samples / self.config.samples_per_token()?;
         execute_audio_unit::<B, _>(
             &self.config,
@@ -622,7 +579,7 @@ where
             context,
         )
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         _: &mut S,
@@ -631,35 +588,26 @@ where
     ) -> Result<B::Tensor, Error> {
         finish_audio_forward(&self.config, hidden, forward)
     }
-    fn retained_context_values<'a>(
-        &'a self,
-        _: &'a AudioForward,
-        _: usize,
-        _: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        std::iter::empty()
-    }
 }
 
-impl<B, S> ParallelLayeredArchitecture<B, S> for AudioArchitecture<B>
+impl<B, S> eredu_runtime::ParallelComponentKernel<B, S> for AudioKernel<B>
 where
     B: NeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B>,
 {
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, AudioForward>, Error> {
-        self.begin_forward(input, state, context)
+        self.begin(input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
         unit: &mut AudioUnit<B>,
         hidden: &B::Tensor,
         state: &mut S,
@@ -667,16 +615,6 @@ where
         _: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_unit(group, index, unit, hidden, state, forward, context)
-    }
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &AudioForward,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.finish_forward(hidden, state, forward, context)
+        self.execute(address, unit, hidden, state, forward, context)
     }
 }

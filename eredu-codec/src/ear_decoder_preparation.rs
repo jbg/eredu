@@ -1,45 +1,25 @@
 //! Cold exact binding plans for independently leased EAR neural decoder units.
 
-use std::{collections::BTreeMap, sync::Arc};
-
-use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
-};
+use eredu_checkpoint::{recipe::RecipeDtype, store::SharedCheckpointSource};
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    ComponentPreparationError, ComponentRecipeConversion, LocalModelLayout, PreparedComponent,
+    WeightBinding,
 };
 
-use crate::{ear_decoder::DecoderConfig, ear_decoder_layered::decoder_parameter_description};
+use crate::{ear_decoder::DecoderConfig, ear_decoder_layered::decoder_component_definition};
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum DecoderPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// Decoder geometry cannot be constructed.
     #[error(transparent)]
     Decoder(#[from] crate::Error),
     /// A required parameter is missing from the selected component.
     #[error("EAR decoder parameter {0} is missing")]
     MissingParameter(String),
-    /// Source restriction failed.
-    #[error(transparent)]
-    Source(#[from] StoreError),
-    /// A recipe disagrees with its exact source metadata.
-    #[error(transparent)]
-    Recipe(#[from] RecipeError),
-    /// Exact recipe binding cannot be represented.
-    #[error(transparent)]
-    Binding(#[from] RecipeBindingError),
-    /// Shared physical placement cannot be applied to an exact recipe.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
-    /// Tensor topology or retained placement is inconsistent.
-    #[error("invalid EAR decoder tensor partition: {0}")]
-    Parallel(String),
-    /// An admitted parameter disagrees with architecture or recipe geometry.
-    #[error("EAR decoder parameter {0} has inconsistent geometry")]
-    Geometry(String),
 }
 
 /// Cold bindings for each upsampling, ConvNeXt and output-projection unit.
@@ -51,103 +31,35 @@ pub enum DecoderPreparationError {
 pub struct PreparedDecoderBindings {
     config: DecoderConfig,
     prefix: String,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
-    local_layout: Option<LocalModelLayout>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedDecoderBindings {
     /// Projects explicit low-level admitted component recipes without artifact
     /// discovery or native allocation. Shapes follow the symbolic architecture;
     /// neighboring component payloads are excluded.
-    pub fn from_recipes(
+    pub fn from_recipes<'a>(
         config: DecoderConfig,
         prefix: &str,
         source: SharedCheckpointSource,
-        parameters: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        parameters: impl FnMut(&str) -> Option<&'a eredu_checkpoint::recipe::DerivedWeightRecipe>,
     ) -> Result<Self, DecoderPreparationError> {
-        let description = decoder_parameter_description(&config, prefix)?;
-        let layout = description.unit_layout().clone();
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(DecoderPreparationError::Geometry(
-                    "unexpected static decoder owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
-                let name = member.target();
-                let mut recipe = parameters
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| DecoderPreparationError::MissingParameter(name.into()))?;
-                let metadata = recipe.infer(source.as_ref())?;
-                if metadata.shape != member.global_shape() {
-                    return Err(DecoderPreparationError::Geometry(name.into()));
-                }
-                if matches!(metadata.dtype, RecipeDtype::F16 | RecipeDtype::BF16) {
-                    recipe = eredu_checkpoint::recipe::DerivedWeightRecipe::Cast {
-                        input: Box::new(recipe),
-                        dtype: RecipeDtype::F32,
-                    };
-                }
-                if recipe.infer(source.as_ref())?.dtype != RecipeDtype::F32 {
-                    return Err(DecoderPreparationError::Geometry(name.into()));
-                }
-                unit_recipes[ordinal].insert(name.into(), recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
+        let definition = decoder_component_definition(&config, prefix)?;
+        let prepared = PreparedComponent::prepare_physical_recipes(
             "ear/decoder/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !targets.contains(&target) {
-                            return Err(DecoderPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(DecoderPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, DecoderPreparationError>>()?;
+            definition,
+            source,
+            parameters,
+            Some(ComponentRecipeConversion {
+                dtype: RecipeDtype::F32,
+                from: &[RecipeDtype::F16, RecipeDtype::BF16],
+            }),
+            |name| DecoderPreparationError::MissingParameter(name.into()),
+        )?;
         Ok(Self {
             config,
             prefix: prefix.into(),
-            layout,
-            source,
-            units,
-            local_layout: None,
+            prepared,
         })
     }
 
@@ -157,25 +69,7 @@ impl PreparedDecoderBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), DecoderPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(DecoderPreparationError::Parallel(
-                "EAR decoder component selection requires a tensor-only topology".into(),
-            ));
-        }
-        let description = decoder_parameter_description(&self.config, &self.prefix)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(DecoderPreparationError::Parallel)?;
-        if let Some(selected) = self.local_layout.as_ref() {
-            if selected != &layout {
-                return Err(DecoderPreparationError::Parallel(
-                    "retained EAR decoder placement differs from the tensor topology".into(),
-                ));
-            }
-            return Ok((self, layout));
-        }
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 
@@ -184,18 +78,8 @@ impl PreparedDecoderBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, DecoderPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(DecoderPreparationError::Parallel(
-                "EAR decoder bindings already have a tensor partition".into(),
-            ));
-        }
         crate::ear_decoder_layered::decoder_local_dimensions(&self.config, &self.prefix, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
 
@@ -208,62 +92,23 @@ impl PreparedDecoderBindings {
         >,
     ) -> Result<PreparedDecoderPartitionBindings, DecoderPreparationError> {
         crate::ear_decoder_partition::validate_decoder_partition(
+            self.prepared.declaration(),
             &self.config,
             &self.prefix,
-            self.local_layout.as_ref(),
+            self.prepared.local_layout(),
             partition,
         )?;
-        let selected = partition
-            .units()
-            .map(|address| {
-                self.layout
-                    .ordinal(address.group(), address.index())
-                    .map(|ordinal| (ordinal, address))
-                    .ok_or_else(|| {
-                        DecoderPreparationError::Geometry("partition unit outside decoder".into())
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let units = self
-            .units
-            .into_iter()
-            .enumerate()
-            .filter_map(|(ordinal, bindings)| {
-                selected
-                    .get(&ordinal)
-                    .copied()
-                    .map(|address| (address, bindings))
-            })
-            .collect::<Vec<_>>();
-        let inputs = units
-            .iter()
-            .flat_map(|(_, bindings)| bindings)
-            .flat_map(|binding| {
-                binding
-                    .source_recipe()
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let source = Arc::new(RestrictedCheckpointSource::including(
-            self.source,
-            "ear/decoder/partition-units",
-            inputs,
-        )?);
+        let prepared = self.prepared.select_units(partition.units())?;
         Ok(PreparedDecoderPartitionBindings {
             config: self.config,
             prefix: self.prefix,
-            local_layout: self.local_layout,
-            source,
-            units,
+            prepared,
         })
     }
 
     /// Exact retained tensor placement, when selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
 
     /// Validated neural decoder geometry.
@@ -277,12 +122,17 @@ impl PreparedDecoderBindings {
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
 
     /// Restricted retained source used by these exact bindings.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
+    }
+
+    /// Validated semantic definition retained through source and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
@@ -291,18 +141,24 @@ impl PreparedDecoderBindings {
     ) -> (
         DecoderConfig,
         String,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
-        ExecutionUnitLayout,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
+        let (definition, local, layout, source, units) = self
+            .prepared
+            .into_declared_unit_parts()
+            .expect("component declares only independently leased units");
         (
             self.config,
             self.prefix,
-            self.local_layout,
-            self.layout,
-            self.source,
-            self.units,
+            definition,
+            local,
+            layout,
+            source,
+            units,
         )
     }
 }
@@ -312,9 +168,7 @@ impl PreparedDecoderBindings {
 pub struct PreparedDecoderPartitionBindings {
     config: DecoderConfig,
     prefix: String,
-    local_layout: Option<LocalModelLayout>,
-    source: SharedCheckpointSource,
-    units: Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 impl PreparedDecoderPartitionBindings {
     /// Global streaming decoder geometry.
@@ -325,17 +179,24 @@ impl PreparedDecoderPartitionBindings {
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
+    /// Complete definition retained independently of the selected pipeline units.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
+    }
     /// Global TP declaration retained independently of selected pipeline units.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
     /// Source authority limited to owned recipes.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
     /// Global unit addresses and exact materialization recipes.
-    pub fn unit_bindings(&self) -> &[(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)] {
-        &self.units
+    pub fn unit_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (eredu_runtime::ExecutionUnitAddress, &[WeightBinding])>
+    {
+        self.prepared.addressed_unit_bindings()
     }
     /// Consumes the retained stage selection without reopening artifacts.
     #[allow(clippy::type_complexity)]
@@ -344,16 +205,24 @@ impl PreparedDecoderPartitionBindings {
     ) -> (
         DecoderConfig,
         String,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
     ) {
+        let (definition, local_layout, invocations, source, units) = self
+            .prepared
+            .into_addressed_unit_parts()
+            .expect("partition declares only independently leased units");
         (
             self.config,
             self.prefix,
-            self.local_layout,
-            self.source,
-            self.units,
+            definition,
+            local_layout,
+            invocations,
+            source,
+            units,
         )
     }
 }

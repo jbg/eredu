@@ -3,7 +3,7 @@ use eredu_architectures::{
     decoder::{self, Config},
     nemotron_labs_diffusion::{
         self,
-        model::{TextInput, TextModel},
+        model::{TextInput, TextKernel, TextModel},
         FamilyConfig,
     },
 };
@@ -321,7 +321,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let reference = Array::load_safetensors(reference_path, &weights_stream)?;
     if vision_context {
         type Composite = nemotron_labs_diffusion::composite::Model<Backend>;
-        let mut model = Composite::new(config.clone(), stream)?;
+        let mut model = nemotron_labs_diffusion::composite::CompositeKernel::from_definition(
+            config.clone(),
+            std::sync::Arc::new(nemotron_labs_diffusion::definition::composite(
+                &config, None,
+            )?),
+            stream,
+        )?;
         let (policy, metadata) = prepare_layerwise_policy_with_bindings(
             source,
             &mut model,
@@ -423,10 +429,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         return Ok(());
     }
-    let mut model = match adapter {
-        Some(adapter) => Model::new_with_draft_adapter(config.clone(), adapter, stream)?,
-        None => Model::new(config.clone(), stream)?,
+    let text_config = match adapter {
+        Some(adapter) => config.clone().with_draft_adapter(adapter),
+        None => config.clone(),
     };
+    let text_definition = std::sync::Arc::new(nemotron_labs_diffusion::definition::text(
+        &text_config,
+        None,
+    )?);
+    let mut model = TextKernel::from_definition(text_config, text_definition, stream)?;
     let (policy, metadata) = prepare_layerwise_policy_with_bindings(
         source,
         &mut model,

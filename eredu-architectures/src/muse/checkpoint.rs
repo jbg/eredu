@@ -807,7 +807,12 @@ fn select_safetensors_recipe_group<C: RecipeCatalog + ?Sized>(
         .map_or(0, |vision| vision.layer_count());
     let text_layers = dimension(args.num_hidden_layers, "text layer count")?;
     let mut selected_recipes = BTreeMap::new();
-    for (target, recipe) in safetensors_recipes(args, catalog)? {
+    let mut recipes = direct_safetensors_recipes(&safetensors_plan(args)?, catalog);
+    if let Some((1, layer)) = selected.filter(|_| args.is_moe()) {
+        let expert = safetensors_expert_recipes(catalog, args, layer)?;
+        recipes.extend(gated_product_materialization_recipes(catalog, &expert)?);
+    }
+    for (target, recipe) in recipes {
         let owner = if target.starts_with("model.audio_tower.") {
             let audio = args
                 .audio_config
@@ -1983,24 +1988,30 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 }
             }
         }
+        let members = eredu_runtime::ParameterBankRecipes::new(
+            catalog,
+            materialization
+                .iter()
+                .map(|(target, recipe)| ((*target).clone(), (*recipe).clone()))
+                .collect(),
+            experts,
+        )
+        .map_err(|error| error.to_string())?;
         for expert in 0..experts {
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert
-                    .checked_add(1)
-                    .ok_or_else(|| "Muse-Glimmer expert index overflowed".to_string())?,
-            };
+            let selected = members
+                .member(expert)
+                .expect("validated expert bank member");
             let parameters = materialization
                 .iter()
-                .map(|(target, recipe)| {
+                .map(|(target, _)| {
                     let binding = target
                         .rsplit('.')
                         .next()
                         .ok_or("expert parameter has no local identity")?;
-                    let recipe = recipe
-                        .select_bounded(catalog, selection.clone())
-                        .map_err(|error| error.to_string())?;
+                    let recipe = selected
+                        .get(target.as_str())
+                        .expect("declared bank parameter")
+                        .clone();
                     let role = if args.linear_format_for(target)
                         == eredu_checkpoint::LinearFormat::Dense
                     {

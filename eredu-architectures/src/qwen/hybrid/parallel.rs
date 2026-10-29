@@ -2,17 +2,14 @@
 
 use std::ops::Range;
 
-use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
+use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    ArchitecturePartition, LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec,
-    ParameterRole, PartitionOwnership, StateLayout, TensorPlacement,
+    ArchitecturePartition, LocalModelLayout, ParallelPlanError, PartitionOwnership, StateLayout,
 };
 
 use super::{
-    prompt_cache_architecture_fingerprint, state_layout_with_geometry, Block, FeedForward,
-    HybridConfig, HybridLayerPolicy, HybridStateGeometry, ParsedHybridConfig, PredictionUnit,
-    TokenMixer, Unit,
+    prompt_cache_architecture_fingerprint, state_layout_with_geometry, HybridConfig,
+    HybridLayerPolicy, HybridStateGeometry, ParsedHybridConfig,
 };
 
 use crate::qwen::vision;
@@ -101,12 +98,12 @@ pub fn local_geometry(
     let prediction = (0..predictions)
         .map(|depth| local_unit_config(config, depth + 1, 0, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let embedding_range = vocabulary_range(layout, "model.embed_tokens", config.vocab_size)?;
-    let output_range = if config.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", config.vocab_size)?)
-    };
+    let (embedding_range, output_range) = super::static_module_spec(config).vocabulary_ranges(
+        layout,
+        "model.embed_tokens",
+        "model.norm",
+        "lm_head",
+    )?;
     let state_layout = local_state_layout(config, &target, &prediction)?;
     let geometry = LocalGeometry {
         target,
@@ -147,58 +144,6 @@ fn local_state_layout(
             }),
     );
     state_layout_with_geometry(config, &geometry).map_err(|error| invalid(error.to_string()))
-}
-
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    vocabulary: i32,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let vocabulary =
-        usize::try_from(vocabulary).map_err(|_| invalid("Qwen hybrid vocabulary is negative"))?;
-    let mut selected = None;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        if tensor.global_shape().first().copied() != Some(vocabulary) {
-            return Err(invalid(format!(
-                "Qwen hybrid vocabulary member {target} has global shape {:?}",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated | TensorPlacement::Local => 0..vocabulary,
-            placement => {
-                return Err(invalid(format!(
-                    "Qwen hybrid vocabulary member {target} has placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(invalid(format!(
-                "Qwen hybrid vocabulary group {logical_name} is inconsistent"
-            )));
-        }
-        selected = Some(range);
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary,
-        local: selected.ok_or_else(|| {
-            invalid(format!(
-                "missing local Qwen hybrid vocabulary layout for {logical_name}"
-            ))
-        })?,
-    };
-    range
-        .validate()
-        .map_err(|error| invalid(error.to_string()))?;
-    Ok(range)
 }
 
 fn invalid(message: impl Into<String>) -> ParallelPlanError {
@@ -299,6 +244,43 @@ impl ConditionalPartitionLocalGeometry {
     /// Selected static roles in canonical vision/target order.
     pub fn static_roles(&self) -> &[String] {
         &self.static_roles
+    }
+
+    pub(super) fn validate_complete_geometry(
+        &self,
+        parsed: &ParsedHybridConfig,
+        complete: &ConditionalLocalGeometry,
+    ) -> Result<(), ParallelPlanError> {
+        self.validate_for(parsed)?;
+        complete.validate_for(parsed)?;
+        if self.complete_state_layout != *complete.state_layout()
+            || self.embedding_range != *complete.text().embedding_range()
+            || self.output_range.as_ref() != complete.text().output_range()
+            || self.merger_widths != complete.merger_widths()
+            || self
+                .vision_units
+                .clone()
+                .into_iter()
+                .flatten()
+                .any(|index| self.vision_block(index) != complete.vision_block(index))
+        {
+            return Err(invalid(
+                "conditional Qwen selected geometry differs from complete local geometry",
+            ));
+        }
+        for index in self.target_units.clone() {
+            let selected = self.target(index).expect("validated target unit");
+            let global = complete
+                .text()
+                .target(index)
+                .expect("validated complete unit");
+            if super::parameters::unit_parameter_geometry(selected, 0, index)?
+                != super::parameters::unit_parameter_geometry(global, 0, index)?
+            {
+                return Err(invalid(format!("conditional Qwen selected unit {index} parameter geometry differs from complete local geometry")));
+            }
+        }
+        Ok(())
     }
 
     fn validate_for(&self, parsed: &ParsedHybridConfig) -> Result<(), ParallelPlanError> {
@@ -809,289 +791,4 @@ fn local_config_at(
         }
     }
     Ok(local)
-}
-
-fn norm_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    block: &Block<B>,
-    root: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(vec![
-        module_parameter_group::<B::Tensor, _>(
-            format!("{root}.input_norm"),
-            ParameterRole::Replicated,
-            &block.input_norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            format!("{root}.post_attention_norm"),
-            ParameterRole::Replicated,
-            &block.post_attention_norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ])
-}
-
-fn block_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    block: &Block<B>,
-    config: &HybridConfig,
-    root: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = norm_groups(block, root)?;
-    match &block.mixer {
-        TokenMixer::Linear(linear) => {
-            let key = usize::try_from(config.linear_num_key_heads).map_err(|_| {
-                ParallelPlanError::InvalidGroup("recurrent heads exceed usize".into())
-            })?;
-            let key_width =
-                usize::try_from(config.linear_num_key_heads * config.linear_key_head_dim).map_err(
-                    |_| ParallelPlanError::InvalidGroup("recurrent key width exceeds usize".into()),
-                )?;
-            let value_width =
-                usize::try_from(config.linear_num_value_heads * config.linear_value_head_dim)
-                    .map_err(|_| {
-                        ParallelPlanError::InvalidGroup(
-                            "recurrent value width exceeds usize".into(),
-                        )
-                    })?;
-            let segments = vec![
-                0..key_width,
-                key_width..2 * key_width,
-                2 * key_width..2 * key_width + value_width,
-            ];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.linear_attn.heads"),
-                ParameterRole::Channels,
-                key,
-                linear,
-                |metadata, shape| {
-                    let name = metadata.id.as_str();
-                    if name.contains("in_proj_qkv") || name.ends_with("conv1d.weight") {
-                        // The convolution consumes concatenated Q, K and V.
-                        // Each rank needs the same head slice of all three
-                        // segments as its local input projection.
-                        segmented_member_sharding(config, metadata, 0, &segments)
-                    } else if name.contains("in_proj_z")
-                        || name.contains("in_proj_b")
-                        || name.contains("in_proj_a")
-                        || name.ends_with("dt_bias")
-                        || name.ends_with("A_log")
-                    {
-                        Ok(MemberSharding::Partitioned { axis: 0 })
-                    } else if name.contains("out_proj") && shape.len() >= 2 {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Replicated)
-                    }
-                },
-            )?);
-        }
-        TokenMixer::Attention(attention) => {
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.attention.heads"),
-                ParameterRole::AttentionHeads,
-                usize::try_from(config.num_key_value_heads).map_err(|_| {
-                    ParallelPlanError::InvalidGroup("attention heads exceed usize".into())
-                })?,
-                attention,
-                |metadata, shape| {
-                    let name = metadata.id.as_str();
-                    if name.contains("q_proj") || name.contains("k_proj") || name.contains("v_proj")
-                    {
-                        Ok(MemberSharding::Partitioned { axis: 0 })
-                    } else if name.contains("o_proj") && shape.len() >= 2 {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Replicated)
-                    }
-                },
-            )?);
-        }
-    }
-    match &block.feed_forward {
-        FeedForward::Dense(mlp) => groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-            format!("{root}.mlp.intermediate"),
-            ParameterRole::FeedForwardIntermediate,
-            aligned_partition_units(
-                root,
-                usize::try_from(config.intermediate_size).map_err(|_| {
-                    ParallelPlanError::InvalidGroup("dense width exceeds usize".into())
-                })?,
-                1,
-                1,
-            )?,
-            mlp,
-            |metadata, shape| {
-                let name = metadata.id.as_str();
-                if name.contains("gate_proj") || name.contains("up_proj") {
-                    Ok(MemberSharding::Partitioned { axis: 0 })
-                } else if name.contains("down_proj") && shape.len() >= 2 {
-                    Ok(MemberSharding::Partitioned { axis: 1 })
-                } else {
-                    Ok(MemberSharding::Replicated)
-                }
-            },
-        )?),
-        FeedForward::Routed(moe) => {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.router"),
-                ParameterRole::Replicated,
-                &moe.router,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?);
-            let intermediate = usize::try_from(config.moe_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("expert width exceeds usize".into())
-            })?;
-            let segments = vec![0..intermediate, intermediate..2 * intermediate];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.experts.intermediate"),
-                ParameterRole::ExpertIntermediate,
-                aligned_partition_units(root, intermediate, 1, 1)?,
-                &moe.experts,
-                |metadata, _| {
-                    if metadata.id.as_str().contains("gate_up") {
-                        segmented_member_sharding(config, metadata, 1, &segments)
-                    } else {
-                        Ok(MemberSharding::Partitioned { axis: 2 })
-                    }
-                },
-            )?);
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.shared.intermediate"),
-                ParameterRole::ExpertIntermediate,
-                aligned_partition_units(
-                    root,
-                    usize::try_from(config.shared_expert_intermediate_size).map_err(|_| {
-                        ParallelPlanError::InvalidGroup("shared expert width exceeds usize".into())
-                    })?,
-                    1,
-                    1,
-                )?,
-                &moe.shared_expert,
-                |metadata, shape| {
-                    let name = metadata.id.as_str();
-                    if name.contains("gate_proj") || name.contains("up_proj") {
-                        Ok(MemberSharding::Partitioned { axis: 0 })
-                    } else if name.contains("down_proj") && shape.len() >= 2 {
-                        Ok(MemberSharding::Partitioned { axis: 1 })
-                    } else {
-                        Ok(MemberSharding::Replicated)
-                    }
-                },
-            )?);
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{root}.mlp.shared_gate"),
-                ParameterRole::Replicated,
-                &moe.shared_expert_gate,
-                |_, _| Ok(MemberSharding::Replicated),
-            )?);
-        }
-    }
-    Ok(groups)
-}
-
-// Segments describe logical weight rows. FP8 scale companions instead contain
-// one row per weight block, including on the expert bank's rank-3 row axis.
-fn segmented_member_sharding(
-    config: &HybridConfig,
-    metadata: &eredu_nn::ParameterMetadata,
-    axis: usize,
-    segments: &[Range<usize>],
-) -> Result<MemberSharding, ParallelPlanError> {
-    let mut segments = segments.to_vec();
-    if metadata.linear_companion == Some(eredu_nn::LinearCompanionRole::Scale) {
-        let weight = metadata.linear_companion_of.as_ref().ok_or_else(|| {
-            invalid(format!(
-                "scale {} has no owning weight",
-                metadata.id.as_str()
-            ))
-        })?;
-        if let eredu_checkpoint::LinearFormat::E4M3BlockFp8(format) =
-            config.linear_format(weight.as_str())
-        {
-            let block = usize::try_from(format.block_rows)
-                .map_err(|_| invalid("FP8 block rows exceed usize"))?;
-            for segment in &mut segments {
-                if block == 0
-                    || !segment.start.is_multiple_of(block)
-                    || !segment.end.is_multiple_of(block)
-                {
-                    return Err(invalid(format!(
-                        "FP8 scale {} segment {segment:?} is not aligned to {block} rows",
-                        metadata.id.as_str(),
-                    )));
-                }
-                *segment = segment.start / block..segment.end / block;
-            }
-        }
-    }
-    Ok(MemberSharding::PartitionedSegments { axis, segments })
-}
-
-/// Declares semantic placement for a target or configured prediction unit.
-pub fn unit_parallel_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    unit: &Unit<B>,
-    config: &HybridConfig,
-    group: usize,
-    index: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    match unit {
-        Unit::Target(block) if group == 0 => {
-            block_groups(block, config, &format!("model.layers.{index}"))
-        }
-        Unit::Prediction(PredictionUnit { block, .. }) if group > 0 && index == 0 => {
-            block_groups(block, config, &format!("mtp.layers.{}", group - 1))
-        }
-        _ => Err(ParallelPlanError::InvalidGroup(format!(
-            "Qwen hybrid unit kind does not match ({group}, {index})"
-        ))),
-    }
-}
-
-/// Canonical checkpoint-shared modules, pinned on each consuming MTP partition.
-pub fn prediction_shared_parameter_groups<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    shared: &super::PredictionShared<B>,
-    depths: usize,
-) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, ParallelPlanError> {
-    let groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            "mtp.pre_fc_norm_hidden",
-            ParameterRole::Replicated,
-            &shared.hidden_norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            "mtp.pre_fc_norm_embedding",
-            ParameterRole::Replicated,
-            &shared.embedding_norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            "mtp.fc",
-            ParameterRole::Replicated,
-            &shared.fusion,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            "mtp.norm",
-            ParameterRole::Replicated,
-            &shared.final_norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ];
-    let consumers = (0..depths)
-        .map(|depth| {
-            eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
-                .map(|group| (group, 0))
-                .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let owner = eredu_runtime::ParameterGroupOwner::static_unit_consumers("mtp", consumers);
-    Ok(groups
-        .into_iter()
-        .map(|group| eredu_runtime::OwnedParameterGroupSpec::new(owner.clone(), group))
-        .collect())
 }

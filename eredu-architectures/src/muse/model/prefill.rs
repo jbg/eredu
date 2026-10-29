@@ -8,7 +8,7 @@ pub(super) struct DecoderPrefill<T> {
     pub assembled: Option<T>,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MuseKernel<B> {
     pub(super) fn resume_prefill<S>(
         &self,
         chunk: Option<DecoderPrefillChunk<'_, B::Tensor>>,
@@ -45,8 +45,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             }
             None => {
                 if !self
-                    .partition_state
-                    .as_ref()
+                    .selected_state()
                     .is_some_and(|state| !state.owns_global_layer(0))
                 {
                     return Err(Error::backend(
@@ -66,6 +65,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 mask: None,
                 parts: Vec::new(),
                 vision: None,
+                vision_active: false,
                 audio: None,
                 waveform: None,
                 decoder_positions: positions,

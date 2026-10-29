@@ -12,6 +12,7 @@ use eredu_nn::{
     Parameter, ParameterSpec, Parameterized, Tensor,
 };
 
+use super::parallel::VisionStaticResource;
 use super::{VisionArithmetic, VisionAttentionPolicy, VisionConfig};
 
 /// Read-only boundaries inside one ordinary vision block.
@@ -585,16 +586,65 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
     }
 }
 
+/// Source-free selection of independently materialized pinned vision resources.
+#[derive(Debug, Clone)]
+pub struct VisionStaticSelection {
+    config: VisionConfig,
+    resources: std::collections::BTreeSet<VisionStaticResource>,
+}
+impl VisionStaticSelection {
+    /// Selects every module for the ordinary lower-level complete tower.
+    pub fn all(config: VisionConfig) -> Self {
+        Self {
+            config,
+            resources: VisionStaticResource::ALL.into_iter().collect(),
+        }
+    }
+
+    /// Resolves native resources from the retained component and admitted canonical bindings.
+    pub fn from_parameter_bindings(
+        args: &super::DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<&super::LocalGeometry>,
+        bindings: &[eredu_runtime::OwnedParameterGroupSpec],
+    ) -> Result<Self, Error> {
+        let definition = super::model::select_definition(args, definition, geometry)?;
+        let config = args
+            .vision_config
+            .clone()
+            .ok_or_else(|| missing_resource("vision configuration"))?;
+        let selected = definition.select_pinned_groups(bindings, &["vision"])?;
+        let resources = selected
+            .into_iter()
+            .map(|binding| {
+                VisionStaticResource::ALL
+                    .into_iter()
+                    .find(|resource| resource.logical_name() == binding.group().logical_name())
+                    .ok_or_else(|| missing_resource(binding.group().logical_name()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { config, resources })
+    }
+}
+
+fn missing_resource(resource: &str) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: "Muse vision".into(),
+        resource: format!("unavailable {resource}"),
+    }
+    .into()
+}
+
 /// Pinned patch, position, normalization, merge-adapter, and projection modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    patch_embedder: PatchEmbedder<B>,
-    pre_norm: CenteredLayerNorm<B>,
-    post_norm: CenteredLayerNorm<B>,
-    adapter_fc1: B::Linear,
-    adapter_fc2: B::Linear,
-    projection: B::Linear,
+    patch_embedder: Option<PatchEmbedder<B>>,
+    pre_norm: Option<CenteredLayerNorm<B>>,
+    post_norm: Option<CenteredLayerNorm<B>>,
+    adapter_fc1: Option<B::Linear>,
+    adapter_fc2: Option<B::Linear>,
+    projection: Option<B::Linear>,
     #[parameter(skip)]
     config: VisionConfig,
 }
@@ -605,10 +655,21 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         config: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if matches!(
-            config.perception_normalization,
-            super::PerceptionNormalization::Float32 { .. }
-        ) {
+        Self::from_selection(VisionStaticSelection::all(config), context)
+    }
+
+    /// Materializes exactly the selected pinned resources without allocating siblings.
+    pub fn from_selection(
+        selection: VisionStaticSelection,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let VisionStaticSelection { config, resources } = selection;
+        if resources.contains(&VisionStaticResource::Projection)
+            && matches!(
+                config.perception_normalization,
+                super::PerceptionNormalization::Float32 { .. }
+            )
+        {
             B::require_operator_capabilities(
                 "ordered perception RMS normalization",
                 eredu_nn::NeuralOperatorCapabilities::CASCADED_RMS
@@ -632,38 +693,83 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         };
         let shuffled = config.hidden_size * config.merge_size * config.merge_size;
         Ok(Self {
-            patch_embedder: PatchEmbedder::new(&config, context)?,
-            pre_norm: CenteredLayerNorm::new(
-                "model.vision_tower.ln_pre",
-                config.hidden_size,
-                config.layer_norm_eps,
-                config.arithmetic,
-                context,
-            )?,
-            post_norm: CenteredLayerNorm::new(
-                "model.vision_tower.ln_post",
-                config.hidden_size,
-                config.layer_norm_eps,
-                config.arithmetic,
-                context,
-            )?,
-            adapter_fc1: linear(
-                "model.vision_adapter.fc1.weight",
-                shuffled,
-                config.projector_hidden_size,
-            )?,
-            adapter_fc2: linear(
-                "model.vision_adapter.fc2.weight",
-                config.projector_hidden_size,
-                config.projector_hidden_size,
-            )?,
-            projection: linear(
-                "model.vision_projection.weight",
-                config.projector_hidden_size,
-                config.language_hidden_size,
-            )?,
+            patch_embedder: resources
+                .contains(&VisionStaticResource::Patch)
+                .then(|| PatchEmbedder::new(&config, context))
+                .transpose()?,
+            pre_norm: resources
+                .contains(&VisionStaticResource::Norms)
+                .then(|| {
+                    CenteredLayerNorm::new(
+                        "model.vision_tower.ln_pre",
+                        config.hidden_size,
+                        config.layer_norm_eps,
+                        config.arithmetic,
+                        context,
+                    )
+                })
+                .transpose()?,
+            post_norm: resources
+                .contains(&VisionStaticResource::Norms)
+                .then(|| {
+                    CenteredLayerNorm::new(
+                        "model.vision_tower.ln_post",
+                        config.hidden_size,
+                        config.layer_norm_eps,
+                        config.arithmetic,
+                        context,
+                    )
+                })
+                .transpose()?,
+            adapter_fc1: resources
+                .contains(&VisionStaticResource::Adapter)
+                .then(|| {
+                    linear(
+                        "model.vision_adapter.fc1.weight",
+                        shuffled,
+                        config.projector_hidden_size,
+                    )
+                })
+                .transpose()?,
+            adapter_fc2: resources
+                .contains(&VisionStaticResource::Adapter)
+                .then(|| {
+                    linear(
+                        "model.vision_adapter.fc2.weight",
+                        config.projector_hidden_size,
+                        config.projector_hidden_size,
+                    )
+                })
+                .transpose()?,
+            projection: resources
+                .contains(&VisionStaticResource::Projection)
+                .then(|| {
+                    linear(
+                        "model.vision_projection.weight",
+                        config.projector_hidden_size,
+                        config.language_hidden_size,
+                    )
+                })
+                .transpose()?,
             config,
         })
+    }
+
+    /// Whether this aggregate retains any learned parameters.
+    pub fn has_parameters(&self) -> bool {
+        self.patch_embedder.is_some()
+            || self.pre_norm.is_some()
+            || self.post_norm.is_some()
+            || self.adapter_fc1.is_some()
+            || self.adapter_fc2.is_some()
+            || self.projection.is_some()
+    }
+
+    fn require_adapter(&self) -> Result<(), Error> {
+        if self.adapter_fc1.is_none() || self.adapter_fc2.is_none() || self.projection.is_none() {
+            return Err(missing_resource("complete language adapter and projection"));
+        }
+        Ok(())
     }
 
     /// Embeds and window-permutes patches and constructs reusable placement state.
@@ -672,16 +778,22 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         input: VisionInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
+        let patch = self
+            .patch_embedder
+            .as_mut()
+            .ok_or_else(|| missing_resource("patch and position modules"))?;
+        let pre_norm = self
+            .pre_norm
+            .as_ref()
+            .ok_or_else(|| missing_resource("ingress normalization"))?;
         validate_patch_grid(
             input.grid,
             self.config.merge_size,
             Some(input.pixels.dim(0)),
         )
         .map_err(Error::backend)?;
-        let hidden =
-            self.patch_embedder
-                .forward(input.pixels, input.grid, &self.config, context)?;
-        let hidden = self.pre_norm.forward(&hidden, context)?;
+        let hidden = patch.forward(input.pixels, input.grid, &self.config, context)?;
+        let hidden = pre_norm.forward(&hidden, context)?;
         let full_chunks = attention_chunk_lengths(input.grid).map_err(Error::backend)?;
         let window = window_partition(
             input.grid,
@@ -746,10 +858,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             &<B::Tensor as Tensor>::Context,
         ) -> Result<(), Error>,
     {
+        self.require_adapter()?;
+        let post_norm = self
+            .post_norm
+            .as_ref()
+            .ok_or_else(|| missing_resource("readout normalization"))?;
         let reverse = inverse_permutation(&state.window_permutation).map_err(Error::backend)?;
         let reverse = B::Tensor::from_i32_slice(&reverse, &[reverse.len() as i32], context)?;
         let hidden = hidden.take_axis(&reverse, 0, context)?;
-        let hidden = self.post_norm.forward(&hidden, context)?;
+        let hidden = post_norm.forward(&hidden, context)?;
         hook(
             VisionObservation::Readout(VisionReadoutPhase::PostNormalization),
             &hidden,
@@ -786,6 +903,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             &<B::Tensor as Tensor>::Context,
         ) -> Result<(), Error>,
     {
+        self.require_adapter()?;
         if hidden.shape().len() != 2
             || hidden.dim(0) <= 0
             || hidden.dim(1)
@@ -795,7 +913,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                 "Muse media adapter input has incompatible geometry",
             ));
         }
-        let hidden = self.adapter_fc1.forward(hidden, context)?;
+        let hidden = self
+            .adapter_fc1
+            .as_mut()
+            .ok_or_else(|| missing_resource("adapter expansion"))?
+            .forward(hidden, context)?;
         hook(
             VisionObservation::Readout(VisionReadoutPhase::Expansion),
             &hidden,
@@ -807,7 +929,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             &hidden,
             context,
         )?;
-        let hidden = self.adapter_fc2.forward(&hidden, context)?;
+        let hidden = self
+            .adapter_fc2
+            .as_mut()
+            .ok_or_else(|| missing_resource("adapter contraction"))?
+            .forward(&hidden, context)?;
         hook(
             VisionObservation::Readout(VisionReadoutPhase::Contraction),
             &hidden,
@@ -819,7 +945,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             &hidden,
             context,
         )?;
-        let hidden = self.projection.forward(&hidden, context)?;
+        let hidden = self
+            .projection
+            .as_mut()
+            .ok_or_else(|| missing_resource("language projection"))?
+            .forward(&hidden, context)?;
         hook(
             VisionObservation::Readout(VisionReadoutPhase::LanguageProjection),
             &hidden,

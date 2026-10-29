@@ -4,7 +4,7 @@ use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
     partitioned_projection_group, LocalModelLayout, MemberSharding, ParallelPlanError,
-    ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout, TensorPlacement,
+    ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
 };
 use std::ops::Range;
 
@@ -564,7 +564,9 @@ pub fn local_state_geometry(
     Ok(geometry)
 }
 
-fn global_target_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
+pub(super) fn global_target_geometry(
+    args: &ModelArgs,
+) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
     Ok(args
         .layer_schedule
         .iter()
@@ -588,7 +590,9 @@ fn global_target_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, Parall
         .collect())
 }
 
-fn global_prediction_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
+pub(super) fn global_prediction_geometry(
+    args: &ModelArgs,
+) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
     Ok(args
         .mtp_policies()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
@@ -607,59 +611,6 @@ fn global_prediction_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, Pa
         .collect())
 }
 
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    global_vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    let mut found = false;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        found = true;
-        if tensor.global_shape().first().copied() != Some(global_vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Nemotron-H vocabulary member {target} has global shape {:?}, expected {global_vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..global_vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "Nemotron-H vocabulary member {target} has non-row placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Nemotron-H vocabulary group {logical_name} has inconsistent companion selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    if !found {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "missing local Nemotron-H vocabulary layout for {logical_name}"
-        )));
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary,
-        local: selected.expect("a found vocabulary member supplies a selection"),
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
-}
-
 /// Derives complete rank-local target, MTP, vocabulary, and state geometry.
 pub fn local_geometry(
     args: &ModelArgs,
@@ -674,15 +625,11 @@ pub fn local_geometry(
     let (target, prediction) = geometry.split_at(target_count);
     let state_layout = state_layout_with_geometry(args, &geometry)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let vocabulary = usize::try_from(args.vocab_size).map_err(|_| {
-        ParallelPlanError::InvalidGroup("Nemotron-H vocabulary exceeds usize".into())
-    })?;
-    let embedding_range = vocabulary_range(layout, "model.embeddings", vocabulary)?;
-    let output_range = if args.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
+    let (embedding_range, output_range) = super::static_spec(
+        args,
+        super::FinalNormalization::Native,
+    )
+    .vocabulary_ranges(layout, "model.embeddings", "model.norm_f", "lm_head")?;
     let prediction_steps = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
         ParallelPlanError::InvalidGroup("Nemotron-H prediction-step count exceeds usize".into())
     })?;

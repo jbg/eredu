@@ -547,19 +547,18 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
             output.push(binding);
             continue;
         }
-        let logical_target = binding
-            .logical_target()
-            .ok_or_else(|| BindingPlacementError::MissingLogicalTarget {
+        let logical_target = binding.logical_target().ok_or_else(|| {
+            BindingPlacementError::MissingLogicalTarget {
                 binding: binding.name().to_owned(),
-            })?
-            .to_owned();
-        let tensor = layout.tensor(&logical_target).ok_or_else(|| {
-            BindingPlacementError::UnknownLogicalTarget {
-                binding: binding.name().to_owned(),
-                target: logical_target.clone(),
             }
         })?;
-        let companions = binding.quantization_companions().cloned();
+        let tensor = layout.tensor(logical_target).ok_or_else(|| {
+            BindingPlacementError::UnknownLogicalTarget {
+                binding: binding.name().to_owned(),
+                target: logical_target.to_owned(),
+            }
+        })?;
+        let companions = binding.quantization_companions();
 
         if !skip_member_axis
             && binding.recipe().is_none()
@@ -615,7 +614,7 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
             continue;
         }
 
-        let mut recipe = binding.source_recipe();
+        let mut recipe = binding.recipe_view();
         let mut selected = false;
         for placement in tensor
             .additional_placements()
@@ -634,7 +633,7 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
             let metadata = recipe.infer(source)?;
             let selection = placement_selection(tensor, placement, metadata.shape())?;
             if selection != TensorSelection::Full {
-                recipe = recipe.select_bounded(source, selection)?;
+                recipe = std::borrow::Cow::Owned(recipe.select_bounded(source, selection)?);
                 selected = true;
             }
         }
@@ -643,9 +642,10 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
             continue;
         }
         let expected_bytes = recipe.infer(source)?.byte_len();
-        let mut placed = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?
-            .with_logical_target(logical_target)?
-            .with_storage_layout(binding.storage_layout());
+        let mut placed =
+            WeightBinding::from_recipe(binding.name(), recipe.into_owned(), expected_bytes)?
+                .with_logical_target(logical_target)?
+                .with_storage_layout(binding.storage_layout());
         if let Some(companions) = companions {
             placed = placed.with_quantization_companions(
                 companions.scale(),

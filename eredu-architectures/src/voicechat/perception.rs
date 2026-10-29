@@ -95,6 +95,9 @@ impl PerceptionDimensions {
 /// Invalid geometry, incompatible retained state or numerical failure.
 #[derive(Debug, thiserror::Error)]
 pub enum PerceptionError {
+    /// Shared component declaration or selected ownership is invalid.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// Shared traversal, residency or native mechanism failure with its source preserved.
     #[error(transparent)]
     Backend(#[from] BackendFailure),
@@ -201,7 +204,10 @@ pub struct PerceptionOutput<T> {
 /// Portable resident perception using the shared layered traversal.
 pub struct Perception<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        super::perception_layered::PerceptionArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            super::perception_layered::PerceptionKernel<B>,
+        >,
         B,
         super::perception_layered::PerceptionRuntimeState<B::Tensor>,
     >,
@@ -258,10 +264,12 @@ impl<B: NeuralBackend> Perception<B> {
     ) -> Result<Self, PerceptionError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::perception_layered::PerceptionArchitecture::new(dimensions)?
-                    .with_precision(precision)?,
+                super::perception_layered::PerceptionKernel::new(dimensions)?
+                    .with_precision(precision)?
+                    .into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts independently materialized units without replacement allocations.
@@ -271,34 +279,21 @@ impl<B: NeuralBackend> Perception<B> {
         blocks: Vec<ConformerBlock<B>>,
         projection: B::Linear,
     ) -> Result<Self, PerceptionError> {
-        use super::perception_layered::{PerceptionArchitecture, PerceptionUnit};
-        let architecture = PerceptionArchitecture::new(dimensions)?;
+        use super::perception_layered::{PerceptionKernel, PerceptionUnit};
+        let architecture = PerceptionKernel::new(dimensions)?.into_component()?;
         let units = vec![
             vec![PerceptionUnit::Subsampling(subsampling)],
             blocks.into_iter().map(PerceptionUnit::Block).collect(),
             vec![PerceptionUnit::Projection(projection)],
         ];
         Ok(Self {
-            runtime: eredu_runtime::ResidentRuntime::from_units(architecture, units).map_err(
-                |error| match error {
-                    eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                    eredu_runtime::ResidentUnitsError::GroupCount { .. } => {
-                        PerceptionError::Configuration(
-                            "resident perception group count differs from its graph",
-                        )
-                    }
-                    eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                        PerceptionError::Configuration(
-                            "resident perception unit count differs from its graph",
-                        )
-                    }
-                },
-            )?,
+            runtime: eredu_runtime::ResidentRuntime::from_units(architecture, units)
+                .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Connected perception geometry, independent of residency policy.
     pub fn dimensions(&self) -> PerceptionDimensions {
-        self.runtime.architecture().dimensions()
+        self.runtime.architecture().kernel().dimensions()
     }
     /// Evaluates a supplied mel window through the same resident and bounded equations.
     /// Parent caches remain unchanged even if a later unit fails.

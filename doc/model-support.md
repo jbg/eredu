@@ -83,6 +83,75 @@ projector.
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 | NemotronLabs VoiceChat | realtime PCM speech, text, transcription, tools | yes | `nemotron_voicechat`; explicit split component bundle and companion | single-device controlled/iterator session; [validation](voicechat-validation.md) |
 
+Low-level DeepSeek-V3 construction consumes a retained declaration through
+`V3Kernel::from_definition`, `from_parallel_definition` or
+`from_partition_definition`. `V3UnitFactory::from_definition` validates independent
+target/MTP unit construction without pinned target resources; complete kernels
+and external prediction preparation use its shared unit construction.
+`deepseek::v3::project_parameters` selects physical formats while retaining logical
+consumers, observation seams and target/MTP state identities. Prediction-extension
+plans retain their complete validated declaration before target projection.
+
+Low-level DeepSeek-V4 complete, tensor-local and partition materialization consume
+a retained declaration through `V4Kernel::from_definition`,
+`from_parallel_definition` and `from_partition_definition`. Partition construction
+validates ownership before allocating selected text, hyper-head and DSpark resources.
+
+Low-level DeepSeek-V4 `V4UnitFactory::from_definition` validates independent
+target/MTP/DSpark unit construction from a retained declaration and selected
+geometry. Kernels and external prediction preparation share this construction;
+DSpark retains its separately declared shared projections and heads.
+`deepseek::v4::project_parameters` preserves logical consumers, observation seams
+and state identities while selecting physical formats.
+
+Low-level Nemotron-H construction consumes a retained declaration through
+`CompleteNemotronKernel::from_definition`, `from_parallel_definition` or
+`NemotronKernel::from_partition`. `nemotron_h::component_definition` declares
+source-free target/MTP ownership; `project_parameters` selects physical formats
+while preserving logical consumers, observation seams and mixed state identities.
+
+Low-level Kimi Linear construction consumes a retained declaration through
+`CompleteKimiKernel::from_definition`, `from_parallel_definition` or
+`KimiKernel::from_partition`. `kimi_linear::project_parameters` preserves logical
+consumers, observation seams and recurrent/compressed state ownership while
+selecting physical formats.
+
+Low-level LFM2 construction consumes a retained component declaration through
+`CompleteLfm2Kernel::from_definition`, `from_parallel_definition` or
+`Lfm2Kernel::from_partition`. `lfm2::project_parameters` selects physical formats
+while preserving logical consumers, observation seams and mixed state ownership.
+
+Low-level text Qwen hybrid construction takes a retained component declaration
+through `QwenKernel::from_definition`, `from_parallel_definition` or `from_partition`.
+`qwen::hybrid::project_parameters` selects physical formats while retaining
+logical consumers, observation seams and independent target/MTP state slots.
+
+Low-level conditional Qwen hybrid construction takes a retained component
+declaration through `ConditionalKernel::from_definition`,
+`from_parallel_definition` or `from_partition`.
+`qwen::hybrid::project_conditional_parameters` selects physical formats while
+retaining logical consumers, observation seams and target/MTP state ownership.
+
+Low-level Qwen3-VL construction takes a retained component declaration through
+`VlKernel::from_definition`, `from_parallel_definition` or `from_partition`.
+`qwen::vl::project_parameters` selects physical formats while retaining canonical
+consumers, observation seams and the persisted mRoPE position-delta state.
+Complete and selected partitions share one materializer and family equations.
+
+Low-level Gemma 4 construction consumes an explicit retained component declaration
+through `GemmaKernel::from_definition` or `from_parallel_definition`.
+`gemma4::model::project_parameters` selects physical formats while retaining
+logical consumers and observation seams. Partition selection retains its declared
+shared-KV receiver caches through explicit state-slot materialization. Optional
+audio output-bias ownership follows admitted tensor presence.
+
+Low-level Inkling construction consumes an explicit retained component declaration
+through `InklingKernel::from_definition` or `from_parallel_definition`.
+`inkling::model::project_parameters` selects executable physical formats while
+retaining logical parameter consumers, observation seams and independent target
+and embedded-prediction state identities. Complete and selected partition
+preparation use the same constructors and family equations.
+
 DiffusionGemma uses the ordinary loading and generation entry points. Its
 `refinement` request setting controls the iterative schedule; `draft_events`
 enables replaceable tentative blocks in observed delivery. Final token constraints
@@ -564,9 +633,11 @@ The family uses the standard dense execution paths: fully resident, per-block
 host offloading, disk streaming, tensor parallelism, pipeline parallelism and
 combined TP/PP, with selected weight transformations and logical-layer captures.
 Publisher-layout GGUF checkpoints preserve their native encodings and Q/K row
-ordering. Each logical invocation owns a separately materialized block, so
-resident memory includes those replicas; checkpoint storage remains physical.
-Bounded residency can admit one logical block at a time.
+ordering. Logical invocations reuse canonical physical bodies while retaining
+independent KV caches. Between-pass normalization is a separate shared resource;
+final normalization retains its accounted pinned replica. Bounded residency
+leases each body and between-pass normalization independently. Pipeline owners
+materialize the canonical resources needed by their selected invocations.
 
 Validation includes independent numerical oracles, controlled/uninterrupted
 generation comparisons, and the downloaded official SafeTensors checkpoint
@@ -612,6 +683,15 @@ observations and interventions; prompt-cache identity; and ordinary/controlled
 sessions with snapshots, restore, fork, cancellation and termination. Independent
 external drafting and the published DSpark/DFlash2 assistants use shared proposal,
 verification and commitment drivers. Spark accepts media and produces text.
+
+Low-level Muse construction takes an explicit retained component declaration via
+`MuseKernel::from_definition`, `from_parallel_definition` or `from_partition`.
+`muse::model::project_parameters` selects physical formats while retaining logical
+consumers, state ownership and observation seams. The same parent is consumed by
+complete and partitioned preparation for both Spark and Glimmer. Text and vision
+`from_parameter_bindings` operations also consume the retained declaration and
+selected geometry, preserving canonical binding validation without rebuilding the
+execution graph.
 
 The [pinned inventory](../validation/fixtures/muse-spark/inventory.json) records
 complete revisions, publisher file sizes/hashes and reference-source identities.

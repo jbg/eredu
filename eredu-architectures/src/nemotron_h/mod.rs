@@ -9,7 +9,29 @@ pub mod mlp;
 pub mod model;
 pub mod mtp;
 pub mod parallel;
+mod parameters;
 mod partitioned;
+/// Validates source-free target and embedded-prediction declarations.
+pub fn component_definition(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, eredu_nn::Error> {
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry
+                .validate_for(args)
+                .map_err(eredu_nn::Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => state_layout(args).map_err(eredu_nn::Error::backend_source)?,
+    };
+    parameters::component_definition(
+        parameter_description(args).map_err(eredu_nn::Error::backend_source)?,
+        state,
+    )
+}
+pub use parameters::{parameter_description, project_parameters};
 
 pub use attention::{new_attention, new_attention_at};
 pub use block::{Block, Operator};
@@ -27,7 +49,8 @@ pub use config::{
 pub use mamba::Mamba2;
 pub use mlp::{expert_bank_spec, localized_expert_bank_spec, DenseMlp, SparseMoe};
 pub use model::{
-    ForwardContext, LayeredModel, TargetBoundary, TargetBoundarySchema, TargetPartitionInput, Unit,
+    CompleteNemotronKernel, ForwardContext, LayeredModel, TargetBoundary, TargetBoundarySchema,
+    TargetPartitionInput, Unit,
 };
 pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit, RetainedValues, TargetReadout};
 pub use parallel::{
@@ -36,7 +59,7 @@ pub use parallel::{
     static_parallel_parameter_groups, unit_parallel_parameter_groups, LocalGeometry,
     PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
-pub use partitioned::{PartitionedForwardContext, PartitionedLayeredModel};
+pub use partitioned::{NemotronKernel, PartitionedForwardContext, PartitionedLayeredModel};
 
 /// Derives the complete replicated target expert plan from normalized geometry.
 pub fn replicated_expert_realization_plan(
@@ -47,46 +70,29 @@ pub fn replicated_expert_realization_plan(
             "Nemotron-H replicated routed text requires target-only sparse units",
         ));
     }
-    let global_experts =
-        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
-    let target_group =
-        eredu_runtime::ExecutionGroupId::new("target").map_err(eredu_nn::Error::backend)?;
-    let unit_specs = args
-        .layer_schedule
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(_, policy)| *policy == LayerPolicy::SparseMoe)
-        .map(|(layer, _)| {
-            localized_expert_bank_spec(
-                args,
-                layer,
-                args.n_routed_experts,
-                args.moe_intermediate_size,
-            )
-            .map(|spec| ((target_group.clone(), layer), spec))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    crate::ExpertRealizationPlan::balanced(
-        global_experts,
-        eredu_core::ParallelRankTopology::new(
-            eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
-            0,
-        )
-        .map_err(eredu_nn::Error::backend)?,
-        unit_specs,
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(eredu_nn::Error::backend)?,
+        0,
     )
-    .map_err(eredu_nn::Error::backend)
+    .map_err(eredu_nn::Error::backend)?;
+    expert_realization_plan(args, None, topology)?.ok_or_else(|| {
+        eredu_nn::Error::backend("Nemotron-H replicated routed text has no expert realization")
+    })
 }
 
-/// Derives complete expert ownership and rank-local ReLU-squared bank geometry.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
+/// Derives complete expert ownership and rank-local ReLU-squared bank geometry
+/// from normalized configuration and optional validated local geometry.
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>, eredu_nn::Error> {
-    let args = architecture.args();
+    args.validate().map_err(eredu_nn::Error::backend)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(args)
+            .map_err(eredu_nn::Error::backend)?;
+    }
     if !args.has_sparse_moe_layers() {
         return Ok(None);
     }
@@ -110,10 +116,7 @@ pub fn expert_realization_plan<
         if policy != LayerPolicy::SparseMoe {
             continue;
         }
-        let width = match architecture
-            .parallel_geometry()
-            .and_then(|geometry| geometry.target_unit(layer))
-        {
+        let width = match geometry.and_then(|geometry| geometry.target_unit(layer)) {
             Some(LayerGeometry::SparseMoe { routed, .. }) => *routed,
             Some(_) => {
                 return Err(eredu_nn::Error::backend(
@@ -151,10 +154,7 @@ pub fn expert_realization_plan<
         let unit = physical % pattern;
         let group = eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
             .map_err(eredu_nn::Error::backend)?;
-        let width = match architecture
-            .parallel_geometry()
-            .and_then(|geometry| geometry.prediction_unit(physical))
-        {
+        let width = match geometry.and_then(|geometry| geometry.prediction_unit(physical)) {
             Some(LayerGeometry::SparseMoe { routed, .. }) => *routed,
             Some(_) => {
                 return Err(eredu_nn::Error::backend(
@@ -258,4 +258,34 @@ pub fn state_identity(
         topology,
     )
     .map_err(eredu_nn::Error::backend)
+}
+
+/// Final-normalization arithmetic selected by execution profiles.
+pub(crate) enum FinalNormalization {
+    Native,
+    Float32,
+}
+
+pub(crate) fn static_spec(
+    args: &ModelArgs,
+    normalization: FinalNormalization,
+) -> crate::decoder::StaticModuleSpec {
+    let embedding_name = "model.embeddings.weight";
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: match normalization {
+            FinalNormalization::Native => None,
+            // One full-width group keeps reduction and learned scale in F32.
+            FinalNormalization::Float32 => Some(1),
+        },
+        embedding_weight: embedding_name.into(),
+        normalization_weight: "model.norm_f.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.layer_norm_epsilon,
+        normalization_offset: 0.0,
+        embedding_format: args.weight_quantization_for(embedding_name).into(),
+        head_format: args.weight_quantization_for("lm_head.weight").into(),
+        tied_head: args.tie_word_embeddings,
+    }
 }

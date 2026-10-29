@@ -343,7 +343,7 @@ impl SelectedExecution {
         global_rank: usize,
         reservation: &mut impl eredu_core::capture::CaptureReservation,
     ) -> Result<
-        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
     > {
         self.parameter_partition_layout_with_index(
@@ -355,64 +355,60 @@ impl SelectedExecution {
         )
     }
 
+    fn partitioned_ownership(
+        &self,
+    ) -> Option<(
+        &ReplicatedTextRequirements,
+        &eredu_runtime::PipelineRankProjection,
+    )> {
+        Some(match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => {
+                selected.requirements().ownership_view()
+            }
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                selected.requirements().ownership_view()
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                selected.requirements().ownership_view()
+            }
+            _ => return None,
+        })
+    }
+
     pub(crate) fn parameter_partition_layout_with_index(
         &self,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
         parameter: &str,
         global_rank: usize,
-        index: Option<&crate::parameter_partition::ParameterMemberIndex>,
+        index: Option<&eredu_runtime::ParameterMemberIndex>,
         reservation: &mut impl eredu_core::capture::CaptureReservation,
     ) -> Result<
-        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
     > {
-        use crate::partitioned_execution::selected_parameter_layout_for_rank;
         let tasks = self.text_realization().materialization_tasks();
         let authored = self
             .authored_layout(parameters, global_rank)
             .map_err(eredu_core::parameters::ParameterError::Unsupported)?;
-        match self.kind.as_ref() {
-            SelectedExecutionKind::PartitionedDense(selected) => {
-                selected_parameter_layout_for_rank(
-                    selected.requirements(),
-                    tasks,
-                    parameters,
-                    parameter,
-                    global_rank,
-                    index,
-                    authored.as_ref(),
-                    reservation,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedRouted(selected) => {
-                selected_parameter_layout_for_rank(
-                    selected.requirements(),
-                    tasks,
-                    parameters,
-                    parameter,
-                    global_rank,
-                    index,
-                    authored.as_ref(),
-                    reservation,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedComposite(selected) => {
-                selected_parameter_layout_for_rank(
-                    selected.requirements(),
-                    tasks,
-                    parameters,
-                    parameter,
-                    global_rank,
-                    index,
-                    authored.as_ref(),
-                    reservation,
-                )
-                .map(Some)
-            }
-            _ => Ok(None),
-        }
+        let Some((execution, rank)) = self.partitioned_ownership() else {
+            return Ok(None);
+        };
+        let topology =
+            eredu_core::ParallelRankTopology::new(rank.topology().topology(), global_rank)
+                .map_err(|error| {
+                    eredu_core::parameters::ParameterError::Invalid(error.to_string())
+                })?;
+        eredu_runtime::derive_rank_parameter_member_layout(
+            execution,
+            topology,
+            tasks,
+            parameters,
+            parameter,
+            index,
+            authored.as_ref(),
+            reservation,
+        )
+        .map(Some)
     }
 
     /// Describes global scalar component coordinates for this retained partition.
@@ -456,45 +452,19 @@ impl SelectedExecution {
             .transpose()
             .map_err(crate::component_partition::ComponentPartitionError::ParameterLayout)?
             .unwrap_or_default();
-        match self.kind.as_ref() {
-            SelectedExecutionKind::PartitionedDense(selected) => {
-                selected_component_layout_for_rank(
-                    selected.requirements(),
-                    descriptor,
-                    parameters,
-                    global_rank,
-                    self.routed_realization(),
-                    authored.as_ref(),
-                    &units,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedRouted(selected) => {
-                selected_component_layout_for_rank(
-                    selected.requirements(),
-                    descriptor,
-                    parameters,
-                    global_rank,
-                    self.routed_realization(),
-                    authored.as_ref(),
-                    &units,
-                )
-                .map(Some)
-            }
-            SelectedExecutionKind::PartitionedComposite(selected) => {
-                selected_component_layout_for_rank(
-                    selected.requirements(),
-                    descriptor,
-                    parameters,
-                    global_rank,
-                    self.routed_realization(),
-                    authored.as_ref(),
-                    &units,
-                )
-                .map(Some)
-            }
-            _ => Ok(None),
-        }
+        let Some(ownership) = self.partitioned_ownership() else {
+            return Ok(None);
+        };
+        selected_component_layout_for_rank(
+            ownership,
+            descriptor,
+            parameters,
+            global_rank,
+            self.routed_realization(),
+            authored.as_ref(),
+            &units,
+        )
+        .map(Some)
     }
 
     /// Compiles one reusable set of component layouts for the whole retained
@@ -528,9 +498,7 @@ impl SelectedExecution {
             .map(Some)
     }
 
-    pub(crate) fn partition_groups(
-        &self,
-    ) -> Option<&[crate::partitioned_execution::PartitionedGroupRequirements]> {
+    pub(crate) fn partition_groups(&self) -> Option<&[eredu_runtime::PipelineGroupOwnership]> {
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 Some(selected.requirements().groups())
@@ -837,11 +805,7 @@ impl SelectedExecution {
             )?;
             let native_peak = mechanisms.recipe_materialization_workspace(&recipe, source)?;
             record_group(task, native_peak)?;
-            if matches!(
-                task.lowering(),
-                eredu_runtime::WeightLoweringKind::Transform
-                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-            ) {
+            if task.lowering().transforms_payload() {
                 let output = recipe.infer(source).map_err(|error| error.to_string())?;
                 conversion_outputs = conversion_outputs
                     .checked_add(
@@ -851,16 +815,11 @@ impl SelectedExecution {
                     .ok_or("conversion output size overflow")?;
                 conversion_source_peak = conversion_source_peak.max(native_peak);
             }
-            result.ordinary_recipe_peak_bytes =
-                result
-                    .ordinary_recipe_peak_bytes
-                    .max(eredu_runtime::placed_recipe_peak_bytes(
-                        &task.source_recipe().map_err(|e| e.to_string())?,
-                        &target(task)?,
-                        source,
-                        layout,
-                        false,
-                    )?);
+            result.ordinary_recipe_peak_bytes = result.ordinary_recipe_peak_bytes.max(
+                recipe
+                    .peak_materialization_bytes(source)
+                    .map_err(|error| error.to_string())?,
+            );
             for companion in task.output_companions() {
                 if let Some(task) = companion.materialization_task() {
                     let recipe = eredu_runtime::placed_source_recipe(
@@ -875,13 +834,9 @@ impl SelectedExecution {
                         mechanisms.recipe_materialization_workspace(&recipe, source)?,
                     )?;
                     result.ordinary_recipe_peak_bytes = result.ordinary_recipe_peak_bytes.max(
-                        eredu_runtime::placed_recipe_peak_bytes(
-                            &task.source_recipe().map_err(|e| e.to_string())?,
-                            &target(task)?,
-                            source,
-                            layout,
-                            false,
-                        )?,
+                        recipe
+                            .peak_materialization_bytes(source)
+                            .map_err(|error| error.to_string())?,
                     );
                 }
             }
@@ -935,30 +890,19 @@ impl SelectedExecution {
                                         .ok_or("expert recipe workspace overflow")?,
                                 );
                             let output = recipe.infer(source).map_err(|e| e.to_string())?;
-                            if matches!(
-                                task.lowering(),
-                                eredu_runtime::WeightLoweringKind::Transform
-                                    | eredu_runtime::WeightLoweringKind::DerivedTransform
-                            ) {
+                            let selected_bytes =
+                                eredu_runtime::selected_addressable_parameter_bytes(task, &output)
+                                    .map_err(|error| error.to_string())?;
+                            if task.lowering().transforms_payload() {
                                 native_retained = native_retained
-                                    .checked_add(
-                                        eredu_runtime::selected_addressable_parameter_bytes(
-                                            task, &output,
-                                        )
-                                        .map_err(|error| error.to_string())?,
-                                    )
+                                    .checked_add(selected_bytes)
                                     .ok_or("expert conversion workspace overflow")?;
                             }
                             retained = retained
                                 .checked_add(output.byte_len())
                                 .ok_or("expert recipe output overflow")?;
                             bytes = bytes
-                                .checked_add(
-                                    eredu_runtime::selected_addressable_parameter_bytes(
-                                        task, &output,
-                                    )
-                                    .map_err(|e| e.to_string())?,
-                                )
+                                .checked_add(selected_bytes)
                                 .ok_or("expert selected bytes overflow")?;
                         }
                         result.expert_member_native_peak_bytes =
@@ -1014,16 +958,11 @@ impl SelectedExecution {
         ) -> Result<eredu_runtime::SelectedParameterResources, String> {
             let requirements = selected.requirements();
             let owned = parameters
-                .groups()
-                .iter()
-                .filter(|group| {
-                    group
-                        .owner()
-                        .is_stored_by(requirements.ownership(), |group, unit| {
-                            requirements.groups().iter().any(|owned| {
-                                owned.group() == group && owned.units().contains(&unit)
-                            })
-                        })
+                .stored_groups(requirements.ownership(), |group, unit| {
+                    requirements
+                        .groups()
+                        .iter()
+                        .any(|owned| owned.group() == group && owned.units().contains(&unit))
                 })
                 .flat_map(|group| group.members())
                 .map(|member| member.target().to_owned())

@@ -79,44 +79,6 @@ mod validate_unused_tests {
     }
 }
 
-/// Validates that required host storage fits the configured offload budget.
-pub fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), Error> {
-    if let Some(budget) = config.host_budget_bytes() {
-        if required > budget {
-            return Err(LayerwiseModelError::HostBudgetTooSmall { required, budget }.into());
-        }
-    }
-    Ok(())
-}
-
-/// Validates that static and window storage fit the configured device budget.
-pub fn validate_device_budget(
-    config: OffloadConfig,
-    static_bytes: u64,
-    window_bytes: u64,
-    depth: usize,
-) -> Result<(), Error> {
-    let required =
-        static_bytes
-            .checked_add(window_bytes)
-            .ok_or(LayerwiseModelError::ArithmeticOverflow {
-                context: "static plus device-window byte total",
-            })?;
-    if let Some(budget) = config.device_budget_bytes() {
-        if required > budget {
-            return Err(LayerwiseModelError::DeviceBudgetTooSmall {
-                static_bytes,
-                window_bytes,
-                depth,
-                required,
-                budget,
-            }
-            .into());
-        }
-    }
-    Ok(())
-}
-
 /// Structured failures produced by the generic layerwise execution engine.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerwiseModelError {
@@ -206,28 +168,6 @@ pub enum LayerwiseModelError {
     UnexpectedCheckpointParameters {
         /// Unexpected keys in stable order.
         unused: Vec<String>,
-    },
-    /// The host cannot retain the required decoder-layer allocation capacity.
-    #[error("host budget {budget} bytes cannot contain {required} bytes of decoder host-transfer allocations")]
-    HostBudgetTooSmall {
-        /// Required charged host-allocation bytes.
-        required: u64,
-        /// Configured host budget.
-        budget: u64,
-    },
-    /// The device cannot contain static weights plus the configured window.
-    #[error("device budget {budget} bytes cannot contain {static_bytes} static bytes plus the depth-{depth} layer window ({window_bytes} bytes, {required} total)")]
-    DeviceBudgetTooSmall {
-        /// Pinned static device bytes.
-        static_bytes: u64,
-        /// Largest consecutive window bytes.
-        window_bytes: u64,
-        /// Configured layer count.
-        depth: usize,
-        /// Total required parameter bytes.
-        required: u64,
-        /// Configured device budget.
-        budget: u64,
     },
     /// A cache vector had the wrong number of layers.
     #[error("layerwise cache has {actual} layers, expected {expected}")]

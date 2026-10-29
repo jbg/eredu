@@ -1,12 +1,11 @@
 //! Flash-Next binds retained media sources to exact target and encoder placement.
 use super::*;
 use crate::qwen4_exp::{
-    conditional::ConditionalModel,
+    conditional::{ConditionalKernel, ConditionalModel},
     media::MediaIngress,
     prepared::PreparedConditionalPartition,
-    target::{BoundTargetSpec, TargetModel, TargetTensorPartition},
+    target::{BoundTargetSpec, TargetTensorPartition},
 };
-use eredu_runtime::ArchitectureParameters;
 
 type GatedPlan = crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>;
 
@@ -17,12 +16,11 @@ fn invalid<E>(error: impl std::fmt::Display) -> CompositePartitionPreparationErr
 /// The target authors exact recurrent/GQA/expert selections; shared vision
 /// placement supplies its independent heads and merger channels. The resulting
 /// description retains this authority rather than reconstructing it at binding.
-fn local_geometry<B>(
+fn local_geometry(
     bound: &BoundTargetSpec,
     ingress: &MediaIngress,
     vision: &crate::qwen::vision::VisionConfig,
     rank: eredu_core::ParallelRankTopology,
-    context: &<B::Tensor as Tensor>::Context,
 ) -> Result<
     (
         TargetTensorPartition,
@@ -31,38 +29,35 @@ fn local_geometry<B>(
         GatedPlan,
     ),
     String,
->
-where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-{
+> {
     let error = |error: eredu_nn::Error| error.to_string();
     let tensor = bound
         .geometry()
         .tensor_partition(rank.tensor_parallel_rank(), rank.tensor_parallel_size())
         .map_err(error)?;
-    let global = TargetModel::<B>::new(bound.clone(), context).map_err(error)?;
-    let target_parameters = global.parameter_description(context).map_err(error)?;
-    let mut local = TargetModel::<B>::new_tensor_parallel(bound.clone(), tensor.clone(), context)
+    let definition = bound.geometry().definition().map_err(error)?;
+    let target_parameters = definition.parameters();
+    let local = tensor.local_spec();
+    let tensor_parameters = local.parameter_description().map_err(error)?;
+    let experts = local.expert_realization(rank).map_err(error)?;
+    let expert_parameters = local
+        .clone()
+        .with_expert_realization(&experts)
+        .and_then(|spec| spec.parameter_description())
         .map_err(error)?;
-    let tensor_parameters = local.parameter_description(context).map_err(error)?;
-    let experts = tensor
-        .local_spec()
-        .expert_realization(rank)
-        .map_err(error)?;
-    local.set_expert_realization(&experts).map_err(error)?;
     let target_layout = tensor
         .local_expert_layout(
-            &target_parameters,
+            target_parameters,
             &tensor_parameters,
-            &local.parameter_description(context).map_err(error)?,
+            &expert_parameters,
             rank.expert_parallel_rank(),
             rank.expert_parallel_size(),
         )
         .map_err(error)?;
-    let global =
-        ConditionalModel::<B>::new(bound.clone(), ingress.clone(), vision.clone(), context)
-            .map_err(error)?;
-    let parameters = global.parameter_description(context).map_err(error)?;
+    crate::qwen4_exp::conditional::validate_ingress(bound.geometry(), ingress, vision)
+        .map_err(error)?;
+    let parameters =
+        crate::qwen4_exp::conditional::parameter_description(&definition, vision).map_err(error)?;
     let mut layout = derive_partitioned_local_layout(&parameters, rank)?;
     for (name, placement) in target_layout.tensors() {
         layout.insert(name.to_owned(), placement.clone());
@@ -128,21 +123,19 @@ impl PreparedConditionalPartition {
         let bound = target.selected_bound_spec(execution).map_err(invalid)?;
         let mut vision = ingress.vision().config().clone();
         vision.linear_formats.clear();
-        for (name, format) in crate::replicated_text::selected_matrix_formats(
-            execution.text().requirements(),
-            execution.text(),
-        ) {
+        let text = execution.text();
+        for (name, format) in text.matrix_formats_for(text.requirements()) {
             if name.starts_with("model.visual.") {
                 vision.linear_formats.insert(name, format);
             }
         }
         let (tensor, parameters, layout, experts) =
-            local_geometry::<B>(&bound, &ingress, &vision, rank, context).map_err(invalid)?;
+            local_geometry(&bound, &ingress, &vision, rank).map_err(invalid)?;
         let state = selected
             .requirements()
             .state()
             .ok_or_else(|| invalid("Flash-Next conditional partition has no target state"))?;
-        let mut architecture = ConditionalModel::<B>::new_partitioned(
+        let mut architecture = ConditionalKernel::<B>::new_partitioned(
             bound,
             tensor.clone(),
             ingress.clone(),
@@ -153,25 +146,22 @@ impl PreparedConditionalPartition {
             context,
         )
         .map_err(invalid)?;
-        architecture
-            .set_expert_realization(&experts)
+        architecture = architecture
+            .with_expert_realization(&experts)
             .map_err(invalid)?;
-        let boundary =
-            <ConditionalModel<B> as PartitionedLayeredArchitecture<B, S>>::boundary_schema(
-                &architecture,
-            )
-            .map_err(invalid)?;
-        let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
-            &architecture,
+        let boundary = architecture.target_boundary_schema().map_err(invalid)?;
+        let partition = ArchitecturePartition::from_description(
+            &parameters,
             selected
                 .requirements()
                 .groups()
                 .iter()
                 .map(|group| (group.group().as_str(), group.units())),
             selected.requirements().ownership().clone(),
+            architecture.definition().state_layout(),
+            architecture.definition().state_partition_plan(),
             tensor,
             boundary,
-            &parameters,
         )
         .map_err(invalid)?;
         if partition.state() != selected.requirements().state() {
@@ -179,49 +169,48 @@ impl PreparedConditionalPartition {
                 "constructed Flash-Next conditional state differs from cold admission",
             ));
         }
-        let source_architecture =
-            if crate::replicated_text::selected_uses_transform(execution.text()) {
-                let source_vision = ingress.vision().config().clone();
-                let (source_tensor, source_parameters, source_layout, source_experts) =
-                    local_geometry::<B>(&source_bound, &ingress, &source_vision, rank, context)
-                        .map_err(invalid)?;
-                if crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                    &source_parameters,
-                    &parameters,
-                    rank,
-                )
-                .map_err(invalid)?
-                    != source_layout
-                {
-                    return Err(invalid(
-                        "Flash-Next conditional transform changed exact source placement",
-                    ));
-                }
-                let mut source = ConditionalModel::<B>::new_partitioned(
-                    source_bound,
-                    source_tensor,
-                    ingress,
-                    source_vision,
-                    rank,
-                    &source_layout,
-                    state,
-                    context,
-                )
+        let source_architecture = if execution.text().uses_weight_transform() {
+            let source_vision = ingress.vision().config().clone();
+            let (source_tensor, source_parameters, source_layout, source_experts) =
+                local_geometry(&source_bound, &ingress, &source_vision, rank).map_err(invalid)?;
+            if eredu_runtime::derive_partitioned_transform_source_layout(
+                &source_parameters,
+                &parameters,
+                rank,
+            )
+            .map_err(|error| invalid(error.to_string()))?
+                != source_layout
+            {
+                return Err(invalid(
+                    "Flash-Next conditional transform changed exact source placement",
+                ));
+            }
+            let mut source = ConditionalKernel::<B>::new_partitioned(
+                source_bound,
+                source_tensor,
+                ingress,
+                source_vision,
+                rank,
+                &source_layout,
+                state,
+                context,
+            )
+            .map_err(invalid)?;
+            source = source
+                .with_expert_realization(&source_experts)
                 .map_err(invalid)?;
-                source
-                    .set_expert_realization(&source_experts)
-                    .map_err(invalid)?;
-                if source.state_layout().map_err(invalid)?
-                    != architecture.state_layout().map_err(invalid)?
-                {
-                    return Err(invalid(
-                        "Flash-Next conditional transform source changed local state geometry",
-                    ));
-                }
-                Some((Box::new(source), source_layout))
-            } else {
-                None
-            };
+            if source.definition().state_layout() != architecture.definition().state_layout() {
+                return Err(invalid(
+                    "Flash-Next conditional transform source changed local state geometry",
+                ));
+            }
+            Some((
+                Box::new(source.into_model().map_err(invalid)?),
+                source_layout,
+            ))
+        } else {
+            None
+        };
         let owned = selected
             .requirements()
             .groups()
@@ -260,6 +249,9 @@ impl PreparedConditionalPartition {
             .keys()
             .map(|(_, unit)| (*unit, *unit))
             .collect();
+        let architecture = architecture
+            .into_partition_model(&partition)
+            .map_err(invalid)?;
         let routed = prepared_gated_composite_execution::<B, S, _>(
             &selected,
             &architecture,
@@ -334,12 +326,12 @@ impl PreparedConditionalPartition {
             return Err(invalid("prediction requires a routed target"));
         };
         let source = self.prepared_target().artifact().clone();
-        let target_source = crate::replicated_text::restrict_store_handoff(
+        let target_source = eredu_runtime::restrict_checkpoint_handoff(
             execution.text().requirements(),
             source.clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         let provider_source = crate::partitioned_execution::qwen4_exp::prediction_provider_source(
             execution.text().requirements(),
             source,

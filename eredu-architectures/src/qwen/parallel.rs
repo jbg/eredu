@@ -10,6 +10,24 @@ use crate::decoder::{block_common_parallel_parameter_groups, dense_mlp_parallel_
 
 use super::{FeedForward, ModelArgs, RoutedTransformerBlock, TransformerBlock};
 
+/// Complete parameter topology derived from neutral router and expert specifications.
+pub fn parameter_description(
+    args: &ModelArgs,
+) -> Result<eredu_runtime::ArchitectureParameterDescription, ParallelPlanError> {
+    if !args.is_moe() {
+        return crate::decoder::dense_parameter_description(args);
+    }
+    crate::decoder::routed_parameter_description(args, |layer| {
+        let root = format!("{}.layers.{layer}.mlp", args.parameter_root);
+        Ok(crate::decoder::RoutedBlockParameters {
+            selector_name: format!("{root}.gate"),
+            bank_name: format!("{root}.experts.intermediate"),
+            selector: super::moe::selector_spec(args, layer)?,
+            bank: super::moe::expert_bank_spec(args, layer)?,
+        })
+    })
+}
+
 /// Derives rank-local Qwen construction geometry from a semantic placement plan.
 pub fn local_block_args(
     args: &ModelArgs,
@@ -122,6 +140,7 @@ pub fn partition_local_routed_geometry(
     validate_routed_realization(args, topology, realization)?;
     crate::decoder::partition_local_geometry_with(
         args,
+        parameter_description(args)?.invocations(),
         layout,
         owned_units,
         |args, layer, layout| {
@@ -196,7 +215,11 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
-    groups.push(dense_mlp_parallel_parameter_group(&block.mlp, args, layer)?);
+    groups.push(dense_mlp_parallel_parameter_group(
+        &block.body.mlp,
+        args,
+        layer,
+    )?);
     Ok(groups)
 }
 
@@ -209,7 +232,7 @@ pub fn routed_layer_parallel_parameter_groups<
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
-    match &block.mlp {
+    match &block.body.mlp {
         FeedForward::Dense(mlp) => {
             groups.push(dense_mlp_parallel_parameter_group(mlp, args, layer)?);
         }

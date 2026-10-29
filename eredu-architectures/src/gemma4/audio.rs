@@ -1,5 +1,7 @@
 //! Backend-neutral Gemma 4 audio encoder equations.
 
+pub(crate) mod parameters;
+
 use std::collections::{HashMap, HashSet};
 
 use eredu_checkpoint::{LinearFormat, WeightQuantization};

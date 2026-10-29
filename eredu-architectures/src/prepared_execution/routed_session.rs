@@ -8,7 +8,6 @@ use eredu_runtime::{
 };
 
 use super::PreparedExecutionError;
-use crate::composite_execution::PreparedCompositeArchitecture;
 use crate::routed_text::{
     PlannedAddressableBank, PlannedResidentBank, PreparedRoutedTextArchitecture, SelectedRoutedBank,
 };
@@ -84,11 +83,9 @@ pub fn construct_selected_routed_composite_session<
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
         + GroupedNeuralBackend,
-    M: ReplicatedTextSessionMechanisms<PreparedCompositeArchitecture<A>, B>,
-    PreparedCompositeArchitecture<A>:
-        LayeredArchitecture<B, M::State> + RoutedLayeredArchitecture<B, M::State>,
-    <PreparedCompositeArchitecture<A> as LayeredArchitecture<B, M::State>>::Error:
-        std::fmt::Display,
+    M: ReplicatedTextSessionMechanisms<A, B>,
+    A: LayeredArchitecture<B, M::State> + RoutedLayeredArchitecture<B, M::State>,
+    <A as LayeredArchitecture<B, M::State>>::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
     Bank: AddressableGroupedBank<B>,
@@ -110,7 +107,7 @@ where
     R: FnOnce(
         C,
         ReplicatedTextSession<
-            PreparedCompositeArchitecture<A>,
+            A,
             B,
             M,
             RoutedReplicatedTextExecution<
@@ -125,7 +122,7 @@ where
     I: FnOnce(
         C,
         ReplicatedTextSession<
-            PreparedCompositeArchitecture<A>,
+            A,
             B,
             M,
             RoutedReplicatedTextExecution<

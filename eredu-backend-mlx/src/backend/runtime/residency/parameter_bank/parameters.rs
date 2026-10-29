@@ -1,7 +1,7 @@
 //! Parameter work over retained members, independent of routing and cache eviction.
 use super::*;
 use eredu_runtime::parameter_operations::{
-    ParameterSlotOperation, PreparedBankParameter, PreparedParameterLocation,
+    BankParameterReadPlan, ParameterSlotOperation, PreparedBankParameter,
 };
 use std::collections::BTreeSet;
 
@@ -24,21 +24,8 @@ impl SharedAddressableParameterBank {
         if !self.owns_parameter_bank(bank) {
             return Ok(false);
         }
-        let location = PreparedParameterLocation::Bank { bank, unit };
-        let parameters = selected
-            .iter()
-            .map(|id| {
-                parameters
-                    .iter()
-                    .find(|parameter| {
-                        parameter.slot.parameter.id.as_str() == id
-                            && parameter.slot.location == location
-                    })
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel("selected bank parameter owner differs".into())
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let plan = BankParameterReadPlan::new(bank, unit, parameters, selected)
+            .map_err(|source| Error::Other(Box::new(source)))?;
         let (manager, replacements) = {
             let bank = self.inner.lock().map_err(|_| {
                 Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
@@ -53,17 +40,12 @@ impl SharedAddressableParameterBank {
                 .collect::<BTreeMap<_, _>>();
             (bank.manager.clone(), replacements)
         };
-        let mut values = Vec::with_capacity(parameters.len());
-        for parameter in parameters {
-            if let Some(value) = replacements.get(parameter.slot.parameter.id.as_str()) {
-                values.push((parameter.slot.parameter.clone(), value.clone()));
-                continue;
-            }
-            let mut copies = Vec::with_capacity(parameter.members.len());
-            for member in &parameter.members {
+        plan.with_slots(
+            |parameter| replacements.get(parameter).cloned(),
+            |member| {
                 let transfer = manager
                     .acquire_many_with_transfer(&[(member.key.unit_id(), 1)], MemoryTier::Device)?;
-                let value = crate::backend::runtime::execution::generic::with_parameter_transfer(
+                crate::backend::runtime::execution::generic::with_parameter_transfer(
                     transfer,
                     stream,
                     |lease| {
@@ -73,21 +55,15 @@ impl SharedAddressableParameterBank {
                         value.evaluated()?;
                         Ok(value)
                     },
-                )?;
-                copies.push(value);
-            }
-            let value = concatenate_axis(&copies, 0, stream)?;
-            value.evaluated()?;
-            values.push((
-                parameter.slot.parameter.clone(),
-                MlxTensor::from_array(value),
-            ));
-        }
-        operation(&mut |visitor| {
-            for (metadata, value) in &mut values {
-                visitor.visit_slot(metadata.clone(), value);
-            }
-        })?;
+                )
+            },
+            |copies| {
+                let value = concatenate_axis(&copies, 0, stream)?;
+                value.evaluated()?;
+                Ok(MlxTensor::from_array(value))
+            },
+            operation,
+        )?;
         Ok(true)
     }
 }
@@ -118,39 +94,30 @@ pub(crate) fn publish_bank_parameter_replacements(
         .collect::<Result<Vec<_>, _>>()?;
     let mut prepared = Vec::with_capacity(guards.len());
     for bank in &guards {
-        let mut replacements = BTreeMap::new();
-        let mut bytes = bank.catalog.clone();
-        if active {
-            for member in &bank.parameter_members {
-                let Some(value) = values.get(&member.parameter) else {
-                    continue;
-                };
-                let count = bank
-                    .parameter_members
-                    .iter()
-                    .filter(|candidate| candidate.parameter == member.parameter)
-                    .count();
-                if value.as_array().shape().first().copied() != i32::try_from(count).ok()
-                    || !matches!(
-                        value.as_array().dtype(),
-                        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
-                    )
-                    || value.as_array().nbytes() % count != 0
-                {
-                    return Err(Error::ArchitectureModel(
-                        "bank replacement has incompatible member geometry or dtype".into(),
-                    ));
-                }
-                let entry_bytes = bytes.get_mut(&member.key).expect("retained member");
-                *entry_bytes = entry_bytes
-                    .checked_sub(member.materialized.byte_len)
-                    .and_then(|n| n.checked_add((value.as_array().nbytes() / count) as u64))
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel("bank replacement byte count overflow".into())
-                    })?;
-                replacements.insert(member.parameter.clone(), value.clone());
-            }
-        }
+        let (parameters, bytes) =
+            eredu_runtime::parameter_operations::prepare_bank_parameter_replacements(
+                bank.parameter_members.members(),
+                &bank.catalog,
+                active,
+                |parameter| {
+                    values.get(parameter).map(|value| {
+                        eredu_runtime::parameter_operations::BankParameterReplacementFacts {
+                            leading_dimension: value.as_array().shape().first().copied(),
+                            element_type: eredu_nn::Tensor::element_type(value),
+                            byte_len: value.as_array().nbytes() as u64,
+                        }
+                    })
+                },
+            )
+            .map_err(|source| Error::Other(Box::new(source)))?
+            .into_parts();
+        let replacements = parameters
+            .into_iter()
+            .map(|parameter| {
+                let value = values[&parameter].clone();
+                (parameter, value)
+            })
+            .collect();
         prepared.push((replacements, bytes));
     }
     if !ordinary()? {
@@ -178,24 +145,21 @@ impl AddressableParameterBank {
         {
             let replacement = self
                 .parameter_members
-                .iter()
-                .find(|member| member.key == *key && member.binding == binding)
-                .and_then(|member| {
+                .binding(*key, binding)
+                .and_then(|address| {
                     self.parameter_replacements
-                        .get(&member.parameter)
-                        .map(|value| (member, value))
+                        .get(&address.member().parameter)
+                        .map(|value| (address, value))
                 });
-            let value = if let Some((member, value)) = replacement {
-                let row = self
-                    .parameter_members
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.parameter == member.parameter && candidate.key < *key
-                    })
-                    .count() as i32;
-                value
-                    .as_array()
-                    .try_index_device((row..row + 1, ..), stream)?
+            let value = if let Some((address, value)) = replacement {
+                let end = i32::try_from(address.row() + 1).map_err(|_| {
+                    AddressableParameterBankError::ReplacementRowOverflow {
+                        identity: *key,
+                        row: address.row(),
+                    }
+                })?;
+                let row = end - 1;
+                value.as_array().try_index_device((row..end, ..), stream)?
             } else {
                 lease.device_value(binding)?.clone()
             };

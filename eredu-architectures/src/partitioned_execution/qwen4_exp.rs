@@ -1,7 +1,9 @@
 //! Flash-Next binds retained canonical tasks to exact authored rank placement.
 use super::*;
-use crate::qwen4_exp::{prepared::PreparedTargetPartition, target::TargetModel};
-use eredu_runtime::ArchitectureParameters;
+use crate::qwen4_exp::{
+    prepared::PreparedTargetPartition,
+    target::{TargetKernel, TargetModel},
+};
 
 fn invalid<E>(error: impl std::fmt::Display) -> DenseDecoderPartitionedDispatchError<E> {
     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
@@ -65,104 +67,98 @@ impl PreparedTargetPartition {
             .geometry()
             .tensor_partition(rank.tensor_parallel_rank(), rank.tensor_parallel_size())
             .map_err(invalid)?;
-        let global_model = TargetModel::<B>::new(bound.clone(), context).map_err(invalid)?;
-        let mut parameters = global_model
-            .parameter_description(context)
+        let mut parameters = bound.geometry().parameter_description().map_err(invalid)?;
+        let mut model = TargetKernel::<B>::new_tensor_parallel(bound, tensor.clone(), context)
             .map_err(invalid)?;
-        let mut model = TargetModel::<B>::new_tensor_parallel(bound, tensor.clone(), context)
-            .map_err(invalid)?;
-        let local_parameters = model.parameter_description(context).map_err(invalid)?;
+        let local_parameters = model.definition().parameters().clone();
         let experts = tensor
             .local_spec()
             .expert_realization(rank)
             .map_err(invalid)?;
-        model.set_expert_realization(&experts).map_err(invalid)?;
+        model = model.with_expert_realization(&experts).map_err(invalid)?;
         let layout = tensor
             .local_expert_layout(
                 &parameters,
                 &local_parameters,
-                &model.parameter_description(context).map_err(invalid)?,
+                &model.definition().parameters().clone(),
                 rank.expert_parallel_rank(),
                 rank.expert_parallel_size(),
             )
             .map_err(invalid)?;
-        retained_layout::validate(&parameters, &layout).map_err(invalid)?;
+        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(invalid)?;
         parameters = parameters
             .with_partition_layout(rank, layout.clone())
             .map_err(invalid)?;
-        let complete_state = model.state_layout().map_err(invalid)?;
+        let complete_state = model.definition().state_layout().clone();
         let state_plan = crate::transport::pipeline_state(0, &complete_state);
-        let partition = ArchitecturePartition::from_description(
-            &parameters,
-            [(crate::decoder::TARGET_EXECUTION_GROUP, owned_units.clone())],
-            selected.requirements().ownership().clone(),
-            &complete_state,
-            &state_plan,
-            tensor.clone(),
-            target.spec().boundary_schema().map_err(invalid)?,
-        )
-        .map_err(invalid)?;
-        validate_partitioned_binding(selected.requirements(), &partition).map_err(invalid)?;
+        let partition = selected
+            .requirements()
+            .construct_partition(
+                &parameters,
+                &complete_state,
+                &state_plan,
+                tensor.clone(),
+                target.spec().boundary_schema().map_err(invalid)?,
+            )
+            .map_err(invalid)?;
         let state = partition
             .state()
             .ok_or_else(|| invalid("Flash-Next target partition has no state"))?;
-        model.set_partition_state(state).map_err(invalid)?;
-        model.retain_global_parameters(parameters.clone());
+        model = model.with_partition_state(state).map_err(invalid)?;
+        model = model
+            .with_global_parameters(parameters.clone())
+            .map_err(invalid)?;
 
-        let source_architecture =
-            if crate::replicated_text::selected_uses_transform(selected.base().text()) {
-                let source_bound = source_partition.source_bound_spec().clone();
-                let source_global =
-                    TargetModel::<B>::new(source_bound.clone(), context).map_err(invalid)?;
-                let source_parameters = source_global
-                    .parameter_description(context)
-                    .map_err(invalid)?;
-                validate_transform_parameter_space(&source_parameters, &parameters)
-                    .map_err(invalid)?;
-                let mut source_model = TargetModel::<B>::new_tensor_parallel(
-                    source_bound,
-                    source_partition.partition().clone(),
-                    context,
+        let source_architecture = if selected.base().text().uses_weight_transform() {
+            let source_bound = source_partition.source_bound_spec().clone();
+            let source_parameters = source_bound
+                .geometry()
+                .parameter_description()
+                .map_err(invalid)?;
+            validate_transform_parameter_space(&source_parameters, &parameters)
+                .map_err(|error| invalid(error.to_string()))?;
+            let mut source_model = TargetKernel::<B>::new_tensor_parallel(
+                source_bound,
+                source_partition.partition().clone(),
+                context,
+            )
+            .map_err(invalid)?;
+            let source_tensor_parameters = source_model.definition().parameters().clone();
+            let source_experts = source_partition
+                .partition()
+                .local_spec()
+                .expert_realization(rank)
+                .map_err(invalid)?;
+            source_model = source_model
+                .with_expert_realization(&source_experts)
+                .map_err(invalid)?;
+            let source_layout = source_partition
+                .partition()
+                .local_expert_layout(
+                    &source_parameters,
+                    &source_tensor_parameters,
+                    &source_model.definition().parameters().clone(),
+                    rank.expert_parallel_rank(),
+                    rank.expert_parallel_size(),
                 )
                 .map_err(invalid)?;
-                let source_tensor_parameters = source_model
-                    .parameter_description(context)
-                    .map_err(invalid)?;
-                let source_experts = source_partition
-                    .partition()
-                    .local_spec()
-                    .expert_realization(rank)
-                    .map_err(invalid)?;
-                source_model
-                    .set_expert_realization(&source_experts)
-                    .map_err(invalid)?;
-                let source_layout = source_partition
-                    .partition()
-                    .local_expert_layout(
-                        &source_parameters,
-                        &source_tensor_parameters,
-                        &source_model
-                            .parameter_description(context)
-                            .map_err(invalid)?,
-                        rank.expert_parallel_rank(),
-                        rank.expert_parallel_size(),
-                    )
-                    .map_err(invalid)?;
-                if source_model.state_layout().map_err(invalid)? != complete_state {
-                    return Err(invalid(
-                        "Flash-Next transform source changed local state geometry",
-                    ));
-                }
-                source_model.set_partition_state(state).map_err(invalid)?;
-                source_model.retain_global_parameters(
+            if source_model.definition().state_layout().clone() != complete_state {
+                return Err(invalid(
+                    "Flash-Next transform source changed local state geometry",
+                ));
+            }
+            source_model = source_model.with_partition_state(state).map_err(invalid)?;
+            source_model = source_model
+                .with_global_parameters(
                     source_parameters
                         .with_partition_layout(rank, source_layout.clone())
                         .map_err(invalid)?,
-                );
-                Some((source_model, source_layout))
-            } else {
-                None
-            };
+                )
+                .map_err(invalid)?;
+            Some((source_model.into_model().map_err(invalid)?, source_layout))
+        } else {
+            None
+        };
 
         let rows = match selected.base().row_lookups() {
             Some(plan) => {
@@ -189,14 +185,15 @@ impl PreparedTargetPartition {
                 ));
             }
         };
-        let source = crate::replicated_text::restrict_store_handoff(
+        let source = eredu_runtime::restrict_checkpoint_handoff(
             selected.base().text().requirements(),
             target.artifact().clone(),
-            crate::replicated_text::StoreHandoffScope::Primary,
+            eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         // Tasks contain global canonical recipes; the native loader applies the
         // retained layout once. Passing already sliced recipes here would select twice.
+        let model = model.into_partition_model(&partition).map_err(invalid)?;
         prepare_family_routed_partition::<B, S, _, _, _, _>(
             model,
             source_architecture,
@@ -243,11 +240,12 @@ pub(crate) fn prediction_provider_source(
                 .map_err(|error| error.to_string())?,
         )
     };
-    crate::replicated_text::restrict_store_handoff(
+    eredu_runtime::restrict_checkpoint_handoff(
         requirements,
         complete,
-        crate::replicated_text::StoreHandoffScope::Complete,
+        eredu_runtime::SourceHandoffScope::Complete,
     )
+    .map_err(|error| error.to_string())
 }
 
 /// Prediction banks replicate expert ownership across stage and expert groups;

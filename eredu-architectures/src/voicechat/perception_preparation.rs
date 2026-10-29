@@ -1,27 +1,27 @@
 //! Cold exact binding plans for independently leased perception units.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
-use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
-};
+use eredu_checkpoint::{recipe::RecipeError, store::SharedCheckpointSource};
 use eredu_runtime::{
-    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
-    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
+    ComponentPreparationError, LocalModelLayout, PreparedComponent, RecipeBindingError,
+    WeightBinding,
 };
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     checkpoint::Component,
-    parameters::{execution_parameter, SpeechParameterError},
+    parameters::{admitted_member, execution_parameter, SpeechParameterError},
     perception::{PerceptionDimensions, PerceptionError},
-    perception_layered::perception_parameter_description,
+    perception_layered::perception_component_definition,
 };
 
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum PerceptionPreparationError {
+    /// Shared exact preparation failed.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
     /// Invalid floating execution profile or attempted precision reselection.
     #[error("invalid speech precision: {0}")]
     Precision(&'static str),
@@ -31,24 +31,12 @@ pub enum PerceptionPreparationError {
     /// A required parameter is missing from the selected component.
     #[error(transparent)]
     Parameters(#[from] SpeechParameterError),
-    /// Source restriction failed.
-    #[error(transparent)]
-    Source(#[from] StoreError),
     /// A recipe disagrees with its exact source metadata.
     #[error(transparent)]
     Recipe(#[from] RecipeError),
     /// Exact recipe binding cannot be represented.
     #[error(transparent)]
     Binding(#[from] RecipeBindingError),
-    /// Exact recipes cannot realize the selected tensor placement.
-    #[error(transparent)]
-    Placement(#[from] BindingPlacementError),
-    /// The shared planner rejected the selected tensor topology.
-    #[error("invalid perception tensor partition: {0}")]
-    Parallel(String),
-    /// An admitted parameter disagrees with architecture or recipe geometry.
-    #[error("VoiceChat perception parameter {0} has inconsistent geometry")]
-    Geometry(String),
 }
 
 /// Cold bindings for subsampling, each Conformer block, and final projection.
@@ -60,10 +48,7 @@ pub enum PerceptionPreparationError {
 pub struct PreparedPerceptionBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
-    layout: ExecutionUnitLayout,
-    source: SharedCheckpointSource,
-    units: Vec<Vec<WeightBinding>>,
-    local_layout: Option<LocalModelLayout>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
 }
 
 impl PreparedPerceptionBindings {
@@ -80,7 +65,11 @@ impl PreparedPerceptionBindings {
         precision
             .validate()
             .map_err(PerceptionPreparationError::Precision)?;
-        precision.bindings(&self.source, &mut self.units)?;
+        self.prepared = self.prepared.transform_units(|source, units| {
+            precision
+                .bindings(source, units)
+                .map_err(PerceptionPreparationError::from)
+        })?;
         self.precision = precision;
         Ok(self)
     }
@@ -111,83 +100,22 @@ impl PreparedPerceptionBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, PerceptionPreparationError> {
-        let description = perception_parameter_description(dimensions)?;
-        let layout = description.unit_layout().clone();
-        let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
-        for owned in description.groups() {
-            let ParameterGroupOwner::ExecutionUnit {
-                group, global_unit, ..
-            } = owned.owner()
-            else {
-                return Err(PerceptionPreparationError::Geometry(
-                    "unexpected static perception owner".into(),
-                ));
-            };
-            let group = description
-                .graph()
-                .group_index(group.as_str())
-                .expect("validated parameter ownership");
-            let ordinal = layout
-                .ordinal(group, *global_unit)
-                .expect("validated parameter unit");
-            for member in owned.members() {
-                let name = member.target();
-                let parameter = parameters
-                    .get(name)
-                    .filter(|p| p.component == Component::Perception)
-                    .ok_or_else(|| SpeechParameterError::MissingParameter {
-                        component: Component::Perception,
-                        name: name.into(),
-                    })?;
-                if parameter.output.shape != member.global_shape()
-                    || parameter.recipe.infer(source.as_ref())? != parameter.output
-                {
-                    return Err(PerceptionPreparationError::Geometry(name.into()));
-                }
-                let parameter = execution_parameter(parameter, &source)?;
-                unit_recipes[ordinal].insert(name.into(), parameter.recipe);
-            }
-        }
-        let inputs = unit_recipes
-            .iter()
-            .flat_map(|unit| unit.values())
-            .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-            .collect();
-        let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-            source,
+        let definition = perception_component_definition(dimensions)?;
+        let prepared = PreparedComponent::prepare(
             "voicechat/perception/leased-units",
-            inputs,
-        )?);
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| {
-                let canonical_targets = recipes
-                    .keys()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
-                let recipes = AtomicRecipeSet::new(source.as_ref(), recipes)?;
-                bindings_from_recipe_set(source.as_ref(), recipes)?
-                    .into_iter()
-                    .map(|binding| {
-                        let target = binding.name().to_owned();
-                        if !canonical_targets.contains(&target) {
-                            return Err(PerceptionPreparationError::Geometry(target));
-                        }
-                        binding
-                            .with_logical_target(target)
-                            .map_err(RecipeBindingError::from)
-                            .map_err(PerceptionPreparationError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, PerceptionPreparationError>>()?;
+            definition,
+            source.clone(),
+            |member| {
+                let parameter =
+                    admitted_member(parameters, &source, Component::Perception, member)?;
+                let parameter = execution_parameter(parameter, &source)?;
+                Ok::<_, PerceptionPreparationError>(parameter.recipe)
+            },
+        )?;
         Ok(Self {
             precision: Default::default(),
             dimensions,
-            layout,
-            source,
-            units,
-            local_layout: None,
+            prepared,
         })
     }
 
@@ -196,17 +124,7 @@ impl PreparedPerceptionBindings {
         self,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<(Self, LocalModelLayout), PerceptionPreparationError> {
-        if topology.pipeline_parallel_size() != 1
-            || topology.expert_parallel_size() != 1
-            || topology.data_parallel_size() != 1
-        {
-            return Err(PerceptionPreparationError::Parallel(
-                "complete-stack perception selection requires a tensor-only topology".into(),
-            ));
-        }
-        let description = perception_parameter_description(self.dimensions)?;
-        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
-            .map_err(PerceptionPreparationError::Parallel)?;
+        let layout = self.prepared.tensor_parallel_layout(topology)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
     /// Applies exact selected tensor placements without changing retained source authority.
@@ -214,18 +132,8 @@ impl PreparedPerceptionBindings {
         mut self,
         layout: &LocalModelLayout,
     ) -> Result<Self, PerceptionPreparationError> {
-        if self.local_layout.is_some() {
-            return Err(PerceptionPreparationError::Parallel(
-                "perception bindings already have a tensor partition".into(),
-            ));
-        }
         super::perception_layered::perception_local_dimensions(self.dimensions, layout)?;
-        self.units = self
-            .units
-            .into_iter()
-            .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
-            .collect::<Result<_, _>>()?;
-        self.local_layout = Some(layout.clone());
+        self.prepared = self.prepared.select(layout)?;
         Ok(self)
     }
     /// Narrows retained source authority and exact bindings to one selected stage.
@@ -239,64 +147,23 @@ impl PreparedPerceptionBindings {
         >,
     ) -> Result<PreparedPerceptionPartitionBindings, PerceptionPreparationError> {
         super::perception_layered::validate_perception_partition(
+            self.prepared.declaration(),
             self.dimensions,
-            self.local_layout.as_ref(),
+            self.prepared.local_layout(),
             partition,
         )?;
-        let selected = partition
-            .units()
-            .map(|address| {
-                self.layout
-                    .ordinal(address.group(), address.index())
-                    .map(|ordinal| (ordinal, address))
-                    .ok_or_else(|| {
-                        PerceptionPreparationError::Geometry(
-                            "partition unit outside perception".into(),
-                        )
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let units = self
-            .units
-            .into_iter()
-            .enumerate()
-            .filter_map(|(ordinal, bindings)| {
-                selected
-                    .get(&ordinal)
-                    .copied()
-                    .map(|address| (address, bindings))
-            })
-            .collect::<Vec<_>>();
-        let inputs = units
-            .iter()
-            .flat_map(|(_, bindings)| bindings)
-            .flat_map(|binding| {
-                binding
-                    .source_recipe()
-                    .source_keys()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let source = Arc::new(RestrictedCheckpointSource::including(
-            self.source,
-            "voicechat/perception/partition-units",
-            inputs,
-        )?);
+        let prepared = self.prepared.select_units(partition.units())?;
         Ok(PreparedPerceptionPartitionBindings {
             precision: self.precision,
             dimensions: self.dimensions,
-            local_layout: self.local_layout,
-            source,
-            units,
+            prepared,
             state_layout: partition.state().map(|state| state.layout().clone()),
         })
     }
 
     /// Exact retained tensor placement, present only after parallel selection.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
 
     /// Validated perception geometry; no other speech stack is selected.
@@ -306,12 +173,17 @@ impl PreparedPerceptionBindings {
 
     /// Exact prepared unit bindings for cold resource accounting.
     pub fn unit_bindings(&self) -> &[Vec<WeightBinding>] {
-        &self.units
+        self.prepared.unit_bindings()
     }
 
     /// Restricted retained source used by these exact bindings.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
+    }
+
+    /// Complete semantic declaration retained through precision and placement selection.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
     }
 
     /// Consumes exact source authority and the canonical ordered binding plan.
@@ -319,11 +191,16 @@ impl PreparedPerceptionBindings {
         self,
     ) -> (
         PerceptionDimensions,
-        ExecutionUnitLayout,
+        eredu_runtime::ComponentDefinition,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<Vec<WeightBinding>>,
     ) {
-        (self.dimensions, self.layout, self.source, self.units)
+        let (definition, _, layout, source, units) = self
+            .prepared
+            .into_declared_unit_parts()
+            .expect("component declares only independently leased units");
+        (self.dimensions, definition, layout, source, units)
     }
 }
 
@@ -332,9 +209,7 @@ impl PreparedPerceptionBindings {
 pub struct PreparedPerceptionPartitionBindings {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
-    local_layout: Option<LocalModelLayout>,
-    source: SharedCheckpointSource,
-    units: Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
+    prepared: PreparedComponent<eredu_runtime::ComponentDefinition>,
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedPerceptionPartitionBindings {
@@ -348,35 +223,50 @@ impl PreparedPerceptionPartitionBindings {
     }
     /// Exact selected physical layout when tensor parallelism is also selected.
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
-        self.local_layout.as_ref()
+        self.prepared.local_layout()
     }
     /// Source authority limited to the actual selected unit recipes.
     pub fn source(&self) -> &SharedCheckpointSource {
-        &self.source
+        self.prepared.source()
     }
     /// Canonical addresses and their exact resident/bounded materialization recipes.
-    pub fn unit_bindings(&self) -> &[(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)] {
-        &self.units
+    pub fn unit_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (eredu_runtime::ExecutionUnitAddress, &[WeightBinding])>
+    {
+        self.prepared.addressed_unit_bindings()
     }
     /// Selected block cache schedule; absent for a parameter-only stage.
     pub fn state_layout(&self) -> Option<&eredu_runtime::StateLayout> {
         self.state_layout.as_ref()
+    }
+    /// Complete definition with global cache identities and parameter ownership.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        self.prepared.declaration()
     }
     /// Consumes exact stage authority without rebasing canonical unit addresses.
     pub fn into_parts(
         self,
     ) -> (
         PerceptionDimensions,
+        eredu_runtime::ComponentDefinition,
         Option<LocalModelLayout>,
+        eredu_runtime::ExecutionUnitAddressMap,
         SharedCheckpointSource,
         Vec<(eredu_runtime::ExecutionUnitAddress, Vec<WeightBinding>)>,
         Option<eredu_runtime::StateLayout>,
     ) {
+        let (definition, local_layout, invocations, source, units) = self
+            .prepared
+            .into_addressed_unit_parts()
+            .expect("partition declares only independently leased units");
         (
             self.dimensions,
-            self.local_layout,
-            self.source,
-            self.units,
+            definition,
+            local_layout,
+            invocations,
+            source,
+            units,
             self.state_layout,
         )
     }

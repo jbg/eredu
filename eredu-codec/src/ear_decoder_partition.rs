@@ -2,8 +2,7 @@
 use crate::{
     ear_decoder::{invalid, DecoderConfig, DecoderState, DecoderUnitSpec, DecoderUnitState},
     ear_decoder_layered::{
-        decoder_local_dimensions, decoder_parameter_description, decoder_state_layout,
-        DecoderArchitecture, DecoderForward, DecoderRuntimeState,
+        decoder_local_dimensions, DecoderForward, DecoderKernel, DecoderRuntimeState,
     },
     streaming::StreamPhase,
     Error,
@@ -12,10 +11,10 @@ use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementTyp
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
     ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype,
-    BoundaryTensorSpec, CommunicationRouteId, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, LocalModelLayout, PartitionBoundaryRoute,
-    PartitionedLayeredArchitecture, PipelinePartitionArchitecture, ResolvedBoundaryWireSchema,
-    StateLayout,
+    BoundaryTensorSpec, CommunicationRouteId, ComponentAdapter, ComponentDefinition,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, LocalModelLayout,
+    PartitionBoundaryRoute, PartitionComponentKernel, PipelineComponentKernel,
+    ResolvedBoundaryWireSchema, StateLayout,
 };
 use std::{collections::BTreeMap, ops::Range};
 
@@ -211,16 +210,16 @@ pub(crate) struct DecoderPartition {
     layout: StateLayout,
 }
 fn ownership<G>(
+    definition: &ComponentDefinition,
     config: &DecoderConfig,
-    prefix: &str,
     partition: &ArchitecturePartition<G, DecoderBoundarySchema>,
 ) -> Result<Range<usize>, Error> {
-    let description = decoder_parameter_description(config, prefix)?;
+    let description = definition.parameters();
     let groups = partition.groups();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &DecoderBoundarySchema::new(config)?
-        || partition.parameter_bindings() != description.select_owned(partition)
+        || !description.matches_partition_bindings(partition)
         || groups.len() != 1
         || groups[0].group_index() != 0
         || !partition.ownership().static_roles().is_empty()
@@ -231,7 +230,7 @@ fn ownership<G>(
         ));
     }
     let range = groups[0].global_units();
-    let count = config.unit_specs()?.len();
+    let count = description.unit_layout().len();
     if range.is_empty()
         || range.end > count
         || partition.ownership().owns_input() != (range.start == 0)
@@ -245,7 +244,7 @@ fn ownership<G>(
         .state()
         .ok_or_else(|| invalid("decoder partition lacks selected cache geometry"))?;
     if state.global_layers() != range
-        || state.layout() != &decoder_state_layout(config)?.slice(range.clone())?
+        || state.layout() != &definition.state_layout().slice(range.clone())?
     {
         return Err(invalid(
             "decoder partition cache geometry differs from its selected units",
@@ -255,6 +254,7 @@ fn ownership<G>(
 }
 /// Checks stage ownership and complete tensor placement before materialization.
 pub fn validate_decoder_partition<G>(
+    definition: &ComponentDefinition,
     config: &DecoderConfig,
     prefix: &str,
     layout: Option<&LocalModelLayout>,
@@ -263,18 +263,19 @@ pub fn validate_decoder_partition<G>(
     if let Some(layout) = layout {
         decoder_local_dimensions(config, prefix, layout)?;
     }
-    ownership(config, prefix, partition).map(|_| ())
+    ownership(definition, config, partition).map(|_| ())
 }
-impl<B: NeuralBackend> DecoderArchitecture<B> {
-    /// Selects exact unit ownership and retained route geometry for one pipeline stage.
+impl<B: NeuralBackend> DecoderKernel<B> {
+    /// Consumes the retained definition and selects exact stage units and route geometry.
     pub fn new_partition<G>(
+        definition: ComponentDefinition,
         config: DecoderConfig,
         prefix: &str,
         layout: Option<&LocalModelLayout>,
         partition: &ArchitecturePartition<G, DecoderBoundarySchema>,
         cuts: &DecoderPipelineCuts,
-    ) -> Result<Self, Error> {
-        let range = ownership(&config, prefix, partition)?;
+    ) -> Result<ComponentAdapter<ComponentDefinition, Self>, Error> {
+        let range = ownership(&definition, &config, partition)?;
         if cuts.schema != DecoderBoundarySchema::new(&config)? {
             return Err(invalid("decoder pipeline cuts belong to another geometry"));
         }
@@ -282,24 +283,15 @@ impl<B: NeuralBackend> DecoderArchitecture<B> {
             Some(layout) => Self::new_parallel(config, prefix, layout)?,
             None => Self::new(config, prefix)?,
         };
-        let layout = decoder_state_layout(&value.config)?.slice(range.clone())?;
+        let layout = definition.state_layout().slice(range.clone())?;
         value.partition = Some(DecoderPartition {
             range,
             cuts: cuts.clone(),
             layout,
         });
-        Ok(value)
+        Ok(ComponentAdapter::new(definition, value)?.select_partition(partition)?)
     }
-    pub(crate) fn require_owned(&self, group: usize, index: usize) -> Result<(), Error> {
-        if self
-            .partition
-            .as_ref()
-            .is_some_and(|selected| group != 0 || !selected.range.contains(&index))
-        {
-            return Err(invalid("decoder unit is outside selected stage ownership"));
-        }
-        Ok(())
-    }
+
     fn selected(&self) -> Result<&DecoderPartition, Error> {
         self.partition
             .as_ref()
@@ -357,10 +349,7 @@ pub(crate) struct DecoderPartitionStateIdentity {
     range: Range<usize>,
 }
 impl DecoderPartitionStateIdentity {
-    fn new<B: NeuralBackend>(
-        architecture: &DecoderArchitecture<B>,
-        selected: &DecoderPartition,
-    ) -> Self {
+    fn new<B: NeuralBackend>(architecture: &DecoderKernel<B>, selected: &DecoderPartition) -> Self {
         Self {
             config: architecture.config.clone(),
             prefix: architecture.prefix.clone(),
@@ -369,7 +358,7 @@ impl DecoderPartitionStateIdentity {
     }
     fn matches<B: NeuralBackend>(
         &self,
-        architecture: &DecoderArchitecture<B>,
+        architecture: &DecoderKernel<B>,
         selected: &DecoderPartition,
     ) -> bool {
         self.config == architecture.config
@@ -380,7 +369,7 @@ impl DecoderPartitionStateIdentity {
 impl<T: Tensor> DecoderRuntimeState<T> {
     /// Initializes only this stage's state or validates and clones its immutable parent carry.
     pub fn for_partition<B: NeuralBackend<Tensor = T>>(
-        architecture: &DecoderArchitecture<B>,
+        architecture: &DecoderKernel<B>,
         previous: Option<&Self>,
     ) -> Result<Self, Error> {
         let selected = architecture.selected()?;
@@ -406,7 +395,7 @@ impl<T: Tensor> DecoderRuntimeState<T> {
     /// Checks exact stage ownership, unit geometry and lifecycle without parameter access.
     pub fn validate_partition<B: NeuralBackend<Tensor = T>>(
         &self,
-        architecture: &DecoderArchitecture<B>,
+        architecture: &DecoderKernel<B>,
     ) -> Result<(), Error> {
         let selected = architecture.selected()?;
         if !self
@@ -436,7 +425,7 @@ impl<T: Tensor> DecoderRuntimeState<T> {
     /// Empty accepting states have no retained batch until their first learned step.
     pub fn validate_stream_partition<B: NeuralBackend<Tensor = T>>(
         &self,
-        architecture: &DecoderArchitecture<B>,
+        architecture: &DecoderKernel<B>,
         batch: i32,
         phase: StreamPhase,
     ) -> Result<(), Error> {
@@ -469,7 +458,7 @@ impl<T: Tensor> DecoderRuntimeState<T> {
     /// Releases only this stage's causal carry without acquiring parameters or producing a tail.
     pub fn finish_partition<B: NeuralBackend<Tensor = T>>(
         &self,
-        architecture: &DecoderArchitecture<B>,
+        architecture: &DecoderKernel<B>,
     ) -> Result<Self, Error> {
         self.validate_partition(architecture)?;
         let mut next = Self::for_partition(architecture, None)?;
@@ -541,7 +530,7 @@ impl<T: Tensor + SnapshotValue> SnapshotValue for DecoderRuntimeState<T> {
     }
 }
 
-impl<B: DistributedNeuralBackend> DecoderArchitecture<B> {
+impl<B: DistributedNeuralBackend> DecoderKernel<B> {
     /// Validates the exact stage cache, request and upstream cut before parameter acquisition.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_prepared_partition(
@@ -622,46 +611,36 @@ impl<B: DistributedNeuralBackend> DecoderArchitecture<B> {
         })
     }
 }
-impl<B: DistributedNeuralBackend> PartitionedLayeredArchitecture<B, DecoderRuntimeState<B::Tensor>>
-    for DecoderArchitecture<B>
+impl<B: DistributedNeuralBackend>
+    PartitionComponentKernel<B, crate::ear_decoder_layered::DecoderRuntimeState<B::Tensor>>
+    for DecoderKernel<B>
 {
     type Boundary = DecoderBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, Error> {
         DecoderBoundarySchema::new(&self.config)
     }
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, DecoderBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, DecoderBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut DecoderRuntimeState<B::Tensor>,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, DecoderForward>, Error> {
-        if mask.is_some() || first != 0 {
+        if mask.is_some() || selected.first_state_ordinal != 0 {
             return Err(invalid(
                 "decoder partition requires its local cache origin and no external mask",
             ));
         }
-        self.begin_prepared_partition(input, None, state, Some(expected), None, context)
+        self.begin_prepared_partition(
+            input,
+            None,
+            state,
+            selected.expected,
+            selected.parallel,
+            selected.native,
+        )
     }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, DecoderBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut DecoderRuntimeState<B::Tensor>,
-        expected: &StateLayout,
-        first: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, DecoderForward>, Error> {
-        if mask.is_some() || first != 0 {
-            return Err(invalid(
-                "decoder partition requires its local cache origin and no external mask",
-            ));
-        }
-        self.begin_prepared_partition(input, None, state, Some(expected), Some(parallel), context)
-    }
+
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
@@ -728,27 +707,25 @@ impl<B: DistributedNeuralBackend> PartitionedLayeredArchitecture<B, DecoderRunti
         }
     }
 }
-impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, DecoderRuntimeState<B::Tensor>>
-    for DecoderArchitecture<B>
+impl<B: DistributedNeuralBackend>
+    PipelineComponentKernel<B, crate::ear_decoder_layered::DecoderRuntimeState<B::Tensor>>
+    for DecoderKernel<B>
 {
-    fn partition_input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         self.request_dimensions(input)
     }
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, DecoderBoundary<B::Tensor>)>,
         state: &mut DecoderRuntimeState<B::Tensor>,
-        expected: Option<&StateLayout>,
-        first: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: eredu_runtime::ComponentPartitionContext<'_, B>,
         _: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, DecoderForward>, Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        if first != 0 {
+        if selected.first_state_ordinal != 0 {
             return Err(invalid(
                 "decoder pipeline requires the selected local cache origin",
             ));
@@ -758,12 +735,19 @@ impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, DecoderRuntim
             Some((hidden, auxiliary)) => LayeredPartitionInput::Hidden { hidden, auxiliary },
             None => LayeredPartitionInput::Tokens(input),
         };
-        self.begin_prepared_partition(ingress, Some(request), state, expected, parallel, context)
+        self.begin_prepared_partition(
+            ingress,
+            Some(request),
+            state,
+            selected.expected,
+            selected.parallel,
+            selected.native,
+        )
     }
-    fn partition_output_width(&self) -> i32 {
+    fn output_width(&self) -> i32 {
         self.config.fft_size + 2
     }
-    fn partition_output_shape(
+    fn output_shape(
         &self,
         _: &Self::Input<'_>,
         batch: i32,
@@ -778,10 +762,7 @@ impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, DecoderRuntim
             expanded_frames(&self.config, sequence)?,
         ])
     }
-    fn partition_boundary_schema(
-        &self,
-        route: &PartitionBoundaryRoute,
-    ) -> Result<Self::Boundary, Error> {
+    fn route_schema(&self, route: &PartitionBoundaryRoute) -> Result<Self::Boundary, Error> {
         if route.source_group != 0 || route.destination_group != 0 {
             return Err(invalid(
                 "decoder route refers to an unknown execution group",
@@ -789,24 +770,16 @@ impl<B: DistributedNeuralBackend> PipelinePartitionArchitecture<B, DecoderRuntim
         }
         self.selected()?.cuts.schema(route.route)
     }
-    fn partition_resolved_boundary_schema(
+    fn resolved_route_schema(
         &self,
         route: &PartitionBoundaryRoute,
         batch: i32,
         sequence: i32,
     ) -> Result<ResolvedBoundaryWireSchema, Error> {
-        self.partition_boundary_schema(route)?
-            .resolve(batch, sequence)
+        self.route_schema(route)?.resolve(batch, sequence)
     }
-    fn partition_retained_state_ordinals(
-        &self,
-        _: usize,
-        _: usize,
-        ordinal: usize,
-    ) -> Range<usize> {
-        ordinal..ordinal + 1
-    }
-    fn partition_tensor_vocabulary_sharded(&self) -> bool {
+
+    fn tensor_vocabulary_sharded(&self) -> bool {
         false
     }
 }

@@ -2,15 +2,14 @@
 
 use eredu_architectures::voicechat::{
     tts_mog::{MogDimensions, MogPrediction, MogSample, TtsError},
-    tts_mog_layered::{
-        LayerwiseMog, MogArchitecture, MogExecution, MogInput, MogRuntimeState, MogUnit,
-    },
+    tts_mog_layered::{MogExecution, MogInput, MogKernel, MogUnit, ParallelMogExecution},
     tts_mog_preparation::{validate_parallel_communication, PreparedMogBindings},
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
-    DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata, LocalModelLayout,
-    ResidencyReport,
+    ComponentAdapter, ComponentDefinition, DenseDiskStreamReport, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, LocalModelLayout, ResidencyReport,
+    StatelessComponentState,
 };
 use safemlx::{Array, Stream};
 
@@ -30,9 +29,15 @@ use crate::{
 };
 
 type Unit = MogUnit<MlxNeuralBackend>;
+type Runtime<P> = LayerwiseRuntime<
+    ComponentAdapter<ComponentDefinition, MogKernel<MlxNeuralBackend>>,
+    MlxNeuralBackend,
+    StatelessComponentState,
+    P,
+>;
 enum Execution {
-    Resident(LayerwiseMog<MlxNeuralBackend, MlxResidentPolicy<Unit>>),
-    Bounded(LayerwiseMog<MlxNeuralBackend, MlxLayerwisePolicy<Unit>>),
+    Resident(Runtime<MlxResidentPolicy<Unit>>),
+    Bounded(Runtime<MlxLayerwisePolicy<Unit>>),
 }
 
 /// Native EAR-TTS MoG over the selected shared resident or bounded parameter policy.
@@ -46,8 +51,8 @@ impl MlxMog {
     /// Current physical residency and retained-source accounting.
     pub fn residency_report(&self) -> Result<ResidencyReport, BackendFailure> {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().residency_report(),
-            Execution::Bounded(model) => model.runtime().policy().residency_report(),
+            Execution::Resident(model) => model.policy().residency_report(),
+            Execution::Bounded(model) => model.policy().residency_report(),
         }
         .map_err(BackendFailure::from_error)
     }
@@ -57,7 +62,6 @@ impl MlxMog {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(model) => model
-                .runtime()
                 .policy()
                 .dense_stream_report()
                 .map_err(BackendFailure::from_error),
@@ -67,8 +71,8 @@ impl MlxMog {
     /// Number of pinned parameter leases outside the independently loaded units.
     pub fn static_lease_count(&self) -> usize {
         match &self.execution {
-            Execution::Resident(model) => model.runtime().policy().static_lease_count(),
-            Execution::Bounded(model) => model.runtime().policy().static_lease_count(),
+            Execution::Resident(model) => model.policy().static_lease_count(),
+            Execution::Bounded(model) => model.policy().static_lease_count(),
         }
     }
 }
@@ -233,18 +237,21 @@ fn materialize(
         Vec::<Array>::new(),
         || {
             let precision = prepared.precision();
-            let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
-            let mut architecture = match local_layout.as_ref() {
-                Some(local) => MogArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local),
-                None => MogArchitecture::<MlxNeuralBackend>::new(dimensions),
+            let (dimensions, definition, local_layout, layout, source, units) =
+                prepared.into_parts();
+            let kernel = match local_layout.as_ref() {
+                Some(local) => MogKernel::<MlxNeuralBackend>::new_parallel(dimensions, local),
+                None => MogKernel::<MlxNeuralBackend>::new(dimensions),
             }
-            .and_then(|architecture| architecture.with_precision(precision))
+            .and_then(|kernel| kernel.with_precision(precision))
             .map_err(BackendFailure::from_error)?;
+            let mut architecture = eredu_runtime::ComponentAdapter::new(definition, kernel)
+                .map_err(|error| BackendFailure::from_error(TtsError::from(error)))?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,
                 &mut architecture,
                 (),
-                std::marker::PhantomData::<MogRuntimeState>,
+                std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                 residency,
                 execution_stream,
                 weights_stream,
@@ -259,12 +266,12 @@ fn materialize(
                     .into_resident(
                         &architecture,
                         execution_stream,
-                        std::marker::PhantomData::<MogRuntimeState>,
+                        std::marker::PhantomData::<eredu_runtime::StatelessComponentState>,
                     )
                     .map_err(BackendFailure::from_error)?;
-                Execution::Resident(LayerwiseMog::new(architecture, policy))
+                Execution::Resident(LayerwiseRuntime::new(architecture, policy))
             } else {
-                Execution::Bounded(LayerwiseMog::new(architecture, policy))
+                Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
             };
             Ok((
                 MlxMog {

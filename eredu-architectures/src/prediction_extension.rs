@@ -9,7 +9,6 @@ pub use qwen4_exp::{
 };
 pub use routed_preparation::PreparedRoutedPrediction;
 
-use eredu_nn::EmbeddingOperator as _;
 use std::num::NonZeroUsize;
 
 pub(crate) mod invocation;
@@ -17,10 +16,15 @@ mod placement;
 pub(crate) mod residency;
 mod resources;
 mod snapshot;
+mod state_lifecycle;
 use invocation::prediction_invocation;
 pub use invocation::PredictionInvocation;
 pub(crate) use placement::PredictionPlacementSlot;
 pub use placement::PreparedPredictionPlacement;
+pub use state_lifecycle::{
+    ModelPredictionStateProfile, PoolingPredictionStateProfile, PredictionStateLifecycle,
+    SequentialPredictionStateProfile,
+};
 
 /// Visits the actual materialized prediction modules in architecture-declared
 /// ownership order. A module ordinal identifies a physical parameter owner; it
@@ -41,6 +45,23 @@ where
         ordinal: usize,
         module: &mut M::Module<U>,
     ) -> Result<(), Self::Error>;
+
+    /// Visits an ordered physical sequence from its declared first ordinal.
+    /// Shared modules remain separate calls in the surrounding topology.
+    fn visit_units<'a, U>(
+        &mut self,
+        first: usize,
+        units: impl IntoIterator<Item = &'a mut M::Module<U>>,
+    ) -> Result<(), Self::Error>
+    where
+        U: Parameterized<B::Tensor> + 'a,
+        M::Module<U>: 'a,
+    {
+        for (index, module) in units.into_iter().enumerate() {
+            self.visit::<U>(first + index, module)?;
+        }
+        Ok(())
+    }
 }
 
 use eredu_core::{cache::LayerCachePolicy, ParallelRankTopology, ParallelTopology};
@@ -48,7 +69,7 @@ use eredu_nn::{
     BlockwiseAttentionBackend, DistributedNeuralBackend, GroupedNeuralBackend, HyperNeuralBackend,
     Parameterized, Tensor,
 };
-use eredu_runtime::{ArchitectureParameters, LocalModelLayout, StateLayout};
+use eredu_runtime::{LocalModelLayout, StateLayout};
 use eredu_runtime::{
     ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion, RuntimeStateComponents,
 };
@@ -947,6 +968,22 @@ where
     where
         M: Parameterized<B::Tensor>;
 
+    /// Materializes ordered units through their independent resource lifecycles.
+    /// Stops at the first error without acquiring later units.
+    fn materialize_units<U>(
+        context: &mut Self::Context<'_>,
+        units: impl IntoIterator<Item = PreparedPredictionUnit<U>>,
+        layout: Option<&LocalModelLayout>,
+    ) -> Result<Vec<Self::Module<U>>, Self::Error>
+    where
+        U: Parameterized<B::Tensor>,
+    {
+        units
+            .into_iter()
+            .map(|unit| Self::materialize_module(context, unit, layout))
+            .collect()
+    }
+
     /// Realizes one architecture-selected pooling-attention cache policy.
     fn pooling_state(
         context: &mut Self::Context<'_>,
@@ -1106,6 +1143,8 @@ where
 {
     /// Exact mutable state retained for one speculative lane.
     type LaneState: Clone + 'static;
+    /// Static state-membership and lifecycle declaration for this lane.
+    type StateProfile: PredictionStateLifecycle<B, M, State = Self::LaneState>;
 
     /// Completes every retained lane value plus the actual phase outputs. The
     /// architecture supplies state membership; the backend settles native work.
@@ -1114,7 +1153,9 @@ where
         state: &mut Self::LaneState,
         outputs: &[&B::Tensor],
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure>;
+    ) -> Result<(), eredu_core::BackendFailure> {
+        Self::StateProfile::complete_state(state, outputs, context)
+    }
 
     /// Visits every materialized prediction parameter owner exactly once in
     /// stable ordinal order. Shared target parameters remain with the target.
@@ -1126,26 +1167,26 @@ where
     /// Observes architecture-owned state membership through native mechanisms.
     fn memory_observation(
         &self,
-        _state: &Self::LaneState,
-        _additional: u64,
+        state: &Self::LaneState,
+        additional: u64,
     ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        None
+        Self::StateProfile::memory_observation(state, additional)
     }
 
     /// Complete prediction-lane copy bound with architecture-owned membership.
     fn snapshot_estimate(
         &self,
-        _state: &Self::LaneState,
+        state: &Self::LaneState,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
+        Self::StateProfile::snapshot_estimate(state)
     }
     /// Copies every prediction state member into durable independent storage.
     fn snapshot(
         &self,
-        _state: &Self::LaneState,
-        _context: &<B::Tensor as Tensor>::Context,
+        state: &Self::LaneState,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        Ok(None)
+        Self::StateProfile::snapshot(state, context)
     }
 
     /// Returns the proposal depth exposed to the scheduler.
@@ -1239,7 +1280,10 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>;
+        I: PredictionOperationInvoker<A, B, S>,
+    {
+        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
+    }
 
     /// Executes exactly one sequential proposal depth.
     fn logits<S, I>(
@@ -1253,10 +1297,13 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>;
+        I: PredictionOperationInvoker<A, B, S>,
+    {
+        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
+    }
 
-    /// Prefills with explicitly installed internal hooks. An absent observer
-    /// preserves the ordinary path without creating diagnostic tensors.
+    /// Required prefill equation path, with optional internal hooks. Ordinary
+    /// calls use the same path without creating diagnostic tensors.
     #[allow(clippy::too_many_arguments)]
     fn prefill_observed<S, I>(
         &mut self,
@@ -1270,18 +1317,10 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        if observer.is_some() {
-            return Err(I::invalid(
-                "selected prediction prefill has no internal observation path".into(),
-            ));
-        }
-        self.prefill::<S, I>(invoker, target_capture, hidden, tokens, lane)
-    }
+        I: PredictionOperationInvoker<A, B, S>;
 
-    /// Executes a proposal depth with admitted internal hooks. Outer proposal
-    /// observers alone do not imply support for this operation.
+    /// Required proposal equation path, with optional admitted internal hooks.
+    /// Runtime support reports retain the exact selected observation capability.
     #[allow(clippy::too_many_arguments)]
     fn logits_observed<S, I>(
         &mut self,
@@ -1295,15 +1334,7 @@ where
     where
         S: eredu_runtime::RuntimeState<B>,
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        if observer.is_some() {
-            return Err(I::invalid(
-                "selected prediction proposal has no internal observation path".into(),
-            ));
-        }
-        self.logits::<S, I>(invoker, hidden, token, draft_index, lane)
-    }
+        I: PredictionOperationInvoker<A, B, S>;
 
     /// Executes a fused proposal when selected by the architecture.
     fn fused_logits<S, I>(
@@ -1377,12 +1408,7 @@ where
         A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
         I: PredictionOperationInvoker<A, B, S>,
     {
-        if observer.is_some() {
-            return Err(I::invalid(
-                "selected prediction replay has no internal observation path".into(),
-            ));
-        }
-        self.advance::<S, I>(invoker, hidden, tokens, lane)
+        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
     }
 }
 
@@ -1540,6 +1566,129 @@ where
     pub state: M::ModelState,
 }
 
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedDeepSeekV3Prediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::DeepSeekV3 { units } => {
+                Ok(MaterializedDeepSeekV3Prediction { units })
+            }
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedDeepSeekV4Prediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::DeepSeekV4 { units, state } => {
+                Ok(MaterializedDeepSeekV4Prediction::Sequential { units, state })
+            }
+            MaterializedPredictionExtension::DeepSeekV4Dspark {
+                strategy,
+                static_modules,
+                units,
+                state,
+            } => Ok(MaterializedDeepSeekV4Prediction::Dspark {
+                strategy,
+                static_modules,
+                units,
+                state,
+            }),
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedInklingPrediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::Inkling {
+                units,
+                shared,
+                state,
+            } => Ok(MaterializedInklingPrediction {
+                units,
+                shared,
+                state,
+            }),
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedQwenHybridPrediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::QwenHybrid {
+                units,
+                shared,
+                state,
+            } => Ok(MaterializedQwenHybridPrediction {
+                units,
+                shared,
+                state,
+            }),
+            extension => Err(extension),
+        }
+    }
+}
+
+impl<B, M> TryFrom<MaterializedPredictionExtension<B, M>> for MaterializedNemotronHPrediction<B, M>
+where
+    B: BlockwiseAttentionBackend
+        + DistributedNeuralBackend
+        + GroupedNeuralBackend
+        + HyperNeuralBackend,
+    M: PredictionExtensionMaterializer<B>,
+{
+    type Error = MaterializedPredictionExtension<B, M>;
+
+    fn try_from(extension: MaterializedPredictionExtension<B, M>) -> Result<Self, Self::Error> {
+        match extension {
+            MaterializedPredictionExtension::NemotronH { groups, state } => {
+                Ok(MaterializedNemotronHPrediction { groups, state })
+            }
+            extension => Err(extension),
+        }
+    }
+}
+
 pub(crate) trait NemotronHPredictionTarget<B>
 where
     B: BlockwiseAttentionBackend
@@ -1577,8 +1726,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
         match parallel {
-            Some(parallel) => self.embed_prediction_parallel(tokens, parallel, context),
-            None => self.embed_prediction(tokens, context),
+            Some(parallel) => self
+                .kernel_mut()
+                .embed_prediction_parallel(tokens, parallel, context),
+            None => self.kernel_mut().embed_prediction(tokens, context),
         }
     }
 
@@ -1589,7 +1740,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.project_prediction_instrumented(hidden, parallel, context, instrumentation)
+        self.kernel_mut().project_prediction_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -1609,13 +1765,14 @@ where
         use eredu_nn::EmbeddingOperator;
         match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules_mut().embeddings,
+                &mut self.kernel_mut().static_modules_mut().embeddings,
                 tokens,
                 eredu_nn::EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             ),
             None => self
+                .kernel_mut()
                 .static_modules_mut()
                 .embeddings
                 .forward(tokens, context),
@@ -1629,8 +1786,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.static_modules_mut()
-            .project_instrumented(hidden, parallel, context, instrumentation)
+        self.kernel_mut().static_modules_mut().project_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -1676,28 +1837,32 @@ where
         M::invoke_module(self.unit, context, |unit| {
             let outcome = (|| {
                 if let Some(observer) = self.observer {
-                    return architecture.pipeline_forward_prediction_observed(
-                        unit,
-                        self.depth,
-                        self.hidden,
-                        self.tokens,
-                        self.cache,
-                        self.pass,
-                        parallel,
-                        context,
-                        observer,
-                    );
+                    return architecture
+                        .kernel_mut()
+                        .pipeline_forward_prediction_observed(
+                            unit,
+                            self.depth,
+                            self.hidden,
+                            self.tokens,
+                            self.cache,
+                            self.pass,
+                            parallel,
+                            context,
+                            observer,
+                        );
                 }
                 match parallel {
-                    Some(parallel) => architecture.pipeline_forward_prediction_neutral_parallel(
-                        unit,
-                        self.hidden,
-                        self.tokens,
-                        self.cache,
-                        parallel,
-                        context,
-                    ),
-                    None => architecture.pipeline_forward_prediction(
+                    Some(parallel) => architecture
+                        .kernel_mut()
+                        .pipeline_forward_prediction_neutral_parallel(
+                            unit,
+                            self.hidden,
+                            self.tokens,
+                            self.cache,
+                            parallel,
+                            context,
+                        ),
+                    None => architecture.kernel_mut().pipeline_forward_prediction(
                         unit,
                         self.hidden,
                         self.tokens,
@@ -1756,23 +1921,27 @@ where
     ) -> Result<Self::Output, eredu_nn::Error> {
         M::invoke_module(self.unit, context, |unit| {
             let outcome = (|| {
-                let hidden =
-                    architecture.begin_partition_prediction_hidden(self.hidden, context)?;
+                let hidden = architecture
+                    .kernel_mut()
+                    .begin_partition_prediction_hidden(self.hidden, context)?;
                 let output = if let Some(observer) = self.observer {
-                    architecture.pipeline_forward_prediction_observed(
-                        unit,
-                        self.depth,
-                        &hidden,
-                        self.tokens,
-                        self.cache,
-                        self.pass,
-                        parallel,
-                        context,
-                        observer,
-                    )
+                    architecture
+                        .kernel_mut()
+                        .pipeline_forward_prediction_observed(
+                            unit,
+                            self.depth,
+                            &hidden,
+                            self.tokens,
+                            self.cache,
+                            self.pass,
+                            parallel,
+                            context,
+                            observer,
+                        )
                 } else {
                     match parallel {
                         Some(parallel) => architecture
+                            .kernel_mut()
                             .pipeline_forward_prediction_neutral_parallel(
                                 unit,
                                 &hidden,
@@ -1781,7 +1950,7 @@ where
                                 parallel,
                                 context,
                             ),
-                        None => architecture.pipeline_forward_prediction(
+                        None => architecture.kernel_mut().pipeline_forward_prediction(
                             unit,
                             &hidden,
                             self.tokens,
@@ -1790,7 +1959,9 @@ where
                         ),
                     }
                 }?;
-                architecture.finish_partition_prediction_output(output, context)
+                architecture
+                    .kernel_mut()
+                    .finish_partition_prediction_output(output, context)
             })();
             prediction_invocation(
                 outcome,
@@ -1825,7 +1996,7 @@ where
         Self: Sized;
 }
 
-impl<B> InklingPredictionTarget<B> for crate::inkling::LayeredModel<B>
+impl<B> InklingPredictionTarget<B> for crate::inkling::InklingKernel<B>
 where
     B: BlockwiseAttentionBackend
         + DistributedNeuralBackend
@@ -1887,13 +2058,14 @@ where
     }
 }
 
-impl<B> InklingPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<crate::inkling::LayeredModel<B>>
+impl<B, D, K, R> InklingPredictionTarget<B> for eredu_runtime::ComponentAdapter<D, K, R>
 where
     B: BlockwiseAttentionBackend
         + DistributedNeuralBackend
         + GroupedNeuralBackend
         + HyperNeuralBackend,
+    D: std::borrow::Borrow<eredu_runtime::ComponentDefinition>,
+    K: InklingPredictionTarget<B>,
 {
     fn prediction_step<M>(
         &mut self,
@@ -1910,7 +2082,7 @@ where
     where
         M: PredictionExtensionMaterializer<B>,
     {
-        self.inner_mut().prediction_step::<M>(
+        self.kernel_mut().prediction_step::<M>(
             unit, shared, hidden, tokens, depth, state, observer, parallel, context,
         )
     }
@@ -2107,11 +2279,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
         match parallel {
-            Some(parallel) => self.pipeline_embed_parallel(tokens, parallel, context),
-            None => self
-                .static_modules_mut()
-                .embeddings
-                .forward(tokens, context),
+            Some(parallel) => self
+                .kernel_mut()
+                .pipeline_embed_parallel(tokens, parallel, context),
+            None => self.kernel_mut().begin_partition_embedding(tokens, context),
         }
     }
     fn project_prediction(
@@ -2121,8 +2292,10 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.static_modules_mut()
-            .project_instrumented(hidden, parallel, context, instrumentation)
+        crate::decoder::DecoderStaticResources::decoder_resources_mut(
+            self.kernel_mut().static_modules_mut(),
+        )
+        .project(hidden, parallel, context, instrumentation)
     }
 }
 
@@ -2140,8 +2313,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
         match parallel {
-            Some(parallel) => self.pipeline_embed_parallel(tokens, parallel, context),
-            None => self.begin_partition_prediction_embedding(tokens, context),
+            Some(parallel) => self
+                .kernel_mut()
+                .pipeline_embed_parallel(tokens, parallel, context),
+            None => self
+                .kernel_mut()
+                .begin_partition_prediction_embedding(tokens, context),
         }
     }
     fn project_prediction(
@@ -2151,37 +2328,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.project_prediction_instrumented(hidden, parallel, context, instrumentation)
-    }
-}
-
-impl<B> QwenHybridPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<
-        crate::qwen::hybrid::ConditionalLayeredModel<B>,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    fn embed_prediction(
-        &mut self,
-        tokens: &B::Tensor,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut().embed_prediction(tokens, parallel, context)
-    }
-    fn project_prediction(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut()
-            .project_prediction(hidden, parallel, context, instrumentation)
+        self.kernel_mut().project_prediction_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -2406,53 +2558,13 @@ where
     M::SequentialState: 'static,
 {
     type LaneState = Vec<M::SequentialState>;
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
-    }
+    type StateProfile = SequentialPredictionStateProfile;
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        for (ordinal, module) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::deepseek::v3::Unit<B>>(ordinal, module)?;
-        }
-        Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        snapshot::sequence_estimate(state, M::sequential_snapshot_estimate)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        snapshot::sequence_memory(state, |state| {
-            M::sequential_memory_observation(state, additional)
-        })
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        snapshot::sequence_copy(state, |state| M::sequential_snapshot(state, context))
+        visitor.visit_units::<crate::deepseek::v3::Unit<B>>(0, self.units.iter_mut())
     }
 
     fn supports_internal_observations(&self) -> bool {
@@ -2467,23 +2579,6 @@ where
         (0..self.units.len())
             .map(|_| M::sequential_state())
             .collect()
-    }
-
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v3::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v3::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
     }
 
     fn prefill_observed<S, I>(
@@ -2525,23 +2620,6 @@ where
         Ok(())
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v3::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v3::Model<B>, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -2578,23 +2656,6 @@ where
             })
             .map(|output| (output.logits, output.hidden))
     }
-
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v3::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v3::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
 }
 
 impl<B, M> executor_sealed::Sealed<crate::deepseek::v4::Model<B>>
@@ -2619,21 +2680,7 @@ where
     M::PoolingState: 'static,
 {
     type LaneState = Vec<M::PoolingState>;
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
-    }
+    type StateProfile = PoolingPredictionStateProfile;
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
         &mut self,
@@ -2650,33 +2697,7 @@ where
                 (1, units)
             }
         };
-        for (ordinal, module) in units.iter_mut().enumerate() {
-            visitor.visit::<crate::deepseek::v4::Unit<B>>(offset + ordinal, module)?;
-        }
-        Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        snapshot::sequence_estimate(state, M::pooling_snapshot_estimate)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        snapshot::sequence_memory(state, |state| {
-            M::pooling_memory_observation(state, additional)
-        })
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        snapshot::sequence_copy(state, |state| M::pooling_snapshot(state, context))
+        visitor.visit_units::<crate::deepseek::v4::Unit<B>>(offset, units.iter_mut())
     }
 
     fn supports_internal_observations(&self) -> bool {
@@ -2777,23 +2798,6 @@ where
         )
     }
 
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v4::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v4::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
-    }
-
     fn prefill_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -2860,23 +2864,6 @@ where
         }
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v4::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v4::Model<B>, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -2917,23 +2904,6 @@ where
             }
             Self::Dspark { .. } => Err(I::invalid("DSpark uses fused prediction proposals".into())),
         }
-    }
-
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        crate::deepseek::v4::Model<B>:
-            eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<crate::deepseek::v4::Model<B>, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
     }
 
     fn fused_logits<S, I>(
@@ -3018,25 +2988,10 @@ where
     A: InklingPredictionTarget<B>,
 {
     type LaneState = M::ModelState;
+    type StateProfile = ModelPredictionStateProfile;
 
     fn supports_internal_observations(&self) -> bool {
         true
-    }
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .prediction_layers_mut()
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
     }
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -3046,31 +3001,7 @@ where
         if let Some(shared) = self.shared.as_mut() {
             visitor.visit::<crate::inkling::MtpShared<B>>(0, shared)?;
         }
-        for (depth, unit) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::inkling::MtpDepth<B>>(depth + 1, unit)?;
-        }
-        Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        M::model_memory_observation(state, additional)
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        M::model_snapshot(state, context)
+        visitor.visit_units::<crate::inkling::MtpDepth<B>>(1, self.units.iter_mut())
     }
 
     fn depth(&self) -> usize {
@@ -3079,22 +3010,6 @@ where
 
     fn new_state(&self) -> Self::LaneState {
         self.state.clone()
-    }
-
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
     }
 
     fn prefill_observed<S, I>(
@@ -3142,22 +3057,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3195,22 +3094,6 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
 }
 
 impl<A, B, M> executor_sealed::Sealed<A> for MaterializedQwenHybridPrediction<B, M>
@@ -3235,25 +3118,10 @@ where
     A: QwenHybridPredictionTarget<B>,
 {
     type LaneState = M::ModelState;
+    type StateProfile = ModelPredictionStateProfile;
 
     fn supports_internal_observations(&self) -> bool {
         true
-    }
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .prediction_layers_mut()
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
     }
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -3261,31 +3129,7 @@ where
         visitor: &mut V,
     ) -> Result<(), V::Error> {
         visitor.visit::<crate::qwen::hybrid::PredictionShared<B>>(0, &mut self.shared)?;
-        for (ordinal, module) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::qwen::hybrid::PredictionUnit<B>>(ordinal + 1, module)?;
-        }
-        Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        M::model_memory_observation(state, additional)
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        M::model_snapshot(state, context)
+        visitor.visit_units::<crate::qwen::hybrid::PredictionUnit<B>>(1, self.units.iter_mut())
     }
 
     fn depth(&self) -> usize {
@@ -3294,22 +3138,6 @@ where
 
     fn new_state(&self) -> Self::LaneState {
         self.state.clone()
-    }
-
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
     }
 
     fn prefill_observed<S, I>(
@@ -3357,22 +3185,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3405,21 +3217,6 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
-    }
 }
 
 impl<A, B, M> executor_sealed::Sealed<A> for MaterializedNemotronHPrediction<B, M>
@@ -3444,56 +3241,20 @@ where
     A: NemotronHPredictionTarget<B>,
 {
     type LaneState = M::ModelState;
+    type StateProfile = ModelPredictionStateProfile;
 
     fn supports_internal_observations(&self) -> bool {
         true
-    }
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .prediction_layers_mut()
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
     }
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error> {
-        for (ordinal, module) in self.groups.iter_mut().flatten().enumerate() {
-            visitor.visit::<crate::nemotron_h::PredictionUnit<B>>(ordinal, module)?;
-        }
-        Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        M::model_memory_observation(state, additional)
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        M::model_snapshot(state, context)
+        visitor.visit_units::<crate::nemotron_h::PredictionUnit<B>>(
+            0,
+            self.groups.iter_mut().flatten(),
+        )
     }
 
     fn depth(&self) -> usize {
@@ -3502,22 +3263,6 @@ where
 
     fn new_state(&self) -> Self::LaneState {
         self.state.clone()
-    }
-
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
     }
 
     fn prefill_observed<S, I>(
@@ -3559,22 +3304,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -3605,22 +3334,6 @@ where
                 observer,
             })
             .map(|output| (output.logits, output.capture))
-    }
-
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
     }
 }
 
@@ -3663,7 +3376,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Output, eredu_nn::Error> {
         M::invoke_module(self.static_modules, context, |static_modules| {
-            let outcome = architecture.pipeline_prefill_dspark_extension_context_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
+            let outcome = architecture.kernel_mut().pipeline_prefill_dspark_extension_context_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
             self.strategy,
             static_modules,
             self.units,
@@ -3723,7 +3436,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Output, eredu_nn::Error> {
         M::invoke_module(self.static_modules, context, |static_modules| {
-            let outcome = architecture.pipeline_dspark_extension_proposal_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
+            let outcome = architecture.kernel_mut().pipeline_dspark_extension_proposal_observed_with_modules::<_, invocation::MaterializedPredictionModules<B, M>>(
             self.strategy,
             static_modules,
             self.units,
@@ -3760,9 +3473,16 @@ where
 {
     /// Target-specific extension shape retained after pairing.
     type Extension<M>: MaterializedPredictionExecutor<Self, B, M>
+        + TryFrom<
+            MaterializedPredictionExtension<B, M>,
+            Error = MaterializedPredictionExtension<B, M>,
+        >
     where
         M: PredictionExtensionMaterializer<B>,
         Self: Sized;
+
+    /// Exact target context reported when the materialized family does not match.
+    const PAIRING_MISMATCH: &'static str;
 
     /// Consumes and validates the architecture-owned materialized extension.
     fn pair_prediction_extension<M>(
@@ -3770,7 +3490,10 @@ where
     ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
     where
         M: PredictionExtensionMaterializer<B>,
-        Self: Sized;
+        Self: Sized,
+    {
+        Self::Extension::<M>::try_from(extension).map_err(|_| invalid(Self::PAIRING_MISMATCH))
+    }
 }
 
 macro_rules! sealed_prediction_target {
@@ -3789,19 +3512,11 @@ sealed_prediction_target!(crate::deepseek::v3::Model<B>);
 sealed_prediction_target!(crate::deepseek::v4::Model<B>);
 sealed_prediction_target!(crate::nemotron_h::PartitionedLayeredModel<B>);
 sealed_prediction_target!(crate::nemotron_h::LayeredModel<B>);
-sealed_prediction_target!(
-    crate::composite_execution::PreparedCompositeArchitecture<crate::inkling::LayeredModel<B>>
-);
 sealed_prediction_target!(crate::inkling::LayeredModel<B>);
-sealed_prediction_target!(
-    crate::composite_execution::PreparedCompositeArchitecture<
-        crate::qwen::hybrid::ConditionalLayeredModel<B>,
-    >
-);
 sealed_prediction_target!(crate::qwen::hybrid::ConditionalLayeredModel<B>);
 sealed_prediction_target!(crate::qwen::hybrid::LayeredModel<B>);
 
-impl<B, P> pairing_sealed::Sealed
+impl<B, P: 'static> pairing_sealed::Sealed
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::NemotronHReplicated,
@@ -3815,7 +3530,7 @@ where
 {
 }
 
-impl<B, P> pairing_sealed::Sealed
+impl<B, P: 'static> pairing_sealed::Sealed
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::QwenHybridReplicated,
@@ -3841,21 +3556,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::DeepSeekV3 { units } => {
-                Ok(MaterializedDeepSeekV3Prediction { units })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the DeepSeek-V3 target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the DeepSeek-V3 target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::deepseek::v4::Model<B>
@@ -3870,32 +3572,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::DeepSeekV4 { units, state } => {
-                Ok(MaterializedDeepSeekV4Prediction::Sequential { units, state })
-            }
-            MaterializedPredictionExtension::DeepSeekV4Dspark {
-                strategy,
-                static_modules,
-                units,
-                state,
-            } => Ok(MaterializedDeepSeekV4Prediction::Dspark {
-                strategy,
-                static_modules,
-                units,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the DeepSeek-V4 target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the DeepSeek-V4 target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::nemotron_h::PartitionedLayeredModel<B>
@@ -3910,21 +3588,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::NemotronH { groups, state } => {
-                Ok(MaterializedNemotronHPrediction { groups, state })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Nemotron-H target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Nemotron-H target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::nemotron_h::LayeredModel<B>
@@ -3939,24 +3604,11 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::NemotronH { groups, state } => {
-                Ok(MaterializedNemotronHPrediction { groups, state })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Nemotron-H target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Nemotron-H target";
 }
 
-impl<B, P> MaterializedPredictionTarget<B>
+impl<B, P: 'static> MaterializedPredictionTarget<B>
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::NemotronHReplicated,
@@ -3973,57 +3625,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::NemotronH { groups, state } => {
-                Ok(MaterializedNemotronHPrediction { groups, state })
-            }
-            _ => Err(invalid(
-                "materialized prediction extension does not match the replicated Nemotron-H target",
-            )),
-        }
-    }
-}
-
-impl<B> MaterializedPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<crate::inkling::LayeredModel<B>>
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + GroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedInklingPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::Inkling {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedInklingPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Inkling target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the replicated Nemotron-H target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::inkling::LayeredModel<B>
@@ -4038,65 +3641,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::Inkling {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedInklingPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Inkling target",
-            )),
-        }
-    }
-}
-
-impl<B> MaterializedPredictionTarget<B>
-    for crate::composite_execution::PreparedCompositeArchitecture<
-        crate::qwen::hybrid::ConditionalLayeredModel<B>,
-    >
-where
-    B: BlockwiseAttentionBackend
-        + DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + HyperNeuralBackend,
-{
-    type Extension<M>
-        = MaterializedQwenHybridPrediction<B, M>
-    where
-        M: PredictionExtensionMaterializer<B>;
-
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Qwen-hybrid target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Inkling target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::qwen::hybrid::ConditionalLayeredModel<B>
@@ -4111,27 +3657,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the conditional Qwen target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the conditional Qwen target";
 }
 
 impl<B> MaterializedPredictionTarget<B> for crate::qwen::hybrid::LayeredModel<B>
@@ -4146,30 +3673,11 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Qwen text target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Qwen text target";
 }
 
-impl<B, P> MaterializedPredictionTarget<B>
+impl<B, P: 'static> MaterializedPredictionTarget<B>
     for crate::replicated_model::FixedReplicatedModel<
         B,
         crate::replicated_text::QwenHybridReplicated,
@@ -4186,27 +3694,8 @@ where
     where
         M: PredictionExtensionMaterializer<B>;
 
-    fn pair_prediction_extension<M>(
-        extension: MaterializedPredictionExtension<B, M>,
-    ) -> Result<Self::Extension<M>, eredu_core::artifact::ArtifactError>
-    where
-        M: PredictionExtensionMaterializer<B>,
-    {
-        match extension {
-            MaterializedPredictionExtension::QwenHybrid {
-                units,
-                shared,
-                state,
-            } => Ok(MaterializedQwenHybridPrediction {
-                units,
-                shared,
-                state,
-            }),
-            _ => Err(invalid(
-                "materialized prediction extension does not match the Qwen text target",
-            )),
-        }
-    }
+    const PAIRING_MISMATCH: &'static str =
+        "materialized prediction extension does not match the Qwen text target";
 }
 
 /// Architecture-owned mutable lane-state geometry for one materialized
@@ -4358,10 +3847,7 @@ where
         match self {
             Self::DeepSeekV3 { layout, units, .. } => {
                 Ok(MaterializedPredictionExtension::DeepSeekV3 {
-                    units: units
-                        .into_iter()
-                        .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                        .collect::<Result<_, _>>()?,
+                    units: M::materialize_units(context, units, Some(&layout))?,
                 })
             }
             Self::DeepSeekV4 {
@@ -4370,10 +3856,7 @@ where
                 state,
                 ..
             } => Ok(MaterializedPredictionExtension::DeepSeekV4 {
-                units: units
-                    .into_iter()
-                    .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                    .collect::<Result<_, _>>()?,
+                units: M::materialize_units(context, units, Some(&layout))?,
                 state: state
                     .into_iter()
                     .map(|(ordinal, policy)| M::pooling_state(context, ordinal, policy))
@@ -4390,10 +3873,7 @@ where
                 Ok(MaterializedPredictionExtension::DeepSeekV4Dspark {
                     strategy,
                     static_modules: M::materialize_module(context, static_modules, Some(&layout))?,
-                    units: units
-                        .into_iter()
-                        .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                        .collect::<Result<_, _>>()?,
+                    units: M::materialize_units(context, units, Some(&layout))?,
                     state: state
                         .into_iter()
                         .map(|(ordinal, policy)| M::pooling_state(context, ordinal, policy))
@@ -4410,10 +3890,7 @@ where
                 shared: shared
                     .map(|shared| M::materialize_module(context, shared, Some(&layout)))
                     .transpose()?,
-                units: units
-                    .into_iter()
-                    .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                    .collect::<Result<_, _>>()?,
+                units: M::materialize_units(context, units, Some(&layout))?,
                 state: M::model_state(context, state)?,
             }),
             Self::QwenHybrid {
@@ -4424,10 +3901,7 @@ where
                 ..
             } => Ok(MaterializedPredictionExtension::QwenHybrid {
                 shared: M::materialize_module(context, shared, Some(&layout))?,
-                units: units
-                    .into_iter()
-                    .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                    .collect::<Result<_, _>>()?,
+                units: M::materialize_units(context, units, Some(&layout))?,
                 state: M::model_state(context, state)?,
             }),
             Self::NemotronH {
@@ -4438,12 +3912,7 @@ where
             } => Ok(MaterializedPredictionExtension::NemotronH {
                 groups: groups
                     .into_iter()
-                    .map(|units| {
-                        units
-                            .into_iter()
-                            .map(|unit| M::materialize_module(context, unit, Some(&layout)))
-                            .collect::<Result<_, _>>()
-                    })
+                    .map(|units| M::materialize_units(context, units, Some(&layout)))
                     .collect::<Result<_, _>>()?,
                 state: M::model_state(context, state)?,
             }),
@@ -4617,41 +4086,38 @@ where
             );
             let target_args =
                 crate::deepseek::v3_with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let parameters = crate::deepseek::parallel::v3_parameter_description(&target_args)
-                .map_err(|error| invalid(error.to_string()))?;
+            let definition =
+                crate::deepseek::v3::project_parameters(&target_args, extension.definition())
+                    .map_err(|error| invalid(error.to_string()))?;
+            let parameters = definition.parameters().clone();
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
                 .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v3_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| {
-                matches!(
-                    task.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            }) {
-                let source_parameters = crate::deepseek::parallel::v3_parameter_description(args)
-                    .map_err(|error| invalid(error.to_string()))?;
-                Some(std::sync::Arc::new(
-                    crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                        &source_parameters,
+            let source_layout = eredu_runtime::prepare_transform_source_layout(
+                tasks.iter().map(|task| task.lowering()),
+                || {
+                    let source_parameters = extension.definition().parameters();
+                    eredu_runtime::derive_partitioned_transform_source_layout(
+                        source_parameters,
                         &parameters,
                         tensor_rank,
                     )
-                    .map_err(invalid)?,
-                ))
-            } else {
-                None
-            };
-            let source = match &source_layout {
-                Some(layout) => crate::deepseek::v3::Model::<B>::new_parallel(
-                    args.clone(),
+                    .map_err(|error| invalid(error.to_string()))
+                },
+            )?;
+            let source_geometry = source_layout
+                .as_ref()
+                .map(|layout| {
                     crate::deepseek::parallel::v3_local_geometry(args, layout)
-                        .map_err(|error| invalid(error.to_string()))?,
-                    source_context,
-                ),
-                None => crate::deepseek::v3::Model::<B>::new(args.clone(), source_context),
-            }
+                        .map_err(|error| invalid(error.to_string()))
+                })
+                .transpose()?;
+            let source = crate::deepseek::v3::V3UnitFactory::from_definition(
+                args.clone(),
+                extension.definition().clone(),
+                source_geometry,
+            )
             .map_err(|error| invalid(error.to_string()))?;
             let target_layers = usize::try_from(args.num_hidden_layers)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -4659,10 +4125,10 @@ where
                 .state_layout()
                 .slice(target_layers..target_layers + extension.depth())
                 .map_err(|error| invalid(error.to_string()))?;
-            let local = crate::deepseek::v3::Model::<B>::new_parallel(
+            let local = crate::deepseek::v3::V3UnitFactory::from_definition(
                 target_args,
-                geometry,
-                execution_context,
+                definition,
+                Some(geometry),
             )
             .map_err(|error| invalid(error.to_string()))?;
             let descriptor =
@@ -4673,10 +4139,10 @@ where
             let mut units = Vec::with_capacity(extension.depth());
             for depth in 0..extension.depth() {
                 let source_unit = source
-                    .construct_unit(depth + 1, 0, source_context)
+                    .construct_unit::<B>(depth + 1, 0, source_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 let mut local_unit = local
-                    .construct_unit(depth + 1, 0, execution_context)
+                    .construct_unit::<B>(depth + 1, 0, execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 if let crate::deepseek::v3::Unit::Prediction(prediction) = &mut local_unit {
                     if let crate::deepseek::block::V3FeedForward::Routed(moe) =
@@ -4730,48 +4196,45 @@ where
             );
             let target_args =
                 crate::deepseek::v4_with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let parameters = crate::deepseek::parallel::v4_parameter_description(&target_args)
-                .map_err(|error| invalid(error.to_string()))?;
+            let definition =
+                crate::deepseek::v4::project_parameters(&target_args, extension.definition())
+                    .map_err(|error| invalid(error.to_string()))?;
+            let parameters = definition.parameters().clone();
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
                 .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v4_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let state_layout = crate::deepseek::v4::state_layout(geometry.args())
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| {
-                matches!(
-                    task.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            }) {
-                let source_parameters = crate::deepseek::parallel::v4_parameter_description(args)
-                    .map_err(|error| invalid(error.to_string()))?;
-                Some(std::sync::Arc::new(
-                    crate::partitioned_execution::derive_partitioned_transform_source_layout(
-                        &source_parameters,
+            let source_layout = eredu_runtime::prepare_transform_source_layout(
+                tasks.iter().map(|task| task.lowering()),
+                || {
+                    let source_parameters = extension.definition().parameters();
+                    eredu_runtime::derive_partitioned_transform_source_layout(
+                        source_parameters,
                         &parameters,
                         tensor_rank,
                     )
-                    .map_err(invalid)?,
-                ))
-            } else {
-                None
-            };
-            let source = match &source_layout {
-                Some(layout) => crate::deepseek::v4::Model::<B>::new_parallel(
-                    args.clone(),
+                    .map_err(|error| invalid(error.to_string()))
+                },
+            )?;
+            let source_geometry = source_layout
+                .as_ref()
+                .map(|layout| {
                     crate::deepseek::parallel::v4_local_geometry(args, layout)
-                        .map_err(|error| invalid(error.to_string()))?,
-                    source_context,
-                ),
-                None => crate::deepseek::v4::Model::<B>::new(args.clone(), source_context),
-            }
+                        .map_err(|error| invalid(error.to_string()))
+                })
+                .transpose()?;
+            let source = crate::deepseek::v4::V4UnitFactory::from_definition(
+                args.clone(),
+                extension.definition().clone(),
+                source_geometry,
+            )
             .map_err(|error| invalid(error.to_string()))?;
-            let local = crate::deepseek::v4::Model::<B>::new_parallel(
+            let local = crate::deepseek::v4::V4UnitFactory::from_definition(
                 target_args,
-                geometry,
-                execution_context,
+                definition,
+                Some(geometry),
             )
             .map_err(|error| invalid(error.to_string()))?;
             let target = usize::try_from(args.num_hidden_layers)
@@ -4786,10 +4249,10 @@ where
             for depth in 0..extension.depth() {
                 let ordinal = target + depth;
                 let source_unit = source
-                    .construct_unit(depth + 1, 0, source_context)
+                    .construct_unit::<B>(depth + 1, 0, source_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 let mut local_unit = local
-                    .construct_unit(depth + 1, 0, execution_context)
+                    .construct_unit::<B>(depth + 1, 0, execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 let policy = state_layout.layer(ordinal).cloned().ok_or_else(|| {
                     invalid(format!(
@@ -4843,15 +4306,18 @@ where
                 .map_err(|error| invalid(error.to_string()))?;
             if args.dspark.is_some() {
                 let strategy = DsparkPredictionStrategy::from_args(args)?;
-                let source_static =
-                    source.static_modules().dspark.clone().ok_or_else(|| {
-                        invalid("source DSpark model has no fused pinned modules")
+                let source_static = source
+                    .construct_dspark::<B>(source_context)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .ok_or_else(|| {
+                        invalid("source DSpark declaration has no fused pinned modules")
                     })?;
                 let local_static = local
-                    .static_modules()
-                    .dspark
-                    .clone()
-                    .ok_or_else(|| invalid("local DSpark model has no fused pinned modules"))?;
+                    .construct_dspark::<B>(execution_context)
+                    .map_err(|error| invalid(error.to_string()))?
+                    .ok_or_else(|| {
+                        invalid("local DSpark declaration has no fused pinned modules")
+                    })?;
                 Ok(PreparedPredictionExtension::DeepSeekV4Dspark {
                     layout: std::sync::Arc::new(layout),
                     parameters: std::sync::Arc::new(parameters),
@@ -4896,10 +4362,8 @@ where
             }
             let target_args =
                 crate::inkling::with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let parameters =
-                crate::inkling::LayeredModel::<B>::new(target_args.clone(), execution_context)
-                    .and_then(|model| model.parameter_description(execution_context))
-                    .map_err(|error| invalid(error.to_string()))?;
+            let parameters = crate::inkling::parameter_description(&target_args)
+                .map_err(|error| invalid(error.to_string()))?;
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
                 .map_err(invalid)?;
             let source = crate::inkling::MtpModel::<B>::new(args, source_context)
@@ -4944,11 +4408,10 @@ where
             // projections. Execution uses ResidentExpertProvider, independently
             // of the target's expert residency policy.
             let description = if args.vision.is_some() {
-                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), source_context)
-                    .and_then(|model| model.parameter_description(source_context))
+                crate::qwen::hybrid::conditional_parameter_description(args)
             } else {
-                crate::qwen::hybrid::LayeredModel::<B>::new(args.text.clone(), source_context)
-                    .and_then(|model| model.parameter_description(source_context))
+                crate::qwen::hybrid::parameter_description(&args.text)
+                    .map_err(eredu_nn::Error::backend)
             }
             .map_err(|error| invalid(error.to_string()))?;
             let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
@@ -5024,11 +4487,7 @@ where
             })
         }
         SafetensorsModelConfig::NemotronH(args) => {
-            let source_architecture =
-                crate::nemotron_h::LayeredModel::<B>::new(args.clone(), source_context)
-                    .map_err(|error| invalid(error.to_string()))?;
-            let source_description = source_architecture
-                .parameter_description(source_context)
+            let source_description = crate::nemotron_h::parameter_description(args)
                 .map_err(|error| invalid(error.to_string()))?;
             // Auxiliary tasks can lower prediction matrices independently of the
             // target. Preserve source formats elsewhere and construct executable
@@ -5051,33 +4510,23 @@ where
             }
             let target_args =
                 crate::nemotron_h::with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let description =
-                crate::nemotron_h::LayeredModel::<B>::new(target_args.clone(), execution_context)
-                    .map_err(|error| invalid(error.to_string()))?
-                    .parameter_description(execution_context)
-                    .map_err(|error| invalid(error.to_string()))?;
+            let description = crate::nemotron_h::parameter_description(&target_args)
+                .map_err(|error| invalid(error.to_string()))?;
             let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
                 .map_err(invalid)?;
             let geometry = crate::nemotron_h::local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
-            let source_layout = if tasks.iter().any(|task| {
-                matches!(
-                    task.lowering(),
-                    eredu_runtime::WeightLoweringKind::Transform
-                        | eredu_runtime::WeightLoweringKind::DerivedTransform
-                )
-            }) {
-                Some(std::sync::Arc::new(
-                    crate::partitioned_execution::derive_partitioned_transform_source_layout(
+            let source_layout = eredu_runtime::prepare_transform_source_layout(
+                tasks.iter().map(|task| task.lowering()),
+                || {
+                    eredu_runtime::derive_partitioned_transform_source_layout(
                         &source_description,
                         &description,
                         tensor_rank,
                     )
-                    .map_err(invalid)?,
-                ))
-            } else {
-                None
-            };
+                    .map_err(|error| invalid(error.to_string()))
+                },
+            )?;
             let source_geometry = source_layout
                 .as_ref()
                 .map(|layout| crate::nemotron_h::local_geometry(args, layout))

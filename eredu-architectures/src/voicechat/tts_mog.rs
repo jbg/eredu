@@ -17,6 +17,12 @@ use eredu_nn::{
 /// Invalid geometry, draw payload or neural execution.
 #[derive(Debug, thiserror::Error)]
 pub enum TtsError {
+    /// Selected physical parameter placement differs from the tensor communicator.
+    #[error(transparent)]
+    TensorLayout(#[from] eredu_runtime::TensorParallelLayoutError),
+    /// Shared component declaration or invocation is invalid.
+    #[error(transparent)]
+    Component(#[from] eredu_runtime::ComponentDefinitionError),
     /// Portable execution graph is invalid.
     #[error(transparent)]
     Graph(#[from] eredu_runtime::ExecutionGraphError),
@@ -659,9 +665,12 @@ impl<B: DistributedNeuralBackend> MogComponentBank<B> {
 /// Resident MoG units use the same traversal and equations as bounded execution.
 pub struct MogHead<B: NeuralBackend> {
     runtime: eredu_runtime::ResidentRuntime<
-        super::tts_mog_layered::MogArchitecture<B>,
+        eredu_runtime::ComponentAdapter<
+            eredu_runtime::ComponentDefinition,
+            super::tts_mog_layered::MogKernel<B>,
+        >,
         B,
-        super::tts_mog_layered::MogRuntimeState,
+        eredu_runtime::StatelessComponentState,
     >,
 }
 impl<B: NeuralBackend> std::fmt::Debug for MogHead<B> {
@@ -716,10 +725,12 @@ impl<B: NeuralBackend> MogHead<B> {
     ) -> Result<Self, TtsError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_mog_layered::MogArchitecture::new(dimensions)?
-                    .with_precision(precision)?,
+                super::tts_mog_layered::MogKernel::new(dimensions)?
+                    .with_precision(precision)?
+                    .into_component()?,
                 context,
-            )?,
+            )
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Adopts separately bound layers, prediction and selected-component units.
@@ -729,7 +740,7 @@ impl<B: NeuralBackend> MogHead<B> {
         prediction: MogPredictionHead<B>,
         components: MogComponentBank<B>,
     ) -> Result<Self, TtsError> {
-        use super::tts_mog_layered::{MogArchitecture, MogUnit};
+        use super::tts_mog_layered::{MogKernel, MogUnit};
         let units = vec![
             blocks.into_iter().map(MogUnit::Block).collect(),
             vec![MogUnit::Prediction(prediction)],
@@ -737,21 +748,15 @@ impl<B: NeuralBackend> MogHead<B> {
         ];
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::from_units(
-                MogArchitecture::new(dimensions)?,
+                MogKernel::new(dimensions)?.into_component()?,
                 units,
             )
-            .map_err(|error| match error {
-                eredu_runtime::ResidentUnitsError::Architecture(error) => error,
-                eredu_runtime::ResidentUnitsError::GroupCount { .. }
-                | eredu_runtime::ResidentUnitsError::UnitCount { .. } => {
-                    TtsError::Configuration("MoG units differ from its execution graph")
-                }
-            })?,
+            .map_err(eredu_runtime::ResidentUnitsError::into_architecture)?,
         })
     }
     /// Complete connected mixture geometry.
     pub fn dimensions(&self) -> MogDimensions {
-        self.runtime.architecture().dimensions()
+        self.runtime.architecture().kernel().dimensions()
     }
     /// Runs all residual layers and small prediction head, leaving component weights idle.
     pub fn predict(
@@ -760,8 +765,9 @@ impl<B: NeuralBackend> MogHead<B> {
         guidance: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogPrediction<B::Tensor>, TtsError> {
-        use super::tts_mog_layered::{MogInput, MogRuntimeState};
-        let mut state = MogRuntimeState::new()?;
+        use super::tts_mog_layered::MogInput;
+        use eredu_runtime::StatelessComponentState;
+        let mut state = StatelessComponentState::new()?;
         let (_, forward) = self.runtime.forward_with_context(
             MogInput::Predict { hidden, guidance },
             &mut state,
@@ -778,8 +784,9 @@ impl<B: NeuralBackend> MogHead<B> {
         noise_scale: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<MogSample<B::Tensor>, TtsError> {
-        use super::tts_mog_layered::{MogInput, MogRuntimeState};
-        let mut state = MogRuntimeState::new()?;
+        use super::tts_mog_layered::MogInput;
+        use eredu_runtime::StatelessComponentState;
+        let mut state = StatelessComponentState::new()?;
         let (_, forward) = self.runtime.forward_with_context(
             MogInput::Selected {
                 prediction,

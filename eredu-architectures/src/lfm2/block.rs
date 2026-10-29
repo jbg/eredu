@@ -664,7 +664,7 @@ pub(crate) fn short_convolution_spec(
 ) -> Result<GatedShortConvolutionSpec, Error> {
     let prefix = format!("{root}.conv");
     let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
-    let linear = |field: &str, input, output| {
+    let linear = |field: &str, input, output| -> Result<LinearSpec, Error> {
         let weight_name = format!("{prefix}.{field}.weight");
         Ok(LinearSpec {
             input,

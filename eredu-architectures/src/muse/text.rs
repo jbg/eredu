@@ -1,17 +1,17 @@
 //! Backend-neutral Muse-Glimmer decoder equations.
 
 use eredu_nn::{
-    AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
-    GatedProductGroupLayout, GroupScoring, GroupedGatedProductOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    AttentionCache, AttentionRequest, EmbeddingOperator, Error, GatedProductGroupLayout,
+    GroupScoring, GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
+    LinearOperator, LinearSpec, NormalizationConstructionSpec, NormalizationOperator,
+    ParameterSpec, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
+    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, ParameterProvider, RoutedExpertRequest, TensorParallelParameterProvider,
 };
 
-use crate::decoder::ComponentInstrumentation;
+use crate::decoder::{ComponentInstrumentation, DecoderStaticResources};
 use crate::linear_format::standard_expert_projection;
 
 use super::config::{
@@ -1457,12 +1457,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct StaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    /// Token table.
-    pub embeddings: B::Embedding,
-    /// Final learned RMS norm.
-    pub final_norm: B::Normalization,
-    /// Optional untied head.
-    pub head: Option<B::Linear>,
+    /// Canonical pinned owners actually retained by this component.
+    pub resources: crate::decoder::PartitionStaticModules<B>,
+    #[parameter(skip)]
+    tied_head: bool,
     #[parameter(skip)]
     embedding_epsilon: f32,
     #[parameter(skip)]
@@ -1473,58 +1471,79 @@ pub struct StaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
     logit_cap: f32,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
-    fn final_norm_spec(args: &DecoderConfig) -> Result<NormalizationConstructionSpec, Error> {
-        let spec = NormalizationConstructionSpec::learned(
-            args.hidden_size,
-            args.rms_norm_eps,
-            ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
-        );
-        match args.vocabulary_arithmetic() {
-            VocabularyArithmetic::Backend => Ok(spec),
-            VocabularyArithmetic::StageRounded | VocabularyArithmetic::Float32 => {
-                spec.with_groups(1)
-            }
-        }
+/// Pinned resource geometry and formats for every vocabulary arithmetic policy.
+pub(super) fn static_spec(args: &DecoderConfig) -> crate::decoder::StaticModuleSpec {
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: match args.vocabulary_arithmetic() {
+            VocabularyArithmetic::Backend => None,
+            VocabularyArithmetic::StageRounded | VocabularyArithmetic::Float32 => Some(1),
+        },
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.rms_norm_eps,
+        normalization_offset: 0.0,
+        embedding_format: args.linear_format_for("model.embed_tokens.weight"),
+        head_format: args.linear_format_for("lm_head.weight"),
+        tied_head: args.tie_word_embeddings,
     }
-    /// Builds pinned modules.
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {
+    /// Builds all canonical pinned resources for ordinary execution.
     pub fn new(
         args: &DecoderConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let embedding = "model.embed_tokens.weight";
-        let head = "lm_head.weight";
+        Self::materialize(args, None, |_| true, context)
+    }
+
+    /// Builds all canonical pinned resources with planner-derived vocabulary rows.
+    pub fn new_parallel(
+        args: &DecoderConfig,
+        geometry: &LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        geometry.validate_for(args).map_err(Error::backend_source)?;
+        Self::materialize(args, Some(geometry), |_| true, context)
+    }
+
+    /// Materializes complete canonical text resources from the retained component and bindings.
+    pub fn from_parameter_bindings(
+        args: &DecoderConfig,
+        definition: std::sync::Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<&LocalGeometry>,
+        bindings: &[eredu_runtime::OwnedParameterGroupSpec],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let definition = super::model::select_definition(args, definition, geometry)?;
+        let roles =
+            definition.select_complete_pinned_roles(bindings, &["embedding", "norm", "output"])?;
+        Self::materialize(args, geometry, |role| roles.contains(role), context)
+    }
+
+    fn materialize(
+        args: &DecoderConfig,
+        geometry: Option<&LocalGeometry>,
+        stores: impl Fn(&str) -> bool,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let resources = crate::decoder::PartitionStaticModules::<B>::from_selected_spec(
+            static_spec(args),
+            geometry.map(|geometry| {
+                (
+                    geometry.embedding_range().clone(),
+                    geometry.output_range().cloned(),
+                )
+            }),
+            stores,
+            context,
+        )?;
         Ok(Self {
-            embeddings: B::embedding(
-                EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        embedding,
-                        args.linear_format_for(embedding),
-                    )?,
-                },
-                context,
-            )?,
-            final_norm: B::normalization(Self::final_norm_spec(args)?, context)?,
-            head: (!args.tie_word_embeddings)
-                .then(|| {
-                    B::linear(
-                        LinearSpec {
-                            input: args.hidden_size,
-                            output: args.vocab_size,
-                            weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                head,
-                                args.linear_format_for(head),
-                            )?,
-                        },
-                        context,
-                    )
-                })
-                .transpose()?,
+            resources,
+            tied_head: args.tie_word_embeddings,
             embedding_epsilon: args.rms_norm_eps,
             vocabulary_arithmetic: args.vocabulary_arithmetic(),
             output_multiplier: args.output_multiplier,
@@ -1532,55 +1551,32 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         })
     }
 
-    /// Builds pinned vocabulary modules from planner-derived row ownership.
-    pub fn new_parallel(
-        args: &DecoderConfig,
-        geometry: &LocalGeometry,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let embedding = "model.embed_tokens.weight";
-        let head = "lm_head.weight";
-        Ok(Self {
-            embeddings: B::vocabulary_parallel_embedding(
-                EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: args.hidden_size,
-                    weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        embedding,
-                        args.linear_format_for(embedding),
-                    )?,
-                },
-                geometry.embedding_range().clone(),
-                context,
-            )?,
-            final_norm: B::normalization(Self::final_norm_spec(args)?, context)?,
-            head: (!args.tie_word_embeddings)
-                .then(|| {
-                    B::vocabulary_parallel_linear(
-                        LinearSpec {
-                            input: args.hidden_size,
-                            output: args.vocab_size,
-                            weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                head,
-                                args.linear_format_for(head),
-                            )?,
-                        },
-                        geometry
-                            .output_range()
-                            .cloned()
-                            .ok_or_else(|| Error::backend("missing Muse-Glimmer output range"))?,
-                        context,
-                    )
-                })
-                .transpose()?,
-            embedding_epsilon: args.rms_norm_eps,
-            vocabulary_arithmetic: args.vocabulary_arithmetic(),
-            output_multiplier: args.output_multiplier,
-            logit_cap: args.final_logit_softcapping,
-        })
+    /// Borrows the actually retained input or tied-output table.
+    pub fn embedding(&self) -> Result<&B::Embedding, Error> {
+        self.resources
+            .embeddings
+            .as_ref()
+            .ok_or_else(|| Error::backend("Muse text does not own the embedding table"))
+    }
+
+    /// Mutably borrows that same canonical table.
+    pub fn embedding_mut(&mut self) -> Result<&mut B::Embedding, Error> {
+        self.resources
+            .embeddings
+            .as_mut()
+            .ok_or_else(|| Error::backend("Muse text does not own the embedding table"))
+    }
+
+    fn require_output(&self) -> Result<(), Error> {
+        if (self.tied_head && self.resources.embeddings.is_some())
+            || (!self.tied_head && self.resources.lm_head.is_some())
+        {
+            Ok(())
+        } else {
+            Err(Error::backend(
+                "Muse text does not own its vocabulary projection",
+            ))
+        }
     }
 
     /// Embeds IDs and applies the released weightless normalization.
@@ -1589,7 +1585,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.embeddings.forward(tokens, context)?;
+        let hidden = self.raw_embeddings(tokens, None, context)?;
         self.normalize_embeddings(&hidden, context)
     }
 
@@ -1602,13 +1598,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
     ) -> Result<B::Tensor, Error> {
         match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.embeddings,
+                self.embedding_mut()?,
                 tokens,
                 eredu_nn::EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             ),
-            None => self.embeddings.forward(tokens, context),
+            None => self.embedding_mut()?.forward(tokens, context),
         }
     }
 
@@ -1655,7 +1651,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.final_norm.forward(hidden, context)
+        self.resources.decoder_resources_mut().normalize(
+            hidden,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Applies output scaling and softcapping after vocabulary shards are gathered.
@@ -1720,10 +1720,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let hidden = instrumentation.normalize_readout(hidden, &mut self.final_norm, context)?;
-        let logits =
-            self.project_vocabulary_instrumented(&hidden, parallel, context, instrumentation)?;
-        let logits = instrumentation.apply("linear", logits)?;
+        self.require_output()?;
+        let logits = self.resources.decoder_resources_mut().finish_parallel(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )?;
         self.finish_logits(logits, context)
     }
 
@@ -1734,30 +1737,20 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        Ok(match (parallel, self.head.as_mut()) {
-            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
-                "projection_input",
-                head,
-                hidden,
-                parallel,
-                context,
-            )?,
-            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
-                "projection_input",
-                &mut self.embeddings,
-                hidden,
-                parallel,
-                context,
-            )?,
-            (None, Some(head)) => {
-                instrumentation.project::<B>("projection_input", head, hidden, None, context)?
-            }
-            (None, None) => instrumentation.project_embedding(
-                "projection_input",
-                &mut self.embeddings,
-                hidden,
-                context,
-            )?,
-        })
+        self.require_output()?;
+        self.resources
+            .decoder_resources_mut()
+            .project(hidden, parallel, context, instrumentation)
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderStaticResources<B>
+    for StaticModules<B>
+{
+    fn decoder_resources(&self) -> crate::decoder::DecoderResources<'_, B> {
+        self.resources.decoder_resources()
+    }
+    fn decoder_resources_mut(&mut self) -> crate::decoder::DecoderResourcesMut<'_, B> {
+        self.resources.decoder_resources_mut()
     }
 }

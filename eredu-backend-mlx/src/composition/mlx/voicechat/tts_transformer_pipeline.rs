@@ -15,9 +15,7 @@ use crate::{
 };
 use eredu_architectures::voicechat::{
     tts_transformer_distribution::PreparedTtsTransformerPipelineBindings,
-    tts_transformer_layered::{
-        OwnedTransformerRuntimeState, TransformerArchitecture, TransformerInput,
-    },
+    tts_transformer_layered::{OwnedTransformerRuntimeState, TransformerInput, TransformerKernel},
 };
 use eredu_core::{BackendFailure, DistributedCommitEpoch, DistributedCommitOutcome};
 use eredu_runtime::{
@@ -29,7 +27,10 @@ use safemlx::{Array, Stream};
 /// Caller-owned unpublished state for a selected native TTS pipeline stage.
 pub type MlxTtsTransformerPipelineState =
     OwnedTransformerRuntimeState<MlxNeuralBackend, MlxKeyValueLayerState>;
-type Architecture = TransformerArchitecture<MlxNeuralBackend>;
+type Architecture = eredu_runtime::ComponentAdapter<
+    eredu_runtime::ComponentDefinition,
+    TransformerKernel<MlxNeuralBackend>,
+>;
 
 /// One native rank of an architecture-selected transformer pipeline.
 /// The shared driver owns routing and commit agreement. The enclosing session
@@ -95,7 +96,7 @@ impl
     type State = MlxTtsTransformerPipelineState;
 
     fn config(&self) -> &eredu_architectures::voicechat::tts_transformer::TransformerConfig {
-        self.execution.architecture().config()
+        self.execution.architecture().kernel().config()
     }
 
     fn causal_position(
@@ -103,7 +104,10 @@ impl
         state: &Self::State,
     ) -> Result<i32, eredu_architectures::voicechat::tts_transformer_layered::TransformerError>
     {
-        self.execution.architecture().validate_causal_state(state)
+        self.execution
+            .architecture()
+            .kernel()
+            .validate_causal_state(state)
     }
 
     fn forward(
@@ -146,20 +150,24 @@ pub fn materialize_voicechat_tts_transformer_pipeline(
 > {
     let (prepared, partition, manifest, plan, tensor_group, activation_dtype) =
         prepared.into_parts();
-    let (config, local_layout, source, units, state_layout) = prepared.into_parts();
-    let architecture = Architecture::from_partition(config, local_layout.as_ref(), &partition)
-        .map_err(BackendFailure::from_error)?;
+    let (config, definition, local_layout, invocations, source, units, state_layout) =
+        prepared.into_parts();
+    let architecture =
+        TransformerKernel::from_partition(definition, config, local_layout.as_ref(), &partition)
+            .map_err(BackendFailure::from_error)?;
     let caches = architecture
+        .kernel()
         .attention_cache_layout()
         .map(|layout| MlxKeyValueState::device(layout.clone()).map(|state| state.as_ref().to_vec()))
         .transpose()
         .map_err(BackendFailure::from_error)?
         .unwrap_or_default();
-    let state = MlxTtsTransformerPipelineState::for_partition(&architecture, caches)
+    let state = MlxTtsTransformerPipelineState::for_partition(architecture.kernel(), caches)
         .map_err(BackendFailure::from_error)?;
     let (execution, metadata) = MlxComponentPipeline::new(
         architecture,
         source,
+        invocations,
         units,
         manifest,
         plan,

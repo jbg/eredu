@@ -309,12 +309,12 @@ where
             // Row providers and bound integer controls retain their own source
             // authority. The module visitor receives only its declared recipes,
             // as on the ordinary routed and replicated composite paths.
-            branch.target = crate::replicated_text::restrict_store_handoff(
+            branch.target = eredu_runtime::restrict_checkpoint_handoff(
                 branch.selected.base().execution().requirements(),
                 branch.target,
-                crate::replicated_text::StoreHandoffScope::Primary,
+                eredu_runtime::SourceHandoffScope::Primary,
             )
-            .map_err(PreparedExecutionError::Architecture)?;
+            .map_err(|handoff| PreparedExecutionError::Architecture(handoff.to_string()))?;
             let resources = branch.partition_resources()?;
             return match retained {
                 RetainedArchitectureConstruction::Qwen4ConditionalPartition(prepared) => {

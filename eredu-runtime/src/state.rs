@@ -19,10 +19,16 @@ use eredu_nn::NeuralBackend;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ArchitectureStatePlacement {
-    /// Partition the state range in lockstep with one execution group's units.
+    /// Align state slots with one group's declared invocation order. Global unit
+    /// identities and dense state-slot positions remain independent.
     GroupUnits {
         /// Canonical execution-group slot.
         group: usize,
+    },
+    /// Attach state slots to one logical invocation, independently of unit ordinals.
+    Invocation {
+        /// Exact canonical invocation owning this state range.
+        address: crate::ExecutionUnitAddress,
     },
     /// Attach the complete state range to the realized architecture output owner.
     OutputOwner,
@@ -36,11 +42,20 @@ pub struct ArchitectureStatePartitionRule {
 }
 
 impl ArchitectureStatePartitionRule {
-    /// Aligns a state range one-for-one with an execution group's unit indices.
+    /// Aligns a state range one-for-one with an execution group's declared order.
     pub fn group_units(group: usize, layers: Range<usize>) -> Self {
         Self {
             layers,
             placement: ArchitectureStatePlacement::GroupUnits { group },
+        }
+    }
+
+    /// Assigns a state range to one explicit invocation. Neighboring stateless
+    /// operations consume no state slots and do not shift this ownership.
+    pub fn invocation(address: crate::ExecutionUnitAddress, layers: Range<usize>) -> Self {
+        Self {
+            layers,
+            placement: ArchitectureStatePlacement::Invocation { address },
         }
     }
 
@@ -157,6 +172,14 @@ pub enum ArchitectureStatePartitionError {
     UnknownGroup {
         /// Missing canonical execution-group slot.
         group: usize,
+    },
+    /// An invocation-owned range names no unit in its declared execution group.
+    #[error("architecture state partition references unknown invocation {group}:{global_unit}")]
+    UnknownInvocation {
+        /// Canonical execution-group slot.
+        group: usize,
+        /// Undeclared architecture-global unit identity.
+        global_unit: usize,
     },
     /// A unit-aligned state range and its execution group have different lengths.
     #[error(

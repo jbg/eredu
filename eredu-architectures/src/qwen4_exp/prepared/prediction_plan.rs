@@ -65,7 +65,7 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
     physical: &BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
     shared_recipes: &BTreeMap<String, DerivedWeightRecipe>,
     unit_recipes: &[BTreeMap<String, DerivedWeightRecipe>],
-    expert_banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
+    expert_banks: &BTreeMap<String, Arc<ParameterBankRecipes>>,
     target_requirements: &RoutedTextRequirements,
     streams: Vec<AppendStreamBinding>,
 ) -> Result<
@@ -117,7 +117,7 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
         let complete = expert_banks
             .get(&root)
             .ok_or_else(|| invalid("missing prepared prediction bank"))?;
-        for (local, recipe) in &complete.recipes {
+        for (local, recipe) in complete.recipes() {
             declared.add(
                 &format!("{root}.{local}"),
                 recipe,
@@ -309,12 +309,12 @@ impl SelectedTargetExecution {
             &self.selected,
         )
         .map_err(invalid)?;
-        crate::replicated_text::validate_store_handoff(
+        eredu_runtime::validate_checkpoint_handoff(
             self.plan.requirements.text(),
             self.plan.target.artifact.as_ref(),
-            crate::replicated_text::StoreHandoffScope::Complete,
+            eredu_runtime::SourceHandoffScope::Complete,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         crate::prediction_extension::PreparedQwen4PredictionWeights::new(
             prediction.artifact.clone(),
             &prediction.spec,
@@ -415,12 +415,12 @@ impl SelectedTargetExecution {
         // also owns prediction banks, whose physical recipes are auxiliary
         // parameters; give that provider the complete declared parameter view,
         // while retaining row tables and host controls in their separate roles.
-        let provider_source = crate::replicated_text::restrict_store_handoff(
+        let provider_source = eredu_runtime::restrict_checkpoint_handoff(
             self.plan.requirements.text(),
             self.plan.target.artifact.clone(),
-            crate::replicated_text::StoreHandoffScope::Complete,
+            eredu_runtime::SourceHandoffScope::Complete,
         )
-        .map_err(invalid)?;
+        .map_err(|handoff| invalid(handoff.to_string()))?;
         let (target, target_source) = self.prepare::<B, S>(context)?;
         Ok(PreparedPredictionExecution {
             target,

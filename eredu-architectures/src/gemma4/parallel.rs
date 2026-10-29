@@ -1,73 +1,127 @@
 //! Semantic parameter placement for Gemma 4 components.
 
-use eredu_nn::{
-    AttentionStateSource, AttentionValueSource, NeuralBackend, VocabularyParallelRange,
-};
+use eredu_nn::{AttentionStateSource, AttentionValueSource, VocabularyParallelRange};
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, module_parameter_group, ArchitecturePartition,
-    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, PartitionOwnership, StateLayout, TensorPlacement,
+    expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
+    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
+    StateLayout, TensorPlacement,
 };
 use std::ops::Range;
 
 use crate::linear_format::standard_parallel_linear_format;
 
-use super::{
-    state_layout, AudioLayer, AudioStatic, FamilyConfig, FeedForwardPolicy, ModalityProjector,
-    ModelArgs, VisionLayer, VisionStatic,
-};
-
-/// Declares one replicated Gemma media execution unit.
-pub fn media_unit_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    logical_name: impl Into<String>,
-    unit: &impl eredu_nn::Parameterized<B::Tensor>,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(vec![module_parameter_group::<B::Tensor, _>(
-        logical_name,
-        ParameterRole::Replicated,
-        unit,
-        |_, _| Ok(MemberSharding::Replicated),
-    )?])
-}
+use super::{state_layout, FamilyConfig, FeedForwardPolicy, ModelArgs};
 
 /// Declares pinned Gemma vision modules as one atomic replicated group.
-pub fn vision_static_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    modules: &VisionStatic<B>,
+pub fn vision_static_parameter_groups(
+    config: &super::VisionConfig,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    media_unit_parameter_groups::<B>("model.vision_tower.static", modules)
+    super::vision::parameters::static_groups(config, "model.vision_tower")
 }
 
-/// Declares pinned Gemma audio modules as one atomic replicated group.
-pub fn audio_static_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    modules: &AudioStatic<B>,
+/// Declares one independently leased Gemma vision layer.
+pub fn vision_layer_parameter_groups(
+    config: &super::VisionConfig,
+    index: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    media_unit_parameter_groups::<B>("model.audio_tower.static", modules)
+    super::vision::parameters::layer_groups(config, "model.vision_tower", index)
 }
 
-/// Declares a Gemma modality projector as one atomic replicated group.
-pub fn modality_projection_parameter_groups<
-    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
+fn audio_parameter_groups(
+    config: &super::AudioConfig,
+    text_hidden: i32,
+    logical_name: &str,
+    layers: Range<usize>,
+    include: impl Fn(&str) -> bool,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    config
+        .validate()
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
+    let parameters = super::audio::parameters::declaration(config, text_hidden as usize, layers)
+        .map_err(ParallelPlanError::InvalidGroup)?;
+    let members: Vec<_> = parameters
+        .into_iter()
+        .filter(|p| include(&p.name) && (!p.optional || config.output_projection_bias))
+        .map(|p| ParameterMemberSpec::new(p.name, p.shape, MemberSharding::Replicated))
+        .collect();
+    expand_linear_format_parameter_groups(
+        vec![ParameterGroupSpec::new(
+            logical_name,
+            ParameterRole::Replicated,
+            members,
+        )?],
+        |member| {
+            let format = if member.global_shape().len() == 2 && member.target().ends_with(".weight")
+            {
+                config.linear_format_for(member.target(), member.global_shape()[1] as i32)
+            } else {
+                eredu_checkpoint::LinearFormat::Dense
+            };
+            standard_parallel_linear_format(member, format)
+        },
+    )
+}
+
+/// Declares pinned audio subsampling and output projection storage.
+pub fn audio_static_parameter_groups(
+    config: &super::AudioConfig,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    audio_parameter_groups(
+        config,
+        config.hidden_size,
+        "model.audio_tower.static",
+        0..0,
+        |name| {
+            name.starts_with("model.audio_tower.") && !name.starts_with("model.audio_tower.layers.")
+        },
+    )
+}
+
+/// Declares one independently leased Gemma audio layer.
+pub fn audio_layer_parameter_groups(
+    config: &super::AudioConfig,
+    index: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    if index >= config.num_hidden_layers as usize {
+        return Err(ParallelPlanError::InvalidGroup(
+            "Gemma audio layer outside declared stack".into(),
+        ));
+    }
+    let prefix = format!("model.audio_tower.layers.{index}");
+    audio_parameter_groups(
+        config,
+        config.hidden_size,
+        &prefix,
+        index..index + 1,
+        |name| name.starts_with(&format!("{prefix}.")),
+    )
+}
+
+/// Declares one media-to-decoder projection with its admitted physical encoding.
+pub fn modality_projection_parameter_groups(
     logical_name: impl Into<String>,
-    projector: &ModalityProjector<B>,
+    component: &str,
+    input: i32,
+    output: i32,
+    format: eredu_checkpoint::LinearFormat,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    media_unit_parameter_groups::<B>(logical_name, projector)
-}
-
-/// Declares one replicated Gemma vision layer.
-pub fn vision_layer_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    layer: &VisionLayer<B>,
-    index: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    media_unit_parameter_groups::<B>(format!("model.vision_tower.encoder.layers.{index}"), layer)
-}
-
-/// Declares one replicated Gemma audio layer.
-pub fn audio_layer_parameter_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    layer: &AudioLayer<B>,
-    index: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    media_unit_parameter_groups::<B>(format!("model.audio_tower.layers.{index}"), layer)
+    if input <= 0 || output <= 0 {
+        return Err(ParallelPlanError::InvalidGroup(
+            "Gemma projector dimensions must be positive".into(),
+        ));
+    }
+    expand_linear_format_parameter_groups(
+        vec![ParameterGroupSpec::new(
+            logical_name,
+            ParameterRole::Replicated,
+            vec![ParameterMemberSpec::new(
+                format!("model.{component}.embedding_projection.weight"),
+                vec![output as usize, input as usize],
+                MemberSharding::Replicated,
+            )],
+        )?],
+        |member| standard_parallel_linear_format(member, format),
+    )
 }
 
 /// Complete planner-derived construction and state geometry for one Gemma 4 rank.
@@ -475,56 +529,6 @@ fn aggregate_local_text(
     Ok(local)
 }
 
-fn vocabulary_range(
-    layout: &LocalModelLayout,
-    logical_name: &str,
-    vocabulary: usize,
-) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
-    {
-        if tensor.global_shape().first().copied() != Some(vocabulary) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Gemma 4 vocabulary member {target} has global shape {:?}, expected {vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..vocabulary,
-            placement => {
-                return Err(ParallelPlanError::InvalidTensor(format!(
-                    "Gemma 4 vocabulary member {target} has non-row placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "Gemma 4 vocabulary group {logical_name} has inconsistent selections"
-            )));
-        }
-        selected = Some(range);
-    }
-    let range = VocabularyParallelRange {
-        global_vocabulary: vocabulary,
-        local: selected.ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!(
-                "missing local Gemma 4 vocabulary layout for {logical_name}"
-            ))
-        })?,
-    };
-    range
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
-    Ok(range)
-}
-
 fn local_per_layer_range(
     args: &ModelArgs,
     layout: &LocalModelLayout,
@@ -594,14 +598,14 @@ pub fn local_geometry(
         per_layer_range.end - per_layer_range.start,
     )?;
     let state_layout = state_layout(&local_text).map_err(|error| invalid(error.to_string()))?;
-    let vocabulary = dim(args.text.vocab_size)?;
-    let embedding_range =
-        vocabulary_range(layout, "model.language_model.embed_tokens", vocabulary)?;
-    let output_range = if args.text.tie_word_embeddings {
-        None
-    } else {
-        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
-    };
+    let (embedding_range, output_range) = super::static_construction_specs(&args.text)
+        .map_err(|error| invalid(error.to_string()))?
+        .vocabulary_ranges(
+            layout,
+            "model.language_model.embed_tokens",
+            "model.language_model.norm",
+            "lm_head",
+        )?;
     let geometry = LocalGeometry {
         text_blocks,
         embedding_range,
@@ -854,73 +858,77 @@ fn local_axis(
 pub fn static_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    static_parameter_groups_at(args, "model.language_model")
+    Ok(pinned_parameter_groups(args)?
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect())
 }
 
-/// Declares shared vocabulary/readout placement under an architecture-owned root.
-pub(crate) fn static_parameter_groups_at(
+/// Declares each pinned resource together with its canonical storage role.
+pub(crate) fn pinned_parameter_groups(
     args: &ModelArgs,
-    root: &str,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+) -> Result<Vec<(&'static str, ParameterGroupSpec)>, ParallelPlanError> {
+    let root = "model.language_model";
     let hidden = dim(args.hidden_size)?;
-    let vocab = dim(args.vocab_size)?;
-    let mut groups = vec![group(
-        format!("{root}.embed_tokens"),
-        ParameterRole::Vocabulary,
-        [(
-            format!("{root}.embed_tokens.weight"),
-            vec![vocab, hidden],
-            MemberSharding::Balanced { axis: 0 },
-        )],
-    )?];
+    let ordinary = super::static_construction_specs(args)
+        .map_err(|error| invalid(error.to_string()))?
+        .pinned_parameter_groups(
+            "model.language_model.embed_tokens",
+            "model.language_model.norm",
+            "lm_head",
+        )?;
+    let mut extra = Vec::new();
     if args.hidden_size_per_layer_input > 0 {
         let per_layer = dim(args.hidden_size_per_layer_input)?;
         let combined = per_layer
             .checked_mul(args.num_hidden_layers())
             .ok_or_else(|| invalid("Gemma per-layer embedding width overflow"))?;
-        groups.push(replicated(
-            format!("{root}.per_layer_embedding"),
-            [(
-                format!("{root}.embed_tokens_per_layer.weight"),
-                vec![
-                    dim(args.vocab_size_per_layer_input.unwrap_or(args.vocab_size))?,
-                    combined,
-                ],
-            )],
-        )?);
-        groups.push(replicated(
-            format!("{root}.per_layer_projection"),
-            [(
-                format!("{root}.per_layer_model_projection.weight"),
-                vec![combined, hidden],
-            )],
-        )?);
-        groups.push(replicated(
-            format!("{root}.per_layer_projection_norm"),
-            [(
-                format!("{root}.per_layer_projection_norm.weight"),
-                vec![per_layer],
-            )],
-        )?);
+        extra.push((
+            "per_layer_embedding",
+            replicated(
+                format!("{root}.per_layer_embedding"),
+                [(
+                    format!("{root}.embed_tokens_per_layer.weight"),
+                    vec![
+                        dim(args.vocab_size_per_layer_input.unwrap_or(args.vocab_size))?,
+                        combined,
+                    ],
+                )],
+            )?,
+        ));
+        extra.push((
+            "per_layer_projection",
+            replicated(
+                format!("{root}.per_layer_projection"),
+                [(
+                    format!("{root}.per_layer_model_projection.weight"),
+                    vec![combined, hidden],
+                )],
+            )?,
+        ));
+        extra.push((
+            "per_layer_norm",
+            replicated(
+                format!("{root}.per_layer_projection_norm"),
+                [(
+                    format!("{root}.per_layer_projection_norm.weight"),
+                    vec![per_layer],
+                )],
+            )?,
+        ));
     }
-    groups.push(replicated(
-        format!("{root}.norm"),
-        [(format!("{root}.norm.weight"), vec![hidden])],
-    )?);
-    if !args.tie_word_embeddings {
-        groups.push(group(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            [(
-                "lm_head.weight".into(),
-                vec![vocab, hidden],
-                MemberSharding::Balanced { axis: 0 },
-            )],
-        )?);
-    }
-    expand_linear_format_parameter_groups(groups, |member| {
+    let extra = eredu_runtime::expand_tagged_linear_format_parameter_groups(extra, |member| {
         standard_parallel_linear_format(member, args.linear_format_for(member.target()))
-    })
+    })?;
+    let mut extra = extra.into_iter();
+    let mut groups = Vec::new();
+    for (role, group) in ordinary {
+        groups.push((role, group));
+        if role == "embedding" {
+            groups.extend(extra.by_ref());
+        }
+    }
+    Ok(groups)
 }
 
 /// Declares one decoder layer's head, MLP, expert, media, and replicated groups.

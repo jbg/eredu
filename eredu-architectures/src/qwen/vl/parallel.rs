@@ -21,7 +21,7 @@ pub struct LocalGeometry {
 }
 
 /// Exact TP/PP-local Qwen3-VL geometry, optionally bound to one selected EP realization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PartitionLocalGeometry {
     vision_units: Option<Range<usize>>,
     vision_blocks: Vec<(i32, i32)>,
@@ -100,7 +100,48 @@ impl PartitionLocalGeometry {
         self.expert_realization.as_ref()
     }
 
-    fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
+    pub(super) fn validate_complete_geometry(
+        &self,
+        args: &ModelArgs,
+        complete: &LocalGeometry,
+    ) -> Result<(), ParallelPlanError> {
+        self.validate_for(args)?;
+        complete.validate_for(args)?;
+        if self.complete_state_layout != complete.state_layout
+            || self.merger_widths != complete.merger_widths
+        {
+            return Err(invalid(
+                "selected Qwen3-VL geometry differs from complete placement",
+            ));
+        }
+        for index in self.vision_units.clone().into_iter().flatten() {
+            if self.vision_block(index) != complete.vision_block(index) {
+                return Err(invalid(
+                    "selected Qwen3-VL vision geometry differs from complete placement",
+                ));
+            }
+        }
+        for index in self.text_units.clone() {
+            let mut expected = complete
+                .text
+                .block(index)
+                .ok_or_else(|| invalid("Qwen3-VL has no complete text geometry"))?
+                .clone();
+            if let Some(realization) = &self.expert_realization {
+                expected.num_experts =
+                    i32::try_from(realization.local_global_group_indices().len())
+                        .map_err(|_| invalid("Qwen3-VL local expert count exceeds i32"))?;
+            }
+            if self.text_block(index) != Some(&expected) {
+                return Err(invalid(
+                    "selected Qwen3-VL text geometry differs from complete placement",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
         let text_count = usize::try_from(args.text.num_hidden_layers)
             .map_err(|_| invalid("Qwen3-VL text layer count is negative"))?;
         let vision_count = args.vision.layer_count();
@@ -362,7 +403,12 @@ pub fn partition_local_geometry(
     }
     let (vision_units, text_units) = partition_ranges(group_ranges)?;
     let complete = local_geometry(args, layout)?;
-    let text = qwen::partition_local_geometry(&args.text, layout, text_units.clone())?;
+    let text = qwen::partition_local_geometry(
+        &args.text,
+        qwen::dense_parameter_description(&args.text)?.invocations(),
+        layout,
+        text_units.clone(),
+    )?;
     finish_partition_geometry(
         args,
         complete,

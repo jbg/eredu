@@ -24,8 +24,9 @@ pub use config::{
 };
 pub use depth::DepthSlice;
 pub use model::{
-    observation_points, state_layout, DecisionBoundary, ForwardContext, Input, LayeredModel,
-    ObservationPoint, StaticModules, Unit, DEPTH_STATE_SEGMENT, TEMPORAL_STATE_SEGMENT,
+    component_definition, observation_points, state_layout, DecisionBoundary, ForwardContext,
+    Input, LayeredModel, MoshiKernel, ObservationPoint, StaticModules, Unit, DEPTH_STATE_SEGMENT,
+    TEMPORAL_STATE_SEGMENT,
 };
 pub use parallel::{
     collective_count, forward_temporal_block_parallel, local_geometry, parameter_contract,

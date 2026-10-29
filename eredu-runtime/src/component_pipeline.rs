@@ -21,6 +21,51 @@ pub enum PipelineBindingError {
     #[error("component pipeline binding: {0}")]
     Contract(&'static str),
 }
+/// Failure preparing one typed component pipeline before native resources exist.
+/// Family geometry remains typed; shared mechanism failures retain their original sources.
+#[derive(Debug, thiserror::Error)]
+pub enum ComponentPipelinePreparationError<E> {
+    /// Family-declared geometry, state or boundary is invalid.
+    #[error(transparent)]
+    Component(E),
+    /// Shared pipeline authority or completion validation failed.
+    #[error(transparent)]
+    Communication(#[from] PartitionExecutionError),
+    /// The tensor cohort cannot propagate local failures safely.
+    #[error(transparent)]
+    LocalAgreement(#[from] crate::PipelineLocalAgreementError),
+    /// Publication cannot cover its declared payload.
+    #[error(transparent)]
+    Capability(#[from] crate::CommunicationCapabilityError),
+    /// An exact communication requirement cannot be represented.
+    #[error(transparent)]
+    Manifest(#[from] crate::CommunicationManifestError),
+    /// Retained selection disagrees with the component's contract.
+    #[error("invalid {component} pipeline selection: {reason}")]
+    Contract {
+        /// Architecture-authored component label for diagnostics.
+        component: &'static str,
+        /// Exact failed contract.
+        reason: &'static str,
+    },
+}
+
+impl PipelineBindingError {
+    /// Adds family-authored diagnostic context without changing the original source.
+    pub fn into_preparation<E>(
+        self,
+        component: &'static str,
+    ) -> ComponentPipelinePreparationError<E> {
+        match self {
+            Self::Communication(error) => ComponentPipelinePreparationError::Communication(error),
+            Self::LocalAgreement(error) => ComponentPipelinePreparationError::LocalAgreement(error),
+            Self::Contract(reason) => {
+                ComponentPipelinePreparationError::Contract { component, reason }
+            }
+        }
+    }
+}
+
 /// Validates exact retained parameters, stage ownership, collective topology and wire geometry.
 /// `boundary_schema` supplies the architecture's declaration for each directed
 /// route, independently of that route's manifest contract. Uniform-width
@@ -140,18 +185,14 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
         .routes()
         .iter()
         .filter(|route| route.destination_rank == manifest.rank())
-        .collect::<Vec<_>>();
+        .map(|route| route.destination_group);
     let outgoing = plan
         .routes()
         .iter()
         .filter(|route| route.source_rank == manifest.rank())
-        .collect::<Vec<_>>();
-    if incoming.len() != usize::from(!partition.ownership().owns_input())
-        || outgoing.len() != usize::from(!partition.ownership().owns_output())
-        || incoming
-            .iter()
-            .any(|route| route.destination_group != first)
-        || outgoing.iter().any(|route| route.source_group != last)
+        .map(|route| route.source_group);
+    if !incoming.eq((!partition.ownership().owns_input()).then_some(first))
+        || !outgoing.eq((!partition.ownership().owns_output()).then_some(last))
     {
         return Err(Contract(
             "routes differ from the stage's single ingress and egress",
@@ -181,9 +222,9 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
                 group.local_index().expect("validated tensor rank"),
             )
             .map_err(|_| Contract("invalid tensor rank"))?;
-            let expected = crate::derive_partitioned_local_layout(description, topology)
+            let expected = crate::parameter_layout::partitioned_local_layout(description, topology)
                 .map_err(|_| Contract("tensor parameter placement cannot be derived"))?;
-            if local_layout != Some(&expected) {
+            if local_layout != Some(expected.as_ref()) {
                 return Err(Contract(
                     "tensor group differs from retained parameter placement",
                 ));
@@ -201,13 +242,12 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
         let contract = route
             .boundary_contract()
             .ok_or(Contract("route lacks exact boundary roles"))?;
-        let symbolic = std::iter::once(schema.primary())
-            .chain(schema.auxiliary())
-            .collect::<Vec<_>>();
-        if contract.schema() != schema.identity() || contract.roles().len() != symbolic.len() {
+        if contract.schema() != schema.identity()
+            || contract.roles().len() != 1 + schema.auxiliary().len()
+        {
             return Err(Contract("route boundary identity or roles differ"));
         }
-        for (actual, expected) in contract.roles().iter().zip(symbolic) {
+        for (actual, expected) in contract.roles().iter().zip(schema.tensors()) {
             let dtype = match expected.dtype() {
                 BoundaryTensorDtype::Int32 => TensorDtype::I32,
                 BoundaryTensorDtype::Float32 => TensorDtype::F32,
@@ -287,23 +327,19 @@ pub fn validate_component_pipeline_ranges(
             "pipeline cuts must exactly cover the selected group routes",
         ));
     }
-    let mut incoming = vec![None; manifest.world_size()];
-    let mut outgoing = vec![None; manifest.world_size()];
+    // Admitted cuts are strictly interior, so untouched endpoints also mark
+    // ranks whose ingress or egress has not yet been assigned.
+    let mut ranges = vec![0..count; manifest.world_size()];
     for route in manifest.routes() {
         let cut = selected[&route.id()];
-        if incoming[route.destination()].replace(cut).is_some()
-            || outgoing[route.source()].replace(cut).is_some()
-        {
+        if ranges[route.destination()].start != 0 || ranges[route.source()].end != count {
             return Err(Contract(
                 "linear stage requires one ingress and one egress at most",
             ));
         }
+        ranges[route.destination()].start = cut;
+        ranges[route.source()].end = cut;
     }
-    let ranges = incoming
-        .iter()
-        .zip(&outgoing)
-        .map(|(start, end)| start.unwrap_or(0)..end.unwrap_or(count))
-        .collect::<Vec<_>>();
     if ranges.iter().any(|range| range.is_empty()) || ranges[manifest.rank()] != local_range {
         return Err(Contract(
             "route cuts disagree with contiguous stage ownership",

@@ -3,7 +3,7 @@ use super::*;
 use crate::RowResidencyRange;
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
-    store::{PreparedCheckpointSource, PreparedTensorSource, SharedCheckpointSource},
+    store::{PreparedCheckpointSource, SharedCheckpointSource},
 };
 
 /// One retained floating scalar, separate from the row payload residency.
@@ -58,16 +58,14 @@ impl PreparedRowLookup {
         limits: RowLookupLimits,
     ) -> Result<Self, RowLookupError> {
         if let Some(scale) = &mut scale {
-            let catalog = scale.source.source_keys().into_iter().map(|key| {
-                Ok((key.clone(), PreparedTensorSource {
-                    metadata: scale.source.source_metadata(&key)?,
-                    provenance: scale.source.source_provenance(&key)?,
-                }))
-            }).collect::<Result<std::collections::BTreeMap<_, _>, eredu_checkpoint::store::StoreError>>()
-                .map_err(RowLookupError::bank)?;
+            let keys = scale.source.source_keys().into_iter().collect();
             scale.source = std::sync::Arc::new(
-                PreparedCheckpointSource::new(scale.source.clone(), catalog)
-                    .map_err(RowLookupError::bank)?,
+                PreparedCheckpointSource::retain(
+                    scale.source.clone(),
+                    "row lookup scalar companion",
+                    keys,
+                )
+                .map_err(RowLookupError::bank)?,
             );
         }
         let descriptor = RowLookupDescriptor::new(

@@ -2,8 +2,8 @@
 use super::{
     rnnt::{RnntDimensions, RnntError},
     rnnt_predictor::{
-        invalid, rnnt_predictor_parameter_description, rnnt_predictor_state_layout, validate_row,
-        RnntPredictorArchitecture, RnntPredictorForward, RnntPredictorRuntimeState,
+        invalid, rnnt_predictor_state_layout, validate_row, RnntPredictorForward,
+        RnntPredictorKernel, RnntPredictorRuntimeState,
     },
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
@@ -161,14 +161,15 @@ impl RnntPredictorPipelineCuts {
 }
 /// Validates exact parameters, state slice and input/output stage ownership.
 pub fn validate_rnnt_predictor_partition<G>(
+    definition: &ComponentDefinition,
     dimensions: RnntDimensions,
     partition: &ArchitecturePartition<G, RnntPredictorBoundarySchema>,
 ) -> Result<Range<usize>, RnntError> {
-    let description = rnnt_predictor_parameter_description(dimensions)?;
+    let description = definition.parameters();
     if partition.graph() != description.graph()
         || partition.unit_layout() != description.unit_layout()
         || partition.boundary_schema() != &RnntPredictorBoundarySchema::new(dimensions)?
-        || partition.parameter_bindings() != description.select_owned(partition)
+        || !description.matches_partition_bindings(partition)
         || partition.groups().len() != 1
         || partition.groups()[0].group_index() != 0
         || !partition.ownership().static_roles().is_empty()
@@ -192,7 +193,7 @@ pub fn validate_rnnt_predictor_partition<G>(
         .state()
         .ok_or_else(|| invalid("RNNT predictor stage lacks local carry declaration"))?;
     if state.global_layers() != range
-        || state.layout() != &rnnt_predictor_state_layout(dimensions)?.slice(range.clone())?
+        || state.layout() != &definition.state_layout().slice(range.clone())?
     {
         return Err(invalid(
             "RNNT predictor local carry declaration differs from owned layers",
@@ -200,7 +201,7 @@ pub fn validate_rnnt_predictor_partition<G>(
     }
     Ok(range)
 }
-impl<B: NeuralBackend> RnntPredictorArchitecture<B> {
+impl<B: NeuralBackend> RnntPredictorKernel<B> {
     fn begin_partition_input(
         &self,
         input: LayeredPartitionInput<'_, B::Tensor, RnntPredictorBoundary<B::Tensor>>,
@@ -223,7 +224,7 @@ impl<B: NeuralBackend> RnntPredictorArchitecture<B> {
                         "RNNT predictor embedded ingress requires first stage",
                     ));
                 }
-                self.begin(input, input, step.unwrap_or(0), state)
+                self.begin_input(input, input, step.unwrap_or(0), state)
             }
             LayeredPartitionInput::Hidden { hidden, auxiliary } => {
                 if self.range().start == 0
@@ -244,47 +245,36 @@ impl<B: NeuralBackend> RnntPredictorArchitecture<B> {
                 {
                     return Err(invalid("RNNT predictor boundary cut or exact step differs"));
                 }
-                self.begin(&hidden, &auxiliary.prototype, received, state)
+                self.begin_input(&hidden, &auxiliary.prototype, received, state)
             }
         }
     }
 }
 impl<B: DistributedNeuralBackend>
-    PartitionedLayeredArchitecture<B, RnntPredictorRuntimeState<B::Tensor>>
-    for RnntPredictorArchitecture<B>
+    PartitionComponentKernel<
+        B,
+        crate::voicechat::rnnt_predictor::RnntPredictorRuntimeState<B::Tensor>,
+    > for RnntPredictorKernel<B>
 {
     type Boundary = RnntPredictorBoundarySchema;
     fn boundary_schema(&self) -> Result<Self::Boundary, RnntError> {
         RnntPredictorBoundarySchema::new(self.dimensions)
     }
-    fn begin_partition<'a>(
+    fn begin_partition(
         &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, RnntPredictorBoundary<B::Tensor>>,
+        input: LayeredPartitionInput<'_, B::Tensor, RnntPredictorBoundary<B::Tensor>>,
         mask: Option<&B::Tensor>,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
-        expected: &StateLayout,
-        first: usize,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
-        if mask.is_some() || first != 0 {
+        if mask.is_some() || selected.first_state_ordinal != 0 {
             return Err(invalid(
                 "RNNT predictor stage expects local state origin and no mask",
             ));
         }
-        self.begin_partition_input(input, None, state, Some(expected), context)
+        self.begin_partition_input(input, None, state, selected.expected, selected.native)
     }
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, RnntPredictorBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        state: &mut RnntPredictorRuntimeState<B::Tensor>,
-        expected: &StateLayout,
-        first: usize,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError> {
-        self.begin_partition(input, mask, state, expected, first, context)
-    }
+
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
@@ -324,27 +314,26 @@ impl<B: DistributedNeuralBackend>
     }
 }
 impl<B: DistributedNeuralBackend>
-    PipelinePartitionArchitecture<B, RnntPredictorRuntimeState<B::Tensor>>
-    for RnntPredictorArchitecture<B>
+    PipelineComponentKernel<
+        B,
+        crate::voicechat::rnnt_predictor::RnntPredictorRuntimeState<B::Tensor>,
+    > for RnntPredictorKernel<B>
 {
-    fn partition_input_dimensions(&self, _: &Self::Input<'_>) -> Result<(i32, i32), RnntError> {
+    fn input_dimensions(&self, _: &Self::Input<'_>) -> Result<(i32, i32), RnntError> {
         Ok((1, 1))
     }
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, RnntPredictorBoundary<B::Tensor>)>,
         state: &mut RnntPredictorRuntimeState<B::Tensor>,
-        expected: Option<&StateLayout>,
-        first: usize,
-        _: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
+        selected: ComponentPartitionContext<'_, B>,
         _: &mut O,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, RnntError>
     where
         O: ActivationObserver<B::Tensor, RnntError> + ?Sized,
     {
-        if first != 0 {
+        if selected.first_state_ordinal != 0 {
             return Err(invalid("RNNT predictor stage requires local carry origin"));
         }
         validate_row(input.input, self.dimensions)?;
@@ -352,23 +341,21 @@ impl<B: DistributedNeuralBackend>
             Some((hidden, auxiliary)) => LayeredPartitionInput::Hidden { hidden, auxiliary },
             None => LayeredPartitionInput::Tokens(input.input),
         };
-        self.begin_partition_input(ingress, Some(input.step), state, expected, context)
+        self.begin_partition_input(
+            ingress,
+            Some(input.step),
+            state,
+            selected.expected,
+            selected.native,
+        )
     }
-    fn partition_output_width(&self) -> i32 {
+    fn output_width(&self) -> i32 {
         self.dimensions.predictor_width
     }
-    fn partition_output_shape(
-        &self,
-        _: &Self::Input<'_>,
-        _: i32,
-        _: i32,
-    ) -> Result<Vec<i32>, RnntError> {
+    fn output_shape(&self, _: &Self::Input<'_>, _: i32, _: i32) -> Result<Vec<i32>, RnntError> {
         Ok(vec![1, self.dimensions.predictor_width])
     }
-    fn partition_boundary_schema(
-        &self,
-        route: &PartitionBoundaryRoute,
-    ) -> Result<Self::Boundary, RnntError> {
+    fn route_schema(&self, route: &PartitionBoundaryRoute) -> Result<Self::Boundary, RnntError> {
         if route.source_group != 0 || route.destination_group != 0 {
             return Err(invalid("RNNT predictor route addresses another group"));
         }
@@ -378,15 +365,8 @@ impl<B: DistributedNeuralBackend>
             .1
             .schema(route.route)
     }
-    fn partition_retained_state_ordinals(
-        &self,
-        _: usize,
-        _: usize,
-        ordinal: usize,
-    ) -> Range<usize> {
-        ordinal..ordinal + 1
-    }
-    fn partition_tensor_vocabulary_sharded(&self) -> bool {
+
+    fn tensor_vocabulary_sharded(&self) -> bool {
         false
     }
 }

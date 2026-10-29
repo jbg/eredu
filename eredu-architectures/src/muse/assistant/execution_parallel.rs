@@ -125,13 +125,9 @@ impl MuseAssistantDefinition {
                 .to_owned()
         }))
         .map_err(Error::backend_source)?;
-        let description = ArchitectureParameterDescription::new(
-            &graph,
-            definition.unit_layout(),
-            groups.iter().map(|group| group.group().clone()),
-            groups.clone(),
-        )
-        .map_err(Error::backend_source)?;
+        let description =
+            ArchitectureParameterDescription::from_owned(&graph, definition.unit_layout(), groups)
+                .map_err(Error::backend_source)?;
         let layout = derive_partitioned_local_layout(&description, rank).map_err(Error::backend)?;
         // Body construction and complete binding consume the same exact selections.
         let (_, selected_body) = body_description.partition_layout().unwrap();

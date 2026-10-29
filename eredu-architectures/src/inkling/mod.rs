@@ -28,9 +28,10 @@ pub use graph::{
     PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use model::{
-    prepare_input, state_identity, DecoderInputPart, ForwardContext, InklingStateLayouts,
-    LayeredModel, ModelInput, PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput,
-    Unit, AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    component_definition, parameter_description, prepare_input, state_identity, DecoderInputPart,
+    ForwardContext, InklingKernel, InklingStateLayouts, LayeredModel, ModelInput,
+    PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput, Unit,
+    AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub(crate) use mtp::mtp_text_args;
 pub use mtp::{MtpDepth, MtpModel, MtpOutput, MtpShared};
@@ -45,6 +46,23 @@ pub use text::{
 };
 pub use vision::{VisionLayer, VisionStatic, VisionTower};
 
+/// Common vocabulary and final-normalization declaration for every text owner.
+pub(crate) fn static_spec(args: &TextArgs) -> crate::decoder::StaticModuleSpec {
+    crate::decoder::StaticModuleSpec {
+        normalization_groups: None,
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.rms_norm_eps,
+        normalization_offset: 0.0,
+        embedding_format: args.linear_format_for("model.embed_tokens.weight"),
+        head_format: args.linear_format_for("lm_head.weight"),
+        tied_head: false,
+    }
+}
+
 /// Rank-local construction specifications for one Inkling sparse unit.
 #[derive(Debug, Clone)]
 pub struct ExpertBankRealization {
@@ -55,13 +73,17 @@ pub struct ExpertBankRealization {
 }
 
 /// Derives complete routed-expert ownership and both rank-local bank geometries.
-pub fn expert_realization_plan<
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
-    architecture: &LayeredModel<B>,
+pub fn expert_realization_plan(
+    args: &ModelArgs,
+    geometry: Option<&LocalGeometry>,
     topology: eredu_core::ParallelRankTopology,
 ) -> Result<Option<crate::ExpertRealizationPlan<ExpertBankRealization>>, eredu_nn::Error> {
-    let args = architecture.args();
+    args.validate().map_err(eredu_nn::Error::backend_source)?;
+    if let Some(geometry) = geometry {
+        geometry
+            .validate_for(args)
+            .map_err(eredu_nn::Error::backend_source)?;
+    }
     let sparse = args
         .text_config
         .layer_schedule
@@ -90,8 +112,7 @@ pub fn expert_realization_plan<
         if policy.feed_forward != FeedForwardPolicy::SparseMoe {
             continue;
         }
-        let local = architecture
-            .shared_parallel_geometry()
+        let local = geometry
             .and_then(|geometry| geometry.text_layer(layer).cloned())
             .unwrap_or_else(|| args.text_config.clone());
         let (routed, shared) =

@@ -2,7 +2,7 @@
 use super::*;
 use crate::decoder::ComponentInstrumentation;
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
     fn component_text_entry<O>(
         &self,
         index: usize,
@@ -33,23 +33,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     {
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new("readout", &mut borrowed);
-        match parallel {
-            Some(parallel) => self.static_modules.text.finish_parallel_instrumented(
-                hidden,
-                parallel,
-                context,
-                &mut instrumentation,
-            ),
-            None => {
-                self.static_modules
-                    .text
-                    .finish_instrumented(hidden, context, &mut instrumentation)
-            }
-        }
+        self.finish_readout(hidden, parallel, context, &mut instrumentation)
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_components<S, P, O>(
         &mut self,
@@ -93,7 +81,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let state_ordinal = self.text_state_ordinal(index)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new(&path, &mut borrowed);
-        let output = block.forward_routed_observed(
+        let output = block.body.forward_routed_observed(
+            block.output_norm.as_mut(),
             index,
             AttentionInput {
                 selected_positions: None,
@@ -117,7 +106,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    LayeredModel<B>
+    VlKernel<B>
 {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_components_parallel<S, P, O>(
@@ -163,7 +152,8 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         let state_ordinal = self.text_state_ordinal(index)?;
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new(&path, &mut borrowed);
-        let output = block.forward_routed_parallel_observed(
+        let output = block.body.forward_routed_parallel_observed(
+            block.output_norm.as_mut(),
             index,
             AttentionInput {
                 selected_positions: None,

@@ -459,16 +459,11 @@ impl Config for FamilyConfig {
 }
 
 impl PartitionedConfig for FamilyConfig {
-    fn validate_partition_parameters(
+    fn partition_parameter_description(
         &self,
-        parameters: &eredu_runtime::ArchitectureParameterDescription,
-    ) -> Result<(), Error> {
-        if super::parallel::parameter_description(self).map_err(Error::backend)? != *parameters {
-            return Err(Error::backend(
-                "shared-backbone partition belongs to different parameter topology",
-            ));
-        }
-        Ok(())
+    ) -> Result<eredu_runtime::ArchitectureParameterDescription, eredu_runtime::ParallelPlanError>
+    {
+        super::parallel::parameter_description(self)
     }
     fn set_local_geometry(
         &mut self,

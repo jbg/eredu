@@ -936,7 +936,7 @@ fn finish_feed_forward<B: NeuralBackend>(
     instrumentation.apply("feed_forward.residual", hidden.add(&output, context)?)
 }
 
-fn shared_routed_spec(
+pub(super) fn shared_routed_spec(
     config: &HybridConfig,
     layer: usize,
     prefix: &str,

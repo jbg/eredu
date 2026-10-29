@@ -548,13 +548,33 @@ impl WeightBinding {
 
     /// Returns the complete source recipe represented by this binding.
     pub fn source_recipe(&self) -> DerivedWeightRecipe {
+        self.recipe_view().into_owned()
+    }
+
+    // Transfers a complete recipe when the binding metadata is no longer needed.
+    pub(crate) fn into_source_recipe(self) -> DerivedWeightRecipe {
         assert!(
             self.alias_of.is_none(),
             "logical aliases have no physical recipe"
         );
-        self.recipe.clone().unwrap_or_else(|| {
-            DerivedWeightRecipe::source(self.checkpoint_key.clone(), self.selection.clone())
-        })
+        self.recipe
+            .unwrap_or_else(|| DerivedWeightRecipe::source(self.checkpoint_key, self.selection))
+    }
+
+    // Inspection borrows retained derived recipes; direct bindings synthesize
+    // their source expression from the checkpoint key and selection.
+    pub(crate) fn recipe_view(&self) -> Cow<'_, DerivedWeightRecipe> {
+        assert!(
+            self.alias_of.is_none(),
+            "logical aliases have no physical recipe"
+        );
+        match &self.recipe {
+            Some(recipe) => Cow::Borrowed(recipe),
+            None => Cow::Owned(DerivedWeightRecipe::source(
+                self.checkpoint_key.clone(),
+                self.selection.clone(),
+            )),
+        }
     }
 
     /// Returns every checkpoint key consumed by this binding.
@@ -596,10 +616,34 @@ impl WeightBinding {
         catalog: &C,
         selection: TensorSelection,
     ) -> Result<Self, WeightBindingSelectionError> {
-        let recipe = self.source_recipe().select_bounded(catalog, selection)?;
+        let recipe = self.recipe_view().select_bounded(catalog, selection)?;
         let bytes = recipe.infer(catalog)?.byte_len();
         Ok(self.with_source_recipe(recipe, bytes)?)
     }
+}
+
+/// Checked executable parameter payload for a binding selection.
+///
+/// Logical aliases add no storage. Distinct physical owners remain separately
+/// charged even when their checkpoint keys or recipes are equal. Source payload,
+/// loading scratch and native host capacity are separate estimates. This does not
+/// validate alias topology; a selection may include aliases to another resource.
+pub fn physical_binding_bytes(
+    bindings: &[WeightBinding],
+) -> Result<u64, ResidencyDeclarationError> {
+    bindings
+        .iter()
+        .filter(|binding| !binding.is_alias())
+        .try_fold(0u64, |total, binding| {
+            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                ResidencyDeclarationError::BindingBytesOverflow {
+                    target: binding
+                        .logical_target()
+                        .unwrap_or_else(|| binding.name())
+                        .into(),
+                }
+            })
+        })
 }
 
 /// Validated owner/alias partition for one atomic binding unit.
@@ -699,9 +743,13 @@ impl<'a> WeightBindingPlan<'a> {
 
     /// Logical aliases paired with their resolved canonical owners.
     pub fn aliases(&self) -> impl Iterator<Item = (&WeightBinding, &WeightBinding)> {
-        self.aliases
-            .iter()
-            .map(|(alias, owner)| (&self.bindings[*alias], &self.bindings[*owner]))
+        self.alias_indices()
+            .map(|(alias, owner)| (&self.bindings[alias], &self.bindings[owner]))
+    }
+
+    // Indices refer to this plan's binding order and resolve directly to physical owners.
+    pub(crate) fn alias_indices(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.aliases.iter().copied()
     }
 }
 
@@ -1136,30 +1184,23 @@ impl ResidencyController {
                 .get(spec.id())
                 .expect("definition identity validated above");
             let catalog = catalog_for_unit(unit.id());
-            let mut total = 0u64;
+            let total = physical_binding_bytes(unit.bindings())?;
             for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
-                total = total.checked_add(binding.expected_bytes()).ok_or(
-                    ResidencyControllerError::ArithmeticOverflow {
-                        context: "unit binding byte total",
-                    },
-                )?;
-                if !binding.is_alias() {
-                    let actual = binding
-                        .source_recipe()
-                        .infer(catalog)
-                        .map_err(|source| ResidencyControllerError::Recipe {
-                            binding: binding.name().to_owned(),
-                            source,
-                        })?
-                        .byte_len();
-                    if actual != binding.expected_bytes() {
-                        return Err(ResidencyControllerError::BindingByteMismatch {
-                            id: unit.id().clone(),
-                            binding: binding.name().to_owned(),
-                            expected_bytes: binding.expected_bytes(),
-                            actual_bytes: actual,
-                        });
-                    }
+                let actual = binding
+                    .recipe_view()
+                    .infer(catalog)
+                    .map_err(|source| ResidencyControllerError::Recipe {
+                        binding: binding.name().to_owned(),
+                        source,
+                    })?
+                    .byte_len();
+                if actual != binding.expected_bytes() {
+                    return Err(ResidencyControllerError::BindingByteMismatch {
+                        id: unit.id().clone(),
+                        binding: binding.name().to_owned(),
+                        expected_bytes: binding.expected_bytes(),
+                        actual_bytes: actual,
+                    });
                 }
             }
             if total != spec.bytes() {
@@ -1544,7 +1585,7 @@ pub enum ResidencyControllerError {
     /// Bounded row planning failed before native materialization.
     #[error(transparent)]
     RowRead(#[from] eredu_checkpoint::rows::RowReadError),
-    /// A binding alias graph was invalid.
+    /// Binding declarations, alias topology or physical byte accounting are invalid.
     #[error(transparent)]
     Declaration(#[from] ResidencyDeclarationError),
     /// More than one definition used the same plan identifier.
@@ -1599,12 +1640,6 @@ pub enum ResidencyControllerError {
         /// Invalid recipe.
         #[source]
         source: RecipeError,
-    },
-    /// Checked byte arithmetic overflowed.
-    #[error("residency arithmetic overflow: {context}")]
-    ArithmeticOverflow {
-        /// Calculation that overflowed.
-        context: &'static str,
     },
 }
 
@@ -2016,6 +2051,12 @@ pub enum ResidencyDeclarationError {
     ZeroSizedBinding {
         /// Invalid local name.
         name: String,
+    },
+    /// Executable payload accounting exceeded its representable byte count.
+    #[error("physical binding byte total overflows at parameter {target:?}")]
+    BindingBytesOverflow {
+        /// Canonical destination when present, otherwise the module-local name.
+        target: String,
     },
     /// A unit had no bindings.
     #[error("residency unit {id} must contain at least one binding")]

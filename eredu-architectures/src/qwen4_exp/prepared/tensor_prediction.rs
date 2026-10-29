@@ -1,7 +1,6 @@
 //! Prediction tensor ranks over the original admitted parameter sources.
 use super::*;
 use crate::qwen4_exp::mtp::PredictionTensorPartition;
-use crate::qwen4_exp::prepared::tensor_partition::partition_recipe;
 
 /// Exact local prediction recipes, retaining shared fusion/readout and target
 /// vocabulary references. Constructing a rank reads no parameter payload.
@@ -9,8 +8,8 @@ use crate::qwen4_exp::prepared::tensor_partition::partition_recipe;
 pub struct PreparedTensorPrediction {
     source: PreparedPrediction,
     partition: PredictionTensorPartition,
-    units: Vec<PreparedParameters>,
-    expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    units: Vec<PreparedParameterRecipes>,
+    expert_banks: BTreeMap<String, Arc<ParameterBankRecipes>>,
 }
 
 impl PreparedPrediction {
@@ -27,52 +26,34 @@ impl PreparedPrediction {
             .units
             .iter()
             .map(|owner| {
-                let recipes = owner
-                    .recipes
-                    .iter()
-                    .map(|(name, recipe)| {
-                        Ok((
-                            name.clone(),
-                            partition_recipe(
-                                owner.source.as_ref(),
-                                name,
-                                recipe,
-                                partition.parameter_selections(name),
-                            )?,
-                        ))
+                owner
+                    .clone()
+                    .map_recipes("qwen4_exp prepared owner", |name, recipe, source| {
+                        eredu_runtime::select_parameter_recipe(
+                            source,
+                            name,
+                            recipe,
+                            partition.parameter_selections(name),
+                        )
+                        .map_err(PreparationError::from)
                     })
-                    .collect::<Result<_, PreparationError>>()?;
-                PreparedParameters::new(owner.source.clone(), recipes)
             })
             .collect::<Result<_, PreparationError>>()?;
         let expert_banks = self
             .expert_banks
             .iter()
             .map(|(root, bank)| {
-                let recipes = bank
-                    .recipes
-                    .iter()
-                    .map(|(name, recipe)| {
-                        let canonical = format!("{root}.{name}");
-                        Ok((
-                            name.clone(),
-                            partition_recipe(
-                                self.artifact.as_ref(),
-                                &canonical,
-                                recipe,
-                                partition.parameter_selections(&canonical),
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<_, PreparationError>>()?;
-                Ok((
-                    root.clone(),
-                    Arc::new(PreparedExpertBank::new(
+                let bank = bank.map_recipes(self.artifact.as_ref(), |name, recipe| {
+                    let canonical = format!("{root}.{name}");
+                    eredu_runtime::select_parameter_recipe(
                         self.artifact.as_ref(),
-                        recipes,
-                        bank.members.len(),
-                    )?),
-                ))
+                        &canonical,
+                        recipe,
+                        partition.parameter_selections(&canonical),
+                    )
+                    .map_err(PreparationError::from)
+                })?;
+                Ok((root.clone(), Arc::new(bank)))
             })
             .collect::<Result<_, PreparationError>>()?;
         Ok(PreparedTensorPrediction {
@@ -96,17 +77,17 @@ impl PreparedTensorPrediction {
     }
 
     /// Replicated fusion and readout from the original prepared owner.
-    pub fn shared(&self) -> &PreparedParameters {
+    pub fn shared(&self) -> &PreparedParameterRecipes {
         self.source.shared()
     }
 
     /// Original target embedding/output references, without target collapse.
-    pub fn vocabulary(&self) -> &PreparedParameters {
+    pub fn vocabulary(&self) -> &PreparedParameterRecipes {
         self.source.vocabulary()
     }
 
     /// Tensor-local ordinary parameters for one independently acquired depth.
-    pub fn unit(&self, depth: usize) -> Result<&PreparedParameters, PreparationError> {
+    pub fn unit(&self, depth: usize) -> Result<&PreparedParameterRecipes, PreparationError> {
         self.units.get(depth).ok_or_else(|| {
             PreparationError::Contract("prediction depth is outside tensor partition".into())
         })
@@ -117,16 +98,18 @@ impl PreparedTensorPrediction {
         &self,
         depth: usize,
         expert: usize,
-    ) -> Result<PreparedParameters, PreparationError> {
+    ) -> Result<PreparedParameterRecipes, PreparationError> {
         self.unit(depth)?;
         let root = format!("mtp.layers.{depth}.mlp.experts");
         let recipes = select_expert(&self.expert_banks, &root, expert)?;
-        PreparedParameters::new(
+        PreparedParameterRecipes::new(
+            "qwen4_exp prepared owner",
             self.source.artifact.clone(),
             recipes
                 .into_iter()
                 .map(|(name, recipe)| (format!("{root}.{name}"), recipe))
                 .collect(),
         )
+        .map_err(PreparationError::from)
     }
 }

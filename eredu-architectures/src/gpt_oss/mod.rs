@@ -6,6 +6,7 @@ pub mod config;
 pub mod model;
 pub mod moe;
 pub mod parallel;
+pub(crate) use parallel::parameter_description;
 
 pub use block::{new_block, GptOssBlockFactory, TransformerBlock};
 pub use checkpoint::{
@@ -18,7 +19,7 @@ pub use config::{
     prompt_cache_architecture_fingerprint, state_identity, state_layout, ConfigError, ModelArgs,
     MxFp4Config,
 };
-pub use model::{new_layered_model, LayeredModel, PartitionedLayeredModel};
+pub use model::{LayeredModel, PartitionedLayeredModel};
 pub use moe::{
     expert_bank_spec, expert_realization_plan, partition_expert_realization_plan,
     replicated_expert_realization_plan, RoutedMlp,

@@ -15,13 +15,12 @@ use eredu_core::{
 use eredu_nn::{Index, LinearOperator, NeuralBackend, Parameterized, Tensor};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureParameters,
-    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout, LayeredArchitecture,
-    LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
-    MemberSharding, OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParameterGroupOwner,
-    ParameterRole, RuntimeState, StateError, StateLayout, StaticParameterVisitor,
-    StaticParameterVisitorMut, SubmissionBackend,
+    ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, ComponentAdapter, ComponentDefinition, ComponentEquations,
+    ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
+    ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
+    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
+    ParameterGroupOwner, ParameterRole, RuntimeState, StateError, StateLayout, SubmissionBackend,
 };
 use std::{marker::PhantomData, num::NonZeroU32};
 
@@ -32,9 +31,9 @@ pub use partition::{
     PerceptionBoundarySchema,
 };
 
-const SUBSAMPLING: &str = "voicechat.perception.subsampling";
-const ENCODER: &str = "voicechat.perception.encoder";
-const PROJECTION: &str = "voicechat.perception.projection";
+pub(super) const SUBSAMPLING: &str = "voicechat.perception.subsampling";
+pub(super) const ENCODER: &str = "voicechat.perception.encoder";
+pub(super) const PROJECTION: &str = "voicechat.perception.projection";
 
 pub(super) fn backend(error: impl std::error::Error + Send + Sync + 'static) -> PerceptionError {
     PerceptionError::Backend(BackendFailure::from_error(error))
@@ -66,33 +65,15 @@ pub trait PerceptionExecution<B: NeuralBackend> {
     ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError>;
 }
 
-/// Perception keeps every learned parameter in a bounded execution unit.
-#[derive(Debug, Default)]
-pub struct PerceptionStaticModules;
-impl<T: 'static> Parameterized<T> for PerceptionStaticModules {
-    fn visit_parameters<'a, V>(&'a self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitor<'a, T>,
-    {
-    }
-    fn visit_parameters_mut<'a, V>(&'a mut self, _: &mut V)
-    where
-        V: eredu_nn::ParameterVisitorMut<'a, T>,
-    {
-    }
-    fn set_trainable(&mut self, _: bool) {}
-}
-
 /// Architecture-owned graph and cold unit construction, with no pinned learned modules.
-pub struct PerceptionArchitecture<B: NeuralBackend> {
+pub struct PerceptionKernel<B: NeuralBackend> {
     precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
     local_blocks: Option<Vec<ConformerLocalDimensions>>,
     partition: Option<partition::PerceptionOwnership>,
-    empty: PerceptionStaticModules,
     backend: PhantomData<fn() -> B>,
 }
-impl<B: NeuralBackend> PerceptionArchitecture<B> {
+impl<B: NeuralBackend> PerceptionKernel<B> {
     /// Selects storage/arithmetic policy for all independently constructed units.
     pub fn with_precision(
         mut self,
@@ -114,7 +95,6 @@ impl<B: NeuralBackend> PerceptionArchitecture<B> {
             dimensions,
             local_blocks: None,
             partition: None,
-            empty: PerceptionStaticModules,
             backend: PhantomData,
         })
     }
@@ -128,6 +108,15 @@ impl<B: NeuralBackend> PerceptionArchitecture<B> {
         architecture.local_blocks = Some(local_blocks);
         Ok(architecture)
     }
+    /// Retains the validated declaration alongside the family equations.
+    pub fn into_component(
+        self,
+    ) -> Result<ComponentAdapter<ComponentDefinition, Self>, PerceptionError> {
+        Ok(ComponentAdapter::new(
+            perception_component_definition(self.dimensions)?,
+            self,
+        )?)
+    }
     /// Whether execution requires the selected tensor collective.
     pub fn is_parallel(&self) -> bool {
         self.local_blocks.is_some()
@@ -136,23 +125,58 @@ impl<B: NeuralBackend> PerceptionArchitecture<B> {
     pub fn dimensions(&self) -> PerceptionDimensions {
         self.dimensions
     }
-    fn count(&self, group: usize) -> Result<usize, PerceptionError> {
-        match group {
-            0 | 2 => Ok(1),
-            1 => Ok(self.dimensions.layers),
-            _ => Err(PerceptionError::Configuration(
-                "unknown perception execution group",
-            )),
-        }
-    }
-    fn validate_unit(&self, group: usize, index: usize) -> Result<(), PerceptionError> {
-        if index >= self.count(group)? {
-            return Err(PerceptionError::Configuration(
-                "perception unit index exceeds group",
-            ));
-        }
-        Ok(())
-    }
+}
+
+/// Canonical perception operations, independent parameter leases and Conformer cache slots.
+pub fn perception_component_definition(
+    dimensions: PerceptionDimensions,
+) -> Result<ComponentDefinition, PerceptionError> {
+    let parameters = perception_parameter_description(dimensions)?;
+    let units = (0..parameters.unit_layout().len())
+        .map(|ordinal| {
+            let address = parameters
+                .unit_layout()
+                .address(ordinal)
+                .expect("canonical unit");
+            let (path, state) = match address.group() {
+                0 => ("stt_model.perception.encoder.pre_encode".into(), 0..0),
+                1 => (
+                    format!("stt_model.perception.encoder.layers.{}", address.index()),
+                    address.index()..address.index() + 1,
+                ),
+                _ => ("stt_model.perception.proj".into(), 0..0),
+            };
+            ComponentUnit { path, state }
+        })
+        .collect();
+    let transport = (0..3)
+        .map(|group| ArchitectureGroupTransport {
+            placement: ArchitectureGroupPlacement::Pipeline,
+            kind: if group == 2 {
+                ArchitectureGroupKind::Projector
+            } else {
+                ArchitectureGroupKind::AudioEncoder
+            },
+            first_owner_static_roles: vec![],
+            last_owner_static_roles: vec![],
+            merge_destination: ArchitectureMergeDestination::LastOwner,
+            parallel_subgroup: None,
+            request_optional: false,
+        })
+        .collect();
+    Ok(ComponentDefinition::new(
+        "voicechat.perception",
+        parameters,
+        units,
+        transport,
+        ENCODER,
+        vec![],
+        perception_state_layout(dimensions)?,
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+            1,
+            0..dimensions.layers,
+        )]),
+    )?)
 }
 
 /// Unpublished runtime caches and their exact architecture layout.
@@ -343,11 +367,9 @@ pub fn perception_parameter_description(
     dimensions.subsampling.validate()?;
     let graph = perception_graph()?;
     let layout = ExecutionUnitLayout::new(&graph, [1, dimensions.layers, 1])?;
-    let mut expected = Vec::new();
     let mut owned = Vec::new();
     let mut add =
         |group: usize, index: usize, spec: ParameterGroupSpec| -> Result<(), PerceptionError> {
-            expected.push(spec.clone());
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(
                     layout.group_id(group).expect("declared group").clone(),
@@ -505,8 +527,8 @@ pub fn perception_parameter_description(
             ],
         )?,
     )?;
-    Ok(ArchitectureParameterDescription::new(
-        &graph, &layout, expected, owned,
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
     )?)
 }
 
@@ -568,17 +590,21 @@ fn perception_graph() -> Result<ExecutionGraph, PerceptionError> {
     .map_err(PerceptionError::from)
 }
 
-impl<B: NeuralBackend> ArchitectureParameters<B> for PerceptionArchitecture<B> {
-    type DefinitionError = PerceptionError;
-    fn state_layout(&self) -> Result<StateLayout, PerceptionError> {
-        perception_state_layout(self.dimensions)
-    }
+impl<B: NeuralBackend> ComponentKernel<B> for PerceptionKernel<B> {
+    type Input<'a> = PerceptionInput<'a, B::Tensor>;
+    type Unit = PerceptionUnit<B>;
+    type ForwardContext = PerceptionForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::option::Iter<'a, B::Tensor>
+    where
+        B::Tensor: 'a;
+    type Error = PerceptionError;
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, PerceptionError> {
-        let global = self.state_layout()?;
+        let global = perception_state_layout(self.dimensions)?;
         let begin = state.global_layer_offset();
         let end = begin
             .checked_add(state.layout().len())
@@ -602,90 +628,13 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for PerceptionArchitecture<B> {
         )
         .map_err(PerceptionError::from)
     }
-    fn parameter_description(
-        &self,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, PerceptionError> {
-        perception_parameter_description(self.dimensions)
-    }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        _: &mut V,
-    ) -> Result<(), V::Error> {
-        Ok(())
-    }
-}
-
-impl<B: NeuralBackend> LayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
-    for PerceptionArchitecture<B>
-{
-    type Input<'a> = PerceptionInput<'a, B::Tensor>;
-    type StaticModules = PerceptionStaticModules;
-    type Unit = PerceptionUnit<B>;
-    type ForwardContext = PerceptionForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = PerceptionError;
-    fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
-        ArchitectureGroupTransport {
-            placement: ArchitectureGroupPlacement::Pipeline,
-            kind: if group == 2 {
-                ArchitectureGroupKind::Projector
-            } else {
-                ArchitectureGroupKind::AudioEncoder
-            },
-            first_owner_static_roles: vec![],
-            last_owner_static_roles: vec![],
-            merge_destination: ArchitectureMergeDestination::LastOwner,
-            parallel_subgroup: None,
-            request_optional: false,
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        ENCODER
-    }
-    fn state_partition_plan(&self, _: &StateLayout) -> ArchitectureStatePartitionPlan {
-        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
-            1,
-            0..self.dimensions.layers,
-        )])
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, PerceptionError> {
-        perception_graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, PerceptionError> {
-        self.count(group)
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, PerceptionError> {
-        self.validate_unit(group, index)?;
-        Ok(match group {
-            0 => "stt_model.perception.encoder.pre_encode".into(),
-            1 => format!("stt_model.perception.encoder.layers.{index}"),
-            _ => "stt_model.perception.proj".into(),
-        })
-    }
-    fn static_modules(&self) -> &PerceptionStaticModules {
-        &self.empty
-    }
-    fn static_modules_mut(&mut self) -> &mut PerceptionStaticModules {
-        &mut self.empty
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PerceptionUnit<B>, PerceptionError> {
-        self.validate_unit(group, index)?;
-        self.require_owned(group, index)?;
+        let group = address.group();
+        let index = address.index();
         Ok(match group {
             0 => PerceptionUnit::Subsampling(
                 CausalSubsampling::new(self.dimensions.subsampling, context)?
@@ -710,7 +659,23 @@ impl<B: NeuralBackend> LayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
             }
         })
     }
-    fn begin_forward<'a>(
+
+    fn executes_group(&self, _: usize, _: &Self::ForwardContext) -> bool {
+        true
+    }
+
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        forward.encoder.iter()
+    }
+}
+impl<B: NeuralBackend> ComponentEquations<B, PerceptionRuntimeState<B::Tensor>>
+    for PerceptionKernel<B>
+{
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut PerceptionRuntimeState<B::Tensor>,
@@ -721,9 +686,9 @@ impl<B: NeuralBackend> LayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
                 "rank-local perception requires parallel execution",
             ));
         }
-        self.begin(input, state, context)
+        self.begin_input(input, state, context)
     }
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
@@ -732,54 +697,33 @@ impl<B: NeuralBackend> LayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
         forward: &mut Self::ForwardContext,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, PerceptionError> {
-        self.count(group)?;
-        let hidden = match (group, dependencies) {
-            (0, []) => initial,
-            (_, [one]) if group != 0 => *one,
-            _ => {
-                return Err(PerceptionError::State(
-                    "perception group dependency mismatch",
-                ))
-            }
-        };
+        let hidden = dependencies.first().copied().unwrap_or(initial);
         if group == 2 {
             forward.encoder = Some(hidden.clone());
         }
         Ok(hidden.clone())
     }
-    fn retained_state_ordinals(
-        &self,
-        group: usize,
-        index: usize,
-        _: usize,
-    ) -> std::ops::Range<usize> {
-        if group == 1 {
-            let local = index.saturating_sub(self.partition.as_ref().map_or(0, |p| p.blocks.start));
-            local..local + 1
-        } else {
-            0..0
-        }
-    }
-    fn state_ordinal(&self, group: usize, index: usize, _: usize) -> usize {
-        if group == 1 {
-            index.saturating_sub(self.partition.as_ref().map_or(0, |p| p.blocks.start))
-        } else {
-            0
-        }
-    }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut PerceptionUnit<B>,
         hidden: &B::Tensor,
         state: &mut PerceptionRuntimeState<B::Tensor>,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, PerceptionError> {
-        self.execute_unit(group, index, unit, hidden, state, forward, None, context)
+        self.execute_unit(
+            address.group(),
+            address.index(),
+            unit,
+            hidden,
+            state,
+            forward,
+            None,
+            context,
+        )
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         state: &mut PerceptionRuntimeState<B::Tensor>,
@@ -792,24 +736,16 @@ impl<B: NeuralBackend> LayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
         ))?;
         Ok(hidden.clone())
     }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _: usize,
-        _: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        forward.encoder.iter()
-    }
 }
 
-impl<B: NeuralBackend> PerceptionArchitecture<B> {
-    fn begin<'a>(
+impl<B: NeuralBackend> PerceptionKernel<B> {
+    fn begin_input<'a>(
         &mut self,
         input: PerceptionInput<'a, B::Tensor>,
         state: &mut PerceptionRuntimeState<B::Tensor>,
         _: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, PerceptionForward<B::Tensor>>, PerceptionError> {
-        if state.layout != self.state_layout()? {
+        if state.layout != perception_state_layout(self.dimensions)? {
             return Err(PerceptionError::State(
                 "perception runtime layout differs from selected geometry",
             ));
@@ -836,8 +772,6 @@ impl<B: NeuralBackend> PerceptionArchitecture<B> {
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, PerceptionError> {
-        self.validate_unit(group, index)?;
-        self.require_owned(group, index)?;
         match (group, unit) {
             (0, PerceptionUnit::Subsampling(module)) => {
                 let encoded = module.forward(hidden, context)?;
@@ -897,10 +831,13 @@ impl<B: NeuralBackend> PerceptionArchitecture<B> {
     }
 }
 
-impl<B: NeuralBackend> ParallelLayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
-    for PerceptionArchitecture<B>
+impl<B: NeuralBackend>
+    ParallelComponentKernel<
+        B,
+        crate::voicechat::perception_layered::PerceptionRuntimeState<B::Tensor>,
+    > for PerceptionKernel<B>
 {
-    fn begin_forward_parallel<'a>(
+    fn begin_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut PerceptionRuntimeState<B::Tensor>,
@@ -921,12 +858,11 @@ impl<B: NeuralBackend> ParallelLayeredArchitecture<B, PerceptionRuntimeState<B::
                 "perception tensor degree differs from the selected communicator",
             ));
         }
-        self.begin(input, state, context)
+        self.begin_input(input, state, context)
     }
-    fn forward_unit_parallel(
+    fn execute_parallel(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut PerceptionRuntimeState<B::Tensor>,
@@ -935,8 +871,8 @@ impl<B: NeuralBackend> ParallelLayeredArchitecture<B, PerceptionRuntimeState<B::
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, PerceptionError> {
         self.execute_unit(
-            group,
-            index,
+            address.group(),
+            address.index(),
             unit,
             hidden,
             state,
@@ -944,16 +880,6 @@ impl<B: NeuralBackend> ParallelLayeredArchitecture<B, PerceptionRuntimeState<B::
             Some(parallel),
             context,
         )
-    }
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut PerceptionRuntimeState<B::Tensor>,
-        forward: &Self::ForwardContext,
-        _: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, PerceptionError> {
-        self.finish_forward(hidden, state, forward, context)
     }
 }
 
@@ -974,48 +900,20 @@ where
     })
 }
 
-/// Ordinary shared layerwise runtime, with the same perception equations and state.
-pub struct LayerwisePerception<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, PerceptionUnit<B>>,
-{
-    runtime: LayerwiseRuntime<PerceptionArchitecture<B>, B, PerceptionRuntimeState<B::Tensor>, P>,
-}
-impl<B, P> LayerwisePerception<B, P>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    P: LayerwisePolicy<B, PerceptionUnit<B>>,
-    P::Error: std::fmt::Display,
-{
-    /// Adopts the existing provider without constructing resident replacement units.
-    pub fn new(architecture: PerceptionArchitecture<B>, policy: P) -> Self {
-        Self {
-            runtime: LayerwiseRuntime::new(architecture, policy),
-        }
-    }
-    /// Shared runtime for parameter operations and diagnostics.
-    pub fn runtime(
-        &self,
-    ) -> &LayerwiseRuntime<PerceptionArchitecture<B>, B, PerceptionRuntimeState<B::Tensor>, P> {
-        &self.runtime
-    }
-    /// Shared runtime for bounded parameter operations.
-    pub fn runtime_mut(
-        &mut self,
-    ) -> &mut LayerwiseRuntime<PerceptionArchitecture<B>, B, PerceptionRuntimeState<B::Tensor>, P>
-    {
-        &mut self.runtime
-    }
-}
-impl<B, P> PerceptionExecution<B> for LayerwisePerception<B, P>
+impl<B, P> PerceptionExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
+        B,
+        PerceptionRuntimeState<B::Tensor>,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, PerceptionUnit<B>>,
     P::Error: std::error::Error + Send + Sync + 'static,
 {
     fn dimensions(&self) -> PerceptionDimensions {
-        self.runtime.architecture().dimensions()
+        self.architecture().kernel().dimensions()
     }
     fn forward(
         &mut self,
@@ -1026,7 +924,6 @@ where
     ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError> {
         let mut state = PerceptionRuntimeState::from_state(self.dimensions(), previous)?;
         let (projected, forward) = self
-            .runtime
             .invoke_with_context(
                 PerceptionInput {
                     mel,
@@ -1046,7 +943,27 @@ where
     }
 }
 
-impl<B, P> LayerwisePerception<B, P>
+/// Selected tensor-parallel perception with caller-owned complete-cache parents.
+/// The retained native mechanisms determine admitted rank-local construction.
+pub trait ParallelPerceptionExecution<B: NeuralBackend>: PerceptionExecution<B> {
+    /// Returns raw encoder features, language projections and unpublished candidate caches.
+    fn forward_parallel(
+        &mut self,
+        mel: &B::Tensor,
+        drop_preencoded: usize,
+        previous: &PerceptionState<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError>;
+}
+
+impl<B, P> ParallelPerceptionExecution<B>
+    for LayerwiseRuntime<
+        ComponentAdapter<ComponentDefinition, PerceptionKernel<B>>,
+        B,
+        PerceptionRuntimeState<B::Tensor>,
+        P,
+    >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     P: LayerwisePolicy<B, PerceptionUnit<B>>,
@@ -1054,7 +971,7 @@ where
 {
     /// Executes the selected tensor partition against a private complete-cache replica.
     /// Both raw encoder features and language projections use the same invocation.
-    pub fn forward_parallel(
+    fn forward_parallel(
         &mut self,
         mel: &B::Tensor,
         drop_preencoded: usize,
@@ -1064,7 +981,6 @@ where
     ) -> Result<PerceptionOutput<B::Tensor>, PerceptionError> {
         let mut state = PerceptionRuntimeState::from_state(self.dimensions(), previous)?;
         let (projected, forward) = self
-            .runtime
             .forward_parallel_with_context_hook(
                 PerceptionInput {
                     mel,

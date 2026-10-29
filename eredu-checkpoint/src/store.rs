@@ -605,6 +605,31 @@ pub struct PreparedCheckpointSource {
 }
 
 impl PreparedCheckpointSource {
+    /// Restricts a source and pins its current metadata and provenance for the
+    /// selected physical inputs. No tensor payload is acquired or buffered.
+    pub fn retain(
+        source: SharedCheckpointSource,
+        scope: impl Into<String>,
+        keys: BTreeSet<String>,
+    ) -> Result<Self, StoreError> {
+        let source: SharedCheckpointSource =
+            Arc::new(RestrictedCheckpointSource::including(source, scope, keys)?);
+        let catalog = source
+            .source_keys()
+            .into_iter()
+            .map(|key| {
+                Ok((
+                    key.clone(),
+                    PreparedTensorSource {
+                        metadata: source.source_metadata(&key)?,
+                        provenance: source.source_provenance(&key)?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
+        Self::new(source, catalog)
+    }
+
     /// Opens an exact admitted SafeTensors shard set and pins it to metadata
     /// retained by header-only preparation.
     ///
@@ -4273,16 +4298,10 @@ mod tests {
             )])
             .unwrap(),
         });
-        let provenance = source.source_provenance("weight").unwrap();
-        let source = PreparedCheckpointSource::new(
+        let source = PreparedCheckpointSource::retain(
             source,
-            BTreeMap::from([(
-                "weight".into(),
-                PreparedTensorSource {
-                    metadata: prepared,
-                    provenance,
-                },
-            )]),
+            "lease validation",
+            BTreeSet::from(["weight".into()]),
         )
         .unwrap();
 

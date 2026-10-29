@@ -1,8 +1,8 @@
 //! Portable lowering of shared-weight stacks to logical decoder invocations.
 //!
 //! Checkpoint recipes retain the single physical source of each repeated weight.
-//! Logical execution units have independent residency and state ownership, so
-//! ordinary decoder drivers handle pipeline cuts, tensor sharding and offloading.
+//! Logical invocations retain independent state while declared canonical owners
+//! determine residency, pipeline replicas and materialization.
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use eredu_core::{AttentionPolicy, LayerSchedule};
@@ -41,7 +41,7 @@ pub fn source_name(root: &str, physical_layers: usize, name: &str) -> String {
     name.to_owned()
 }
 
-/// Exact aliases for every invocation, including the normalization between passes.
+/// Exact recipes for canonical block owners, including normalization between passes.
 /// Self aliases keep shared originals in the executable catalog when another
 /// invocation consumes them through a recipe.
 pub fn recipes(
@@ -50,6 +50,7 @@ pub fn recipes(
     physical_layers: usize,
     repetitions: usize,
     normalize_between: bool,
+    parameter_owner: impl Fn(usize) -> usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
     physical_layers
         .checked_mul(repetitions)
@@ -72,8 +73,12 @@ pub fn recipes(
             return Err(format!("physical block {layer} exceeds {physical_layers}"));
         }
         for pass in 0..repetitions {
+            let invocation = pass * physical_layers + layer;
+            if parameter_owner(invocation) != invocation {
+                continue;
+            }
             result.insert(
-                format!("{prefix}{}.{suffix}", pass * physical_layers + layer),
+                format!("{prefix}{invocation}.{suffix}"),
                 DerivedWeightRecipe::source(&key, TensorSelection::Full),
             );
         }
@@ -85,8 +90,12 @@ pub fn recipes(
             DerivedWeightRecipe::source(&norm, TensorSelection::Full),
         );
         for pass in 1..repetitions {
+            let invocation = pass * physical_layers - 1;
+            if parameter_owner(invocation) != invocation {
+                continue;
+            }
             result.insert(
-                format!("{prefix}{}.output_norm.weight", pass * physical_layers - 1),
+                format!("{prefix}{invocation}.output_norm.weight"),
                 DerivedWeightRecipe::source(&norm, TensorSelection::Full),
             );
         }

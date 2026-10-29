@@ -1,12 +1,12 @@
 //! Shared graph traversal of retained vision blocks and the ordinary Flash-Next target.
 use super::{
     media::{MediaIngress, PreparedMediaInput},
-    target::{BoundTargetSpec, TargetForward, TargetInput, TargetModel, Unit as TargetUnit},
+    target::{BoundTargetSpec, TargetForward, TargetInput, TargetKernel, Unit as TargetUnit},
 };
 use crate::qwen::vision::{VisionBlock, VisionConfig, VisionState, VisionStatic};
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, EmbeddingOperator, Error, GroupedNeuralBackend,
-    Parameterized, Tensor,
+    Tensor,
 };
 use eredu_runtime::*;
 
@@ -18,7 +18,7 @@ pub mod prefill;
 const TARGET_INDEX: usize = 0;
 const VISION_INDEX: usize = 1;
 
-pub(crate) fn graph() -> Result<ExecutionGraph, Error> {
+fn graph() -> Result<ExecutionGraph, Error> {
     // Flat parameter-bank coordinates stay target-first. Dependency order is
     // independent of declaration order, so the encoder still executes first.
     ExecutionGraph::new(
@@ -33,7 +33,82 @@ pub(crate) fn graph() -> Result<ExecutionGraph, Error> {
     )
     .map_err(Error::backend)
 }
-pub(crate) fn vision_transport() -> ArchitectureGroupTransport {
+/// Composes retained target storage and vision geometry without native resources.
+pub fn parameter_description(
+    target: &ComponentDefinition,
+    vision: &VisionConfig,
+) -> Result<ArchitectureParameterDescription, Error> {
+    Ok(definition(target, vision)?.parameters().clone())
+}
+
+/// Validates target and optional vision invocations before native construction.
+pub fn definition(
+    target: &ComponentDefinition,
+    vision: &VisionConfig,
+) -> Result<ComponentDefinition, Error> {
+    let parameters = declare_parameters(target, vision)?;
+    let mut units = (0..target.unit_count(TARGET_INDEX)?)
+        .map(|index| {
+            target
+                .unit(TARGET_INDEX, index)
+                .cloned()
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    units.extend((0..vision.layer_count()).map(|index| ComponentUnit {
+        path: format!("model.visual.blocks.{index}"),
+        state: 0..0,
+    }));
+    ComponentDefinition::new(
+        "qwen4_exp_conditional",
+        parameters,
+        units,
+        vec![
+            target.group_transport(TARGET_INDEX)?.clone(),
+            vision_transport(),
+        ],
+        crate::decoder::TARGET_EXECUTION_GROUP,
+        vec![],
+        target.state_layout().clone(),
+        target.state_partition_plan().clone(),
+    )
+    .map_err(Error::from)
+}
+
+fn declare_parameters(
+    target: &ComponentDefinition,
+    vision: &VisionConfig,
+) -> Result<ArchitectureParameterDescription, Error> {
+    let graph = graph()?;
+    let layout = ExecutionUnitLayout::new(
+        &graph,
+        [target.unit_count(TARGET_INDEX)?, vision.layer_count()],
+    )
+    .map_err(Error::backend)?;
+    let mut groups = target.parameters().groups().to_vec();
+    for group in crate::qwen::vision::static_parallel_parameter_groups(vision, "model.visual")
+        .map_err(Error::backend)?
+    {
+        groups.push(OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_role("vision"),
+            group,
+        ));
+    }
+    for index in 0..vision.layer_count() {
+        for group in
+            crate::qwen::vision::block_parallel_parameter_groups(vision, "model.visual", index)
+                .map_err(Error::backend)?
+        {
+            groups.push(OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(layout.group_id(1).unwrap().clone(), index),
+                group,
+            ));
+        }
+    }
+    ArchitectureParameterDescription::from_owned(&graph, &layout, groups).map_err(Error::backend)
+}
+
+fn vision_transport() -> ArchitectureGroupTransport {
     ArchitectureGroupTransport {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::VisionEncoder,
@@ -45,9 +120,31 @@ pub(crate) fn vision_transport() -> ArchitectureGroupTransport {
     }
 }
 
+pub(crate) fn validate_ingress(
+    spec: &super::target::TargetSpec,
+    ingress: &MediaIngress,
+    vision: &VisionConfig,
+) -> Result<(), Error> {
+    // Formats may change at selection; semantic geometry must match the retained role.
+    let mut expected = ingress.vision().config().clone();
+    let mut actual = vision.clone();
+    expected.linear_formats.clear();
+    actual.linear_formats.clear();
+    if expected != actual || vision.out_hidden_size != spec.configuration().hidden_size {
+        return Err(Error::backend(
+            "conditional vision geometry differs from retained ingress",
+        ));
+    }
+    super::media::MediaIngress::new(spec, ingress.vision().clone())
+        .map_err(Error::backend_source)?;
+    Ok(())
+}
+
 /// Pinned modules. The target owns the single vocabulary and residual readout.
+#[derive(eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct ConditionalStatic<B: GroupedNeuralBackend + DistributedNeuralBackend> {
-    target: TargetModel<B>,
+    target: TargetKernel<B>,
     vision: VisionStatic<B>,
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend + Clone> Clone for ConditionalStatic<B> {
@@ -56,37 +153,6 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend + Clone> Clone for Condi
             target: self.target.clone(),
             vision: self.vision.clone(),
         }
-    }
-}
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Parameterized<B::Tensor>
-    for ConditionalStatic<B>
-{
-    fn visit_parameters<'a, V: eredu_nn::ParameterVisitor<'a, B::Tensor>>(
-        &'a self,
-        visitor: &mut V,
-    ) {
-        self.target
-            .decoder
-            .static_modules()
-            .visit_parameters(visitor);
-        self.vision.visit_parameters(visitor);
-    }
-    fn visit_parameters_mut<'a, V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>>(
-        &'a mut self,
-        visitor: &mut V,
-    ) {
-        self.target
-            .decoder
-            .static_modules_mut()
-            .visit_parameters_mut(visitor);
-        self.vision.visit_parameters_mut(visitor);
-    }
-    fn set_trainable(&mut self, trainable: bool) {
-        self.target
-            .decoder
-            .static_modules_mut()
-            .set_trainable(trainable);
-        self.vision.set_trainable(trainable);
     }
 }
 /// One independently materialized encoder block or target execution unit.
@@ -100,6 +166,14 @@ pub enum ConditionalUnit<B: GroupedNeuralBackend + DistributedNeuralBackend> {
 }
 /// One ordinary target pass, or an initial admitted media prompt.
 pub enum ConditionalInput<'a, T> {
+    /// Admitted prepared input using the same target/media equations.
+    Prepared(
+        crate::composite_execution::PreparedCompositeInput<
+            'a,
+            T,
+            super::media::MediaInputPartPlan<T>,
+        >,
+    ),
     /// Text decode or already assembled bounded target input.
     Target(TargetInput<'a, T>),
     /// Prepared media context; the shared graph runs only required encoder blocks.
@@ -165,17 +239,42 @@ impl<T: Tensor> ConditionalForward<T> {
             )
     }
 }
-/// Portable composition; parameter residency and submission remain shared mechanisms.
-pub struct ConditionalModel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
+/// Conditional execution through the shared validated component adapter.
+pub type ConditionalModel<B> = ComponentAdapter<
+    std::sync::Arc<ComponentDefinition>,
+    ConditionalKernel<B>,
+    KernelParameterModules,
+>;
+
+/// Family media assembly and target/vision equations under the shared lifecycle.
+pub struct ConditionalKernel<B: GroupedNeuralBackend + DistributedNeuralBackend> {
     modules: ConditionalStatic<B>,
     ingress: MediaIngress,
     vision: VisionConfig,
     vision_local: Option<Vec<(i32, i32)>>,
     vision_input_owner: bool,
     partition_state: Option<PartitionState>,
-    global_parameters: Option<ArchitectureParameterDescription>,
+    definition: std::sync::Arc<ComponentDefinition>,
 }
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
+    /// Assembles the complete shared runtime adapter from finalized geometry.
+    pub fn into_model(self) -> Result<ConditionalModel<B>, Error> {
+        ComponentAdapter::with_pinned_resources::<B>(self.definition.clone(), self)
+            .map_err(Error::from)
+    }
+    /// Retains selected ownership and exact native pinned resources on that same adapter.
+    pub fn into_partition_model<G, A>(
+        self,
+        partition: &ArchitecturePartition<G, A>,
+    ) -> Result<ConditionalModel<B>, Error> {
+        let kernel = self.select_partition_resources(partition)?;
+        ComponentAdapter::with_partition_resources::<B, G, A>(
+            kernel.definition.clone(),
+            kernel,
+            partition,
+        )
+        .map_err(Error::from)
+    }
     /// Constructs pinned modules only; encoder and target units are built on demand.
     pub fn new(
         spec: BoundTargetSpec,
@@ -183,21 +282,11 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
         vision: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        // Formats may change at selection; semantic geometry must match the retained role.
-        let mut expected = ingress.vision().config().clone();
-        let mut actual = vision.clone();
-        expected.linear_formats.clear();
-        actual.linear_formats.clear();
-        if expected != actual || vision.out_hidden_size != spec.geometry().config.hidden_size {
-            return Err(Error::backend(
-                "conditional vision geometry differs from retained ingress",
-            ));
-        }
-        super::media::MediaIngress::new(spec.geometry(), ingress.vision().clone())
-            .map_err(Error::backend_source)?;
+        validate_ingress(spec.geometry(), &ingress, &vision)?;
+        let definition = std::sync::Arc::new(definition(&spec.geometry().definition()?, &vision)?);
         Ok(Self {
             modules: ConditionalStatic {
-                target: TargetModel::new(spec, context)?,
+                target: TargetKernel::new(spec, context)?,
                 vision: VisionStatic::new_with_root(vision.clone(), "model.visual", context)?,
             },
             ingress,
@@ -205,7 +294,7 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
             vision_local: None,
             vision_input_owner: true,
             partition_state: None,
-            global_parameters: None,
+            definition,
         })
     }
     fn begin_media<S>(
@@ -342,16 +431,15 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
                 |ids| {
                     self.modules
                         .target
-                        .decoder
-                        .static_modules_mut()
-                        .embeddings
+                        .statics
+                        .embedding_mut()?
                         .forward(ids, context)
                 },
                 context,
             )
             .map_err(Error::backend_source)?;
-        let next = media
-            .with_target_input(|input| self.modules.target.begin_forward(input, state, context))?;
+        let next =
+            media.with_target_input(|input| self.modules.target.begin(input, state, context))?;
         Ok(LayeredForwardState {
             hidden: next.hidden,
             context: ConditionalForward {
@@ -383,27 +471,82 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalModel<B> {
     pub fn ingress(&self) -> &MediaIngress {
         &self.ingress
     }
-    fn unit_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self.modules.target.spec.units.len()),
-            1 => Ok(self.vision.layer_count()),
-            _ => Err(Error::backend("conditional execution group out of bounds")),
-        }
+    pub(crate) fn target_boundary_schema(
+        &self,
+    ) -> Result<super::input::RequestBoundarySchema, Error> {
+        self.modules.target.spec.boundary_schema()
     }
-    fn check_unit(&self, group: usize, index: usize) -> Result<(), Error> {
-        if index >= self.unit_count(group)? {
-            return Err(Error::backend("conditional unit out of bounds"));
+    /// Retained target/vision invocation, parameter, state and transport authority.
+    pub fn definition(&self) -> &ComponentDefinition {
+        &self.definition
+    }
+}
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ComponentPinnedResources<B>
+    for ConditionalKernel<B>
+{
+    type Modules = ConditionalStatic<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.modules
+    }
+    fn visit_pinned<V: StaticParameterVisitor<B>>(&self, visitor: &mut V) -> Result<(), V::Error> {
+        self.modules.target.visit_pinned(visitor)?;
+        if self.modules.vision.has_parameters() {
+            visitor.visit("vision", &self.modules.vision)?;
+        }
+        Ok(())
+    }
+    fn visit_pinned_mut<V: StaticParameterVisitorMut<B>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
+        self.modules.target.visit_pinned_mut(visitor)?;
+        if self.modules.vision.has_parameters() {
+            visitor.visit_mut("vision", &mut self.modules.vision)?;
         }
         Ok(())
     }
 }
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<B>
-    for ConditionalModel<B>
+
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend>
+    crate::prediction_extension::Qwen4PredictionTarget<B> for ConditionalKernel<B>
 {
-    type DefinitionError = Error;
-    fn state_layout(&self) -> Result<StateLayout, Error> {
-        self.modules.target.state_layout()
+    fn prediction_embedding(
+        &mut self,
+        tokens: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.modules.target.prediction_embedding(tokens, context)
     }
+    fn prediction_logits(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.modules
+            .target
+            .prediction_logits(hidden, context, instrumentation)
+    }
+}
+
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ComponentKernel<B>
+    for ConditionalKernel<B>
+{
+    type Input<'a>
+        = ConditionalInput<'a, B::Tensor>
+    where
+        Self: 'a;
+    type Unit = ConditionalUnit<B>;
+    type ForwardContext = ConditionalForward<B::Tensor>;
+    type RetainedContextValues<'a>
+        = std::vec::IntoIter<&'a B::Tensor>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
+    type Error = Error;
     fn state_identity(
         &self,
         state: &PartitionState,
@@ -423,59 +566,6 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         )
         .map_err(Error::backend)
     }
-    fn parameter_description(
-        &self,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ArchitectureParameterDescription, Error> {
-        if let Some(parameters) = &self.global_parameters {
-            return Ok(parameters.clone());
-        }
-        let graph = graph()?;
-        let layout = ExecutionUnitLayout::new(&graph, [self.unit_count(0)?, self.unit_count(1)?])
-            .map_err(Error::backend)?;
-        let mut groups = self
-            .modules
-            .target
-            .parameter_description(context)?
-            .groups()
-            .to_vec();
-        for group in crate::qwen::vision::static_parallel_parameter_groups(
-            &self.modules.vision,
-            &self.vision,
-            "model.visual",
-        )
-        .map_err(Error::backend)?
-        {
-            groups.push(OwnedParameterGroupSpec::new(
-                ParameterGroupOwner::static_role("vision"),
-                group,
-            ));
-        }
-        for index in 0..self.vision.layer_count() {
-            let module =
-                VisionBlock::<B>::new_with_root(&self.vision, "model.visual", index, context)?;
-            for group in crate::qwen::vision::block_parallel_parameter_groups(
-                &module,
-                &self.vision,
-                "model.visual",
-                index,
-            )
-            .map_err(Error::backend)?
-            {
-                groups.push(OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(layout.group_id(1).unwrap().clone(), index),
-                    group,
-                ));
-            }
-        }
-        ArchitectureParameterDescription::new(
-            &graph,
-            &layout,
-            groups.iter().map(|g| g.group().clone()),
-            groups.clone(),
-        )
-        .map_err(Error::backend)
-    }
     fn static_parameter_recipes(
         &self,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -487,144 +577,13 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ArchitectureParameters<
         recipes.extend(self.ingress.vision().static_parameters().recipes().clone());
         Ok(recipes)
     }
-    fn visit_static_parameters<V: StaticParameterVisitor<B>>(
-        &self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        self.modules.target.visit_static_parameters(visitor)?;
-        visitor.visit("vision", &self.modules.vision)
-    }
-    fn visit_static_parameters_mut<V: StaticParameterVisitorMut<B>>(
-        &mut self,
-        visitor: &mut V,
-    ) -> Result<(), V::Error> {
-        self.modules.target.visit_static_parameters_mut(visitor)?;
-        visitor.visit_mut("vision", &mut self.modules.vision)
-    }
-}
-impl<B, S> LayeredArchitecture<B, S> for ConditionalModel<B>
-where
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
-{
-    type StaticModules = ConditionalStatic<B>;
-    type Unit = ConditionalUnit<B>;
-    type Input<'a>
-        = ConditionalInput<'a, B::Tensor>
-    where
-        B::Tensor: 'a;
-    type ForwardContext = ConditionalForward<B::Tensor>;
-    type RetainedContextValues<'a>
-        = std::vec::IntoIter<&'a B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
-            .with_routed_units(true)
-    }
-    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
-        self.unit_count(group)?;
-        Ok((group == TARGET_INDEX)
-            .then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.into()))
-    }
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.forward_unit_observed_with_provider(
-            group,
-            index,
-            unit,
-            hidden,
-            state,
-            forward,
-            ExpertPass::Prefill,
-            &mut ResidentExpertProvider,
-            context,
-            observer,
-        )
-    }
-    fn finish_forward_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.modules.target.finish_forward_observed(
-            hidden,
-            state,
-            forward
-                .target
-                .as_ref()
-                .ok_or_else(|| Error::backend("missing target context"))?,
-            context,
-            observer,
-        )
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        graph()
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        self.unit_count(group)
-    }
-    fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
-        if group == VISION_INDEX {
-            vision_transport()
-        } else {
-            crate::transport::decoder()
-        }
-    }
-    fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
-    }
-    fn state_partition_plan(&self, layout: &StateLayout) -> ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_state(TARGET_INDEX, layout)
-    }
-    fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
-        if group == TARGET_INDEX {
-            index
-        } else {
-            0
-        }
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        self.check_unit(group, index)?;
-        Ok(if group == VISION_INDEX {
-            format!("model.visual.blocks.{index}")
-        } else {
-            self.modules.target.spec.units[index].path()
-        })
-    }
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.modules
-    }
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.modules
-    }
     fn build_unit(
         &self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Error> {
-        self.check_unit(group, index)?;
+        let group = address.group();
+        let index = address.index();
         if group == VISION_INDEX {
             let (heads, intermediate) = self
                 .vision_local
@@ -647,7 +606,98 @@ where
             ))
         }
     }
-    fn begin_forward<'a>(
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        group == TARGET_INDEX || (group == VISION_INDEX && forward.vision.is_some())
+    }
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward
+            .target
+            .as_ref()
+            .and_then(<TargetKernel<B> as ComponentKernel<B>>::prediction_target_capture)
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        let mut values = vec![];
+        values.extend(forward.encoder_storage_values().map(|(_, value)| value));
+        if let Some(target) = &forward.target {
+            values.extend(<TargetKernel<B> as ComponentKernel<B>>::retained_values(
+                &self.modules.target,
+                target,
+                self.modules
+                    .target
+                    .definition()
+                    .unit_address(0, 0)
+                    .expect("target invocation"),
+            ));
+        }
+        values.into_iter()
+    }
+}
+impl<B, S> ComponentEquations<B, S> for ConditionalKernel<B>
+where
+    B: GroupedNeuralBackend + DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
+{
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
+        Ok((group == TARGET_INDEX)
+            .then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.into()))
+    }
+    fn execute_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.execute_routed_observed(
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            ExpertPass::Prefill,
+            &mut ResidentExpertProvider,
+            context,
+            observer,
+        )
+    }
+    fn finish_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.modules.target.finish_observed(
+            hidden,
+            state,
+            forward
+                .target
+                .as_ref()
+                .ok_or_else(|| Error::backend("missing target context"))?,
+            context,
+            observer,
+        )
+    }
+    fn begin<'a>(
         &mut self,
         input: Self::Input<'a>,
         state: &mut S,
@@ -663,6 +713,7 @@ where
             incoming_target: None,
         };
         match input {
+            ConditionalInput::Prepared(input) => self.begin_prepared(input, state, context),
             ConditionalInput::Target(input) => {
                 if let Some(partition) = self
                     .partition_state
@@ -716,7 +767,7 @@ where
                         },
                     });
                 }
-                let next = self.modules.target.begin_forward(input, state, context)?;
+                let next = self.modules.target.begin(input, state, context)?;
                 Ok(LayeredForwardState {
                     hidden: next.hidden,
                     context: empty(next.context),
@@ -732,11 +783,7 @@ where
             } => self.begin_media(prepared, range, projected, state, context),
         }
     }
-
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        group == TARGET_INDEX || (group == VISION_INDEX && forward.vision.is_some())
-    }
-    fn begin_execution_group(
+    fn begin_group(
         &mut self,
         group: usize,
         initial: &B::Tensor,
@@ -760,35 +807,31 @@ where
                     |ids| {
                         self.modules
                             .target
-                            .decoder
-                            .static_modules_mut()
-                            .embeddings
+                            .statics
+                            .embedding_mut()?
                             .forward(ids, context)
                     },
                     context,
                 )
                 .map_err(Error::backend_source)?;
-            let next = input.with_target_input(|input| {
-                self.modules.target.begin_forward(input, state, context)
-            })?;
+            let next = input
+                .with_target_input(|input| self.modules.target.begin(input, state, context))?;
             forward.target = Some(next.context);
             return Ok(next.hidden);
         }
         Ok(initial.clone())
     }
-    fn forward_unit(
+    fn execute(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_unit_with_provider(
-            group,
-            index,
+        self.execute_routed(
+            address,
             unit,
             hidden,
             state,
@@ -798,7 +841,7 @@ where
             context,
         )
     }
-    fn complete_execution_group(
+    fn complete_group(
         &mut self,
         group: usize,
         hidden: &B::Tensor,
@@ -814,7 +857,7 @@ where
             forward.projected = Some(output.embeddings.clone());
             Ok(output.embeddings)
         } else {
-            self.modules.target.complete_execution_group(
+            self.modules.target.complete_group(
                 0,
                 hidden,
                 state,
@@ -826,14 +869,14 @@ where
             )
         }
     }
-    fn finish_forward(
+    fn finish(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.modules.target.finish_forward(
+        self.modules.target.finish(
             hidden,
             state,
             forward
@@ -846,14 +889,14 @@ where
     fn projects_final_text_position() -> bool {
         true
     }
-    fn finish_text_forward(
+    fn finish_text(
         &mut self,
         hidden: &B::Tensor,
         state: &mut S,
         forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.modules.target.finish_text_forward(
+        self.modules.target.finish_text(
             hidden,
             state,
             forward
@@ -863,34 +906,8 @@ where
             context,
         )
     }
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        forward
-            .target
-            .as_ref()
-            .and_then(<TargetModel<B> as LayeredArchitecture<B, S>>::prediction_target_capture)
-    }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        let mut values = vec![];
-        values.extend(forward.encoder_storage_values().map(|(_, value)| value));
-        if let Some(target) = &forward.target {
-            values.extend(
-                <TargetModel<B> as LayeredArchitecture<B, S>>::retained_context_values(
-                    &self.modules.target,
-                    target,
-                    0,
-                    0,
-                ),
-            );
-        }
-        values.into_iter()
-    }
 }
-impl<B, S> RoutedLayeredArchitecture<B, S> for ConditionalModel<B>
+impl<B, S> RoutedComponentKernel<B, S> for ConditionalKernel<B>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -902,10 +919,9 @@ where
     fn routed_sparse_observations(&self) -> bool {
         true
     }
-    fn forward_unit_observed_with_provider<P, O>(
+    fn execute_routed_observed<P, O>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -920,7 +936,8 @@ where
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.check_unit(group, index)?;
+        let group = address.group();
+        let index = address.index();
         match (group, unit) {
             (VISION_INDEX, ConditionalUnit::Vision(block)) => self.modules.vision.forward_block(
                 block,
@@ -933,9 +950,8 @@ where
                 context,
             ),
             (TARGET_INDEX, ConditionalUnit::Target(unit)) => {
-                self.modules.target.forward_unit_observed_with_provider(
-                    0,
-                    index,
+                self.modules.target.execute_routed_observed(
+                    self.modules.target.definition().unit_address(0, index)?,
                     unit,
                     hidden,
                     state,
@@ -952,10 +968,9 @@ where
             _ => Err(Error::backend("conditional unit/group mismatch")),
         }
     }
-    fn forward_unit_with_provider<P>(
+    fn execute_routed<P>(
         &mut self,
-        group: usize,
-        index: usize,
+        address: ExecutionUnitAddress,
         unit: &mut Self::Unit,
         hidden: &B::Tensor,
         state: &mut S,
@@ -968,7 +983,8 @@ where
         P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.check_unit(group, index)?;
+        let group = address.group();
+        let index = address.index();
         match (group, unit) {
             (VISION_INDEX, ConditionalUnit::Vision(block)) => {
                 let vision = forward
@@ -979,60 +995,32 @@ where
                     .vision
                     .forward_block(block, index, hidden, vision, context)
             }
-            (TARGET_INDEX, ConditionalUnit::Target(unit)) => {
-                self.modules.target.forward_unit_with_provider(
-                    0,
-                    index,
-                    unit,
-                    hidden,
-                    state,
-                    forward
-                        .target
-                        .as_mut()
-                        .ok_or_else(|| Error::backend("missing target context"))?,
-                    pass,
-                    provider,
-                    context,
-                )
-            }
+            (TARGET_INDEX, ConditionalUnit::Target(unit)) => self.modules.target.execute_routed(
+                self.modules.target.definition().unit_address(0, index)?,
+                unit,
+                hidden,
+                state,
+                forward
+                    .target
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("missing target context"))?,
+                pass,
+                provider,
+                context,
+            ),
             _ => Err(Error::backend("conditional unit/group mismatch")),
         }
     }
 }
-impl<B, S> ReplicatedTextArchitecture<B, S> for ConditionalModel<B>
-where
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
+impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TextComponentKernel<B>
+    for ConditionalKernel<B>
 {
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
-        ConditionalInput::Target(
-            <TargetModel<B> as ReplicatedTextArchitecture<B, S>>::text_input(tokens, mask),
-        )
+        ConditionalInput::Target(<TargetKernel<B> as TextComponentKernel<B>>::text_input(
+            tokens, mask,
+        ))
     }
     fn supports_chunked_prefill() -> bool {
         true
-    }
-}
-
-impl<B: GroupedNeuralBackend + DistributedNeuralBackend>
-    crate::prediction_extension::Qwen4PredictionTarget<B> for ConditionalModel<B>
-{
-    fn prediction_embedding(
-        &mut self,
-        tokens: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.modules.target.prediction_embedding(tokens, context)
-    }
-    fn prediction_logits(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
-    ) -> Result<B::Tensor, Error> {
-        self.modules
-            .target
-            .prediction_logits(hidden, context, instrumentation)
     }
 }

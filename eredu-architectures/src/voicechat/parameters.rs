@@ -1,20 +1,22 @@
 //! Exact learned-parameter units projected from retained VoiceChat artifacts.
 //!
-//! A unit follows the supplied module's ordinary parameter traversal, so a
-//! Conformer, Gemma, MoG or codec block can be bound independently. This contract
-//! does not select a residency schedule or construct a realtime executable.
+//! A unit projects a semantic parameter declaration or a caller-supplied module's
+//! ordinary parameter traversal. Conformer, Gemma, MoG and codec blocks can be
+//! bound independently. This contract does not select a residency schedule or
+//! construct a realtime executable.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
-    store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
+    recipe::{DerivedWeightRecipe, RecipeAlias, RecipeDtype, RecipeError},
+    store::{SharedCheckpointSource, StoreError},
 };
 use eredu_nn::{validate_parameter_topology, ParameterTopologyError, Parameterized};
 use eredu_runtime::{
-    bind_materialized_unit, bindings_from_recipe_set, materialize_selected_bindings,
-    select_bindings, ParameterBackend, ParameterOrchestrationError, RecipeBindingError,
-    SelectedBindingPlan, WeightBinding,
+    bind_materialized_unit, materialize_selected_bindings, prepare_resource_bindings,
+    select_bindings, ArchitectureParameterDescription, ComponentPreparationError, ParameterBackend,
+    ParameterMemberSpec, ParameterOrchestrationError, ParameterResourceRecipes, PreparedComponent,
+    RecipeBindingError, SelectedBindingPlan, WeightBinding,
 };
 
 use super::{
@@ -37,6 +39,14 @@ pub enum SpeechParameterError {
         /// Selected component.
         component: Component,
         /// Module's exact stable identity.
+        name: String,
+    },
+    /// A declared member disagrees with its retained recipe output metadata.
+    #[error("VoiceChat component {component:?} parameter {name} disagrees with admitted metadata")]
+    InconsistentAdmission {
+        /// Selected source component.
+        component: Component,
+        /// Declared canonical identity.
         name: String,
     },
     /// Host preprocessing and integer policy buffers cannot become neural weights.
@@ -62,6 +72,9 @@ pub enum SpeechParameterError {
     /// Generic runtime binding declarations are inconsistent.
     #[error(transparent)]
     Binding(#[from] RecipeBindingError),
+    /// A semantic declaration disagrees with retained recipes or geometry.
+    #[error(transparent)]
+    Preparation(#[from] ComponentPreparationError),
 }
 
 /// One exact module's canonical recipes and restricted physical source authority.
@@ -93,6 +106,24 @@ impl PreparedSpeechParameterUnit {
             .ok_or(SpeechParameterError::MissingComponent(component))?
             .clone();
         project_unit(artifacts.plan().parameters(), source, component, module)
+    }
+
+    pub(super) fn from_description(
+        artifacts: &RetainedVoiceChatArtifacts,
+        component: Component,
+        description: ArchitectureParameterDescription,
+    ) -> Result<Self, SpeechParameterError> {
+        check_component(component)?;
+        let source = artifacts
+            .component_source(component)
+            .ok_or(SpeechParameterError::MissingComponent(component))?
+            .clone();
+        project_description(
+            artifacts.plan().parameters(),
+            source,
+            component,
+            description,
+        )
     }
 
     /// Architecture component retaining this unit's physical source.
@@ -205,6 +236,84 @@ pub(super) fn execution_parameter(
     Ok(parameter)
 }
 
+fn project_description(
+    admitted: &BTreeMap<String, ParameterAdmission>,
+    source: SharedCheckpointSource,
+    component: Component,
+    description: ArchitectureParameterDescription,
+) -> Result<PreparedSpeechParameterUnit, SpeechParameterError> {
+    check_component(component)?;
+    let mut parameters = BTreeMap::new();
+    let prepared = PreparedComponent::prepare(
+        format!("voicechat/{component:?}/module"),
+        description,
+        source.clone(),
+        |member| -> Result<_, SpeechParameterError> {
+            let name = member.target();
+            let parameter = admitted_parameter(admitted, &source, component, name)?;
+            let recipe = parameter.recipe.clone();
+            parameters.insert(name.to_owned(), parameter);
+            Ok(recipe)
+        },
+    )?;
+    let (_, _, _, source, units) = prepared.into_declared_unit_parts()?;
+    let mut bindings = units.into_iter().flatten().collect::<Vec<_>>();
+    bindings.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(PreparedSpeechParameterUnit {
+        component,
+        source,
+        parameters,
+        bindings,
+    })
+}
+
+fn parameter_for_component<'a>(
+    admitted: &'a BTreeMap<String, ParameterAdmission>,
+    component: Component,
+    name: &str,
+) -> Result<&'a ParameterAdmission, SpeechParameterError> {
+    admitted
+        .get(name)
+        .filter(|parameter| parameter.component == component)
+        .ok_or_else(|| SpeechParameterError::MissingParameter {
+            component,
+            name: name.into(),
+        })
+}
+
+/// Checks retained admission before any execution conversion or accounting change.
+pub(super) fn admitted_member<'a>(
+    admitted: &'a BTreeMap<String, ParameterAdmission>,
+    source: &SharedCheckpointSource,
+    component: Component,
+    member: &ParameterMemberSpec,
+) -> Result<&'a ParameterAdmission, SpeechParameterError> {
+    let name = member.target();
+    let parameter = parameter_for_component(admitted, component, name)?;
+    if parameter.output.shape != member.global_shape()
+        || parameter.recipe.infer(source.as_ref())? != parameter.output
+    {
+        return Err(SpeechParameterError::InconsistentAdmission {
+            component,
+            name: name.into(),
+        });
+    }
+    Ok(parameter)
+}
+
+fn admitted_parameter(
+    admitted: &BTreeMap<String, ParameterAdmission>,
+    source: &SharedCheckpointSource,
+    component: Component,
+    name: &str,
+) -> Result<ParameterAdmission, SpeechParameterError> {
+    if host_parameter(name) {
+        return Err(SpeechParameterError::HostParameter(name.into()));
+    }
+    let parameter = parameter_for_component(admitted, component, name)?;
+    Ok(execution_parameter(parameter, source)?)
+}
+
 fn project_unit<T: 'static, M: Parameterized<T>>(
     admitted: &BTreeMap<String, ParameterAdmission>,
     source: SharedCheckpointSource,
@@ -216,17 +325,10 @@ fn project_unit<T: 'static, M: Parameterized<T>>(
     let mut parameters = BTreeMap::new();
     for metadata in &topology {
         let name = metadata.id.as_str();
-        if host_parameter(name) {
-            return Err(SpeechParameterError::HostParameter(name.into()));
-        }
-        let parameter = admitted
-            .get(name)
-            .filter(|parameter| parameter.component == component)
-            .ok_or_else(|| SpeechParameterError::MissingParameter {
-                component,
-                name: name.into(),
-            })?;
-        parameters.insert(name.to_owned(), execution_parameter(parameter, &source)?);
+        parameters.insert(
+            name.to_owned(),
+            admitted_parameter(admitted, &source, component, name)?,
+        );
     }
     let mut recipes = BTreeMap::new();
     let mut aliases = Vec::new();
@@ -248,17 +350,18 @@ fn project_unit<T: 'static, M: Parameterized<T>>(
             recipes.insert(name.to_owned(), parameter.recipe.clone());
         }
     }
-    let inputs = recipes
-        .values()
-        .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
-        .collect();
-    let source: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
+    let (source, mut resources) = prepare_resource_bindings(
         source,
         format!("voicechat/{component:?}/module"),
-        inputs,
-    )?);
-    let recipes = AtomicRecipeSet::new_with_aliases(source.as_ref(), recipes, aliases)?;
-    let bindings = bindings_from_recipe_set(source.as_ref(), recipes)?;
+        BTreeMap::from([(
+            (),
+            ParameterResourceRecipes {
+                outputs: recipes,
+                aliases,
+            },
+        )]),
+    )?;
+    let bindings = resources.remove(&()).expect("declared module resource");
     Ok(PreparedSpeechParameterUnit {
         component,
         source,

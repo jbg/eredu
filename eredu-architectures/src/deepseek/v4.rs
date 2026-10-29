@@ -16,17 +16,17 @@ use eredu_nn::{
     PoolingAttentionCache, Tensor,
 };
 use eredu_runtime::{
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, ModelStateIdentity, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
-    RoutedLayeredArchitecture, StateLayout, StateSegmentLifetime, StateSegmentSpec,
+    ComponentAdapter, ComponentEquations, ComponentKernel, ComponentPartitionContext,
+    ComponentPinnedResources, ExecutionUnitAddress, KernelParameterModules, LayerRuntimeState,
+    LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, ModelStateIdentity,
+    ParallelComponentKernel, ParallelRoutedComponentKernel, ParameterProvider,
+    PartitionComponentKernel, PipelineComponentKernel, RoutedComponentKernel, StateLayout,
+    StateSegmentLifetime, StateSegmentSpec, TextComponentKernel,
 };
 
 use eredu_checkpoint::LinearFormat;
 
-use crate::decoder::{
-    SequentialPredictionGroups, StaticModuleSpec, StaticModules as TextStaticModules,
-};
+use crate::decoder::{DecoderStaticResources, PartitionStaticModules, StaticModuleSpec};
 
 use super::{
     block::V4Block,
@@ -35,6 +35,10 @@ use super::{
     mtp::{EmbeddedInput, ForwardMode, RetainedValues, V4PredictionLayer},
     DsparkConfig, V4Args, V4AttentionPolicy,
 };
+
+/// Shared execution adapter over V4 equations and the validated component definition.
+pub type Model<B> =
+    ComponentAdapter<Arc<eredu_runtime::ComponentDefinition>, V4Kernel<B>, KernelParameterModules>;
 
 fn capture_target_layer<T: Tensor>(
     policy: Option<&V4TargetCapturePolicy>,
@@ -139,204 +143,6 @@ where
     }
 }
 
-impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
-where
-    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: PoolingAttentionCache<B::Tensor>,
-{
-    fn routed_unit_observations(&self) -> bool {
-        self.args.dspark.is_none()
-    }
-
-    fn routed_sparse_observations(&self) -> bool {
-        self.args.dspark.is_none()
-    }
-
-    fn forward_unit_with_provider<P>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: ParameterProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        Model::forward_unit_with_provider(
-            self, group, index, unit, hidden, state, forward, pass, provider, context,
-        )
-    }
-
-    fn forward_unit_observed_with_provider<P, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: ParameterProvider<B>,
-        P::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        Model::forward_unit_observed_with_provider(
-            self, group, index, unit, hidden, state, forward, pass, provider, context, observer,
-        )
-    }
-}
-
-impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
-where
-    B: HyperNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: PoolingAttentionCache<B::Tensor>,
-{
-    fn parallel_routed_unit_observations(&self) -> bool {
-        self.args.dspark.is_none()
-    }
-
-    fn parallel_routed_sparse_observations(&self) -> bool {
-        self.args.dspark.is_none()
-    }
-
-    fn forward_unit_parallel_observed_with_provider<P, O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        P: eredu_runtime::TensorParallelParameterProvider<B>,
-        P::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.groups.unit_count(group)?;
-        if let Unit::Target(block) = unit {
-            if group != 0 {
-                return Err(Error::backend(
-                    "V4 target unit selected in prediction group",
-                ));
-            }
-            let output = block.forward_parallel_observed_with_provider(
-                &format!("layers.{index}"),
-                hidden,
-                &forward.input_ids,
-                forward.mask.as_ref(),
-                Some(
-                    state
-                        .layer(self.target_state_ordinal(index)?)
-                        .map_err(Error::backend)?,
-                ),
-                pass,
-                provider,
-                context,
-                observer,
-                |value, context| B::sum_parallel(value, parallel, context),
-            )?;
-            if let Some(position) = self
-                .args
-                .target_capture_policy
-                .as_ref()
-                .and_then(|policy| policy.position(index))
-            {
-                let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
-                observer.observe(&format!("dspark.target_captures.{position}"), &capture)?;
-                forward.captures[position] = Some(capture);
-            }
-            Ok(output)
-        } else if let Unit::Prediction(unit) = unit {
-            if group == 0 {
-                return Err(Error::backend(
-                    "V4 prediction unit selected in target group",
-                ));
-            }
-            let layer =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
-            let head = self
-                .static_modules
-                .text
-                .lm_head
-                .as_mut()
-                .expect("validated V4 models have an untied output head");
-            let output = unit.forward_parallel_observed_with_provider(
-                &format!("mtp.{}", group - 1),
-                hidden,
-                &forward.embedded,
-                &forward.input_ids,
-                state.layer(layer).map_err(Error::backend)?,
-                head,
-                pass,
-                provider,
-                parallel,
-                context,
-                observer,
-                |value, context| B::sum_parallel(value, parallel, context),
-            )?;
-            forward.draft_logits = Some(output.logits);
-            Ok(output.hidden)
-        } else if group > 0 {
-            observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-            let output = Model::forward_unit_parallel_with_provider(
-                self, group, index, unit, hidden, state, forward, pass, parallel, provider, context,
-            )?;
-            eredu_runtime::observe_and_intervene(
-                observer,
-                &format!("mtp.{}.output", group - 1),
-                &output,
-            )
-        } else {
-            Err(Error::backend(
-                "V4 prediction unit selected in target group",
-            ))
-        }
-    }
-
-    fn forward_unit_parallel_with_provider<P>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>
-    where
-        P: eredu_runtime::TensorParallelParameterProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        Model::forward_unit_parallel_with_provider(
-            self, group, index, unit, hidden, state, forward, pass, parallel, provider, context,
-        )
-    }
-}
-
 /// One target, sequential MTP, or fused DSpark execution unit.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -370,9 +176,9 @@ where
 #[parameterized(tensor = "B::Tensor")]
 pub struct StaticModules<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Shared embedding, final normalization, and vocabulary head lifecycle.
-    pub text: TextStaticModules<B>,
+    pub text: PartitionStaticModules<B>,
     /// Learned collapse from hyper-connection streams to final hidden state.
-    pub hyper_head: HyperHead<B>,
+    pub hyper_head: Option<HyperHead<B>>,
     /// Optional fused-drafter projections and heads.
     pub dspark: Option<DsparkStatic<B>>,
 }
@@ -624,83 +430,137 @@ impl<T> ForwardContext<T> {
     }
 }
 
+/// Validated V4 unit and DSpark resource construction without target pinned modules.
+pub struct V4UnitFactory {
+    args: V4Args,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
+    parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
+}
+impl V4UnitFactory {
+    /// Retains the semantic definition and validates global or selected local geometry.
+    /// This step allocates no native modules.
+    pub fn from_definition(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<super::parallel::V4LocalGeometry>,
+    ) -> Result<Self, Error> {
+        let definition = select_definition(&args, definition, geometry.as_ref())?;
+        Ok(Self {
+            args,
+            definition,
+            parallel_geometry: geometry.map(Arc::new),
+            expert_realization: None,
+        })
+    }
+    fn require_operators<B>(&self) -> Result<(), Error>
+    where
+        B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    {
+        crate::operator_requirements::require::<B>(
+            "DeepSeek-V4",
+            if self.parallel_geometry.is_some() {
+                crate::operator_requirements::DEEPSEEK_V4
+                    .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL)
+            } else {
+                crate::operator_requirements::DEEPSEEK_V4
+            },
+        )
+    }
+    /// Constructs the declared fused-drafter projections and heads, when present.
+    pub fn construct_dspark<B>(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<DsparkStatic<B>>, Error>
+    where
+        B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    {
+        self.require_operators::<B>()?;
+        self.args
+            .dspark
+            .as_ref()
+            .map(|config| DsparkStatic::new(&self.args, config, context))
+            .transpose()
+    }
+    /// Constructs only the addressed target, sequential MTP or DSpark resource.
+    pub fn construct_unit<B>(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error>
+    where
+        B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    {
+        self.require_operators::<B>()?;
+        self.definition.unit(group, index)?;
+        let args = self
+            .parallel_geometry
+            .as_ref()
+            .map_or(&self.args, |geometry| geometry.args());
+        let owner_group = if group == 0 {
+            "target".to_owned()
+        } else {
+            format!("mtp.{}", group - 1)
+        };
+        let selected_spec = self
+            .expert_realization
+            .as_ref()
+            .and_then(|realization| realization.unit_spec(&owner_group, index))
+            .cloned();
+        if group == 0 && self.expert_realization.is_some() && selected_spec.is_none() {
+            return Err(Error::backend(format!(
+                "V4 expert realization has no bank for {owner_group}.{index}"
+            )));
+        }
+        let mut unit = if group == 0 {
+            let block = match selected_spec.clone() {
+                Some(spec) => V4Block::new_with_expert_spec(args, index, spec, context)?,
+                None => V4Block::new(args, index, context)?,
+            };
+            Unit::Target(block)
+        } else if self.args.dspark.is_some() {
+            let global =
+                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
+            Unit::Dspark(V4Block::new_at(
+                args,
+                global,
+                &format!("mtp.{}", group - 1),
+                None,
+                context,
+            )?)
+        } else {
+            Unit::Prediction(V4PredictionLayer::new(args, group - 1, context)?)
+        };
+        if group != 0 {
+            if let Some(realization) = &self.expert_realization {
+                let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
+                    Error::backend(format!(
+                        "V4 expert realization has no bank for {owner_group}.{index}"
+                    ))
+                })?;
+                let feed_forward = match &mut unit {
+                    Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
+                    Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
+                };
+                feed_forward.experts = B::grouped_gated_product(spec.clone(), context)?;
+            }
+        }
+        Ok(unit)
+    }
+}
+
 /// Thin V4 target-model architecture over the shared layered runtime.
-pub struct Model<B>
+pub struct V4Kernel<B>
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
-    args: V4Args,
+    construction: V4UnitFactory,
     static_modules: StaticModules<B>,
-    groups: SequentialPredictionGroups,
-    parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
-    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
     partition_target_start: usize,
 }
 
-impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
-where
-    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
-{
-    type DefinitionError = Error;
-
-    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        self.state_layout_impl()
-    }
-
-    fn state_identity(
-        &self,
-        state: &eredu_runtime::PartitionState,
-        topology: eredu_core::cache::PromptCacheTopology,
-    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
-        state_identity(
-            &self.args,
-            state.layout(),
-            state.global_layer_offset(),
-            topology,
-        )
-    }
-
-    fn parameter_description(
-        &self,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
-        super::parallel::v4_parameter_description(&self.args).map_err(Error::backend)
-    }
-
-    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitor<B>,
-    {
-        visitor.visit("embedding", &self.static_modules.text.embeddings)?;
-        visitor.visit("norm", &self.static_modules.text.boundary.norm)?;
-        if let Some(head) = &self.static_modules.text.lm_head {
-            visitor.visit("output", head)?;
-        }
-        visitor.visit("hyper_head", &self.static_modules.hyper_head)?;
-        if let Some(dspark) = &self.static_modules.dspark {
-            visitor.visit("mtp", dspark)?;
-        }
-        Ok(())
-    }
-
-    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
-    where
-        V: eredu_runtime::StaticParameterVisitorMut<B>,
-    {
-        visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.text.boundary.norm)?;
-        if let Some(head) = &mut self.static_modules.text.lm_head {
-            visitor.visit_mut("output", head)?;
-        }
-        visitor.visit_mut("hyper_head", &mut self.static_modules.hyper_head)?;
-        if let Some(dspark) = &mut self.static_modules.dspark {
-            visitor.visit_mut("mtp", dspark)?;
-        }
-        Ok(())
-    }
-}
-
-impl<B> Model<B>
+impl<B> V4Kernel<B>
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
@@ -801,7 +661,7 @@ where
         let boundary = self.routed_target_boundary(forward)?;
         if owns_output {
             let draft_hidden = complete_target_capture(
-                self.args.target_capture_policy.as_ref(),
+                self.construction.args.target_capture_policy.as_ref(),
                 hidden,
                 &boundary.captures.into_iter().map(Some).collect::<Vec<_>>(),
                 context,
@@ -817,7 +677,7 @@ where
                 &[
                     hidden.dim(0),
                     hidden.dim(1),
-                    self.args.hc_mult * self.args.hidden_size,
+                    self.construction.args.hc_mult * self.construction.args.hidden_size,
                 ],
                 context,
             )?;
@@ -836,8 +696,9 @@ where
             TargetPartitionInput::Tokens(tokens) => {
                 let embedded = self.lookup_tokens(tokens, parallel, context)?;
                 let embedded = instrumentation.apply("embedding", embedded)?;
-                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
                 let captures = (0..self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -845,7 +706,11 @@ where
                     .map(|_| {
                         B::Tensor::full_f32(
                             0.0,
-                            &[tokens.dim(0), tokens.dim(1), self.args.hidden_size],
+                            &[
+                                tokens.dim(0),
+                                tokens.dim(1),
+                                self.construction.args.hidden_size,
+                            ],
                             context,
                         )
                     })
@@ -860,8 +725,8 @@ where
                     &[
                         hidden.dim(0),
                         hidden.dim(1),
-                        self.args.hc_mult,
-                        self.args.hidden_size,
+                        self.construction.args.hc_mult,
+                        self.construction.args.hidden_size,
                     ],
                     context,
                 )?;
@@ -889,64 +754,179 @@ where
         self.pipeline_finish_parallel(hidden, parallel, context)
     }
 
-    /// Builds unloaded pinned V4 modules.
-    pub fn new(args: V4Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "DeepSeek-V4",
-            crate::operator_requirements::DEEPSEEK_V4,
-        )?;
-        args.validate().map_err(Error::backend)?;
-        let text = TextStaticModules::from_spec(text_static_spec(&args), context)?;
-        Ok(Self {
-            groups: prediction_groups(&args)?,
-            static_modules: static_modules(&args, text, context)?,
-            args,
-            parallel_geometry: None,
-            expert_realization: None,
-            partition_target_start: 0,
-        })
+    /// Materializes ordinary modules from the cold retained declaration.
+    pub fn from_definition(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::materialize(args, definition, None, |_| Ok(None), context)
     }
 
-    /// Builds unloaded V4 modules using one authoritative rank-local plan.
-    pub fn new_parallel(
+    /// Materializes modules using the retained definition and authoritative local geometry.
+    pub fn from_parallel_definition(
         args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
         geometry: super::parallel::V4LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "DeepSeek-V4",
-            crate::operator_requirements::DEEPSEEK_V4
-                .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL),
-        )?;
-        args.validate().map_err(Error::backend)?;
-        geometry.validate_for(&args).map_err(Error::backend)?;
-        let text = TextStaticModules::from_parallel_spec(
-            text_static_spec(&args),
-            geometry.embedding_range().clone(),
-            Some(geometry.output_range().clone()),
-            context,
-        )?;
-        Ok(Self {
-            groups: prediction_groups(&args)?,
-            static_modules: static_modules(&args, text, context)?,
+        Self::materialize(args, definition, Some(geometry), |_| Ok(None), context)
+    }
+
+    /// Validates selected ownership before allocating its pinned resources.
+    pub fn from_partition_definition<G, A>(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: super::parallel::V4LocalGeometry,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Model<B>, Error> {
+        Self::materialize(
             args,
-            parallel_geometry: Some(Arc::new(geometry)),
-            expert_realization: None,
-            partition_target_start: 0,
+            definition,
+            Some(geometry),
+            |definition| {
+                definition
+                    .select_partition(partition)
+                    .map(Some)
+                    .map_err(Error::from)
+            },
+            context,
+        )?
+        .into_partition_model(partition)
+    }
+
+    fn materialize(
+        args: V4Args,
+        definition: Arc<eredu_runtime::ComponentDefinition>,
+        geometry: Option<super::parallel::V4LocalGeometry>,
+        select: impl FnOnce(
+            &eredu_runtime::ComponentDefinition,
+        ) -> Result<Option<eredu_runtime::ComponentSelection>, Error>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let construction = V4UnitFactory::from_definition(args, definition, geometry)?;
+        construction.require_operators::<B>()?;
+        let selection = select(&construction.definition)?;
+        let partition_target_start = selection
+            .as_ref()
+            .and_then(|selection| selection.state())
+            .map_or(0, |state| state.global_layer_offset());
+        Ok(Self {
+            static_modules: static_modules(&construction, selection.as_ref(), context)?,
+            construction,
+            partition_target_start,
         })
+    }
+
+    fn complete_group_inner(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        forward: &mut ForwardContext<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if group == 0 && matches!(forward.mode, ForwardMode::Target) {
+            forward.target_capture = Some(complete_target_capture(
+                self.construction.args.target_capture_policy.as_ref(),
+                hidden,
+                &forward.captures,
+                context,
+            )?);
+        }
+        if group == self.construction.definition.prediction_groups().len()
+            && matches!(forward.mode, ForwardMode::DsparkProposal)
+        {
+            let dspark = self
+                .static_modules
+                .dspark
+                .as_mut()
+                .expect("DSpark proposal mode has pinned DSpark modules");
+            let collapsed = dspark.hyper_head.forward(hidden, context)?;
+            let normalized = dspark.output_norm.forward(&collapsed, context)?;
+            let head = self
+                .static_modules
+                .text
+                .lm_head
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
+            let mut logits = match parallel {
+                Some(parallel) => {
+                    B::vocabulary_parallel_project(head, &normalized, parallel, context)?
+                }
+                None => head.forward(&normalized, context)?,
+            };
+            let anchor = forward.input_ids.index(
+                &[eredu_nn::Index::Full, eredu_nn::Index::Range(0, 1)],
+                context,
+            )?;
+            let markov = dspark.markov_embedding.forward(&anchor, context)?;
+            let adjustment = dspark.markov_output.forward(&markov, context)?;
+            let adjustment = adjustment.broadcast_to(logits.shape(), context)?;
+            logits = logits.add(&adjustment, context)?;
+            forward.draft_logits = Some(logits);
+        }
+        if group > 0 && matches!(forward.mode, ForwardMode::Draft(_)) {
+            forward.draft_hidden = Some(hidden.clone());
+        }
+        Ok(hidden.clone())
+    }
+
+    /// Consumes the complete semantic declaration, equations, and canonical pinned resources.
+    pub fn into_model(self) -> Result<Model<B>, Error> {
+        ComponentAdapter::with_pinned_resources::<B>(self.construction.definition.clone(), self)
+            .map_err(Error::from)
+    }
+
+    /// Consumes selected ownership and retains its canonical resources and local state origin.
+    pub fn into_partition_model<G, A>(
+        mut self,
+        partition: &eredu_runtime::ArchitecturePartition<G, A>,
+    ) -> Result<Model<B>, Error> {
+        let selected = self.construction.definition.select_partition(partition)?;
+        self.partition_target_start = selected
+            .state()
+            .map_or(0, |state| state.global_layer_offset());
+        let owns = |role: &str| {
+            selected.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+        };
+        if !owns("embedding") {
+            self.static_modules.text.embeddings = None;
+        }
+        if !owns("norm") {
+            self.static_modules.text.norm = None;
+        }
+        if !owns("output") {
+            self.static_modules.text.lm_head = None;
+        }
+        if !owns("hyper_head") {
+            self.static_modules.hyper_head = None;
+        }
+        if !owns("mtp") {
+            self.static_modules.dspark = None;
+        }
+        ComponentAdapter::with_partition_resources::<B, _, _>(
+            self.construction.definition.clone(),
+            self,
+            partition,
+        )
+        .map_err(Error::from)
     }
 
     /// Returns the state layout matching the modules this instance builds.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
-        match &self.parallel_geometry {
-            Some(geometry) => Ok(geometry.state_layout().clone()),
-            None => state_layout(&self.args),
-        }
+        Ok(self.construction.definition.state_layout().clone())
+    }
+
+    /// Borrows the validated declaration retained before native construction.
+    pub fn definition(&self) -> &eredu_runtime::ComponentDefinition {
+        &self.construction.definition
     }
 
     /// Borrows rank-local geometry for resident and streamed unit factories.
     pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V4LocalGeometry>> {
-        self.parallel_geometry.clone()
+        self.construction.parallel_geometry.clone()
     }
 
     /// Installs the architecture-derived expert realization used by every unit factory.
@@ -954,12 +934,7 @@ where
         &mut self,
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) {
-        self.expert_realization = Some(realization);
-    }
-
-    /// Selects the architecture-global target-unit origin of a rank-local PP slice.
-    pub fn set_partition_target_start(&mut self, start: usize) {
-        self.partition_target_start = start;
+        self.construction.expert_realization = Some(realization);
     }
 
     fn target_state_ordinal(&self, index: usize) -> Result<usize, Error> {
@@ -972,12 +947,12 @@ where
 
     /// Returns the normalized V4 arguments.
     pub const fn args(&self) -> &V4Args {
-        &self.args
+        &self.construction.args
     }
 
     /// Returns the prediction depth count declared by the execution graph.
     pub fn mtp_len(&self) -> usize {
-        self.groups.prediction_count()
+        self.construction.definition.prediction_groups().len()
     }
 
     /// Returns the maximum number of draft tokens emitted by one proposal.
@@ -986,8 +961,8 @@ where
     /// block instead emits the checkpoint-declared block width, independently
     /// of the number of blocks used to compute it.
     pub fn draft_proposal_capacity(&self) -> usize {
-        self.args.dspark.as_ref().map_or_else(
-            || self.groups.prediction_count(),
+        self.construction.args.dspark.as_ref().map_or_else(
+            || self.construction.definition.prediction_groups().len(),
             |config| {
                 usize::try_from(config.block_size).expect("validated DSpark block size is positive")
             },
@@ -1012,60 +987,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
-        self.groups.unit_count(group)?;
-        let args = self
-            .parallel_geometry
-            .as_ref()
-            .map_or(&self.args, |geometry| geometry.args());
-        let owner_group = if group == 0 {
-            "target".to_owned()
-        } else {
-            format!("mtp.{}", group - 1)
-        };
-        let selected_spec = self
-            .expert_realization
-            .as_ref()
-            .and_then(|realization| realization.unit_spec(&owner_group, index))
-            .cloned();
-        if group == 0 && self.expert_realization.is_some() && selected_spec.is_none() {
-            return Err(Error::backend(format!(
-                "V4 expert realization has no bank for {owner_group}.{index}"
-            )));
-        }
-        let mut unit = if group == 0 {
-            let block = match selected_spec.clone() {
-                Some(spec) => V4Block::new_with_expert_spec(args, index, spec, context)?,
-                None => V4Block::new(args, index, context)?,
-            };
-            Unit::Target(block)
-        } else if self.args.dspark.is_some() {
-            let global =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
-            Unit::Dspark(V4Block::new_at(
-                args,
-                global,
-                &format!("mtp.{}", group - 1),
-                None,
-                context,
-            )?)
-        } else {
-            Unit::Prediction(V4PredictionLayer::new(args, group - 1, context)?)
-        };
-        if group != 0 {
-            if let Some(realization) = &self.expert_realization {
-                let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
-                    Error::backend(format!(
-                        "V4 expert realization has no bank for {owner_group}.{index}"
-                    ))
-                })?;
-                let feed_forward = match &mut unit {
-                    Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
-                    Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
-                };
-                feed_forward.experts = B::grouped_gated_product(spec.clone(), context)?;
-            }
-        }
-        Ok(unit)
+        self.construction.construct_unit::<B>(group, index, context)
     }
 
     fn lookup_tokens(
@@ -1076,13 +998,23 @@ where
     ) -> Result<B::Tensor, Error> {
         match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules.text.embeddings,
+                self.static_modules
+                    .text
+                    .embeddings
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
                 tokens,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
                 context,
             ),
-            None => self.static_modules.text.embeddings.forward(tokens, context),
+            None => self
+                .static_modules
+                .text
+                .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
+                .forward(tokens, context),
         }
     }
 
@@ -1099,6 +1031,7 @@ where
     {
         let expected = match parallel {
             Some(_) => self
+                .construction
                 .parallel_geometry
                 .as_ref()
                 .ok_or_else(|| Error::backend("V4 model was not built with local geometry"))?
@@ -1116,7 +1049,7 @@ where
             EmbeddedInput::Target { tokens, mask } => {
                 let embedded = self.lookup_tokens(tokens, parallel, context)?;
                 let embedded = instrumentation.apply("embedding", embedded)?;
-                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
                 (
                     tokens.clone(),
                     embedded,
@@ -1130,7 +1063,9 @@ where
                 hidden,
                 depth,
             } => {
-                if self.args.dspark.is_some() || depth >= self.groups.prediction_count() {
+                if self.construction.args.dspark.is_some()
+                    || depth >= self.construction.definition.prediction_groups().len()
+                {
                     return Err(Error::backend(format!(
                         "V4 sequential prediction depth {depth} is unavailable"
                     )));
@@ -1144,7 +1079,7 @@ where
                 )
             }
             EmbeddedInput::DsparkContext { captures } => {
-                validate_dspark_target_capture(&self.args, captures)?;
+                validate_dspark_target_capture(&self.construction.args, captures)?;
                 let dspark = self
                     .static_modules
                     .dspark
@@ -1153,7 +1088,7 @@ where
                 let main = dspark
                     .main_norm
                     .forward(&dspark.main_projection.forward(captures, context)?, context)?;
-                let hidden = broadcast_streams::<B>(&main, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&main, &self.construction.args, context)?;
                 (
                     captures.clone(),
                     main,
@@ -1164,6 +1099,7 @@ where
             }
             EmbeddedInput::DsparkProposal { anchor, capacity } => {
                 let config = self
+                    .construction
                     .args
                     .dspark
                     .as_ref()
@@ -1183,7 +1119,7 @@ where
                     B::Tensor::concatenate(&[anchor.clone(), noise], 1, context)?
                 };
                 let embedded = self.lookup_tokens(&input_ids, parallel, context)?;
-                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
                 let mask = Some(dspark_bidirectional_mask::<B::Tensor>(capacity, context)?);
                 (
                     input_ids,
@@ -1205,6 +1141,7 @@ where
                 draft_logits: None,
                 draft_hidden: None,
                 captures: self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -1224,8 +1161,10 @@ where
             .static_modules
             .text
             .embeddings
+            .as_mut()
+            .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
             .forward(tokens, context)?;
-        broadcast_streams::<B>(&embedded, &self.args, context)
+        broadcast_streams::<B>(&embedded, &self.construction.args, context)
     }
 
     /// Applies vocabulary-parallel lookup and architecture-owned stream broadcast.
@@ -1236,13 +1175,17 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let embedded = B::vocabulary_parallel_lookup(
-            &mut self.static_modules.text.embeddings,
+            self.static_modules
+                .text
+                .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
             tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
             context,
         )?;
-        broadcast_streams::<B>(&embedded, &self.args, context)
+        broadcast_streams::<B>(&embedded, &self.construction.args, context)
     }
 
     /// Collapses hyper streams, applies the final norm, and projects logits on
@@ -1274,13 +1217,20 @@ where
         };
         let collapsed = instrumentation.collapse_streams::<B>(
             "stream_coefficients",
-            &mut self.static_modules.hyper_head,
+            self.static_modules
+                .hyper_head
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own hyper head storage"))?,
             effective.as_ref().unwrap_or(hidden),
             context,
         )?;
         let normalized = instrumentation.normalize_readout(
             &collapsed,
-            &mut self.static_modules.text.boundary.norm,
+            self.static_modules
+                .text
+                .norm
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own normalization storage"))?,
             context,
         )?;
         let head = self
@@ -1288,7 +1238,7 @@ where
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head");
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
         let logits = match parallel {
             Some(parallel) => instrumentation.project_vocabulary::<B>(
                 "projection_input",
@@ -1315,11 +1265,17 @@ where
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.hyper_head.forward(hidden, context)?;
+        let hidden = self
+            .static_modules
+            .hyper_head
+            .as_mut()
+            .ok_or_else(|| Error::backend("V4 does not own hyper head storage"))?
+            .forward(hidden, context)?;
         self.static_modules
             .text
-            .boundary
             .norm
+            .as_mut()
+            .ok_or_else(|| Error::backend("V4 does not own normalization storage"))?
             .forward(&hidden, context)
     }
 
@@ -1355,13 +1311,15 @@ where
             .static_modules
             .text
             .embeddings
+            .as_mut()
+            .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
             .forward(tokens, context)?;
         let output_head = self
             .static_modules
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head");
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
         match unit {
             Unit::Prediction(unit) => {
                 unit.forward(hidden, &embedded, tokens, cache, output_head, context)
@@ -1394,13 +1352,15 @@ where
             .static_modules
             .text
             .embeddings
+            .as_mut()
+            .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
             .forward(tokens, context)?;
         let output_head = self
             .static_modules
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head");
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
         match unit {
             Unit::Prediction(unit) => unit.forward_with_provider(
                 hidden,
@@ -1433,7 +1393,11 @@ where
         C: PoolingAttentionCache<B::Tensor>,
     {
         let embedded = B::vocabulary_parallel_lookup(
-            &mut self.static_modules.text.embeddings,
+            self.static_modules
+                .text
+                .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
             tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
@@ -1444,7 +1408,7 @@ where
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head");
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
         match unit {
             Unit::Prediction(unit) => unit.forward_parallel(
                 hidden,
@@ -1481,7 +1445,11 @@ where
         P::Error: std::fmt::Display,
     {
         let embedded = B::vocabulary_parallel_lookup(
-            &mut self.static_modules.text.embeddings,
+            self.static_modules
+                .text
+                .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
             tokens,
             EmbeddingLookupPolicy::Strict,
             parallel,
@@ -1492,7 +1460,7 @@ where
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head");
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
         match unit {
             Unit::Prediction(unit) => unit.forward_parallel_with_provider(
                 hidden,
@@ -1536,7 +1504,11 @@ where
         };
         let embedded = match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules.text.embeddings,
+                self.static_modules
+                    .text
+                    .embeddings
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
                 tokens,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
@@ -1546,6 +1518,8 @@ where
                 .static_modules
                 .text
                 .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
                 .forward(tokens, context)?,
         };
         let head = self
@@ -1553,7 +1527,7 @@ where
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head");
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
         let path = format!("mtp.{depth}");
         match parallel {
             Some(parallel) => unit.forward_parallel_observed(
@@ -1611,7 +1585,11 @@ where
         };
         let embedded = match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules.text.embeddings,
+                self.static_modules
+                    .text
+                    .embeddings
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
                 tokens,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
@@ -1621,6 +1599,8 @@ where
                 .static_modules
                 .text
                 .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
                 .forward(tokens, context)?,
         };
         let head = self
@@ -1628,7 +1608,7 @@ where
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head");
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
         let path = format!("mtp.{depth}");
         match parallel {
             Some(parallel) => unit.forward_parallel_observed_with_provider(
@@ -1663,8 +1643,8 @@ where
                 &[
                     hidden.dim(0),
                     hidden.dim(1),
-                    self.args.hc_mult,
-                    self.args.hidden_size,
+                    self.construction.args.hc_mult,
+                    self.construction.args.hidden_size,
                 ],
                 context,
             )
@@ -1684,7 +1664,7 @@ where
             &[
                 output.hidden.dim(0),
                 output.hidden.dim(1),
-                self.args.hc_mult * self.args.hidden_size,
+                self.construction.args.hc_mult * self.construction.args.hidden_size,
             ],
             context,
         )?;
@@ -1737,7 +1717,7 @@ where
         if units.len() != caches.len() {
             return Err(Error::backend("DSpark unit/cache count mismatch"));
         }
-        validate_dspark_target_capture(&self.args, captures)?;
+        validate_dspark_target_capture(&self.construction.args, captures)?;
         let dspark = self
             .static_modules
             .dspark
@@ -1746,7 +1726,7 @@ where
         let main = dspark
             .main_norm
             .forward(&dspark.main_projection.forward(captures, context)?, context)?;
-        let hidden = broadcast_streams::<B>(&main, &self.args, context)?;
+        let hidden = broadcast_streams::<B>(&main, &self.construction.args, context)?;
         for (unit, cache) in units.iter_mut().zip(caches) {
             let Unit::Dspark(unit) = unit.as_mut() else {
                 return Err(Error::backend("DSpark context received a non-DSpark unit"));
@@ -1812,6 +1792,7 @@ where
         I: crate::prediction_extension::invocation::PredictionModuleInvoker<B, Unit<B>, C>,
     {
         if self
+            .construction
             .args
             .target_capture_policy
             .as_ref()
@@ -1847,7 +1828,7 @@ where
         let main = instrumentation.apply("normalized", main)?;
         let hidden = instrumentation.apply(
             "streams",
-            broadcast_streams::<B>(&main, &self.args, context)?,
+            broadcast_streams::<B>(&main, &self.construction.args, context)?,
         )?;
         for (depth, (unit, cache)) in units.iter_mut().zip(caches).enumerate() {
             I::invoke(
@@ -1994,7 +1975,11 @@ where
         };
         let embedded = match parallel {
             Some(parallel) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules.text.embeddings,
+                self.static_modules
+                    .text
+                    .embeddings
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
                 &input_ids,
                 EmbeddingLookupPolicy::Strict,
                 parallel,
@@ -2004,12 +1989,14 @@ where
                 .static_modules
                 .text
                 .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
                 .forward(&input_ids, context)?,
         };
         let embedded = instrumentation.apply("embedding", embedded)?;
         let mut hidden = instrumentation.apply(
             "input",
-            broadcast_streams::<B>(&embedded, &self.args, context)?,
+            broadcast_streams::<B>(&embedded, &self.construction.args, context)?,
         )?;
         for (depth, (unit, cache)) in units.iter_mut().zip(caches).enumerate() {
             hidden = I::invoke(
@@ -2072,7 +2059,7 @@ where
                 .text
                 .lm_head
                 .as_mut()
-                .expect("validated V4 models have an untied output head");
+                .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
             let logits = match parallel {
                 Some(parallel) => instrumentation.project_vocabulary::<B>(
                     "projection_input",
@@ -2272,6 +2259,7 @@ where
         ) -> Result<B::Tensor, Error>,
     {
         let config = self
+            .construction
             .args
             .dspark
             .as_ref()
@@ -2294,13 +2282,17 @@ where
             B::Tensor::concatenate(&[anchor.clone(), noise], 1, context)?
         };
         let embedded = B::vocabulary_parallel_lookup(
-            &mut self.static_modules.text.embeddings,
+            self.static_modules
+                .text
+                .embeddings
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?,
             &input_ids,
             EmbeddingLookupPolicy::Strict,
             parallel,
             context,
         )?;
-        let mut hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+        let mut hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
         for (unit, cache) in units.iter_mut().zip(caches) {
             let Unit::Dspark(unit) = unit.as_mut() else {
                 return Err(Error::backend("DSpark proposal received a non-DSpark unit"));
@@ -2320,7 +2312,7 @@ where
                 .text
                 .lm_head
                 .as_mut()
-                .expect("validated V4 models have an untied output head"),
+                .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?,
             &normalized,
             parallel,
             context,
@@ -2353,6 +2345,7 @@ where
         ) -> Result<B::Tensor, Error>,
     {
         let config = self
+            .construction
             .args
             .dspark
             .as_ref()
@@ -2378,8 +2371,10 @@ where
             .static_modules
             .text
             .embeddings
+            .as_mut()
+            .ok_or_else(|| Error::backend("V4 does not own embedding storage"))?
             .forward(&input_ids, context)?;
-        let mut hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+        let mut hidden = broadcast_streams::<B>(&embedded, &self.construction.args, context)?;
         for (unit, cache) in units.iter_mut().zip(caches) {
             let Unit::Dspark(unit) = unit.as_mut() else {
                 return Err(Error::backend("DSpark proposal received a non-DSpark unit"));
@@ -2399,7 +2394,7 @@ where
             .text
             .lm_head
             .as_mut()
-            .expect("validated V4 models have an untied output head")
+            .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?
             .forward(&normalized, context)?;
         let markov = dspark.markov_embedding.forward(anchor, context)?;
         let adjustment = dspark.markov_output.forward(&markov, context)?;
@@ -2427,7 +2422,7 @@ where
         P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_with_provider(
@@ -2444,7 +2439,7 @@ where
                     context,
                 )?;
                 capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
+                    self.construction.args.target_capture_policy.as_ref(),
                     index,
                     &hidden,
                     &mut forward.captures,
@@ -2453,33 +2448,50 @@ where
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let output_head = self
-                    .static_modules
-                    .text
-                    .lm_head
-                    .as_mut()
-                    .expect("validated V4 models have an untied output head");
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let output_head =
+                    self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
+                        Error::backend("V4 does not own vocabulary output storage")
+                    })?;
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
-                let output = unit.forward_with_provider(
-                    hidden,
-                    &forward.embedded,
-                    &forward.input_ids,
-                    state.layer(layer).map_err(Error::backend)?,
-                    output_head,
-                    pass,
-                    provider,
-                    context,
-                )?;
+                let output =
+                    unit.forward_with_provider(
+                        hidden,
+                        &forward.embedded,
+                        &forward.input_ids,
+                        state
+                            .layer(layer.checked_sub(self.partition_target_start).ok_or_else(
+                                || {
+                                    Error::backend(
+                                        "V4 prediction state precedes selected partition",
+                                    )
+                                },
+                            )?)
+                            .map_err(Error::backend)?,
+                        output_head,
+                        pass,
+                        provider,
+                        context,
+                    )?;
                 forward.draft_logits = Some(output.logits);
                 Ok(output.hidden)
             }
             Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
-                let cache = state.layer(layer).map_err(Error::backend)?;
+                let cache = state
+                    .layer(
+                        layer
+                            .checked_sub(self.partition_target_start)
+                            .ok_or_else(|| {
+                                Error::backend("V4 prediction state precedes selected partition")
+                            })?,
+                    )
+                    .map_err(Error::backend)?;
                 match forward.mode {
                     ForwardMode::DsparkContext => {
                         unit.prefill_attention_cache(hidden, cache, context)?;
@@ -2526,7 +2538,7 @@ where
         P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.groups.unit_count(group)?;
+        self.construction.definition.unit(group, index)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
                 let hidden = unit.forward_parallel_with_provider(
@@ -2544,7 +2556,7 @@ where
                     |value, context| B::sum_parallel(value, parallel, context),
                 )?;
                 capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
+                    self.construction.args.target_capture_policy.as_ref(),
                     index,
                     &hidden,
                     &mut forward.captures,
@@ -2553,20 +2565,29 @@ where
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
-                let head = self
-                    .static_modules
-                    .text
-                    .lm_head
-                    .as_mut()
-                    .expect("validated V4 models have an untied output head");
+                let head =
+                    self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
+                        Error::backend("V4 does not own vocabulary output storage")
+                    })?;
                 let output = unit.forward_parallel_with_provider(
                     hidden,
                     &forward.embedded,
                     &forward.input_ids,
-                    state.layer(layer).map_err(Error::backend)?,
+                    state
+                        .layer(
+                            layer
+                                .checked_sub(self.partition_target_start)
+                                .ok_or_else(|| {
+                                    Error::backend(
+                                        "V4 prediction state precedes selected partition",
+                                    )
+                                })?,
+                        )
+                        .map_err(Error::backend)?,
                     pass,
                     provider,
                     context,
@@ -2577,10 +2598,19 @@ where
                 Ok(output.hidden)
             }
             Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
-                let cache = state.layer(layer).map_err(Error::backend)?;
+                let cache = state
+                    .layer(
+                        layer
+                            .checked_sub(self.partition_target_start)
+                            .ok_or_else(|| {
+                                Error::backend("V4 prediction state precedes selected partition")
+                            })?,
+                    )
+                    .map_err(Error::backend)?;
                 match forward.mode {
                     ForwardMode::DsparkContext => {
                         unit.prefill_attention_cache(hidden, cache, context)?;
@@ -2640,6 +2670,7 @@ where
                     observer,
                 )?;
                 if let Some(position) = self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -2652,32 +2683,46 @@ where
                 Ok(output)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
-                let head = self
-                    .static_modules
-                    .text
-                    .lm_head
-                    .as_mut()
-                    .expect("validated V4 models have an untied output head");
-                let output = unit.forward_observed(
-                    &format!("mtp.{}", group - 1),
-                    hidden,
-                    &forward.embedded,
-                    &forward.input_ids,
-                    state.layer(layer).map_err(Error::backend)?,
-                    head,
-                    context,
-                    observer,
-                )?;
+                let head =
+                    self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
+                        Error::backend("V4 does not own vocabulary output storage")
+                    })?;
+                let output =
+                    unit.forward_observed(
+                        &format!("mtp.{}", group - 1),
+                        hidden,
+                        &forward.embedded,
+                        &forward.input_ids,
+                        state
+                            .layer(layer.checked_sub(self.partition_target_start).ok_or_else(
+                                || {
+                                    Error::backend(
+                                        "V4 prediction state precedes selected partition",
+                                    )
+                                },
+                            )?)
+                            .map_err(Error::backend)?,
+                        head,
+                        context,
+                        observer,
+                    )?;
                 forward.draft_logits = Some(output.logits);
                 Ok(output.hidden)
             }
             Unit::Dspark(_) if group > 0 => {
                 observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-                let output = <Self as LayeredArchitecture<B, S>>::forward_unit(
-                    self, group, index, unit, hidden, state, forward, context,
+                let output = <Self as ComponentEquations<B, S>>::execute(
+                    self,
+                    self.construction.definition.unit_address(group, index)?,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    context,
                 )?;
                 eredu_runtime::observe_and_intervene(
                     observer,
@@ -2731,6 +2776,7 @@ where
                     observer,
                 )?;
                 if let Some(position) = self
+                    .construction
                     .args
                     .target_capture_policy
                     .as_ref()
@@ -2743,36 +2789,53 @@ where
                 Ok(output)
             }
             Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
-                let output_head = self
-                    .static_modules
-                    .text
-                    .lm_head
-                    .as_mut()
-                    .expect("validated V4 models have an untied output head");
-                let output = unit.forward_observed_with_provider(
-                    &format!("mtp.{}", group - 1),
-                    hidden,
-                    &forward.embedded,
-                    &forward.input_ids,
-                    state.layer(layer).map_err(Error::backend)?,
-                    output_head,
-                    pass,
-                    provider,
-                    context,
-                    observer,
-                )?;
+                let output_head =
+                    self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
+                        Error::backend("V4 does not own vocabulary output storage")
+                    })?;
+                let output =
+                    unit.forward_observed_with_provider(
+                        &format!("mtp.{}", group - 1),
+                        hidden,
+                        &forward.embedded,
+                        &forward.input_ids,
+                        state
+                            .layer(layer.checked_sub(self.partition_target_start).ok_or_else(
+                                || {
+                                    Error::backend(
+                                        "V4 prediction state precedes selected partition",
+                                    )
+                                },
+                            )?)
+                            .map_err(Error::backend)?,
+                        output_head,
+                        pass,
+                        provider,
+                        context,
+                        observer,
+                    )?;
                 forward.draft_logits = Some(output.logits);
                 Ok(output.hidden)
             }
             Unit::Dspark(unit) if group > 0 => {
                 observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
                     + group
                     - 1;
-                let cache = state.layer(layer).map_err(Error::backend)?;
+                let cache = state
+                    .layer(
+                        layer
+                            .checked_sub(self.partition_target_start)
+                            .ok_or_else(|| {
+                                Error::backend("V4 prediction state precedes selected partition")
+                            })?,
+                    )
+                    .map_err(Error::backend)?;
                 let output = match forward.mode {
                     ForwardMode::DsparkContext => {
                         unit.prefill_attention_cache(hidden, cache, context)?;
@@ -2802,7 +2865,7 @@ where
     }
 }
 
-fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
+pub(super) fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
     StaticModuleSpec {
         normalization_groups: None,
         embedding_weight: "embed.weight".into(),
@@ -2812,46 +2875,58 @@ fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
         hidden_size: args.hidden_size,
         normalization_epsilon: args.rms_norm_eps,
         normalization_offset: 0.0,
-        embedding_quantization: None,
+        embedding_format: LinearFormat::Dense,
         head_format: args.linear_format_for("head.weight"),
         tied_head: false,
     }
 }
 
-fn prediction_groups(args: &V4Args) -> Result<SequentialPredictionGroups, Error> {
-    SequentialPredictionGroups::new(
-        "layers",
-        usize::try_from(args.num_hidden_layers).map_err(Error::backend)?,
-        (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?)
-            .map(|depth| format!("mtp.{depth}")),
-    )
-}
-
 fn static_modules<B>(
-    args: &V4Args,
-    text: TextStaticModules<B>,
+    construction: &V4UnitFactory,
+    selection: Option<&eredu_runtime::ComponentSelection>,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<StaticModules<B>, Error>
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
-    let hyper_head = HyperHead::new(
-        HyperHeadSpec {
-            streams: args.hc_mult,
-            hidden_size: args.hidden_size,
-            norm_epsilon: args.rms_norm_eps,
-            epsilon: args.hc_eps,
-            function: parameter("hc_head_fn")?,
-            base: parameter("hc_head_base")?,
-            scale: parameter("hc_head_scale")?,
-        },
+    let args = &construction.args;
+    let owns = |role: &str| {
+        selection.is_none_or(|selection| {
+            selection.owns_storage(&eredu_runtime::ParameterStorageId::StaticRole(role.into()))
+        })
+    };
+    let text = PartitionStaticModules::from_selected_spec(
+        text_static_spec(args),
+        construction.parallel_geometry.as_ref().map(|geometry| {
+            (
+                geometry.embedding_range().clone(),
+                Some(geometry.output_range().clone()),
+            )
+        }),
+        owns,
         context,
     )?;
-    let dspark = args
-        .dspark
-        .as_ref()
-        .map(|config| DsparkStatic::new(args, config, context))
+    let hyper_head = owns("hyper_head")
+        .then(|| {
+            HyperHead::new(
+                HyperHeadSpec {
+                    streams: args.hc_mult,
+                    hidden_size: args.hidden_size,
+                    norm_epsilon: args.rms_norm_eps,
+                    epsilon: args.hc_eps,
+                    function: parameter("hc_head_fn")?,
+                    base: parameter("hc_head_base")?,
+                    scale: parameter("hc_head_scale")?,
+                },
+                context,
+            )
+        })
         .transpose()?;
+    let dspark = if owns("mtp") {
+        construction.construct_dspark::<B>(context)?
+    } else {
+        None
+    };
     Ok(StaticModules {
         text,
         hyper_head,
@@ -2935,950 +3010,10 @@ impl<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> DsparkStatic<B>
     }
 }
 
-impl<B, S> LayeredArchitecture<B, S> for Model<B>
-where
-    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: PoolingAttentionCache<B::Tensor>,
-{
-    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let complete = self.args.dspark.is_none();
-        eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
-    }
-
-    type Input<'a> = EmbeddedInput<'a, B::Tensor>;
-    type StaticModules = StaticModules<B>;
-    type Unit = Unit<B>;
-    type ForwardContext = ForwardContext<B::Tensor>;
-    type RetainedContextValues<'a>
-        = RetainedValues<'a, B::Tensor>
-    where
-        B::Tensor: 'a;
-    type Error = Error;
-
-    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            target_group_transport()
-        } else {
-            let mut transport = crate::transport::prediction();
-            if group == 1 {
-                transport.first_owner_static_roles.push("mtp".into());
-            }
-            transport
-        }
-    }
-
-    fn primary_execution_group(&self) -> &str {
-        crate::decoder::TARGET_EXECUTION_GROUP
-    }
-
-    fn prediction_execution_groups(&self) -> Vec<String> {
-        self.groups.prediction_execution_groups()
-    }
-
-    fn prediction_target_capture(context: &Self::ForwardContext) -> Option<&B::Tensor> {
-        context.target_capture()
-    }
-
-    fn prediction_target_placeholder_shape(
-        &self,
-        forward: &Self::ForwardContext,
-    ) -> Result<Option<Vec<i32>>, Self::Error> {
-        let input = forward.input_ids();
-        let shape = match &self.args.target_capture_policy {
-            Some(policy) => vec![
-                input.dim(0),
-                input.dim(1),
-                i32::try_from(policy.len())
-                    .map_err(|_| Error::backend("target capture count exceeds i32"))?
-                    .checked_mul(self.args.hidden_size)
-                    .ok_or_else(|| Error::backend("target capture width overflowed"))?,
-            ],
-            None => vec![input.dim(0), input.dim(1), self.args.hidden_size],
-        };
-        Ok(Some(shape))
-    }
-
-    fn state_partition_plan(
-        &self,
-        layout: &eredu_runtime::StateLayout,
-    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
-        crate::transport::pipeline_with_output_state(
-            0,
-            self.args.num_hidden_layers as usize,
-            layout,
-        )
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.groups.execution_graph()
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.groups.unit_count(group)
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.groups.unit_path(group, index)
-    }
-
-    fn observes_unit_boundaries(&self, group: usize, _index: usize) -> bool {
-        group == 0 || self.args.dspark.is_none()
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        &self.static_modules
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        &mut self.static_modules
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Unit, Self::Error> {
-        self.construct_unit(group, index, context)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.begin_instrumented(
-            input,
-            state,
-            None,
-            context,
-            &mut crate::decoder::ComponentInstrumentation::disabled(),
-        )
-    }
-
-    fn begin_forward_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        self.begin_instrumented(
-            input,
-            state,
-            None,
-            context,
-            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-        )
-    }
-
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &B::Tensor,
-        dependencies: &[&B::Tensor],
-        _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.groups.begin(group, initial, dependencies)
-    }
-
-    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        match forward.mode {
-            ForwardMode::Target => group == 0,
-            ForwardMode::Draft(depth) => group == depth + 1,
-            ForwardMode::DsparkContext | ForwardMode::DsparkProposal => group > 0,
-        }
-    }
-
-    fn forward_unit_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        Model::forward_unit_observed(
-            self, group, index, unit, hidden, state, forward, context, observer,
-        )
-    }
-
-    fn forward_unit(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
-        match unit {
-            Unit::Target(unit) if group == 0 => {
-                let hidden = unit.forward(
-                    hidden,
-                    &forward.input_ids,
-                    forward.mask.as_ref(),
-                    Some(
-                        state
-                            .layer(self.target_state_ordinal(index)?)
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )?;
-                capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
-                    index,
-                    &hidden,
-                    &mut forward.captures,
-                    context,
-                )?;
-                Ok(hidden)
-            }
-            Unit::Prediction(unit) if group > 0 => {
-                let output_head = self
-                    .static_modules
-                    .text
-                    .lm_head
-                    .as_mut()
-                    .expect("validated V4 models have an untied output head");
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
-                    + group
-                    - 1;
-                let output = unit.forward(
-                    hidden,
-                    &forward.embedded,
-                    &forward.input_ids,
-                    state.layer(layer).map_err(Error::backend)?,
-                    output_head,
-                    context,
-                )?;
-                forward.draft_logits = Some(output.logits);
-                Ok(output.hidden)
-            }
-            Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
-                    + group
-                    - 1;
-                let cache = state.layer(layer).map_err(Error::backend)?;
-                match forward.mode {
-                    ForwardMode::DsparkContext => {
-                        unit.prefill_attention_cache(hidden, cache, context)?;
-                        Ok(hidden.clone())
-                    }
-                    ForwardMode::DsparkProposal => unit.forward(
-                        hidden,
-                        &forward.input_ids,
-                        forward.mask.as_ref(),
-                        Some(cache),
-                        context,
-                    ),
-                    _ => Err(Error::backend("DSpark unit selected outside DSpark mode")),
-                }
-            }
-            _ => Err(Error::backend(format!(
-                "V4 execution unit does not match group {group}"
-            ))),
-        }
-    }
-
-    fn complete_execution_group(
-        &mut self,
-        group: usize,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &mut Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        if group == 0 && matches!(forward.mode, ForwardMode::Target) {
-            forward.target_capture = Some(complete_target_capture(
-                self.args.target_capture_policy.as_ref(),
-                hidden,
-                &forward.captures,
-                context,
-            )?);
-        }
-        if group == self.groups.prediction_count()
-            && matches!(forward.mode, ForwardMode::DsparkProposal)
-        {
-            let dspark = self
-                .static_modules
-                .dspark
-                .as_mut()
-                .expect("DSpark proposal mode has pinned DSpark modules");
-            let collapsed = dspark.hyper_head.forward(hidden, context)?;
-            let normalized = dspark.output_norm.forward(&collapsed, context)?;
-            let mut logits = self
-                .static_modules
-                .text
-                .lm_head
-                .as_mut()
-                .expect("validated V4 models have an untied output head")
-                .forward(&normalized, context)?;
-            let anchor = forward.input_ids.index(
-                &[eredu_nn::Index::Full, eredu_nn::Index::Range(0, 1)],
-                context,
-            )?;
-            let markov = dspark.markov_embedding.forward(&anchor, context)?;
-            let adjustment = dspark.markov_output.forward(&markov, context)?;
-            let adjustment = adjustment.broadcast_to(logits.shape(), context)?;
-            logits = logits.add(&adjustment, context)?;
-            forward.draft_logits = Some(logits);
-        }
-        if group > 0 && matches!(forward.mode, ForwardMode::Draft(_)) {
-            forward.draft_hidden = Some(hidden.clone());
-        }
-        Ok(hidden.clone())
-    }
-
-    fn finish_forward(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        match forward.mode {
-            ForwardMode::Target => self.finish_target_instrumented(
-                hidden,
-                None,
-                context,
-                &mut crate::decoder::ComponentInstrumentation::disabled(),
-            ),
-            ForwardMode::Draft(_) | ForwardMode::DsparkProposal => forward
-                .draft_logits
-                .clone()
-                .ok_or_else(|| Error::backend("V4 draft group produced no logits")),
-            ForwardMode::DsparkContext => Ok(hidden.clone()),
-        }
-    }
-
-    fn finish_forward_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        if matches!(forward.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.finish_target_instrumented(
-                hidden,
-                None,
-                context,
-                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-            )
-        } else {
-            self.finish_forward(hidden, state, forward, context)
-        }
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        RetainedValues::new([
-            Some(&forward.input_ids),
-            Some(&forward.embedded),
-            forward.mask.as_ref(),
-            forward.target_capture.as_ref(),
-            forward.draft_logits.as_ref(),
-            forward.draft_hidden.as_ref(),
-        ])
-        .with_extras(&forward.captures)
-    }
-}
-
 pub(crate) fn target_group_transport() -> eredu_runtime::ArchitectureGroupTransport {
     let mut transport = crate::transport::decoder();
     transport.last_owner_static_roles.push("hyper_head".into());
     transport
-}
-
-impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
-where
-    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: PoolingAttentionCache<B::Tensor>,
-{
-    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
-        let complete = self.args.dspark.is_none();
-        eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
-    }
-
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        self.begin_instrumented(
-            input,
-            state,
-            Some(parallel),
-            context,
-            &mut crate::decoder::ComponentInstrumentation::disabled(),
-        )
-    }
-
-    fn begin_forward_parallel_observed<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        self.begin_instrumented(
-            input,
-            state,
-            Some(parallel),
-            context,
-            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-        )
-    }
-
-    fn forward_unit_parallel_observed<O>(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        self.groups.unit_count(group)?;
-        if let Unit::Target(block) = unit {
-            if group != 0 {
-                return Err(Error::backend(
-                    "V4 target unit selected in prediction group",
-                ));
-            }
-            let output = block.forward_parallel_observed(
-                &format!("layers.{index}"),
-                hidden,
-                &forward.input_ids,
-                forward.mask.as_ref(),
-                Some(
-                    state
-                        .layer(self.target_state_ordinal(index)?)
-                        .map_err(Error::backend)?,
-                ),
-                context,
-                observer,
-                |value, context| B::sum_parallel(value, parallel, context),
-            )?;
-            if let Some(position) = self
-                .args
-                .target_capture_policy
-                .as_ref()
-                .and_then(|policy| policy.position(index))
-            {
-                let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
-                observer.observe(&format!("dspark.target_captures.{position}"), &capture)?;
-                forward.captures[position] = Some(capture);
-            }
-            Ok(output)
-        } else if let Unit::Prediction(unit) = unit {
-            if group == 0 {
-                return Err(Error::backend(
-                    "V4 prediction unit selected in target group",
-                ));
-            }
-            let layer =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
-            let head = self
-                .static_modules
-                .text
-                .lm_head
-                .as_mut()
-                .expect("validated V4 models have an untied output head");
-            let output = unit.forward_parallel_observed(
-                &format!("mtp.{}", group - 1),
-                hidden,
-                &forward.embedded,
-                &forward.input_ids,
-                state.layer(layer).map_err(Error::backend)?,
-                head,
-                parallel,
-                context,
-                observer,
-                |value, context| B::sum_parallel(value, parallel, context),
-            )?;
-            forward.draft_logits = Some(output.logits);
-            Ok(output.hidden)
-        } else if group > 0 {
-            observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-            let output = <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
-                self, group, index, unit, hidden, state, forward, parallel, context,
-            )?;
-            eredu_runtime::observe_and_intervene(
-                observer,
-                &format!("mtp.{}.output", group - 1),
-                &output,
-            )
-        } else {
-            Err(Error::backend(
-                "V4 prediction unit selected in target group",
-            ))
-        }
-    }
-
-    fn forward_unit_parallel(
-        &mut self,
-        group: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        self.groups.unit_count(group)?;
-        match unit {
-            Unit::Target(unit) if group == 0 => {
-                let hidden = unit.forward_parallel(
-                    hidden,
-                    &forward.input_ids,
-                    forward.mask.as_ref(),
-                    Some(
-                        state
-                            .layer(self.target_state_ordinal(index)?)
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                    |value, context| B::sum_parallel(value, parallel, context),
-                )?;
-                capture_target_layer(
-                    self.args.target_capture_policy.as_ref(),
-                    index,
-                    &hidden,
-                    &mut forward.captures,
-                    context,
-                )?;
-                Ok(hidden)
-            }
-            Unit::Prediction(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
-                    + group
-                    - 1;
-                let output = unit.forward_parallel(
-                    hidden,
-                    &forward.embedded,
-                    &forward.input_ids,
-                    state.layer(layer).map_err(Error::backend)?,
-                    context,
-                    |value, context| B::sum_parallel(value, parallel, context),
-                    |value, context| {
-                        B::vocabulary_parallel_project(
-                            self.static_modules
-                                .text
-                                .lm_head
-                                .as_mut()
-                                .expect("validated V4 models have an untied output head"),
-                            value,
-                            parallel,
-                            context,
-                        )
-                    },
-                )?;
-                forward.draft_logits = Some(output.logits);
-                Ok(output.hidden)
-            }
-            Unit::Dspark(unit) if group > 0 => {
-                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
-                    + group
-                    - 1;
-                let cache = state.layer(layer).map_err(Error::backend)?;
-                match forward.mode {
-                    ForwardMode::DsparkContext => {
-                        unit.prefill_attention_cache(hidden, cache, context)?;
-                        Ok(hidden.clone())
-                    }
-                    ForwardMode::DsparkProposal => unit.forward_parallel(
-                        hidden,
-                        &forward.input_ids,
-                        forward.mask.as_ref(),
-                        Some(cache),
-                        context,
-                        |value, context| B::sum_parallel(value, parallel, context),
-                    ),
-                    _ => Err(Error::backend("DSpark unit selected outside DSpark mode")),
-                }
-            }
-            _ => Err(Error::backend(format!(
-                "V4 parallel execution unit does not match group {group}"
-            ))),
-        }
-    }
-
-    fn complete_execution_group_parallel(
-        &mut self,
-        group: usize,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &mut Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        if group == 0 && matches!(forward.mode, ForwardMode::Target) {
-            forward.target_capture = Some(complete_target_capture(
-                self.args.target_capture_policy.as_ref(),
-                hidden,
-                &forward.captures,
-                context,
-            )?);
-        }
-        if group == self.groups.prediction_count()
-            && matches!(forward.mode, ForwardMode::DsparkProposal)
-        {
-            let dspark = self
-                .static_modules
-                .dspark
-                .as_mut()
-                .expect("DSpark proposal mode has pinned DSpark modules");
-            let collapsed = dspark.hyper_head.forward(hidden, context)?;
-            let normalized = dspark.output_norm.forward(&collapsed, context)?;
-            let mut logits = B::vocabulary_parallel_project(
-                self.static_modules
-                    .text
-                    .lm_head
-                    .as_mut()
-                    .expect("validated V4 models have an untied output head"),
-                &normalized,
-                parallel,
-                context,
-            )?;
-            let anchor = forward.input_ids.index(
-                &[eredu_nn::Index::Full, eredu_nn::Index::Range(0, 1)],
-                context,
-            )?;
-            let markov = dspark.markov_embedding.forward(&anchor, context)?;
-            let adjustment = dspark.markov_output.forward(&markov, context)?;
-            logits = logits.add(&adjustment.broadcast_to(logits.shape(), context)?, context)?;
-            forward.draft_logits = Some(logits);
-        }
-        if group > 0 && matches!(forward.mode, ForwardMode::Draft(_)) {
-            forward.draft_hidden = Some(hidden.clone());
-        }
-        Ok(hidden.clone())
-    }
-
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        match forward.mode {
-            ForwardMode::Target => self.finish_target_instrumented(
-                hidden,
-                Some(parallel),
-                context,
-                &mut crate::decoder::ComponentInstrumentation::disabled(),
-            ),
-            ForwardMode::Draft(_) | ForwardMode::DsparkProposal => forward
-                .draft_logits
-                .clone()
-                .ok_or_else(|| Error::backend("V4 draft group produced no logits")),
-            ForwardMode::DsparkContext => Ok(hidden.clone()),
-        }
-    }
-
-    fn finish_forward_parallel_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: &mut S,
-        forward: &Self::ForwardContext,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        if matches!(forward.mode, ForwardMode::Target) {
-            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.finish_target_instrumented(
-                hidden,
-                Some(parallel),
-                context,
-                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-            )
-        } else {
-            self.finish_forward_parallel(hidden, state, forward, parallel, context)
-        }
-    }
-}
-
-impl<B, S> PartitionedLayeredArchitecture<B, S> for Model<B>
-where
-    B: HyperNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: PoolingAttentionCache<B::Tensor>,
-{
-    fn partition_observation_hooks(
-        &self,
-        _tensor_parallel: bool,
-    ) -> eredu_runtime::inspection::ObservationHookSupport {
-        let complete = self.args.dspark.is_none();
-        eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
-    }
-
-    type Boundary = TargetBoundarySchema;
-
-    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        TargetBoundarySchema::from_args(self.args())
-    }
-
-    fn begin_partition<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        _state: &mut S,
-        _expected: &StateLayout,
-        _first_state_ordinal: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let input = match input {
-            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
-                hidden,
-                boundary: auxiliary,
-            },
-        };
-        self.begin_routed_target_partition(input, mask, None, context)
-    }
-
-    fn begin_partition_parallel<'a>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        _state: &mut S,
-        _expected: &StateLayout,
-        _first_state_ordinal: usize,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let input = match input {
-            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
-                hidden,
-                boundary: auxiliary,
-            },
-        };
-        self.begin_routed_target_partition(input, mask, Some(parallel), context)
-    }
-
-    fn begin_partition_observed<'a, O>(
-        &mut self,
-        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
-        mask: Option<&B::Tensor>,
-        _state: &mut S,
-        _expected: &StateLayout,
-        _first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let input = match input {
-            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
-                hidden,
-                boundary: auxiliary,
-            },
-        };
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        self.begin_routed_target_partition_instrumented(
-            input,
-            mask,
-            parallel,
-            context,
-            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-        )
-    }
-
-    fn finish_partition_observed<O>(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-    {
-        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-        match self.finish_routed_target_partition_instrumented(
-            hidden,
-            forward,
-            owns_output,
-            parallel,
-            context,
-            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-        )? {
-            TargetPartitionOutput::Final {
-                logits,
-                draft_hidden,
-            } => Ok(LayeredPartitionOutput::Final {
-                output: logits,
-                retained: Some(draft_hidden),
-            }),
-            TargetPartitionOutput::Boundary { hidden, boundary } => {
-                Ok(LayeredPartitionOutput::Boundary {
-                    hidden,
-                    auxiliary: boundary,
-                })
-            }
-        }
-    }
-
-    fn finish_partition(
-        &mut self,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &Self::ForwardContext,
-        owns_output: bool,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Self::Error> {
-        match self.finish_routed_target_partition(
-            hidden,
-            forward,
-            owns_output,
-            parallel,
-            context,
-        )? {
-            TargetPartitionOutput::Final {
-                logits,
-                draft_hidden,
-            } => Ok(LayeredPartitionOutput::Final {
-                output: logits,
-                retained: Some(draft_hidden),
-            }),
-            TargetPartitionOutput::Boundary { hidden, boundary } => {
-                Ok(LayeredPartitionOutput::Boundary {
-                    hidden,
-                    auxiliary: boundary,
-                })
-            }
-        }
-    }
-}
-
-impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for Model<B>
-where
-    B: HyperNeuralBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend,
-    S: LayerRuntimeState<B>,
-    S::LayerState: PoolingAttentionCache<B::Tensor>,
-{
-    fn partition_input_dimensions(
-        &self,
-        input: &Self::Input<'_>,
-    ) -> Result<(i32, i32), Self::Error> {
-        match input {
-            EmbeddedInput::Target { tokens, .. } => Ok((tokens.dim(0), tokens.dim(1))),
-            _ => Err(eredu_nn::Error::backend(
-                "target partition received prediction input",
-            )),
-        }
-    }
-
-    fn begin_pipeline_partition<'a, O>(
-        &mut self,
-        input: Self::Input<'a>,
-        incoming: Option<(
-            B::Tensor,
-            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
-        )>,
-        state: &mut S,
-        expected: Option<&eredu_runtime::StateLayout>,
-        first_state_ordinal: usize,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
-    {
-        let expected = expected.ok_or_else(|| {
-            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
-        })?;
-        let (tokens, mask) = match input {
-            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
-            _ => {
-                return Err(eredu_nn::Error::backend(
-                    "target partition received prediction input",
-                ))
-            }
-        };
-        let input = match incoming {
-            Some((hidden, auxiliary)) => {
-                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
-            }
-            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
-        };
-        self.begin_partition_observed(
-            input,
-            mask,
-            state,
-            expected,
-            first_state_ordinal,
-            parallel,
-            context,
-            observer,
-        )
-    }
-
-    fn partition_output_width(&self) -> i32 {
-        self.args.vocab_size
-    }
 }
 
 /// Builds the shared learned or token-selected MoE policy for one target
@@ -4125,4 +3260,1222 @@ fn broadcast_streams<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend>
 ) -> Result<B::Tensor, Error> {
     eredu_nn::residual_streams::ResidualStreamGeometry::new(args.hc_mult, args.hidden_size)?
         .expand(hidden, context)
+}
+
+/// Validates source-free V4 invocation, storage, state and transport ownership.
+pub fn component_definition(
+    args: &V4Args,
+    geometry: Option<&super::parallel::V4LocalGeometry>,
+) -> Result<eredu_runtime::ComponentDefinition, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => state_layout(args)?,
+    };
+    let parameters = super::parallel::v4_parameters(args).map_err(Error::backend_source)?;
+    let definition = super::component::definition(
+        "deepseek_v4",
+        parameters,
+        state,
+        target_group_transport(),
+        unit_path,
+    )?;
+    definition
+        .map_unit_observation_boundaries(|address, boundaries| {
+            if kernel_observations(args, address) {
+                boundaries.clone().with_kernel_ownership()
+            } else {
+                boundaries.clone()
+            }
+        })
+        .map_err(Error::from)
+}
+
+fn unit_path(address: ExecutionUnitAddress, _ordinal: usize) -> String {
+    if address.group() == 0 {
+        format!("layers.{}", address.index())
+    } else {
+        format!("mtp.{}", address.group() - 1)
+    }
+}
+fn kernel_observations(args: &V4Args, address: ExecutionUnitAddress) -> bool {
+    address.group() == 0 || args.dspark.is_none()
+}
+
+/// Selects executable formats while preserving logical consumers and observation seams.
+pub fn project_parameters(
+    args: &V4Args,
+    definition: &Arc<eredu_runtime::ComponentDefinition>,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    super::component::project_parameters(
+        "deepseek_v4",
+        super::parallel::v4_parameters(args).map_err(Error::backend_source)?,
+        definition,
+    )
+}
+fn invalid_definition(
+    definition: &eredu_runtime::ComponentDefinition,
+    resource: impl Into<String>,
+) -> Error {
+    eredu_runtime::ComponentDefinitionError::Invalid {
+        component: definition.id().into(),
+        resource: resource.into(),
+    }
+    .into()
+}
+fn select_definition(
+    args: &V4Args,
+    definition: Arc<eredu_runtime::ComponentDefinition>,
+    geometry: Option<&super::parallel::V4LocalGeometry>,
+) -> Result<Arc<eredu_runtime::ComponentDefinition>, Error> {
+    args.validate().map_err(Error::backend_source)?;
+    if definition.id() != "deepseek_v4" {
+        return Err(invalid_definition(
+            &definition,
+            "DeepSeek-V4 component identity",
+        ));
+    }
+    definition.validate_parameter_topology(
+        &super::parallel::v4_parameters(args).map_err(Error::backend_source)?,
+    )?;
+    let global = state_layout(args)?;
+    let state = match geometry {
+        Some(geometry) => {
+            geometry.validate_for(args).map_err(Error::backend_source)?;
+            geometry.state_layout().clone()
+        }
+        None => global.clone(),
+    };
+    if definition.state_layout() != &global && definition.state_layout() != &state {
+        return Err(invalid_definition(
+            &definition,
+            "V4 retained state differs from global or selected geometry",
+        ));
+    }
+    if let Some((_, layout)) = definition.parameters().partition_layout() {
+        let retained =
+            super::parallel::v4_local_geometry(args, layout).map_err(Error::backend_source)?;
+        let full = eredu_nn::VocabularyParallelRange {
+            global_vocabulary: args.vocab_size as usize,
+            local: 0..args.vocab_size as usize,
+        };
+        let selected = geometry.map_or(args, super::parallel::V4LocalGeometry::args);
+        let actual = retained.args();
+        if retained.state_layout() != &state
+            || retained.embedding_range()
+                != geometry.map_or(&full, super::parallel::V4LocalGeometry::embedding_range)
+            || retained.output_range()
+                != geometry.map_or(&full, super::parallel::V4LocalGeometry::output_range)
+            || actual.num_attention_heads != selected.num_attention_heads
+            || actual.o_groups != selected.o_groups
+            || actual.moe_intermediate_size != selected.moe_intermediate_size
+            || geometry.is_some_and(|geometry| {
+                retained.routed_expert_intermediate_range()
+                    != geometry.routed_expert_intermediate_range()
+                    || retained.shared_expert_intermediate_range()
+                        != geometry.shared_expert_intermediate_range()
+            })
+        {
+            return Err(invalid_definition(
+                &definition,
+                "V4 retained placement differs from selected geometry",
+            ));
+        }
+    }
+    super::component::validate(
+        &definition,
+        target_group_transport(),
+        unit_path,
+        |address, unit, boundaries| {
+            if kernel_observations(args, address) {
+                boundaries
+                    == &eredu_runtime::UnitObservationBoundaries::around(&unit.path)
+                        .with_kernel_ownership()
+            } else {
+                !boundaries.is_kernel_owned()
+            }
+        },
+    )?;
+    definition.select_state_layout(&state).map_err(Error::from)
+}
+
+impl<B> ComponentKernel<B> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+{
+    type Input<'a>
+        = EmbeddedInput<'a, B::Tensor>
+    where
+        Self: 'a;
+    type Unit = Unit<B>;
+    type ForwardContext = ForwardContext<B::Tensor>;
+    type RetainedContextValues<'a>
+        = RetainedValues<'a, B::Tensor>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
+    type Error = Error;
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Self::Error> {
+        state_identity(
+            &self.construction.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+        )
+    }
+    fn build_unit(
+        &self,
+        address: ExecutionUnitAddress,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, Self::Error> {
+        let group = address.group();
+        let index = address.index();
+        self.construct_unit(group, index, context)
+    }
+    fn executes_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        match forward.mode {
+            ForwardMode::Target => group == 0,
+            ForwardMode::Draft(depth) => group == depth + 1,
+            ForwardMode::DsparkContext | ForwardMode::DsparkProposal => group > 0,
+        }
+    }
+    fn prediction_target_capture(context: &Self::ForwardContext) -> Option<&B::Tensor> {
+        context.target_capture()
+    }
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        let input = forward.input_ids();
+        let shape = match &self.construction.args.target_capture_policy {
+            Some(policy) => vec![
+                input.dim(0),
+                input.dim(1),
+                i32::try_from(policy.len())
+                    .map_err(|_| Error::backend("target capture count exceeds i32"))?
+                    .checked_mul(self.construction.args.hidden_size)
+                    .ok_or_else(|| Error::backend("target capture width overflowed"))?,
+            ],
+            None => vec![
+                input.dim(0),
+                input.dim(1),
+                self.construction.args.hidden_size,
+            ],
+        };
+        Ok(Some(shape))
+    }
+    fn retained_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _address: ExecutionUnitAddress,
+    ) -> Self::RetainedContextValues<'a> {
+        RetainedValues::new([
+            Some(&forward.input_ids),
+            Some(&forward.embedded),
+            forward.mask.as_ref(),
+            forward.target_capture.as_ref(),
+            forward.draft_logits.as_ref(),
+            forward.draft_hidden.as_ref(),
+        ])
+        .with_extras(&forward.captures)
+    }
+}
+impl<B> ComponentPinnedResources<B> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+{
+    type Modules = StaticModules<B>;
+    fn pinned_modules(&self) -> &Self::Modules {
+        &self.static_modules
+    }
+    fn pinned_modules_mut(&mut self) -> &mut Self::Modules {
+        &mut self.static_modules
+    }
+    fn visit_pinned<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitor<B>,
+    {
+        self.static_modules
+            .text
+            .decoder_resources()
+            .visit(visitor)?;
+        if let Some(head) = &self.static_modules.hyper_head {
+            visitor.visit("hyper_head", head)?;
+        }
+        if let Some(dspark) = &self.static_modules.dspark {
+            visitor.visit("mtp", dspark)?;
+        }
+        Ok(())
+    }
+    fn visit_pinned_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: eredu_runtime::StaticParameterVisitorMut<B>,
+    {
+        self.static_modules
+            .text
+            .decoder_resources_mut()
+            .visit(visitor)?;
+        if let Some(head) = &mut self.static_modules.hyper_head {
+            visitor.visit_mut("hyper_head", head)?;
+        }
+        if let Some(dspark) = &mut self.static_modules.dspark {
+            visitor.visit_mut("mtp", dspark)?;
+        }
+        Ok(())
+    }
+}
+impl<B, S> ComponentEquations<B, S> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let complete = self.construction.args.dspark.is_none();
+        eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
+    }
+    fn begin<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_instrumented(
+            input,
+            state,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+    fn begin_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.begin_instrumented(
+            input,
+            state,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+        )
+    }
+    fn begin_group(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        super::component::begin_group(&self.construction.definition, group, initial, dependencies)
+    }
+    fn execute(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let group = address.group();
+        let index = address.index();
+        self.construction.definition.unit(group, index)?;
+        match unit {
+            Unit::Target(unit) if group == 0 => {
+                let hidden = unit.forward(
+                    hidden,
+                    &forward.input_ids,
+                    forward.mask.as_ref(),
+                    Some(
+                        state
+                            .layer(self.target_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
+                    context,
+                )?;
+                capture_target_layer(
+                    self.construction.args.target_capture_policy.as_ref(),
+                    index,
+                    &hidden,
+                    &mut forward.captures,
+                    context,
+                )?;
+                Ok(hidden)
+            }
+            Unit::Prediction(unit) if group > 0 => {
+                let output_head =
+                    self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
+                        Error::backend("V4 does not own vocabulary output storage")
+                    })?;
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
+                    + group
+                    - 1;
+                let output =
+                    unit.forward(
+                        hidden,
+                        &forward.embedded,
+                        &forward.input_ids,
+                        state
+                            .layer(layer.checked_sub(self.partition_target_start).ok_or_else(
+                                || {
+                                    Error::backend(
+                                        "V4 prediction state precedes selected partition",
+                                    )
+                                },
+                            )?)
+                            .map_err(Error::backend)?,
+                        output_head,
+                        context,
+                    )?;
+                forward.draft_logits = Some(output.logits);
+                Ok(output.hidden)
+            }
+            Unit::Dspark(unit) if group > 0 => {
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
+                    + group
+                    - 1;
+                let cache = state
+                    .layer(
+                        layer
+                            .checked_sub(self.partition_target_start)
+                            .ok_or_else(|| {
+                                Error::backend("V4 prediction state precedes selected partition")
+                            })?,
+                    )
+                    .map_err(Error::backend)?;
+                match forward.mode {
+                    ForwardMode::DsparkContext => {
+                        unit.prefill_attention_cache(hidden, cache, context)?;
+                        Ok(hidden.clone())
+                    }
+                    ForwardMode::DsparkProposal => unit.forward(
+                        hidden,
+                        &forward.input_ids,
+                        forward.mask.as_ref(),
+                        Some(cache),
+                        context,
+                    ),
+                    _ => Err(Error::backend("DSpark unit selected outside DSpark mode")),
+                }
+            }
+            _ => Err(Error::backend(format!(
+                "V4 execution unit does not match group {group}"
+            ))),
+        }
+    }
+    fn execute_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let group = address.group();
+        let index = address.index();
+        V4Kernel::forward_unit_observed(
+            self, group, index, unit, hidden, state, forward, context, observer,
+        )
+    }
+    fn complete_group(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.complete_group_inner(group, hidden, forward, None, context)
+    }
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        match forward.mode {
+            ForwardMode::Target => self.finish_target_instrumented(
+                hidden,
+                None,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::disabled(),
+            ),
+            ForwardMode::Draft(_) | ForwardMode::DsparkProposal => forward
+                .draft_logits
+                .clone()
+                .ok_or_else(|| Error::backend("V4 draft group produced no logits")),
+            ForwardMode::DsparkContext => Ok(hidden.clone()),
+        }
+    }
+    fn finish_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if matches!(forward.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.finish_target_instrumented(
+                hidden,
+                None,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
+        } else {
+            self.finish(hidden, state, forward, context)
+        }
+    }
+}
+impl<B, S> ParallelComponentKernel<B, S> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let complete = self.construction.args.dspark.is_none();
+        eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
+    }
+    fn begin_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        self.begin_instrumented(
+            input,
+            state,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+    fn begin_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.begin_instrumented(
+            input,
+            state,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+        )
+    }
+    fn execute_parallel(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let group = address.group();
+        let index = address.index();
+        self.construction.definition.unit(group, index)?;
+        match unit {
+            Unit::Target(unit) if group == 0 => {
+                let hidden = unit.forward_parallel(
+                    hidden,
+                    &forward.input_ids,
+                    forward.mask.as_ref(),
+                    Some(
+                        state
+                            .layer(self.target_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )?;
+                capture_target_layer(
+                    self.construction.args.target_capture_policy.as_ref(),
+                    index,
+                    &hidden,
+                    &mut forward.captures,
+                    context,
+                )?;
+                Ok(hidden)
+            }
+            Unit::Prediction(unit) if group > 0 => {
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
+                    + group
+                    - 1;
+                let output =
+                    unit.forward_parallel(
+                        hidden,
+                        &forward.embedded,
+                        &forward.input_ids,
+                        state
+                            .layer(layer.checked_sub(self.partition_target_start).ok_or_else(
+                                || {
+                                    Error::backend(
+                                        "V4 prediction state precedes selected partition",
+                                    )
+                                },
+                            )?)
+                            .map_err(Error::backend)?,
+                        context,
+                        |value, context| B::sum_parallel(value, parallel, context),
+                        |value, context| {
+                            B::vocabulary_parallel_project(
+                                self.static_modules.text.lm_head.as_mut().ok_or_else(|| {
+                                    Error::backend("V4 does not own vocabulary output storage")
+                                })?,
+                                value,
+                                parallel,
+                                context,
+                            )
+                        },
+                    )?;
+                forward.draft_logits = Some(output.logits);
+                Ok(output.hidden)
+            }
+            Unit::Dspark(unit) if group > 0 => {
+                let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                    .map_err(Error::backend)?
+                    + group
+                    - 1;
+                let cache = state
+                    .layer(
+                        layer
+                            .checked_sub(self.partition_target_start)
+                            .ok_or_else(|| {
+                                Error::backend("V4 prediction state precedes selected partition")
+                            })?,
+                    )
+                    .map_err(Error::backend)?;
+                match forward.mode {
+                    ForwardMode::DsparkContext => {
+                        unit.prefill_attention_cache(hidden, cache, context)?;
+                        Ok(hidden.clone())
+                    }
+                    ForwardMode::DsparkProposal => unit.forward_parallel(
+                        hidden,
+                        &forward.input_ids,
+                        forward.mask.as_ref(),
+                        Some(cache),
+                        context,
+                        |value, context| B::sum_parallel(value, parallel, context),
+                    ),
+                    _ => Err(Error::backend("DSpark unit selected outside DSpark mode")),
+                }
+            }
+            _ => Err(Error::backend(format!(
+                "V4 parallel execution unit does not match group {group}"
+            ))),
+        }
+    }
+    fn execute_parallel_observed<O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let group = address.group();
+        let index = address.index();
+        self.construction.definition.unit(group, index)?;
+        if let Unit::Target(block) = unit {
+            if group != 0 {
+                return Err(Error::backend(
+                    "V4 target unit selected in prediction group",
+                ));
+            }
+            let output = block.forward_parallel_observed(
+                &format!("layers.{index}"),
+                hidden,
+                &forward.input_ids,
+                forward.mask.as_ref(),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
+                context,
+                observer,
+                |value, context| B::sum_parallel(value, parallel, context),
+            )?;
+            if let Some(position) = self
+                .construction
+                .args
+                .target_capture_policy
+                .as_ref()
+                .and_then(|policy| policy.position(index))
+            {
+                let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
+                observer.observe(&format!("dspark.target_captures.{position}"), &capture)?;
+                forward.captures[position] = Some(capture);
+            }
+            Ok(output)
+        } else if let Unit::Prediction(unit) = unit {
+            if group == 0 {
+                return Err(Error::backend(
+                    "V4 prediction unit selected in target group",
+                ));
+            }
+            let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                .map_err(Error::backend)?
+                + group
+                - 1;
+            let head = self
+                .static_modules
+                .text
+                .lm_head
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
+            let output = unit.forward_parallel_observed(
+                &format!("mtp.{}", group - 1),
+                hidden,
+                &forward.embedded,
+                &forward.input_ids,
+                state
+                    .layer(
+                        layer
+                            .checked_sub(self.partition_target_start)
+                            .ok_or_else(|| {
+                                Error::backend("V4 prediction state precedes selected partition")
+                            })?,
+                    )
+                    .map_err(Error::backend)?,
+                head,
+                parallel,
+                context,
+                observer,
+                |value, context| B::sum_parallel(value, parallel, context),
+            )?;
+            forward.draft_logits = Some(output.logits);
+            Ok(output.hidden)
+        } else if group > 0 {
+            observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
+            let output = <Self as ParallelComponentKernel<B, S>>::execute_parallel(
+                self,
+                self.construction.definition.unit_address(group, index)?,
+                unit,
+                hidden,
+                state,
+                forward,
+                parallel,
+                context,
+            )?;
+            eredu_runtime::observe_and_intervene(
+                observer,
+                &format!("mtp.{}.output", group - 1),
+                &output,
+            )
+        } else {
+            Err(Error::backend(
+                "V4 prediction unit selected in target group",
+            ))
+        }
+    }
+    fn complete_group_parallel(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.complete_group_inner(group, hidden, forward, Some(parallel), context)
+    }
+    fn finish_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        match forward.mode {
+            ForwardMode::Target => self.finish_target_instrumented(
+                hidden,
+                Some(parallel),
+                context,
+                &mut crate::decoder::ComponentInstrumentation::disabled(),
+            ),
+            ForwardMode::Draft(_) | ForwardMode::DsparkProposal => forward
+                .draft_logits
+                .clone()
+                .ok_or_else(|| Error::backend("V4 draft group produced no logits")),
+            ForwardMode::DsparkContext => Ok(hidden.clone()),
+        }
+    }
+    fn finish_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if matches!(forward.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.finish_target_instrumented(
+                hidden,
+                Some(parallel),
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
+        } else {
+            self.finish_parallel(hidden, state, forward, parallel, context)
+        }
+    }
+}
+impl<B, S> RoutedComponentKernel<B, S> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn routed_unit_observations(&self) -> bool {
+        self.construction.args.dspark.is_none()
+    }
+    fn routed_sparse_observations(&self) -> bool {
+        self.construction.args.dspark.is_none()
+    }
+    fn execute_routed<P>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let group = address.group();
+        let index = address.index();
+        V4Kernel::forward_unit_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, provider, context,
+        )
+    }
+    fn execute_routed_observed<P, O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let group = address.group();
+        let index = address.index();
+        V4Kernel::forward_unit_observed_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, provider, context, observer,
+        )
+    }
+}
+impl<B, S> ParallelRoutedComponentKernel<B, S> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn parallel_routed_unit_observations(&self) -> bool {
+        self.construction.args.dspark.is_none()
+    }
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        self.construction.args.dspark.is_none()
+    }
+    fn execute_parallel_routed<P>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let group = address.group();
+        let index = address.index();
+        V4Kernel::forward_unit_parallel_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, parallel, provider, context,
+        )
+    }
+    fn execute_parallel_routed_observed<P, O>(
+        &mut self,
+        address: ExecutionUnitAddress,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let group = address.group();
+        let index = address.index();
+        self.construction.definition.unit(group, index)?;
+        if let Unit::Target(block) = unit {
+            if group != 0 {
+                return Err(Error::backend(
+                    "V4 target unit selected in prediction group",
+                ));
+            }
+            let output = block.forward_parallel_observed_with_provider(
+                &format!("layers.{index}"),
+                hidden,
+                &forward.input_ids,
+                forward.mask.as_ref(),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
+                pass,
+                provider,
+                context,
+                observer,
+                |value, context| B::sum_parallel(value, parallel, context),
+            )?;
+            if let Some(position) = self
+                .construction
+                .args
+                .target_capture_policy
+                .as_ref()
+                .and_then(|policy| policy.position(index))
+            {
+                let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
+                observer.observe(&format!("dspark.target_captures.{position}"), &capture)?;
+                forward.captures[position] = Some(capture);
+            }
+            Ok(output)
+        } else if let Unit::Prediction(unit) = unit {
+            if group == 0 {
+                return Err(Error::backend(
+                    "V4 prediction unit selected in target group",
+                ));
+            }
+            let layer = usize::try_from(self.construction.args.num_hidden_layers)
+                .map_err(Error::backend)?
+                + group
+                - 1;
+            let head = self
+                .static_modules
+                .text
+                .lm_head
+                .as_mut()
+                .ok_or_else(|| Error::backend("V4 does not own vocabulary output storage"))?;
+            let output = unit.forward_parallel_observed_with_provider(
+                &format!("mtp.{}", group - 1),
+                hidden,
+                &forward.embedded,
+                &forward.input_ids,
+                state
+                    .layer(
+                        layer
+                            .checked_sub(self.partition_target_start)
+                            .ok_or_else(|| {
+                                Error::backend("V4 prediction state precedes selected partition")
+                            })?,
+                    )
+                    .map_err(Error::backend)?,
+                head,
+                pass,
+                provider,
+                parallel,
+                context,
+                observer,
+                |value, context| B::sum_parallel(value, parallel, context),
+            )?;
+            forward.draft_logits = Some(output.logits);
+            Ok(output.hidden)
+        } else if group > 0 {
+            observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
+            let output = V4Kernel::forward_unit_parallel_with_provider(
+                self, group, index, unit, hidden, state, forward, pass, parallel, provider, context,
+            )?;
+            eredu_runtime::observe_and_intervene(
+                observer,
+                &format!("mtp.{}.output", group - 1),
+                &output,
+            )
+        } else {
+            Err(Error::backend(
+                "V4 prediction unit selected in target group",
+            ))
+        }
+    }
+}
+impl<B, S> PartitionComponentKernel<B, S> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    type Boundary = TargetBoundarySchema;
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        let complete = self.construction.args.dspark.is_none();
+        eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
+    }
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        TargetBoundarySchema::from_args(self.args())
+    }
+    fn begin_partition(
+        &mut self,
+        input: LayeredPartitionInput<'_, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        _state: &mut S,
+        selected: ComponentPartitionContext<'_, B>,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
+                hidden,
+                boundary: auxiliary,
+            },
+        };
+        self.begin_routed_target_partition(input, mask, selected.parallel, selected.native)
+    }
+    fn begin_partition_observed<O>(
+        &mut self,
+        input: LayeredPartitionInput<'_, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        _state: &mut S,
+        selected: ComponentPartitionContext<'_, B>,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let input = match input {
+            LayeredPartitionInput::Tokens(tokens) => TargetPartitionInput::Tokens(tokens),
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => TargetPartitionInput::Hidden {
+                hidden,
+                boundary: auxiliary,
+            },
+        };
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.begin_routed_target_partition_instrumented(
+            input,
+            mask,
+            selected.parallel,
+            selected.native,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+        )
+    }
+    fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Self::Error> {
+        match self.finish_routed_target_partition(
+            hidden,
+            forward,
+            owns_output,
+            parallel,
+            context,
+        )? {
+            TargetPartitionOutput::Final {
+                logits,
+                draft_hidden,
+            } => Ok(LayeredPartitionOutput::Final {
+                output: logits,
+                retained: Some(draft_hidden),
+            }),
+            TargetPartitionOutput::Boundary { hidden, boundary } => {
+                Ok(LayeredPartitionOutput::Boundary {
+                    hidden,
+                    auxiliary: boundary,
+                })
+            }
+        }
+    }
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        match self.finish_routed_target_partition_instrumented(
+            hidden,
+            forward,
+            owns_output,
+            parallel,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+        )? {
+            TargetPartitionOutput::Final {
+                logits,
+                draft_hidden,
+            } => Ok(LayeredPartitionOutput::Final {
+                output: logits,
+                retained: Some(draft_hidden),
+            }),
+            TargetPartitionOutput::Boundary { hidden, boundary } => {
+                Ok(LayeredPartitionOutput::Boundary {
+                    hidden,
+                    auxiliary: boundary,
+                })
+            }
+        }
+    }
+    fn enter_partition_group(
+        &mut self,
+        _group: usize,
+        initial: &B::Tensor,
+        _state: &mut S,
+        _forward: &mut Self::ForwardContext,
+        _parallel: Option<&B::ParallelContext>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        Ok(initial.clone())
+    }
+}
+impl<B, S> PipelineComponentKernel<B, S> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+        match input {
+            EmbeddedInput::Target { tokens, .. } => Ok((tokens.dim(0), tokens.dim(1))),
+            _ => Err(eredu_nn::Error::backend(
+                "target partition received prediction input",
+            )),
+        }
+    }
+    fn output_width(&self) -> i32 {
+        self.construction.args.vocab_size
+    }
+    fn tensor_vocabulary_sharded(&self) -> bool {
+        true
+    }
+    fn begin_pipeline<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        )>,
+        state: &mut S,
+        selected: ComponentPartitionContext<'_, B>,
+        observer: &mut O,
+    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (tokens, mask) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
+            _ => {
+                return Err(eredu_nn::Error::backend(
+                    "target partition received prediction input",
+                ))
+            }
+        };
+        let input = match incoming {
+            Some((hidden, auxiliary)) => {
+                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
+            }
+            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        };
+        self.begin_partition_observed(input, mask, state, selected, observer)
+    }
+}
+impl<B> TextComponentKernel<B> for V4Kernel<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+{
+    fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
+        EmbeddedInput::Target { tokens, mask }
+    }
 }

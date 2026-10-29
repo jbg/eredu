@@ -1,6 +1,6 @@
 //! Flash-Next operations plugged into the shared prediction lifecycle.
 use super::*;
-use crate::qwen4_exp::{mtp, target::TargetModel};
+use crate::qwen4_exp::{mtp, target::TargetKernel};
 use eredu_nn::{residual_streams::ResidualStreamGeometry, EmbeddingOperator};
 use eredu_runtime::{RuntimeState, TensorParallelParameterProvider};
 
@@ -22,17 +22,14 @@ pub trait Qwen4PredictionTarget<B: GroupedNeuralBackend + DistributedNeuralBacke
     ) -> Result<B::Tensor, eredu_nn::Error>;
 }
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Qwen4PredictionTarget<B>
-    for TargetModel<B>
+    for TargetKernel<B>
 {
     fn prediction_embedding(
         &mut self,
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.decoder
-            .static_modules_mut()
-            .embeddings
-            .forward(tokens, context)
+        self.statics.embedding_mut()?.forward(tokens, context)
     }
     fn prediction_logits(
         &mut self,
@@ -40,26 +37,23 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> Qwen4PredictionTarget<B
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.decoder.static_modules_mut().project_instrumented(
-            hidden,
-            None,
-            context,
-            instrumentation,
-        )
+        self.statics
+            .project_instrumented(hidden, None, context, instrumentation)
     }
 }
 
-impl<A, B> Qwen4PredictionTarget<B> for crate::composite_execution::PreparedCompositeArchitecture<A>
+impl<B, D, K, R> Qwen4PredictionTarget<B> for eredu_runtime::ComponentAdapter<D, K, R>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
-    A: Qwen4PredictionTarget<B>,
+    D: std::borrow::Borrow<eredu_runtime::ComponentDefinition>,
+    K: Qwen4PredictionTarget<B>,
 {
     fn prediction_embedding(
         &mut self,
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut().prediction_embedding(tokens, context)
+        self.kernel_mut().prediction_embedding(tokens, context)
     }
     fn prediction_logits(
         &mut self,
@@ -67,7 +61,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, eredu_nn::Error> {
-        self.inner_mut()
+        self.kernel_mut()
             .prediction_logits(hidden, context, instrumentation)
     }
 }
@@ -263,25 +257,10 @@ where
     A: Qwen4PredictionTarget<B>,
 {
     type LaneState = M::ModelState;
+    type StateProfile = super::ModelPredictionStateProfile;
 
     fn supports_internal_observations(&self) -> bool {
         true
-    }
-
-    fn complete_state(
-        &self,
-        state: &mut Self::LaneState,
-        outputs: &[&B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), eredu_core::BackendFailure> {
-        M::complete_prediction_values(
-            state
-                .prediction_layers_mut()
-                .iter()
-                .flat_map(eredu_runtime::RuntimeLayerState::<B>::retained_values)
-                .chain(outputs.iter().copied()),
-            context,
-        )
     }
 
     fn visit_modules<V: PredictionModuleVisitor<B, M>>(
@@ -289,31 +268,7 @@ where
         visitor: &mut V,
     ) -> Result<(), V::Error> {
         visitor.visit::<crate::qwen4_exp::mtp::PredictionShared<B>>(0, &mut self.shared)?;
-        for (ordinal, module) in self.units.iter_mut().enumerate() {
-            visitor.visit::<crate::qwen4_exp::mtp::PredictionUnit<B>>(ordinal + 1, module)?;
-        }
-        Ok(())
-    }
-
-    fn snapshot_estimate(
-        &self,
-        state: &Self::LaneState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
-    }
-    fn memory_observation(
-        &self,
-        state: &Self::LaneState,
-        additional: u64,
-    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
-        M::model_memory_observation(state, additional)
-    }
-    fn snapshot(
-        &self,
-        state: &Self::LaneState,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::LaneState>, eredu_core::BackendFailure> {
-        M::model_snapshot(state, context)
+        visitor.visit_units::<crate::qwen4_exp::mtp::PredictionUnit<B>>(1, self.units.iter_mut())
     }
 
     fn depth(&self) -> usize {
@@ -349,22 +304,6 @@ where
 
     fn new_state(&self) -> Self::LaneState {
         self.state.clone()
-    }
-
-    fn prefill<S, I>(
-        &mut self,
-        invoker: &mut I,
-        target_capture: &B::Tensor,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, target_capture, hidden, tokens, lane, None)
     }
 
     fn prefill_observed<S, I>(
@@ -411,22 +350,6 @@ where
             })
     }
 
-    fn logits<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        token: &B::Tensor,
-        draft_index: usize,
-        lane: &mut Self::LaneState,
-    ) -> Result<(B::Tensor, B::Tensor), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.logits_observed::<S, I>(invoker, hidden, token, draft_index, lane, None)
-    }
-
     fn logits_observed<S, I>(
         &mut self,
         invoker: &mut I,
@@ -459,21 +382,6 @@ where
                 observer,
             })
             .map(|output| (output.logits, output.capture))
-    }
-    fn advance_observed<S, I>(
-        &mut self,
-        invoker: &mut I,
-        hidden: &B::Tensor,
-        tokens: &B::Tensor,
-        lane: &mut Self::LaneState,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error>>,
-    ) -> Result<(), I::Error>
-    where
-        S: eredu_runtime::RuntimeState<B>,
-        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
-        I: PredictionOperationInvoker<A, B, S>,
-    {
-        self.prefill_observed::<S, I>(invoker, hidden, hidden, tokens, lane, observer)
     }
 }
 
@@ -627,14 +535,9 @@ where
                 let layout = partition
                     .local_layout(&parameters, &local)
                     .map_err(|error| invalid(error.to_string()))?;
-                let source_layout = if tasks.iter().any(|task| {
-                    matches!(
-                        task.lowering(),
-                        eredu_runtime::WeightLoweringKind::Transform
-                            | eredu_runtime::WeightLoweringKind::DerivedTransform
-                    )
-                }) {
-                    Some(std::sync::Arc::new(
+                let source_layout = eredu_runtime::prepare_transform_source_layout(
+                    tasks.iter().map(|task| task.lowering()),
+                    || {
                         source_partition
                             .local_layout(
                                 &prediction_parameters::<B>(source_spec, context)?,
@@ -643,11 +546,9 @@ where
                                     context,
                                 )?,
                             )
-                            .map_err(|error| invalid(error.to_string()))?,
-                    ))
-                } else {
-                    None
-                };
+                            .map_err(|error| invalid(error.to_string()))
+                    },
+                )?;
                 (Some(std::sync::Arc::new(layout)), source_layout)
             }
             None => (None, None),
@@ -817,11 +718,7 @@ where
         M: PredictionExtensionMaterializer<B>,
     {
         let shared = M::materialize_module(context, self.shared, self.layout.as_deref())?;
-        let units = self
-            .units
-            .into_iter()
-            .map(|unit| M::materialize_module(context, unit, self.layout.as_deref()))
-            .collect::<Result<_, _>>()?;
+        let units = M::materialize_units(context, self.units, self.layout.as_deref())?;
         Ok((shared, units))
     }
 }
@@ -854,7 +751,6 @@ where
         |_, _| Ok(MemberSharding::Replicated),
     )
     .map_err(|error| invalid(error.to_string()))?;
-    let mut expected = vec![shared.clone()];
     let mut owned = vec![OwnedParameterGroupSpec::new(
         ParameterGroupOwner::static_role("prediction_shared"),
         shared,
@@ -869,13 +765,12 @@ where
             |_, _| Ok(MemberSharding::Replicated),
         )
         .map_err(|error| invalid(error.to_string()))?;
-        expected.push(group.clone());
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), depth),
             group,
         ));
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+    ArchitectureParameterDescription::from_owned(&graph, &layout, owned)
         .map_err(|error| invalid(error.to_string()))
 }
 

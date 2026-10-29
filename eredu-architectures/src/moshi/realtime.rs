@@ -27,9 +27,8 @@ use eredu_runtime::{
 };
 
 use super::{
-    observation_points, parameter_contract, select_parallel_execution, state_layout,
-    DecisionBoundary, MoshiConfig, MoshiParallelSelection, MoshiParameterContract,
-    MoshiPreparationPlan,
+    observation_points, parameter_contract, select_parallel_execution, DecisionBoundary,
+    MoshiConfig, MoshiParallelSelection, MoshiParameterContract, MoshiPreparationPlan,
 };
 
 /// Derives portable input validation from normalized Moshi architecture policy.
@@ -151,11 +150,15 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>,
 {
     fn realtime_decision_boundary(&self) -> Result<DecisionBoundary, eredu_nn::Error> {
-        DecisionBoundary::new(self.config())
+        DecisionBoundary::new(self.kernel().config())
     }
 
     fn realtime_temporal_cardinality(&self) -> usize {
-        self.config().frame_schedule().total_audio_codebooks() + 1
+        self.kernel()
+            .config()
+            .frame_schedule()
+            .total_audio_codebooks()
+            + 1
     }
 }
 
@@ -1235,12 +1238,11 @@ pub fn selected_moshi_lowering_summary(
     }
 
     let mut transform = None;
-    for lowering in selected.weight_lowerings().iter().filter(|lowering| {
-        matches!(
-            lowering.kind(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    for lowering in selected
+        .weight_lowerings()
+        .iter()
+        .filter(|lowering| lowering.kind().transforms_payload())
+    {
         let quantization = lowering
             .descriptor()
             .executable()
@@ -1281,8 +1283,8 @@ where
     let (
         preparation,
         execution_config,
-        _source_parameters,
-        _execution_parameters,
+        source_parameters,
+        execution_parameters,
         parallel,
         contract,
     ) = prepared.into_parts();
@@ -1292,28 +1294,43 @@ where
             "Moshi realtime topology and rank-local parallel plan differ".into(),
         ));
     }
-    let transforms = selected.weight_lowerings().iter().any(|lowering| {
-        matches!(
-            lowering.kind(),
-            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-        )
-    });
+    let transforms = selected
+        .weight_lowerings()
+        .iter()
+        .any(|lowering| lowering.kind().transforms_payload());
     let source_config = transforms.then(|| preparation.config().clone());
 
     visitor.construction_started();
     let source_architecture = source_config
-        .map(|config| super::LayeredModel::<B>::new(config, context))
+        .map(|config| {
+            super::MoshiKernel::<B>::from_prepared(
+                config,
+                source_parameters.into_definition(),
+                None,
+                None,
+                context,
+            )
+            .and_then(super::MoshiKernel::into_model)
+        })
         .transpose()
         .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
     let architecture = match parallel.as_ref() {
-        Some(parallel) => super::LayeredModel::<B>::new_selected_parallel(
+        Some(parallel) => super::MoshiKernel::<B>::from_prepared(
             execution_config,
-            parallel.geometry().clone(),
-            parallel.execution_identity().to_owned(),
+            parallel.retained_definition(),
+            Some(parallel.geometry().clone()),
+            Some(parallel.execution_identity().to_owned()),
             context,
         ),
-        None => super::LayeredModel::<B>::new(execution_config, context),
+        None => super::MoshiKernel::<B>::from_prepared(
+            execution_config,
+            execution_parameters.into_definition(),
+            None,
+            None,
+            context,
+        ),
     }
+    .and_then(super::MoshiKernel::into_model)
     .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
     visitor
         .visit(
@@ -1509,7 +1526,7 @@ fn build_candidate(
         Some(
             select_parallel_execution(
                 &execution_config,
-                execution_parameters.description(),
+                &execution_parameters,
                 rank,
                 maximum_batch_size,
                 maximum_sequence_length,
@@ -1544,13 +1561,9 @@ fn build_candidate(
         topology.tensor()
     ))?;
     let state = parallel.as_ref().map_or_else(
-        || {
-            state_layout(&execution_config).map_err(|error| {
-                MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string())
-            })
-        },
-        |parallel| Ok(parallel.geometry().state_layout().clone()),
-    )?;
+        || execution_parameters.definition().state_layout().clone(),
+        |parallel| parallel.definition().state_layout().clone(),
+    );
     let mut mechanisms = vec![
         RealtimeMechanism::TensorOperations,
         RealtimeMechanism::NeuralOperations,
@@ -1680,20 +1693,20 @@ fn weight_lowerings(
     source: &MoshiParameterContract,
     execution: &MoshiParameterContract,
 ) -> Result<Vec<RealtimeWeightLoweringRequirement>, MoshiRealtimeSelectionError> {
-    let source_members = parameter_members(source)?;
-    let execution_members = parameter_members(execution)?;
+    let source_members = source.description().members_by_target();
+    let execution_members = execution.description().members_by_target();
     execution_members
         .iter()
         .filter(|(_, member)| member.linear_companion().is_none())
         .map(|(target, target_member)| {
-            let source_member = source_members.get(target.as_str()).ok_or_else(|| {
+            let source_member = source_members.get(*target).ok_or_else(|| {
                 invalid_architecture(format!(
                     "execution parameter {target:?} has no source contract"
                 ))
             })?;
             match (
-                source.matrices().get(target.as_str()),
-                execution.matrices().get(target.as_str()),
+                source.matrices().get(*target),
+                execution.matrices().get(*target),
             ) {
                 (Some(source_matrix), Some(target_matrix)) => matrix_lowering(
                     preparation,
@@ -1724,8 +1737,8 @@ fn matrix_lowering(
     target_matrix: &super::MoshiMatrixContract,
     source_member: &eredu_runtime::ParameterMemberSpec,
     target_member: &eredu_runtime::ParameterMemberSpec,
-    source_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
-    target_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
+    source_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
+    target_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
 ) -> Result<RealtimeWeightLoweringRequirement, MoshiRealtimeSelectionError> {
     if source_matrix.logical_shape() != target_matrix.logical_shape()
         || source_member.global_shape() != source_matrix.physical_shape()
@@ -1798,8 +1811,8 @@ fn append_matrix_companion(
     primary: &str,
     source_target: Option<&str>,
     execution_target: Option<&str>,
-    source_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
-    execution_members: &BTreeMap<String, eredu_runtime::ParameterMemberSpec>,
+    source_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
+    execution_members: &BTreeMap<&str, &eredu_runtime::ParameterMemberSpec>,
     role: RealtimeWeightComponentRole,
     components: &mut Vec<RealtimeWeightComponentRequirement>,
 ) -> Result<(), MoshiRealtimeSelectionError> {
@@ -1983,29 +1996,6 @@ fn recipe_component(
         output: output.clone(),
         direct,
     })
-}
-
-fn parameter_members(
-    contract: &MoshiParameterContract,
-) -> Result<BTreeMap<String, eredu_runtime::ParameterMemberSpec>, MoshiRealtimeSelectionError> {
-    let mut members = BTreeMap::new();
-    for member in contract
-        .description()
-        .groups()
-        .iter()
-        .flat_map(|group| group.group().members())
-    {
-        if members
-            .insert(member.target().to_owned(), member.clone())
-            .is_some()
-        {
-            return Err(invalid_architecture(format!(
-                "parameter contract repeats target {:?}",
-                member.target()
-            )));
-        }
-    }
-    Ok(members)
 }
 
 fn validate_observations(

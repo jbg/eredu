@@ -260,7 +260,9 @@ impl GgufTargetPlan {
         self.normalize()?.bind(source, limits)
     }
 
-    fn expert_banks(&self) -> Result<BTreeMap<String, Arc<PreparedExpertBank>>, PreparationError> {
+    fn expert_banks(
+        &self,
+    ) -> Result<BTreeMap<String, Arc<ParameterBankRecipes>>, PreparationError> {
         (0..self.text.config().layers.len())
             .map(|layer| {
                 let root = format!("model.layers.{layer}.mlp.experts");
@@ -270,7 +272,7 @@ impl GgufTargetPlan {
                     .into_iter()
                     .map(|(name, recipe)| (name[root.len() + 1..].to_owned(), recipe))
                     .collect();
-                let bank = PreparedExpertBank::new(
+                let bank = ParameterBankRecipes::new(
                     self.text.catalog(),
                     recipes,
                     self.text.config().experts.count as usize,

@@ -2,50 +2,9 @@
 
 use super::*;
 
-fn prepared_parameter_members(
-    entries: &[ParameterBankEntry],
-    targets: &BTreeMap<(ParameterBankKey, String), String>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<
-    Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
-    AddressableParameterBankError,
-> {
-    let result = entries
-        .iter()
-        .flat_map(|entry| {
-            entry
-                .unit
-                .bindings()
-                .iter()
-                .map(move |binding| (entry, binding))
-        })
-        .map(|(entry, binding)| {
-            let parameter = targets
-                .get(&(entry.identity, binding.name().to_owned()))
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "selected bank binding has no logical destination".into(),
-                    )
-                })?;
-            Ok(
-                eredu_runtime::parameter_operations::PreparedBankParameterMember {
-                    key: entry.identity,
-                    binding: binding.name().to_owned(),
-                    parameter: parameter.clone(),
-                    materialized: binding.source_recipe().infer(store)?,
-                },
-            )
-        })
-        .collect::<Result<Vec<_>, Error>>();
-    result.map_err(|source| AddressableParameterBankError::Transformation {
-        source: Box::new(source),
-    })
-}
-
 /// Shared entry catalog, scheduler, residency manager, and telemetry.
 pub struct AddressableParameterBank {
-    pub(super) parameter_members:
-        Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
+    pub(super) parameter_members: eredu_runtime::parameter_operations::PreparedBankParameterIndex,
     pub(super) parameter_replacements: BTreeMap<String, MlxTensor>,
     pub(super) effective_member_bytes: BTreeMap<ParameterBankKey, u64>,
     pub(super) pool_id: u64,
@@ -81,12 +40,12 @@ pub struct SharedAddressableParameterBank {
 
 pub(super) fn preflight_selected_entry_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-    entries: &[ParameterBankEntry],
+    entries: &[AddressableBankEntry],
 ) -> Result<(), AddressableParameterBankError> {
     for entry in entries {
         eredu_runtime::preflight_bindings::<crate::backend::nn::shared::MlxNeuralBackend>(
             store,
-            entry.unit.bindings(),
+            entry.unit().bindings(),
         )
         .map_err(|error| AddressableParameterBankError::Transformation {
             source: Box::new(Error::Other(Box::new(error))),
@@ -105,6 +64,7 @@ impl SharedAddressableParameterBank {
         })?;
         Ok(bank
             .parameter_members
+            .members()
             .iter()
             .filter(|member| self.scope.is_none_or(|scope| member.key.bank() == scope))
             .cloned()
@@ -153,7 +113,7 @@ impl AddressableParameterBank {
     #[cfg(test)]
     pub(crate) fn new<S, O>(
         store: Arc<S>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         options: O,
         source_stream: Stream,
         device_stream: Stream,
@@ -170,7 +130,7 @@ impl AddressableParameterBank {
     #[cfg(test)]
     pub(crate) fn new_shared<O>(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         options: O,
         source_stream: Stream,
         device_stream: Stream,
@@ -196,7 +156,7 @@ impl AddressableParameterBank {
     /// Creates a cache from exact per-binding selected transformation tasks.
     pub fn new_selected_shared(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        selected: SelectedAddressableEntries,
+        selected: AddressableBankCatalog,
         rows: &eredu_runtime::SelectedRowLookups,
         source_stream: Stream,
         device_stream: Stream,
@@ -207,155 +167,58 @@ impl AddressableParameterBank {
             })?;
         let options: ParameterBankOptions = rows.options().into();
         let rows = rows.prepared();
-        rows.validate_other_banks(selected.entries.iter().map(|entry| entry.identity.bank()))
+        rows.validate_other_banks(selected.entries.iter().map(|entry| entry.key().bank()))
             .map_err(|source| AddressableParameterBankError::Transformation {
                 source: Box::new(source.into()),
             })?;
         let row_ranges: Vec<_> = rows.ranges().cloned().collect();
         preflight_selected_entry_bindings(store.as_ref(), &selected.entries)?;
-        let selected_keys = selected
-            .entries
-            .iter()
-            .map(|entry| entry.identity)
-            .collect::<std::collections::BTreeSet<_>>();
-        if selected_keys
-            != selected
-                .placements
-                .keys()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-        {
-            return Err(AddressableParameterBankError::Transformation {
-                source: Box::new(Error::ArchitectureModel(
-                    "selected addressable placements do not cover the exact entry keys".into(),
-                )),
-            });
-        }
-        for entry in &selected.entries {
-            let expected = selected
-                .expected_bytes
-                .get(&entry.identity)
-                .ok_or_else(|| AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "selected addressable entry {:?} has no neutral byte total",
-                        entry.identity
-                    ))),
-                })?;
-            let projected = entry
-                .unit
-                .bindings()
-                .iter()
-                .try_fold(0u64, |total, binding| {
-                    let bytes = if let Some(transform) = selected
-                        .transformations
-                        .get(&(entry.identity, binding.name().to_owned()))
-                    {
-                        let metadata = binding.source_recipe().infer(store.as_ref())?;
-                        packed_projection_bytes(
-                            metadata.shape(),
-                            transform.quantization,
-                            &transform.companion_dtype,
-                        )?
-                    } else {
-                        binding.expected_bytes()
-                    };
-                    total.checked_add(bytes).ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "selected addressable entry bytes overflowed".into(),
-                        )
-                    })
-                })
-                .map_err(|source| AddressableParameterBankError::Transformation {
-                    source: Box::new(source),
-                })?;
-            if projected != *expected {
-                return Err(AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "selected addressable entry {:?} bytes differ: expected {}, projected {}",
-                        entry.identity, expected, projected
-                    ))),
-                });
-            }
-        }
-        // Validate the combined namespace/budget plan before a selected weight
-        // transformation can read payloads. Rows retain their own source recipes.
-        let specs = selected
-            .entries
-            .iter()
-            .map(|entry| {
-                OffloadUnitSpec::new(
-                    entry.identity.unit_id(),
-                    selected.expected_bytes[&entry.identity],
-                    ResidencyPolicy::Cacheable,
-                    MemoryTier::Disk,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        OffloadPlan::with_ranges(
-            options.storage,
-            specs,
-            row_ranges.iter().map(|range| range.range().clone()),
-        )?;
-        if selected.transformations.is_empty() {
-            let parameter_members = prepared_parameter_members(
-                &selected.entries,
-                &selected.parameter_targets,
-                store.as_ref(),
-            )?;
-            let mut bank = Self::new_shared_with_policy(
-                store,
-                selected.entries,
+        let (entries, transformations, preparation) =
+            eredu_runtime::AddressableBankPreparation::admit(
+                selected,
                 row_ranges,
-                options,
-                ResidencyPolicy::Cacheable,
-                MemoryTier::Disk,
-                source_stream,
-                device_stream,
-                Vec::new(),
-                selected.placements,
-                None,
-            )?;
-            bank.parameter_members = parameter_members;
-            return Ok(bank);
-        }
-        let telemetry_formats = selected_transformation_formats(&selected.transformations);
-        let transformed = quantize_selected_entry_catalog(
+                options.storage,
+                store.as_ref(),
+            )
+            .map_err(|source| AddressableParameterBankError::Transformation {
+                source: Box::new(Error::Other(Box::new(source))),
+            })?;
+        let telemetry_formats = transformations.formats().to_vec();
+        let (store, entries, materialization) = if transformations.groups().is_empty() {
+            (store, entries, None)
+        } else {
+            let transformed = quantize_selected_entry_catalog(
+                store,
+                entries,
+                transformations,
+                options.compact_bank_scratch_bytes,
+                &source_stream,
+            )
+            .map_err(|source| AddressableParameterBankError::Transformation {
+                source: Box::new(source),
+            })?;
+            (
+                transformed.store,
+                transformed.entries,
+                Some(transformed.report),
+            )
+        };
+        let (residency, parameter_members, placements) = preparation
+            .bind(entries, store.as_ref())
+            .map_err(|source| AddressableParameterBankError::Transformation {
+                source: Box::new(Error::Other(Box::new(source))),
+            })?
+            .into_parts();
+        let mut bank = Self::from_prepared_shared(
             store,
-            selected.entries,
-            selected.transformations,
-            options.compact_bank_scratch_bytes,
-            &source_stream,
-        )
-        .map_err(|source| AddressableParameterBankError::Transformation {
-            source: Box::new(source),
-        })?;
-        for entry in &transformed.entries {
-            if selected.expected_bytes.get(&entry.identity) != Some(&entry.bytes) {
-                return Err(AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "materialized addressable entry {:?} differs from its neutral selected bytes",
-                        entry.identity
-                    ))),
-                });
-            }
-        }
-        let parameter_members = prepared_parameter_members(
-            &transformed.entries,
-            &selected.parameter_targets,
-            transformed.store.as_ref(),
-        )?;
-        let mut bank = Self::new_shared_with_policy(
-            transformed.store,
-            transformed.entries,
-            row_ranges,
+            residency,
             options,
-            ResidencyPolicy::Cacheable,
             MemoryTier::Disk,
             source_stream,
             device_stream,
             telemetry_formats,
-            selected.placements,
-            Some(transformed.report),
+            placements,
+            materialization,
         )?;
         bank.parameter_members = parameter_members;
         Ok(bank)
@@ -370,7 +233,7 @@ impl AddressableParameterBank {
     #[cfg(test)]
     pub(crate) fn new_resident_shared(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, AddressableParameterBankError> {
@@ -389,10 +252,11 @@ impl AddressableParameterBank {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_shared_with_policy(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        entries: impl IntoIterator<Item = AddressableBankEntry>,
         row_ranges: Vec<eredu_runtime::RowResidencyRange>,
         options: ParameterBankOptions,
         policy: ResidencyPolicy,
@@ -404,48 +268,52 @@ impl AddressableParameterBank {
         materialization: Option<WeightMaterializationReport>,
     ) -> Result<Self, AddressableParameterBankError> {
         options.validate()?;
-        let mut catalog = BTreeMap::new();
-        let mut definitions = Vec::new();
-        let mut specs = Vec::new();
+        let residency = eredu_runtime::PreparedAddressableBankResidency::new(
+            entries,
+            row_ranges,
+            options.storage,
+            policy,
+            initial_tier,
+        )?;
+        Self::from_prepared_shared(
+            store,
+            residency,
+            options,
+            initial_tier,
+            source_stream,
+            device_stream,
+            weight_quantizations,
+            placements,
+            materialization,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_prepared_shared(
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        residency: eredu_runtime::PreparedAddressableBankResidency,
+        options: ParameterBankOptions,
+        initial_tier: MemoryTier,
+        source_stream: Stream,
+        device_stream: Stream,
+        weight_quantizations: Vec<WeightQuantization>,
+        placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
+        materialization: Option<WeightMaterializationReport>,
+    ) -> Result<Self, AddressableParameterBankError> {
+        options.validate()?;
+        let (catalog, definitions, row_ranges, plan) = residency.into_parts();
         #[cfg(test)]
         let mut namespace_entry_counts = BTreeMap::new();
         #[cfg(test)]
         let mut namespace_global_spans = BTreeMap::new();
-        for entry in entries {
-            if catalog.insert(entry.identity, entry.bytes).is_some() {
-                return Err(AddressableParameterBankError::DuplicateEntry {
-                    identity: entry.identity,
-                });
-            }
-            #[cfg(test)]
-            {
-                *namespace_entry_counts
-                    .entry(entry.identity.unit())
-                    .or_insert(0) += 1;
-            }
-            #[cfg(test)]
-            {
-                namespace_global_spans
-                    .entry(entry.identity.unit())
-                    .and_modify(|span: &mut usize| *span = (*span).max(entry.identity.member() + 1))
-                    .or_insert(entry.identity.member() + 1);
-            }
-            specs.push(OffloadUnitSpec::new(
-                entry.identity.unit_id(),
-                entry.bytes,
-                policy,
-                initial_tier,
-            )?);
-            definitions.push(entry.unit);
+        #[cfg(test)]
+        for key in catalog.keys() {
+            *namespace_entry_counts.entry(key.unit()).or_insert(0) += 1;
+            namespace_global_spans
+                .entry(key.unit())
+                .and_modify(|span: &mut usize| *span = (*span).max(key.member() + 1))
+                .or_insert(key.member() + 1);
         }
-        if catalog.is_empty() && row_ranges.is_empty() {
-            return Err(AddressableParameterBankError::EmptyCatalog);
-        }
-        let plan = OffloadPlan::with_ranges(
-            options.storage,
-            specs,
-            row_ranges.iter().map(|range| range.range().clone()),
-        )?;
         let manager = ResidencyManager::new_shared_row_ranges(
             store,
             BTreeMap::new(),
@@ -458,7 +326,7 @@ impl AddressableParameterBank {
         manager.initialize()?;
         static NEXT_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
-            parameter_members: Vec::new(),
+            parameter_members: Default::default(),
             parameter_replacements: BTreeMap::new(),
             effective_member_bytes: catalog.clone(),
             pool_id: NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -575,51 +443,47 @@ impl AddressableParameterBank {
             })?;
             let identity = ParameterBankKey::new(0, namespace, global_entry);
             if !self.catalog.contains_key(&identity) {
-                return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
+                return Err(
+                    eredu_runtime::AddressableBankDemandError::MissingOwnedEntry { identity }
+                        .into(),
+                );
             }
             let count = demand.entry(identity).or_insert(0);
             *count = count.saturating_add(1);
         }
 
-        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        self.acquire_demand(demand, compact_ids, grouped_ids.len() as u64, pass, stream)
+        let entries: Vec<_> = demand.into_iter().collect();
+        let plan = if entries.is_empty() {
+            eredu_runtime::AddressableBankDemand::default()
+        } else {
+            eredu_runtime::AddressableBankDemand::new(
+                &entries,
+                &self.catalog,
+                &self.effective_member_bytes,
+                self.scratch_limit,
+            )?
+        };
+        self.acquire_demand(plan, pass, stream)
     }
 
     fn acquire_demand(
         &self,
-        demand: BTreeMap<ParameterBankKey, u64>,
-        compact_ids: Vec<ParameterBankKey>,
-        selection_count: u64,
+        plan: eredu_runtime::AddressableBankDemand,
         pass: BankAccessClass,
         stream: &Stream,
     ) -> Result<AcquiredParameters, AddressableParameterBankError> {
-        let bank = compact_ids.first().map(|key| key.bank());
-        if compact_ids.iter().any(|key| Some(key.bank()) != bank) {
-            return Err(AddressableParameterBankError::MixedBanks);
-        }
-        let scratch_bytes = demand.keys().try_fold(0u64, |total, identity| {
-            total
-                .checked_add(self.effective_member_bytes[identity])
-                .ok_or(AddressableParameterBankError::ByteOverflow)
-        })?;
-        if scratch_bytes > self.scratch_limit {
-            return Err(AddressableParameterBankError::ScratchLimitExceeded {
-                required_bytes: scratch_bytes,
-                limit_bytes: self.scratch_limit,
-                distinct_entries: demand.len(),
-            });
-        }
+        let (entries, selection_count, scratch_bytes) = plan.into_parts();
+        let bank = entries.first().map(|(key, _)| key.bank());
         let before = self.resident_snapshot()?;
         let started = Instant::now();
         let mut host_hits = 0u64;
         let mut host_misses = 0u64;
         let mut device_hits = 0u64;
         let mut device_misses = 0u64;
-        let mut requests = Vec::with_capacity(compact_ids.len());
+        let mut requests = Vec::with_capacity(entries.len());
         let mut host_requests = Vec::new();
-        for identity in &compact_ids {
+        for &(identity, selection_demand) in &entries {
             let unit = identity.unit_id();
-            let selection_demand = demand[identity];
             let host_hit = self.manager.is_resident(&unit, MemoryTier::Host)?;
             let device_hit = self.manager.is_resident(&unit, MemoryTier::Device)?;
             if host_hit {
@@ -665,7 +529,7 @@ impl AddressableParameterBank {
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
         if let Some(bank) = bank {
             let stats = statistics.entry(bank).or_default().pass_mut(pass);
-            let distinct = compact_ids.len() as u64;
+            let distinct = entries.len() as u64;
             stats.requested_selections = stats.requested_selections.saturating_add(selection_count);
             stats.distinct_entries = stats.distinct_entries.saturating_add(distinct);
             stats.coalesced_duplicates = stats
@@ -707,9 +571,10 @@ impl AddressableParameterBank {
         }
         drop(statistics);
 
+        let (identities, demand) = entries.into_iter().unzip();
         Ok(AcquiredParameters {
-            identities: compact_ids,
-            demand: demand.into_values().collect(),
+            identities,
+            demand,
             scratch_bytes,
             pass,
             transfer,
@@ -723,27 +588,13 @@ impl AddressableParameterBank {
         pass: BankAccessClass,
         stream: &Stream,
     ) -> Result<AcquiredParameters, AddressableParameterBankError> {
-        if entries.is_empty() {
-            return Err(AddressableParameterBankError::EmptyDemand);
-        }
-        let mut demand = BTreeMap::new();
-        let mut selection_count = 0u64;
-        for &(identity, count) in entries {
-            if count == 0 {
-                return Err(AddressableParameterBankError::ZeroDemand { identity });
-            }
-            if !self.catalog.contains_key(&identity) {
-                return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
-            }
-            if demand.insert(identity, count).is_some() {
-                return Err(AddressableParameterBankError::DuplicateDemand { identity });
-            }
-            selection_count = selection_count
-                .checked_add(count)
-                .ok_or(AddressableParameterBankError::ByteOverflow)?;
-        }
-        let compact_ids = demand.keys().copied().collect::<Vec<_>>();
-        self.acquire_demand(demand, compact_ids, selection_count, pass, stream)
+        let plan = eredu_runtime::AddressableBankDemand::new(
+            entries,
+            &self.catalog,
+            &self.effective_member_bytes,
+            self.scratch_limit,
+        )?;
+        self.acquire_demand(plan, pass, stream)
     }
 
     /// Records a completed compact-bank construction.
@@ -755,11 +606,14 @@ impl AddressableParameterBank {
         duration: Duration,
     ) -> Result<(), AddressableParameterBankError> {
         if bytes > self.scratch_limit {
-            return Err(AddressableParameterBankError::ScratchLimitExceeded {
-                required_bytes: bytes,
-                limit_bytes: self.scratch_limit,
-                distinct_entries: 0,
-            });
+            return Err(
+                eredu_runtime::AddressableBankDemandError::ScratchLimitExceeded {
+                    required_bytes: bytes,
+                    limit_bytes: self.scratch_limit,
+                    distinct_entries: 0,
+                }
+                .into(),
+            );
         }
         let mut statistics = self
             .statistics

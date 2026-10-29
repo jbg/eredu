@@ -2,9 +2,8 @@
 
 use eredu_architectures::voicechat::{
     tts_transformer_layered::{
-        tts_transformer_parameter_description, TransformerArchitecture, TransformerBoundary,
-        TransformerBoundarySchema, TransformerError, TransformerRuntimeState,
-        TransformerStateMarker, TransformerUnit,
+        TransformerBoundary, TransformerBoundarySchema, TransformerError, TransformerKernel,
+        TransformerRuntimeState, TransformerStateMarker, TransformerUnit,
     },
     tts_transformer_preparation::PreparedTtsTransformerPartitionBindings,
 };
@@ -35,7 +34,10 @@ use crate::{
 
 type Unit = TransformerUnit<MlxNeuralBackend>;
 type Runtime<P> = LayerwisePartitionRuntime<
-    TransformerArchitecture<MlxNeuralBackend>,
+    eredu_runtime::ComponentAdapter<
+        eredu_runtime::ComponentDefinition,
+        TransformerKernel<MlxNeuralBackend>,
+    >,
     MlxNeuralBackend,
     TransformerStateMarker<MlxNeuralBackend>,
     P,
@@ -71,6 +73,7 @@ impl MlxTtsTransformerPartition {
             Execution::Bounded(runtime) => runtime.architecture(),
         };
         let caches = architecture
+            .kernel()
             .attention_cache_layout()
             .map(|layout| {
                 MlxKeyValueState::device(layout.clone()).map(|state| state.as_ref().to_vec())
@@ -78,7 +81,7 @@ impl MlxTtsTransformerPartition {
             .transpose()
             .map_err(BackendFailure::from_error)?
             .unwrap_or_default();
-        TransformerRuntimeState::for_partition(architecture, caches)
+        TransformerRuntimeState::for_partition(architecture.kernel(), caches)
             .map_err(BackendFailure::from_error)
     }
 
@@ -184,15 +187,16 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
             let topology = ParallelTopology::new(group.size(), 1, 1, 1)
                 .and_then(|topology| ParallelRankTopology::new(topology, group.rank()))
                 .map_err(BackendFailure::from_error)?;
-            let parameters = tts_transformer_parameter_description(prepared.config())
-                .map_err(BackendFailure::from_error)?;
-            let expected = eredu_runtime::derive_partitioned_local_layout(&parameters, topology)
-                .map_err(|message| {
-                    BackendFailure::from_error(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        message,
-                    ))
-                })?;
+            let expected = eredu_runtime::derive_partitioned_local_layout(
+                prepared.definition().parameters(),
+                topology,
+            )
+            .map_err(|message| {
+                BackendFailure::from_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    message,
+                ))
+            })?;
             if *layout != expected {
                 return Err(BackendFailure::from_error(TransformerError::Configuration(
                     "TTS stage tensor layout differs from its communicator",
@@ -206,18 +210,17 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
             )))
         }
     }
-    let (config, local_layout, source, units, state_layout) = prepared.into_parts();
-    if !units
-        .iter()
-        .map(|(address, _)| *address)
-        .eq(partition.units())
+    let (config, definition, local_layout, invocations, source, units, state_layout) =
+        prepared.into_parts();
+    if !invocations.logical_addresses().eq(partition.units())
         || state_layout.as_ref() != partition.state().map(|state| state.layout())
     {
         return Err(BackendFailure::from_error(TransformerError::Configuration(
             "prepared TTS stage differs from selected unit or state authority",
         )));
     }
-    let mut architecture = TransformerArchitecture::<MlxNeuralBackend>::from_partition(
+    let mut architecture = TransformerKernel::<MlxNeuralBackend>::from_partition(
+        definition,
         config,
         local_layout.as_ref(),
         partition,
@@ -235,6 +238,7 @@ pub fn materialize_voicechat_tts_transformer_partition<G>(
                 execution_stream,
                 weights_stream,
                 |_| false,
+                invocations,
                 Vec::new(),
                 units,
             )

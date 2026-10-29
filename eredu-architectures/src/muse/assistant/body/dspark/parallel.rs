@@ -176,13 +176,8 @@ impl DsparkBodyDefinition {
             "assistant.final_norm",
         ])
         .map_err(Error::backend_source)?;
-        ArchitectureParameterDescription::new(
-            &graph,
-            self.geometry.unit_layout(),
-            owned.iter().map(|group| group.group().clone()),
-            owned.clone(),
-        )
-        .map_err(Error::backend_source)
+        ArchitectureParameterDescription::from_owned(&graph, self.geometry.unit_layout(), owned)
+            .map_err(Error::backend_source)
     }
 
     /// Selects exact TP placement and derives local head, K/V and dense widths.
