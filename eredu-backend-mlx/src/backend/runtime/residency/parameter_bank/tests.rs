@@ -14,7 +14,9 @@ use super::acquisition::preflight_selected_entry_bindings;
 use super::*;
 use crate::tests::support::grouped_provider::ParameterBankSelection;
 use eredu_core::residency::CacheEvictionPolicy;
-use eredu_runtime::{ParameterBank, WeightBinding};
+use eredu_runtime::{
+    AddressableBankPreparationError, AddressableBankSelectionError, ParameterBank, WeightBinding,
+};
 
 fn stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -249,7 +251,7 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
         placements: BTreeMap::new(),
     };
     let before = store.source_diagnostics().unwrap().physical_reads;
-    AddressableParameterBank::new_selected_shared(
+    let error = AddressableParameterBank::new_selected_shared(
         store.clone(),
         selected,
         &eredu_runtime::SelectedRowLookups::select(
@@ -264,6 +266,22 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
     )
     .err()
     .expect("incomplete selected placement must fail");
+    let preparation = match &error {
+        AddressableParameterBankError::Transformation { source } => match source.as_ref() {
+            Error::Other(source) => source.downcast_ref::<AddressableBankPreparationError>(),
+            _ => None,
+        },
+        _ => None,
+    };
+    assert!(
+        matches!(
+            preparation,
+            Some(AddressableBankPreparationError::Selection(
+                AddressableBankSelectionError::PlacementCoverage { missing, unexpected }
+            )) if missing.len() == 1 && missing.contains(&identity) && unexpected.is_empty()
+        ),
+        "unexpected rejection: {error:?}"
+    );
     assert_eq!(store.source_diagnostics().unwrap().physical_reads, before);
 }
 
