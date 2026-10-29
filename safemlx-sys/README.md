@@ -34,6 +34,10 @@ Conditional configuration does not raise smaller native limits or evict cache.
 The prefix-append exports patch exposes the strided CPU copy operation and
 tracing-state accessor across the Windows MLX/MLX-C DLL boundary. Linux static
 CUDA consumers link cuSOLVER alongside the other native CUDA dependencies.
+CUDA JIT disk caches are partitioned by GPU compute capability, NVRTC version,
+CUDA driver API version and MLX version, including beneath `MLX_PTX_CACHE_DIR`.
+Kernel-load failures report the CUDA error name, numeric code and description
+alongside the driver JIT log, which can be empty for cubin load failures.
 
 ## Backends
 
