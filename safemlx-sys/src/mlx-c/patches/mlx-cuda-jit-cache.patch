@@ -1,0 +1,85 @@
+diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
+--- a/mlx/backend/cuda/jit_module.cpp
++++ b/mlx/backend/cuda/jit_module.cpp
+@@ -181,7 +181,7 @@
+   return cached_args;
+ }
+ 
+-// Get the cache directory for storing compiled results.
++// Get the cache root for storing compiled results.
+ const std::filesystem::path& ptx_cache_dir() {
+   static std::filesystem::path cache = []() -> std::filesystem::path {
+     std::filesystem::path cache;
+@@ -212,6 +212,29 @@
+     return cache;
+   }();
+   return cache;
++}
++
++// NVRTC emits device-specific cubins when possible. Module names alone do not
++// identify compatible binaries, even when the MLX version is unchanged.
++std::filesystem::path device_ptx_cache_dir(Device& device) {
++  const auto& root = ptx_cache_dir();
++  if (root.empty()) {
++    return {};
++  }
++  int major, minor, driver;
++  CHECK_NVRTC_ERROR(nvrtcVersion(&major, &minor));
++  CHECK_CUDA_ERROR(cuDriverGetVersion(&driver));
++  auto path = root / "eredu-jit-v1" / version() /
++      fmt::format(
++          "sm_{}{}-nvrtc_{}_{}-driver_{}",
++          device.compute_capability_major(),
++          device.compute_capability_minor(),
++          major,
++          minor,
++          driver);
++  std::error_code error;
++  std::filesystem::create_directories(path, error);
++  return error ? std::filesystem::path{} : path;
+ }
+ 
+ std::filesystem::path get_ptx_path(
+@@ -466,9 +489,17 @@
+   CUresult jit_result = cuModuleLoadDataEx(
+       &module_, ptx.data(), std::size(options), options, values);
+   if (jit_result != CUDA_SUCCESS) {
+-    throw std::runtime_error(
+-        fmt::format(
+-            "Failed to load compiled {} kernel: {}.", module_name, jit_log));
++    const char* error_name = nullptr;
++    const char* error_string = nullptr;
++    cuGetErrorName(jit_result, &error_name);
++    cuGetErrorString(jit_result, &error_string);
++    throw std::runtime_error(fmt::format(
++        "Failed to load compiled {} kernel: {} ({}): {}. CUDA JIT log: {}",
++        module_name,
++        error_name ? error_name : "unknown CUDA error",
++        static_cast<int>(jit_result),
++        error_string ? error_string : "no CUDA error description",
++        jit_log[0] ? jit_log : "<empty>"));
+   }
+ 
+   // Load kernels.
+@@ -490,8 +521,10 @@
+   std::string ptx;
+   std::vector<std::pair<std::string, std::string>> ptx_kernels;
+ 
+-  // Try to load them from the file cache
+-  if (!read_cached_ptx(ptx_cache_dir(), module_name, ptx, ptx_kernels)) {
++  // Try to load them from the file cache for this GPU and toolchain.
++  auto cache_dir = use_disk_cache ? device_ptx_cache_dir(device)
++                                  : std::filesystem::path{};
++  if (!read_cached_ptx(cache_dir, module_name, ptx, ptx_kernels)) {
+     auto [precompiled, source_code, kernel_names] = builder();
+ 
+     // Get the PTX or cubin
+@@ -507,7 +540,7 @@
+     // If requested save them in the file cache for the next launch
+     if (use_disk_cache) {
+       write_cached_ptx(
+-          ptx_cache_dir(), module_name, ptx, ptx_kernels, source_code);
++          cache_dir, module_name, ptx, ptx_kernels, source_code);
+     }
+   }
+ 

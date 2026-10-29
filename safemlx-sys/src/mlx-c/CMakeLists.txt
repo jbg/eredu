@@ -76,6 +76,7 @@ else()
       mlx-host-transfer-umbrella.patch
       mlx-timing-events.patch
       mlx-cuda-jit-include-dirs.patch
+      mlx-cuda-jit-cache.patch
       mlx-blas-header-discovery.patch
       mlx-embedded-metallib.patch
       mlx-host-transfer-noexcept-move.patch
