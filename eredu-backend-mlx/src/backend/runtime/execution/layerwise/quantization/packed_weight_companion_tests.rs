@@ -5,6 +5,7 @@ use eredu_checkpoint::store::MemoryWeightStore;
 use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{LinearFormatSpec, LinearSpec, NeuralBackend, ParameterSpec};
+use eredu_runtime::WeightLoweringKind;
 use safemlx::{Array, Device, DeviceType};
 
 fn parameter(name: &str) -> ParameterSpec {
