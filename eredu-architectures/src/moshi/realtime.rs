@@ -1294,7 +1294,10 @@ where
             "Moshi realtime topology and rank-local parallel plan differ".into(),
         ));
     }
-    let transforms = selected.weight_lowerings().iter().any(|lowering| lowering.kind().transforms_payload());
+    let transforms = selected
+        .weight_lowerings()
+        .iter()
+        .any(|lowering| lowering.kind().transforms_payload());
     let source_config = transforms.then(|| preparation.config().clone());
 
     visitor.construction_started();

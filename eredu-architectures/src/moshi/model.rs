@@ -215,7 +215,6 @@ impl StaticConstruction {
         }
         Ok(embeddings)
     }
-
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules<B> {

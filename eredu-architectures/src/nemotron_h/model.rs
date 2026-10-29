@@ -1172,8 +1172,7 @@ where
     {
         let mut forward = self.begin(input, state, context)?;
         if matches!(forward.context.mode, ForwardMode::Target) {
-            forward =
-                crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
+            forward = crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
             forward.context.embedded = forward.hidden.clone();
         }
         Ok(forward)

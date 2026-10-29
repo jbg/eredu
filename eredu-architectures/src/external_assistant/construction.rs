@@ -277,11 +277,9 @@ impl CompatibleExternalAssistantPreparation {
                 "Muse static invocation has no Muse target",
             ));
         };
-        let args = muse::with_checkpoint_formats(
-            args,
-            execution.text_realization().quantized_formats(),
-        )
-        .map_err(invalid_assistant)?;
+        let args =
+            muse::with_checkpoint_formats(args, execution.text_realization().quantized_formats())
+                .map_err(invalid_assistant)?;
         let parameters = muse::component_definition(&args, None)
             .map_err(invalid_assistant)?
             .parameters()

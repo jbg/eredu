@@ -332,7 +332,5 @@ pub(crate) fn select_composite(
     )?;
     validate_state(config, definition.state_layout(), definition.id())?;
     validate_state(config, state, definition.id())?;
-    definition
-        .select_state_layout(state)
-        .map_err(Error::from)
+    definition.select_state_layout(state).map_err(Error::from)
 }

@@ -1,7 +1,7 @@
 //! Decoder equation order, parameter ownership and cache references.
-use std::{collections::BTreeMap, ops::Range};
-use eredu_nn::Error;
 use super::Config;
+use eredu_nn::Error;
+use std::{collections::BTreeMap, ops::Range};
 
 /// One independently leased equation in decoder execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -564,7 +564,9 @@ pub fn local_state_geometry(
     Ok(geometry)
 }
 
-pub(super) fn global_target_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
+pub(super) fn global_target_geometry(
+    args: &ModelArgs,
+) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
     Ok(args
         .layer_schedule
         .iter()
@@ -588,7 +590,9 @@ pub(super) fn global_target_geometry(args: &ModelArgs) -> Result<Vec<LayerGeomet
         .collect())
 }
 
-pub(super) fn global_prediction_geometry(args: &ModelArgs) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
+pub(super) fn global_prediction_geometry(
+    args: &ModelArgs,
+) -> Result<Vec<LayerGeometry>, ParallelPlanError> {
     Ok(args
         .mtp_policies()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
@@ -621,8 +625,11 @@ pub fn local_geometry(
     let (target, prediction) = geometry.split_at(target_count);
     let state_layout = state_layout_with_geometry(args, &geometry)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let (embedding_range, output_range) = super::static_spec(args, super::FinalNormalization::Native)
-        .vocabulary_ranges(layout, "model.embeddings", "model.norm_f", "lm_head")?;
+    let (embedding_range, output_range) = super::static_spec(
+        args,
+        super::FinalNormalization::Native,
+    )
+    .vocabulary_ranges(layout, "model.embeddings", "model.norm_f", "lm_head")?;
     let prediction_steps = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
         ParallelPlanError::InvalidGroup("Nemotron-H prediction-step count exceeds usize".into())
     })?;

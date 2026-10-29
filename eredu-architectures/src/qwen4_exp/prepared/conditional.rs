@@ -543,7 +543,9 @@ impl SelectedConditionalExecution {
         let spec = plan
             .target
             .bind_spec(plan.target.selected_spec(&selected)?)?;
-        let source_architecture = selected.text().uses_weight_transform()
+        let source_architecture = selected
+            .text()
+            .uses_weight_transform()
             .then(|| {
                 ConditionalKernel::<B>::new(
                     plan.target.bound_spec()?,

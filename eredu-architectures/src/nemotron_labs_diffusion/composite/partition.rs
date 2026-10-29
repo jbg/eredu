@@ -4,8 +4,8 @@ use crate::nemotron_labs_diffusion::partitioned::{
     PartitionedTextKernel, TextBoundary, TextBoundarySchema,
 };
 use eredu_runtime::{
-    ArchitecturePartition, LayeredPartitionInput,
-    LayeredPartitionOutput, LocalModelLayout, PartitionOwnership, StateLayout,
+    ArchitecturePartition, LayeredPartitionInput, LayeredPartitionOutput, LocalModelLayout,
+    PartitionOwnership, StateLayout,
 };
 use std::ops::Range;
 

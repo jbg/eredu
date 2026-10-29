@@ -456,7 +456,9 @@ pub fn quantizer_parameter_description(
             spec,
         ));
     }
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
+    )?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for QuantizerKernel<B> {

@@ -713,7 +713,9 @@ pub fn tts_transformer_parameter_description(
             spec,
         ));
     }
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
+    )?)
 }
 impl<B: NeuralBackend> ComponentKernel<B> for TransformerKernel<B> {
     type Input<'a> = TransformerInput<'a, B::Tensor>;

@@ -1069,9 +1069,7 @@ pub fn partition_chunk_range(
 /// in the same atomic parameter group.
 pub fn expand_linear_format_parameter_groups(
     groups: Vec<ParameterGroupSpec>,
-    declaration: impl Fn(
-        &ParameterMemberSpec,
-    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     groups
         .into_iter()
@@ -1084,9 +1082,7 @@ pub fn expand_linear_format_parameter_groups(
 /// ordinary parameter catalogs.
 pub fn expand_linear_format_parameter_group(
     group: ParameterGroupSpec,
-    declaration: impl Fn(
-        &ParameterMemberSpec,
-    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
     let mut members = Vec::new();
     for source in group.members() {
@@ -1111,9 +1107,7 @@ pub fn expand_linear_format_parameter_group(
 /// Tags move with their group and require neither cloning nor ordering.
 pub fn expand_tagged_linear_format_parameter_groups<Tag>(
     groups: impl IntoIterator<Item = (Tag, ParameterGroupSpec)>,
-    declaration: impl Fn(
-        &ParameterMemberSpec,
-    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
 ) -> Result<Vec<(Tag, ParameterGroupSpec)>, ParallelPlanError> {
     groups
         .into_iter()
@@ -1127,9 +1121,7 @@ pub fn expand_tagged_linear_format_parameter_groups<Tag>(
 /// ownership, sharing or replica-consumer declarations.
 pub fn expand_owned_linear_format_parameter_groups(
     groups: Vec<crate::OwnedParameterGroupSpec>,
-    declaration: impl Fn(
-        &ParameterMemberSpec,
-    ) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
+    declaration: impl Fn(&ParameterMemberSpec) -> Result<Option<LinearFormatSpec>, ParallelPlanError>,
 ) -> Result<Vec<crate::OwnedParameterGroupSpec>, ParallelPlanError> {
     groups
         .into_iter()

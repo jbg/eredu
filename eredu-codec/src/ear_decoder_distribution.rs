@@ -7,9 +7,9 @@ use crate::{
 };
 use eredu_core::CollectiveGroupId;
 use eredu_runtime::{
-    ComponentPipelinePreparationError, ArchitectureBoundary, ArchitectureGroupKind,
-    ArchitecturePartition, CommunicationManifest, PartitionedExecutionPlan,
-    PipelineActivationDtype, PipelineBindingError,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
+    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
+    PipelineBindingError,
 };
 
 /// Exact source recipes, global cuts and distributed authority for one streaming stage.

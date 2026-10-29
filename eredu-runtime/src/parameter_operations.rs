@@ -7,15 +7,17 @@ use eredu_core::{capture::*, parameters::ParameterError};
 use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 
 mod assembly;
-mod banks;
 mod bank_reads;
+mod banks;
 pub use bank_reads::{BankParameterReadPlan, BankParameterReadSelectionError};
 mod bank_index;
-pub use bank_index::{BankParameterIndexError, BankParameterMemberAddress, PreparedBankParameterIndex};
+pub use bank_index::{
+    BankParameterIndexError, BankParameterMemberAddress, PreparedBankParameterIndex,
+};
 mod bank_replacements;
 pub use bank_replacements::{
-    prepare_bank_parameter_replacements, BankParameterReplacementFacts,
-    BankParameterReplacementError, PreparedBankParameterReplacements,
+    prepare_bank_parameter_replacements, BankParameterReplacementError,
+    BankParameterReplacementFacts, PreparedBankParameterReplacements,
 };
 pub use banks::{
     prepare_bank_parameter_members, prepare_bank_parameter_slots, BankParameterPreparationError,

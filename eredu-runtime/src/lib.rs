@@ -19,7 +19,8 @@ pub mod cache;
 pub mod capture;
 mod checkpoint_handoff;
 pub use checkpoint_handoff::{
-    restrict_checkpoint_handoff, validate_checkpoint_handoff, SourceHandoffError, SourceHandoffScope,
+    restrict_checkpoint_handoff, validate_checkpoint_handoff, SourceHandoffError,
+    SourceHandoffScope,
 };
 
 /// Opaque groups, routes, and capability contracts for distributed mechanisms.
@@ -30,8 +31,9 @@ pub mod component;
 pub mod component_execution;
 pub use component_execution::{
     ComponentAdapter, ComponentDefinition, ComponentDefinitionError, ComponentEquations,
-    ComponentKernel, ComponentParameterUse, ComponentSelection, ComponentUnit, EmptyParameterModule,
-    ParallelComponentKernel, ParameterStorageId, StateSlotId, StatelessComponentState,
+    ComponentKernel, ComponentParameterUse, ComponentSelection, ComponentUnit,
+    EmptyParameterModule, ParallelComponentKernel, ParameterStorageId, StateSlotId,
+    StatelessComponentState,
 };
 mod component_text;
 pub use component_text::{RefinementComponentKernel, TextComponentKernel};
@@ -72,8 +74,8 @@ mod execution_unit_preparation;
 pub use execution_unit_preparation::{
     execution_unit_resource_requirements, ExecutionUnitPreparationError,
     ExecutionUnitResourcePreparation, ExecutionUnitResourceRequirements,
-    PreparedExecutionUnitResources, ParameterResourcePreparation,
-    ParameterResourcePreparationError, PreparedParameterResources,
+    ParameterResourcePreparation, ParameterResourcePreparationError,
+    PreparedExecutionUnitResources, PreparedParameterResources,
 };
 /// Completed-token lifecycle, snapshot reservation and branch accounting policy.
 pub mod execution_control;
@@ -135,8 +137,8 @@ mod pipeline_executor;
 pub mod replicated_execution;
 mod tensor_wave;
 pub use component_pipeline::{
-    validate_component_pipeline, validate_component_pipeline_ranges, ComponentPipelinePreparationError,
-    PipelineBindingError,
+    validate_component_pipeline, validate_component_pipeline_ranges,
+    ComponentPipelinePreparationError, PipelineBindingError,
 };
 pub use pipeline_executor::{
     validate_pipeline_local_agreement, OrdinaryPipelinePartitionUnitStrategy,
@@ -282,32 +284,27 @@ pub use execution_plan::{
     ResidencyDiagnostics,
 };
 pub use expert::{
-    addressable_projection_bytes, place_addressable_bank_members, AddressableBankPlacementError,
-    combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
+    addressable_projection_bytes, combine_routed_expert_tensor_parallel,
+    combine_tensor_parallel_expert_outputs, place_addressable_bank_members,
     plan_addressable_bank_bindings, reduce_routed_expert_tensor_parallel,
     reduce_tensor_parallel_expert_output, selected_addressable_parameter_bytes,
     with_provider_unit_observer, with_resident_unit_coordinates, with_routed_unit_invocation,
     with_routed_unit_observer, AddressableBankBindingPlan, AddressableBankDistribution,
     AddressableBankFootprint, AddressableBankMember, AddressableBankMemberError,
-    AddressableBankMemberPlacement, AddressableBankParameter, AddressableBankTask,
-    AddressableBankTaskCache, AddressableBindingTransform, AddressableExpertRouteProvider,
-    AddressableExpertRouteRequest, AddressableGatedProductBank, AddressableGroupedBank,
-    ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation, ExpertRouteTensorMovement,
-    IndexedMovement, ObservedExpertProvider, ObservedExpertProviderError, ParameterProvider,
-    ProviderUnitObserver, ResidentExpertProvider, RoutedBankId, RoutedBankProviderError,
-    RoutedBankProviders, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    RoutedObservationPoints, RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver,
-    TensorParallelParameterProvider,
+    AddressableBankMemberPlacement, AddressableBankParameter, AddressableBankPlacementError,
+    AddressableBankTask, AddressableBankTaskCache, AddressableBindingTransform,
+    AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
+    AddressableGroupedBank, ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation,
+    ExpertRouteTensorMovement, IndexedMovement, ObservedExpertProvider,
+    ObservedExpertProviderError, ParameterProvider, ProviderUnitObserver, ResidentExpertProvider,
+    RoutedBankId, RoutedBankProviderError, RoutedBankProviders, RoutedExpertRequest,
+    RoutedExpertTensorParallelOutput, RoutedObservationPoints, RoutedUnitBatch,
+    RoutedUnitInvocation, RoutedUnitObserver, TensorParallelParameterProvider,
 };
 pub use expert::{
-    AddressableBankDemand, AddressableBankDemandError, validate_addressable_bank_selection,
-    AddressableBankSelectionError, AddressableBankPreparation, AddressableBankPreparationError,
-    PreparedSelectedAddressableBank,
-};
-pub use expert::{
-    plan_addressable_bank_residency, AddressableBankResidencyError,
-    PreparedAddressableBankResidency, AddressableBankCatalog, AddressableBankCatalogError,
-    AddressableBankEntry, AddressableBankEntryError,
+    plan_addressable_bank_residency, AddressableBankCatalog, AddressableBankCatalogError,
+    AddressableBankEntry, AddressableBankEntryError, AddressableBankResidencyError,
+    PreparedAddressableBankResidency,
 };
 pub use expert::{
     prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
@@ -316,6 +313,11 @@ pub use expert::{
 pub use expert::{
     select_routes_with_observer, select_routes_with_provider, with_exchanged_unit_observer,
     with_partition_unit_observer, RoutedUnitOrigin, RoutedUnitOrigins,
+};
+pub use expert::{
+    validate_addressable_bank_selection, AddressableBankDemand, AddressableBankDemandError,
+    AddressableBankPreparation, AddressableBankPreparationError, AddressableBankSelectionError,
+    PreparedSelectedAddressableBank,
 };
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
@@ -364,9 +366,8 @@ pub use parallel::{
     aligned_partition_units, aligned_partition_units_with_tail, derive_transform_source_layout,
     expand_linear_format_parameter_group, expand_linear_format_parameter_groups,
     expand_owned_linear_format_parameter_groups, expand_tagged_linear_format_parameter_groups,
-    module_parameter_group,
-    packed_gated_product_logical_group, packed_relu2_logical_group, partition_chunk_range,
-    partition_parameter_group_chunks, partitioned_module_parameter_group,
+    module_parameter_group, packed_gated_product_logical_group, packed_relu2_logical_group,
+    partition_chunk_range, partition_parameter_group_chunks, partitioned_module_parameter_group,
     partitioned_projection_group, projection_parameter_group, segmented_projection_group,
     top_k_group_selector_logical_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
     ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
@@ -392,9 +393,8 @@ pub use parameter_layout::{
     derive_partitioned_group_layout, derive_partitioned_local_layout,
     derive_partitioned_transform_source_layout, logical_parameter_group_range,
     prepare_transform_source_layout, retained_partition_layout, validate_parameter_layout,
-    validate_tensor_parallel_layout,
-    validate_transform_parameter_space, ParameterGroupSelection, TensorParallelLayoutError,
-    TransformSourceLayoutError,
+    validate_tensor_parallel_layout, validate_transform_parameter_space, ParameterGroupSelection,
+    TensorParallelLayoutError, TransformSourceLayoutError,
 };
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,
@@ -575,12 +575,12 @@ pub use weight_residency::{
 /// Generic calibrated target workspace composition from ordinary module topology.
 pub mod workspace_resources;
 
-mod parameter_bank;
 mod parameter_acquisition;
+mod parameter_bank;
 mod parameter_coordinates;
 pub use parameter_coordinates::{
-    derive_parameter_coordinates, derive_parameter_member_layout, derive_rank_parameter_member_layout,
-    ParameterPartitionLayout,
+    derive_parameter_coordinates, derive_parameter_member_layout,
+    derive_rank_parameter_member_layout, ParameterPartitionLayout,
 };
 mod materialization_index;
 pub use materialization_index::{MaterializationTaskIndex, MaterializationTaskIndexError};
@@ -593,8 +593,10 @@ pub use pipeline_placement::{
     balanced_pipeline_ranges, PipelinePlacementError, PipelinePlacementPlan, PipelineRoute,
 };
 mod parameter_members;
-pub use parameter_members::{resolve_parameter_member, ParameterMemberIndex, ResolvedParameterMember};
 pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};
+pub use parameter_members::{
+    resolve_parameter_member, ParameterMemberIndex, ResolvedParameterMember,
+};
 
 /// Bounded row-addressable parameter lookup.
 pub mod row_lookup;

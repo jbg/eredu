@@ -1,15 +1,14 @@
 //! Consuming selected bank admission and post-materialization preparation.
 use super::{
-    AddressableBankCatalog, AddressableBankEntry, AddressableBankMemberPlacement,
-    AddressableBankResidencyError, AddressableBankSelectionError, AddressableBankTransformPlan,
-    PreparedAddressableBankResidency, plan_addressable_bank_residency,
-    validate_addressable_bank_selection,
+    plan_addressable_bank_residency, validate_addressable_bank_selection, AddressableBankCatalog,
+    AddressableBankEntry, AddressableBankMemberPlacement, AddressableBankResidencyError,
+    AddressableBankSelectionError, AddressableBankTransformPlan, PreparedAddressableBankResidency,
+};
+use crate::parameter_operations::{
+    prepare_bank_parameter_members, BankParameterIndexError, BankParameterPreparationError,
+    PreparedBankParameterIndex,
 };
 use crate::{ParameterBankKey, RowResidencyRange};
-use crate::parameter_operations::{
-    BankParameterPreparationError, BankParameterIndexError, PreparedBankParameterIndex,
-    prepare_bank_parameter_members,
-};
 use eredu_checkpoint::recipe::RecipeCatalog;
 use eredu_core::residency::{MemoryTier, OffloadConfig, ResidencyPolicy};
 use std::collections::{BTreeMap, BTreeSet};

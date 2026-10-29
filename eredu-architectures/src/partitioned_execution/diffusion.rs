@@ -96,7 +96,9 @@ where
             selected.requirements().ownership().clone(),
         )
         .map_err(architecture)?;
-        selected.requirements().validate_binding(&source_partition)
+        selected
+            .requirements()
+            .validate_binding(&source_partition)
             .map_err(architecture)?;
         let mut model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
@@ -222,7 +224,9 @@ where
             selected.requirements().ownership().clone(),
         )
         .map_err(architecture)?;
-        selected.requirements().validate_binding(&source_partition)
+        selected
+            .requirements()
+            .validate_binding(&source_partition)
             .map_err(architecture)?;
         let model = crate::diffusion_gemma::model::TextKernel::<B>::from_partition(
             args.clone(),
@@ -245,7 +249,10 @@ where
         context,
     )
     .map_err(architecture)?;
-    selected.requirements().validate_binding(&partition).map_err(architecture)?;
+    selected
+        .requirements()
+        .validate_binding(&partition)
+        .map_err(architecture)?;
     let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
         &parameters,

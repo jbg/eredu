@@ -62,7 +62,9 @@ pub use vision::{
 pub(crate) fn static_construction_specs(
     args: &ModelArgs,
 ) -> Result<crate::decoder::StaticModuleConstruction, eredu_nn::Error> {
-    use eredu_nn::{EmbeddingSpec, Error, LinearSpec, NormalizationConstructionSpec, ParameterSpec};
+    use eredu_nn::{
+        EmbeddingSpec, Error, LinearSpec, NormalizationConstructionSpec, ParameterSpec,
+    };
     let embedding_weight = "model.language_model.embed_tokens.weight";
     let head_weight = "lm_head.weight";
     let embedding = EmbeddingSpec {

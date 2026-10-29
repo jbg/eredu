@@ -98,8 +98,12 @@ pub fn local_geometry(
     let prediction = (0..predictions)
         .map(|depth| local_unit_config(config, depth + 1, 0, layout))
         .collect::<Result<Vec<_>, _>>()?;
-    let (embedding_range, output_range) = super::static_module_spec(config)
-        .vocabulary_ranges(layout, "model.embed_tokens", "model.norm", "lm_head")?;
+    let (embedding_range, output_range) = super::static_module_spec(config).vocabulary_ranges(
+        layout,
+        "model.embed_tokens",
+        "model.norm",
+        "lm_head",
+    )?;
     let state_layout = local_state_layout(config, &target, &prediction)?;
     let geometry = LocalGeometry {
         target,

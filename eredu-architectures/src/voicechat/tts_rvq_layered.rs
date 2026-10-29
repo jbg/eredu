@@ -660,7 +660,9 @@ pub fn rvq_parameter_description(
             projection,
         ),
     ];
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
+    )?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for RvqKernel<B> {

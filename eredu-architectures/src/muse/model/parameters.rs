@@ -14,8 +14,8 @@ pub(crate) fn describe(args: &DecoderConfig) -> Result<ArchitectureParameterDesc
     }
     let layout =
         ExecutionUnitLayout::new(&graph, counts.iter().copied()).map_err(Error::backend)?;
-    let text_static = crate::muse::parallel::static_resource_parameter_groups(args)
-        .map_err(Error::backend)?;
+    let text_static =
+        crate::muse::parallel::static_resource_parameter_groups(args).map_err(Error::backend)?;
     let vision_static = crate::muse::parallel::vision_static_resource_groups(args)
         .map_err(Error::backend_source)?;
     let mut owned = text_static
@@ -300,7 +300,5 @@ pub(crate) fn select_definition(
             }
         },
     )?;
-    definition
-        .select_state_layout(&state)
-        .map_err(Error::from)
+    definition.select_state_layout(&state).map_err(Error::from)
 }

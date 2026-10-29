@@ -12,7 +12,7 @@ use crate::{
     backend::error::Error,
     backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups},
     backend::runtime::residency::parameter_bank::{
-        AddressableParameterBank, BankAccessClass, AddressableBankEntry,
+        AddressableBankEntry, AddressableParameterBank, BankAccessClass,
     },
     module::PhysicalParam,
     tests::support::expert_dispatch::{

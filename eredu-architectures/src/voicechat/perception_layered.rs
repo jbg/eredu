@@ -527,7 +527,9 @@ pub fn perception_parameter_description(
             ],
         )?,
     )?;
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
+    )?)
 }
 
 /// Resolves physical geometry using the shared symbolic placement compiler.

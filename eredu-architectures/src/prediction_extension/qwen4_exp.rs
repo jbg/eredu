@@ -541,7 +541,10 @@ where
                         source_partition
                             .local_layout(
                                 &prediction_parameters::<B>(source_spec, context)?,
-                                &prediction_parameters::<B>(source_partition.local_spec(), context)?,
+                                &prediction_parameters::<B>(
+                                    source_partition.local_spec(),
+                                    context,
+                                )?,
                             )
                             .map_err(|error| invalid(error.to_string()))
                     },

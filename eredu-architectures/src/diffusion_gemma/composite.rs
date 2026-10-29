@@ -327,9 +327,7 @@ fn select_definition(
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
     let state = component_state(config, geometry)?;
-    definition
-        .select_state_layout(&state)
-        .map_err(Error::from)
+    definition.select_state_layout(&state).map_err(Error::from)
 }
 
 /// Image parameters are replicated within a tensor group and cut per layer by PP.

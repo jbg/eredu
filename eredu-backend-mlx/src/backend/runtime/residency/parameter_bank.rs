@@ -4,13 +4,13 @@
 //! inspected once per grouped block, validated before acquisition, coalesced in
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
-use eredu_checkpoint::WeightQuantization;
 #[cfg(test)]
 use eredu_checkpoint::store::TensorSelection;
+use eredu_checkpoint::WeightQuantization;
 use eredu_nn::GroupedNeuralBackend;
-pub use eredu_runtime::{AddressableBankCatalog, AddressableBankEntry};
 #[cfg(test)]
 use eredu_runtime::OffloadUnit;
+pub use eredu_runtime::{AddressableBankCatalog, AddressableBankEntry};
 use eredu_runtime::{
     AddressableGroupedBank, IndexedMovement, ParameterBankAccess, ParameterBankAcquisition,
     ResidencyReport, WeightBinding, WeightMaterializationReport,
@@ -37,20 +37,20 @@ use crate::{
     backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source,
     backend::runtime::residency::manager::{ResidencyError, ResidencyManager, ResidentTransfer},
 };
+use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
 #[cfg(test)]
 use eredu_core::residency::{OffloadPlan, ResidencyPolicy};
-use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
 
 mod catalog;
 #[cfg(test)]
 pub(crate) use catalog::quantize_entry_catalog;
+use catalog::quantize_selected_entry_catalog;
 #[allow(unused_imports)]
 pub(crate) use catalog::QuantizedParameterBankCatalog;
 pub use catalog::{
     entries_from_selected_members, BankAccessClass, ParameterBankKey, ParameterBankOptions,
     ParameterBankOptionsError,
 };
-use catalog::quantize_selected_entry_catalog;
 
 mod telemetry;
 use telemetry::ParameterBankStatistics;

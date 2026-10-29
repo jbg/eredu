@@ -308,8 +308,12 @@ pub fn local_geometry(
     let state_layout = super::parallel_state_layout(args, &text_layers)
         .map_err(|error| invalid(error.to_string()))?;
     let prediction_state = prediction_state(args, state_layout.len())?;
-    let (embedding_range, output_range) = super::static_spec(&args.text_config)
-        .vocabulary_ranges(layout, "model.embed_tokens", "model.norm", "lm_head")?;
+    let (embedding_range, output_range) = super::static_spec(&args.text_config).vocabulary_ranges(
+        layout,
+        "model.embed_tokens",
+        "model.norm",
+        "lm_head",
+    )?;
     let geometry = LocalGeometry {
         text_layers,
         embedding_range,

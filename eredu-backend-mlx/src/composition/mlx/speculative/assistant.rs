@@ -273,7 +273,10 @@ pub(super) fn prepare_external_assistant_parameters<
             stream,
         )?;
     }
-    let module = MlxModule::new(A::module::<MlxNeuralBackend>(module_config.clone(), stream)?);
+    let module = MlxModule::new(A::module::<MlxNeuralBackend>(
+        module_config.clone(),
+        stream,
+    )?);
     let task_refs = tasks.iter().collect::<Vec<_>>();
     let bindings = build_mlx_exact_replicated_text_bindings(
         &module,

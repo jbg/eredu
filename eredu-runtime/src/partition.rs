@@ -382,7 +382,10 @@ impl ArchitectureParameterDescription {
             {
                 return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
             }
-            if let Some(target) = actual.keys().find(|target| !expected.contains_key(**target)) {
+            if let Some(target) = actual
+                .keys()
+                .find(|target| !expected.contains_key(**target))
+            {
                 return Err(ArchitectureParameterError::UnexpectedOwnership(
                     target.to_string(),
                 ));
@@ -419,7 +422,9 @@ impl ArchitectureParameterDescription {
                     .entry((group, *global_unit))
                     .or_insert_with(|| consumers.iter().copied().collect::<BTreeSet<_>>());
                 if selected.len() != consumers.len()
-                    || consumers.iter().any(|consumer| !selected.contains(consumer))
+                    || consumers
+                        .iter()
+                        .any(|consumer| !selected.contains(consumer))
                 {
                     return Err(ArchitectureParameterError::InconsistentUnitConsumers {
                         group,
@@ -681,10 +686,12 @@ impl ArchitectureParameterDescription {
         &self,
         partition: &ArchitecturePartition<G, A>,
     ) -> bool {
-        partition.parameter_bindings().iter().eq(self.stored_groups(
-            partition.ownership(),
-            |group, unit| partition.owns_unit(group.as_str(), unit),
-        ))
+        partition
+            .parameter_bindings()
+            .iter()
+            .eq(self.stored_groups(partition.ownership(), |group, unit| {
+                partition.owns_unit(group.as_str(), unit)
+            }))
     }
 
     /// Projects every group in a stored canonical resource, including physical replicas.
@@ -704,7 +711,8 @@ impl ArchitectureParameterDescription {
             .collect::<BTreeSet<_>>();
         self.groups.iter().filter(move |tagged| {
             storage.contains(
-                &ParameterStorageRef::from_owner(tagged.owner()).expect("validated parameter owner"),
+                &ParameterStorageRef::from_owner(tagged.owner())
+                    .expect("validated parameter owner"),
             )
         })
     }
@@ -3818,7 +3826,8 @@ mod tests {
         let without_state = ArchitecturePartition::select_topology(
             &identity_description(
                 &ExecutionGraph::chain(["vision"]).unwrap(),
-                &ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
+                &ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1])
+                    .unwrap(),
             ),
             [("vision", 0..1)],
             PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),

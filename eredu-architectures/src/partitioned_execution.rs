@@ -25,9 +25,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     derive_partitioned_local_layout, derive_partitioned_transform_source_layout,
-    validate_transform_parameter_space, ArchitectureBoundary,
-    ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitecturePartition,
-    BoundaryDimensionContract, BoundaryRoleContract, BoundaryWireSchema, CommunicationCapabilities,
+    validate_transform_parameter_space, ArchitectureBoundary, ArchitectureGroupKind,
+    ArchitectureGroupPlacement, ArchitecturePartition, BoundaryDimensionContract,
+    BoundaryRoleContract, BoundaryWireSchema, CommunicationCapabilities,
     CommunicationCompletionPolicy, CommunicationGroupRequirements, CommunicationManifest,
     CommunicationOperation, CommunicationOperationRequirement, CommunicationRouteDescriptor,
     CommunicationRouteId, CommunicationTensorLimits, PartitionOwnership, PartitionState,
@@ -5868,10 +5868,8 @@ impl<R> PartitionedAdmission<R> {
         eredu_core::cache::PromptCacheTopology::new(
             (topology.pipeline() > 1)
                 .then_some((topology.pipeline(), rank.pipeline_parallel_rank())),
-            (topology.tensor() > 1)
-                .then_some((topology.tensor(), rank.tensor_parallel_rank())),
-            (topology.expert() > 1)
-                .then_some((topology.expert(), rank.expert_parallel_rank())),
+            (topology.tensor() > 1).then_some((topology.tensor(), rank.tensor_parallel_rank())),
+            (topology.expert() > 1).then_some((topology.expert(), rank.expert_parallel_rank())),
             true,
         )
         .map_err(|error| error.to_string())
@@ -8180,7 +8178,6 @@ pub(crate) fn selected_component_layout_for_rank(
     Ok(result)
 }
 
-
 impl TextRequirements for eredu_runtime::ReplicatedTextRequirements {
     fn text(&self) -> &eredu_runtime::ReplicatedTextRequirements {
         self
@@ -8335,9 +8332,9 @@ where
             .map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
             })?;
-        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(|error| {
-            eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
-        })?;
+        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(
+            |error| eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string()),
+        )?;
         if let Some((source, source_layout)) = source_architecture.as_ref() {
             let source_parameters = source.parameter_description(context).map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
@@ -8349,9 +8346,10 @@ where
                     "selected transform source changed the execution-unit address space".into(),
                 ));
             }
-            eredu_runtime::validate_retained_parameter_layout(&source_parameters, source_layout).map_err(
-                |error| eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string()),
-            )?;
+            eredu_runtime::validate_retained_parameter_layout(&source_parameters, source_layout)
+                .map_err(|error| {
+                    eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+                })?;
         }
         eredu_runtime::prepare_partitioned_session_runtime::<_, B, _, S, _, _, FactoryError, _>(
             architecture,
@@ -8717,7 +8715,9 @@ where
             store.as_ref(),
             eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
+        .map_err(|handoff| {
+            DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string())
+        })?;
         return qwen_hybrid::prepare::<B, S, V>(args, selected, store, context, visitor);
     }
     if let Some(args) = match (safetensors, gguf) {
@@ -8739,7 +8739,9 @@ where
             store.as_ref(),
             eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
+        .map_err(|handoff| {
+            DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string())
+        })?;
         let selected_args = crate::replicated_text::selected_nemotron_h_args(args, selected.base())
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
         let source_args = selected
@@ -8780,7 +8782,9 @@ where
             store.as_ref(),
             eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
+        .map_err(|handoff| {
+            DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string())
+        })?;
         let selected_args =
             crate::replicated_text::selected_kimi_linear_args(args, selected.base())
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -8909,7 +8913,9 @@ where
             store.as_ref(),
             eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
+        .map_err(|handoff| {
+            DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string())
+        })?;
         return qwen_hybrid::prepare_prediction::<B, S, M, V>(
             args, selected, extension, store, context, visitor,
         );
@@ -9146,7 +9152,9 @@ where
             let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                    .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_geometry = crate::nemotron_h::partition_local_geometry(
                 &source_args,
                 &source_layout,
@@ -9169,7 +9177,9 @@ where
                     source_geometry,
                     crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
                 )
-                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_architecture = crate::nemotron_h::NemotronKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9298,7 +9308,9 @@ where
             let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                    .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_geometry = crate::kimi_linear::partition_local_geometry(
                 &source_args,
                 &source_layout,
@@ -9321,7 +9333,9 @@ where
                     source_geometry,
                     eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
                 )
-                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_architecture = crate::kimi_linear::KimiKernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9443,7 +9457,9 @@ where
             let source_parameters = source_definition.parameters().clone();
             let source_layout =
                 derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
-                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                    .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_geometry =
                 crate::lfm2::partition_local_geometry(&source_args, &source_layout, owned.units())
                     .map_err(|error| {
@@ -9463,7 +9479,9 @@ where
                     source_geometry,
                     eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
                 )
-                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             let source_architecture = crate::lfm2::Lfm2Kernel::<B>::from_partition(
                 source_args,
                 source_definition,
@@ -9581,7 +9599,9 @@ where
             let source_parameters = source_definition.parameters();
             let source_layout =
                 derive_partitioned_transform_source_layout(source_parameters, parameters, rank)
-                    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                    .map_err(|error| {
+                        DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                    })?;
             let source_geometry = crate::decoder::partition_local_geometry(
                 &source_args,
                 source_parameters.invocations(),
@@ -9606,7 +9626,9 @@ where
                     source_geometry,
                     eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size()),
                 )
-                .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
             partition
                 .validate_transform_parameter_owners(
                     &source_partition,
@@ -10222,7 +10244,9 @@ where
             store.as_ref(),
             eredu_runtime::SourceHandoffScope::Primary,
         )
-        .map_err(|handoff| DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string()))?;
+        .map_err(|handoff| {
+            DenseDecoderPartitionedDispatchError::Architecture(handoff.to_string())
+        })?;
         let extension = <crate::qwen::hybrid::LayeredModel<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
             .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
         return qwen_hybrid::prepare_routed::<B, S, _>(
@@ -10673,7 +10697,11 @@ where
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::lfm2::with_checkpoint_formats(
             &source_args,
-            selected.base().text().requirements().native_quantized_formats(),
+            selected
+                .base()
+                .text()
+                .requirements()
+                .native_quantized_formats(),
         )
         .map_err(error)?;
         let source_definition = crate::lfm2::project_parameters(&source_args, &retained)
@@ -10826,7 +10854,11 @@ where
         let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
         let source_args = crate::kimi_linear::with_checkpoint_formats(
             &source_args,
-            selected.base().text().requirements().native_quantized_formats(),
+            selected
+                .base()
+                .text()
+                .requirements()
+                .native_quantized_formats(),
         )
         .map_err(error)?;
         let source_definition = crate::kimi_linear::project_parameters(&source_args, &retained)
@@ -11419,7 +11451,9 @@ where
     E: RoutedCollectiveSpec + crate::routed_text::RoutedGroupedSpec,
     V: FamilyRoutedPartitionVisitor<B, S, A>,
 {
-    selected.requirements().validate_binding(&partition)
+    selected
+        .requirements()
+        .validate_binding(&partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let mut tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
         selected.materialization_tasks(),
@@ -12403,19 +12437,22 @@ where
             .map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
             })?;
-        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(|error| {
-            eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
-        })?;
+        eredu_runtime::validate_retained_parameter_layout(&parameters, &layout).map_err(
+            |error| eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string()),
+        )?;
         if let Some((source, source_layout)) = source_architecture.as_ref() {
             let source_parameters = source.parameter_description(context).map_err(|error| {
                 eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
             })?;
-            validate_transform_parameter_space(&source_parameters, &parameters).map_err(|error| {
-                eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
-            })?;
-            eredu_runtime::validate_retained_parameter_layout(&source_parameters, source_layout).map_err(
-                |error| eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string()),
+            validate_transform_parameter_space(&source_parameters, &parameters).map_err(
+                |error| {
+                    eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+                },
             )?;
+            eredu_runtime::validate_retained_parameter_layout(&source_parameters, source_layout)
+                .map_err(|error| {
+                    eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+                })?;
         }
         let excluded = if matches!(
             bank_residency,

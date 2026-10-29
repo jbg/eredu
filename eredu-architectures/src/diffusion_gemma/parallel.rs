@@ -27,8 +27,8 @@ pub fn static_parameter_groups(
         .into_iter()
         .map(|(_, group)| group)
         .collect::<Vec<_>>();
-    let hidden = usize::try_from(args.hidden_size)
-        .map_err(|_| invalid("invalid feedback hidden width"))?;
+    let hidden =
+        usize::try_from(args.hidden_size).map_err(|_| invalid("invalid feedback hidden width"))?;
     let width = args
         .layer_policy(0)
         .ok_or_else(|| invalid("empty diffusion stack"))?

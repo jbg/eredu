@@ -7,9 +7,8 @@ use super::{
 };
 use eredu_core::CollectiveGroupId;
 use eredu_runtime::{
-    ComponentPipelinePreparationError, ArchitectureBoundary, ArchitectureGroupKind,
-    ArchitecturePartition, CommunicationManifest, PartitionedExecutionPlan,
-    PipelineActivationDtype,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
+    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
 };
 
 /// Exact component sources, stage ownership and transport selection.

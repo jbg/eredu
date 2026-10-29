@@ -283,11 +283,8 @@ fn select_definition(
         &crate::transport::pipeline_state(0, definition.state_layout()),
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
-    definition
-        .select_state_layout(state)
-        .map_err(Error::from)
+    definition.select_state_layout(state).map_err(Error::from)
 }
-
 
 impl<B> Lfm2Kernel<B>
 where

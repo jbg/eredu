@@ -359,12 +359,13 @@ pub fn partition_parameter_acquisition_bindings(
     let mut partitioned = vec![Vec::new(); units.len()];
     for binding in bindings {
         let target = binding.logical_target().unwrap_or_else(|| binding.name());
-        let (index, assigned) = owners
-            .get_mut(target)
-            .ok_or_else(|| ParameterAcquisitionError::Output {
-                target: target.into(),
-                reason: "binding has no acquisition owner",
-            })?;
+        let (index, assigned) =
+            owners
+                .get_mut(target)
+                .ok_or_else(|| ParameterAcquisitionError::Output {
+                    target: target.into(),
+                    reason: "binding has no acquisition owner",
+                })?;
         if std::mem::replace(assigned, true) {
             return Err(ParameterAcquisitionError::Output {
                 target: target.into(),

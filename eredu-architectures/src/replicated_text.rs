@@ -1076,7 +1076,8 @@ where
         .requirements()
         .shared_component_definition()
         .ok_or_else(|| eredu_nn::Error::backend("decoder selection has no retained definition"))?;
-    let source = selected.uses_weight_transform()
+    let source = selected
+        .uses_weight_transform()
         .then(|| {
             crate::decoder::CompleteDecoderKernel::<B, C, P>::from_definition(
                 source_args.clone(),
@@ -1522,7 +1523,8 @@ where
             let capability_estimate = crate::capability::lfm2(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected.uses_weight_transform()
+            let source_architecture = selected
+                .uses_weight_transform()
                 .then(|| {
                     <P as FixedProfile<B, S, Lfm2Replicated>>::from_definition(
                         args.clone(),
@@ -1562,7 +1564,8 @@ where
             let capability_estimate = crate::capability::nemotron_h(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected.uses_weight_transform()
+            let source_architecture = selected
+                .uses_weight_transform()
                 .then(|| {
                     <P as FixedProfile<B, S, NemotronHReplicated>>::from_definition(
                         args.clone(),
@@ -1602,7 +1605,8 @@ where
             let capability_estimate = crate::capability::qwen_hybrid_text(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected.uses_weight_transform()
+            let source_architecture = selected
+                .uses_weight_transform()
                 .then(|| {
                     <P as FixedProfile<B, S, QwenHybridReplicated>>::from_definition(
                         args.clone(),
@@ -1642,7 +1646,8 @@ where
             let capability_estimate = crate::capability::kimi_linear(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected.uses_weight_transform()
+            let source_architecture = selected
+                .uses_weight_transform()
                 .then(|| {
                     <P as FixedProfile<B, S, KimiLinearReplicated>>::from_definition(
                         args.clone(),
@@ -1854,7 +1859,8 @@ where
             let capability_estimate = $capability(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
-            let source_architecture = selected.uses_weight_transform()
+            let source_architecture = selected
+                .uses_weight_transform()
                 .then(|| {
                     <P as CompressedProfile<B, S, $family>>::from_definition(
                         args.clone(),
@@ -2129,7 +2135,8 @@ where
                 "shared-backbone selection has no retained definition".into(),
             )
         })?;
-        let source = selected.uses_weight_transform()
+        let source = selected
+            .uses_weight_transform()
             .then(|| {
                 crate::nemotron_labs_diffusion::model::TextKernel::<B>::from_definition(
                     config.clone(),
@@ -2194,7 +2201,8 @@ where
             "shared iterative selection has no retained definition".into(),
         )
     })?;
-    let source = selected.uses_weight_transform()
+    let source = selected
+        .uses_weight_transform()
         .then(|| {
             crate::diffusion_gemma::model::TextKernel::<B>::from_definition(
                 config.clone(),
@@ -2460,7 +2468,8 @@ where
     let capability_estimate = crate::capability::nemotron_h(args)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     let effective_model_type = args.model_type.clone();
-    let source_architecture = selected.uses_weight_transform()
+    let source_architecture = selected
+        .uses_weight_transform()
         .then(|| {
             <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::from_definition(
                 args.clone(),
@@ -7605,8 +7614,9 @@ where
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
         .ok_or(ReplicatedTextIneligibility::Unrelated)?;
     let source_linear_formats = requirements.execution().native_matrix_formats();
-    let target_linear_formats =
-        selected.execution().matrix_formats_for(requirements.execution());
+    let target_linear_formats = selected
+        .execution()
+        .matrix_formats_for(requirements.execution());
     let source_formats = requirements.execution().native_quantized_formats();
     let target_formats = selected.execution().quantized_formats();
     let has_transform = selected.execution().uses_weight_transform();
@@ -8117,8 +8127,9 @@ where
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
         .ok_or(ReplicatedTextIneligibility::Unrelated)?;
     let source_linear_formats = requirements.execution().native_matrix_formats();
-    let target_linear_formats =
-        selected.execution().matrix_formats_for(requirements.execution());
+    let target_linear_formats = selected
+        .execution()
+        .matrix_formats_for(requirements.execution());
     let source_formats = requirements.execution().native_quantized_formats();
     let target_formats = selected.execution().quantized_formats();
     let has_transform = selected.execution().uses_weight_transform();

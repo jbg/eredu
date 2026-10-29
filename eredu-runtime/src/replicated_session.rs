@@ -1318,11 +1318,13 @@ where
     let (mut architecture, partition, communication, tasks) = input.into_parts();
     let invocations = match scope {
         PartitionedUnitScope::All => {
-            let map = architecture
-                .execution_unit_storage_map()
-                .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
+            let map = architecture.execution_unit_storage_map().map_err(|error| {
+                PartitionedRuntimeConstructionError::Contract(error.to_string())
+            })?;
             map.validate_layout(partition.unit_layout())
-                .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
+                .map_err(|error| {
+                    PartitionedRuntimeConstructionError::Contract(error.to_string())
+                })?;
             map
         }
         PartitionedUnitScope::Owned => partition.invocations().clone(),

@@ -3400,9 +3400,7 @@ fn select_definition(
             }
         },
     )?;
-    definition
-        .select_state_layout(&state)
-        .map_err(Error::from)
+    definition.select_state_layout(&state).map_err(Error::from)
 }
 
 impl<B> ComponentKernel<B> for V4Kernel<B>

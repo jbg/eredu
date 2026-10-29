@@ -561,9 +561,9 @@ impl ComponentDefinition {
             for member in group.members() {
                 match (member.linear_companion(), member.linear_companion_of()) {
                     (Some(_), Some(primary))
-                        if primaries
-                            .get(primary)
-                            .is_some_and(|(owner, selected)| *selected && *owner == group.owner()) => {}
+                        if primaries.get(primary).is_some_and(|(owner, selected)| {
+                            *selected && *owner == group.owner()
+                        }) => {}
                     (None, None) => {}
                     _ => {
                         return Err(invalid(&format!(
@@ -603,7 +603,10 @@ impl ComponentDefinition {
                         .groups()
                         .iter()
                         .flat_map(|owned| {
-                            owned.members().iter().map(move |member| (member.target(), owned))
+                            owned
+                                .members()
+                                .iter()
+                                .map(move |member| (member.target(), owned))
                         })
                         .collect::<std::collections::BTreeMap<_, _>>()
                 })

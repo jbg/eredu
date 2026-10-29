@@ -2483,10 +2483,9 @@ pub(crate) mod model_text {
                 VocabularyModulePlacement::Omitted
             } else if let Some(geometry) = geometry {
                 VocabularyModulePlacement::VocabularyParallel(
-                    geometry
-                        .output_range()
-                        .cloned()
-                        .ok_or_else(|| Error::backend("untied Gemma 4 output has no local range"))?,
+                    geometry.output_range().cloned().ok_or_else(|| {
+                        Error::backend("untied Gemma 4 output has no local range")
+                    })?,
                 )
             } else {
                 VocabularyModulePlacement::Local
@@ -2504,7 +2503,9 @@ pub(crate) mod model_text {
                     .then(|| {
                         B::embedding(
                             EmbeddingSpec {
-                                vocabulary: args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
+                                vocabulary: args
+                                    .vocab_size_per_layer_input
+                                    .unwrap_or(args.vocab_size),
                                 dimensions: combined_width,
                                 weight: ParameterSpec::trainable(per_layer_embedding)
                                     .map_err(Error::backend)?,

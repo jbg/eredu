@@ -393,8 +393,11 @@ impl SelectedExecution {
         let Some((execution, rank)) = self.partitioned_ownership() else {
             return Ok(None);
         };
-        let topology = eredu_core::ParallelRankTopology::new(rank.topology().topology(), global_rank)
-            .map_err(|error| eredu_core::parameters::ParameterError::Invalid(error.to_string()))?;
+        let topology =
+            eredu_core::ParallelRankTopology::new(rank.topology().topology(), global_rank)
+                .map_err(|error| {
+                    eredu_core::parameters::ParameterError::Invalid(error.to_string())
+                })?;
         eredu_runtime::derive_rank_parameter_member_layout(
             execution,
             topology,

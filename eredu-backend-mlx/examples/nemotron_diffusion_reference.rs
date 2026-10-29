@@ -321,12 +321,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let reference = Array::load_safetensors(reference_path, &weights_stream)?;
     if vision_context {
         type Composite = nemotron_labs_diffusion::composite::Model<Backend>;
-        let mut model =
-            nemotron_labs_diffusion::composite::CompositeKernel::from_definition(
-                config.clone(),
-                std::sync::Arc::new(nemotron_labs_diffusion::definition::composite(&config, None)?),
-                stream,
-            )?;
+        let mut model = nemotron_labs_diffusion::composite::CompositeKernel::from_definition(
+            config.clone(),
+            std::sync::Arc::new(nemotron_labs_diffusion::definition::composite(
+                &config, None,
+            )?),
+            stream,
+        )?;
         let (policy, metadata) = prepare_layerwise_policy_with_bindings(
             source,
             &mut model,
@@ -433,7 +434,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => config.clone(),
     };
     let text_definition = std::sync::Arc::new(nemotron_labs_diffusion::definition::text(
-        &text_config, None,
+        &text_config,
+        None,
     )?);
     let mut model = TextKernel::from_definition(text_config, text_definition, stream)?;
     let (policy, metadata) = prepare_layerwise_policy_with_bindings(

@@ -263,7 +263,9 @@ impl SelectedTargetExecution {
         let spec = plan.target.bind_spec(spec)?;
         let identity = spec.state_fingerprint().to_owned();
         construction_started();
-        let source_architecture = selected.text().uses_weight_transform()
+        let source_architecture = selected
+            .text()
+            .uses_weight_transform()
             .then(|| {
                 plan.target.bound_spec().and_then(|bound| {
                     TargetKernel::<B>::new(bound, context).and_then(TargetKernel::into_model)

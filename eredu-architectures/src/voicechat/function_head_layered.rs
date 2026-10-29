@@ -428,17 +428,17 @@ pub fn function_head_parameter_description(
             MemberSharding::Balanced { axis: 0 },
         )],
     )?;
-    let group = eredu_runtime::expand_linear_format_parameter_group(logical, |_| {
-        Ok(Some(format.clone()))
-    })?;
+    let group =
+        eredu_runtime::expand_linear_format_parameter_group(logical, |_| Ok(Some(format.clone())))?;
     let owned = OwnedParameterGroupSpec::new(
-        ParameterGroupOwner::execution_unit(
-            layout.group_id(0).expect("function group").clone(),
-            0,
-        ),
+        ParameterGroupOwner::execution_unit(layout.group_id(0).expect("function group").clone(), 0),
         group,
     );
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, [owned])?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph,
+        &layout,
+        [owned],
+    )?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for FunctionHeadKernel<B> {

@@ -108,7 +108,10 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
         )?;
         let text_definition = crate::diffusion_gemma::model::project_from_composite(&definition)?;
         let text = TextKernel::materialize(
-            config.clone(), text_definition, Some(geometry.text.clone()), context,
+            config.clone(),
+            text_definition,
+            Some(geometry.text.clone()),
+            context,
         )?;
         let image = ImageStatic::materialize(
             &config,

@@ -255,11 +255,13 @@ impl<'a> ExecutionUnitResourcePreparation<'a> {
         resources
             .definitions
             .push(OffloadUnit::new(id.clone(), bindings)?);
-        resources.specs.push(resources.residency.parameter_unit_spec(
-            id.clone(),
-            bytes,
-            ResidencyPolicy::Windowed,
-        )?);
+        resources
+            .specs
+            .push(resources.residency.parameter_unit_spec(
+                id.clone(),
+                bytes,
+                ResidencyPolicy::Windowed,
+            )?);
         resources.unit_ids.push(id);
         resources.unit_bytes.push(bytes);
         resources.host_bytes.push(host_bytes);

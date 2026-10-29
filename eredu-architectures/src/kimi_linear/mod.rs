@@ -39,7 +39,8 @@ pub use parallel::{
     PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
 pub use partitioned::{
-    project_parameters, CompleteKimiGeometry, CompleteKimiKernel, KimiGeometry, KimiKernel, PartitionedLayeredModel,
+    project_parameters, CompleteKimiGeometry, CompleteKimiKernel, KimiGeometry, KimiKernel,
+    PartitionedLayeredModel,
 };
 
 use crate::decoder::StaticModuleSpec;

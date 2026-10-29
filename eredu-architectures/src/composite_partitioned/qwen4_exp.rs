@@ -169,50 +169,48 @@ impl PreparedConditionalPartition {
                 "constructed Flash-Next conditional state differs from cold admission",
             ));
         }
-        let source_architecture =
-            if execution.text().uses_weight_transform() {
-                let source_vision = ingress.vision().config().clone();
-                let (source_tensor, source_parameters, source_layout, source_experts) =
-                    local_geometry(&source_bound, &ingress, &source_vision, rank)
-                        .map_err(invalid)?;
-                if eredu_runtime::derive_partitioned_transform_source_layout(
-                    &source_parameters,
-                    &parameters,
-                    rank,
-                )
-                .map_err(|error| invalid(error.to_string()))?
-                    != source_layout
-                {
-                    return Err(invalid(
-                        "Flash-Next conditional transform changed exact source placement",
-                    ));
-                }
-                let mut source = ConditionalKernel::<B>::new_partitioned(
-                    source_bound,
-                    source_tensor,
-                    ingress,
-                    source_vision,
-                    rank,
-                    &source_layout,
-                    state,
-                    context,
-                )
+        let source_architecture = if execution.text().uses_weight_transform() {
+            let source_vision = ingress.vision().config().clone();
+            let (source_tensor, source_parameters, source_layout, source_experts) =
+                local_geometry(&source_bound, &ingress, &source_vision, rank).map_err(invalid)?;
+            if eredu_runtime::derive_partitioned_transform_source_layout(
+                &source_parameters,
+                &parameters,
+                rank,
+            )
+            .map_err(|error| invalid(error.to_string()))?
+                != source_layout
+            {
+                return Err(invalid(
+                    "Flash-Next conditional transform changed exact source placement",
+                ));
+            }
+            let mut source = ConditionalKernel::<B>::new_partitioned(
+                source_bound,
+                source_tensor,
+                ingress,
+                source_vision,
+                rank,
+                &source_layout,
+                state,
+                context,
+            )
+            .map_err(invalid)?;
+            source = source
+                .with_expert_realization(&source_experts)
                 .map_err(invalid)?;
-                source = source
-                    .with_expert_realization(&source_experts)
-                    .map_err(invalid)?;
-                if source.definition().state_layout() != architecture.definition().state_layout() {
-                    return Err(invalid(
-                        "Flash-Next conditional transform source changed local state geometry",
-                    ));
-                }
-                Some((
-                    Box::new(source.into_model().map_err(invalid)?),
-                    source_layout,
-                ))
-            } else {
-                None
-            };
+            if source.definition().state_layout() != architecture.definition().state_layout() {
+                return Err(invalid(
+                    "Flash-Next conditional transform source changed local state geometry",
+                ));
+            }
+            Some((
+                Box::new(source.into_model().map_err(invalid)?),
+                source_layout,
+            ))
+        } else {
+            None
+        };
         let owned = selected
             .requirements()
             .groups()

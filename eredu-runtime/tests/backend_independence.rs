@@ -8839,7 +8839,6 @@ fn composite_prepared_parts_drive_dependency_group_output() {
     assert_eq!(output, FakeTensor(vec![15, 9, 9]));
     assert_eq!(shared_state.as_ref()[2].0, 6);
     assert_eq!(shared_state.as_ref()[3].0, 5);
-
 }
 
 #[test]

@@ -6,9 +6,8 @@ use super::{
 };
 use eredu_core::CollectiveGroupId;
 use eredu_runtime::{
-    ComponentPipelinePreparationError, ArchitectureBoundary, ArchitectureGroupKind,
-    ArchitecturePartition, CommunicationManifest, PartitionedExecutionPlan,
-    PipelineActivationDtype,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
+    ComponentPipelinePreparationError, PartitionedExecutionPlan, PipelineActivationDtype,
 };
 
 /// Retained source recipes and exact partition/transport authority.

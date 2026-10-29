@@ -6,12 +6,12 @@ use eredu_nn::{
     Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState,
-    LayeredPartitionInput, LayeredPartitionOutput, ModelStateIdentity, ParameterProvider,
-    ResidentExpertProvider, RuntimeStateComponents, StateLayout,
+    ComponentEquations as _, ParallelComponentKernel as _, PartitionComponentKernel as _,
 };
 use eredu_runtime::{
-    ComponentEquations as _, ParallelComponentKernel as _, PartitionComponentKernel as _,
+    ExecutionUnitLayout, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
+    LayeredPartitionOutput, ModelStateIdentity, ParameterProvider, ResidentExpertProvider,
+    RuntimeStateComponents, StateLayout,
 };
 
 use crate::{
@@ -925,8 +925,7 @@ where
     {
         let mut forward = self.begin(input, state, context)?;
         if matches!(forward.context.mode, ForwardMode::Target) {
-            forward =
-                crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
+            forward = crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
             forward.context.embedded = forward.hidden.clone();
         }
         Ok(forward)

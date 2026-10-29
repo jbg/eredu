@@ -674,7 +674,9 @@ pub(super) fn rnnt_parameter_description_for_phases(
             ));
         }
     }
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
+    )?)
 }
 
 impl<B: NeuralBackend, const PREDICTOR: bool> ComponentKernel<B> for RnntKernel<B, PREDICTOR> {

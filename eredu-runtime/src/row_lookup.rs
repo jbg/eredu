@@ -5,7 +5,9 @@ use eredu_nn::{NeuralBackend, ParameterId, Tensor, TensorElementType};
 mod demand;
 pub use demand::RowBankDemand;
 mod descriptor;
-pub use descriptor::{RowLookupDescriptor, RowLookupDescriptors, RowScaleDescriptor, RowScaleSource};
+pub use descriptor::{
+    RowLookupDescriptor, RowLookupDescriptors, RowScaleDescriptor, RowScaleSource,
+};
 
 mod collection;
 pub use collection::{PreparedRowLookups, RowLookupRequirements};

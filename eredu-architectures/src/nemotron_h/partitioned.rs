@@ -3,8 +3,8 @@
 use eredu_nn::{AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, Tensor};
 use eredu_runtime::PartitionComponentKernel as _;
 use eredu_runtime::{
-    LayerRuntimeState, LayeredForwardState,
-    LayeredPartitionInput, ParameterProvider, RuntimeStateComponents, StateLayout,
+    LayerRuntimeState, LayeredForwardState, LayeredPartitionInput, ParameterProvider,
+    RuntimeStateComponents, StateLayout,
 };
 
 use super::{
@@ -36,7 +36,6 @@ pub struct NemotronKernel<B: eredu_nn::GroupedNeuralBackend + eredu_nn::Distribu
     geometry: PartitionLocalGeometry,
     boundary: TargetBoundarySchema,
 }
-
 
 impl<B> NemotronKernel<B>
 where

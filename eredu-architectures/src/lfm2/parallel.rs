@@ -497,8 +497,12 @@ pub fn local_geometry(
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = state_layout_with_geometry(args, &state_geometry(args, &blocks))
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let (embedding_range, output_range) = super::static_spec(args)
-        .vocabulary_ranges(layout, "model.embed_tokens", "model.embedding_norm", "lm_head")?;
+    let (embedding_range, output_range) = super::static_spec(args).vocabulary_ranges(
+        layout,
+        "model.embed_tokens",
+        "model.embedding_norm",
+        "lm_head",
+    )?;
     let geometry = LocalGeometry {
         blocks,
         embedding_range,

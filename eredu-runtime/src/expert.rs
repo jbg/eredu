@@ -25,21 +25,21 @@ pub use banks::{RoutedBankProviderError, RoutedBankProviders};
 mod demand;
 pub use demand::{AddressableBankDemand, AddressableBankDemandError};
 mod preparation;
-pub use preparation::{
-    AddressableBankPreparation, AddressableBankPreparationError, PreparedSelectedAddressableBank,
-};
 pub use catalog::{
-    plan_addressable_bank_residency, AddressableBankResidencyError,
-    PreparedAddressableBankResidency, AddressableBankCatalog, AddressableBankCatalogError,
-    AddressableBankEntry, AddressableBankEntryError,
-};
-pub use quantization::{
-    prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
-    AddressableBankQuantizationError, AddressableBankTransformGroup, AddressableBankTransformPlan,
+    plan_addressable_bank_residency, AddressableBankCatalog, AddressableBankCatalogError,
+    AddressableBankEntry, AddressableBankEntryError, AddressableBankResidencyError,
+    PreparedAddressableBankResidency,
 };
 pub use placement::{
     place_addressable_bank_members, validate_addressable_bank_selection,
     AddressableBankPlacementError, AddressableBankSelectionError,
+};
+pub use preparation::{
+    AddressableBankPreparation, AddressableBankPreparationError, PreparedSelectedAddressableBank,
+};
+pub use quantization::{
+    prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
+    AddressableBankQuantizationError, AddressableBankTransformGroup, AddressableBankTransformPlan,
 };
 pub use route_intervention::{select_routes_with_observer, select_routes_with_provider};
 pub use units::{

@@ -547,11 +547,11 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
             output.push(binding);
             continue;
         }
-        let logical_target = binding
-            .logical_target()
-            .ok_or_else(|| BindingPlacementError::MissingLogicalTarget {
+        let logical_target = binding.logical_target().ok_or_else(|| {
+            BindingPlacementError::MissingLogicalTarget {
                 binding: binding.name().to_owned(),
-            })?;
+            }
+        })?;
         let tensor = layout.tensor(logical_target).ok_or_else(|| {
             BindingPlacementError::UnknownLogicalTarget {
                 binding: binding.name().to_owned(),

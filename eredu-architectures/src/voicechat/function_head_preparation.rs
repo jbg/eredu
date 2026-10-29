@@ -6,7 +6,9 @@ use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
     store::{SharedCheckpointSource, StoreError},
 };
-use eredu_runtime::{ComponentPreparationError, LocalModelLayout, PreparedComponent, WeightBinding};
+use eredu_runtime::{
+    ComponentPreparationError, LocalModelLayout, PreparedComponent, WeightBinding,
+};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},

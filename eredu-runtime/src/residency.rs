@@ -557,9 +557,8 @@ impl WeightBinding {
             self.alias_of.is_none(),
             "logical aliases have no physical recipe"
         );
-        self.recipe.unwrap_or_else(|| {
-            DerivedWeightRecipe::source(self.checkpoint_key, self.selection)
-        })
+        self.recipe
+            .unwrap_or_else(|| DerivedWeightRecipe::source(self.checkpoint_key, self.selection))
     }
 
     // Inspection borrows retained derived recipes; direct bindings synthesize

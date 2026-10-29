@@ -2,8 +2,9 @@
 use super::{
     rnnt::{RnntDimensions, RnntError, RnntProjectionExecution},
     rnnt_layered::{
-        rnnt_local_dimensions_for_description, rnnt_parameter_description_for_phases, runtime_error,
-        RnntForward, RnntInput, RnntKernel, RnntLocalDimensions, RnntSelection, RnntUnit,
+        rnnt_local_dimensions_for_description, rnnt_parameter_description_for_phases,
+        runtime_error, RnntForward, RnntInput, RnntKernel, RnntLocalDimensions, RnntSelection,
+        RnntUnit,
     },
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};

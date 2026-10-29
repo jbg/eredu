@@ -119,9 +119,11 @@ pub fn prepare_bank_parameter_replacements(
                     key: member.key,
                 })?;
         }
-        parameters.extend(replacements.into_iter().filter_map(|(name, (_, facts))| {
-            facts.flatten().map(|_| name.to_owned())
-        }));
+        parameters.extend(
+            replacements
+                .into_iter()
+                .filter_map(|(name, (_, facts))| facts.flatten().map(|_| name.to_owned())),
+        );
     }
     Ok(PreparedBankParameterReplacements {
         parameters,

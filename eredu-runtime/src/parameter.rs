@@ -600,10 +600,12 @@ where
             } else if let Some(physical) = companion.catalog_source() {
                 validate_physical_source(physical, source)?;
                 DerivedWeightRecipe::source(physical.catalog_key(), TensorSelection::Full)
-            } else if task.lowering().transforms_payload() || matches!(
-                task.source_encoding(),
-                eredu_checkpoint::SourceTensorEncoding::Gguf { .. }
-            ) {
+            } else if task.lowering().transforms_payload()
+                || matches!(
+                    task.source_encoding(),
+                    eredu_checkpoint::SourceTensorEncoding::Gguf { .. }
+                )
+            {
                 if !source.is_authoritative_materialized_key(companion.name()) {
                     return Err(ModuleBindingPlanError::ExactTask {
                         details: format!(
@@ -697,10 +699,7 @@ where
 }
 
 fn push_exact_declaration(
-    parameters: &BTreeMap<
-        ParameterId,
-        (ParameterBindingTarget, eredu_nn::ParameterStorageLayout),
-    >,
+    parameters: &BTreeMap<ParameterId, (ParameterBindingTarget, eredu_nn::ParameterStorageLayout)>,
     declarations: &mut Vec<PlannedBinding>,
     conversions: &mut BTreeMap<String, Vec<RecipeDtype>>,
     target: String,
@@ -1205,7 +1204,9 @@ impl PreparedParameterRecipes {
             .flat_map(|recipe| recipe.source_keys().into_iter().map(str::to_owned))
             .collect();
         self.source = Arc::new(RestrictedCheckpointSource::including(
-            self.source, scope, keys,
+            self.source,
+            scope,
+            keys,
         )?);
         Ok(self)
     }
@@ -1622,9 +1623,7 @@ where
         excluded: &'a dyn Fn(&ParameterId) -> bool,
     }
 
-    impl<'a, 'value, P: 'value, W> ParameterVisitorMut<'value, P>
-        for MutableTopologyValidator<'a, W>
-    {
+    impl<'a, 'value, P: 'value, W> ParameterVisitorMut<'value, P> for MutableTopologyValidator<'a, W> {
         fn visit_mut(&mut self, metadata: ParameterMetadata, _: &'value mut P) {
             if self.duplicate.is_some() {
                 return;

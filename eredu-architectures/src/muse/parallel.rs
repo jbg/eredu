@@ -404,8 +404,12 @@ pub fn local_geometry(
         .map(|layer| local_decoder_config(args, layer, layout))
         .collect::<Result<Vec<_>, _>>()?;
     let state_layout = local_state_layout(&text_blocks)?;
-    let (embedding_range, output_range) = super::text::static_spec(args)
-        .vocabulary_ranges(layout, "model.embed_tokens", "model.norm", "lm_head")?;
+    let (embedding_range, output_range) = super::text::static_spec(args).vocabulary_ranges(
+        layout,
+        "model.embed_tokens",
+        "model.norm",
+        "lm_head",
+    )?;
     let geometry = LocalGeometry {
         text_blocks,
         embedding_range,

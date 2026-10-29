@@ -1,11 +1,11 @@
 //! Backend-neutral Muse-Glimmer decoder equations.
 
 use eredu_nn::{
-    AttentionCache, AttentionRequest, EmbeddingOperator, Error,
-    GatedProductGroupLayout, GroupScoring, GroupedGatedProductOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    AttentionCache, AttentionRequest, EmbeddingOperator, Error, GatedProductGroupLayout,
+    GroupScoring, GroupedGatedProductOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
+    LinearOperator, LinearSpec, NormalizationConstructionSpec, NormalizationOperator,
+    ParameterSpec, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
+    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, ParameterProvider, RoutedExpertRequest, TensorParallelParameterProvider,

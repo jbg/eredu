@@ -36,7 +36,8 @@ pub use parallel::{
     LocalGeometry, PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
 pub use partitioned::{
-    project_parameters, CompleteLfm2Geometry, CompleteLfm2Kernel, Lfm2Geometry, Lfm2Kernel, PartitionedLayeredModel,
+    project_parameters, CompleteLfm2Geometry, CompleteLfm2Kernel, Lfm2Geometry, Lfm2Kernel,
+    PartitionedLayeredModel,
 };
 
 use crate::decoder::StaticModuleSpec;

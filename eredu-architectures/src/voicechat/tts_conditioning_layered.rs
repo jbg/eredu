@@ -622,7 +622,9 @@ pub fn conditioning_parameter_description(
             ],
         )?,
     );
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
+    )?)
 }
 
 impl<B: NeuralBackend> ComponentKernel<B> for ConditioningKernel<B> {

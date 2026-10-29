@@ -1,6 +1,8 @@
 //! Native completion and binding for architecture-selected component pipelines.
 
-use super::generic::{prepare_layerwise_policy_from_addressed_bindings, MlxSelectedLayerwisePolicy};
+use super::generic::{
+    prepare_layerwise_policy_from_addressed_bindings, MlxSelectedLayerwisePolicy,
+};
 use crate::{
     backend::{
         distributed::MlxDistributedSession,

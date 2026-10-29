@@ -1269,9 +1269,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
 }
 
 /// Inkling normalizes complete text/media assembly before decoder ingress.
-pub(crate) fn embedding_norm_spec(
-    args: &TextArgs,
-) -> Result<NormalizationConstructionSpec, Error> {
+pub(crate) fn embedding_norm_spec(args: &TextArgs) -> Result<NormalizationConstructionSpec, Error> {
     Ok(NormalizationConstructionSpec::learned(
         args.hidden_size,
         args.rms_norm_eps,

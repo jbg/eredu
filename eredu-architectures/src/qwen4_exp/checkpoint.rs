@@ -18,8 +18,7 @@ use eredu_checkpoint::{
     rows::{PreparedRowSource, RowReadError},
     store::{
         CheckpointSource, EncodedTensorLease, PreparedCheckpointSource, ReadPolicy,
-        SharedCheckpointSource, StoreError,
-        TensorReadRequest, TensorSelection,
+        SharedCheckpointSource, StoreError, TensorReadRequest, TensorSelection,
     },
     StoredDtype,
 };

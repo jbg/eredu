@@ -1,5 +1,7 @@
 //! Exact checkpoint authority for architecture-admitted execution requirements.
-use crate::{ReplicatedTextParameterPresence, ReplicatedTextPhysicalSource, ReplicatedTextRequirements};
+use crate::{
+    ReplicatedTextParameterPresence, ReplicatedTextPhysicalSource, ReplicatedTextRequirements,
+};
 use std::{collections::BTreeSet, sync::Arc};
 
 /// Checkpoint provenance or recipe facts disagree with the admitted handoff.

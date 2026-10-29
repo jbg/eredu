@@ -1651,9 +1651,7 @@ fn select_definition(
         |_, ordinal| format!("model.layers.{ordinal}"),
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
-    definition
-        .select_state_layout(&state)
-        .map_err(Error::from)
+    definition.select_state_layout(&state).map_err(Error::from)
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend>
@@ -1784,8 +1782,7 @@ where
     {
         let mut forward = self.begin(input, state, context)?;
         if matches!(forward.context.mode, ForwardMode::Target) {
-            forward =
-                crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
+            forward = crate::decoder::ComponentInstrumentation::apply_embedding(forward, observer)?;
             forward.context.embedded = forward.hidden.clone();
         }
         Ok(forward)

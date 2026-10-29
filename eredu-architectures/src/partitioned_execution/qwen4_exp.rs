@@ -109,57 +109,56 @@ impl PreparedTargetPartition {
             .with_global_parameters(parameters.clone())
             .map_err(invalid)?;
 
-        let source_architecture =
-            if selected.base().text().uses_weight_transform() {
-                let source_bound = source_partition.source_bound_spec().clone();
-                let source_parameters = source_bound
-                    .geometry()
-                    .parameter_description()
-                    .map_err(invalid)?;
-                validate_transform_parameter_space(&source_parameters, &parameters)
-                    .map_err(|error| invalid(error.to_string()))?;
-                let mut source_model = TargetKernel::<B>::new_tensor_parallel(
-                    source_bound,
-                    source_partition.partition().clone(),
-                    context,
+        let source_architecture = if selected.base().text().uses_weight_transform() {
+            let source_bound = source_partition.source_bound_spec().clone();
+            let source_parameters = source_bound
+                .geometry()
+                .parameter_description()
+                .map_err(invalid)?;
+            validate_transform_parameter_space(&source_parameters, &parameters)
+                .map_err(|error| invalid(error.to_string()))?;
+            let mut source_model = TargetKernel::<B>::new_tensor_parallel(
+                source_bound,
+                source_partition.partition().clone(),
+                context,
+            )
+            .map_err(invalid)?;
+            let source_tensor_parameters = source_model.definition().parameters().clone();
+            let source_experts = source_partition
+                .partition()
+                .local_spec()
+                .expert_realization(rank)
+                .map_err(invalid)?;
+            source_model = source_model
+                .with_expert_realization(&source_experts)
+                .map_err(invalid)?;
+            let source_layout = source_partition
+                .partition()
+                .local_expert_layout(
+                    &source_parameters,
+                    &source_tensor_parameters,
+                    &source_model.definition().parameters().clone(),
+                    rank.expert_parallel_rank(),
+                    rank.expert_parallel_size(),
                 )
                 .map_err(invalid)?;
-                let source_tensor_parameters = source_model.definition().parameters().clone();
-                let source_experts = source_partition
-                    .partition()
-                    .local_spec()
-                    .expert_realization(rank)
-                    .map_err(invalid)?;
-                source_model = source_model
-                    .with_expert_realization(&source_experts)
-                    .map_err(invalid)?;
-                let source_layout = source_partition
-                    .partition()
-                    .local_expert_layout(
-                        &source_parameters,
-                        &source_tensor_parameters,
-                        &source_model.definition().parameters().clone(),
-                        rank.expert_parallel_rank(),
-                        rank.expert_parallel_size(),
-                    )
-                    .map_err(invalid)?;
-                if source_model.definition().state_layout().clone() != complete_state {
-                    return Err(invalid(
-                        "Flash-Next transform source changed local state geometry",
-                    ));
-                }
-                source_model = source_model.with_partition_state(state).map_err(invalid)?;
-                source_model = source_model
-                    .with_global_parameters(
-                        source_parameters
-                            .with_partition_layout(rank, source_layout.clone())
-                            .map_err(invalid)?,
-                    )
-                    .map_err(invalid)?;
-                Some((source_model.into_model().map_err(invalid)?, source_layout))
-            } else {
-                None
-            };
+            if source_model.definition().state_layout().clone() != complete_state {
+                return Err(invalid(
+                    "Flash-Next transform source changed local state geometry",
+                ));
+            }
+            source_model = source_model.with_partition_state(state).map_err(invalid)?;
+            source_model = source_model
+                .with_global_parameters(
+                    source_parameters
+                        .with_partition_layout(rank, source_layout.clone())
+                        .map_err(invalid)?,
+                )
+                .map_err(invalid)?;
+            Some((source_model.into_model().map_err(invalid)?, source_layout))
+        } else {
+            None
+        };
 
         let rows = match selected.base().row_lookups() {
             Some(plan) => {

@@ -1257,14 +1257,13 @@ fn vocabulary_global_rows(
     let construction = super::model::StaticConstruction::new(config)
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     let mut rows = BTreeMap::new();
-    let mut add =
-        |weight: &eredu_nn::ParameterSpec, vocabulary| -> Result<(), ParallelPlanError> {
-            let vocabulary = usize::try_from(vocabulary).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Moshi vocabulary exceeds usize".into())
-            })?;
-            rows.insert(weight.id.as_str().to_owned(), vocabulary);
-            Ok(())
-        };
+    let mut add = |weight: &eredu_nn::ParameterSpec, vocabulary| -> Result<(), ParallelPlanError> {
+        let vocabulary = usize::try_from(vocabulary).map_err(|_| {
+            ParallelPlanError::InvalidGroup("Moshi vocabulary exceeds usize".into())
+        })?;
+        rows.insert(weight.id.as_str().to_owned(), vocabulary);
+        Ok(())
+    };
     for spec in &construction.embeddings {
         add(&spec.embedding.weight, spec.embedding.vocabulary)?;
     }

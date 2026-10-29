@@ -17,14 +17,14 @@ pub(crate) mod residency;
 mod resources;
 mod snapshot;
 mod state_lifecycle;
-pub use state_lifecycle::{
-    ModelPredictionStateProfile, PoolingPredictionStateProfile, PredictionStateLifecycle,
-    SequentialPredictionStateProfile,
-};
 use invocation::prediction_invocation;
 pub use invocation::PredictionInvocation;
 pub(crate) use placement::PredictionPlacementSlot;
 pub use placement::PreparedPredictionPlacement;
+pub use state_lifecycle::{
+    ModelPredictionStateProfile, PoolingPredictionStateProfile, PredictionStateLifecycle,
+    SequentialPredictionStateProfile,
+};
 
 /// Visits the actual materialized prediction modules in architecture-declared
 /// ownership order. A module ordinal identifies a physical parameter owner; it
@@ -2656,7 +2656,6 @@ where
             })
             .map(|output| (output.logits, output.hidden))
     }
-
 }
 
 impl<B, M> executor_sealed::Sealed<crate::deepseek::v4::Model<B>>
@@ -3095,7 +3094,6 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-
 }
 
 impl<A, B, M> executor_sealed::Sealed<A> for MaterializedQwenHybridPrediction<B, M>
@@ -3219,7 +3217,6 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-
 }
 
 impl<A, B, M> executor_sealed::Sealed<A> for MaterializedNemotronHPrediction<B, M>
@@ -3338,7 +3335,6 @@ where
             })
             .map(|output| (output.logits, output.capture))
     }
-
 }
 
 struct V4DsparkContextOperation<'a, 'o, B, M>
@@ -4090,8 +4086,9 @@ where
             );
             let target_args =
                 crate::deepseek::v3_with_checkpoint_formats(args, formats).map_err(invalid)?;
-            let definition = crate::deepseek::v3::project_parameters(&target_args, extension.definition())
-                .map_err(|error| invalid(error.to_string()))?;
+            let definition =
+                crate::deepseek::v3::project_parameters(&target_args, extension.definition())
+                    .map_err(|error| invalid(error.to_string()))?;
             let parameters = definition.parameters().clone();
             let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
                 .map_err(invalid)?;
@@ -4122,8 +4119,8 @@ where
                 source_geometry,
             )
             .map_err(|error| invalid(error.to_string()))?;
-            let target_layers =
-                usize::try_from(args.num_hidden_layers).map_err(|error| invalid(error.to_string()))?;
+            let target_layers = usize::try_from(args.num_hidden_layers)
+                .map_err(|error| invalid(error.to_string()))?;
             let state = geometry
                 .state_layout()
                 .slice(target_layers..target_layers + extension.depth())

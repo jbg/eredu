@@ -303,9 +303,8 @@ pub fn balanced_parameter_group_range(
     let complete = range == (0..global_extent);
     for member in group.members() {
         let actual = layout.tensor(member.target()).ok_or_else(invalid)?;
-        let (mut placement, shape) =
-            resolve_balanced_member(member, axis, global_extent, &range)
-                .map_err(crate::ParallelPlanError::InvalidTensor)?;
+        let (mut placement, shape) = resolve_balanced_member(member, axis, global_extent, &range)
+            .map_err(crate::ParallelPlanError::InvalidTensor)?;
         if (complete || member.sharding() == &crate::MemberSharding::Replicated)
             && matches!(
                 actual.placement(),
@@ -537,8 +536,14 @@ fn local_layout_groups<'a>(
             } else {
                 resolve_member(member, group.partition_units(), member_rank, member_parts)?
             };
-            let mut tensor =
-                local_tensor(group, member, local_shape, placement, logical_range.clone(), false);
+            let mut tensor = local_tensor(
+                group,
+                member,
+                local_shape,
+                placement,
+                logical_range.clone(),
+                false,
+            );
             if tensor_parts > 1 {
                 if let Some(range) = &packed_expert_range {
                     tensor = tensor.with_additional_placement(crate::TensorPlacement::Range {
@@ -673,9 +678,9 @@ fn resolve_balanced_member(
         || range.end > global_extent
     {
         return Err(format!(
-        "tensor {:?} does not preserve axis {axis} extent {global_extent} selection {range:?}",
-        member.target(),
-    ));
+            "tensor {:?} does not preserve axis {axis} extent {global_extent} selection {range:?}",
+            member.target(),
+        ));
     }
     if replicated {
         Ok((

@@ -284,7 +284,5 @@ pub(crate) fn select_definition(
         &state_partition_plan(&state),
         |_, _, boundaries| !boundaries.is_kernel_owned(),
     )?;
-    definition
-        .select_state_layout(&state)
-        .map_err(Error::from)
+    definition.select_state_layout(&state).map_err(Error::from)
 }

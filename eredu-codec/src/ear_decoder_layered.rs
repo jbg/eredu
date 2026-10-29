@@ -432,7 +432,9 @@ pub fn decoder_parameter_description(
             group,
         ));
     }
-    Ok(ArchitectureParameterDescription::from_owned(&graph, &layout, owned)?)
+    Ok(ArchitectureParameterDescription::from_owned(
+        &graph, &layout, owned,
+    )?)
 }
 impl<B: NeuralBackend> ComponentKernel<B> for DecoderKernel<B> {
     type Input<'a> = &'a B::Tensor;

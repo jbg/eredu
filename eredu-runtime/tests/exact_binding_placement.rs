@@ -275,8 +275,7 @@ fn exact_binding_places_each_rank_before_validating_its_local_slot() {
         },
     ]);
     let layout =
-        eredu_runtime::project_parameter_selection_layout(&fused, &global, Some(&local))
-            .unwrap();
+        eredu_runtime::project_parameter_selection_layout(&fused, &global, Some(&local)).unwrap();
     let bindings = bind(&source, &task, vec![2, 2], Some(&layout)).unwrap();
     let selected = layout.tensor("weight").unwrap();
     assert_eq!(
@@ -557,19 +556,15 @@ fn exact_binding_applies_compound_member_and_tensor_placements_once() {
     use eredu_runtime::parameter_operations::{
         prepare_bank_parameter_replacements, BankParameterReplacementFacts,
     };
-    let replacement = prepare_bank_parameter_replacements(
-        &parameters[0].members,
-        &members,
-        true,
-        |parameter| {
+    let replacement =
+        prepare_bank_parameter_replacements(&parameters[0].members, &members, true, |parameter| {
             (parameter == "weight").then_some(BankParameterReplacementFacts {
                 leading_dimension: Some(2),
                 element_type: Some(eredu_nn::TensorElementType::F16),
                 byte_len: 32,
             })
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     let (selected, effective_bytes) = replacement.into_parts();
     assert_eq!(selected, BTreeSet::from(["weight".to_owned()]));
     assert_eq!(effective_bytes.values().copied().sum::<u64>(), 32);
