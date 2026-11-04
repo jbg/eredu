@@ -41,6 +41,7 @@ RELEASE_ORDER = (
     "eredu-backend-mlx",
     "eredu",
     "eredu-cli",
+    "eredu-recommendation",
 )
 
 MAX_ARCHIVE_BYTES = 10 * 1024 * 1024

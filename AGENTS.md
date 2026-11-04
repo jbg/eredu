@@ -16,6 +16,7 @@ portable mechanisms: eredu-media / eredu-runtime
 portable families:   eredu-codec / eredu-architectures
 native realization:  eredu-backend-* (currently eredu-backend-mlx)
 facade:               eredu
+application policy:   eredu-recommendation
 applications:         eredu-cli / examples / downstream applications
 ```
 
@@ -105,6 +106,11 @@ it.
 - `eredu-evaluation` owns reusable evaluation fixtures, metrics, and comparison
   policy. Concrete backend tests and examples may use it as a development
   dependency; production backend mechanisms must not call into it.
+- `eredu-recommendation` owns model discovery, benchmark attribution, catalogue
+  construction, and application recommendation policy above the portable facade.
+  It consumes retained inspection and forecast contracts, never implements family
+  geometry or native execution. Core catalogue assessment and ranking require no
+  network or concrete backend. No lower production stratum depends on it.
 - `eredu-cli`, examples, and downstream applications are consumers above the
   facade or explicitly imported low-level neutral contracts. They do not
   become owners of backend, architecture, or runtime policy merely because

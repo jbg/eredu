@@ -90,6 +90,12 @@ jobs:
       - name: Test portable facade contracts
         if: matrix.suite == 'portable'
         run: cargo test --locked -p eredu --no-default-features --test portable_facade --test backend_conformance
+      - name: Check portable recommendation APIs and CLI
+        if: matrix.suite == 'portable'
+        run: |
+          cargo check --locked -p eredu-recommendation --no-default-features
+          cargo check --locked -p eredu-recommendation --features cli --all-targets
+          cargo test --locked -p eredu-recommendation --features hub --doc
       - name: Install validation tooling Python
         if: matrix.suite == 'portable'
         uses: actions/setup-python@v5
