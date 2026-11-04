@@ -214,7 +214,9 @@ memory, and 128 MiB per I/O stream; CLI flags configure time and memory limits.
 Unavailable memory monitoring, resource exhaustion and backend errors remain
 unverified outcomes. They never become claims of model incompatibility.
 
-Build reports preserve exclusions and their compatibility state. Source failures
+Build reports preserve exclusions and their compatibility state. Repository-level
+lineage and metadata rejections exclude that checkpoint without interrupting
+assessment of other repositories. Source failures
 abort publication rather than silently reducing coverage. Refresh retains
 immutable artifact revisions and benchmark evidence while re-inspecting the
 entries for the requested engine/profile. Catalogue and report files each use
