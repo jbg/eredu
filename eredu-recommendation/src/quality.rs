@@ -40,12 +40,16 @@ impl BenchmarkIndex {
             .await?
             .error_for_status()?;
         let methodology = Hub::bounded_body(methodology, 16 * 1024 * 1024).await?;
-        let version = regex::Regex::new(
-            r"Artificial Analysis Intelligence Index v([0-9]+\.[0-9]+(?:\.[0-9]+)?)",
-        )?
-        .captures(std::str::from_utf8(&methodology)?)
-        .context("AA methodology version could not be identified")?[1]
-            .to_owned();
+        let methodology = std::str::from_utf8(&methodology)?;
+        let index = regex::Regex::new(
+            r"Artificial Analysis Intelligence Index v([0-9]+\.[0-9]+(?:\.[0-9]+)?) incorporates ([0-9]+) evaluations",
+        )?;
+        let index = index
+            .captures(methodology)
+            .context("AA index version and evaluation count could not be identified")?;
+        let version = index[1].to_owned();
+        let evaluation_count: usize = index[2].parse()?;
+        anyhow::ensure!(evaluation_count > 0, "AA index has no evaluations");
         let response = client
             .get("https://artificialanalysis.ai/api/v2/data/llms/models")
             .header("x-api-key", header)
@@ -90,13 +94,13 @@ impl BenchmarkIndex {
                 let bytes = Hub::bounded_body(response, 16 * 1024 * 1024).await?;
                 let page = std::str::from_utf8(&bytes)?;
                 let repo = weights_repo(page)?;
-                let estimated = if repo.is_some() {
-                    index_is_estimated(page, &id)
+                let status = if repo.is_some() {
+                    index_measurement(page, &id, score, evaluation_count)
                         .with_context(|| format!("Checking AA evaluation status for {url}"))?
                 } else {
-                    false
+                    Measurement::Unknown
                 };
-                Ok::<_, anyhow::Error>((repo, estimated, id, url, name, score))
+                Ok::<_, anyhow::Error>((repo, status, id, url, name, score))
             }
         }))
         .buffered(4)
@@ -105,19 +109,27 @@ impl BenchmarkIndex {
         let evaluations = results.len();
         let mut unmapped = 0;
         let mut estimates = 0;
+        let mut unverified = 0;
         let mut index = Self {
             version,
             ..Default::default()
         };
         for result in results {
-            let (repo, estimated, id, url, name, score) = result?;
+            let (repo, status, id, url, name, score) = result?;
             let Some(repo) = repo else {
                 unmapped += 1;
                 continue;
             };
-            if estimated {
-                estimates += 1;
-                continue;
+            match status {
+                Measurement::Estimated => {
+                    estimates += 1;
+                    continue;
+                }
+                Measurement::Unknown => {
+                    unverified += 1;
+                    continue;
+                }
+                Measurement::Measured => {}
             }
             // Multiple reasoning configurations can point to one checkpoint. Keep the
             // highest scoring measured configuration and retain its name for attribution.
@@ -144,7 +156,7 @@ impl BenchmarkIndex {
             !index.models.is_empty(),
             "AA returned no mapped open-weight models; existing catalogue preserved"
         );
-        eprintln!("AA: {evaluations} scored configurations, {} distinct HF checkpoints, {unmapped} configurations without HF weights links, {estimates} estimated configurations excluded", index.models.len());
+        eprintln!("AA: {evaluations} scored configurations, {} distinct HF checkpoints, {unmapped} configurations without HF weights links, {estimates} estimated and {unverified} unverified configurations excluded", index.models.len());
         Ok(index)
     }
 
@@ -313,9 +325,23 @@ fn weights_repo(page: &str) -> Result<Option<String>> {
 }
 
 #[cfg(feature = "hub")]
-fn index_is_estimated(page: &str, model_id: &str) -> Result<bool> {
-    // AA does not expose estimate status in its API. Read the page's identified
-    // currentModel, never related-model entries or a page-wide estimate label.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Measurement {
+    Measured,
+    Estimated,
+    Unknown,
+}
+
+#[cfg(feature = "hub")]
+fn index_measurement(
+    page: &str,
+    model_id: &str,
+    api_score: f64,
+    evaluation_count: usize,
+) -> Result<Measurement> {
+    // Match the exact API configuration, never related models or page-wide labels.
+    // Current pages can omit the estimate flag. That omission alone is not
+    // evidence: require the full index's per-evaluation results and matching score.
     let chunks = regex::Regex::new(r#"self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)"#)?;
     let mut payload = String::new();
     for capture in chunks.captures_iter(page) {
@@ -331,14 +357,49 @@ fn index_is_estimated(page: &str, model_id: &str) -> Result<bool> {
         if model["id"].as_str() != Some(model_id) {
             continue;
         }
-        let estimated = model["intelligenceIndexIsEstimated"]
-            .as_bool()
-            .context("AA evaluation has no explicit estimate status")?;
-        anyhow::ensure!(
-            status.is_none_or(|previous| previous == estimated),
-            "Conflicting AA estimate status"
-        );
-        status = Some(estimated);
+        let observed = measurement(&model, api_score, evaluation_count);
+        if status.is_some_and(|previous| previous != observed) {
+            return Ok(Measurement::Unknown);
+        }
+        status = Some(observed);
     }
-    status.context("AA page has no matching current model with explicit estimate status")
+    Ok(status.unwrap_or(Measurement::Unknown))
+}
+
+#[cfg(feature = "hub")]
+fn measurement(model: &Value, api_score: f64, evaluation_count: usize) -> Measurement {
+    if model["intelligenceIndexIsEstimated"].as_bool() == Some(true) {
+        return Measurement::Estimated;
+    }
+    // The API publishes scores rounded to one decimal place. A different page
+    // score can indicate a stale response or a different index revision.
+    if !api_score.is_finite()
+        || !model["intelligenceIndex"]
+            .as_f64()
+            .is_some_and(|value| value.is_finite() && (value - api_score).abs() <= 0.050_000_001)
+    {
+        return Measurement::Unknown;
+    }
+    match model.get("intelligenceIndexIsEstimated") {
+        Some(Value::Bool(false)) => return Measurement::Measured,
+        Some(_) => return Measurement::Unknown,
+        None => {}
+    }
+    let Some(results) = model["intelligenceIndexEvaluations"].as_array() else {
+        return Measurement::Unknown;
+    };
+    let mut slugs = std::collections::HashSet::new();
+    if evaluation_count == 0
+        || results.len() != evaluation_count
+        || results.iter().any(|result| {
+            let slug = result["slug"].as_str().unwrap_or("");
+            slug.is_empty()
+                || !slugs.insert(slug)
+                || !result["score"].as_f64().is_some_and(f64::is_finite)
+                || result["isEstimated"].as_bool() == Some(true)
+        })
+    {
+        return Measurement::Unknown;
+    }
+    Measurement::Measured
 }
