@@ -14,7 +14,7 @@ workspace = true
 
 [features]
 default = []
-hub = ["dep:reqwest", "dep:futures", "dep:tokio", "dep:regex", "dep:tempfile"]
+hub = ["dep:reqwest", "dep:futures", "dep:tokio", "dep:regex", "dep:tempfile", "dep:serde-saphyr", "dep:sha2"]
 builder = ["hub", "dep:base64", "dep:sysinfo"]
 cli = ["builder", "dep:clap"]
 mlx = ["eredu/mlx"]
@@ -44,3 +44,6 @@ sysinfo = { version = "0.37", default-features = false, features = ["system"], o
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"], optional = true }
+sha2 = { workspace = true, optional = true }

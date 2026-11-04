@@ -138,6 +138,7 @@ async fn main() -> Result<()> {
             let budgets: Vec<DomainBudget> = read(&budgets)?;
             let candidates = catalogue.assess(&engine_revision, &budgets)?;
             let policy = RecommendationPolicy {
+                require_curation: false,
                 require_benchmark: !allow_unbenchmarked,
                 require_conversational: !allow_nonconversational,
             };
