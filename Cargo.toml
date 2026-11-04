@@ -19,6 +19,7 @@ members = [
     "eredu-media",
     "eredu-evaluation",
     "eredu-cli",
+    "eredu-recommendation",
     "examples/eredu-ios/native",
 ]
 resolver = "2"
@@ -57,6 +58,7 @@ eredu-architectures = { version = "0.5.0", path = "eredu-architectures" }
 eredu-codec = { version = "0.5.0", path = "eredu-codec", default-features = false }
 eredu-media = { version = "0.4.0", path = "eredu-media", default-features = false }
 eredu-evaluation = { version = "0.5.0", path = "eredu-evaluation" }
+eredu-recommendation = { version = "0.1.0", path = "eredu-recommendation", default-features = false }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

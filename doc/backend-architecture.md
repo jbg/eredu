@@ -1,5 +1,17 @@
 # Language-model backend architecture
 
+`eredu-recommendation` is application policy above the portable facade. It owns
+remote discovery, benchmark attribution, revision-pinned catalogues and ranking.
+It consumes architecture inspection and request-aware forecasts without owning
+family admission, tensor geometry, execution selection or native resources.
+Offline catalogue assessment clears stored capacity observations and reapplies
+caller-supplied budgets to each physical domain. Missing observations remain
+unknown; benchmark scores and file sizes cannot establish backend compatibility
+or memory fit. The optional builder uses an explicitly selected worker process
+with sampled memory, wall-time and I/O limits. Network and concrete adapters are
+separate opt-in features. No runtime, architecture, backend or facade production
+crate depends on recommendation policy.
+
 Local artifact admission retains the exact primary checkpoint, shard admissions,
 and explicitly selected or discovered GGUF companion roles in `ArtifactInspection`.
 `ArtifactSource` and companion selection are neutral contracts in `eredu-core`;

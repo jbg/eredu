@@ -62,6 +62,7 @@ Implementation crates remain specialized dependencies.
 | Crate | Role |
 | --- | --- |
 | [`eredu`](eredu/) | Main model loading, generation, chat, multimodal, realtime, and planning API |
+| [`eredu-recommendation`](eredu-recommendation/) | Revision-pinned discovery, benchmark attribution, catalogue tooling, and memory-aware recommendation policy |
 | [`eredu-cli`](eredu-cli/) | Command-line model runner built on Eredu |
 | [`eredu-core`](eredu-core/) | Backend-neutral contracts, artifact inspection, planning, validation, and portable schemas |
 | [`eredu-media`](eredu-media/) | Optional backend-neutral host audio, image, and video processing |

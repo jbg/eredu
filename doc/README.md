@@ -9,6 +9,9 @@ changes, archived APIs and exact revisions for applications pinned to old `main`
 
 ## Models and applications
 
+- [Model recommendations](../eredu-recommendation/README.md): portable discovery,
+  benchmark evidence, offline catalogue assessment and bounded builder workers.
+
 - [Model and checkpoint support](model-support.md): supported families,
   modalities, artifact formats, and inspection.
 - [DiffusionGemma validation](diffusion-gemma-validation.md): shared-stack block
