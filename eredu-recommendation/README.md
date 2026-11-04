@@ -126,7 +126,11 @@ metadata attribution, not a cryptographic proof that weights are unchanged.
 
 `BenchmarkIndex::artificial_analysis(api_key)` fetches measured Artificial
 Analysis configurations and retains their evaluation URLs and configuration
-names. It excludes estimates and ambiguous checkpoint mappings. The adapter
+names. It excludes estimates, unverified measurement status, and ambiguous checkpoint mappings.
+The exact model configuration must match the API score. Pages without an explicit
+estimate flag qualify only when they publish a complete set of finite, uniquely
+identified per-evaluation results for the current methodology; a missing flag alone
+never establishes measurement. The adapter
 also reads public methodology and model pages; their structure and mapping
 availability are external dependencies. API credentials are arguments rather
 than implicit environment lookups. Applications retain provider attribution
