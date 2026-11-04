@@ -216,8 +216,9 @@ unverified outcomes. They never become claims of model incompatibility.
 
 Build reports preserve exclusions and their compatibility state. Repository-level
 lineage and metadata rejections exclude that checkpoint without interrupting
-assessment of other repositories. Source failures
-abort publication rather than silently reducing coverage. Refresh retains
+assessment of other repositories. Inaccessible artifacts (HTTP 401, 403, 404 or
+410) are also recorded as unverified exclusions. Transport errors, rate limits
+and service failures abort publication rather than silently reducing coverage. Refresh retains
 immutable artifact revisions and benchmark evidence while re-inspecting the
 entries for the requested engine/profile. Catalogue and report files each use
 atomic replacement, and an empty result never replaces an existing catalogue.
