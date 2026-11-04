@@ -279,9 +279,18 @@ impl CatalogueBuilder {
 }
 
 fn source_failure(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|source| source.downcast_ref::<reqwest::Error>().is_some())
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| {
+                // A discovered repository may be gated, removed, or inaccessible to
+                // this caller. Report that candidate as unverified. Rate limits,
+                // service failures, and transport errors still abort publication.
+                !error
+                    .status()
+                    .is_some_and(|status| matches!(status.as_u16(), 401 | 403 | 404 | 410))
+            })
+    })
 }
 
 /// Atomic replacement uses a temporary file in the destination directory.
