@@ -79,10 +79,16 @@ impl CatalogueBuilder {
                         }
                         report.exclusions.extend(exclusions);
                     }
-                    Err(error) => {
+                    Err(error) if source_failure(&error) => {
                         // Source failures abort publication instead of silently shrinking coverage.
                         return Err(error.context(format!("Building {repo}")));
                     }
+                    Err(error) => report.exclusions.push(Exclusion {
+                        repo_id: repo.into(),
+                        variant_id: None,
+                        compatibility: Compatibility::Unknown,
+                        reason: error.to_string(),
+                    }),
                 }
             }
         }
