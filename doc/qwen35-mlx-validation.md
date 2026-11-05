@@ -108,3 +108,31 @@ cargo test -p eredu --no-default-features \
   --test portable_facade --test backend_conformance
 cargo test -p eredu-cli --features metal
 ```
+
+## Official header-only inspection
+
+Header-only source catalogs retain the complete admitted checkpoint resolution,
+including declared MTP tensors. Ordinary target parameters exclude MTP; auxiliary
+prediction parameters retain their exact tensor identities and backing shards.
+Missing declared MTP weights fail admission even when the supplied shard index is
+internally consistent. Physical role views remain restricted to admitted sources.
+
+Portable execution-class selection and exact fusion-tensor provenance checks
+cover these official SafeTensors checkpoints using immutable configs, indexes and
+shard headers. Weight payloads and numerical generation are outside these checks.
+
+| Checkpoint | Revision |
+| --- | --- |
+| [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B/tree/2fc06364715b967f1860aea9cf38778875588b17) | `2fc06364715b967f1860aea9cf38778875588b17` |
+| [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B/tree/15852e8c16360a2fea060d615a32b45270f8a8fc) | `15852e8c16360a2fea060d615a32b45270f8a8fc` |
+| [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B/tree/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a) | `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` |
+| [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B/tree/c202236235762e1c871ad0ccb60c8ee5ba337b9a) | `c202236235762e1c871ad0ccb60c8ee5ba337b9a` |
+| [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B/tree/fc05daec18b0a78c049392ed2e771dde82bdf654) | `fc05daec18b0a78c049392ed2e771dde82bdf654` |
+| [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/tree/59d61f3ce65a6d9863b86d2e96597125219dc754) | `59d61f3ce65a6d9863b86d2e96597125219dc754` |
+
+The facade's MLX cold inspection reports compatible metadata and produces a
+generation forecast for the pinned 0.8B dense and 35B-A3B routed checkpoints.
+The same source path also passes an ordinary non-MTP control,
+`HuggingFaceTB/SmolLM2-135M-Instruct` at
+`12fd25f77366fa6b3b4b768ec3050bf629380bac`. These checks create no native tensors
+and do not establish numerical generation parity or complete memory upper bounds.

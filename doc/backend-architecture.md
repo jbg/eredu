@@ -493,7 +493,10 @@ logical consumers. SafeTensors declarations contain neutral tensor metadata,
 admitted shard identities and resolved schemas. Architecture-owned component
 roles use restricted source views and may combine disjoint inputs from several
 containers. Opening a role does not rediscover a directory or duplicate a store
-shared with another role.
+shared with another role. Header-only catalogs use the physical declaration’s
+complete admitted resolution, including embedded prediction sources. Logical target
+and prediction views remain restricted independently; header inspection grants no
+payload-opening authority.
 
 VoiceChat's portable admission module uses these declarations for perception,
 backbone, function head, TTS, codec and RNNT parameters. It parses nested NeMo and
