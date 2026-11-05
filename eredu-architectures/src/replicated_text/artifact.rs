@@ -578,16 +578,10 @@ fn derive_recipe_source(
                 )
                 .map_err(|e| ReplicatedTextRequirementsError::InvalidArtifact(e.to_string()))?,
             )),
-            PhysicalArtifactPreparation::MetadataOnly { .. } => {
-                let architecture = inspection
-                    .architecture_plan()
-                    .safetensors_architecture()
-                    .ok_or_else(|| {
-                        ReplicatedTextRequirementsError::InvalidArtifact(
-                            "metadata-only source requires a SafeTensors schema".into(),
-                        )
-                    })?;
-                safetensors_inspection_recipe_source(inspection, architecture)?
+            PhysicalArtifactPreparation::MetadataOnly { resolution } => {
+                // The physical declaration retains the complete admitted source,
+                // including prediction tensors omitted from the ordinary target.
+                safetensors_inspection_catalog(inspection, resolution)?
             }
         };
         let catalog: Arc<dyn ColdCatalog> = Arc::new(ArtifactRecipeCatalog {
@@ -620,6 +614,13 @@ pub(super) fn safetensors_inspection_recipe_source(
             "SafeTensors architecture omitted exact catalog admission".into(),
         )
     })?;
+    safetensors_inspection_catalog(inspection, selected)
+}
+
+fn safetensors_inspection_catalog(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: &eredu_checkpoint::validation::ResolvedCheckpointPlan,
+) -> Result<Arc<dyn ColdCatalog>, ReplicatedTextRequirementsError> {
     let mut metadata = BTreeMap::new();
     for key in selected.source_keys() {
         let descriptor = inspection.tensors().get(key).ok_or_else(|| {
