@@ -31,6 +31,8 @@ pub struct CatalogueSelection {
     pub max_parameters: u64,
     pub formats: Vec<String>,
     pub public_only: bool,
+    /// Expand measured publisher checkpoints into lineage-verified quantizations.
+    pub include_quantizations: bool,
 }
 
 pub struct CatalogueBuilder {
@@ -54,8 +56,36 @@ impl CatalogueBuilder {
         &self,
         index: &crate::quality::BenchmarkIndex,
     ) -> Result<(Catalogue, BuildReport)> {
+        self.build_selected(
+            index,
+            &CatalogueSelection {
+                max_parameters: u64::MAX,
+                formats: vec!["safetensors".into(), "gguf".into()],
+                public_only: false,
+                include_quantizations: true,
+            },
+        )
+        .await
+    }
+
+    /// Build from measured checkpoint identities, with explicit coverage limits.
+    /// Disabling quantization expansion inspects only benchmark-mapped publishers.
+    pub async fn build_selected(
+        &self,
+        index: &crate::quality::BenchmarkIndex,
+        selection: &CatalogueSelection,
+    ) -> Result<(Catalogue, BuildReport)> {
         self.profile.validate()?;
         index.validate()?;
+        ensure!(
+            selection.max_parameters > 0
+                && !selection.formats.is_empty()
+                && selection
+                    .formats
+                    .iter()
+                    .all(|f| matches!(f.as_str(), "safetensors" | "gguf")),
+            "Invalid catalog selection"
+        );
         ensure!(
             !self.engine_revision.is_empty(),
             "Engine revision must be explicit"
@@ -65,13 +95,16 @@ impl CatalogueBuilder {
             engine_revision: self.engine_revision.clone(),
             profile: self.profile.clone(),
             benchmark_version: index.version.clone(),
-            curation_version: None,
             models: Vec::new(),
         };
         let mut report = BuildReport::default();
         let mut repos = std::collections::HashSet::new();
         for parent in &index.candidates {
-            let mut candidates = crate::quality::derived_models(&self.hub, parent).await?;
+            let mut candidates = if selection.include_quantizations {
+                crate::quality::derived_models(&self.hub, parent).await?
+            } else {
+                Vec::new()
+            };
             candidates.insert(0, serde_json::json!({"id":parent}));
             for candidate in candidates {
                 let Some(repo) = candidate["id"].as_str() else {
@@ -80,7 +113,7 @@ impl CatalogueBuilder {
                 if !repos.insert(repo.to_owned()) {
                     continue;
                 }
-                match self.model(repo, Some(index), None, None).await {
+                match self.model(repo, index, Some(selection)).await {
                     Ok((model, exclusions)) => {
                         if let Some(model) = model {
                             catalogue.models.push(model);
@@ -112,91 +145,15 @@ impl CatalogueBuilder {
         Ok((catalogue, report))
     }
 
-    /// Inspect only the source repositories explicitly selected by the curator.
-    /// Benchmark coverage enriches attribution; it never expands the candidate set.
-    pub async fn build_curated(
-        &self,
-        index: &crate::curation::CurationIndex,
-        benchmarks: Option<&crate::quality::BenchmarkIndex>,
-        selection: &CatalogueSelection,
-    ) -> Result<(Catalogue, BuildReport)> {
-        self.profile.validate()?;
-        index.validate()?;
-        if let Some(benchmarks) = benchmarks {
-            benchmarks.validate()?;
-        }
-        ensure!(
-            !self.engine_revision.is_empty()
-                && selection.max_parameters > 0
-                && !selection.formats.is_empty()
-                && selection
-                    .formats
-                    .iter()
-                    .all(|f| matches!(f.as_str(), "safetensors" | "gguf")),
-            "Invalid curated catalog build configuration"
-        );
-        let mut catalogue = Catalogue {
-            schema_version: SCHEMA_VERSION,
-            engine_revision: self.engine_revision.clone(),
-            profile: self.profile.clone(),
-            benchmark_version: benchmarks
-                .map(|b| b.version.clone())
-                .unwrap_or_else(|| "unranked".into()),
-            curation_version: Some(index.version()),
-            models: Vec::new(),
-        };
-        let mut report = BuildReport::default();
-        for entry in &index.repositories {
-            let repo = &entry.repo_id;
-            match self
-                .model(repo, benchmarks, Some(&entry.curation), Some(selection))
-                .await
-            {
-                Ok((model, exclusions)) => {
-                    if let Some(model) = model {
-                        catalogue.models.push(model);
-                    }
-                    report.exclusions.extend(exclusions);
-                }
-                Err(error) if source_failure(&error) => {
-                    return Err(error.context(format!("Building {repo}")))
-                }
-                Err(error) => report.exclusions.push(Exclusion {
-                    repo_id: repo.clone(),
-                    variant_id: None,
-                    compatibility: Compatibility::Unknown,
-                    reason: error.to_string(),
-                }),
-            }
-        }
-        catalogue.models.sort_by(|a, b| {
-            crate::quality::compare_quality(a.quality.as_ref(), b.quality.as_ref())
-                .then_with(|| {
-                    a.curation
-                        .as_ref()
-                        .map(|c| c.rank)
-                        .cmp(&b.curation.as_ref().map(|c| c.rank))
-                })
-                .then_with(|| a.repo_id.cmp(&b.repo_id))
-        });
-        ensure!(
-            !catalogue.models.is_empty(),
-            "No verified curated candidates; existing output is preserved"
-        );
-        catalogue.validate(&self.engine_revision)?;
-        Ok((catalogue, report))
-    }
-
     async fn model(
         &self,
         repo: &str,
-        index: Option<&crate::quality::BenchmarkIndex>,
-        curation: Option<&crate::curation::Curation>,
+        index: &crate::quality::BenchmarkIndex,
         selection: Option<&CatalogueSelection>,
     ) -> Result<(Option<Model>, Vec<Exclusion>)> {
         let (repository, manifest) = self.hub.repository(repo, None).await?;
-        let quality = index.and_then(|index| index.for_model(repo, &manifest));
-        if quality.is_none() && curation.is_none() {
+        let quality = index.for_model(repo, &manifest);
+        if quality.is_none() {
             return Ok((
                 None,
                 vec![Exclusion {
@@ -210,13 +167,12 @@ impl CatalogueBuilder {
         let original = quality
             .as_ref()
             .filter(|q| q.inherited)
-            .map(|q| q.evaluated_model_id.as_str())
-            .or_else(|| curation.and_then(|_| crate::quality::quantized_parent(&manifest)));
+            .map(|q| q.evaluated_model_id.as_str());
         if let Some(selection) = selection {
             ensure!(
                 !selection.public_only
                     || (manifest["gated"] == false && manifest["private"] != true),
-                "Curated source is gated or private"
+                "Source is gated or private"
             );
             let metadata = match original {
                 Some(parent) => self.hub.model(parent).await?,
@@ -242,7 +198,6 @@ impl CatalogueBuilder {
             repo_id: repo.into(),
             revision: repository.revision.clone(),
             quality,
-            curation: curation.cloned(),
             variants: Vec::new(),
         };
         let mut exclusions = Vec::new();
@@ -331,7 +286,6 @@ impl CatalogueBuilder {
             engine_revision: self.engine_revision.clone(),
             profile: self.profile.clone(),
             benchmark_version: original.benchmark_version.clone(),
-            curation_version: original.curation_version.clone(),
             models: Vec::new(),
         };
         let mut report = BuildReport::default();
