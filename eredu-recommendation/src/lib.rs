@@ -11,6 +11,8 @@ pub mod lineage;
 #[cfg(feature = "hub")]
 mod metadata;
 pub mod quality;
+pub mod ranking;
+pub mod sources;
 pub mod suitability;
 #[cfg(feature = "hub")]
 pub mod transport;
@@ -93,20 +95,22 @@ pub struct Candidate {
     pub revision: String,
     pub variant: ModelVariant,
     pub quality: Option<Quality>,
+    pub publisher: Option<sources::PublisherSource>,
+    pub adoption: Option<ranking::Adoption>,
     pub assessment: Assessment,
 }
 
 /// Application eligibility choices; compatibility and a proven likely fit are mandatory.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RecommendationPolicy {
-    pub require_benchmark: bool,
+    pub ranking: ranking::RankingPolicy,
     pub require_conversational: bool,
 }
 
 impl Default for RecommendationPolicy {
     fn default() -> Self {
         Self {
-            require_benchmark: true,
+            ranking: ranking::RankingPolicy::default(),
             require_conversational: true,
         }
     }
@@ -117,8 +121,6 @@ impl RecommendationPolicy {
         candidate.assessment.compatibility == Compatibility::Compatible
             && (!self.require_conversational
                 || candidate.assessment.suitability == Suitability::Suitable)
-            && (!self.require_benchmark
-                || quality::has_recommendation_evidence(candidate.quality.as_ref()))
     }
 
     pub fn eligible(&self, candidate: &Candidate) -> bool {
@@ -132,14 +134,20 @@ impl RecommendationPolicy {
 
     /// Candidates must use a common benchmark index and comparable forecast profiles.
     /// Unknown or straddling memory bounds never become affirmative fit advice.
-    pub fn rank<'a>(&self, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
+    pub fn rank<'a>(
+        &self,
+        candidates: &'a [Candidate],
+    ) -> Result<Vec<&'a Candidate>, ranking::RankingError> {
         self.ordered(candidates.iter().filter(|c| self.eligible(c)).collect())
     }
 
     /// Separate availability for supported candidates whose memory fit is unverified.
     /// These are not recommendations. Known shortfalls remain excluded; callers
     /// preserve load/request admission warnings before executing an unverified model.
-    pub fn memory_unverified<'a>(&self, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
+    pub fn memory_unverified<'a>(
+        &self,
+        candidates: &'a [Candidate],
+    ) -> Result<Vec<&'a Candidate>, ranking::RankingError> {
         self.ordered(
             candidates
                 .iter()
@@ -154,14 +162,20 @@ impl RecommendationPolicy {
         )
     }
 
-    fn ordered<'a>(&self, mut ranked: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
-        ranked.sort_by(|a, b| {
-            quality::compare_quality(a.quality.as_ref(), b.quality.as_ref())
+    fn ordered<'a>(
+        &self,
+        mut ranked: Vec<&'a Candidate>,
+    ) -> Result<Vec<&'a Candidate>, ranking::RankingError> {
+        let scores = self.ranking.scores(&ranked).ok_or(ranking::RankingError)?;
+        let mut scored: Vec<_> = ranked.drain(..).zip(scores).collect();
+        scored.sort_by(|(a, sa), (b, sb)| {
+            sb.total_cmp(sa)
                 .then_with(|| b.variant.precision_rank.cmp(&a.variant.precision_rank))
                 .then_with(|| a.repo_id.cmp(&b.repo_id))
                 .then_with(|| a.variant.variant_id.cmp(&b.variant.variant_id))
         });
-        ranked
+        ranked = scored.into_iter().map(|(c, _)| c).collect();
+        Ok(ranked)
     }
 }
 

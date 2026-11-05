@@ -10,7 +10,7 @@ use eredu::api::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -83,7 +83,7 @@ pub struct Catalogue {
     /// Caller-supplied immutable engine build/revision identifier.
     pub engine_revision: String,
     pub profile: Profile,
-    pub benchmark_version: String,
+    pub benchmark_version: Option<String>,
     pub models: Vec<Model>,
 }
 
@@ -93,6 +93,8 @@ pub struct Model {
     pub repo_id: String,
     pub revision: String,
     pub quality: Option<Quality>,
+    pub publisher: Option<crate::sources::PublisherSource>,
+    pub adoption: Option<crate::ranking::Adoption>,
     pub variants: Vec<Variant>,
 }
 
@@ -127,7 +129,10 @@ impl Catalogue {
         let invalid = |s: &str| CatalogueError::Invalid(s.into());
         if self.schema_version != SCHEMA_VERSION
             || self.engine_revision.is_empty()
-            || self.benchmark_version.is_empty()
+            || self
+                .benchmark_version
+                .as_ref()
+                .is_some_and(|s| s.is_empty())
         {
             return Err(invalid("missing provenance or unsupported schema"));
         }
@@ -140,6 +145,18 @@ impl Catalogue {
                 || model.variants.is_empty()
             {
                 return Err(invalid("invalid repository, revision or duplicate model"));
+            }
+            if model
+                .publisher
+                .as_ref()
+                .is_some_and(|p| !p.valid(&model.repo_id))
+                || model
+                    .adoption
+                    .as_ref()
+                    .is_some_and(|a| !a.valid(&model.repo_id))
+                || (model.quality.is_some() && self.benchmark_version.is_none())
+            {
+                return Err(invalid("invalid publisher or ranking provenance"));
             }
             if model
                 .quality
@@ -252,6 +269,8 @@ impl Catalogue {
                     revision: model.revision.clone(),
                     variant: item.artifact.clone(),
                     quality: model.quality.clone(),
+                    publisher: model.publisher.clone(),
+                    adoption: model.adoption.clone(),
                     assessment,
                 })
             })

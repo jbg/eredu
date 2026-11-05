@@ -1,9 +1,12 @@
 # Language-model backend architecture
 
 `eredu-recommendation` is application policy above the portable facade. It owns
-remote discovery, independently measured benchmark attribution, revision-pinned
-catalogues and ranking. Applications can restrict construction to benchmark-mapped
-publisher checkpoints without searching for community derivatives.
+publisher-scoped discovery, revision-pinned catalogues and configurable ranking
+from separate benchmark and adoption observations. The architecture registry exports
+official publisher namespaces; recommendation policy consumes that declaration.
+Benchmarks are optional evidence, never a compatibility or memory-admission gate.
+Repository-age exposure and observation timestamps govern recent-download ranking;
+family geometry and runtime mechanism choices do not depend on popularity.
 It consumes architecture inspection and request-aware forecasts without owning
 family admission, tensor geometry, execution selection or native resources.
 Offline catalogue assessment clears stored capacity observations and reapplies

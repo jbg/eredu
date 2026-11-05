@@ -31,8 +31,6 @@ pub struct CatalogueSelection {
     pub max_parameters: u64,
     pub formats: Vec<String>,
     pub public_only: bool,
-    /// Expand measured publisher checkpoints into lineage-verified quantizations.
-    pub include_quantizations: bool,
 }
 
 pub struct CatalogueBuilder {
@@ -50,96 +48,60 @@ impl CatalogueBuilder {
             .await?
     }
 
-    /// Repository selection and benchmark policy belong to the supplied index.
-    /// Each candidate is pinned before inspection; failed candidates are reported.
-    pub async fn build(
+    /// Source membership establishes candidates; measured benchmarks only enrich evidence.
+    pub async fn build_sources(
         &self,
-        index: &crate::quality::BenchmarkIndex,
-    ) -> Result<(Catalogue, BuildReport)> {
-        self.build_selected(
-            index,
-            &CatalogueSelection {
-                max_parameters: u64::MAX,
-                formats: vec!["safetensors".into(), "gguf".into()],
-                public_only: false,
-                include_quantizations: true,
-            },
-        )
-        .await
-    }
-
-    /// Build from measured checkpoint identities, with explicit coverage limits.
-    /// Disabling quantization expansion inspects only benchmark-mapped publishers.
-    pub async fn build_selected(
-        &self,
-        index: &crate::quality::BenchmarkIndex,
+        sources: &crate::sources::SourceIndex,
+        benchmarks: Option<&crate::quality::BenchmarkIndex>,
         selection: &CatalogueSelection,
     ) -> Result<(Catalogue, BuildReport)> {
         self.profile.validate()?;
-        index.validate()?;
+        sources.validate()?;
+        if let Some(index) = benchmarks {
+            index.validate()?;
+        }
         ensure!(
-            selection.max_parameters > 0
+            !self.engine_revision.is_empty()
+                && selection.max_parameters > 0
                 && !selection.formats.is_empty()
                 && selection
                     .formats
                     .iter()
                     .all(|f| matches!(f.as_str(), "safetensors" | "gguf")),
-            "Invalid catalog selection"
-        );
-        ensure!(
-            !self.engine_revision.is_empty(),
-            "Engine revision must be explicit"
+            "Invalid explicit-source build selection"
         );
         let mut catalogue = Catalogue {
             schema_version: SCHEMA_VERSION,
             engine_revision: self.engine_revision.clone(),
             profile: self.profile.clone(),
-            benchmark_version: index.version.clone(),
+            benchmark_version: benchmarks.map(|b| b.version.clone()),
             models: Vec::new(),
         };
         let mut report = BuildReport::default();
-        let mut repos = std::collections::HashSet::new();
-        for parent in &index.candidates {
-            let mut candidates = if selection.include_quantizations {
-                crate::quality::derived_models(&self.hub, parent).await?
-            } else {
-                Vec::new()
-            };
-            candidates.insert(0, serde_json::json!({"id":parent}));
-            for candidate in candidates {
-                let Some(repo) = candidate["id"].as_str() else {
-                    continue;
-                };
-                if !repos.insert(repo.to_owned()) {
-                    continue;
-                }
-                match self.model(repo, index, Some(selection)).await {
-                    Ok((model, exclusions)) => {
-                        if let Some(model) = model {
-                            catalogue.models.push(model);
-                        }
-                        report.exclusions.extend(exclusions);
+        for entry in &sources.entries {
+            match self
+                .model(&entry.repo_id, benchmarks, entry, selection)
+                .await
+            {
+                Ok((model, exclusions)) => {
+                    if let Some(model) = model {
+                        catalogue.models.push(model);
                     }
-                    Err(error) if source_failure(&error) => {
-                        // Source failures abort publication instead of silently shrinking coverage.
-                        return Err(error.context(format!("Building {repo}")));
-                    }
-                    Err(error) => report.exclusions.push(Exclusion {
-                        repo_id: repo.into(),
-                        variant_id: None,
-                        compatibility: Compatibility::Unknown,
-                        reason: error.to_string(),
-                    }),
+                    report.exclusions.extend(exclusions);
                 }
+                Err(error) if source_failure(&error) => return Err(error),
+                Err(error) => report.exclusions.push(Exclusion {
+                    repo_id: entry.repo_id.clone(),
+                    variant_id: None,
+                    compatibility: Compatibility::Unknown,
+                    reason: error.to_string(),
+                }),
             }
         }
-        catalogue.models.sort_by(|a, b| {
-            crate::quality::compare_quality(a.quality.as_ref(), b.quality.as_ref())
-                .then_with(|| a.repo_id.cmp(&b.repo_id))
-        });
+        catalogue.models.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
         ensure!(
             !catalogue.models.is_empty(),
-            "No verified catalogue candidates; existing output is preserved"
+            "No compatible source candidates; existing output preserved"
         );
         catalogue.validate(&self.engine_revision)?;
         Ok((catalogue, report))
@@ -148,61 +110,49 @@ impl CatalogueBuilder {
     async fn model(
         &self,
         repo: &str,
-        index: &crate::quality::BenchmarkIndex,
-        selection: Option<&CatalogueSelection>,
+        index: Option<&crate::quality::BenchmarkIndex>,
+        source: &crate::sources::SourceEntry,
+        selection: &CatalogueSelection,
     ) -> Result<(Option<Model>, Vec<Exclusion>)> {
         let (repository, manifest) = self.hub.repository(repo, None).await?;
-        let quality = index.for_model(repo, &manifest);
-        if quality.is_none() {
-            return Ok((
-                None,
-                vec![Exclusion {
-                    repo_id: repo.into(),
-                    variant_id: None,
-                    compatibility: Compatibility::Unknown,
-                    reason: "No unambiguous measured benchmark lineage".into(),
-                }],
-            ));
-        }
-        let original = quality
-            .as_ref()
-            .filter(|q| q.inherited)
-            .map(|q| q.evaluated_model_id.as_str());
-        if let Some(selection) = selection {
-            ensure!(
-                !selection.public_only
-                    || (manifest["gated"] == false && manifest["private"] != true),
-                "Source is gated or private"
-            );
-            let metadata = match original {
-                Some(parent) => self.hub.model(parent).await?,
-                None => manifest.clone(),
-            };
-            let parameters = metadata["safetensors"]["total"].as_u64();
-            ensure!(
-                parameters.is_some_and(|n| n > 0 && n <= selection.max_parameters),
-                "Outside {}-parameter coverage or missing original parameter count: {:?}",
-                selection.max_parameters,
-                parameters
-            );
-        }
-        let parent = match original {
-            Some(original) => {
-                Some(crate::lineage::evaluated(&self.hub, repo, &manifest, original).await?)
-            }
-            None => None,
-        };
+        let config = self
+            .hub
+            .file(repo, &repository.revision, "config.json")
+            .await?;
+        let identity = eredu_architectures::configuration::resolve_model_identity(
+            &serde_json::from_slice(&config)?,
+        )?;
+        ensure!(
+            identity.kind == source.publisher.family && source.publisher.valid(repo),
+            "Pinned architecture does not match its official publisher declaration"
+        );
+        let quality = index
+            .and_then(|index| index.for_model(repo, &manifest))
+            .filter(|q| !q.inherited);
+        ensure!(
+            !selection.public_only || (manifest["gated"] == false && manifest["private"] != true),
+            "Source is gated or private"
+        );
+        let parameters = manifest["safetensors"]["total"].as_u64();
+        ensure!(
+            parameters.is_some_and(|n| n > 0 && n <= selection.max_parameters),
+            "Outside {}-parameter coverage or missing parameter count: {:?}",
+            selection.max_parameters,
+            parameters
+        );
         let (purpose, evidence) =
             crate::suitability::assess_checked(&self.hub, &manifest, quality.as_ref()).await?;
         let mut model = Model {
             repo_id: repo.into(),
             revision: repository.revision.clone(),
             quality,
+            publisher: Some(source.publisher.clone()),
+            adoption: source.adoption.clone(),
             variants: Vec::new(),
         };
         let mut exclusions = Vec::new();
         for artifact in &repository.variants {
-            if selection.is_some_and(|s| !s.formats.contains(&artifact.format)) {
+            if !selection.formats.contains(&artifact.format) {
                 exclusions.push(Exclusion {
                     repo_id: repo.into(),
                     variant_id: Some(artifact.variant_id.clone()),
@@ -212,13 +162,6 @@ impl CatalogueBuilder {
                 continue;
             }
             let result: Result<Variant> = async {
-                let lineage = match &parent {
-                    Some(p) => Some(
-                        crate::lineage::verify(&self.hub, repo, &repository.revision, artifact, p)
-                            .await?,
-                    ),
-                    None => None,
-                };
                 let metadata = self.hub.metadata(&repository, artifact, &manifest).await?;
                 let inspection = match metadata {
                     Ok(metadata) => self.inspect(metadata).await?,
@@ -243,7 +186,7 @@ impl CatalogueBuilder {
                 }
                 Ok(Variant {
                     artifact: artifact.clone(),
-                    lineage,
+                    lineage: None,
                     suitability,
                     suitability_evidence: vec![evidence.clone()],
                     inspection,
