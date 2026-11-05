@@ -3,6 +3,7 @@
 #[cfg(feature = "builder")]
 pub mod builder;
 pub mod catalogue;
+pub mod curation;
 #[cfg(feature = "hub")]
 pub mod discovery;
 pub mod forecast;
@@ -93,6 +94,7 @@ pub struct Candidate {
     pub revision: String,
     pub variant: ModelVariant,
     pub quality: Option<Quality>,
+    pub curation: Option<curation::Curation>,
     pub assessment: Assessment,
 }
 
@@ -100,6 +102,7 @@ pub struct Candidate {
 #[derive(Debug, Clone, Copy)]
 pub struct RecommendationPolicy {
     pub require_benchmark: bool,
+    pub require_curation: bool,
     pub require_conversational: bool,
 }
 
@@ -107,31 +110,76 @@ impl Default for RecommendationPolicy {
     fn default() -> Self {
         Self {
             require_benchmark: true,
+            require_curation: false,
             require_conversational: true,
         }
     }
 }
 
 impl RecommendationPolicy {
-    pub fn eligible(&self, candidate: &Candidate) -> bool {
+    fn meets_requirements(&self, candidate: &Candidate) -> bool {
         candidate.assessment.compatibility == Compatibility::Compatible
+            && (!self.require_conversational
+                || candidate.assessment.suitability == Suitability::Suitable)
+            && (!self.require_curation
+                || candidate
+                    .curation
+                    .as_ref()
+                    .is_some_and(curation::Curation::valid))
+            && (!self.require_benchmark
+                || quality::has_recommendation_evidence(candidate.quality.as_ref()))
+    }
+
+    pub fn eligible(&self, candidate: &Candidate) -> bool {
+        self.meets_requirements(candidate)
             && candidate
                 .assessment
                 .memory
                 .as_ref()
                 .is_some_and(|m| m.fit == MemoryFit::LikelyFit)
-            && (!self.require_conversational
-                || candidate.assessment.suitability == Suitability::Suitable)
-            && (!self.require_benchmark
-                || quality::has_recommendation_evidence(candidate.quality.as_ref()))
     }
 
     /// Candidates must use a common benchmark index and comparable forecast profiles.
     /// Unknown or straddling memory bounds never become affirmative fit advice.
     pub fn rank<'a>(&self, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
-        let mut ranked: Vec<_> = candidates.iter().filter(|c| self.eligible(c)).collect();
+        self.ordered(candidates.iter().filter(|c| self.eligible(c)).collect())
+    }
+
+    /// Separate availability for supported candidates whose memory fit is unverified.
+    /// These are not recommendations. Known shortfalls remain excluded; callers
+    /// preserve load/request admission warnings before executing an unverified model.
+    pub fn memory_unverified<'a>(&self, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
+        self.ordered(
+            candidates
+                .iter()
+                .filter(|c| {
+                    self.meets_requirements(c)
+                        && c.assessment
+                            .memory
+                            .as_ref()
+                            .is_some_and(|m| m.fit == MemoryFit::InsufficientInformation)
+                })
+                .collect(),
+        )
+    }
+
+    fn ordered<'a>(&self, mut ranked: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
         ranked.sort_by(|a, b| {
             quality::compare_quality(a.quality.as_ref(), b.quality.as_ref())
+                .then_with(|| {
+                    a.curation
+                        .as_ref()
+                        .filter(|c| c.valid())
+                        .map(|c| c.rank)
+                        .unwrap_or(u64::MAX)
+                        .cmp(
+                            &b.curation
+                                .as_ref()
+                                .filter(|c| c.valid())
+                                .map(|c| c.rank)
+                                .unwrap_or(u64::MAX),
+                        )
+                })
                 .then_with(|| b.variant.precision_rank.cmp(&a.variant.precision_rank))
                 .then_with(|| a.repo_id.cmp(&b.repo_id))
                 .then_with(|| a.variant.variant_id.cmp(&b.variant.variant_id))

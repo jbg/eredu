@@ -13,7 +13,7 @@ opens a device, or implements model-family memory formulas.
 | Feature | Surface |
 | --- | --- |
 | Default, with no features | Catalogue schemas, validation, offline budget reassessment, ranking, lineage and suitability policy, facade forecast integration |
-| `hub` | Hugging Face discovery, pinned metadata transport, variant enumeration and Artificial Analysis benchmark ingestion |
+| `hub` | Hugging Face discovery, LM Studio curation import, pinned metadata transport, variant enumeration and Artificial Analysis benchmark ingestion |
 | `builder` | Catalogue construction and supervised inspection workers; includes `hub` |
 | `cli` | Command-line tools; includes `builder` |
 | `mlx` | Explicit facade adapter selection for live metadata inspection |
@@ -25,6 +25,40 @@ an existing architecture selection built with caller-supplied mechanism facts.
 `forecast::inspect` resolves the explicitly selected facade backend and returns
 its typed error when that adapter is unavailable. Offline catalogue assessment
 works without compiling the adapter used to produce the catalogue.
+
+## Curated catalogues
+
+`curation::CurationIndex::lm_studio(cache_dir)` imports the featured local-model
+catalogue at `https://lmstudio.ai/models`. Only each collection's explicit download
+options and the HF sources in its named `model.yaml` definition are candidates.
+It never searches the wider Hub or expands those sources into community derivatives.
+The public site's structured records carry both inline and UTF-8 length-framed
+definitions. Missing, ambiguous or identity-mismatched definitions stop publication.
+Requests and records are bounded; transient source failures receive bounded retries.
+The optional public-page cache expires after one hour.
+
+`CatalogueBuilder::build_curated` accepts this snapshot, optional independently
+measured benchmark evidence, and `CatalogueSelection` limits for source formats,
+public access and original checkpoint parameter count. Format selection precedes
+header fetching and inspection. Curation records preserve the catalog model ID,
+revision, definition hash, source URL and catalog position. Catalogue schema 2
+keeps this evidence separate from measured quality, including during refresh.
+Curator descriptions, benchmark claims and advertised memory requirements do not
+supply quality scores, compatibility or memory advice.
+
+Applications that accept curator-selected models without benchmark coverage use
+`RecommendationPolicy { require_curation: true, require_benchmark: false,
+require_conversational: true }`. Compatibility, conversational suitability and a
+proven likely fit remain mandatory. Comparable measured results determine quality
+order when available; otherwise curator position precedes encoding precision and
+stable identity. Curator position is not a performance score. The default policy
+requires benchmark evidence and does not require curation.
+
+`RecommendationPolicy::memory_unverified` returns a separate ordered list of
+compatible candidates that meet the other policy requirements but have
+`InsufficientInformation` memory fit. They are not fit recommendations. Known
+shortfalls are excluded. Applications label this distinction and retain their
+normal load/request memory admission checks before running such a model.
 
 ## Offline assessment
 
@@ -73,7 +107,8 @@ The default recommendation policy requires compatible metadata, likely memory
 fit, conversational suitability and measured benchmark evidence. Applications
 can relax the benchmark or conversational requirement explicitly. Compatibility
 and likely fit remain mandatory. Eligible candidates sort by benchmark order,
-then encoding precision preference, with deterministic identity tie-breakers.
+then validated curator position when present, encoding precision preference, and
+deterministic identity tie-breakers.
 All candidates passed to one ranking operation use the same benchmark index
 and comparable workload profiles. Precision preference is a filename-derived
 encoding heuristic, not a measured quality score. Neither file size nor model

@@ -10,7 +10,7 @@ use eredu::api::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -84,6 +84,7 @@ pub struct Catalogue {
     pub engine_revision: String,
     pub profile: Profile,
     pub benchmark_version: String,
+    pub curation_version: Option<String>,
     pub models: Vec<Model>,
 }
 
@@ -93,6 +94,7 @@ pub struct Model {
     pub repo_id: String,
     pub revision: String,
     pub quality: Option<Quality>,
+    pub curation: Option<crate::curation::Curation>,
     pub variants: Vec<Variant>,
 }
 
@@ -131,6 +133,13 @@ impl Catalogue {
         {
             return Err(invalid("missing provenance or unsupported schema"));
         }
+        if self.curation_version.as_ref().is_some_and(|version| {
+            !version
+                .strip_prefix("lm-studio:sha256:")
+                .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        }) {
+            return Err(invalid("invalid curation snapshot identity"));
+        }
         self.profile.validate()?;
         let mut repos = HashSet::new();
         for model in &self.models {
@@ -155,6 +164,11 @@ impl Catalogue {
                 return Err(invalid(
                     "benchmark attribution differs from checkpoint identity",
                 ));
+            }
+            if model.curation.as_ref().is_some_and(|c| !c.valid())
+                || (model.curation.is_some() != self.curation_version.is_some())
+            {
+                return Err(invalid("incomplete curation provenance"));
             }
             let mut ids = HashSet::new();
             for item in &model.variants {
@@ -252,6 +266,7 @@ impl Catalogue {
                     revision: model.revision.clone(),
                     variant: item.artifact.clone(),
                     quality: model.quality.clone(),
+                    curation: model.curation.clone(),
                     assessment,
                 })
             })
