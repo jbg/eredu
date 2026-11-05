@@ -366,6 +366,32 @@ impl ModelKind {
         }
     }
 
+    /// Official publisher namespaces for discovering this family's released checkpoints.
+    /// Membership is a source boundary, not proof that every upload is supported.
+    pub const fn official_hf_organisations(self) -> &'static [&'static str] {
+        match self {
+            Self::DeepSeekV3 | Self::DeepSeekV4 => &["deepseek-ai"],
+            Self::DiffusionGemma | Self::Gemma2 | Self::Gemma4 => &["google"],
+            Self::GptOss => &["openai"],
+            Self::Inkling => &["thinkingmachines"],
+            Self::K2Horizon => &["IFM"],
+            Self::KimiLinear => &["moonshotai"],
+            Self::Llama => &["meta-llama", "mistralai", "microsoft", "HuggingFaceTB"],
+            Self::Nanbeige => &["Nanbeige"],
+            Self::MuseGlimmer | Self::MuseSpark => &["meta-models"],
+            Self::Lfm2 => &["LiquidAI"],
+            Self::NemotronH | Self::NemotronLabsDiffusion | Self::VoiceChat => &["nvidia"],
+            Self::Moshi => &["kyutai", "nvidia"],
+            Self::Qwen2
+            | Self::Qwen3
+            | Self::Qwen3Next
+            | Self::Qwen3Vl
+            | Self::Qwen3VlMoe
+            | Self::Qwen35
+            | Self::Qwen4Exp => &["Qwen"],
+        }
+    }
+
     /// Neutral loader protocol required by this family.
     pub const fn loading_protocol(self) -> LoadingProtocol {
         match self {

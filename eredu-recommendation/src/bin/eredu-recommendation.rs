@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use eredu_recommendation::{
-    builder::{write_json, CatalogueBuilder},
+    builder::{write_json, CatalogueBuilder, CatalogueSelection},
     catalogue::Catalogue,
     forecast::DomainBudget,
     quality::BenchmarkIndex,
+    sources::{PublisherSelection, SourceIndex},
     transport::Hub,
     worker::{self, WorkerLimits},
     RecommendationPolicy,
@@ -51,15 +52,17 @@ enum Action {
         planning: Planning,
     },
     Build {
-        /// Explicit benchmark index, or provide an Artificial Analysis key file.
-        #[arg(
-            long,
-            conflicts_with = "aa_key_file",
-            required_unless_present = "aa_key_file"
-        )]
+        /// Optional measured evidence; candidate discovery does not depend on coverage.
+        #[arg(long, conflicts_with = "aa_key_file")]
         index: Option<PathBuf>,
         #[arg(long)]
         aa_key_file: Option<PathBuf>,
+        #[arg(long)]
+        source_index: Option<PathBuf>,
+        #[arg(long, default_value_t = 40_000_000_000)]
+        max_parameters: u64,
+        #[arg(long, default_value_t = 32)]
+        per_publisher: usize,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -86,8 +89,9 @@ enum Action {
         /// JSON array of physical domains and their current memory budgets.
         #[arg(long)]
         budgets: PathBuf,
+        /// Optional JSON RankingPolicy; defaults combine benchmarks and recent adoption equally.
         #[arg(long)]
-        allow_unbenchmarked: bool,
+        ranking_policy: Option<PathBuf>,
         #[arg(long)]
         allow_nonconversational: bool,
     },
@@ -131,19 +135,22 @@ async fn main() -> Result<()> {
             catalogue,
             engine_revision,
             budgets,
-            allow_unbenchmarked,
+            ranking_policy,
             allow_nonconversational,
         } => {
             let catalogue: Catalogue = read(&catalogue)?;
             let budgets: Vec<DomainBudget> = read(&budgets)?;
             let candidates = catalogue.assess(&engine_revision, &budgets)?;
             let policy = RecommendationPolicy {
-                require_benchmark: !allow_unbenchmarked,
+                ranking: ranking_policy
+                    .map(|p| read(&p))
+                    .transpose()?
+                    .unwrap_or_default(),
                 require_conversational: !allow_nonconversational,
             };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&policy.rank(&candidates))?
+                serde_json::to_string_pretty(&policy.rank(&candidates)?)?
             );
         }
         command => {
@@ -196,21 +203,43 @@ async fn main() -> Result<()> {
                 Action::Build {
                     index,
                     aa_key_file,
+                    source_index,
+                    max_parameters,
+                    per_publisher,
                     output,
                     report,
                     planning,
                 } => {
-                    let index = match index {
+                    let index: Option<BenchmarkIndex> = match (index, aa_key_file) {
+                        (Some(path), _) => Some(read(&path)?),
+                        (_, Some(path)) => Some(
+                            BenchmarkIndex::artificial_analysis(&std::fs::read_to_string(path)?)
+                                .await?,
+                        ),
+                        _ => None,
+                    };
+                    let sources: SourceIndex = match source_index {
                         Some(path) => read(&path)?,
                         None => {
-                            BenchmarkIndex::artificial_analysis(&std::fs::read_to_string(
-                                aa_key_file.context("Missing benchmark credential")?,
-                            )?)
+                            SourceIndex::publishers(
+                                &hub,
+                                &PublisherSelection::supported(max_parameters, per_publisher),
+                            )
                             .await?
                         }
                     };
                     let builder = builder(hub, planning)?;
-                    let (catalogue, diagnostics) = builder.build(&index).await?;
+                    let (catalogue, diagnostics) = builder
+                        .build_sources(
+                            &sources,
+                            index.as_ref(),
+                            &CatalogueSelection {
+                                max_parameters,
+                                public_only: true,
+                                formats: vec!["safetensors".into(), "gguf".into()],
+                            },
+                        )
+                        .await?;
                     write_json(&report, &diagnostics)?;
                     write_json(&output, &catalogue)?;
                 }

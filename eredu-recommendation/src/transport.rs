@@ -26,6 +26,11 @@ pub struct Hub {
 }
 
 impl Hub {
+    pub(crate) fn uncached(&self) -> Self {
+        let mut hub = self.clone();
+        hub.cache_dir = None;
+        hub
+    }
     #[cfg(feature = "hub")]
     pub fn new(token: Option<String>, cache_dir: Option<std::path::PathBuf>) -> Result<Self> {
         Ok(Self {

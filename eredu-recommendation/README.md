@@ -26,14 +26,42 @@ an existing architecture selection built with caller-supplied mechanism facts.
 its typed error when that adapter is unavailable. Offline catalogue assessment
 works without compiling the adapter used to produce the catalogue.
 
-## Measured catalogues
+## Sources and ranking evidence
 
-`CatalogueBuilder::build_selected` accepts an independently measured benchmark
-index and `CatalogueSelection` limits for artifact formats, public access and
-original checkpoint parameter count. With `include_quantizations: false`, only
-the benchmark's mapped publisher checkpoints are inspected; Hub derivative search
-is disabled. Format selection precedes header fetching and inspection.
-Catalogue schema 3 retains benchmark attribution without external curator data.
+`ModelKind::official_hf_organisations` exports publisher namespaces from the
+exhaustive architecture registry. `PublisherSelection::supported` consumes that
+scope. `SourceIndex::publishers` enumerates each namespace with bounded pagination,
+filters public ungated repositories by task, architecture-specific publisher
+ownership and total parameter count, and
+shortlists a configurable number per publisher by recent adoption. Pinned config
+inspection confirms that the architecture still matches its publisher declaration. Namespace
+membership is provenance, not compatibility or quality proof. Model-card scores,
+all-time downloads and last-modified dates do not supply ranking evidence.
+
+`CatalogueBuilder::build_sources` consumes the captured source index and optional
+independently measured benchmarks. Missing benchmark coverage never excludes a
+source. `CatalogueSelection` controls formats and parameter coverage before
+header inspection; source builds do not expand into community derivatives.
+Schema 4 stores publisher membership, optional benchmark attribution and optional
+timestamped adoption separately. Refresh preserves the observation's original
+time and repository scope rather than claiming fresh usage data.
+
+`RankingPolicy` combines configurable weighted `MeasuredBenchmark` and
+`RecentAdoption` signals independently of eligibility. Defaults use equal weights.
+Each signal becomes a percentile among eligible repositories with observations;
+missing evidence has neutral percentile 0.5, not an invented measurement.
+Duplicate encodings do not add votes. Benchmark observations share one index.
+Invalid weights or priors return an error rather than an empty recommendation.
+
+HF adoption records the last-30-day count, observation time, optional repository
+creation time and source URL. For repositories younger than the window, exposure
+is their age in days; otherwise it is 30 days. Unknown age uses the full window.
+The rate is `(downloads + prior_daily * prior_days) / (exposure_days + prior_days)`.
+Defaults of 100 downloads/day and seven prior days damp very young launch spikes;
+these are explicit policy parameters, not learned model-quality facts. Creation
+time is a repository-age proxy, not a proven model release date. Discovery fetches
+usage observations without the transport's metadata cache; snapshot replay keeps
+captured timestamps. No clock or HTTP client is needed for offline ranking.
 
 `RecommendationPolicy::memory_unverified` returns a separate ordered list of
 compatible candidates that meet the other policy requirements but have
@@ -62,7 +90,7 @@ let budgets = vec![DomainBudget {
 }];
 let candidates = catalogue.assess("accepted-engine-build-identity", &budgets)?;
 let policy = RecommendationPolicy::default();
-for candidate in policy.rank(&candidates) {
+for candidate in policy.rank(&candidates)? {
     println!("{} @ {}: {}", candidate.repo_id, candidate.revision, candidate.variant.variant_id);
 }
 # Ok(())
@@ -84,12 +112,10 @@ budget. Unknown availability stays unknown; zero available bytes is a real
 zero-capacity observation. Host and device capacities are never added together.
 Changing the workload or preparation policy requires new inspection evidence.
 
-The default recommendation policy requires compatible metadata, likely memory
-fit, conversational suitability and measured benchmark evidence. Applications
-can relax the benchmark or conversational requirement explicitly. Compatibility
-and likely fit remain mandatory. Eligible candidates sort by benchmark order,
-then encoding precision preference and
-deterministic identity tie-breakers.
+Eligibility requires compatible metadata, likely memory fit and conversational
+suitability. Benchmark coverage and popularity never override those requirements.
+Measured benchmarks are informational ranking evidence, not an eligibility gate.
+Encoding precision and stable repository/variant identity break ranking ties.
 All candidates passed to one ranking operation use the same benchmark index
 and comparable workload profiles. Precision preference is a filename-derived
 encoding heuristic, not a measured quality score. Neither file size nor model
