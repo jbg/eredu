@@ -7,6 +7,7 @@ use crate::{
     Compatibility, Suitability,
 };
 use anyhow::{ensure, Result};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -78,11 +79,17 @@ impl CatalogueBuilder {
             models: Vec::new(),
         };
         let mut report = BuildReport::default();
-        for entry in &sources.entries {
-            match self
-                .model(&entry.repo_id, benchmarks, entry, selection)
-                .await
-            {
+        // Bound metadata IO and supervised workers without changing publication order.
+        let mut results = stream::iter(sources.entries.iter().map(|entry| async move {
+            (
+                entry,
+                self.model(&entry.repo_id, benchmarks, entry, selection)
+                    .await,
+            )
+        }))
+        .buffered(4);
+        while let Some((entry, result)) = results.next().await {
+            match result {
                 Ok((model, exclusions)) => {
                     if let Some(model) = model {
                         catalogue.models.push(model);

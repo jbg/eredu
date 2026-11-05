@@ -42,7 +42,8 @@ all-time downloads and last-modified dates do not supply ranking evidence.
 independently measured benchmarks. Missing benchmark coverage never excludes a
 source. `CatalogueSelection` controls formats and parameter coverage before
 header inspection; source builds do not expand into community derivatives.
-Schema 4 stores publisher membership, optional benchmark attribution and optional
+Construction runs at most four metadata/inspection jobs concurrently and publishes
+only after all source results are checked. Schema 4 stores publisher membership, optional benchmark attribution and optional
 timestamped adoption separately. Refresh preserves the observation's original
 time and repository scope rather than claiming fresh usage data.
 
