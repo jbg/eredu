@@ -54,6 +54,12 @@ order when available; otherwise curator position precedes encoding precision and
 stable identity. Curator position is not a performance score. The default policy
 requires benchmark evidence and does not require curation.
 
+`RecommendationPolicy::memory_unverified` returns a separate ordered list of
+compatible candidates that meet the other policy requirements but have
+`InsufficientInformation` memory fit. They are not fit recommendations. Known
+shortfalls are excluded. Applications label this distinction and retain their
+normal load/request memory admission checks before running such a model.
+
 ## Offline assessment
 
 Applications supply a catalogue, the exact engine build identity they accept,

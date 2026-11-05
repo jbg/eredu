@@ -117,13 +117,8 @@ impl Default for RecommendationPolicy {
 }
 
 impl RecommendationPolicy {
-    pub fn eligible(&self, candidate: &Candidate) -> bool {
+    fn meets_requirements(&self, candidate: &Candidate) -> bool {
         candidate.assessment.compatibility == Compatibility::Compatible
-            && candidate
-                .assessment
-                .memory
-                .as_ref()
-                .is_some_and(|m| m.fit == MemoryFit::LikelyFit)
             && (!self.require_conversational
                 || candidate.assessment.suitability == Suitability::Suitable)
             && (!self.require_curation
@@ -135,10 +130,40 @@ impl RecommendationPolicy {
                 || quality::has_recommendation_evidence(candidate.quality.as_ref()))
     }
 
+    pub fn eligible(&self, candidate: &Candidate) -> bool {
+        self.meets_requirements(candidate)
+            && candidate
+                .assessment
+                .memory
+                .as_ref()
+                .is_some_and(|m| m.fit == MemoryFit::LikelyFit)
+    }
+
     /// Candidates must use a common benchmark index and comparable forecast profiles.
     /// Unknown or straddling memory bounds never become affirmative fit advice.
     pub fn rank<'a>(&self, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
-        let mut ranked: Vec<_> = candidates.iter().filter(|c| self.eligible(c)).collect();
+        self.ordered(candidates.iter().filter(|c| self.eligible(c)).collect())
+    }
+
+    /// Separate availability for supported candidates whose memory fit is unverified.
+    /// These are not recommendations. Known shortfalls remain excluded; callers
+    /// preserve load/request admission warnings before executing an unverified model.
+    pub fn memory_unverified<'a>(&self, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
+        self.ordered(
+            candidates
+                .iter()
+                .filter(|c| {
+                    self.meets_requirements(c)
+                        && c.assessment
+                            .memory
+                            .as_ref()
+                            .is_some_and(|m| m.fit == MemoryFit::InsufficientInformation)
+                })
+                .collect(),
+        )
+    }
+
+    fn ordered<'a>(&self, mut ranked: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
         ranked.sort_by(|a, b| {
             quality::compare_quality(a.quality.as_ref(), b.quality.as_ref())
                 .then_with(|| {
