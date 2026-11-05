@@ -1,9 +1,9 @@
 # Language-model backend architecture
 
 `eredu-recommendation` is application policy above the portable facade. It owns
-remote discovery, external curation, benchmark attribution, revision-pinned catalogues
-and ranking. Curator source membership is separate from measured quality; importing
-a curated source does not adopt its model-card scores or advertised memory limits.
+remote discovery, independently measured benchmark attribution, revision-pinned
+catalogues and ranking. Applications can restrict construction to benchmark-mapped
+publisher checkpoints without searching for community derivatives.
 It consumes architecture inspection and request-aware forecasts without owning
 family admission, tensor geometry, execution selection or native resources.
 Offline catalogue assessment clears stored capacity observations and reapplies
