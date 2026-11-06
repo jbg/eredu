@@ -25,6 +25,26 @@ pub fn can_reclaim_submission_resources() -> bool {
     runtime_lock::can_reclaim_submission_resources()
 }
 
+/// Reclaims all already-terminal native submission records on this thread.
+///
+/// This ordinary host boundary may run native resource destructors and block.
+/// It neither waits for work nor treats a failure as completion. Calls under
+/// the runtime lock or during unwinding defer cleanup to a later boundary.
+pub fn reclaim_terminal_submission_resources() -> Result<(), Exception> {
+    if !can_reclaim_submission_resources() {
+        return Ok(());
+    }
+    let _guard = runtime_lock::enter_for_metadata();
+    // Terminal records are detached under the registry lock, then destroyed
+    // outside that lock on their exact original owner thread.
+    if unsafe { safemlx_sys::mlx_submission_reclaim_terminal() } != 0 {
+        return Err(Exception::custom(
+            "could not reclaim terminal submission resources",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether native work accepted by a submission scope has stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]

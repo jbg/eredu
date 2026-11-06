@@ -1640,6 +1640,7 @@ extern "C" {
         scope: mlx_submission_scope,
     ) -> ::std::os::raw::c_int;
     pub fn mlx_submission_scope_free(scope: mlx_submission_scope) -> ::std::os::raw::c_int;
+    pub fn mlx_submission_reclaim_terminal() -> ::std::os::raw::c_int;
 }
 pub const mlx_event_backend__MLX_EVENT_BACKEND_NONE: mlx_event_backend_ = 0;
 pub const mlx_event_backend__MLX_EVENT_BACKEND_CPU: mlx_event_backend_ = 1;

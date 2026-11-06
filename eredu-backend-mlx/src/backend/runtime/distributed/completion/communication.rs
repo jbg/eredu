@@ -154,8 +154,8 @@ impl CommunicationOrphanQuarantine {
 impl Drop for CommunicationOrphanQuarantine {
     fn drop(&mut self) {
         self.reap();
-        // Never wait at thread exit. Recovery retains unresolved native resources
-        // independently; an inaccessible submitting thread is not terminal proof.
+        // Hand unresolved owners to recovery. Its final owner-thread boundary
+        // waits for terminal proof before releasing the retained resources.
         for work in self.work.drain(..) {
             #[cfg(test)]
             if work.recovery.progress().settled {

@@ -433,6 +433,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
 pub struct MlxDrafter {
     payload: Rc<OrdinaryRetirement<DrafterPayload>>,
     poisoned: Rc<Cell<bool>>,
+    _retirement: ordinary_retirement::ReclaimOnDrop,
 }
 
 struct DrafterPayload {
@@ -759,7 +760,11 @@ impl MlxDrafter {
         }
         drop(recovery);
         retained.borrow_mut().take();
-        Ok(Self { payload, poisoned })
+        Ok(Self {
+            payload,
+            poisoned,
+            _retirement: ordinary_retirement::ReclaimOnDrop,
+        })
     }
 
     pub(in crate::composition::mlx) fn prepare_operation(

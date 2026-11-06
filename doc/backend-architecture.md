@@ -3574,9 +3574,14 @@ fail. A preallocated owner retains graph, primitive, temporary-buffer, stream,
 and callback state until every accepted frontier is terminal. An error is not
 terminal evidence, and evaluation is never retried as a cleanup operation.
 Backend submission scopes retain application resources and session authority
-across returned errors, discarded errors, and unwinding. Recovery neither
-terminates the process nor waits for native work in destructors. Unobservable
-work stays owned and its affected execution resources remain unavailable.
+across returned errors, discarded errors, and unwinding. Ordinary recovery
+destruction neither terminates the process nor waits for native work. Unobservable work stays owned and its affected execution resources
+remain unavailable. At owner-thread exit, the thread remains alive to progress
+its sealed recovery scopes until terminal proof permits release. This final
+boundary also reclaims all already-terminal native registry records, including
+batches larger than ordinary housekeeping limits. It may wait; a device or
+callback that never finishes can prevent thread exit. Failure alone never authorizes release, and unresolved owners are not
+abandoned through a permanent leak.
 Terminal proof and reclamation are distinct: bounded native scope progress
 publishes completion without destroying arbitrary primitive or group owners.
 Portable layered execution runs a strict dependency chain on the caller's
@@ -3601,10 +3606,15 @@ does not drain events or whole streams. Terminal module, session, checkpoint,
 and manager-lease owners are staged for ordinary unlocked reclamation, since
 their destructors may acquire host locks or execute application code. Dense
 forward cleanup is deferred from abort to an ordinary entry or owner reclamation.
+Public MLX session, drafter, and realtime execution owners reclaim terminal
+resources after releasing their payload references. This boundary drains nested
+retired owners before returning from ordinary destruction, including allocator
+cache cleanup. It does not run under the native runtime lock or during unwinding.
 Selected model materialization also reclaims an already-retired snapshot before
-allocating the next model, so completed previous-session weights need not remain
-alive until replacement session publication. Newly staged recursive owners wait
-for a later ordinary entry; this is not a drain of unresolved native work.
+allocating the next model. Thread exit releases remaining terminal owners on their
+originating thread. Terminal queues initialize before recovery TLS, so final
+recovery retirement can still enqueue owners before those queues are destroyed.
+Ordinary execution-owner destruction does not drain unresolved native work.
 Each completion poll keeps one nonblocking runtime guard across its native
 observations. MLX realtime completion retains successfully validated readiness
 across clones, so unrelated runtime-lock contention cannot turn completed work
@@ -3613,15 +3623,14 @@ that proof; failure flags still prevent publication. Native resource-retirement
 queries retain their nonblocking runtime guard even after publication is ready.
 Arbitrary application resources retained by neural submissions
 are staged separately after every native/consumer owner releases them: their
-destructors do not run from polling, recovery Drop, or TLS teardown. The next
-unlocked ordinary neural submission reclaims them, or callers explicitly use
+destructors do not run from polling or ordinary recovery Drop. The next unlocked
+ordinary neural submission reclaims them, or callers explicitly use
 `MlxNeuralBackend::reclaim_retired_resources`. This step may block in a caller's
 destructor and is skipped under the runtime lock, during unwinding, and during
-recursive reclamation. If no eligible reclamation occurs before owner-thread
-exit, those resources remain retained.
-If an application destructor panics during explicit reclamation, the remaining
-detached resources are retained instead of invoking more destructors while
-unwinding.
+recursive reclamation. Public execution-owner destruction also reclaims them.
+Thread exit releases remaining terminal application resources. Destruction of
+detached batches follows ordinary Rust unwinding semantics; it does not
+intentionally abandon the remaining owners.
 MLX prefetch, cache-I/O, and host-demotion worker handles request shutdown
 without joining from recovery or teardown. Each worker owns its active inputs
 until that operation returns. Prefetch and cache-I/O workers cancel queued work
@@ -4899,8 +4908,8 @@ then either finish native cancellation or transfer the completion and every
 live retained resource to a quarantine owner; only exact completion permits
 observation, cache commit, or publication. MLX uses a thread-affine quarantine
 because its events do not expose native cancellation. Terminal native evidence
-permits reclamation; thread-runtime teardown does not wait and permanently
-retains any owner for which that evidence is still unavailable.
+permits reclamation; owner-thread teardown waits for that evidence before
+releasing the retained native and application owners.
 
 An admitted artifact with embedded prediction is split before partitioned
 construction into an ordinary target projection and a typed prediction
@@ -6165,9 +6174,10 @@ Successful synchronous MLX operations retire their native owners under the same
 runtime guard that confirms completion, then finish staged host destruction at
 an ordinary unlocked boundary. This prevents another runtime user from delaying
 lease release between a successful wait and the next session mutation or bounded
-checkpoint acquisition. Polling, errors, and teardown remain nonblocking: when
-the runtime is busy, failure still reaches the retained owner, but resource
-release waits for both terminal evidence and safe runtime access.
+checkpoint acquisition. Polling, errors, and ordinary recovery destruction
+remain nonblocking: when the runtime is busy, failure still reaches the retained
+owner, but resource release waits for terminal evidence and safe runtime access.
+Final owner-thread exit may wait for that evidence before releasing its owners.
 
 The backend is selected for the entire model/session. Per-operation backend
 selection would make cache ownership ambiguous and introduce implicit data
@@ -7052,11 +7062,11 @@ upstream MLX exposes no event abort, timed-out work is retained in a
 thread-affine quarantine and its native communicator cannot be realized again
 until a later safe reap observes terminal native evidence. Failed submissions
 also retain these resources without a returned public event. If the
-originating thread exits first, teardown does not block: unresolved arrays,
-count storage, groups, routes, streams, and native execution owners remain
-retained permanently. This bounded-teardown policy can retain memory after an
-unrecoverable device failure; it never converts a missing completion proof
-into process termination or unsafe destruction. Complete all-rank manifest consensus also precedes
+originating thread exits first, teardown keeps that thread alive until terminal
+proof permits releasing arrays, count storage, groups, routes, streams, and
+native execution owners. Unrecoverable work can prevent thread exit; missing
+completion proof never authorizes unsafe destruction. Complete all-rank manifest
+consensus also precedes
 every rank-local MLX capability, quarantine, and world-identity check, so a
 corrupt projection produces the same shared setup failure before subgroup or
 payload realization. Because the serialized completion policy is itself part
@@ -7111,10 +7121,10 @@ timeout disposition: orphaned MLX work retains every native dependency and
 fences the same native world. Quarantine registers an idempotent thread-local
 runtime housekeeping callback, so any later same-thread MLX entry observes and
 releases exactly completed work even when no communication operation performs
-an explicit reap. Owner-thread teardown makes only a nonblocking retirement
-attempt. If terminal evidence or runtime access is unavailable, its retained
-resources remain owned permanently; thread-affine work is not transferred to a
-reaper thread. An asynchronous error alone never authorizes reclamation.
+an explicit reap. Owner-thread teardown waits for terminal evidence and runtime
+access, then reclaims the retained owners on that same thread. Thread-affine work
+is not transferred to a reaper thread. An asynchronous error alone never
+authorizes reclamation.
 
 `DistributedSession` is an optional capability of the selected model session.
 It exposes high-level sum, gather, variable-count exchange, point-to-point, and

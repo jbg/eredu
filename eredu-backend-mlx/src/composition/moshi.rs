@@ -489,6 +489,7 @@ pub struct MlxRealtimeExecution {
     metadata: LayerwiseModelMetadata,
     payload: Rc<OrdinaryRetirement<RealtimeExecutionPayload>>,
     poisoned: Rc<Cell<bool>>,
+    _retirement: ordinary_retirement::ReclaimOnDrop,
 }
 
 struct RealtimeExecutionPayload {
@@ -849,6 +850,7 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
                 execution,
                 resources: self.resources,
             })),
+            _retirement: ordinary_retirement::ReclaimOnDrop,
         })
     }
 }
