@@ -626,6 +626,7 @@ pub struct MlxModelSession {
     >,
     intervention_session_identity: String,
     state_residency: CacheResidencyPolicy,
+    _retirement: ordinary_retirement::ReclaimOnDrop,
 }
 
 impl MlxModelSession {
@@ -717,6 +718,7 @@ impl MlxModelSession {
             partition_capture: std::cell::OnceCell::new(),
             intervention_session_identity,
             state_residency,
+            _retirement: ordinary_retirement::ReclaimOnDrop,
         };
         session.reset()?;
         Ok(session)

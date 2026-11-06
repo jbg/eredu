@@ -11,6 +11,7 @@ struct HostResources(Option<Box<HostResourceNode>>);
 
 impl HostResources {
     fn new(values: Vec<Box<dyn Send>>) -> Self {
+        MlxNeuralBackend::prepare_thread_retirement();
         Self(Some(Box::new(HostResourceNode { values, next: None })))
     }
 
@@ -28,9 +29,9 @@ struct RetiredHostResources(Option<Box<HostResourceNode>>);
 
 impl Drop for RetiredHostResources {
     fn drop(&mut self) {
-        // Arbitrary user destructors are not safe to invoke during TLS teardown.
-        if let Some(node) = self.0.take() {
-            std::mem::forget(node);
+        while let Some(mut node) = self.0.take() {
+            self.0 = node.next.take();
+            drop(node);
         }
     }
 }
@@ -53,22 +54,28 @@ impl Drop for HostResources {
                 retired.0 = Some(owned);
             }
         });
-        if let Some(node) = node {
-            std::mem::forget(node);
-        }
+        // Recursive retirement during TLS teardown still owns its values.
+        drop(node);
     }
 }
 
 impl MlxNeuralBackend {
+    pub(crate) fn prepare_thread_retirement() {
+        let _ = RETIRED_HOST_RESOURCES.try_with(|_| {});
+    }
+
+    pub(crate) fn thread_retirement_available() -> bool {
+        RETIRED_HOST_RESOURCES.try_with(|_| ()).is_ok()
+    }
+
     /// Reclaims this thread's retired application-owned submission resources.
     ///
     /// This ordinary host operation may run arbitrary Rust destructors and block.
-    /// Polling, completion Drop, and TLS teardown never invoke those destructors.
+    /// Polling and ordinary completion Drop defer those destructors.
     /// New submissions also call this method. Reentrant calls while inside the
     /// native runtime, calls while unwinding, and recursive reclamation are deferred.
-    /// If the owner thread exits before reclamation, these resources remain retained.
-    /// If a resource destructor panics, the rest of that detached batch remains
-    /// permanently retained instead of running more destructors during unwinding.
+    /// Thread exit releases terminal resources that have not yet been reclaimed.
+    /// Resource destructors have ordinary Rust unwinding semantics.
     pub fn reclaim_retired_resources() {
         if !safemlx::can_reclaim_submission_resources() {
             return;
@@ -85,6 +92,7 @@ impl MlxNeuralBackend {
             }
             let _reset = Reset(reclaiming);
             crate::backend::submission_recovery::reap();
+            let _ = safemlx::reclaim_terminal_submission_resources();
             let pending = RETIRED_HOST_RESOURCES
                 .try_with(|retired| {
                     retired
@@ -97,9 +105,6 @@ impl MlxNeuralBackend {
             let mut pending = RetiredHostResources(pending);
             while let Some(node) = pending.0.as_mut() {
                 if let Some(value) = node.values.pop() {
-                    // If this destructor panics, the snapshot's Drop retains
-                    // every remaining value rather than invoking more user
-                    // destructors during unwinding.
                     drop(value);
                 } else {
                     let mut node = pending.0.take().expect("current retired node");

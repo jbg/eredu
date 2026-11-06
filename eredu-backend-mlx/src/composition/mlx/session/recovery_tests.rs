@@ -285,10 +285,22 @@ fn unwinding_does_not_release_unobservable_native_resources() {
 }
 
 #[test]
-fn submitting_thread_exit_permanently_retains_unobservable_payload_and_authority() {
+fn submitting_thread_exit_waits_for_terminal_proof_and_releases_payload_and_authority() {
+    use std::sync::{atomic::AtomicBool, mpsc};
+    struct LateTerminal(Arc<AtomicBool>);
+    impl Probe for LateTerminal {
+        fn seal(&mut self) {}
+        fn progress(&self) -> Status {
+            // A native failure remains a failure after its work finishes.
+            status(self.0.load(Ordering::SeqCst), true, true)
+        }
+    }
     let drops = Arc::new(AtomicUsize::new(0));
     let thread_drops = Arc::clone(&drops);
-    let authority = std::thread::spawn(move || {
+    let terminal = Arc::new(AtomicBool::new(false));
+    let thread_terminal = Arc::clone(&terminal);
+    let (ready, dropped) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
         let mut authority = SessionAuthority::new();
         let owner = SubmissionResources::new(
             authority.begin_submission().unwrap(),
@@ -299,16 +311,21 @@ fn submitting_thread_exit_permanently_retains_unobservable_payload_and_authority
                 _payload: Rc::new(Payload(thread_drops)),
                 ticket: owner.ticket(),
             },
-            FakeProbe(Rc::new(Cell::new(status(false, false, true)))),
+            LateTerminal(thread_terminal),
         );
         owner.request_release();
         drop(guard);
+        ready.send(()).unwrap();
         authority
-    })
-    .join()
-    .unwrap();
-    assert!(authority.require_idle().is_err());
+    });
+    dropped
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 0);
+    terminal.store(true, Ordering::SeqCst);
+    let authority = worker.join().unwrap();
+    assert!(authority.require_idle().is_ok());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]

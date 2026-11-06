@@ -75,3 +75,12 @@ extern "C" int mlx_submission_scope_free(mlx_submission_scope scope) {
   }
   return 1;
 }
+
+extern "C" int mlx_submission_reclaim_terminal(void) {
+  try {
+    mlx::core::submission::retire_records(true);
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}

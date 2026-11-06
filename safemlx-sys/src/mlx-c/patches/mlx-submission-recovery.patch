@@ -314,24 +314,33 @@ new file mode 100644
 index 0000000..e6aea2c
 --- /dev/null
 +++ b/mlx/submission.cpp
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,546 @@
 +#include "mlx/submission.h"
 +
 +#include <algorithm>
 +#include <limits>
 +#include <mutex>
++#include <stdexcept>
 +
 +namespace mlx::core::submission {
 +namespace {
 +thread_local Scope* active_scope = nullptr;
 +thread_local Record* active_capture = nullptr;
-+thread_local const void* owner_identity = nullptr;
++thread_local uint64_t owner_identity = 0;
 +
-+const void* prepare_owner_identity() {
++uint64_t prepare_owner_identity() {
 +  if (!owner_identity) {
-+    // std::thread::id and TLS addresses may be reused after thread exit.
-+    // A never-recycled tag cannot authorize another thread to touch an encoder.
-+    owner_identity = new unsigned char;
++    // Thread IDs and TLS addresses can be recycled. Reserve an identity without
++    // allocating an immortal tag, and never wrap into another thread's identity.
++    static std::atomic<uint64_t> next{1};
++    auto candidate = next.load(std::memory_order_relaxed);
++    do {
++      if (candidate == std::numeric_limits<uint64_t>::max()) {
++        throw std::overflow_error("submission owner identity exhausted");
++      }
++    } while (!next.compare_exchange_weak(
++        candidate, candidate + 1, std::memory_order_relaxed));
++    owner_identity = candidate;
 +  }
 +  return owner_identity;
 +}
@@ -716,15 +725,17 @@ index 0000000..e6aea2c
 +  }
 +}
 +
-+void retire_records() {
++void retire_records(bool all) {
 +  Record* retired = nullptr;
 +  {
 +    auto& owners = registry();
-+    std::unique_lock<std::mutex> lock(owners.mutex, std::try_to_lock);
-+    if (!lock.owns_lock()) {
++    std::unique_lock<std::mutex> lock(owners.mutex, std::defer_lock);
++    if (all) {
++      lock.lock();
++    } else if (!lock.try_lock()) {
 +      return;
 +    }
-+    auto count = std::min<size_t>(owners.size, 64);
++    auto count = all ? owners.size : std::min<size_t>(owners.size, 64);
 +    while (count--) {
 +      auto* record = owners.head;
 +      owners.head = record->next_;
@@ -902,7 +913,7 @@ index 0000000..c32fdb8
 +  std::atomic<bool> activity_{false};
 +  std::atomic<bool> failed_{false};
 +  std::atomic<bool> blocked_{false};
-+  const void* owner_;
++  uint64_t owner_;
 +  Scope* parent_{nullptr};
 +  Scope* previous_{nullptr};
 +  Scope* next_{nullptr};
@@ -914,8 +925,8 @@ index 0000000..c32fdb8
 +MLX_API void progress_records(bool allow_backend_progress = true) noexcept;
 +// Ordinary host operations may explicitly reclaim terminal records. Arbitrary
 +// primitive/resource destructors run outside the registry lock, never in
-+// scope progress/free, worker observation or thread-local teardown.
-+MLX_API void retire_records();
++// scope progress/free or worker observation. Final owner-thread cleanup may wait.
++MLX_API void retire_records(bool all = false);
 +MLX_API bool stream_failed(Stream) noexcept;
 +
 +// Construct and prepare before native work. Keep the current array, remaining
@@ -950,7 +961,7 @@ index 0000000..c32fdb8
 +
 + private:
 +  friend void progress_records(bool) noexcept;
-+  friend void retire_records();
++  friend void retire_records(bool);
 +  friend bool stream_failed(Stream) noexcept;
 +  friend bool failed_work_pending() noexcept;
 +  struct PhysicalPin {
@@ -984,7 +995,7 @@ index 0000000..c32fdb8
 +  bool activity_{false};
 +  bool blocked_{false};
 +  bool settled_{false};
-+  const void* owner_;
++  uint64_t owner_;
 +};
 +
 +// Only active inside one primitive until its ordinary backend retention has

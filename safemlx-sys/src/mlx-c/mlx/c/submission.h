@@ -35,6 +35,9 @@ int mlx_submission_scope_query(
 int mlx_submission_scope_progress(
     mlx_submission_status* out, mlx_submission_scope scope);
 int mlx_submission_scope_free(mlx_submission_scope scope);
+// Ordinary owner-thread boundary: release all already-terminal native records.
+// Does not progress or authorize release of unresolved work.
+int mlx_submission_reclaim_terminal(void);
 
 #ifdef __cplusplus
 }

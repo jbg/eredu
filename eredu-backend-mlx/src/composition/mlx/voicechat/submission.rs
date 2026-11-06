@@ -91,6 +91,7 @@ struct ExecutionPayload {
 /// policy. Returned host output is deliverable only after its branch commits.
 pub struct MlxVoiceChatExecution {
     payload: Arc<OrdinaryRetirement<ExecutionPayload>>,
+    _retirement: ordinary_retirement::ReclaimOnDrop,
 }
 
 impl MlxVoiceChatExecution {
@@ -104,6 +105,7 @@ impl MlxVoiceChatExecution {
                 active: Cell::new(false),
                 _cache_cleanup: crate::backend::ordinary_retirement::TrimCacheOnRetirement,
             })),
+            _retirement: ordinary_retirement::ReclaimOnDrop,
         }
     }
 
@@ -115,6 +117,7 @@ impl MlxVoiceChatExecution {
     pub fn share(&self) -> Self {
         Self {
             payload: self.payload.clone(),
+            _retirement: ordinary_retirement::ReclaimOnDrop,
         }
     }
 

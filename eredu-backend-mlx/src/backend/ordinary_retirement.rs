@@ -29,9 +29,12 @@ struct Queue(Option<Box<dyn Retired>>);
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        // Neither TLS exit nor unwinding may invoke unknown owner destructors.
-        if let Some(node) = self.0.take() {
-            std::mem::forget(node);
+        // These owners already have terminal-work proof. Thread exit is their
+        // final owner-thread boundary; do not abandon them when there is no
+        // subsequent API call. Detach links before running arbitrary Drop.
+        while let Some(mut node) = self.0.take() {
+            self.0 = node.take_next();
+            drop(node);
         }
     }
 }
@@ -40,6 +43,31 @@ thread_local! {
     static RETIRED: RefCell<Queue> = RefCell::default();
     static RECLAIMING: Cell<bool> = const { Cell::new(false) };
     static TRIM_CACHE: Cell<bool> = const { Cell::new(false) };
+}
+
+// Initialize terminal queues before recovery TLS. Rust destroys TLS in reverse
+// initialization order, so recovery can still stage terminal owners at exit.
+pub(crate) fn prepare_thread() {
+    let _ = RETIRED.try_with(|_| {});
+}
+
+pub(crate) fn thread_available() -> bool {
+    RETIRED.try_with(|_| ()).is_ok()
+}
+
+/// Last field of a public execution owner. Runs after its payload references
+/// have been released, outside native recovery and ordinary host locks.
+pub(crate) struct ReclaimOnDrop;
+
+impl Drop for ReclaimOnDrop {
+    fn drop(&mut self) {
+        if safemlx::can_reclaim_submission_resources()
+            && !RECLAIMING.try_with(Cell::get).unwrap_or(true)
+        {
+            crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+            reclaim_all();
+        }
+    }
 }
 
 /// Last field of a retired executable owner: schedules allocator cleanup after
@@ -57,6 +85,7 @@ pub(crate) struct OrdinaryRetirement<T: 'static>(Option<Box<Node<T>>>);
 
 impl<T: 'static> OrdinaryRetirement<T> {
     pub(crate) fn new(value: T) -> Self {
+        prepare_thread();
         Self(Some(Box::new(Node { value, next: None })))
     }
 
@@ -92,14 +121,15 @@ impl<T: 'static> Drop for OrdinaryRetirement<T> {
                 queue.0 = Some(owned);
             }
         });
-        if let Some(node) = node {
-            std::mem::forget(node);
-        }
+        // TLS can be unavailable while its final queue is being destroyed.
+        // The node is already safe to release; normal Rust ownership still
+        // applies to recursively retired owners at that boundary.
+        drop(node);
     }
 }
 
 /// Reclaims only an already-retired snapshot, outside native/list locks.
-/// A panic retains the remaining snapshot; recursive/new work waits for a later call.
+/// Recursive/new work waits for a later call; snapshots retain ordinary Rust Drop semantics.
 pub(crate) fn reclaim() {
     if !safemlx::can_reclaim_submission_resources() {
         return;
@@ -224,31 +254,5 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         reclaim();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn ordinary_retirement_thread_exit_retains_unreclaimed_owners() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let witness = Witness(Arc::clone(&drops));
-        std::thread::spawn(move || drop(OrdinaryRetirement::new(witness)))
-            .join()
-            .unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn ordinary_retirement_panic_retains_the_remaining_snapshot() {
-        struct Panics;
-        impl Drop for Panics {
-            fn drop(&mut self) {
-                panic!("injected owner destructor failure");
-            }
-        }
-        let drops = Arc::new(AtomicUsize::new(0));
-        drop(OrdinaryRetirement::new(Witness(Arc::clone(&drops))));
-        drop(OrdinaryRetirement::new(Panics));
-        assert!(std::panic::catch_unwind(reclaim).is_err());
-        reclaim();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 }

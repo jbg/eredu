@@ -1,7 +1,8 @@
 //! Backend-local, nonblocking retention for native work whose status is unknown.
 //!
 //! The linked node is allocated before submission. Returning an error, unwinding,
-//! reentrant housekeeping, and thread exit never release an unresolved node.
+//! and reentrant housekeeping never release an unresolved node. Thread exit keeps
+//! the originating thread alive until its native work reaches terminal proof.
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -176,17 +177,29 @@ fn retire(node: Box<dyn Pending>) -> Option<Box<dyn Pending>> {
     retained
 }
 
+// A thread-affine owner cannot migrate to a process-wide reaper. Keep its
+// thread alive until completion rather than abandoning native/app ownership.
+// Unlike polling and ordinary Recovery::drop, this final boundary may wait.
+fn retire_before_thread_exit(node: Box<dyn Pending>) {
+    while !node.progress() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Teardown may block on native access, unlike bounded retirement. Release
+    // arbitrary Rust owners outside the runtime lock, including recursive TLS
+    // retirement after the ordinary host-resource queue has been destroyed.
+    drop(node);
+    let _ = safemlx::reclaim_terminal_submission_resources();
+}
+
 impl Drop for Orphans {
     fn drop(&mut self) {
-        let mut next = self.0.take();
-        while let Some(mut node) = next {
-            next = node.take_next();
-            if let Some(node) = retire(node) {
-                // Native work can outlive its submitting thread. There is no
-                // safe teardown proof, so retain it permanently at thread exit.
-                std::mem::forget(node);
-            }
+        while let Some(mut node) = self.0.take() {
+            self.0 = node.take_next();
+            retire_before_thread_exit(node);
         }
+        // Completed synchronous work can leave native records without a Rust
+        // orphan. Final cleanup covers those records even when this list is empty.
+        let _ = safemlx::reclaim_terminal_submission_resources();
     }
 }
 
@@ -208,12 +221,15 @@ fn quarantine(node: Box<dyn Pending>) {
         }
     });
     if let Some(node) = pending {
-        std::mem::forget(node);
+        // Recursive retirement during final TLS teardown has no later reaper.
+        retire_before_thread_exit(node);
     }
 }
 
 /// Advances old records without waiting or holding a reentrant list borrow.
 pub(crate) fn reap() {
+    crate::backend::ordinary_retirement::prepare_thread();
+    crate::backend::nn::shared::MlxNeuralBackend::prepare_thread_retirement();
     // A snapshot cannot treat a temporarily extracted retirement list as empty.
     let Ok(previous) = REAPING.try_with(|flag| flag.replace(true)) else {
         return;
@@ -272,6 +288,10 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
     }
 
     pub fn with_probe(retention: T, probe: P) -> Self {
+        // Terminal queues outlive this thread's recovery list, including when
+        // its final retirement attempt releases an owner during TLS teardown.
+        crate::backend::ordinary_retirement::prepare_thread();
+        crate::backend::nn::shared::MlxNeuralBackend::prepare_thread_retirement();
         Self {
             node: Some(Box::new(Node {
                 retention,
@@ -311,7 +331,7 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
     }
 
     /// Waits for successful work to settle, returning immediately on failure.
-    /// Error and teardown paths must keep using nonblocking progress instead.
+    /// Error paths use nonblocking progress; final thread exit waits separately.
     pub fn wait(&self) -> Status {
         loop {
             let status = self.progress();
@@ -366,6 +386,15 @@ impl<T: Retention, P: Probe> Drop for Recovery<T, P> {
     fn drop(&mut self) {
         if let Some(mut node) = self.node.take() {
             node.probe.seal();
+            // An application TLS completion may outlive backend TLS. Do not
+            // release arbitrary Rust owners under a native retirement guard
+            // when there is no ordinary queue left to receive them.
+            if !crate::backend::ordinary_retirement::thread_available()
+                || !crate::backend::nn::shared::MlxNeuralBackend::thread_retirement_available()
+            {
+                retire_before_thread_exit(node);
+                return;
+            }
             if let Some(node) = retire(node) {
                 quarantine(node);
             }
