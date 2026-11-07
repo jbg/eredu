@@ -161,9 +161,6 @@ impl Tokenizer {
         // Match the Jinja environment used by Transformers chat templates.
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_filter("tojson", json::tojson);
-        env.add_function("dict", python_dict);
         Self {
             inner: tokenizer,
             env,
@@ -508,7 +505,7 @@ pub fn chat_template_kwargs(
     model_id: &str,
 ) -> Result<BTreeSet<String>, Error> {
     let mut env = Environment::new();
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    register_chat_template_helpers(&mut env);
     let compatible_template = normalize_chat_template(model_template);
     env.add_template_owned(model_id.to_owned(), compatible_template)?;
     let template = env.get_template(model_id)?;
@@ -525,14 +522,29 @@ pub fn chat_template_kwargs(
         .collect())
 }
 
-const STANDARD_CHAT_TEMPLATE_VARIABLES: &[&str] = &[
-    "messages",
-    "tools",
-    "documents",
-    "add_generation_prompt",
-    "raise_exception",
-    "strftime_now",
-];
+const STANDARD_CHAT_TEMPLATE_VARIABLES: &[&str] =
+    &["messages", "tools", "documents", "add_generation_prompt"];
+
+/// Standard Transformers globals and Python-compatible operations shared by
+/// template discovery and all rendering entry points. Unknown helper names are
+/// not inferred from template source or silently replaced with no-ops.
+fn register_chat_template_helpers(env: &mut Environment<'static>) {
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_filter("tojson", json::tojson);
+    env.add_function("dict", python_dict);
+    env.add_function(
+        "raise_exception",
+        |message: String| -> Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                message,
+            ))
+        },
+    );
+    env.add_function("strftime_now", |format: &str| {
+        chrono::Local::now().format(format).to_string()
+    });
+}
 
 /// Renders JSON message arrays using a caller-provided MiniJinja environment.
 pub fn apply_chat_template_json<'a, I>(
@@ -622,9 +634,7 @@ where
     R: Serialize + 'a,
     T: Serialize + 'a,
 {
-    env.add_function("strftime_now", |format: &str| {
-        chrono::Local::now().format(format).to_string()
-    });
+    register_chat_template_helpers(env);
 
     let ApplyChatTemplateArgs {
         conversations,
