@@ -74,6 +74,13 @@ mod tests {
                 arguments: arguments.as_object().unwrap().clone(),
             });
         }
+        events.push(SemanticEvent::ToolCallRejected {
+            index: 0,
+            id: "call".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({"query":7}).as_object().unwrap().clone(),
+            error: "invalid argument type".repeat(200),
+        });
         for reason in [
             FinishReason::Eos,
             FinishReason::StopSequence,

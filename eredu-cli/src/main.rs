@@ -801,6 +801,9 @@ fn write_semantic_event(
         )),
         SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.clone()),
         SemanticEvent::ToolCallCompleted { .. } => Some("}}\n".into()),
+        SemanticEvent::ToolCallRejected { error, .. } => {
+            Some(format!("}}}}\nTool call rejected: {error}\n"))
+        }
         SemanticEvent::ReasoningDelta(text) => {
             reasoning_stream.write_delta(stderr, text, reasoning_output)?;
             None

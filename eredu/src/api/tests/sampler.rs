@@ -971,3 +971,46 @@ fn speculative_capture_reuses_domain_before_forcing_and_preserves_processing() {
     assert_eq!(actual, expected);
     assert_eq!(sample_processed(&sampler, &actual), 0);
 }
+
+#[test]
+fn closed_schema_invalid_calls_are_feedback_without_executable_completion() {
+    let plan=ConstraintCompiler::synthetic_for_tests().compile_tool_plan(
+        &DECLARATIVE_DIALECT,SYNTHETIC_PARAMETERS,&[json!({"type":"function","function":{
+            "name":"ping","parameters":{"type":"object","properties":{"query":{"type":"string"},"id":{"type":"integer"}},
+                "anyOf":[{"required":["query"]},{"required":["id"]}],"additionalProperties":false}
+        }})],ToolChoice::Auto,ParallelToolCallPolicy::Disabled,Vec::new()).unwrap();
+    let mut parser = plan.create_parser().unwrap();
+    parser
+        .push(r#"{"calls":[{"name":"ping","arguments":{}"#)
+        .unwrap();
+    assert!(!parser.events().iter().any(|event| matches!(
+        event,
+        SemanticEvent::ToolCallCompleted { .. } | SemanticEvent::ToolCallRejected { .. }
+    )));
+    parser.push("}]}").unwrap();
+    parser.finish(FinishReason::Eos).unwrap();
+    assert!(parser.events().iter().any(
+        |event| matches!(event,SemanticEvent::ToolCallRejected{name,arguments,error,..}
+        if name=="ping" && arguments.is_empty() && error.contains("anyOf"))
+    ));
+    assert!(!parser
+        .events()
+        .iter()
+        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
+    assert!(matches!(
+        parser.events().last(),
+        Some(SemanticEvent::Finished {
+            reason: FinishReason::Eos
+        })
+    ));
+    let mut corrected = plan.create_parser().unwrap();
+    corrected
+        .push(r#"{"calls":[{"name":"ping","arguments":{"query":"Paris"}}]}"#)
+        .unwrap();
+    corrected.finish(FinishReason::Eos).unwrap();
+    assert!(corrected.events().iter().any(|event|matches!(event,SemanticEvent::ToolCallCompleted{arguments,..} if arguments["query"]=="Paris")));
+    let mut malformed = plan.create_parser().unwrap();
+    assert!(malformed
+        .push(r#"{"calls":[{"name":"ping","arguments":]}]}"#)
+        .is_err());
+}

@@ -340,6 +340,15 @@ mod tests {
                 if name == &original && serde_json::Value::Object(arguments.clone()) == json!({"value":"ok"}))));
         // The active internal name remains the wire name, so a cloned parser
         // still rejects arguments against the registered schema.
-        assert!(restored_active.push("3}}\n</tool_call>").is_err());
+        restored_active.push("3}}\n</tool_call>").unwrap();
+        restored_active
+            .finish(FinishReason::GrammarComplete)
+            .unwrap();
+        assert!(restored_active.events().iter().any(|event|matches!(event,
+            SemanticEvent::ToolCallRejected{name,arguments,..} if name==&original && arguments["value"]==3)));
+        assert!(!restored_active
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
 }

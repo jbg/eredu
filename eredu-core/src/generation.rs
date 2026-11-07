@@ -1044,6 +1044,20 @@ pub enum SemanticEvent {
         /// Complete parsed arguments. Application authorization remains with the caller.
         arguments: serde_json::Map<String, serde_json::Value>,
     },
+    /// A closed call with object arguments that failed application-schema validation.
+    /// This is feedback for the caller/model, never authorization to execute a tool.
+    ToolCallRejected {
+        /// Zero-based position matching the start event.
+        index: usize,
+        /// Stable identifier matching the start event.
+        id: String,
+        /// Original application tool name matching the start event.
+        name: String,
+        /// The attempted JSON object, preserved for conversation history.
+        arguments: serde_json::Map<String, serde_json::Value>,
+        /// Application-schema validation diagnostic.
+        error: String,
+    },
     /// Generation terminated.
     Finished {
         /// The condition that ended the stream.

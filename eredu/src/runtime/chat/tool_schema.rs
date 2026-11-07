@@ -29,23 +29,14 @@ impl ToolSchemas {
         Ok(Self(Arc::new(schemas)))
     }
 
-    pub(crate) fn validate(
-        &self,
-        name: &str,
-        arguments: &str,
-    ) -> Result<Map<String, Value>, String> {
+    pub(crate) fn validate(&self, name: &str, arguments: &Value) -> Result<(), String> {
         let validator = self
             .0
             .get(name)
             .ok_or_else(|| format!("unknown tool function {name:?}"))?;
-        let arguments = Value::Object(parse_arguments(name, arguments)?);
         validator
-            .validate(&arguments)
-            .map_err(|error| format!("tool {name:?} arguments do not match its schema: {error}"))?;
-        let Value::Object(arguments) = arguments else {
-            unreachable!()
-        };
-        Ok(arguments)
+            .validate(arguments)
+            .map_err(|error| format!("tool {name:?} arguments do not match its schema: {error}"))
     }
 }
 

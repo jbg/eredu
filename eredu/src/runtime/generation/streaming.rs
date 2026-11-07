@@ -594,22 +594,40 @@ impl SemanticEventSink {
             .active_tool_call
             .as_ref()
             .expect("tool end requires an active call");
-        let arguments = if let Some(schemas) = &self.tool_schemas {
-            schemas.validate(&call.name, &call.arguments)?
-        } else {
-            crate::runtime::chat::tool_schema::parse_arguments(&call.name, &call.arguments)?
+        // Framing and JSON syntax failures remain fatal. A closed object with
+        // invalid application arguments is a rejected call the host can return
+        // to the model, without weakening the executable-completion contract.
+        let arguments = serde_json::Value::Object(
+            crate::runtime::chat::tool_schema::parse_arguments(&call.name, &call.arguments)?,
+        );
+        let rejection = self
+            .tool_schemas
+            .as_ref()
+            .and_then(|schemas| schemas.validate(&call.name, &arguments).err());
+        let serde_json::Value::Object(arguments) = arguments else {
+            unreachable!()
         };
-        let call = self.active_tool_call.take().expect("validated active call");
+        let call = self.active_tool_call.take().expect("closed active call");
         let name = self
             .tool_names
             .original(&call.name)
             .unwrap_or(&call.name)
             .to_owned();
-        self.events.push(SemanticEvent::ToolCallCompleted {
-            index: call.index,
-            id: call.id,
-            name,
-            arguments,
+        self.events.push(if let Some(error) = rejection {
+            SemanticEvent::ToolCallRejected {
+                index: call.index,
+                id: call.id,
+                name,
+                arguments,
+                error,
+            }
+        } else {
+            SemanticEvent::ToolCallCompleted {
+                index: call.index,
+                id: call.id,
+                name,
+                arguments,
+            }
         });
         Ok(())
     }

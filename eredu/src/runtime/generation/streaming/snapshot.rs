@@ -61,6 +61,17 @@ impl SnapshotStorage for SemanticEvent {
                 .heap_bytes()?
                 .checked_add(name.heap_bytes()?)?
                 .checked_add(arguments.heap_bytes()?),
+            Self::ToolCallRejected {
+                id,
+                name,
+                arguments,
+                error,
+                ..
+            } => id
+                .heap_bytes()?
+                .checked_add(name.heap_bytes()?)?
+                .checked_add(arguments.heap_bytes()?)?
+                .checked_add(error.heap_bytes()?),
             Self::Finished { reason: _ } => Some(0),
         }
     }
