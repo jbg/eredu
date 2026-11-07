@@ -470,6 +470,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         plan: CapturePlan,
         trace_limits: TraceLimits,
     ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+        if self.prompt_cache_store.is_some() {
+            return Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store for observed execution".into()).into());
+        }
         if prompt_token_ids.is_empty()
             || prompt_token_ids
                 .iter()
@@ -547,7 +550,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     where
         F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
     {
-        let identity = if prepared.session_identity != self.session_identity {
+        let identity = if self.prompt_cache_store.is_some() {
+            Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store for observed execution".into()).into())
+        } else if prepared.session_identity != self.session_identity {
             Err(CaptureError::Invalid(
                 "observed request belongs to a different loaded session".into(),
             )

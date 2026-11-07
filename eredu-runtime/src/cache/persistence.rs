@@ -19,6 +19,10 @@ use std::{
 #[path = "persistence/retained.rs"]
 mod retained;
 pub use retained::RetainedCacheShard;
+mod store;
+mod transfer;
+pub use store::{DirectoryPromptCacheStore, MemoryPromptCacheStore};
+pub use transfer::*;
 
 static NEXT_LIVE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REVERSIBLE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -628,6 +632,12 @@ pub fn inspect_prompt_cache(
     directory: impl AsRef<Path>,
 ) -> Result<PromptCacheManifest, PromptCachePersistenceError> {
     let directory = resolve_prompt_cache_root(directory.as_ref())?;
+    inspect_prompt_cache_generation(&directory)
+}
+
+fn inspect_prompt_cache_generation(
+    directory: &Path,
+) -> Result<PromptCacheManifest, PromptCachePersistenceError> {
     let manifest_path = directory.join("manifest.json");
     let reader = BufReader::new(File::open(&manifest_path).map_err(|source| {
         PromptCachePersistenceError::Io {
@@ -874,6 +884,16 @@ fn validate_state_shard(
     state: &PromptCacheStateTensor,
 ) -> Result<(), PromptCachePersistenceError> {
     let (metadata, file_len, data_start) = read_shard_metadata(path)?;
+    validate_state_metadata(path, state, &metadata, file_len, data_start)
+}
+
+fn validate_state_metadata(
+    path: &Path,
+    state: &PromptCacheStateTensor,
+    metadata: &safetensors::tensor::Metadata,
+    file_len: u64,
+    data_start: u64,
+) -> Result<(), PromptCachePersistenceError> {
     let entries = metadata.tensors();
     if entries.len() != 1 {
         return Err(malformed(
@@ -937,16 +957,19 @@ fn read_shard_metadata(
 
 fn read_shard_metadata_from_file(
     path: &Path,
-    file: &mut File,
+    file: &mut (impl Read + Seek + ?Sized),
 ) -> Result<(safetensors::tensor::Metadata, u64, u64), PromptCachePersistenceError> {
     let file_len = file
-        .metadata()
+        .seek(SeekFrom::End(0))
+        .and_then(|len| {
+            file.seek(SeekFrom::Start(0))?;
+            Ok(len)
+        })
         .map_err(|source| PromptCachePersistenceError::Io {
-            action: "stat prompt cache shard",
+            action: "inspect prompt cache shard",
             path: path.to_path_buf(),
             source,
-        })?
-        .len();
+        })?;
     let mut length_bytes = [0u8; 8];
     file.read_exact(&mut length_bytes)
         .map_err(|source| PromptCachePersistenceError::Io {

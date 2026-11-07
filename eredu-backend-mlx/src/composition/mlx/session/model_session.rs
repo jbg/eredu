@@ -461,6 +461,7 @@ impl MlxModelInput {
 /// compose sampling, pending input, facade semantics and capture admissions.
 pub struct MlxNativeTextState {
     state: Box<dyn std::any::Any>,
+    _retirement: ordinary_retirement::ReclaimOnDrop,
 }
 
 impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
@@ -519,7 +520,10 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
         runtime
             .session_mut()
             .with_model_operation(|model| Ok(model.erased_mut().capture_native_control_state()))?
-            .map(|state| MlxNativeTextState { state })
+            .map(|state| MlxNativeTextState {
+                state,
+                _retirement: ordinary_retirement::ReclaimOnDrop,
+            })
     }
 
     fn estimate_native_text_growth(
@@ -558,7 +562,10 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
                     .erased_mut()
                     .copy_native_control_state(saved.state.as_ref()))
             })?
-            .map(|state| MlxNativeTextState { state })
+            .map(|state| MlxNativeTextState {
+                state,
+                _retirement: ordinary_retirement::ReclaimOnDrop,
+            })
     }
 
     fn validate_native_text_state(
@@ -1210,7 +1217,7 @@ impl MlxModelSession {
     pub fn save_prompt_cache(
         &mut self,
         backend: &MlxBackend<'_>,
-        root: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -1218,11 +1225,11 @@ impl MlxModelSession {
         self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
-        let root = root.as_ref();
+        let options = options.clone().with_capture_limit(store.max_bytes());
         self.with_model_operation(|model| {
             if model.has_neutral_partitioned_control() {
                 model
-                    .save_prompt_cache_distributed(root, descriptor, prefix_token_ids, options)?
+                    .save_prompt_cache_distributed(store.directory().ok_or_else(|| Error::ArchitectureModel("process-local memory stores do not provide all-rank atomic publication".into()))?, descriptor, prefix_token_ids, &options)?
                     .ok_or_else(|| {
                         Error::ArchitectureModel(
                             "this partition rank owns no prompt-cache state".into(),
@@ -1231,10 +1238,10 @@ impl MlxModelSession {
             } else {
                 model
                     .save_prompt_cache(
-                        root,
+                        store,
                         descriptor,
                         prefix_token_ids,
-                        options,
+                        &options,
                         backend.stream(),
                     )
                     .map_err(Into::into)
@@ -1246,14 +1253,13 @@ impl MlxModelSession {
     pub fn load_prompt_cache(
         &mut self,
         backend: &MlxBackend<'_>,
-        root: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
         self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
-        let root = root.as_ref();
         let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
             return Err(Error::ArchitectureModel(
                 "prompt-cache loading requires paged state selected during preparation".into(),
@@ -1263,7 +1269,7 @@ impl MlxModelSession {
         self.with_model_operation(|model| {
             let manifest = if model.has_neutral_partitioned_control() {
                 model
-                    .load_prompt_cache_distributed(root, expected, prefix_token_ids)?
+                    .load_prompt_cache_distributed(store.directory().ok_or_else(|| Error::ArchitectureModel("process-local memory stores do not provide all-rank atomic restoration".into()))?, expected, prefix_token_ids)?
                     .ok_or_else(|| {
                         Error::ArchitectureModel(
                             "this partition rank owns no prompt-cache state".into(),
@@ -1271,7 +1277,7 @@ impl MlxModelSession {
                     })?
             } else {
                 model.load_prompt_cache(
-                    root,
+                    store,
                     expected,
                     prefix_token_ids,
                     options,
@@ -1286,7 +1292,7 @@ impl MlxModelSession {
     pub fn load_prompt_cache_for_input(
         &mut self,
         backend: &MlxBackend<'_>,
-        root: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input: &MlxModelInput,
@@ -1304,13 +1310,12 @@ impl MlxModelSession {
                 "prompt-cache loading requires paged state selected during preparation".into(),
             ));
         };
-        let root = root.as_ref();
         let options = options.clone();
         self.with_model_operation(|model| {
             if model.has_neutral_partitioned_control() {
                 model
                     .load_prompt_cache_for_input_distributed(
-                        root,
+                        store.directory().ok_or_else(|| Error::ArchitectureModel("process-local memory stores do not provide all-rank atomic restoration".into()))?,
                         expected,
                         prefix_token_ids,
                         identity,
@@ -1323,7 +1328,7 @@ impl MlxModelSession {
             } else {
                 model
                     .load_prompt_cache_for_input(
-                        root,
+                        store,
                         expected,
                         prefix_token_ids,
                         identity,
@@ -2592,6 +2597,96 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         suffix.cache_identity = prompt.cache_identity.clone();
         *prompt = suffix;
         Ok(true)
+    }
+
+    fn complete_text_prefill(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Self::Prompt,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<bool, Error> {
+        runtime
+            .session()
+            .validate_parameter_epoch(&mut state.sampling.parameter_epoch)?;
+        let submission = runtime.prefill(prompt)?;
+        submission.completion.wait()?;
+        Ok(true)
+    }
+
+    fn prompt_cache_model_identity(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, eredu_core::BackendFailure> {
+        if !matches!(
+            runtime.session().state_residency,
+            CacheResidencyPolicy::Paged(_)
+        ) {
+            return Err(eredu_core::BackendFailure::from_error(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "prompt-cache import/export requires a plan with paged execution state",
+            )));
+        }
+        if runtime.session().distributed().is_some() {
+            return Err(eredu_core::BackendFailure::from_error(std::io::Error::new(std::io::ErrorKind::Unsupported,"automatic prompt-cache reuse requires process-local cache-hit and prefill admission")));
+        }
+        runtime
+            .session()
+            .prompt_cache_model_identity()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+    fn prompt_cache_prefix_fingerprint(
+        runtime: &ModelRuntime<Self>,
+        prefix: &[u32],
+    ) -> Result<String, eredu_core::BackendFailure> {
+        let input = Self::prepare_text_prompt(runtime.backend(), prefix.to_vec())
+            .and_then(|input| {
+                input.with_semantic_content_fingerprint(
+                    eredu_core::cache::prompt_cache_token_fingerprint(prefix),
+                )
+            })
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        Ok(input
+            .cache_identity()
+            .expect("prepared semantic identity")
+            .prefix_content_fingerprint()
+            .to_owned())
+    }
+    fn estimate_prompt_cache_state(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<Option<u64>, eredu_core::BackendFailure> {
+        <Self as eredu_core::execution_control::NativeTextStateBackend>::estimate_native_text_state(
+            runtime, None,
+        )
+        .map(|estimate| estimate.map(|e| e.retained_bytes.max(e.copy_bytes)))
+        .map_err(eredu_core::BackendFailure::from_error)
+    }
+    fn save_prompt_cache(
+        runtime: &mut ModelRuntime<Self>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
+        descriptor: eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+        options: &eredu_core::cache::PromptCacheOptions,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, eredu_core::BackendFailure> {
+        let (backend, session) = runtime.parts_mut();
+        session
+            .save_prompt_cache(backend, store, descriptor, prefix, options)
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+    fn load_prompt_cache(
+        runtime: &mut ModelRuntime<Self>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
+        descriptor: &eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+    ) -> Result<eredu_core::cache::PromptCacheManifest, eredu_core::BackendFailure> {
+        let input = Self::prepare_text_prompt(runtime.backend(), prefix.to_vec())
+            .and_then(|input| {
+                input.with_semantic_content_fingerprint(
+                    eredu_core::cache::prompt_cache_token_fingerprint(prefix),
+                )
+            })
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let (backend, session) = runtime.parts_mut();
+        session
+            .load_prompt_cache_for_input(backend, store, descriptor, prefix, &input)
+            .map_err(eredu_core::BackendFailure::from_error)
     }
 
     fn text_prefill_chunking_support(runtime: &ModelRuntime<Self>) -> Result<(), &'static str> {

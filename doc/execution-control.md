@@ -2764,3 +2764,14 @@ changed masked selection invalidates its dependent suffix. Single-model requests
 retain the complete numerical continuation with their immutable causal-context
 prefix and independent random stream. Declared refinement-only executions reject
 AR and speculative modes before changing request state.
+
+### Automatic prompt-cache stores
+
+A store configured on `LoadedModel` applies to normal independent chat requests.
+Starting controlled, speculative or observed execution with that configuration
+returns a typed
+unsupported error before work: cache publication/eviction is an external side
+effect outside the controlled snapshot, capture and cumulative-copy ledger.
+Remove the automatic store configuration before such a run. The existing
+prompt-cache import/export path accepts memory and directory stores at completed
+native boundaries; this is the same state mechanism, not another cache API.

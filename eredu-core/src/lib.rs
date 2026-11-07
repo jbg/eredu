@@ -129,7 +129,7 @@ pub use capability::{
 };
 pub use execution::{
     BackendId, DevicePlan, DraftAdapterSource, DraftPlacementPlan, DraftingPlan, ExecutionPlan,
-    ExecutionPlanError, ExpertCachePlan, MediaCompanionSources, ResidencyPlan,
+    ExecutionPlanError, ExpertCachePlan, MediaCompanionSources, PagedStatePlan, ResidencyPlan,
     WeightTransformationPlan, DEFAULT_MAX_CACHED_SHARDS, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 pub use generation::{

@@ -176,3 +176,25 @@ fn release_kinds_have_distinct_namespaces_even_with_identical_labels() {
         }
     );
 }
+
+#[test]
+fn memory_prompt_cache_reserves_concurrent_staging_until_abort() {
+    use eredu_core::cache::{PromptCacheOptions, PromptCacheStore, PromptCacheStoreError};
+    let store = eredu_runtime::MemoryPromptCacheStore::new(64);
+    let options = PromptCacheOptions::new(None, true).unwrap();
+    let writer = store.begin(48, &options).unwrap();
+    assert_eq!(store.retained_bytes(), 48);
+    assert!(matches!(
+        store.begin(17, &options),
+        Err(PromptCacheStoreError::Budget { .. })
+    ));
+    store.clear().unwrap();
+    assert_eq!(store.retained_bytes(), 48);
+    drop(writer);
+    assert_eq!(store.retained_bytes(), 0);
+    let writer = store.begin(64, &options).unwrap();
+    assert!(store.begin(1, &options).is_err());
+    drop(writer);
+    assert_eq!(store.retained_bytes(), 0);
+    assert!(store.open().unwrap().is_none());
+}

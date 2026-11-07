@@ -167,7 +167,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     let manifest = session.save_prompt_cache(
         &backend,
-        &args.cache_dir,
+        &eredu_runtime::DirectoryPromptCacheStore::new(&args.cache_dir, u64::MAX),
         descriptor.clone(),
         &prefix_ids,
         &PromptCacheOptions::new(Some("paged-prompt-cache-example".into()), args.replace)?,
@@ -175,8 +175,12 @@ fn main() -> anyhow::Result<()> {
     println!("saved blocks: {}", manifest.blocks.len());
     println!("save report: {:#?}", session.cache_residency_report()?);
 
-    let inspected =
-        session.load_prompt_cache(&backend, &args.cache_dir, &descriptor, &prefix_ids)?;
+    let inspected = session.load_prompt_cache(
+        &backend,
+        &eredu_runtime::DirectoryPromptCacheStore::new(&args.cache_dir, u64::MAX),
+        &descriptor,
+        &prefix_ids,
+    )?;
     println!("cataloged blocks: {}", inspected.blocks.len());
     println!("load report: {:#?}", session.cache_residency_report()?);
     let restored_logits = decode_tokens(&suffix, &backend, &mut session)?;

@@ -27,27 +27,28 @@ use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 
 use eredu_core::{
     cache::{
-        prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, CacheBlockId,
-        CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheStreamId, CacheTier,
-        PromptCacheBlock, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner,
-        StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
+        CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheStreamId,
+        CacheTier, PromptCacheBlock, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
+        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheRead, PromptCacheStateTensor,
+        PromptCacheStore, PromptCacheStoreError, StateTensorOwner, StateTensorRole,
     },
     residency::CacheEvictionPolicy,
 };
 use eredu_runtime::{
-    finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
-    resolve_prompt_cache_root, safe_prompt_cache_shard_path, CacheBlockLifecycle,
-    CacheBlockStorage, CacheHostDemotionOperation, CacheIoExecutionStateError, CacheIoOperation,
-    CacheIoOperationKey, CacheIoOperationKind, CacheIoSubmission as RuntimeCacheIoSubmission,
-    CacheIoSubmissionOutcome, CacheIoTicket as RuntimeCacheIoTicket,
-    CacheIoWorker as RuntimeCacheIoWorker, CacheIoWorkerError, CacheLayerResidencyStats,
-    CacheLifecycleError, CachePoolError, CachePoolMembership, CachePoolReservation,
-    CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPool,
-    CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
-    LiveCacheBlockPublication, LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail,
-    PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
+    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheIoExecutionStateError,
+    CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
+    CacheIoSubmission as RuntimeCacheIoSubmission, CacheIoSubmissionOutcome,
+    CacheIoTicket as RuntimeCacheIoTicket, CacheIoWorker as RuntimeCacheIoWorker,
+    CacheIoWorkerError, CacheLayerResidencyStats, CacheLifecycleError, CachePoolError,
+    CachePoolMembership, CachePoolReservation, CachePoolResource, CachePoolUsage,
+    CacheResidencyConfigurationError, CacheResidencyPool, CacheResidencyReport,
+    CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase, LiveCacheBlockPublication,
+    LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail, PagedCacheOptions,
+    PromptCachePersistenceError,
 };
+
+#[cfg(test)]
+use eredu_runtime::{hash_prompt_cache_shard_payload, inspect_prompt_cache};
 
 /// Maximum number of cache blocks scheduled ahead by paged-cache prefetch.
 pub const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
@@ -664,6 +665,9 @@ pub use io::{
 /// Structured cache residency and persistence failures.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheResidencyError {
+    /// Store publication, format or capture allowance failure.
+    #[error(transparent)]
+    PromptStore(#[from] PromptCacheStoreError),
     /// Backend-neutral cache identity, geometry, or state policy is invalid.
     #[error(transparent)]
     Policy(#[from] CachePolicyError),

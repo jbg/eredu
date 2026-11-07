@@ -120,7 +120,7 @@ fn prepared_session_allows_another_stream_but_rejects_another_device_before_work
         session
             .save_prompt_cache(
                 &replacement,
-                &destination,
+                &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
                 descriptor.clone(),
                 &[1],
                 &eredu_core::cache::PromptCacheOptions::default(),
@@ -129,12 +129,23 @@ fn prepared_session_allows_another_stream_but_rejects_another_device_before_work
     );
     reject(
         session
-            .load_prompt_cache(&replacement, &destination, &descriptor, &[1])
+            .load_prompt_cache(
+                &replacement,
+                &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
+                &descriptor,
+                &[1],
+            )
             .unwrap_err(),
     );
     reject(
         session
-            .load_prompt_cache_for_input(&replacement, &destination, &descriptor, &[1], &input)
+            .load_prompt_cache_for_input(
+                &replacement,
+                &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
+                &descriptor,
+                &[1],
+                &input,
+            )
             .unwrap_err(),
     );
     assert!(!destination.exists());

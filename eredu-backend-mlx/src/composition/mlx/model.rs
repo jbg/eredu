@@ -184,20 +184,20 @@ impl Executable {
 
     pub fn load_prompt_cache(
         &mut self,
-        directory: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         _options: PagedCacheOptions,
         _stream: &Stream,
     ) -> Result<PromptCacheManifest, Exception> {
         self.erased_mut()
-            .load_prompt_cache(directory.as_ref(), expected, prefix_token_ids)
+            .load_prompt_cache(store, expected, prefix_token_ids)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
     pub fn load_prompt_cache_for_input(
         &mut self,
-        directory: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input_identity: eredu_runtime::PreparedInputCacheIdentity,
@@ -205,25 +205,20 @@ impl Executable {
         _stream: &Stream,
     ) -> Result<PromptCacheManifest, Exception> {
         self.erased_mut()
-            .load_prompt_cache_for_input(
-                directory.as_ref(),
-                expected,
-                prefix_token_ids,
-                input_identity,
-            )
+            .load_prompt_cache_for_input(store, expected, prefix_token_ids, input_identity)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
     pub fn save_prompt_cache(
         &mut self,
-        destination: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
         _stream: &Stream,
     ) -> Result<PromptCacheManifest, Exception> {
         self.erased_mut()
-            .save_prompt_cache(destination.as_ref(), descriptor, prefix_token_ids, options)
+            .save_prompt_cache(store, descriptor, prefix_token_ids, options)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 

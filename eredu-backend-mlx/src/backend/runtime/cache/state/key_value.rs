@@ -765,7 +765,7 @@ impl MlxKeyValueState {
     /// Finalizes paged tails and atomically persists a completed prefix.
     pub fn save_prompt_cache(
         &mut self,
-        destination: impl AsRef<Path>,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -785,7 +785,7 @@ impl MlxKeyValueState {
         }
         manager
             .ok_or_else(|| Exception::custom("cannot persist empty paged state"))?
-            .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
+            .save_prompt_cache(store, descriptor, prefix_token_ids, &[], options)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 }

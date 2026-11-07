@@ -1,55 +1,185 @@
-//! Prompt-cache catalog loading and fixed-state restoration.
-
+//! Native execution-state inventory, allocation and completed byte transfers.
 use super::*;
+use eredu_core::BackendFailure;
+use eredu_runtime::{
+    PromptCacheBlockRestore, PromptCacheExport, PromptCacheExportBlock, PromptCacheExportInventory,
+    PromptCacheExportState, PromptCachePayload, PromptCacheStateRestore, PromptCacheTensorLayout,
+};
 
-/// In-memory fixed state supplied when saving a cache snapshot.
+/// Native binding of an architecture-declared fixed state tensor.
 pub struct PromptCacheStateArray<'a> {
-    /// Layer or model-global owner.
+    /// Architecture-declared state owner.
     pub owner: StateTensorOwner,
-    /// Semantic role declared by the canonical layout.
+    /// Architecture-declared tensor role.
     pub role: StateTensorRole,
-    /// Array to persist.
+    /// Native tensor held by the completed execution state.
     pub array: &'a Array,
 }
+fn native_cache_dtype(name: &str) -> Result<Dtype, CacheResidencyError> {
+    Ok(match name {
+        "Bool" => Dtype::Bool,
+        "Uint8" => Dtype::Uint8,
+        "Uint16" => Dtype::Uint16,
+        "Uint32" => Dtype::Uint32,
+        "Uint64" => Dtype::Uint64,
+        "Int8" => Dtype::Int8,
+        "Int16" => Dtype::Int16,
+        "Int32" => Dtype::Int32,
+        "Int64" => Dtype::Int64,
+        "Float16" => Dtype::Float16,
+        "Bfloat16" => Dtype::Bfloat16,
+        "Float32" => Dtype::Float32,
+        "Float64" => Dtype::Float64,
+        _ => {
+            return Err(CacheResidencyError::ArrayMismatch(
+                "unsupported native state dtype".into(),
+            ))
+        }
+    })
+}
+fn transfer_prompt_block(
+    block: &PromptCacheBlock,
+    source: &eredu_runtime::RetainedCacheShard,
+) -> Result<HostCacheBlock, CacheResidencyError> {
+    let mut first = HostTransferBuffer::new(
+        &block.first_shape,
+        native_cache_dtype(&block.first_dtype)?,
+        HostTransferPolicy::Transfer,
+    )
+    .map_err(|e| transfer_error("allocate first restore buffer", e))?;
+    let mut second = HostTransferBuffer::new(
+        &block.second_shape,
+        native_cache_dtype(&block.second_dtype)?,
+        HostTransferPolicy::Transfer,
+    )
+    .map_err(|e| transfer_error("allocate second restore buffer", e))?;
+    source.read_into(
+        &mut [
+            (
+                &block.first_array,
+                first
+                    .as_bytes_mut()
+                    .map_err(|e| transfer_error("bind first restore bytes", e))?,
+            ),
+            (
+                &block.second_array,
+                second
+                    .as_bytes_mut()
+                    .map_err(|e| transfer_error("bind second restore bytes", e))?,
+            ),
+        ],
+        Some(&block.payload_sha256),
+    )?;
+    Ok(HostCacheBlock::from_buffers(
+        block.representation,
+        first.freeze(),
+        second.freeze(),
+    ))
+}
+fn transfer_prompt_state(
+    state: &PromptCacheStateTensor,
+    source: &eredu_runtime::RetainedCacheShard,
+    stream: &Stream,
+) -> Result<Array, CacheResidencyError> {
+    let mut host = HostTransferBuffer::new(
+        &state.shape,
+        native_cache_dtype(&state.dtype)?,
+        HostTransferPolicy::Transfer,
+    )
+    .map_err(|e| transfer_error("allocate state restore buffer", e))?;
+    source.read_into(
+        &mut [(
+            &state.array,
+            host.as_bytes_mut()
+                .map_err(|e| transfer_error("bind state restore bytes", e))?,
+        )],
+        Some(&state.payload_sha256),
+    )?;
+    host.copy_to_array(stream)
+        .and_then(|p| p.synchronize())
+        .map(|(array, _)| array)
+        .map_err(|e| transfer_error("complete state restore", e))
+}
+struct NativeBlockRestore<'a> {
+    manager: &'a CacheResidencyManager,
+    stream: &'a Stream,
+    sink_tokens: usize,
+}
+impl PromptCacheBlockRestore for NativeBlockRestore<'_> {
+    fn transfer_block(
+        &mut self,
+        block: &PromptCacheBlock,
+        source: &eredu_runtime::RetainedCacheShard,
+    ) -> Result<(), BackendFailure> {
+        (|| -> Result<(), CacheResidencyError> {
+            let host = transfer_prompt_block(block, source)?;
+            let [first, second] = host.buffers();
+            let (first, completion) = first
+                .copy_to_array(self.stream)
+                .map_err(|e| transfer_error("restore cache block", e))?
+                .into_parts();
+            completion
+                .synchronize()
+                .map_err(|e| transfer_error("complete cache restore", e))?;
+            let (second, completion) = second
+                .copy_to_array(self.stream)
+                .map_err(|e| transfer_error("restore cache block", e))?
+                .into_parts();
+            completion
+                .synchronize()
+                .map_err(|e| transfer_error("complete cache restore", e))?;
+            let arrays = match block.representation {
+                CacheRepresentation::KeyValue => CacheBlockArrays::KeyValue {
+                    keys: first,
+                    values: second,
+                },
+                CacheRepresentation::CompressedLatentRotary => {
+                    CacheBlockArrays::CompressedLatentRotary {
+                        latent: first,
+                        rotary_key: second,
+                    }
+                }
+                CacheRepresentation::AppendStream { slot, lane } => {
+                    CacheBlockArrays::AppendStream {
+                        slot,
+                        lane,
+                        records: first,
+                        reserved: second,
+                    }
+                }
+            };
+            self.manager.seal_block(
+                block.global_layer,
+                block.start,
+                block.end,
+                block.rank,
+                arrays,
+                !matches!(
+                    block.representation,
+                    CacheRepresentation::AppendStream { .. }
+                ) && block.end <= self.sink_tokens as i64,
+            )?;
 
-/// Catalogs a compatible prompt prefix lazily as read-only disk-backed blocks.
-pub fn open_prompt_cache(
-    directory: impl AsRef<Path>,
-    expected: &PromptCacheDescriptor,
-    model: &PromptCacheModelIdentity,
-    prefix_token_ids: &[u32],
-    options: PagedCacheOptions,
-) -> Result<(CacheResidencyManager, PromptCacheManifest), CacheResidencyError> {
-    validate_prompt_cache_model_identity(expected, model)?;
-    let directory = directory.as_ref();
-    let cache_root = resolve_prompt_cache_root(directory)?;
-    let manifest = inspect_prompt_cache(directory)?;
-    manifest.validate_compatibility(expected, prefix_token_ids)?;
-    if manifest.block_size_tokens != options.block_size_tokens() {
-        return Err(CacheResidencyError::PromptCache(
-            PromptCacheError::Incompatible(format!(
-                "block size {} does not match requested {}",
-                manifest.block_size_tokens,
-                options.block_size_tokens()
-            )),
-        ));
+            Ok(())
+        })()
+        .map_err(BackendFailure::from_error)
     }
-    let manager = CacheResidencyManager::new(options)?;
-    {
-        let mut state = manager.lock()?;
-        for block in &manifest.blocks {
+    fn retain_block(
+        &mut self,
+        block: &PromptCacheBlock,
+        source: Arc<eredu_runtime::RetainedCacheShard>,
+        shard: PathBuf,
+    ) -> Result<(), BackendFailure> {
+        (|| -> Result<(), CacheResidencyError> {
             let id = CacheBlockId {
-                session_id: manager.session_id,
+                session_id: self.manager.session_id,
                 global_layer: block.global_layer,
                 representation: block.representation,
                 start: block.start,
                 end: block.end,
                 rank: block.rank,
             };
-            let shard = safe_prompt_cache_shard_path(&cache_root, &block.shard)?;
-            let source = Arc::new(eredu_runtime::RetainedCacheShard::open_block(
-                &shard, block,
-            )?);
+            let mut state = self.manager.lock()?;
             let record = CacheBlockRecord {
                 physical: MlxCacheBlockStorage::disk(
                     id.clone(),
@@ -73,269 +203,259 @@ pub fn open_prompt_cache(
                 !matches!(
                     block.representation,
                     CacheRepresentation::AppendStream { .. }
-                ) && block.end <= manifest.sink_tokens as i64,
+                ) && block.end <= self.sink_tokens as i64,
             )?;
             if state.blocks.insert(id.clone(), record).is_some() {
                 return Err(CacheLifecycleError::DuplicateBlock(id).into());
             }
-        }
+
+            Ok(())
+        })()
+        .map_err(BackendFailure::from_error)
+    }
+}
+/// Creates native paging storage from the runtime's validated restore plan.
+pub fn open_prompt_cache(
+    read: &dyn PromptCacheRead,
+    expected: &PromptCacheDescriptor,
+    model: &PromptCacheModelIdentity,
+    prefix: &[u32],
+    options: PagedCacheOptions,
+    stream: &Stream,
+) -> Result<(CacheResidencyManager, PromptCacheManifest), CacheResidencyError> {
+    let restore = eredu_runtime::PromptCacheRestore::new(
+        read,
+        expected,
+        model,
+        prefix,
+        options.block_size_tokens(),
+    )?;
+    let manifest = restore.manifest();
+    let manager = CacheResidencyManager::new(options)?;
+    restore.restore_blocks(&mut NativeBlockRestore {
+        manager: &manager,
+        stream,
+        sink_tokens: manifest.sink_tokens,
+    })?;
+    {
+        let mut state = manager.lock()?;
         state.telemetry.report.prompt_cache_loads += 1;
-        state.telemetry.report.prompt_cache_bytes += manifest
-            .blocks
-            .iter()
-            .map(|block| block.logical_bytes)
-            .sum::<u64>();
+        state.telemetry.report.prompt_cache_bytes +=
+            manifest.blocks.iter().map(|b| b.logical_bytes).sum::<u64>();
         state.telemetry.report.imported_retained_shards += manifest.blocks.len() as u64;
         update_report_totals(&mut state);
     }
-    Ok((manager, manifest))
+    Ok((manager, manifest.clone()))
 }
-
-/// Materialized non-attention state tensor from a validated prompt cache.
+/// Native binding produced by a completed state restore.
 pub struct LoadedPromptCacheStateTensor {
-    /// Architecture state owner identified by the prompt-cache manifest.
+    /// Architecture-declared state owner.
     pub owner: StateTensorOwner,
-    /// Semantic role of the state tensor.
+    /// Architecture-declared tensor role.
     pub role: StateTensorRole,
-    /// Materialized MLX state array.
+    /// Restored native tensor.
     pub array: Array,
 }
-
-/// Loads all fixed-state tensors after manifest and model compatibility validation.
-pub fn load_prompt_cache_state_tensors(
-    directory: impl AsRef<Path>,
-    manifest: &PromptCacheManifest,
-    stream: &Stream,
-) -> Result<Vec<LoadedPromptCacheStateTensor>, CacheResidencyError> {
-    let root = resolve_prompt_cache_root(directory.as_ref())?;
-    let host_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let mut loaded = Vec::with_capacity(manifest.state_tensors.len());
-    for state in &manifest.state_tensors {
-        let path = safe_prompt_cache_shard_path(&root, &state.shard)?;
-        let actual_hash = hash_prompt_cache_shard_payload(&path)?;
-        if actual_hash != state.payload_sha256 {
-            return Err(CacheResidencyError::MalformedShard {
-                path,
-                reason: "fixed-state payload digest does not match the manifest".into(),
-            });
-        }
-        let mut arrays = Array::load_safetensors(&path, &host_stream).map_err(|source| {
-            CacheResidencyError::Runtime(format!("load {}: {source}", path.display()))
-        })?;
-        let array =
-            arrays
-                .remove(&state.array)
-                .ok_or_else(|| CacheResidencyError::MalformedShard {
-                    path: path.clone(),
-                    reason: format!("missing state array {}", state.array),
-                })?;
-        if !arrays.is_empty() {
-            return Err(CacheResidencyError::MalformedShard {
-                path,
-                reason: "fixed-state shard contains unexpected arrays".into(),
-            });
-        }
-        let array = array.copy(stream).map_err(|source| {
-            CacheResidencyError::Runtime(format!(
-                "copy {} to execution stream: {source}",
-                path.display()
-            ))
-        })?;
-        eval([&array]).map_err(|source| {
-            CacheResidencyError::Runtime(format!(
-                "evaluate {} on execution stream: {source}",
-                path.display()
-            ))
-        })?;
-        loaded.push(LoadedPromptCacheStateTensor {
+struct NativeStateRestore<'a> {
+    stream: &'a Stream,
+    tensors: Vec<LoadedPromptCacheStateTensor>,
+}
+impl PromptCacheStateRestore for NativeStateRestore<'_> {
+    fn transfer_state(
+        &mut self,
+        state: &PromptCacheStateTensor,
+        source: &eredu_runtime::RetainedCacheShard,
+    ) -> Result<(), BackendFailure> {
+        let array = transfer_prompt_state(state, source, self.stream)
+            .map_err(BackendFailure::from_error)?;
+        self.tensors.push(LoadedPromptCacheStateTensor {
             owner: state.owner,
             role: state.role,
             array,
         });
+        Ok(())
     }
-    Ok(loaded)
 }
-
+/// Completes native fixed-state transfers selected by the portable driver.
+pub fn load_prompt_cache_state_tensors(
+    read: &dyn PromptCacheRead,
+    manifest: &PromptCacheManifest,
+    stream: &Stream,
+) -> Result<Vec<LoadedPromptCacheStateTensor>, CacheResidencyError> {
+    let mut target = NativeStateRestore {
+        stream,
+        tensors: Vec::new(),
+    };
+    eredu_runtime::restore_prompt_cache_states(read, manifest, &mut target)?;
+    Ok(target.tensors)
+}
+enum NativeCachePayload {
+    Block(HostCacheBlock),
+    State(ImmutableHostTransferBuffer),
+}
+impl PromptCachePayload for NativeCachePayload {
+    fn bytes(&self) -> Result<Vec<&[u8]>, BackendFailure> {
+        match self {
+            Self::Block(block) => block
+                .buffers()
+                .into_iter()
+                .map(|buffer| buffer.as_bytes().map_err(BackendFailure::from_error))
+                .collect(),
+            Self::State(buffer) => Ok(vec![buffer
+                .as_bytes()
+                .map_err(BackendFailure::from_error)?]),
+        }
+    }
+}
+struct NativeCacheExport<'a> {
+    inventory: PromptCacheExportInventory,
+    records: Vec<CacheBlockRecord>,
+    states: &'a [PromptCacheStateArray<'a>],
+    stream: Stream,
+}
+impl PromptCacheExport for NativeCacheExport<'_> {
+    type Payload = NativeCachePayload;
+    fn inventory(&self) -> &PromptCacheExportInventory {
+        &self.inventory
+    }
+    fn transfer_block(&self, index: usize) -> Result<NativeCachePayload, BackendFailure> {
+        let record = &self.records[index];
+        (|| -> Result<_, CacheResidencyError> {
+            let host = if let Some(arrays) = record.physical.device_resource() {
+                HostCacheBlock::from_device_arrays(arrays, &self.stream)?
+            } else if let Some(host) = record.physical.host_resource() {
+                host.clone()
+            } else {
+                load_host_cache_block_direct(
+                    record
+                        .physical
+                        .backing()
+                        .expect("backing-only cache record"),
+                    record.physical.id().representation,
+                )?
+            };
+            Ok(NativeCachePayload::Block(host))
+        })()
+        .map_err(BackendFailure::from_error)
+    }
+    fn transfer_state(&self, index: usize) -> Result<NativeCachePayload, BackendFailure> {
+        HostTransferBuffer::copy_from_array(
+            self.states[index].array,
+            HostTransferPolicy::Transfer,
+            &self.stream,
+        )
+        .and_then(|p| p.synchronize())
+        .map(|host| NativeCachePayload::State(host.freeze()))
+        .map_err(BackendFailure::from_error)
+    }
+}
 impl CacheResidencyManager {
-    /// Writes a completed immutable prefix atomically to a persistent directory.
+    /// Exposes native block inventory and completed transfers to the runtime publisher.
     pub fn save_prompt_cache(
         &self,
-        destination: impl AsRef<Path>,
+        store: &dyn PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         state_arrays: &[PromptCacheStateArray<'_>],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, CacheResidencyError> {
-        let destination = destination.as_ref();
-        descriptor.validate()?;
-        let publication = PromptCachePublication::begin(destination, options.replace_existing())?;
-        let temporary = publication.staging_directory().to_path_buf();
-
-        let result = (|| {
-            let records = {
-                let state = self.lock()?;
-                let owned_layers = descriptor.global_layer_start()..descriptor.global_layer_end();
-                let mut records = Vec::new();
-                for record in state
-                    .blocks
-                    .values()
-                    .filter(|record| owned_layers.contains(&record.physical.id().global_layer))
-                {
-                    let id = record.physical.id();
-                    if state.lifecycle.is_leased(id)? {
-                        return Err(CacheLifecycleError::BlockLeased(id.clone()).into());
-                    }
-                    records.push(record.clone());
+        let records = {
+            let state = self.lock()?;
+            let mut records = Vec::new();
+            for record in state.blocks.values().filter(|record| {
+                (descriptor.global_layer_start()..descriptor.global_layer_end())
+                    .contains(&record.physical.id().global_layer)
+            }) {
+                if state.lifecycle.is_leased(record.physical.id())? {
+                    return Err(
+                        CacheLifecycleError::BlockLeased(record.physical.id().clone()).into(),
+                    );
                 }
-                records
-            };
-            let mut manifest_blocks = Vec::with_capacity(records.len());
-            let mut manifest_state = Vec::with_capacity(state_arrays.len());
-            let mut logical_bytes = 0u64;
-            for (index, record) in records.iter().enumerate() {
-                let shard = format!("block-{index:08}.safetensors");
-                let shard_path = temporary.join(&shard);
-                if let Some(arrays) = record.physical.device_resource() {
-                    save_block_arrays(&shard_path, arrays)?;
-                } else if let Some(block) = record.physical.host_resource() {
-                    save_host_cache_block(&shard_path, block)?;
-                } else {
-                    let location = record
-                        .physical
-                        .backing()
-                        .expect("backing-only phase owns its disk location");
-                    let block = load_host_cache_block_direct(
-                        location,
-                        record.physical.id().representation,
-                    )?;
-                    save_host_cache_block(&shard_path, &block)?;
-                }
-                let payload_sha256 = finalize_prompt_cache_shard(&shard_path)?;
-                logical_bytes += record.bytes;
-                let names = array_names(record.physical.id().representation);
-                manifest_blocks.push(PromptCacheBlock {
-                    global_layer: record.physical.id().global_layer,
-                    representation: record.physical.id().representation,
-                    start: record.physical.id().start,
-                    end: record.physical.id().end,
-                    rank: record.physical.id().rank,
-                    shard,
-                    first_array: names.0.into(),
-                    second_array: names.1.into(),
-                    first_shape: record.shapes[0].clone(),
-                    second_shape: record.shapes[1].clone(),
-                    first_dtype: record.dtypes[0].clone(),
-                    second_dtype: record.dtypes[1].clone(),
-                    logical_bytes: record.bytes,
-                    payload_sha256,
-                });
+                records.push(record.clone());
             }
-            for (index, state) in state_arrays.iter().enumerate() {
-                let shard = format!("state-{index:08}.safetensors");
-                let shard_path = temporary.join(&shard);
-                let array_name = "state";
-                Array::save_safetensors([(array_name, state.array)], None, &shard_path).map_err(
-                    |source| {
-                        CacheResidencyError::Runtime(format!(
-                            "save {}: {source}",
-                            shard_path.display()
-                        ))
-                    },
-                )?;
-                let payload_sha256 = finalize_prompt_cache_shard(&shard_path)?;
-                let state_bytes = state.array.nbytes() as u64;
-                logical_bytes = logical_bytes.checked_add(state_bytes).ok_or_else(|| {
-                    CacheResidencyError::PromptCache(PromptCacheError::Malformed(
-                        "prompt-cache state byte count overflow".into(),
-                    ))
-                })?;
-                manifest_state.push(PromptCacheStateTensor {
+            records
+        };
+        let blocks = records
+            .iter()
+            .map(|record| {
+                Ok(PromptCacheExportBlock {
+                    id: record.physical.id().clone(),
+                    tensors: [
+                        PromptCacheTensorLayout::new(
+                            record.shapes[0].clone(),
+                            record.dtypes[0].clone(),
+                        )?,
+                        PromptCacheTensorLayout::new(
+                            record.shapes[1].clone(),
+                            record.dtypes[1].clone(),
+                        )?,
+                    ],
+                })
+            })
+            .collect::<Result<Vec<_>, PromptCacheStoreError>>()?;
+        let states = state_arrays
+            .iter()
+            .map(|state| {
+                Ok(PromptCacheExportState {
                     owner: state.owner,
                     role: state.role,
-                    shard,
-                    array: array_name.into(),
-                    shape: state.array.shape().to_vec(),
-                    dtype: dtype_name(state.array.dtype()),
-                    logical_bytes: state_bytes,
-                    payload_sha256,
-                });
-            }
-            let mut stream_frontiers = Vec::new();
-            {
-                let state = self.lock()?;
-                for (index, policy) in descriptor.layer_layout().iter().enumerate() {
-                    let layer = descriptor.global_layer_start() + index;
-                    for stream in policy.append_streams() {
-                        for lane in 0..descriptor.batch_size() {
-                            let lane = u32::try_from(lane).map_err(|_| {
-                                CacheResidencyError::ArrayMismatch(
-                                    "append-stream batch exceeds u32".into(),
-                                )
-                            })?;
-                            let representation = CacheRepresentation::AppendStream {
-                                slot: stream.slot(),
-                                lane,
-                            };
-                            if state
-                                .lifecycle
-                                .tail(CacheStreamId::new(layer, representation))
-                                .is_some_and(|tail| tail.bytes != 0)
-                            {
-                                return Err(CacheResidencyError::ArrayMismatch("append-stream tail must be finalized before prompt persistence".into()));
-                            }
-                            let records = manifest_blocks
-                                .iter()
-                                .filter(|block| {
-                                    block.global_layer == layer
-                                        && block.representation == representation
-                                })
-                                .map(|block| block.end as usize)
-                                .max()
-                                .unwrap_or(0);
-                            stream_frontiers.push(eredu_core::cache::PromptCacheStreamFrontier {
-                                global_layer: layer,
-                                slot: stream.slot(),
-                                lane,
-                                records,
-                            });
-                        }
-                    }
-                }
-            }
-            stream_frontiers
-                .sort_by_key(|frontier| (frontier.global_layer, frontier.slot, frontier.lane));
-            let manifest = PromptCacheManifest {
-                schema_version: PROMPT_CACHE_SCHEMA_VERSION,
-                model_family: descriptor.model_family().to_owned(),
-                effective_model_type: descriptor.effective_model_type().to_owned(),
-                checkpoint_fingerprint: descriptor.checkpoint_fingerprint().to_owned(),
-                prefix_content_fingerprint: descriptor.prefix_content_fingerprint().to_owned(),
-                architecture_fingerprint: descriptor.architecture_fingerprint().to_owned(),
-                layer_count: descriptor.layer_count(),
-                global_layer_start: descriptor.global_layer_start(),
-                global_layer_end: descriptor.global_layer_end(),
+                    tensor: PromptCacheTensorLayout::new(
+                        state.array.shape().to_vec(),
+                        dtype_name(state.array.dtype()),
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, PromptCacheStoreError>>()?;
+        let mut transfer_bytes = 0;
+        for bytes in records
+            .iter()
+            .map(|r| r.bytes)
+            .chain(state_arrays.iter().map(|s| s.array.nbytes() as u64))
+        {
+            let capacity = host_transfer_capacity_upper_bound(
+                usize::try_from(bytes).map_err(|e| CacheResidencyError::Runtime(e.to_string()))?,
+                HostTransferPolicy::Transfer,
+            )
+            .map_err(|e| transfer_error("price native cache transfer", e))?
+                as u64;
+            transfer_bytes = transfer_bytes.max(capacity.checked_mul(2).ok_or_else(|| {
+                CacheResidencyError::Runtime("native transfer capacity overflow".into())
+            })?);
+        }
+        let unsealed_streams = self
+            .lock()?
+            .lifecycle
+            .tails()
+            .filter(|(_, tail)| tail.bytes != 0)
+            .map(|(stream, _)| stream)
+            .collect();
+        let source = NativeCacheExport {
+            inventory: PromptCacheExportInventory {
                 block_size_tokens: self.options().block_size_tokens(),
-                batch_size: descriptor.batch_size(),
-                total_prefix_tokens: prefix_token_ids.len(),
-                prefix_sha256: prompt_cache_token_fingerprint(prefix_token_ids),
-                layer_layout: descriptor.layer_layout().clone(),
-                layer_prefix_offsets: descriptor.layer_prefix_offsets().to_vec(),
-                state_segments: descriptor.state_segments().to_vec(),
-                sink_tokens: descriptor.sink_tokens(),
-                topology: descriptor.topology().clone(),
-                distributed_commit: descriptor.distributed_commit(),
-                application_namespace: options.application_namespace().map(str::to_owned),
-                blocks: manifest_blocks,
-                state_tensors: manifest_state,
-                stream_frontiers,
-            };
-            publication.commit(&manifest)?;
-            let mut state = self.lock()?;
-            state.telemetry.report.prompt_cache_saves += 1;
-            state.telemetry.report.prompt_cache_bytes += logical_bytes;
-            Ok(manifest)
-        })();
-
-        result
+                blocks,
+                states,
+                unsealed_streams,
+                transfer_bytes,
+            },
+            records,
+            states: state_arrays,
+            stream: Stream::new_with_device(&Device::new(DeviceType::Cpu, 0)),
+        };
+        let manifest = eredu_runtime::publish_prompt_cache(
+            &source,
+            store,
+            descriptor,
+            prefix_token_ids,
+            options,
+        )?;
+        let mut state = self.lock()?;
+        state.telemetry.report.prompt_cache_saves += 1;
+        state.telemetry.report.prompt_cache_bytes += manifest
+            .blocks
+            .iter()
+            .map(|b| b.logical_bytes)
+            .chain(manifest.state_tensors.iter().map(|s| s.logical_bytes))
+            .sum::<u64>();
+        Ok(manifest)
     }
 }

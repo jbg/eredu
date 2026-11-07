@@ -120,7 +120,7 @@ fn combined_prompt_cache_restores_ragged_streams_fixed_state_and_attention() {
     assert!(
         manager
             .save_prompt_cache(
-                &destination,
+                &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
                 descriptor.clone(),
                 &tokens,
                 &arrays,
@@ -132,7 +132,7 @@ fn combined_prompt_cache_restores_ragged_streams_fixed_state_and_attention() {
     summaries.finalize().unwrap();
     let saved = manager
         .save_prompt_cache(
-            &destination,
+            &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
             descriptor.clone(),
             &tokens,
             &arrays,
@@ -147,9 +147,21 @@ fn combined_prompt_cache_restores_ragged_streams_fixed_state_and_attention() {
             .collect::<Vec<_>>(),
         [(5, 0, 3), (5, 1, 0)]
     );
-    let (restored, manifest) =
-        open_prompt_cache(&destination, &descriptor, &identity, &tokens, options).unwrap();
-    let state = load_prompt_cache_state_tensors(&destination, &manifest, &stream).unwrap();
+    let (restored, manifest) = open_prompt_cache(
+        &*crate::tests::support::read_prompt_cache(&destination),
+        &descriptor,
+        &identity,
+        &tokens,
+        options,
+        &stream,
+    )
+    .unwrap();
+    let state = load_prompt_cache_state_tensors(
+        &*crate::tests::support::read_prompt_cache(&destination),
+        &manifest,
+        &stream,
+    )
+    .unwrap();
     assert_eq!(state.len(), 1);
     assert_eq!(
         MlxTensor::from(state[0].array.clone())

@@ -22,9 +22,14 @@ pub use executor::{
 pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
 pub use persistence::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
-    prompt_cache_rank_path, resolve_prompt_cache_root, safe_prompt_cache_shard_path,
-    validate_prompt_cache_manifest, LiveCacheBlockPublication, LiveCachePublicationError,
-    PromptCachePersistenceError, PromptCachePublication, RetainedCacheShard,
+    prompt_cache_array_names, prompt_cache_export_allowance, prompt_cache_rank_path,
+    publish_prompt_cache, resolve_prompt_cache_root, restore_prompt_cache_states,
+    safe_prompt_cache_shard_path, validate_prompt_cache_manifest, with_rank_prompt_cache_store,
+    DirectoryPromptCacheStore, LiveCacheBlockPublication, LiveCachePublicationError,
+    MemoryPromptCacheStore, PreparedPromptCachePublication, PromptCacheBlockRestore,
+    PromptCacheExport, PromptCacheExportBlock, PromptCacheExportInventory, PromptCacheExportState,
+    PromptCachePayload, PromptCachePersistenceError, PromptCachePublication, PromptCacheRestore,
+    PromptCacheStateRestore, PromptCacheTensorLayout, RetainedCacheShard,
     ReversiblePromptCachePublication, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
     PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };

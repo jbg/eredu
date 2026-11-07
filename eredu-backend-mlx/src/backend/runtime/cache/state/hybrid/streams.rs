@@ -648,7 +648,7 @@ mod tests {
         let destination = directory.path().join("state");
         let saved = state
             .save_prompt_cache(
-                &destination,
+                &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
                 descriptor.clone(),
                 &[1, 2, 3],
                 &PromptCacheOptions::default(),
@@ -666,9 +666,21 @@ mod tests {
                 vec![3, 0, 3, 0]
             }
         );
-        let (manager, manifest) =
-            open_prompt_cache(&destination, &descriptor, &identity, &[1, 2, 3], options).unwrap();
-        let arrays = load_prompt_cache_state_tensors(&destination, &manifest, stream).unwrap();
+        let (manager, manifest) = open_prompt_cache(
+            &*crate::tests::support::read_prompt_cache(&destination),
+            &descriptor,
+            &identity,
+            &[1, 2, 3],
+            options,
+            &stream,
+        )
+        .unwrap();
+        let arrays = load_prompt_cache_state_tensors(
+            &*crate::tests::support::read_prompt_cache(&destination),
+            &manifest,
+            stream,
+        )
+        .unwrap();
         let mut restored = MlxHybridState::paged(layout, manager, None, &bindings).unwrap();
         restored
             .restore_prompt_cache_state(arrays, 3, &[0])

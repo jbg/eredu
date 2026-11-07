@@ -36,6 +36,7 @@ clap = { workspace = true, optional = true }
 eredu.workspace = true
 eredu-architectures.workspace = true
 eredu-core.workspace = true
+eredu-runtime.workspace = true
 futures = { version = "0.3", optional = true }
 regex = { version = "1", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"], optional = true }

@@ -335,6 +335,43 @@ impl DraftAdapterSource {
     }
 }
 
+/// Finite paging limits for model execution state, independent of prompt-cache
+/// storage. No disk spill is enabled by this plan.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PagedStatePlan {
+    /// Positions per sealed state block.
+    pub block_size_tokens: u32,
+    /// Device-resident mutable-state allowance.
+    pub device_bytes: u64,
+    /// Host-resident mutable-state allowance.
+    pub host_bytes: u64,
+}
+impl PagedStatePlan {
+    /// Creates validated state limits without allocating storage.
+    pub fn new(
+        block_size_tokens: u32,
+        device_bytes: u64,
+        host_bytes: u64,
+    ) -> Result<Self, ExecutionPlanError> {
+        let plan = Self {
+            block_size_tokens,
+            device_bytes,
+            host_bytes,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+    fn validate(&self) -> Result<(), ExecutionPlanError> {
+        if self.block_size_tokens == 0
+            || self.block_size_tokens > i32::MAX as u32
+            || self.device_bytes == 0
+        {
+            return Err(ExecutionPlanError::InvalidPagedState);
+        }
+        Ok(())
+    }
+}
+
 /// A concrete, backend-neutral set of model/session execution choices.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
@@ -375,6 +412,8 @@ pub struct ExecutionPlan {
     /// Explicitly requires persisted prompt-prefix import/export independently of cache residency.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) prompt_cache_persistence: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) paged_state: Option<PagedStatePlan>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -400,6 +439,7 @@ impl ExecutionPlan {
             required_device_capabilities: DeviceCapabilities::new(true, false, false),
             required_session_capabilities: SessionCapabilities::default(),
             prompt_cache_persistence: false,
+            paged_state: None,
         }
     }
 
@@ -548,7 +588,17 @@ impl ExecutionPlan {
         self
     }
 
-    /// Requires persisted prompt-prefix import/export without changing cache residency.
+    /// Selects bounded paged execution state without filesystem backing.
+    pub fn with_paged_state(mut self, state: PagedStatePlan) -> Self {
+        self.paged_state = Some(state);
+        self
+    }
+    /// Selected paged execution state, independent of prompt-cache store medium.
+    pub fn paged_state(&self) -> Option<&PagedStatePlan> {
+        self.paged_state.as_ref()
+    }
+
+    /// Requires prompt-cache import/export, independently of the chosen store medium.
     pub fn with_prompt_cache_persistence(mut self, required: bool) -> Self {
         self.prompt_cache_persistence = required;
         self
@@ -617,6 +667,9 @@ impl ExecutionPlan {
 
     /// Validates schema, topology, and portable resource invariants without a backend.
     pub fn validate_structure(&self) -> Result<(), ExecutionPlanError> {
+        if let Some(state) = &self.paged_state {
+            state.validate()?;
+        }
         if self.schema_version != EXECUTION_PLAN_SCHEMA_VERSION {
             return Err(ExecutionPlanError::Schema(self.schema_version));
         }
@@ -660,6 +713,9 @@ impl ExecutionPlan {
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExecutionPlanError {
+    /// Invalid finite paged execution-state limits.
+    #[error("paged state requires a positive block size fitting i32 and a positive device budget")]
+    InvalidPagedState,
     /// Backend identifier is empty.
     #[error("execution-plan backend identifier must not be empty")]
     EmptyBackendId,

@@ -302,6 +302,21 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         Ok(advanced)
     }
 
+    /// Consumes a prefill-only continuation and completes its final input
+    /// without sampling. This commits the prepared input's cache provenance.
+    pub fn complete_prefill<C: TokenFilterController>(
+        &mut self,
+        mut state: TextGenerationContinuation<B, C>,
+    ) -> Result<bool, TextContinuationError<B::Error, C::Error>> {
+        self.validate(&state)?;
+        state.require_quiescent()?;
+        let Some(PendingTextInput::Prefill(prompt)) = state.inner.step.take() else {
+            return Ok(false);
+        };
+        B::complete_text_prefill(self.runtime, prompt, &mut state.inner.backend_state)
+            .map_err(|error| ControlledTextGenerationError::Backend(error).into())
+    }
+
     /// Settles exact native completion and moves out the single bounded record
     /// batch. It remains available after failure for attributed error evidence;
     /// draining never turns a failed continuation into a resumable one.

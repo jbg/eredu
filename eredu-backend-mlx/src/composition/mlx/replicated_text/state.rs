@@ -124,7 +124,7 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
     ) -> Result<Self, Error>;
     fn load_prompt_cache(
         selected: &SelectedStateRealization,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
@@ -132,7 +132,7 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
     ) -> Result<(Self, PromptCacheManifest), Error>;
     fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -231,23 +231,28 @@ impl MlxStateMechanisms for MlxKeyValueState {
 
     fn load_prompt_cache(
         selected: &SelectedStateRealization,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
-        _stream: &Stream,
+        stream: &Stream,
     ) -> Result<(Self, PromptCacheManifest), Error> {
         let CacheResidencyPolicy::Paged(options) = selected.policy() else {
             return Err(Error::Parallel(
                 "prompt-cache loading requires selected paged state".into(),
             ));
         };
+        let read = store
+            .open()
+            .map_err(|e| Error::Other(Box::new(e)))?
+            .ok_or_else(|| Error::Parallel("prompt cache store is empty".into()))?;
         let (manager, manifest) = open_prompt_cache(
-            directory,
+            &*read,
             expected,
             identity,
             prefix_token_ids,
             options.clone(),
+            stream,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         let state = MlxKeyValueState::from_selected_with_global_layer_start(
@@ -261,19 +266,13 @@ impl MlxStateMechanisms for MlxKeyValueState {
 
     fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
-        MlxKeyValueState::save_prompt_cache(
-            self,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-        )
-        .map_err(Into::into)
+        MlxKeyValueState::save_prompt_cache(self, store, descriptor, prefix_token_ids, options)
+            .map_err(Into::into)
     }
 
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
@@ -371,7 +370,7 @@ impl MlxStateMechanisms for MlxHybridState {
 
     fn load_prompt_cache(
         selected: &SelectedStateRealization,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
@@ -382,15 +381,20 @@ impl MlxStateMechanisms for MlxHybridState {
                 "prompt-cache loading requires selected paged state".into(),
             ));
         };
+        let read = store
+            .open()
+            .map_err(|e| Error::Other(Box::new(e)))?
+            .ok_or_else(|| Error::Parallel("prompt cache store is empty".into()))?;
         let (manager, manifest) = open_prompt_cache(
-            directory,
+            &*read,
             expected,
             identity,
             prefix_token_ids,
             options.clone(),
+            stream,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        let tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
+        let tensors = load_prompt_cache_state_tensors(&*read, &manifest, stream)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let mut state = MlxHybridState::from_selected_with_global_layer_start(
             selected,
@@ -409,12 +413,12 @@ impl MlxStateMechanisms for MlxHybridState {
 
     fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
-        MlxHybridState::save_prompt_cache(self, destination, descriptor, prefix_token_ids, options)
+        MlxHybridState::save_prompt_cache(self, store, descriptor, prefix_token_ids, options)
             .map_err(Into::into)
     }
 
@@ -507,7 +511,7 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
 
     fn load_prompt_cache(
         selected: &SelectedStateRealization,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
@@ -518,12 +522,17 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
                 "prompt-cache loading requires selected paged state".into(),
             ));
         };
+        let read = store
+            .open()
+            .map_err(|e| Error::Other(Box::new(e)))?
+            .ok_or_else(|| Error::Parallel("prompt cache store is empty".into()))?;
         let (manager, manifest) = open_prompt_cache(
-            directory,
+            &*read,
             expected,
             identity,
             prefix_token_ids,
             options.clone(),
+            stream,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         let prefix = i32::try_from(prefix_token_ids.len())
@@ -535,7 +544,7 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
             prefix,
             expected.topology().cache_rank_identity(),
         )?;
-        let mut tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
+        let mut tensors = load_prompt_cache_state_tensors(&*read, &manifest, stream)
             .map_err(|error| Error::Parallel(error.to_string()))?
             .into_iter()
             .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
@@ -560,7 +569,7 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
 
     fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -579,7 +588,7 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         manager
             .flatten()
             .ok_or_else(|| Error::Parallel("prompt-cache persistence requires paged state".into()))?
-            .save_prompt_cache(destination, descriptor, prefix_token_ids, &fixed, options)
+            .save_prompt_cache(store, descriptor, prefix_token_ids, &fixed, options)
             .map_err(|error| Error::Parallel(error.to_string()))
     }
 

@@ -40,7 +40,7 @@ fn prompt_cache_is_atomic_inspectable_and_reopens_lazily() {
         .unwrap();
     assert!(manager
         .save_prompt_cache(
-            &invalid_destination,
+            &eredu_runtime::DirectoryPromptCacheStore::new(&invalid_destination, u64::MAX),
             invalid_descriptor,
             &tokens,
             &[],
@@ -50,7 +50,7 @@ fn prompt_cache_is_atomic_inspectable_and_reopens_lazily() {
     assert!(!invalid_destination.exists());
     manager
         .save_prompt_cache(
-            &destination,
+            &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
             descriptor.clone(),
             &tokens,
             &[],
@@ -89,16 +89,15 @@ fn prompt_cache_is_atomic_inspectable_and_reopens_lazily() {
     )
     .unwrap();
     assert!(open_prompt_cache(
-        &destination,
+        &*crate::tests::support::read_prompt_cache(&destination),
         &incompatible,
         &identity,
         &tokens,
-        options.clone()
-    )
+        options.clone(), &stream)
     .is_err());
 
     let (loaded_manager, loaded_manifest) =
-        open_prompt_cache(&destination, &descriptor, &identity, &tokens, options).unwrap();
+        open_prompt_cache(&*crate::tests::support::read_prompt_cache(&destination), &descriptor, &identity, &tokens, options, &stream).unwrap();
     assert_eq!(loaded_manifest.blocks.len(), 3);
     let mut restored =
         PagedKeyValueCache::new_with_layout(loaded_manager.clone(), 0, None, 0, Some(rank))
@@ -184,7 +183,7 @@ fn distinct_window_schedule_save_reopen_continue_preserves_ranges() {
     let destination = directory.path().join("distinct-windows");
     manager
         .save_prompt_cache(
-            &destination,
+            &eredu_runtime::DirectoryPromptCacheStore::new(&destination, u64::MAX),
             descriptor.clone(),
             &tokens,
             &[],
@@ -243,7 +242,7 @@ fn distinct_window_schedule_save_reopen_continue_preserves_ranges() {
     )
     .unwrap();
     let (manager, manifest) =
-        open_prompt_cache(&destination, &descriptor, &identity, &tokens, options).unwrap();
+        open_prompt_cache(&*crate::tests::support::read_prompt_cache(&destination), &descriptor, &identity, &tokens, options, &stream).unwrap();
     assert_eq!(&manifest.layer_layout, descriptor.layer_layout());
 
     for (layer, window) in windows.into_iter().enumerate() {

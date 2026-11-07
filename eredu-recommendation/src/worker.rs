@@ -299,9 +299,7 @@ pub fn run() -> Result<()> {
     let input: WorkerInput = serde_json::from_slice(&bytes)?;
     let result = (|| -> Result<Inspection> {
         let metadata = input.metadata.decode()?;
-        let options = eredu::api::MetadataInspectionOptions::new(eredu::api::BackendId::new(
-            &input.profile.backend,
-        )?);
+        let options = input.profile.inspection_options()?;
         Ok(forecast::inspect(
             &metadata,
             &options,

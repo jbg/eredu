@@ -23,24 +23,6 @@ pub(in super::super) fn write_live_block(
     })
 }
 
-pub(in super::super) fn save_block_arrays(
-    path: &Path,
-    arrays: &CacheBlockArrays,
-) -> Result<(), CacheResidencyError> {
-    let names = array_names(arrays.representation());
-    let values = arrays.arrays();
-    // The native serializer rejects empty arrays, but empty companion storage
-    // is valid for key-only attention and named records. Use the shared bounded
-    // host encoding, which preserves those exact zero-width declarations.
-    if values.iter().any(|value| value.shape().contains(&0)) {
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        return save_host_cache_block(path, &HostCacheBlock::from_device_arrays(arrays, &stream)?);
-    }
-    Array::save_safetensors([(names.0, values[0]), (names.1, values[1])], None, path).map_err(
-        |source| CacheResidencyError::Runtime(format!("save {}: {source}", path.display())),
-    )
-}
-
 pub(in super::super) fn save_host_cache_block(
     path: &Path,
     block: &HostCacheBlock,
@@ -145,9 +127,27 @@ pub(in super::super) fn load_host_cache_block_direct(
         opened = eredu_runtime::RetainedCacheShard::open(&location.path, location.logical_bytes)?;
         &opened
     };
+    load_host_cache_block_source(
+        source,
+        &location.path,
+        &location.first_name,
+        &location.second_name,
+        representation,
+        location.payload_sha256.as_deref(),
+    )
+}
+
+pub(in super::super) fn load_host_cache_block_source(
+    source: &eredu_runtime::RetainedCacheShard,
+    path: &Path,
+    first_name: &str,
+    second_name: &str,
+    representation: CacheRepresentation,
+    payload_sha256: Option<&str>,
+) -> Result<HostCacheBlock, CacheResidencyError> {
     if source.metadata().tensors().len() != 2 {
         return Err(CacheResidencyError::MalformedShard {
-            path: location.path.clone(),
+            path: path.to_path_buf(),
             reason: "unexpected extra arrays".into(),
         });
     }
@@ -157,7 +157,7 @@ pub(in super::super) fn load_host_cache_block_direct(
                 .metadata()
                 .info(name)
                 .ok_or_else(|| CacheResidencyError::MalformedShard {
-                    path: location.path.clone(),
+                    path: path.to_path_buf(),
                     reason: format!("missing array {name}"),
                 })?;
         let shape = info
@@ -176,24 +176,24 @@ pub(in super::super) fn load_host_cache_block_direct(
         )
         .map_err(|source| transfer_error("allocate disk-loaded host cache buffer", source))
     };
-    let mut first = allocate(&location.first_name)?;
-    let mut second = allocate(&location.second_name)?;
+    let mut first = allocate(first_name)?;
+    let mut second = allocate(second_name)?;
     source.read_into(
         &mut [
             (
-                &location.first_name,
+                first_name,
                 first
                     .as_bytes_mut()
                     .map_err(|e| transfer_error("first cache buffer", e))?,
             ),
             (
-                &location.second_name,
+                second_name,
                 second
                     .as_bytes_mut()
                     .map_err(|e| transfer_error("second cache buffer", e))?,
             ),
         ],
-        location.payload_sha256.as_deref(),
+        payload_sha256,
     )?;
     Ok(HostCacheBlock::from_buffers(
         representation,
@@ -213,9 +213,5 @@ pub(in super::super) fn remove_ephemeral_file(record: &CacheBlockRecord) {
 pub(in super::super) fn array_names(
     representation: CacheRepresentation,
 ) -> (&'static str, &'static str) {
-    match representation {
-        CacheRepresentation::KeyValue => ("keys", "values"),
-        CacheRepresentation::AppendStream { .. } => ("records", "reserved"),
-        CacheRepresentation::CompressedLatentRotary => ("latent", "rotary_key"),
-    }
+    eredu_runtime::prompt_cache_array_names(representation)
 }

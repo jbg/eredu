@@ -260,7 +260,7 @@ where
     /// Restores native state bytes from a validated prompt-cache artifact.
     fn load_prompt_cache(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
@@ -272,7 +272,7 @@ where
     fn save_prompt_cache(
         &mut self,
         state: &mut Self::State,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -3789,7 +3789,7 @@ where
     /// Validates and replaces state from a reusable prompt cache.
     pub fn load_prompt_cache(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
@@ -3806,7 +3806,7 @@ where
         let (state, manifest) = self
             .mechanisms
             .load_prompt_cache(
-                directory,
+                store,
                 expected,
                 &identity,
                 prefix_token_ids,
@@ -3825,7 +3825,7 @@ where
     /// Opens a prompt cache only when its content identity matches the admitted prepared input.
     pub fn load_prompt_cache_for_input(
         &mut self,
-        directory: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         input_identity: PreparedInputCacheIdentity,
@@ -3833,7 +3833,7 @@ where
     ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
         self.validate_prompt_input_descriptor(expected, &input_identity)?;
-        let manifest = self.load_prompt_cache(directory, expected, prefix_token_ids, context)?;
+        let manifest = self.load_prompt_cache(store, expected, prefix_token_ids, context)?;
         self.committed_prompt_input_identity = Some(input_identity);
         Ok(manifest)
     }
@@ -3887,7 +3887,7 @@ where
     /// Validates identity and persists the current state through native bytes.
     pub fn save_prompt_cache(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -3901,7 +3901,7 @@ where
             .mechanisms
             .save_prompt_cache(
                 &mut self.state,
-                destination,
+                store,
                 descriptor.clone(),
                 prefix_token_ids,
                 options,
@@ -3915,7 +3915,7 @@ where
     /// Persists state only when the descriptor names the successfully committed prepared input.
     pub fn save_prompt_cache_for_input(
         &mut self,
-        destination: &Path,
+        store: &dyn eredu_core::cache::PromptCacheStore,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
@@ -3929,7 +3929,7 @@ where
                 "prompt-cache prepared-input identity differs from the committed prompt".into(),
             ));
         }
-        self.save_prompt_cache(destination, descriptor, prefix_token_ids, options, context)
+        self.save_prompt_cache(store, descriptor, prefix_token_ids, options, context)
     }
 
     fn load_prompt_cache_distributed_inner(
@@ -3983,7 +3983,7 @@ where
         let provisional = local.map(|(selected_state, identity)| {
             self.mechanisms
                 .load_prompt_cache(
-                    directory,
+                    &crate::DirectoryPromptCacheStore::new(directory, u64::MAX),
                     expected,
                     &identity,
                     prefix_token_ids,

@@ -440,3 +440,256 @@ mod speculative;
 
 #[path = "native_execution_control/candidate_domain.rs"]
 mod candidate_domain;
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run explicitly with accessible Metal initialization"
+)]
+fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contracts() {
+    let root = fixture(false);
+    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
+        .with_paged_state(eredu_core::PagedStatePlan::new(3, 4 << 20, 4 << 20).unwrap())
+        .with_prompt_cache_persistence(true);
+    let load = || {
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+            .unwrap()
+            .into_parts()
+            .0
+    };
+    let mut cold = load();
+    let mut model = load();
+    let chat=model.prepare_chat(ChatTemplateRequest {
+        messages:vec![serde_json::json!({"role":"user","content":"left right left right left right left right"})],
+        add_generation_prompt:true,..Default::default()
+    }).unwrap();
+    let tokens = model.encode(chat.rendered_prompt(), false).unwrap();
+    let settings = PreparedChatGenerationSettings {
+        prefill: PrefillChunkPolicy::Bounded(std::num::NonZeroUsize::new(3).unwrap()),
+        overrides: GenerationConfigOverrides {
+            temperature: Some(0.0),
+            max_new_tokens: Some(4),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let generate = |model: &mut LoadedModel<_>, ids: Vec<u32>, cancellation| {
+        model.reset().unwrap();
+        model
+            .session()
+            .generate(GenerationRequest {
+                input: PreparedChatInput::token_ids(&chat, ids),
+                output_mode: OutputMode::Text,
+                settings,
+                caller_stop_sequences: &[],
+                cancellation,
+                control_handle: None,
+                on_event: |_| {},
+            })
+            .unwrap()
+    };
+    let stores: Vec<std::sync::Arc<dyn PromptCacheStore>> = vec![
+        std::sync::Arc::new(MemoryPromptCacheStore::new(4 << 20)),
+        std::sync::Arc::new(DirectoryPromptCacheStore::new(
+            root.0.join("cache"),
+            4 << 20,
+        )),
+    ];
+    for store in stores {
+        model
+            .set_prompt_cache_store("fixture-checkpoint", Box::new(store.clone()))
+            .unwrap();
+        let first = generate(&mut model, tokens.clone(), Default::default());
+        assert_eq!(
+            first.stats().prompt_cache.as_ref().unwrap().reused_tokens,
+            0
+        );
+        assert!(
+            model.prompt_cache_store().unwrap().retained_bytes() > 0,
+            "stats={:?}, prefill={:?}",
+            first.stats(),
+            model.prefill_chunking_support()
+        );
+        let pinned = model.prompt_cache_store().unwrap().open().unwrap().unwrap();
+        let saved_manifest = pinned.manifest().clone();
+        let warm = generate(&mut model, tokens.clone(), Default::default());
+        assert!(warm.stats().prompt_cache.as_ref().unwrap().reused_tokens > 0);
+        assert_eq!(warm.token_ids(), first.token_ids());
+        assert_eq!(
+            warm.token_ids(),
+            generate(&mut cold, tokens.clone(), Default::default()).token_ids()
+        );
+        // The existing checkpoint identity permits reuse across model loads.
+        cold.set_prompt_cache_store("fixture-checkpoint", Box::new(store.clone()))
+            .unwrap();
+        let reloaded = generate(&mut cold, tokens.clone(), Default::default());
+        assert!(
+            reloaded
+                .stats()
+                .prompt_cache
+                .as_ref()
+                .unwrap()
+                .reused_tokens
+                > 0
+        );
+        assert_eq!(reloaded.token_ids(), warm.token_ids());
+        cold.remove_prompt_cache_store();
+        // Reject a mismatched digest atomically through both store implementations.
+        let validation: Box<dyn PromptCacheStore> = if store.directory().is_some() {
+            Box::new(DirectoryPromptCacheStore::new(
+                root.0.join("invalid-cache"),
+                4 << 20,
+            ))
+        } else {
+            Box::new(MemoryPromptCacheStore::new(4 << 20))
+        };
+        let mut writer = validation
+            .begin(
+                1 << 20,
+                &eredu_core::cache::PromptCacheOptions::new(None, true).unwrap(),
+            )
+            .unwrap();
+        for name in saved_manifest
+            .blocks
+            .iter()
+            .map(|b| &b.shard)
+            .chain(saved_manifest.state_tensors.iter().map(|s| &s.shard))
+        {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut pinned.open_shard(name).unwrap(), &mut bytes).unwrap();
+            writer.put_shard(name, bytes).unwrap();
+        }
+        let mut invalid = saved_manifest.clone();
+        invalid.blocks[0].payload_sha256 = "0".repeat(64);
+        assert!(writer.commit(&invalid).is_err());
+        assert!(validation.open().unwrap().is_none());
+        assert_eq!(validation.retained_bytes(), 0);
+        // A reader admitted before replacement remains usable, even after clear.
+        model.prompt_cache_store().unwrap().clear().unwrap();
+        if model.prompt_cache_store().unwrap().directory().is_none() {
+            assert!(model.prompt_cache_store().unwrap().retained_bytes() > 0);
+        }
+        for block in &saved_manifest.blocks {
+            let source = eredu_runtime::RetainedCacheShard::from_reader(
+                std::path::Path::new(&block.shard),
+                pinned.open_shard(&block.shard).unwrap(),
+                block.logical_bytes,
+            )
+            .unwrap();
+            let mut first = vec![
+                0;
+                source
+                    .metadata()
+                    .info(&block.first_array)
+                    .unwrap()
+                    .data_offsets
+                    .1
+                    - source
+                        .metadata()
+                        .info(&block.first_array)
+                        .unwrap()
+                        .data_offsets
+                        .0
+            ];
+            let mut second = vec![
+                0;
+                source
+                    .metadata()
+                    .info(&block.second_array)
+                    .unwrap()
+                    .data_offsets
+                    .1
+                    - source
+                        .metadata()
+                        .info(&block.second_array)
+                        .unwrap()
+                        .data_offsets
+                        .0
+            ];
+            source
+                .read_into(
+                    &mut [
+                        (&block.first_array, &mut first),
+                        (&block.second_array, &mut second),
+                    ],
+                    Some(&block.payload_sha256),
+                )
+                .unwrap();
+        }
+        drop(pinned);
+        assert_eq!(model.prompt_cache_store().unwrap().retained_bytes(), 0);
+        let _ = generate(&mut model, tokens.clone(), Default::default());
+        let mut extended = tokens.clone();
+        extended.extend([1, 2, 1, 2]);
+        let warm = generate(&mut model, extended.clone(), Default::default());
+        assert!(warm.stats().prompt_cache.as_ref().unwrap().reused_tokens > 0);
+        assert_eq!(
+            warm.token_ids(),
+            generate(&mut cold, extended.clone(), Default::default()).token_ids()
+        );
+        extended[0] = if extended[0] == 1 { 2 } else { 1 };
+        let mismatch = generate(&mut model, extended.clone(), Default::default());
+        assert_eq!(
+            mismatch
+                .stats()
+                .prompt_cache
+                .as_ref()
+                .unwrap()
+                .reused_tokens,
+            0
+        );
+        assert_eq!(
+            mismatch.token_ids(),
+            generate(&mut cold, extended.clone(), Default::default()).token_ids()
+        );
+        model
+            .set_prompt_cache_store("different-checkpoint", Box::new(store.clone()))
+            .unwrap();
+        let changed_identity = generate(&mut model, extended.clone(), Default::default());
+        assert_eq!(
+            changed_identity
+                .stats()
+                .prompt_cache
+                .as_ref()
+                .unwrap()
+                .reused_tokens,
+            0
+        );
+        assert_eq!(changed_identity.token_ids(), mismatch.token_ids());
+        let cancellation = eredu_core::GenerationCancellationToken::default();
+        let signal = cancellation.clone();
+        let cancelled = model
+            .session()
+            .generate(GenerationRequest {
+                input: PreparedChatInput::token_ids(&chat, extended),
+                output_mode: OutputMode::Text,
+                settings,
+                caller_stop_sequences: &[],
+                cancellation,
+                control_handle: None,
+                on_event: move |event| {
+                    if matches!(event, SemanticEvent::TextDelta(_)) {
+                        signal.cancel();
+                    }
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            cancelled.finish_reason(),
+            eredu_core::FinishReason::Cancelled
+        );
+        assert_eq!(model.prompt_cache_store().unwrap().retained_bytes(), 0);
+    }
+    model
+        .set_prompt_cache_store(
+            "fixture-checkpoint",
+            Box::new(MemoryPromptCacheStore::new(1)),
+        )
+        .unwrap();
+    let denied = generate(&mut model, tokens.clone(), Default::default());
+    assert_eq!(model.prompt_cache_store().unwrap().retained_bytes(), 0);
+    assert_eq!(
+        denied.token_ids(),
+        generate(&mut cold, tokens, Default::default()).token_ids()
+    );
+}

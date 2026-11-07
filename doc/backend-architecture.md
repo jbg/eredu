@@ -13646,3 +13646,62 @@ retain observation seams, parameter consumers and the same partition ownership.
 Families validate the exact added state geometry and the transport that requires
 it. Gemma shared-KV partitions use this projection for their declared receiver
 caches, without reconstructing the component or its parameter topology.
+
+### Prompt-cache stores and independent requests
+
+Prompt-cache import/export consumes the neutral `PromptCacheStore` contract.
+`MemoryPromptCacheStore` and `DirectoryPromptCacheStore` publish the same
+versioned manifest and safetensors shards through one capture/restore path.
+Portable runtime owns manifest construction, canonical tensor encoding, shard
+names, compatibility validation, staging reservations, publication and immutable
+reader leases. `PromptCacheExport` supplies native state inventory and completed
+host byte transfers; the runtime publisher consumes them without a concrete
+backend dependency. Architecture declarations retain state geometry and roles.
+
+Portable restore validates and pins one immutable generation before native state
+installation. It selects eager memory restoration or retained file-backed paging
+and drives narrow native callbacks. Native bindings allocate exact tensor buffers,
+complete device transfers and bind restored state to the existing storage owner.
+They do not inspect store paths or decode safetensors metadata for prompt restore.
+The existing native live-spill codec remains an execution-storage mechanism.
+
+Memory-store limits include active staging and generations pinned after eviction.
+Backends report native transfer capacity; runtime admits the complete publication
+allowance before requesting any native copy. Dropped or failed writers refund
+reservations. Rank scoping and reversible distributed publication are portable
+runtime operations; native adapters export into the supplied staging store.
+
+Import/export currently binds the selected paged-state realization. Resident KV
+snapshot primitives alone do not cover resident append streams, compressed state
+and pooling state. Those require complete resident export/restore bindings and
+matching cold capability/forecast support before the paging restriction can be
+removed. Storage medium remains independent of execution-state paging; a memory
+store creates no files and paging need not enable live disk spill.
+
+The facade configures a store and caller-verified checkpoint fingerprint on a
+loaded model. Normal `session().generate(...)` accepts the full conversation,
+restores a matching prefix through ordinary prompt-cache import, advances the
+shared prefill driver to complete an exact prepared prefix without sampling,
+and publishes it through ordinary prompt-cache export. Sampling and semantic
+parsing start fresh. Live request state resets on completion; errors and
+cancellation evict the published entry. Hits retain that original prefix: a
+suffix prepared independently cannot attest an extended composite input.
+There is no separate prefix-cache owner or cached-generation API.
+
+Automatic reuse requires local ordinary text execution. Explicit all-rank
+directory publication retains its coordinated path; a process-local memory
+store cannot provide cross-rank atomic publication. Controlled, speculative and
+observed runs reject a configured automatic store because external publication
+is outside their snapshot/capture resource ledger. Their explicit cache
+import/export mechanisms remain available at completed boundaries.
+
+BF16 attention's internal contiguous batch indices are constructed and bounded
+on the host. Their native row projections retain shape checks but do not submit
+a device-to-host bounds read for each attention tile. Arbitrary routed indices
+continue to receive device bounds validation. Arithmetic and reduction order
+remain unchanged.
+
+The BF16 row-projection dispatch schedules adjacent input rows against the same
+weight row, allowing prefill to reuse weights in native caches. Each output dot
+retains its original lane reduction and final cast; only independent workgroup
+coordinates change.
