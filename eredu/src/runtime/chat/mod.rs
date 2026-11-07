@@ -552,6 +552,7 @@ pub struct PreparedChat {
     pub(crate) semantic_support: SemanticSupport,
     pub(crate) text_generation_support: CapabilitySupport,
     pub(crate) capabilities: ChatCapabilities,
+    pub(crate) reasoning_efforts: &'static [&'static str],
     pub(crate) generation_runtime_plan: Option<GenerationRuntimePlan>,
     /// Checkpoint EOS token IDs used to stop generation.
     pub(crate) eos_token_ids: Vec<u32>,
@@ -600,6 +601,12 @@ impl PreparedChat {
     /// control is separate, and snapshots require complete estimates and limits.
     pub fn text_generation_support(&self) -> &CapabilitySupport {
         &self.text_generation_support
+    }
+
+    /// Effort values declared by the recognized template profile. Each selected
+    /// value still requires ordinary preparation with the exact request context.
+    pub fn supported_reasoning_efforts(&self) -> &[&str] {
+        self.reasoning_efforts
     }
 
     /// Returns independently gated protocol capabilities.

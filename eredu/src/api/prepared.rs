@@ -67,6 +67,31 @@ impl PreparedTextModel {
         })
     }
 
+    /// Prepares a chat using the admitted tokenizer and template, without loading
+    /// weights or creating a native device. Uses the ordinary request validator.
+    pub fn prepare_chat(
+        &mut self,
+        request: crate::runtime::chat::ChatTemplateRequest,
+    ) -> Result<crate::runtime::chat::PreparedChat, super::TextModelError> {
+        let template = self
+            .config
+            .chat_template
+            .clone()
+            .ok_or(super::TextModelError::MissingChatTemplate)?;
+        let compiler = crate::runtime::chat::constraints::ConstraintCompiler::from_tokenizer(
+            &self.tokenizer,
+            &self.config.eos_token_ids,
+        );
+        super::request::prepare_chat_from_parts(
+            &mut self.tokenizer,
+            template,
+            &self.config.model_id,
+            &self.config.eos_token_ids,
+            Some(&compiler),
+            request,
+        )
+    }
+
     /// Exact retained artifact, including the selected projector and shard set.
     pub fn artifact(&self) -> &ArtifactInspection {
         &self.artifact

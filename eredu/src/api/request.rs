@@ -2263,6 +2263,9 @@ pub(super) fn prepare_chat_from_parts_with_history(
         generation_prompt,
         template_identity,
         format_profile_identity: profile.identity,
+        reasoning_efforts: profile
+            .reasoning_effort_control
+            .map_or(&[], |control| control.supported),
         native_tool_support,
         semantic_support,
         text_generation_support,
