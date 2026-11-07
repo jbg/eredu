@@ -23,6 +23,12 @@ literal Unicode, and no HTML escaping. Templates can override `ensure_ascii`,
 `indent`, `separators`, and `sort_keys`. These details affect prompt tokens and
 model behavior, particularly when tool schemas are rendered into the prompt.
 
+Template inspection and every rendering API share the standard helper environment:
+Python-compatible `dict`, `tojson` and methods, plus Transformers' `raise_exception`
+and `strftime_now` globals. Template validation errors retain their message and
+source location. Registered globals are excluded from discovered template kwargs;
+unknown function names still fail rather than being silently stubbed.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT.
