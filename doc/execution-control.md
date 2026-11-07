@@ -2775,3 +2775,15 @@ effect outside the controlled snapshot, capture and cumulative-copy ledger.
 Remove the automatic store configuration before such a run. The existing
 prompt-cache import/export path accepts memory and directory stores at completed
 native boundaries; this is the same state mechanism, not another cache API.
+
+### Rejected tool calls
+
+A syntactically closed tool call with JSON object arguments that fail the
+application schema emits `ToolCallRejected`, preserving its identity, attempted
+arguments and validation diagnostic. It never emits `ToolCallCompleted` for that
+call and does not authorize execution. Hosts can record the attempted assistant
+call with a tool-error result and request a correction. The same semantic sink
+serves ordinary and controlled generation; retained events account for the
+rejected arguments and diagnostic. Cancellation and incomplete or malformed
+framing remain distinct from a schema rejection. Voice-chat tool batches retain
+their existing all-valid-calls publication contract and reject invalid batches.

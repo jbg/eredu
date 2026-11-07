@@ -63,11 +63,18 @@ impl<D: SnapshotValue> SnapshotValue for Queue<D> {
 
 fn event_strings(event: &SemanticEvent) -> impl Iterator<Item = &String> {
     let fields = match event {
-        SemanticEvent::ReasoningDelta(text) | SemanticEvent::TextDelta(text) => [Some(text), None],
+        SemanticEvent::ReasoningDelta(text) | SemanticEvent::TextDelta(text) => {
+            [Some(text), None, None]
+        }
         SemanticEvent::ToolCallStart { id, name, .. }
-        | SemanticEvent::ToolCallCompleted { id, name, .. } => [Some(id), Some(name)],
-        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => [Some(json_fragment), None],
-        SemanticEvent::Finished { .. } => [None, None],
+        | SemanticEvent::ToolCallCompleted { id, name, .. } => [Some(id), Some(name), None],
+        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
+            [Some(json_fragment), None, None]
+        }
+        SemanticEvent::ToolCallRejected {
+            id, name, error, ..
+        } => [Some(id), Some(name), Some(error)],
+        SemanticEvent::Finished { .. } => [None, None, None],
     };
     fields.into_iter().flatten()
 }
@@ -96,7 +103,9 @@ impl<D: SnapshotValue> SnapshotValue for VoiceChatConversationOutput<D> {
             .iter()
             .flat_map(|batch| batch.events.iter())
             .map(|event| {
-                let arguments = if let SemanticEvent::ToolCallCompleted { arguments, .. } = event {
+                let arguments = if let SemanticEvent::ToolCallCompleted { arguments, .. }
+                | SemanticEvent::ToolCallRejected { arguments, .. } = event
+                {
                     Some(arguments_estimate(arguments))
                 } else {
                     None
@@ -204,6 +213,19 @@ fn copy_event(event: &SemanticEvent) -> Result<SemanticEvent, BackendFailure> {
             id: copy_text(id)?,
             name: copy_text(name)?,
             arguments: copy_arguments(arguments)?,
+        },
+        SemanticEvent::ToolCallRejected {
+            index,
+            id,
+            name,
+            arguments,
+            error,
+        } => SemanticEvent::ToolCallRejected {
+            index: *index,
+            id: copy_text(id)?,
+            name: copy_text(name)?,
+            arguments: copy_arguments(arguments)?,
+            error: copy_text(error)?,
         },
         SemanticEvent::Finished { reason } => SemanticEvent::Finished { reason: *reason },
     })

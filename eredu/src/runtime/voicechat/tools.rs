@@ -142,7 +142,8 @@ impl VoiceChatToolBatch {
         let copy_bytes = self.events.iter().try_fold(0_u64, |total, event| {
             let bytes = match event {
                 SemanticEvent::ToolCallStart { index, .. }
-                | SemanticEvent::ToolCallCompleted { index, .. } => {
+                | SemanticEvent::ToolCallCompleted { index, .. }
+                | SemanticEvent::ToolCallRejected { index, .. } => {
                     tool_call_id_len(ticket, *index) as u64
                 }
                 _ => 0,
@@ -168,7 +169,8 @@ impl VoiceChatToolBatch {
         self.events.iter().try_fold(0_u64, |total, event| {
             let growth = match event {
                 SemanticEvent::ToolCallStart { id, index, .. }
-                | SemanticEvent::ToolCallCompleted { id, index, .. } => {
+                | SemanticEvent::ToolCallCompleted { id, index, .. }
+                | SemanticEvent::ToolCallRejected { id, index, .. } => {
                     tool_call_id_len(ticket, *index).saturating_sub(id.len()) as u64
                 }
                 _ => 0,
@@ -192,7 +194,8 @@ impl VoiceChatToolBatch {
         let ticket = self.ticket.with_request(request);
         for event in &mut self.events {
             if let SemanticEvent::ToolCallStart { index, id, .. }
-            | SemanticEvent::ToolCallCompleted { index, id, .. } = event
+            | SemanticEvent::ToolCallCompleted { index, id, .. }
+            | SemanticEvent::ToolCallRejected { index, id, .. } = event
             {
                 let mut replacement = String::new();
                 replacement
@@ -699,6 +702,12 @@ fn parse_calls(
         .map_err(protocol)?;
     parser.finish(FinishReason::Eos).map_err(protocol)?;
     let mut events = parser.take_events();
+    if let Some(error) = events.iter().find_map(|event| match event {
+        SemanticEvent::ToolCallRejected { error, .. } => Some(error),
+        _ => None,
+    }) {
+        return Err(protocol(error.clone()));
+    }
     events.retain(|event| !matches!(event, SemanticEvent::Finished { .. }));
     for event in &mut events {
         match event {

@@ -427,8 +427,12 @@ Dialect grammars enforce the constraints they can represent and retain protocol
 syntax, function names and call limits for other schemas. The shared semantic
 event sink parses the complete argument object once and validates it before
 emitting `ToolCallCompleted` with the call index, ID, original application name
-and parsed arguments. Incremental start and argument events remain provisional.
-Snapshot sizing includes the parsed object; tool-enabled continuation and history
+and parsed arguments. Closed object arguments that fail validation instead emit
+`ToolCallRejected` with the attempted call and diagnostic. Applications can return
+that rejection to the model as a tool result; it never authorizes execution.
+Incremental start and argument events remain provisional. Framing and JSON syntax
+errors remain failures. Snapshot sizing includes rejected arguments and diagnostics
+alongside validated objects; tool-enabled continuation and history
 bounds include JSON container expansion. Immutable validators are shared across
 forks while partial arguments remain
 private to each parser. Backends continue to consume neutral token filters and

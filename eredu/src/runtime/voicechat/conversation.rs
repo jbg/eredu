@@ -740,6 +740,21 @@ impl VoiceChatPublicationCapacity {
                         .ok_or(VoiceChatConversationError::Capacity("tool bytes"))?;
                     &[id, name]
                 }
+                SemanticEvent::ToolCallRejected {
+                    id,
+                    name,
+                    arguments,
+                    error,
+                    ..
+                } => {
+                    let bytes = serde_json::to_vec(arguments)
+                        .map_err(|_| VoiceChatConversationError::Capacity("tool bytes"))?
+                        .len();
+                    remaining = remaining
+                        .checked_sub(bytes)
+                        .ok_or(VoiceChatConversationError::Capacity("tool bytes"))?;
+                    &[id, name, error]
+                }
                 SemanticEvent::Finished { .. } => &[],
             };
             for part in parts {
